@@ -15,6 +15,9 @@ class TestMainReturnPtr(unittest.TestCase):
         pcc = CEvaluator()
 
         ret = pcc.evaluate('''
+
+            int a = 50;
+            int b = 4;
             int* swap(int *x, int *y){
                 int tmp;
                 tmp = *x;
@@ -24,15 +27,16 @@ class TestMainReturnPtr(unittest.TestCase):
             }
 
             int* main(){
-                int a = 50;
-                int b = 4;
-                int *c;
-                c = swap(&a, &b);
-                return c ;
+                swap(&a, &b);
+                return &a ;
             }
             ''', llvmdump=True)
 
         # ret_value = ret.contents
-        print("The answer is {} ret type is {}".format(ret, type(ret)))
+        print("The answer is {} ret type is {} content ".format(ret, type(ret)))
+
+        # so the global var
         assert ret.contents.value == 4
 
+if __name__ == "__main__":
+    unittest.main()

@@ -40,7 +40,11 @@ class LLVMCodeGenerator(object):
         self.module = ir.Module()
         self.builder = None
         self.func_symtab = {}
-        self.global_varinfo = {}
+        self.func_tyinfo = {}
+        self.global_symtab = {}
+        self.global_tyinfo = {}
+        self.global_builder = ir.IRBuilder()
+        self.in_builder = None
 
     def generate_code(self, node):
         return self.codegen(node)
@@ -66,10 +70,18 @@ class LLVMCodeGenerator(object):
             for level in range(point_level):
                 ir_type = ir.PointerType(ir_type)
 
-        ret = self.builder.alloca(ir_type, size=None, name=name)
-        self.global_varinfo[name] = ir_type
-        self.func_symtab[name] = ret
-        return ret
+        if self.builder:
+            ret = self.builder.alloca(ir_type, size=None, name=name)
+            self.func_symtab[name] = ret
+            self.func_tyinfo[name] = ir_type
+        else:
+            # it is global ?
+            ret = ir.GlobalVariable(self.module, ir_type, name)
+            # ret = self.global_builder.alloca(ir_type, size=None, name=name)
+            self.global_symtab[name] = ret
+            self.global_tyinfo[name] = ir_type
+
+        return ret, ir_type
 
     def codegen(self, node):
         method = 'codegen_' + node.__class__.__name__
@@ -310,7 +322,7 @@ class LLVMCodeGenerator(object):
     def codegen_ForExprAST(self, node):
 
         saved_block = self.builder.block
-        var_addr = self.create_entry_block_alloca(node.id_name)
+        var_addr, var_ir_type = self.create_entry_block_alloca(node.id_name)
         self.builder.position_at_end(
             saved_block)  # why the save_block at the end
 
@@ -380,10 +392,12 @@ class LLVMCodeGenerator(object):
 
 
     def codegen_Decl(self, node):
-        # may be it is just for for value decl
+        # may be it is just for for value decl how to detect it is global
 
         if self.in_builder:
             saved_block = self.builder.block
+        else:
+            saved_block = None
         # import pdb;pdb.set_trace()
         if isinstance(node.type, c_ast.TypeDecl):
             type_str = node.type.type.names[0]
@@ -400,19 +414,20 @@ class LLVMCodeGenerator(object):
             else:
                 init_val = ir.values.Constant(ir_type, init)
 
-            var_addr = self.create_entry_block_alloca(node.name, type_str, 1)
+            var_addr, var_ir_type = self.create_entry_block_alloca(node.name, type_str, 1)
             if self.in_builder:
                 self.builder.position_at_end(saved_block)
 
             if isinstance(init_val.type, ir.IntType) and \
                     isinstance(ir_type, ir.DoubleType):
-                init_val = self.builder.uitofp(init_val, ir.DoubleType(),
-                                               'booltmp')
+                if self.builder:
+                    init_val = self.builder.uitofp(init_val, ir.DoubleType(), 'booltmp')
 
             if self.in_builder:
                 self.builder.store(init_val, var_addr)
-
-            self.func_symtab[node.name] = var_addr
+            else:
+                self.global_symtab[node.name].initializer = init_val  # no need wrap again
+                # self.global_symtab[node.name].linkage = "internal"
 
         elif isinstance(node.type, c_ast.ArrayDecl):
             # At now only support Int
@@ -432,9 +447,9 @@ class LLVMCodeGenerator(object):
                     continue
                 pass
 
-            var_addr = self.create_entry_block_alloca(
+            var_addr, var_ir_type = self.create_entry_block_alloca(
                 node.name, type_str, 1, array_list)
-            self.func_symtab[node.name] = var_addr
+
 
         elif isinstance(node.type, c_ast.PtrDecl):
 
@@ -457,18 +472,21 @@ class LLVMCodeGenerator(object):
                     continue
                 pass
 
-            var_addr = self.create_entry_block_alloca(
+            var_addr , var_ir_type= self.create_entry_block_alloca(
                 node.name, type_str, 1, point_level=point_level)
+        else:
+            return None, None
 
-            self.func_symtab[node.name] = var_addr
+        # self.func_symtab[node.name] = var_addr
 
         return None, var_addr
 
     def codegen_ID(self, node):
         node.show()
-        var_addr = self.func_symtab[node.name]
+        # import pdb;pdb.set_trace()
+        var_addr = self.func_symtab.get(node.name) or self.global_symtab[node.name]
         ret = self.builder.load(var_addr, node.name)
-        node.ir_type = self.global_varinfo[node.name]
+        node.ir_type = self.func_tyinfo.get(node.name) or self.global_tyinfo[node.name]
         return ret, var_addr
 
     def codegen_ArrayRef(self, node):
@@ -601,7 +619,7 @@ class LLVMCodeGenerator(object):
         self.builder = ir.IRBuilder(bb_entry)
         self.return_in_branch = []
         self.func_symtab = {}
-        self.global_varinfo = {}
+        self.func_tyinfo = {}
         self.in_builder = True
 
         for i, arg in enumerate(func.args):
@@ -611,7 +629,7 @@ class LLVMCodeGenerator(object):
             alloca = self.builder.alloca(arg_type, name=arg.name)
             self.builder.store(arg, alloca)
             self.func_symtab[arg.name] = alloca
-            self.global_varinfo[arg.name] = arg_type
+            self.func_tyinfo[arg.name] = arg_type
 
         self.codegen(node.body)
         return func, None
