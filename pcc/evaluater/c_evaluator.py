@@ -31,6 +31,7 @@ class CEvaluator(object):
         self.codegen = LLVMCodeGenerator()
         self.parser = CParser()
         self.target = llvm.Target.from_default_triple()
+        self.ee = None
 
     def evaluate(self, codestr, optimize=True, llvmdump=False, args=None):
         ast = self.parser.parse(codestr)
@@ -57,22 +58,24 @@ class CEvaluator(object):
                     f.write(tempbcode)
 
         target_machine = self.target.create_target_machine()
-        with llvm.create_mcjit_compiler(llvmmod, target_machine) as ee:
-            ee.finalize_object()
 
-            if llvmdump:
-                tempbcode = target_machine.emit_assembly(llvmmod)
-                with(open("temp.bcode", "w")) as f:
-                    f.write(tempbcode)
+        self.ee = llvm.create_mcjit_compiler(llvmmod, target_machine)
+        self.ee.finalize_object()
 
-            # func = llvmmod.get_function(ast.proto.name)
-            func = llvmmod.get_function("main")
-            return_type = get_c_type_from_ir(self.codegen.return_type)
+        if llvmdump:
+            tempbcode = target_machine.emit_assembly(llvmmod)
+            with(open("temp.bcode", "w")) as f:
+                f.write(tempbcode)
 
-            # how to get main args type
-            fptr = CFUNCTYPE(return_type)(ee.get_pointer_to_function(func))
-            #
-            if args is None:
-                args = []
-            result = fptr(*args)
-            return result
+        # func = llvmmod.get_function(ast.proto.name)
+        func = llvmmod.get_function("main")
+        return_type = get_c_type_from_ir(self.codegen.return_type)
+
+        # how to get main args type
+        fptr = CFUNCTYPE(return_type)(self.ee.get_pointer_to_function(func))
+        #
+        if args is None:
+            args = []
+        result = fptr(*args)
+
+        return result
