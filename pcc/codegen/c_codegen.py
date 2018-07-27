@@ -1,10 +1,20 @@
 import llvmlite.ir as ir
 from ..ast import c_ast as c_ast
 
+bool_t = ir.IntType(1)
+int8_t = ir.IntType(8)
+int32_t = ir.IntType(32)
+int64_t = ir.IntType(64)
+voidptr_t = int8_t.as_pointer()
+
+true_bit = bool_t(1)
+false_bit = bool_t(0)
+true_byte = int8_t(1)
+false_byte = int8_t(0)
+
 
 class CodegenError(Exception):
     pass
-
 
 def get_ir_type(type_str):
     # only support int and double
@@ -98,6 +108,15 @@ class LLVMCodeGenerator(object):
         node.show()
         if node.type == "int":
             return ir.values.Constant(ir.IntType(64), int(node.value)), None
+        elif node.type == 'string':
+
+            b = bytearray(node.value[1:-1] + '\00', encoding='ascii')
+            n = len(b)
+            array = ir.ArrayType(ir.IntType(8), n)
+            tmp = ir.values.Constant(
+                array,
+                b)
+            return tmp , None
         else:
             return ir.values.Constant(ir.DoubleType(), float(node.value)), None
 
@@ -379,16 +398,33 @@ class LLVMCodeGenerator(object):
             callee = node.name.name
 
         callee_func = self.module.globals.get(callee, None)
-
-        if callee_func is None or not isinstance(callee_func, ir.Function):
-            raise CodegenError('Call to unknown function', node.callee)
-
-        if len(callee_func.args) != len(node.args.exprs):
-            raise CodegenError('Call argument length mismatch', node.callee)
-
         call_args = [self.codegen(arg)[0] for arg in node.args.exprs]
 
-        return self.builder.call(callee_func, call_args, 'calltmp'), None
+        # just for see and hard code it
+        if callee == "printf":
+            cstring = voidptr_t
+            fnty = ir.FunctionType(int32_t, [cstring], var_arg=True)
+            callee_func = ir.Function(self.module, fnty, name="printf")
+            print("callee_func", callee_func)
+            # import pdb;pdb.set_trace()
+            # cast array to pointer
+            data_fmt = call_args[0]
+            global_fmt = ir.GlobalVariable(
+                self.module, data_fmt.type, "printf_format")
+            # global_fmt.linkage = "internal"
+            # global_fmt.global_constant = True
+            global_fmt.initializer = data_fmt
+            format_ptr = self.builder.bitcast(global_fmt, cstring)
+            return self.builder.call(
+                callee_func, [format_ptr] + call_args[1:], 'calltmp'), None
+
+        else:
+            if callee_func is None or not isinstance(callee_func, ir.Function):
+                raise CodegenError('Call to unknown function', node.callee)
+
+            if len(callee_func.args) != len(node.args.exprs):
+                raise CodegenError('Call argument length mismatch', node.callee)
+            return self.builder.call(callee_func, call_args, 'calltmp'), None
 
 
     def codegen_Decl(self, node):
