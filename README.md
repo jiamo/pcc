@@ -27,7 +27,7 @@ Run pcc test
 
 TODO
 --------------------
-0. make `python test.c` work.
+0. make `pcc test.c` work.
 1. finish the full c syntax (which mean too much test cases).
 2. the libc function like `printf, memset`.
 3. code refactor.
