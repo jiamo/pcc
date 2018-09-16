@@ -6,7 +6,7 @@ int8_t = ir.IntType(8)
 int32_t = ir.IntType(32)
 int64_t = ir.IntType(64)
 voidptr_t = int8_t.as_pointer()
-
+int64ptr_t = int64_t.as_pointer()
 true_bit = bool_t(1)
 false_bit = bool_t(0)
 true_byte = int8_t(1)
@@ -15,6 +15,7 @@ false_byte = int8_t(0)
 
 class CodegenError(Exception):
     pass
+
 
 def get_ir_type(type_str):
     # only support int and double
@@ -43,6 +44,7 @@ def get_ir_type_from_node(node):
         else:
             ir_type = ir.DoubleType()
     return ir_type
+
 
 class LLVMCodeGenerator(object):
 
@@ -183,11 +185,11 @@ class LLVMCodeGenerator(object):
             # result_ptr = self.builder.load(name_ptr)
             result_ptr = name_ir
             result = self.builder.load(result_ptr)
-            # go to next lwevel
+
         if node.op == '&':
             name_ir, name_ptr = self.codegen(node.expr)
             result_ptr = name_ptr
-            result = result_ptr  # got point from vaule is the result
+            result = result_ptr  # got point from value is the result
 
         return result, result_ptr
 
@@ -338,58 +340,6 @@ class LLVMCodeGenerator(object):
         # The 'for' expression always returns 0
         return ir.values.Constant(ir.DoubleType(), 0.0)
 
-    def codegen_ForExprAST(self, node):
-
-        saved_block = self.builder.block
-        var_addr, var_ir_type = self.create_entry_block_alloca(node.id_name)
-        self.builder.position_at_end(
-            saved_block)  # why the save_block at the end
-
-        start_val, _ = self.codegen(node.start_expr)
-        self.builder.store(start_val, var_addr)
-
-        # The builder is what? loop is a block which begin with loop
-        loop_bb = self.builder.function.append_basic_block('loop')
-
-        self.builder.branch(loop_bb)
-        self.builder.position_at_start(loop_bb)
-        old_var_addr = self.func_symtab.get(node.id_name)
-        self.func_symtab[node.id_name] = var_addr
-        body_val, _ = self.codegen(node.body)
-
-        # Compute the end condition
-        endcond, _ = self.codegen(node.end_expr)
-        cmp = self.builder.fcmp_ordered(
-            '!=', endcond, ir.values.Constant(ir.DoubleType(), 0.0),
-            'loopcond')
-
-        if node.step_expr is None:
-            stepval = self.builder.constant(ir.DoubleType(), 1.0)
-        else:
-            stepval, _ = self.codegen(node.step_expr)
-
-        cur_var = self.builder.load(var_addr, node.id_name)
-        nextval = self.builder.fadd(cur_var, stepval, 'nextvar')
-        self.builder.store(nextval, var_addr)
-
-        # Create the 'after loop' block and insert it
-        after_bb = self.builder.function.append_basic_block('afterloop')
-
-        # Insert the conditional branch into the end of loop_end_bb
-        self.builder.cbranch(cmp, loop_bb, after_bb)
-
-        # New code will be inserted into after_bb
-        self.builder.position_at_start(after_bb)
-
-        # Restore the old var address if it was shadowed.
-        if old_var_addr is not None:
-            self.func_symtab[node.id_name] = old_var_addr
-        else:
-            del self.func_symtab[node.id_name]
-
-        # The 'for' expression always returns 0
-        return ir.values.Constant(ir.DoubleType(), 0.0), None
-
     def codegen_FuncCall(self, node):
         node.show()
         callee = None
@@ -417,7 +367,12 @@ class LLVMCodeGenerator(object):
             format_ptr = self.builder.bitcast(global_fmt, cstring)
             return self.builder.call(
                 callee_func, [format_ptr] + call_args[1:], 'calltmp'), None
-
+        elif callee == 'malloc':
+            # TODO try to make it return (void *) not the (int *)
+            fnty = ir.FunctionType(int64ptr_t, [int64_t], var_arg=True)
+            callee_func = ir.Function(self.module, fnty, name="malloc")
+            return self.builder.call(
+                callee_func, call_args[0:], 'calltmp'), None
         else:
             if callee_func is None or not isinstance(callee_func, ir.Function):
                 raise CodegenError('Call to unknown function', node.callee)
@@ -425,7 +380,6 @@ class LLVMCodeGenerator(object):
             if len(callee_func.args) != len(node.args.exprs):
                 raise CodegenError('Call argument length mismatch', node.callee)
             return self.builder.call(callee_func, call_args, 'calltmp'), None
-
 
     def codegen_Decl(self, node):
         # may be it is just for for value decl how to detect it is global
@@ -450,7 +404,8 @@ class LLVMCodeGenerator(object):
             else:
                 init_val = ir.values.Constant(ir_type, init)
 
-            var_addr, var_ir_type = self.create_entry_block_alloca(node.name, type_str, 1)
+            var_addr, var_ir_type = self.create_entry_block_alloca(
+                node.name, type_str, 1)
             if self.in_builder:
                 self.builder.position_at_end(saved_block)
 
@@ -462,7 +417,8 @@ class LLVMCodeGenerator(object):
             if self.in_builder:
                 self.builder.store(init_val, var_addr)
             else:
-                self.global_symtab[node.name].initializer = init_val  # no need wrap again
+                self.global_symtab[node.name].initializer = init_val
+                # no need wrap again
                 # self.global_symtab[node.name].linkage = "internal"
 
         elif isinstance(node.type, c_ast.ArrayDecl):
