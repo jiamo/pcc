@@ -9,5 +9,5 @@ int func(){
 }
 
 int main(){
-    return func()
+    return func();
 }

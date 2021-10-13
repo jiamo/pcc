@@ -74,7 +74,7 @@ def parse_file(filename, use_cpp=False, cpp_path='cpp', cpp_args='',
     if use_cpp:
         text = preprocess_file(filename, cpp_path, cpp_args)
     else:
-        with open(filename, 'rU') as f:
+        with open(filename, 'r') as f:
             text = f.read()
 
     if parser is None:

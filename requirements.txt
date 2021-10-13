@@ -1,1 +1,2 @@
-llvmlite==0.12.1
+llvmlite==0.32.0
+click

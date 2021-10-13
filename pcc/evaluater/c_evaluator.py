@@ -67,12 +67,10 @@ class CEvaluator(object):
             with(open("temp.bcode", "w")) as f:
                 f.write(tempbcode)
 
-        # func = llvmmod.get_function(ast.proto.name)
-        func = llvmmod.get_function("main")
         return_type = get_c_type_from_ir(self.codegen.return_type)
 
         # how to get main args type
-        fptr = CFUNCTYPE(return_type)(self.ee.get_pointer_to_function(func))
+        fptr = CFUNCTYPE(return_type)(self.ee.get_function_address("main"))
         #
         if args is None:
             args = []

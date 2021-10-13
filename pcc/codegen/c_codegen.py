@@ -1,4 +1,5 @@
 import llvmlite.ir as ir
+from llvmlite.ir import IRBuilder
 from ..ast import c_ast as c_ast
 
 bool_t = ir.IntType(1)
@@ -20,7 +21,7 @@ class CodegenError(Exception):
 def get_ir_type(type_str):
     # only support int and double
     if type_str == "int":
-        ir_type = ir.IntType(64)
+        ir_type = int64_t
     else:
         ir_type = ir.DoubleType()
     return ir_type
@@ -55,7 +56,7 @@ class LLVMCodeGenerator(object):
         self.func_tyinfo = {}
         self.global_symtab = {}
         self.global_tyinfo = {}
-        self.global_builder = ir.IRBuilder()
+        self.global_builder:IRBuilder = ir.IRBuilder()
         self.in_builder = None
 
     def generate_code(self, node):
@@ -340,6 +341,21 @@ class LLVMCodeGenerator(object):
         # The 'for' expression always returns 0
         return ir.values.Constant(ir.DoubleType(), 0.0)
 
+    def codegen_Cast(self, node):
+
+        node.show()
+        expr, ptr = self.codegen(node.expr)
+        dest_type_str = node.to_type.type.type.names[0]
+        # dest_type = get_ir_type(dest_type_str)
+        # # breakpoint()
+        # print(expr.type, dest_type)
+        # ir.IntType(64) can't be case position
+        match (type(expr.type), dest_type_str):
+            # ir.types different from ir.IntType
+            case (ir.types.DoubleType, "int"):
+                return self.builder.fptosi(expr, int64_t), None
+
+
     def codegen_FuncCall(self, node):
         node.show()
         callee = None
@@ -348,7 +364,9 @@ class LLVMCodeGenerator(object):
             callee = node.name.name
 
         callee_func = self.module.globals.get(callee, None)
-        call_args = [self.codegen(arg)[0] for arg in node.args.exprs]
+        call_args = []
+        if node.args:
+            call_args = [self.codegen(arg)[0] for arg in node.args.exprs]
 
         # just for see and hard code it
         if callee == "printf":
@@ -377,7 +395,7 @@ class LLVMCodeGenerator(object):
             if callee_func is None or not isinstance(callee_func, ir.Function):
                 raise CodegenError('Call to unknown function', node.callee)
 
-            if len(callee_func.args) != len(node.args.exprs):
+            if node.args and len(callee_func.args) != len(node.args.exprs):
                 raise CodegenError('Call argument length mismatch', node.callee)
             return self.builder.call(callee_func, call_args, 'calltmp'), None
 
@@ -464,7 +482,7 @@ class LLVMCodeGenerator(object):
                     continue
                 pass
 
-            var_addr , var_ir_type= self.create_entry_block_alloca(
+            var_addr, var_ir_type= self.create_entry_block_alloca(
                 node.name, type_str, 1, point_level=point_level)
         else:
             return None, None
