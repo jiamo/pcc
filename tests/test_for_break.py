@@ -24,25 +24,23 @@ class TestWhile(unittest.TestCase):
 
                 int len = 100;
                 int sum =  0 ;
+                int i = 1;
 
-
-                while( len != 0 ){
-                    sum += len;
-                    if (len == 2) {
+                for(i=1; i <= len; i++){
+                    sum += i;
+                    if (i == 10) {
                         break;
                     }
                     else{
-                        len--;
                         continue;
                     }
 
                 }
-
                 return sum ;
             }
             ''', llvmdump=True)
         print(ret)
-        assert(ret == 5049)
+        assert(ret == 55)
 
 
 #TODO  If is complext should finish the basic

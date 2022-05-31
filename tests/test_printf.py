@@ -20,6 +20,14 @@ def test_printf(capsys):
         ''', llvmdump=True)
     # it seem can't work to catch llvm output
     out, err = capsys.readouterr()
+    print(out)
     assert "helloworld" in out
     sys.stdout.write(out)
     sys.stderr.write(err)
+
+
+if __name__ == '__main__':
+
+    # This is a good point to self start main
+    # print(pcc.evaluate('main()'))
+    unittest.main()

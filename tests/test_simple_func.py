@@ -33,3 +33,6 @@ class TestSimpleFunc(unittest.TestCase):
 
         print("The answer is %d" % ret)
 
+if __name__ == '__main__':
+    # Evaluate some code.
+    unittest.main()
