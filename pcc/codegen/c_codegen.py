@@ -15,7 +15,7 @@ false_bit = bool_t(0)
 true_byte = int8_t(1)
 false_byte = int8_t(0)
 cstring = voidptr_t
-
+struct_types = {}
 
 class CodegenError(Exception):
     pass
@@ -267,12 +267,23 @@ class LLVMCodeGenerator(object):
         elif node.op in [">", "<", ">=", "<=", "!=", "=="]:
             if dispatch_type == dispatch_type_int:
                 cmp = self.builder.icmp_signed(node.op, lhs, rhs, 'cmptmp')
-                return self.builder.uitofp(cmp, ir.DoubleType(),
-                                           'booltmp'), None
+                return self.builder.uitofp(cmp, ir.DoubleType(),'booltmp'), None
             else:
                 cmp = self.builder.fcmp_unordered(node.op, lhs, rhs, 'cmptmp')
-                return self.builder.uitofp(cmp, ir.DoubleType(),
-                                           'booltmp'), None
+                return self.builder.uitofp(cmp, ir.DoubleType(), 'booltmp'), None
+        elif node.op == '&&':
+            # it is not
+            # lhs_bool = self.builder.icmp_signed('!=', lhs, ir.Constant(ir.DoubleType(), 0))
+            # rhs_bool = self.builder.icmp_signed('!=', rhs, ir.Constant(ir.DoubleType(), 0))
+            lhs_bool = self.builder.fptosi(lhs, int32_t)
+            rhs_bool = self.builder.fptosi(rhs, int32_t)
+            cmp = self.builder.and_(lhs_bool, rhs_bool, 'cmptmp')
+            return self.builder.uitofp(cmp, ir.DoubleType(), 'booltmp'), None
+        elif node.op == '||':
+            lhs_bool = self.builder.fptosi(lhs, int32_t)
+            rhs_bool = self.builder.fptosi(rhs, int32_t)
+            cmp =  self.builder.or_(lhs_bool, rhs_bool, 'cmptmp')
+            return self.builder.uitofp(cmp, ir.DoubleType(), 'booltmp'), None
         else:
             func = self.module.globals.get('binary{0}'.format(node.op))
             return self.builder.call(func, [lhs, rhs], 'binop'), None
@@ -444,39 +455,66 @@ class LLVMCodeGenerator(object):
             return self.builder.call(callee_func, call_args, 'calltmp'), None
 
     def codegen_Decl(self, node):
+        node.show()
+        type_str = ""
+
         if isinstance(node.type, c_ast.TypeDecl):
-            type_str = node.type.type.names[0]
-            # import pdb;pdb.set_trace()
-            if type_str == "int":
-                ir_type = ir.IntType(64)
-                init = 0
+            if isinstance(node.type.type, c_ast.Struct):
+                name = node.type.declname
+                if node.type.type.name is None:
+                    struct_type = self.codegen_Struct(node.type.type)
+                    # change to IdentifiedStructType
+                    # TODO https://github.com/numba/llvmlite/issues/674
+                    # struct_type = ir.IdentifiedStructType(ir.context, name)
+                    # struct_type.members = literal_struct_type.members
+                    # struct_type.set_body(*literal_struct_type.elements)
+                    if not self.in_global:
+                        ret = self.builder.alloca(struct_type, size=None, name=name)
+                        self.define(name, (struct_type, ret))
+                    else:
+                        ret = ir.GlobalVariable(self.module, struct_type, name)
+                        self.define(name, (struct_type, ret))
+                    return None, None
+                else:
+                    struct_type = self.env[node.type.type.name][0]
+                    if not self.in_global:
+                        ret = self.builder.alloca(struct_type, size=None, name=name)
+                        self.define(name, (struct_type, ret))
+                    else:
+                        ret = ir.GlobalVariable(self.module, struct_type, name)
+                        self.define(name, (struct_type, ret))
+                    return None, None
             else:
-                ir_type = ir.DoubleType()
-                init = 0.0
-            # import pdb;pdb.set_trace()
-            if node.init is not None:
-                init_val, _ = self.codegen(node.init)
-            else:
-                init_val = ir.values.Constant(ir_type, init)
+                type_str = node.type.type.names[0]
+                if type_str == "int":
+                    ir_type = ir.IntType(64)
+                    init = 0
+                else:
+                    ir_type = ir.DoubleType()
+                    init = 0.0
 
-            var_addr, var_ir_type = self.create_entry_block_alloca(
-                node.name, type_str, 1)
+                if node.init is not None:
+                    init_val, _ = self.codegen(node.init)
+                else:
+                    init_val = ir.values.Constant(ir_type, init)
 
-            if isinstance(init_val.type, ir.IntType) and \
-                    isinstance(ir_type, ir.DoubleType):
-                if self.builder:
-                    init_val = self.builder.uitofp(init_val, ir.DoubleType(), 'booltmp')
+                var_addr, var_ir_type = self.create_entry_block_alloca(
+                    node.name, type_str, 1)
 
-            if self.in_global:
-                var_addr.initializer = init_val
-            else:
-                self.builder.store(init_val, var_addr)
+                if isinstance(init_val.type, ir.IntType) and \
+                        isinstance(ir_type, ir.DoubleType):
+                    if self.builder:
+                        init_val = self.builder.uitofp(init_val, ir.DoubleType(), 'booltmp')
+
+                if self.in_global:
+                    var_addr.initializer = init_val
+                else:
+                    self.builder.store(init_val, var_addr)
 
         elif isinstance(node.type, c_ast.ArrayDecl):
             # At now only support Int
             array_list = []
             array_node = node.type
-
             while True:
                 array_next_type = array_node.type
                 if isinstance(array_next_type, c_ast.TypeDecl):
@@ -488,7 +526,8 @@ class LLVMCodeGenerator(object):
                     array_list.append(int(array_node.dim.value))
                     array_node = array_next_type
                     continue
-                pass
+                else:
+                    raise Exception("TODO implement")
 
             var_addr, var_ir_type = self.create_entry_block_alloca(
                 node.name, type_str, 1, array_list)
@@ -668,3 +707,46 @@ class LLVMCodeGenerator(object):
         retval, _ = self.codegen(node.body)
         self.builder.ret(retval)
         return func, None
+
+    def codegen_Struct(self, node):
+        # Generate LLVM types for struct members
+        node.show()
+        member_types = []
+        member_names = []
+        for decl in node.decls:
+            type_str = decl.type.type.names[0]
+            if type_str == "int":
+                ir_type = ir.IntType(64)
+            else:
+                ir_type = ir.DoubleType()
+            member_types.append(ir_type)
+            member_names.append(decl.name)
+        # Create the struct type
+        struct_type = ir.LiteralStructType(member_types,)
+        struct_type.members = member_names
+
+        return struct_type
+
+    def codegen_StructRef(self, node):
+        node.show()
+        struct_instance_addr = self.env[node.name.name][1]
+        if not isinstance(struct_instance_addr.type, ir.PointerType):
+            raise Exception("Invalid struct reference")
+
+        struct_type = struct_instance_addr.type.pointee
+        field_index = None
+        for i, field in enumerate(struct_type.members):
+            # breakpoint()
+            if field == node.field.name:
+                field_index = i
+                break
+
+        if field_index is None:
+            raise RuntimeError(f"Field '{node.field.name}' not found in struct '{node.name}'")
+
+        field_addr = self.builder.gep(struct_instance_addr, [
+            ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_index)], inbounds=True)
+
+        field_value = self.builder.load(field_addr)
+
+        return field_value, field_addr

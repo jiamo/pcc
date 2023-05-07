@@ -16,9 +16,8 @@ Notice
 Development 
 --------------------
 
-1. only test with llvm-7 on mac. (linux should work)
-   
-`LLVM_CONFIG='/usr/local/Cellar/llvm@7/7.1.0_2/bin/llvm-config' pip install llvmlite==0.32.0`
+1. test with llvm-13 on mac. (linux should work)
+`LLVM_CONFIG='/usr/local/Cellar/llvm@13/13.0.1/bin/llvm-config' pip install llvmlite==0.39.1`
 
 
 
