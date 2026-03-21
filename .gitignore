@@ -71,3 +71,8 @@ uv.lock
 
 # Temp files
 temp.*
+
+
+
+redis
+nginx

@@ -285,6 +285,7 @@ class LLVMCodeGenerator(object):
             self.define(name, (ir_type, ret))
         else:
             ret = ir.GlobalVariable(self.module, ir_type, name)
+            ret.initializer = ir.Constant(ir_type, None)  # zero-initialize
             self.define(name, (ir_type, ret))
 
         return ret, ir_type
@@ -1046,9 +1047,13 @@ class LLVMCodeGenerator(object):
 
         # Forward function declaration: int foo(int x);
         if isinstance(node.type, c_ast.FuncDecl):
-            ir_type, _ = self.codegen(node.type)
             funcname = node.name
-            # Build arg types
+            # Skip if function already defined/declared
+            existing = self.module.globals.get(funcname)
+            if existing and isinstance(existing, ir.Function):
+                self.define(funcname, (None, existing))
+                return None, None
+            ir_type, _ = self.codegen(node.type)
             arg_types = []
             if node.type.args:
                 for arg in node.type.args.params:
@@ -1121,7 +1126,12 @@ class LLVMCodeGenerator(object):
                     init = 0
 
                 if node.init is not None:
-                    init_val, _ = self.codegen(node.init)
+                    if self.in_global:
+                        # Global vars: evaluate init as constant expression
+                        const_val = self._eval_const_expr(node.init)
+                        init_val = ir.Constant(ir_type, const_val)
+                    else:
+                        init_val, _ = self.codegen(node.init)
                 else:
                     init_val = ir.values.Constant(ir_type, init)
 
@@ -1129,8 +1139,6 @@ class LLVMCodeGenerator(object):
                     node.name, type_str, 1)
 
                 if self.in_global:
-                    if init_val.type != ir_type:
-                        init_val = ir.Constant(ir_type, init)
                     var_addr.initializer = init_val
                 else:
                     init_val = self._implicit_convert(init_val, ir_type)
