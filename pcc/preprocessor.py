@@ -43,7 +43,22 @@ BUILTIN_DEFINES = {
     "USHRT_MAX": "65535",
     "UINT_MAX": "4294967295",
     "LONG_MAX": "9223372036854775807",
+    "ULONG_MAX": "18446744073709551615",
+    "LLONG_MAX": "9223372036854775807",
+    "LLONG_MIN": "(-9223372036854775807-1)",
+    "ULLONG_MAX": "18446744073709551615",
     "SIZE_MAX": "18446744073709551615",
+    "INTPTR_MAX": "9223372036854775807",
+    "FLT_MAX": "3.402823466e+38",
+    "DBL_MAX": "1.7976931348623158e+308",
+    "FLT_MIN": "1.175494351e-38",
+    "DBL_MIN": "2.2250738585072014e-308",
+    "FLT_MANT_DIG": "24",
+    "DBL_MANT_DIG": "53",
+    "FLT_MAX_EXP": "128",
+    "DBL_MAX_EXP": "1024",
+    "HUGE_VAL": "1e308",
+    "HUGE_VALF": "1e38f",
     "true": "1",
     "false": "0",
     "__STDC__": "1",
@@ -57,6 +72,18 @@ typedef long ssize_t;
 typedef long ptrdiff_t;
 typedef long intptr_t;
 typedef unsigned long uintptr_t;
+typedef void *va_list;
+typedef long long intmax_t;
+typedef unsigned long long uintmax_t;
+typedef int sig_atomic_t;
+typedef int wchar_t;
+typedef int wint_t;
+typedef long off_t;
+typedef long clock_t;
+typedef long time_t;
+typedef int pid_t;
+typedef unsigned int mode_t;
+typedef int FILE;
 """
 
 
@@ -112,7 +139,9 @@ class Preprocessor:
             skipping = any(s[0] for s in skip_stack)
 
             if stripped.startswith('#'):
-                directive = stripped[1:].strip()
+                # Strip inline C comments from directives
+                directive = re.sub(r'/\*.*?\*/', '', stripped[1:]).strip()
+                directive = re.sub(r'//.*$', '', directive).strip()
                 handled = self._handle_directive(
                     directive, output, skip_stack, skipping, base_dir)
                 i += 1
@@ -242,6 +271,9 @@ class Preprocessor:
 
     def _eval_condition(self, expr):
         """Evaluate a #if / #elif expression. Returns True/False."""
+        # Strip C comments from expression
+        expr = re.sub(r'/\*.*?\*/', '', expr).strip()
+        expr = re.sub(r'//.*$', '', expr).strip()
         # Handle defined(NAME) and defined NAME BEFORE macro expansion
         # to avoid expanding the name away
         expanded = re.sub(

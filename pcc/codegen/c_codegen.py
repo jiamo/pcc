@@ -253,24 +253,40 @@ def get_ir_type_from_names(names):
 
 
 def get_ir_type_from_node(node):
+    if isinstance(node, c_ast.EllipsisParam):
+        return voidptr_t  # shouldn't be called, but be safe
 
-    if isinstance(node.type, c_ast.PtrDecl):
-        inner = node.type.type
+    return _resolve_node_type(node.type)
+
+
+def _resolve_node_type(node_type):
+    """Resolve an AST type node to an IR type."""
+    if isinstance(node_type, c_ast.PtrDecl):
+        inner = node_type.type
         if isinstance(inner, c_ast.FuncDecl):
-            # Function pointer parameter: int (*f)(int)
-            ret_type = get_ir_type(inner.type.type.names)
+            ret_type = _resolve_node_type(inner.type)
             param_types = []
             if inner.args:
                 for p in inner.args.params:
+                    if isinstance(p, c_ast.EllipsisParam):
+                        continue
                     param_types.append(get_ir_type_from_node(p))
             return ir.FunctionType(ret_type, param_types).as_pointer()
-        return_type_str = inner.type.names
-        data_ir_type = get_ir_type(return_type_str)
-        ir_type = ir.PointerType(data_ir_type)
-    else:
-        return_type_str = node.type.type.names
-        ir_type = get_ir_type(return_type_str)
-    return ir_type
+        pointee = _resolve_node_type(inner)
+        if isinstance(pointee, ir.VoidType):
+            return voidptr_t
+        return ir.PointerType(pointee)
+    elif isinstance(node_type, c_ast.TypeDecl):
+        if isinstance(node_type.type, c_ast.IdentifierType):
+            return get_ir_type(node_type.type.names)
+        elif isinstance(node_type.type, c_ast.Struct):
+            return int8_t  # opaque struct
+        elif isinstance(node_type.type, c_ast.Union):
+            return int8_t  # opaque union
+        return int64_t
+    elif isinstance(node_type, c_ast.ArrayDecl):
+        return voidptr_t  # array params decay to pointer
+    return int64_t
 
 
 class LLVMCodeGenerator(object):
@@ -291,6 +307,8 @@ class LLVMCodeGenerator(object):
         self.env[name] = val
 
     def lookup(self, name):
+        if not isinstance(name, str):
+            name = name.name if hasattr(name, 'name') else str(name)
         if name not in self.env and name in LIBC_FUNCTIONS:
             self._declare_libc(name)
         return self.env[name]
@@ -346,6 +364,8 @@ class LLVMCodeGenerator(object):
             ir_type.dim_array = array_list
 
         if point_level != 0:
+            if isinstance(ir_type, ir.VoidType):
+                ir_type = int8_t  # void* -> i8*
             for level in range(point_level):
                 ir_type = ir.PointerType(ir_type)
 
@@ -364,8 +384,30 @@ class LLVMCodeGenerator(object):
         return getattr(self, method)(node)
 
     def codegen_FileAST(self, node):
+        # Collect names of functions that have definitions (FuncDef)
+        funcdef_names = set()
         for ext in node.ext:
-            self.codegen(ext)
+            if isinstance(ext, c_ast.FuncDef) and ext.decl:
+                funcdef_names.add(ext.decl.name)
+        self._funcdef_names = funcdef_names
+
+        # Two-pass: first types/typedefs, then everything else
+        pass1 = set()
+        for i, ext in enumerate(node.ext):
+            is_type_def = False
+            if isinstance(ext, c_ast.Decl):
+                if isinstance(ext.type, (c_ast.Struct, c_ast.Union, c_ast.Enum)):
+                    is_type_def = True
+                elif isinstance(ext.type, c_ast.TypeDecl) and isinstance(ext.type.type, (c_ast.Struct, c_ast.Union)):
+                    is_type_def = True
+            elif isinstance(ext, c_ast.Typedef):
+                is_type_def = True
+            if is_type_def:
+                self.codegen(ext)
+                pass1.add(i)
+        for i, ext in enumerate(node.ext):
+            if i not in pass1:
+                self.codegen(ext)
 
     _escape_map = {
         'n': '\n', 't': '\t', 'r': '\r', '\\': '\\',
@@ -457,7 +499,17 @@ class LLVMCodeGenerator(object):
             self.builder.store(rv, lv_addr)
             return rv, lv_addr  # return value for chained assignment
         else:
-            addresult = handle(lv, rv, 'addtmp')
+            # Pointer compound assignment: p += n, p -= n
+            if isinstance(lv.type, ir.PointerType) and isinstance(rv.type, ir.IntType):
+                if node.op == '+=':
+                    addresult = self.builder.gep(lv, [rv], name='ptradd')
+                elif node.op == '-=':
+                    neg = self.builder.neg(rv, 'neg')
+                    addresult = self.builder.gep(lv, [neg], name='ptrsub')
+                else:
+                    addresult = handle(lv, rv, 'addtmp')
+            else:
+                addresult = handle(lv, rv, 'addtmp')
             self.builder.store(addresult, lv_addr)
             return addresult, lv_addr
 
@@ -466,46 +518,18 @@ class LLVMCodeGenerator(object):
         result = None
         result_ptr = None
 
-        if node.op == "p++":
-            # post-increment: return old value
-            _, lv_addr = self.lookup(node.expr.name)
-            lv = self.builder.load(lv_addr, node.expr.name)
+        if node.op in ("p++", "p--", "++", "--"):
+            lv, lv_addr = self.codegen(node.expr)
+            is_post = node.op.startswith('p')
+            is_inc = '+' in node.op
             if isinstance(lv.type, ir.PointerType):
-                addresult = self.builder.gep(lv, [ir.Constant(int64_t, 1)], name='ptrinc')
+                delta = ir.Constant(int64_t, 1 if is_inc else -1)
+                new_val = self.builder.gep(lv, [delta], name='ptrincdec')
             else:
-                addresult = self.builder.add(lv, ir.Constant(lv.type, 1), 'addtmp')
-            self.builder.store(addresult, lv_addr)
-            result = lv
-
-        elif node.op == "p--":
-            _, lv_addr = self.lookup(node.expr.name)
-            lv = self.builder.load(lv_addr, node.expr.name)
-            if isinstance(lv.type, ir.PointerType):
-                addresult = self.builder.gep(lv, [ir.Constant(int64_t, -1)], name='ptrdec')
-            else:
-                addresult = self.builder.sub(lv, ir.Constant(lv.type, 1), 'subtmp')
-            self.builder.store(addresult, lv_addr)
-            result = lv
-
-        elif node.op == "++":
-            _, lv_addr = self.lookup(node.expr.name)
-            lv = self.builder.load(lv_addr, node.expr.name)
-            if isinstance(lv.type, ir.PointerType):
-                addresult = self.builder.gep(lv, [ir.Constant(int64_t, 1)], name='ptrinc')
-            else:
-                addresult = self.builder.add(lv, ir.Constant(lv.type, 1), 'addtmp')
-            self.builder.store(addresult, lv_addr)
-            result = addresult
-
-        elif node.op == "--":
-            _, lv_addr = self.lookup(node.expr.name)
-            lv = self.builder.load(lv_addr, node.expr.name)
-            if isinstance(lv.type, ir.PointerType):
-                addresult = self.builder.gep(lv, [ir.Constant(int64_t, -1)], name='ptrdec')
-            else:
-                addresult = self.builder.sub(lv, ir.Constant(lv.type, 1), 'subtmp')
-            self.builder.store(addresult, lv_addr)
-            result = addresult
+                one = ir.Constant(lv.type, 1)
+                new_val = self.builder.add(lv, one, 'inc') if is_inc else self.builder.sub(lv, one, 'dec')
+            self.builder.store(new_val, lv_addr)
+            result = lv if is_post else new_val
 
         elif node.op == '*':
             name_ir, name_ptr = self.codegen(node.expr)
@@ -565,7 +589,6 @@ class LLVMCodeGenerator(object):
 
     def _resolve_type_str(self, type_str):
         """Resolve typedef'd type names to their base type string."""
-        # If it's a list of names, try the first element as typedef key
         if isinstance(type_str, list):
             type_str = type_str[0] if len(type_str) == 1 else type_str
         if isinstance(type_str, list):
@@ -574,8 +597,13 @@ class LLVMCodeGenerator(object):
         if key in self.env:
             resolved = self.env[key]
             if isinstance(resolved, str):
+                # Could be a __struct_ reference or a base type name
+                if resolved.startswith('__struct_'):
+                    struct_name = resolved[len('__struct_'):]
+                    if struct_name in self.env:
+                        return self.env[struct_name][0]
+                    return int8_t  # opaque
                 return resolved
-            # It's an IR type (e.g., struct typedef)
             return resolved
         return type_str
 
@@ -610,18 +638,53 @@ class LLVMCodeGenerator(object):
                 elem_ptr = self.builder.gep(base_addr, idx, inbounds=True)
                 self.builder.store(val, elem_ptr)
 
+    def _resolve_param_type(self, param):
+        """Resolve a function parameter type, handling typedefs and pointers."""
+        return self._resolve_ast_type(param.type)
+
+    def _resolve_ast_type(self, node_type):
+        """Recursively resolve an AST type to IR type, with typedef support."""
+        if isinstance(node_type, c_ast.PtrDecl):
+            inner = node_type.type
+            if isinstance(inner, c_ast.FuncDecl):
+                return self._build_func_ptr_type(inner)
+            pointee = self._resolve_ast_type(inner)
+            if isinstance(pointee, ir.VoidType):
+                return voidptr_t
+            return ir.PointerType(pointee)
+        elif isinstance(node_type, c_ast.TypeDecl):
+            if isinstance(node_type.type, c_ast.IdentifierType):
+                return self._get_ir_type(node_type.type.names)
+            elif isinstance(node_type.type, c_ast.Struct):
+                return self.codegen_Struct(node_type.type)
+            elif isinstance(node_type.type, c_ast.Union):
+                return self.codegen_Union(node_type.type)
+            return int64_t
+        elif isinstance(node_type, c_ast.ArrayDecl):
+            return voidptr_t
+        return int64_t
+
+    def _eval_dim(self, dim_node):
+        """Evaluate array dimension (may be a constant or expression)."""
+        if dim_node is None:
+            return 0
+        if isinstance(dim_node, c_ast.Constant):
+            v = dim_node.value.rstrip('uUlL')
+            return int(v, 0)  # handles hex/octal/decimal
+        return self._eval_const_expr(dim_node)
+
     def _build_func_ptr_type(self, func_decl_node):
         """Build an IR function pointer type from a FuncDecl AST node."""
-        # Return type
         ret_ir, _ = self.codegen(func_decl_node)
-        # Parameter types
         param_types = []
         if func_decl_node.args:
             for param in func_decl_node.args.params:
+                if isinstance(param, c_ast.EllipsisParam):
+                    continue
                 if isinstance(param, c_ast.Typename):
-                    param_types.append(get_ir_type(param.type.type.names))
+                    param_types.append(self._resolve_ast_type(param.type))
                 elif isinstance(param, c_ast.Decl):
-                    param_types.append(get_ir_type_from_node(param))
+                    param_types.append(self._resolve_param_type(param))
         func_type = ir.FunctionType(ret_ir, param_types)
         return func_type.as_pointer()
 
@@ -641,6 +704,15 @@ class LLVMCodeGenerator(object):
                 return self.builder.sext(val, target_type)
             elif val.type.width > target_type.width:
                 return self.builder.trunc(val, target_type)
+        # int -> pointer (e.g., NULL assignment, p = 0)
+        if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.PointerType):
+            return self.builder.inttoptr(val, target_type)
+        # pointer -> int
+        if isinstance(val.type, ir.PointerType) and isinstance(target_type, ir.IntType):
+            return self.builder.ptrtoint(val, target_type)
+        # pointer -> different pointer
+        if isinstance(val.type, ir.PointerType) and isinstance(target_type, ir.PointerType):
+            return self.builder.bitcast(val, target_type)
         return val
 
     def _to_bool(self, val, name='cond'):
@@ -1055,7 +1127,16 @@ class LLVMCodeGenerator(object):
                 call_args = [self.codegen(arg)[0] for arg in node.args.exprs]
             fp_val, _ = self.codegen(node.name)
             if isinstance(fp_val.type, ir.PointerType) and isinstance(fp_val.type.pointee, ir.FunctionType):
-                ret_type = fp_val.type.pointee.return_type
+                # Coerce args to match function pointer param types
+                ftype = fp_val.type.pointee
+                coerced = []
+                for j, a in enumerate(call_args):
+                    if j < len(ftype.args):
+                        coerced.append(self._coerce_arg(a, ftype.args[j]))
+                    else:
+                        coerced.append(a)
+                call_args = coerced
+                ret_type = ftype.return_type
                 if isinstance(ret_type, ir.VoidType):
                     self.builder.call(fp_val, call_args)
                     return ir.Constant(int64_t, 0), None
@@ -1078,12 +1159,14 @@ class LLVMCodeGenerator(object):
                 # or the alloca's pointee could be a function ptr
                 func_val = loaded
                 if isinstance(func_val.type, ir.PointerType) and isinstance(func_val.type.pointee, ir.FunctionType):
-                    ret_type = func_val.type.pointee.return_type
+                    ftype = func_val.type.pointee
+                    coerced = [self._coerce_arg(a, ftype.args[j]) if j < len(ftype.args) else a for j, a in enumerate(call_args)]
+                    ret_type = ftype.return_type
                     is_void = isinstance(ret_type, ir.VoidType)
                     if is_void:
-                        self.builder.call(func_val, call_args)
+                        self.builder.call(func_val, coerced)
                         return ir.Constant(int64_t, 0), None
-                    result = self.builder.call(func_val, call_args, 'fpcall')
+                    result = self.builder.call(func_val, coerced, 'fpcall')
                     if isinstance(result.type, ir.IntType) and result.type.width < 64:
                         result = self.builder.sext(result, int64_t, 'retext')
                     return result, None
@@ -1161,18 +1244,22 @@ class LLVMCodeGenerator(object):
         # Forward function declaration: int foo(int x);
         if isinstance(node.type, c_ast.FuncDecl):
             funcname = node.name
-            # Skip if function already defined/declared
+            # Skip if function already defined/declared, or if a FuncDef exists for it
             existing = self.module.globals.get(funcname)
             if existing and isinstance(existing, ir.Function):
                 self.define(funcname, (None, existing))
                 return None, None
             ir_type, _ = self.codegen(node.type)
             arg_types = []
+            is_va = False
             if node.type.args:
                 for arg in node.type.args.params:
-                    arg_types.append(get_ir_type_from_node(arg))
+                    if isinstance(arg, c_ast.EllipsisParam):
+                        is_va = True
+                        continue
+                    arg_types.append(self._resolve_param_type(arg))
             func = ir.Function(
-                self.module, ir.FunctionType(ir_type, arg_types), name=funcname)
+                self.module, ir.FunctionType(ir_type, arg_types, var_arg=is_va), name=funcname)
             self.define(funcname, (ir_type, func))
             return None, None
 
@@ -1264,17 +1351,18 @@ class LLVMCodeGenerator(object):
             while True:
                 array_next_type = array_node.type
                 if isinstance(array_next_type, c_ast.TypeDecl):
-                    array_list.append(int(array_node.dim.value))
+                    dim_val = self._eval_dim(array_node.dim) if array_node.dim else 0
+                    array_list.append(dim_val)
                     type_str = array_next_type.type.names
                     break
 
                 elif isinstance(array_next_type, c_ast.ArrayDecl):
-                    array_list.append(int(array_node.dim.value))
+                    array_list.append(self._eval_dim(array_node.dim))
                     array_node = array_next_type
                     continue
                 elif isinstance(array_next_type, c_ast.PtrDecl):
                     # Array of pointers: int *arr[3]
-                    dim = int(array_node.dim.value)
+                    dim = self._eval_dim(array_node.dim)
                     inner = array_next_type.type
                     if isinstance(inner, c_ast.TypeDecl):
                         elem_type_str = inner.type.names
@@ -1472,7 +1560,7 @@ class LLVMCodeGenerator(object):
         if isinstance(node.type, c_ast.PtrDecl):
             return_type_str = node.type.type.type.names
             data_ir_type = get_ir_type(return_type_str)
-            ir_type = ir.PointerType(data_ir_type)
+            ir_type = voidptr_t if isinstance(data_ir_type, ir.VoidType) else ir.PointerType(data_ir_type)
         else:
             return_type_str = node.type.type.names
             ir_type = get_ir_type(return_type_str)
@@ -1499,17 +1587,10 @@ class LLVMCodeGenerator(object):
                 if isinstance(arg_type, c_ast.EllipsisParam):
                     is_var_arg = True
                     continue
-                # Resolve typedef'd types for parameters
-                if (hasattr(arg_type, 'type') and isinstance(arg_type.type, c_ast.TypeDecl) and
-                        isinstance(arg_type.type.type, c_ast.IdentifierType)):
-                    resolved = self._get_ir_type(arg_type.type.type.names)
-                    arg_types.append(resolved)
-                else:
-                    arg_types.append(get_ir_type_from_node(arg_type))
+                arg_types.append(self._resolve_param_type(arg_type))
 
         with self.new_function():
 
-            # Reuse forward-declared function if it exists
             existing = self.module.globals.get(funcname)
             if existing and isinstance(existing, ir.Function) and existing.is_declaration:
                 self.function = existing
@@ -1527,8 +1608,9 @@ class LLVMCodeGenerator(object):
                     if isinstance(p, c_ast.EllipsisParam):
                         continue
                     arg_type = arg_types[param_idx]
-                    var = self.builder.alloca(arg_type, name=p.name)
-                    self.define(p.name, (arg_type, var))
+                    pname = p.name if isinstance(p.name, str) else f'arg{param_idx}'
+                    var = self.builder.alloca(arg_type, name=pname)
+                    self.define(pname, (arg_type, var))
                     self.builder.store(self.function.args[param_idx], var)
                     param_idx += 1
 
@@ -1548,7 +1630,12 @@ class LLVMCodeGenerator(object):
 
         # If this is a reference to a named struct without decls, look it up
         if node.name and (node.decls is None or len(node.decls) == 0):
-            return self.env[node.name][0]
+            if node.name in self.env:
+                return self.env[node.name][0]
+            # Opaque/forward-declared struct: treat as i8 (byte) for pointer use
+            opaque = ir.IntType(8)
+            self.define(node.name, (opaque, None))
+            return opaque
 
         member_types = []
         member_names = []
@@ -1561,25 +1648,11 @@ class LLVMCodeGenerator(object):
                 member_types.append(nested_type)
             elif isinstance(decl.type, c_ast.ArrayDecl):
                 array_node = decl.type
-                dim = int(array_node.dim.value)
-                elem_type_str = array_node.type.type.names
-                member_types.append(ir.ArrayType(get_ir_type(elem_type_str), dim))
+                dim = self._eval_dim(array_node.dim) if array_node.dim else 0
+                elem_type = _resolve_node_type(array_node.type)
+                member_types.append(ir.ArrayType(elem_type, dim))
             elif isinstance(decl.type, c_ast.PtrDecl):
-                inner = decl.type.type
-                if isinstance(inner, c_ast.FuncDecl):
-                    # Function pointer member: int (*fn)(int)
-                    member_types.append(self._build_func_ptr_type(inner))
-                elif isinstance(inner, c_ast.TypeDecl):
-                    member_types.append(ir.PointerType(get_ir_type(inner.type.names)))
-                elif isinstance(inner, c_ast.PtrDecl):
-                    # Pointer to pointer
-                    inner2 = inner.type
-                    if isinstance(inner2, c_ast.TypeDecl):
-                        member_types.append(ir.PointerType(ir.PointerType(get_ir_type(inner2.type.names))))
-                    else:
-                        member_types.append(voidptr_t)
-                else:
-                    member_types.append(voidptr_t)
+                member_types.append(_resolve_node_type(decl.type))
             elif isinstance(decl.type, c_ast.TypeDecl):
                 type_str = decl.type.type.names
                 member_types.append(self._get_ir_type(type_str))
@@ -1604,8 +1677,7 @@ class LLVMCodeGenerator(object):
         member_types = {}
         max_size = 0
         for decl in node.decls:
-            type_str = decl.type.type.names
-            ir_t = get_ir_type(type_str)
+            ir_t = _resolve_node_type(decl.type)
             member_types[decl.name] = ir_t
             sz = self._ir_type_size(ir_t)
             if sz > max_size:
@@ -1730,6 +1802,12 @@ class LLVMCodeGenerator(object):
                 return int(v, 8)
             return int(v)
         elif isinstance(node, c_ast.UnaryOp):
+            if node.op == 'sizeof':
+                if isinstance(node.expr, c_ast.Typename):
+                    ir_t = _resolve_node_type(node.expr.type)
+                    return self._ir_type_size(ir_t)
+                val = self._eval_const_expr(node.expr)
+                return 8  # default sizeof for expressions
             val = self._eval_const_expr(node.expr)
             if node.op == '-':
                 return -val
@@ -1746,6 +1824,17 @@ class LLVMCodeGenerator(object):
                    '>>': lambda a,b: a>>b, '&': lambda a,b: a&b,
                    '|': lambda a,b: a|b, '^': lambda a,b: a^b}
             return ops[node.op](l, r)
+        elif isinstance(node, c_ast.ID):
+            # Try to look up as enum constant or defined value
+            if node.name in self.env:
+                _, val = self.env[node.name]
+                if isinstance(val, ir.values.Constant) and isinstance(val.type, ir.IntType):
+                    return int(val.constant)
+            return 0  # unknown identifier defaults to 0
+        elif isinstance(node, c_ast.Cast):
+            return self._eval_const_expr(node.expr)
+        elif isinstance(node, c_ast.Typename):
+            return 0
         raise CodegenError(f"Not a constant expression: {type(node).__name__}")
 
     def codegen_DeclList(self, node):
@@ -1760,16 +1849,31 @@ class LLVMCodeGenerator(object):
                 base_type = node.type.type.names
                 self.define(f'__typedef_{node.name}', base_type)
             elif isinstance(node.type.type, c_ast.Struct):
-                struct_type = self.codegen_Struct(node.type.type)
-                self.define(f'__typedef_{node.name}', struct_type)
+                if node.type.type.name:
+                    # Named struct: store reference to struct name for lazy resolution
+                    self.codegen_Struct(node.type.type)  # ensure it's registered
+                    self.define(f'__typedef_{node.name}', f'__struct_{node.type.type.name}')
+                else:
+                    struct_type = self.codegen_Struct(node.type.type)
+                    self.define(f'__typedef_{node.name}', struct_type)
+            elif isinstance(node.type.type, c_ast.Union):
+                if node.type.type.name:
+                    self.codegen_Union(node.type.type)
+                    self.define(f'__typedef_{node.name}', f'__struct_{node.type.type.name}')
+                else:
+                    union_type = self.codegen_Union(node.type.type)
+                    self.define(f'__typedef_{node.name}', union_type)
         elif isinstance(node.type, c_ast.PtrDecl):
             inner = node.type.type
             if isinstance(inner, c_ast.FuncDecl):
-                # typedef int (*callback)(int, int);
                 fp_type = self._build_func_ptr_type(inner)
                 self.define(f'__typedef_{node.name}', fp_type)
             elif isinstance(inner, c_ast.TypeDecl):
                 base_type_str = inner.type.names
-                ptr_type = ir.PointerType(get_ir_type(base_type_str))
+                base_ir = get_ir_type(base_type_str)
+                if isinstance(base_ir, ir.VoidType):
+                    ptr_type = voidptr_t  # void* -> i8*
+                else:
+                    ptr_type = ir.PointerType(base_ir)
                 self.define(f'__typedef_{node.name}', ptr_type)
         return None, None
