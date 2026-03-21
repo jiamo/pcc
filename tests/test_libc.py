@@ -88,7 +88,7 @@ class TestString(unittest.TestCase):
             int main(){
                 int a[2] = {1, 2};
                 int b[2] = {1, 2};
-                return memcmp(a, b, 16);
+                return memcmp(a, b, sizeof(a));
             }
         ''', optimize=False)
         assert ret == 0

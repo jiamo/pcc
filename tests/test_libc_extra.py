@@ -57,7 +57,7 @@ class TestStringExtra(unittest.TestCase):
         ret = pcc.evaluate('''
             int main(){
                 int a[5] = {1, 2, 3, 4, 5};
-                memmove(a + 1, a, 24);
+                memmove(a + 1, a, 3 * sizeof(int));
                 return a[1];
             }
         ''', optimize=False)
@@ -160,6 +160,25 @@ class TestTimeGetpid(unittest.TestCase):
                 return pid > 0;
             }
         ''')
+        assert ret == 1
+
+    def test_localtime_r_with_time_t(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            #include <time.h>
+
+            int main(){
+                time_t t = time(0);
+                struct tm out;
+                return localtime_r(&t, &out) != 0 &&
+                       out.tm_year >= 100 &&
+                       out.tm_mon >= 0 &&
+                       out.tm_mon < 12;
+            }
+            ''',
+            optimize=False,
+        )
         assert ret == 1
 
 

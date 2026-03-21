@@ -72,7 +72,7 @@ class TestSizeofChar(unittest.TestCase):
     def test_sizeof_int(self):
         pcc = CEvaluator()
         ret = pcc.evaluate('int main(){ return sizeof(int); }')
-        assert ret == 8
+        assert ret == 4  # int is i32 (standard C)
 
 
 if __name__ == '__main__':

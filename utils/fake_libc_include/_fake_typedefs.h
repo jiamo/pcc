@@ -1,9 +1,10 @@
 #ifndef _FAKE_TYPEDEFS_H
 #define _FAKE_TYPEDEFS_H
 
-typedef int size_t;
-typedef int __builtin_va_list;
-typedef int __gnuc_va_list;
+typedef unsigned long size_t;
+typedef char *__builtin_va_list;
+typedef __builtin_va_list __gnuc_va_list;
+typedef __builtin_va_list va_list;
 typedef int __int8_t;
 typedef int __uint8_t;
 typedef int __int16_t;
@@ -12,8 +13,8 @@ typedef int __int_least16_t;
 typedef int __uint_least16_t;
 typedef int __int32_t;
 typedef int __uint32_t;
-typedef int __int64_t;
-typedef int __uint64_t;
+typedef long __int64_t;
+typedef unsigned long __uint64_t;
 typedef int __int_least32_t;
 typedef int __uint_least32_t;
 typedef int _LOCK_T;
@@ -24,14 +25,14 @@ typedef int __uid_t;
 typedef int __gid_t;
 typedef int _off64_t;
 typedef int _fpos_t;
-typedef int _ssize_t;
+typedef long _ssize_t;
 typedef int wint_t;
 typedef int _mbstate_t;
 typedef int _flock_t;
 typedef int _iconv_t;
 typedef int __ULong;
 typedef int __FILE;
-typedef int ptrdiff_t;
+typedef long ptrdiff_t;
 typedef int wchar_t;
 typedef int __off_t;
 typedef int __pid_t;
@@ -42,18 +43,23 @@ typedef int u_int;
 typedef int u_long;
 typedef int ushort;
 typedef int uint;
+#if defined(__LP64__) || defined(_LP64) || defined(__x86_64__) || defined(__aarch64__)
+typedef long clock_t;
+typedef long time_t;
+#else
 typedef int clock_t;
 typedef int time_t;
+#endif
 typedef int daddr_t;
 typedef int caddr_t;
 typedef int ino_t;
-typedef int off_t;
+typedef long off_t;
 typedef int dev_t;
 typedef int uid_t;
 typedef int gid_t;
 typedef int pid_t;
 typedef int key_t;
-typedef int ssize_t;
+typedef long ssize_t;
 typedef int mode_t;
 typedef int nlink_t;
 typedef int fd_mask;
@@ -93,9 +99,7 @@ typedef int pthread_rwlockattr_t;
 typedef int pthread_spinlock_t;
 typedef int pthread_barrier_t;
 typedef int pthread_barrierattr_t;
-typedef int jmp_buf;
 typedef int rlim_t;
-typedef int sigjmp_buf;
 typedef int stack_t;
 typedef int siginfo_t;
 typedef int z_stream;
@@ -140,7 +144,5 @@ typedef int uintmax_t;
 
 /* C99 stdbool.h bool type. _Bool is built-in in C99 */
 typedef _Bool bool;
-
-typedef int va_list;
 
 #endif

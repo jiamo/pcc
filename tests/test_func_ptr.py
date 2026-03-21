@@ -21,6 +21,17 @@ class TestFuncPtr(unittest.TestCase):
         ''', optimize=False)
         assert ret == 7
 
+    def test_address_of_function_initializer(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int add(int a, int b){ return a + b; }
+            int main(){
+                int (*fp)(int, int) = &add;
+                return fp(3, 4);
+            }
+        ''', optimize=False)
+        assert ret == 7
+
     def test_reassign(self):
         pcc = CEvaluator()
         ret = pcc.evaluate('''
@@ -42,6 +53,15 @@ class TestFuncPtr(unittest.TestCase):
             int apply(int (*f)(int), int x){ return f(x); }
             int square(int x){ return x * x; }
             int main(){ return apply(square, 5); }
+        ''', optimize=False)
+        assert ret == 25
+
+    def test_address_of_function_as_parameter(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int apply(int (*f)(int), int x){ return f(x); }
+            int square(int x){ return x * x; }
+            int main(){ return apply(&square, 5); }
         ''', optimize=False)
         assert ret == 25
 

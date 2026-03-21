@@ -40,11 +40,12 @@ class TestTypeModifiers(unittest.TestCase):
 
     def test_size_t(self):
         pcc = CEvaluator()
-        assert pcc.evaluate('int main(){ size_t n = 42; return n; }') == 42
+        assert pcc.evaluate('#include <stddef.h>\nint main(){ size_t n = 42; return n; }') == 42
 
     def test_size_t_in_function(self):
         pcc = CEvaluator()
         ret = pcc.evaluate('''
+            #include <stddef.h>
             int count(int *a, size_t n) {
                 int s = 0;
                 size_t i;
@@ -57,6 +58,23 @@ class TestTypeModifiers(unittest.TestCase):
             }
         ''', optimize=False)
         assert ret == 60
+
+    def test_unsigned_name_does_not_leak_across_scopes(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int u(unsigned idx) { return idx > 0; }
+            int f(int idx) {
+                if (!((idx) <= (-(32767/2 + 1000))))
+                    return 1;
+                else if (idx == (-(32767/2 + 1000)))
+                    return 2;
+                return 3;
+            }
+            int main() {
+                return u(1) + f(-(32767/2 + 1000)) * 10;
+            }
+        ''', optimize=False)
+        assert ret == 21
 
 
 class TestFuncMacro(unittest.TestCase):

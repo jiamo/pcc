@@ -11,7 +11,8 @@ import unittest
 class TestSwitch(unittest.TestCase):
     def test_switch_case(self):
         pcc = CEvaluator()
-        ret = pcc.evaluate('''
+        ret = pcc.evaluate(
+            """
             int main(){
                 int x = 2;
                 int result = 0;
@@ -28,12 +29,15 @@ class TestSwitch(unittest.TestCase):
                 }
                 return result;
             }
-            ''', llvmdump=True)
+            """,
+            llvmdump=True,
+        )
         assert ret == 20
 
     def test_switch_default(self):
         pcc = CEvaluator()
-        ret = pcc.evaluate('''
+        ret = pcc.evaluate(
+            """
             int main(){
                 int x = 99;
                 int result = 0;
@@ -50,12 +54,15 @@ class TestSwitch(unittest.TestCase):
                 }
                 return result;
             }
-            ''', llvmdump=True)
+            """,
+            llvmdump=True,
+        )
         assert ret == 42
 
     def test_switch_first_case(self):
         pcc = CEvaluator()
-        ret = pcc.evaluate('''
+        ret = pcc.evaluate(
+            """
             int main(){
                 int x = 1;
                 int result = 0;
@@ -69,9 +76,78 @@ class TestSwitch(unittest.TestCase):
                 }
                 return result;
             }
-            ''', llvmdump=True)
+            """,
+            llvmdump=True,
+        )
         assert ret == 100
 
+    def test_switch_grouped_cases_share_body(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(){
+                int x = 2;
+                int result = 0;
+                switch(x){
+                    case 1:
+                    case 2:
+                    case 3:
+                        result = 42;
+                        break;
+                    default:
+                        result = 99;
+                        break;
+                }
+                return result;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 42
 
-if __name__ == '__main__':
+    def test_switch_fallthrough(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(){
+                int x = 1;
+                int result = 0;
+                switch(x){
+                    case 1:
+                        result += 10;
+                    case 2:
+                        result += 20;
+                        break;
+                    default:
+                        result = 99;
+                        break;
+                }
+                return result;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 30
+
+    def test_switch_grouped_escaped_char_cases(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            r"""
+            int main(){
+                int c = '\n';
+                switch(c){
+                    case '\n':
+                    case '\r':
+                        return 0;
+                    default:
+                        return 1;
+                }
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+
+if __name__ == "__main__":
     unittest.main()
