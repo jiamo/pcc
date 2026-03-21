@@ -3,28 +3,29 @@ import llvmlite.binding as llvm
 from ..codegen.c_codegen import LLVMCodeGenerator
 from ..parse.c_parser import CParser
 
-from ctypes import CFUNCTYPE, c_double, c_int64, POINTER
+from ctypes import CFUNCTYPE, c_double, c_int64, c_int8, POINTER
 
 
 def get_c_type_from_ir(ir_type):
-    if isinstance(ir_type, ir.IntType):
-        return_type = c_int64
+    if isinstance(ir_type, ir.VoidType):
+        return None
+    elif isinstance(ir_type, ir.IntType):
+        if ir_type.width == 8:
+            return c_int8
+        return c_int64
     elif isinstance(ir_type, ir.DoubleType):
-        return_type = c_double
+        return c_double
     elif isinstance(ir_type, ir.PointerType):
         point_type = get_c_type_from_ir(ir_type.pointee)
-        return_type = POINTER(point_type)
+        return POINTER(point_type)
     else:
-        return_type = c_int64
-
-    return return_type
+        return c_int64
 
 
 class CEvaluator(object):
 
     def __init__(self):
 
-        llvm.initialize()
         llvm.initialize_native_target()
         llvm.initialize_native_asmprinter()
 
@@ -35,6 +36,7 @@ class CEvaluator(object):
 
     def evaluate(self, codestr, optimize=True, llvmdump=False, args=None):
         ast = self.parser.parse(codestr)
+        self.codegen = LLVMCodeGenerator()
         self.codegen.generate_code(ast)
 
         if llvmdump:
@@ -42,15 +44,14 @@ class CEvaluator(object):
             with(open("temp.ir", "w")) as f:
                 f.write(tempstr)
 
-        print(str(self.codegen.module))
         llvmmod = llvm.parse_assembly(str(self.codegen.module))
 
         if optimize:
-            pmb = llvm.create_pass_manager_builder()
-            pmb.opt_level = 2
-            pm = llvm.create_module_pass_manager()
-            pmb.populate(pm)
-            pm.run(llvmmod)
+            target_machine = self.target.create_target_machine()
+            pto = llvm.create_pipeline_tuning_options(speed_level=2, size_level=0)
+            pb = llvm.create_pass_builder(target_machine, pto)
+            pm = pb.getModulePassManager()
+            pm.run(llvmmod, pb)
 
             if llvmdump:
                 tempbcode = str(llvmmod)

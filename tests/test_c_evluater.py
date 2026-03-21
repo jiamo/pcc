@@ -27,7 +27,6 @@ class TestCevluatar(unittest.TestCase):
             }
             ''', llvmdump=True)
 
-        print("The answer is {}".format(ret))
         assert (ret == 7)
         # This is a good point to self start main
         # print(pcc.evaluate('main()'))

@@ -32,7 +32,6 @@ class TestNestedLoopEvaluation(unittest.TestCase):
             }
             ''', llvmdump=False)
 
-        print("The result is %d" % ret)
         assert (ret == 163)
 
 

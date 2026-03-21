@@ -36,7 +36,6 @@ class TestFor(unittest.TestCase):
             }
             ''', llvmdump=False)
 
-        print("The answer is %d"%ret)
         assert (ret == 10550)
     # This is a good point to self start main
     # print(pcc.evaluate('main()'))

@@ -322,6 +322,15 @@ class CLexer(object):
     ##
     t_ignore = ' \t'
 
+    # C-style block comments /* ... */
+    def t_BLOCK_COMMENT(self, t):
+        r'/\*[\s\S]*?\*/'
+        t.lexer.lineno += t.value.count('\n')
+
+    # C++ style line comments // ...
+    def t_LINE_COMMENT(self, t):
+        r'//[^\n]*'
+
     # Newlines
     def t_NEWLINE(self, t):
         r'\n+'

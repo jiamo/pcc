@@ -32,7 +32,6 @@ class TestIf(unittest.TestCase):
             }
             ''', llvmdump=True)
 
-        print("The answer is %d" % ret)
         assert int(ret) == 1
 
 

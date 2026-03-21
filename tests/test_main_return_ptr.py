@@ -33,8 +33,6 @@ class TestMainReturnPtr(unittest.TestCase):
             ''', llvmdump=True)
 
         # ret_value = ret.contents
-        print("The answer is {} ret type is {} content ".format(ret, type(ret)))
-
         # so the global var
         assert ret.contents.value == 4
 

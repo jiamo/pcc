@@ -27,7 +27,6 @@ class TestStruct(unittest.TestCase):
             }
             ''', llvmdump=True)
 
-        print("The answer is %d" % ret)
         assert (ret == 32)
 
 if __name__ == '__main__':

@@ -5,16 +5,15 @@ import click
 
 
 @click.command()
-@click.option("--llvmdump", is_flag=True, default=False)
+@click.option("--llvmdump", is_flag=True, default=False, help="Dump LLVM IR to temp files")
 @click.argument('filename')
 def main(filename, llvmdump):
-    print(filename, llvmdump)
+    """Pcc - a C compiler built on Python and LLVM."""
     pcc = CEvaluator()
-    print("hello\n")
     with open(filename, "r") as f:
+        ret = pcc.evaluate(f.read(), llvmdump=llvmdump)
+    sys.exit(ret if isinstance(ret, int) else 0)
 
-        ret = pcc.evaluate(f.read(),llvmdump=llvmdump)
-        print(ret)
 
 if __name__ == "__main__":
     main()

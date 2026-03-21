@@ -20,7 +20,6 @@ class TestIf(unittest.TestCase):
             }
             ''', llvmdump=True, args=[7])
 
-        print("The answer is %d" % ret)
         assert ret == -3
 
 

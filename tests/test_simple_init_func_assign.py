@@ -29,4 +29,3 @@ class TestSimpleFunc(unittest.TestCase):
             }
             ''', llvmdump=True)
 
-        print("The answer is %d" % ret)

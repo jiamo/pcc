@@ -1,0 +1,91 @@
+"""Test string literal pointer and global array features."""
+import os
+import sys
+
+this_dir = os.path.dirname(__file__)
+parent_dir = os.path.dirname(this_dir)
+sys.path.insert(0, parent_dir)
+from pcc.evaluater.c_evaluator import CEvaluator
+import unittest
+
+
+class TestStringPointer(unittest.TestCase):
+    def test_char_ptr_from_literal(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                char *s = "hello";
+                return strlen(s);
+            }
+        ''', optimize=False)
+        assert ret == 5
+
+    def test_char_ptr_strcmp(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                char *a = "abc";
+                char *b = "abc";
+                return strcmp(a, b);
+            }
+        ''', optimize=False)
+        assert ret == 0
+
+
+class TestGlobalArray(unittest.TestCase):
+    def test_global_array_init(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int g[3] = {10, 20, 30};
+            int main(){ return g[1]; }
+        ''', optimize=False)
+        assert ret == 20
+
+    def test_global_array_sum(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int data[4] = {1, 2, 3, 4};
+            int sum(int *a, int n){
+                int s = 0;
+                int i;
+                for(i = 0; i < n; i++) s += a[i];
+                return s;
+            }
+            int main(){ return sum(data, 4); }
+        ''', optimize=False)
+        assert ret == 10
+
+
+class TestC99ForDecl(unittest.TestCase):
+    def test_for_with_decl(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                int s = 0;
+                for(int i = 0; i < 5; i++) s += i;
+                return s;
+            }
+        ''')
+        assert ret == 10
+
+
+class TestDoWhileContinue(unittest.TestCase):
+    def test_continue_in_dowhile(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                int i = 0;
+                int s = 0;
+                do {
+                    i++;
+                    if (i % 2 == 0) continue;
+                    s += i;
+                } while(i < 10);
+                return s;
+            }
+        ''')
+        assert ret == 25  # 1+3+5+7+9
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -48,7 +48,6 @@ class TestArray(unittest.TestCase):
             }
             ''', llvmdump=True)
 
-        print("The answer is %d"%ret)
         assert (ret == 4000)
 
 if __name__ == '__main__':

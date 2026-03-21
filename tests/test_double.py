@@ -21,7 +21,6 @@ class TestInt(unittest.TestCase):
             }
             ''', llvmdump=True)
 
-        print("The answer is %d" % ret)
         assert ret == 1
 
 # TODO  If is complext should finish the basic

@@ -64,3 +64,10 @@ lextab.py
 *.ir
 yacctab.py
 *.gch
+
+# uv / venv
+.venv/
+uv.lock
+
+# Temp files
+temp.*
