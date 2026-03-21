@@ -1,0 +1,105 @@
+"""Tests for function pointers."""
+import os
+import sys
+
+this_dir = os.path.dirname(__file__)
+parent_dir = os.path.dirname(this_dir)
+sys.path.insert(0, parent_dir)
+from pcc.evaluater.c_evaluator import CEvaluator
+import unittest
+
+
+class TestFuncPtr(unittest.TestCase):
+    def test_basic(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int add(int a, int b){ return a + b; }
+            int main(){
+                int (*fp)(int, int) = add;
+                return fp(3, 4);
+            }
+        ''', optimize=False)
+        assert ret == 7
+
+    def test_reassign(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int add(int a, int b){ return a + b; }
+            int mul(int a, int b){ return a * b; }
+            int main(){
+                int (*fp)(int, int) = add;
+                int r1 = fp(3, 4);
+                fp = mul;
+                int r2 = fp(3, 4);
+                return r1 + r2;
+            }
+        ''', optimize=False)
+        assert ret == 19  # 7 + 12
+
+    def test_as_parameter(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int apply(int (*f)(int), int x){ return f(x); }
+            int square(int x){ return x * x; }
+            int main(){ return apply(square, 5); }
+        ''', optimize=False)
+        assert ret == 25
+
+    def test_typedef_func_ptr(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            typedef int (*binop)(int, int);
+            int add(int a, int b){ return a + b; }
+            int sub(int a, int b){ return a - b; }
+            int main(){
+                binop f = add;
+                int r1 = f(10, 3);
+                f = sub;
+                int r2 = f(10, 3);
+                return r1 + r2;
+            }
+        ''', optimize=False)
+        assert ret == 20  # 13 + 7
+
+    def test_callback_pattern(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            void foreach(int *a, int n, void (*fn)(int *)){
+                int i;
+                for(i = 0; i < n; i++) fn(a + i);
+            }
+            void doubler(int *p){ *p = *p * 2; }
+            int main(){
+                int a[3] = {1, 2, 3};
+                foreach(a, 3, doubler);
+                return a[0] + a[1] + a[2];
+            }
+        ''', optimize=False)
+        assert ret == 12  # 2+4+6
+
+    def test_comparator_pattern(self):
+        """qsort-style comparator function pointer."""
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            void sort2(int *a, int *b, int (*cmp)(int, int)){
+                if (cmp(*a, *b) > 0) {
+                    int t = *a; *a = *b; *b = t;
+                }
+            }
+            int ascending(int a, int b){ return a - b; }
+            int descending(int a, int b){ return b - a; }
+            int main(){
+                int x = 5; int y = 3;
+                sort2(&x, &y, ascending);
+                int r1 = x * 10 + y;  // x=3, y=5 -> 35
+                x = 5; y = 3;
+                sort2(&x, &y, descending);
+                int r2 = x * 10 + y;  // x=5, y=3 -> 53
+                return r1 + r2;
+            }
+        ''', optimize=False)
+        assert ret == 88  # 35 + 53
+
+
+if __name__ == '__main__':
+    unittest.main()
