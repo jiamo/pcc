@@ -2,6 +2,7 @@ import llvmlite.ir as ir
 import llvmlite.binding as llvm
 from ..codegen.c_codegen import LLVMCodeGenerator
 from ..parse.c_parser import CParser
+from ..preprocessor import preprocess
 
 from ctypes import CFUNCTYPE, c_double, c_int64, c_int8, POINTER
 
@@ -34,7 +35,8 @@ class CEvaluator(object):
         self.target = llvm.Target.from_default_triple()
         self.ee = None
 
-    def evaluate(self, codestr, optimize=True, llvmdump=False, args=None):
+    def evaluate(self, codestr, optimize=True, llvmdump=False, args=None, base_dir=None):
+        codestr = preprocess(codestr, base_dir=base_dir)
         ast = self.parser.parse(codestr)
         self.codegen = LLVMCodeGenerator()
         self.codegen.generate_code(ast)

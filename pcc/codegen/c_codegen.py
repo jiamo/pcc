@@ -17,6 +17,157 @@ false_byte = int8_t(0)
 cstring = voidptr_t
 struct_types = {}
 
+# Libc function signature registry: name -> (return_type, [param_types], var_arg)
+# Covers: stdio.h, stdlib.h, string.h, ctype.h, math.h, unistd.h, time.h
+_VOID = ir.VoidType()
+_double = ir.DoubleType()
+_FILE_ptr = voidptr_t  # FILE* modeled as opaque void*
+_size_t = int64_t
+_time_t = int64_t
+
+LIBC_FUNCTIONS = {
+    # === stdio.h ===
+    "printf":    (int32_t,   [cstring],                              True),
+    "fprintf":   (int32_t,   [_FILE_ptr, cstring],                   True),
+    "sprintf":   (int32_t,   [cstring, cstring],                     True),
+    "snprintf":  (int32_t,   [cstring, _size_t, cstring],            True),
+    "vprintf":   (int32_t,   [cstring, voidptr_t],                   False),
+    "vfprintf":  (int32_t,   [_FILE_ptr, cstring, voidptr_t],        False),
+    "vsprintf":  (int32_t,   [cstring, cstring, voidptr_t],          False),
+    "vsnprintf": (int32_t,   [cstring, _size_t, cstring, voidptr_t], False),
+    "scanf":     (int32_t,   [cstring],                              True),
+    "fscanf":    (int32_t,   [_FILE_ptr, cstring],                   True),
+    "sscanf":    (int32_t,   [cstring, cstring],                     True),
+    "fopen":     (_FILE_ptr, [cstring, cstring],                     False),
+    "fclose":    (int32_t,   [_FILE_ptr],                            False),
+    "fread":     (_size_t,   [voidptr_t, _size_t, _size_t, _FILE_ptr], False),
+    "fwrite":    (_size_t,   [voidptr_t, _size_t, _size_t, _FILE_ptr], False),
+    "fseek":     (int32_t,   [_FILE_ptr, int64_t, int32_t],          False),
+    "ftell":     (int64_t,   [_FILE_ptr],                            False),
+    "rewind":    (_VOID,     [_FILE_ptr],                            False),
+    "feof":      (int32_t,   [_FILE_ptr],                            False),
+    "ferror":    (int32_t,   [_FILE_ptr],                            False),
+    "fflush":    (int32_t,   [_FILE_ptr],                            False),
+    "fgets":     (cstring,   [cstring, int32_t, _FILE_ptr],          False),
+    "fputs":     (int32_t,   [cstring, _FILE_ptr],                   False),
+    "fgetc":     (int32_t,   [_FILE_ptr],                            False),
+    "fputc":     (int32_t,   [int32_t, _FILE_ptr],                   False),
+    "getc":      (int32_t,   [_FILE_ptr],                            False),
+    "putc":      (int32_t,   [int32_t, _FILE_ptr],                   False),
+    "getchar":   (int32_t,   [],                                     False),
+    "putchar":   (int32_t,   [int32_t],                              False),
+    "ungetc":    (int32_t,   [int32_t, _FILE_ptr],                   False),
+    "puts":      (int32_t,   [cstring],                              False),
+    "perror":    (_VOID,     [cstring],                              False),
+    "remove":    (int32_t,   [cstring],                              False),
+    "rename":    (int32_t,   [cstring, cstring],                     False),
+
+    # === stdlib.h ===
+    "malloc":    (voidptr_t, [_size_t],                              False),
+    "calloc":    (voidptr_t, [_size_t, _size_t],                     False),
+    "realloc":   (voidptr_t, [voidptr_t, _size_t],                   False),
+    "free":      (_VOID,     [voidptr_t],                            False),
+    "exit":      (_VOID,     [int32_t],                              False),
+    "_Exit":     (_VOID,     [int32_t],                              False),
+    "abort":     (_VOID,     [],                                     False),
+    "atexit":    (int32_t,   [voidptr_t],                            False),
+    "abs":       (int32_t,   [int32_t],                              False),
+    "labs":      (int64_t,   [int64_t],                              False),
+    "atoi":      (int32_t,   [cstring],                              False),
+    "atol":      (int64_t,   [cstring],                              False),
+    "atof":      (_double,   [cstring],                              False),
+    "strtol":    (int64_t,   [cstring, voidptr_t, int32_t],          False),
+    "strtoul":   (int64_t,   [cstring, voidptr_t, int32_t],          False),
+    "strtod":    (_double,   [cstring, voidptr_t],                   False),
+    "strtof":    (_double,   [cstring, voidptr_t],                   False),
+    "rand":      (int32_t,   [],                                     False),
+    "srand":     (_VOID,     [int32_t],                              False),
+    "qsort":     (_VOID,     [voidptr_t, _size_t, _size_t, voidptr_t], False),
+    "bsearch":   (voidptr_t, [voidptr_t, voidptr_t, _size_t, _size_t, voidptr_t], False),
+    "getenv":    (cstring,   [cstring],                              False),
+    "system":    (int32_t,   [cstring],                              False),
+
+    # === string.h ===
+    "strlen":    (_size_t,   [cstring],                              False),
+    "strcmp":    (int32_t,   [cstring, cstring],                     False),
+    "strncmp":   (int32_t,   [cstring, cstring, _size_t],            False),
+    "strcpy":    (cstring,   [cstring, cstring],                     False),
+    "strncpy":   (cstring,   [cstring, cstring, _size_t],            False),
+    "strcat":    (cstring,   [cstring, cstring],                     False),
+    "strncat":   (cstring,   [cstring, cstring, _size_t],            False),
+    "strchr":    (cstring,   [cstring, int32_t],                     False),
+    "strrchr":   (cstring,   [cstring, int32_t],                     False),
+    "strstr":    (cstring,   [cstring, cstring],                     False),
+    "strpbrk":   (cstring,   [cstring, cstring],                     False),
+    "strspn":    (_size_t,   [cstring, cstring],                     False),
+    "strcspn":   (_size_t,   [cstring, cstring],                     False),
+    "strtok":    (cstring,   [cstring, cstring],                     False),
+    "memset":    (voidptr_t, [voidptr_t, int32_t, _size_t],          False),
+    "memcpy":    (voidptr_t, [voidptr_t, voidptr_t, _size_t],        False),
+    "memmove":   (voidptr_t, [voidptr_t, voidptr_t, _size_t],        False),
+    "memcmp":    (int32_t,   [voidptr_t, voidptr_t, _size_t],        False),
+    "memchr":    (voidptr_t, [voidptr_t, int32_t, _size_t],          False),
+    "strerror":  (cstring,   [int32_t],                              False),
+
+    # === ctype.h ===
+    "isalpha":   (int32_t,   [int32_t],                              False),
+    "isdigit":   (int32_t,   [int32_t],                              False),
+    "isalnum":   (int32_t,   [int32_t],                              False),
+    "isspace":   (int32_t,   [int32_t],                              False),
+    "isupper":   (int32_t,   [int32_t],                              False),
+    "islower":   (int32_t,   [int32_t],                              False),
+    "isprint":   (int32_t,   [int32_t],                              False),
+    "ispunct":   (int32_t,   [int32_t],                              False),
+    "iscntrl":   (int32_t,   [int32_t],                              False),
+    "isxdigit":  (int32_t,   [int32_t],                              False),
+    "isgraph":   (int32_t,   [int32_t],                              False),
+    "toupper":   (int32_t,   [int32_t],                              False),
+    "tolower":   (int32_t,   [int32_t],                              False),
+
+    # === math.h ===
+    "sin":       (_double,   [_double],                              False),
+    "cos":       (_double,   [_double],                              False),
+    "tan":       (_double,   [_double],                              False),
+    "asin":      (_double,   [_double],                              False),
+    "acos":      (_double,   [_double],                              False),
+    "atan":      (_double,   [_double],                              False),
+    "atan2":     (_double,   [_double, _double],                     False),
+    "sinh":      (_double,   [_double],                              False),
+    "cosh":      (_double,   [_double],                              False),
+    "tanh":      (_double,   [_double],                              False),
+    "exp":       (_double,   [_double],                              False),
+    "exp2":      (_double,   [_double],                              False),
+    "log":       (_double,   [_double],                              False),
+    "log2":      (_double,   [_double],                              False),
+    "log10":     (_double,   [_double],                              False),
+    "pow":       (_double,   [_double, _double],                     False),
+    "sqrt":      (_double,   [_double],                              False),
+    "cbrt":      (_double,   [_double],                              False),
+    "hypot":     (_double,   [_double, _double],                     False),
+    "ceil":      (_double,   [_double],                              False),
+    "floor":     (_double,   [_double],                              False),
+    "round":     (_double,   [_double],                              False),
+    "trunc":     (_double,   [_double],                              False),
+    "fmod":      (_double,   [_double, _double],                     False),
+    "fabs":      (_double,   [_double],                              False),
+    "ldexp":     (_double,   [_double, int32_t],                     False),
+
+    # === time.h ===
+    "time":      (_time_t,   [voidptr_t],                            False),
+    "clock":     (int64_t,   [],                                     False),
+    "difftime":  (_double,   [_time_t, _time_t],                     False),
+
+    # === unistd.h (POSIX) ===
+    "sleep":     (int32_t,   [int32_t],                              False),
+    "usleep":    (int32_t,   [int32_t],                              False),
+    "read":      (int64_t,   [int32_t, voidptr_t, _size_t],          False),
+    "write":     (int64_t,   [int32_t, voidptr_t, _size_t],          False),
+    "open":      (int32_t,   [cstring, int32_t],                     True),
+    "close":     (int32_t,   [int32_t],                              False),
+    "getpid":    (int32_t,   [],                                     False),
+    "getppid":   (int32_t,   [],                                     False),
+}
+
 class CodegenError(Exception):
     pass
 
@@ -56,38 +207,23 @@ class LLVMCodeGenerator(object):
         self.nlabels = 0
         self.function = None
         self.in_global = True
-        fnty = ir.FunctionType(int32_t, [cstring], var_arg=True)
-        callee_func = ir.Function(self.module, fnty, name="printf")
-        fnty1 = ir.FunctionType(int64ptr_t, [int64_t], var_arg=True)
-        callee_func1 = ir.Function(self.module, fnty1, name="malloc")
-        # free(void*)
-        fnty_free = ir.FunctionType(ir.VoidType(), [voidptr_t])
-        callee_free = ir.Function(self.module, fnty_free, name="free")
-        # memset(void*, int, size_t) -> void*
-        fnty_memset = ir.FunctionType(voidptr_t, [voidptr_t, int32_t, int64_t])
-        callee_memset = ir.Function(self.module, fnty_memset, name="memset")
-        # strlen(char*) -> i64
-        fnty_strlen = ir.FunctionType(int64_t, [voidptr_t])
-        callee_strlen = ir.Function(self.module, fnty_strlen, name="strlen")
-        # strcpy(char*, char*) -> char*
-        fnty_strcpy = ir.FunctionType(voidptr_t, [voidptr_t, voidptr_t])
-        callee_strcpy = ir.Function(self.module, fnty_strcpy, name="strcpy")
-        # strcmp(char*, char*) -> i32
-        fnty_strcmp = ir.FunctionType(int32_t, [voidptr_t, voidptr_t])
-        callee_strcmp = ir.Function(self.module, fnty_strcmp, name="strcmp")
-        self.define('printf', (fnty, callee_func))
-        self.define('malloc', (fnty1, callee_func1))
-        self.define('free', (fnty_free, callee_free))
-        self.define('memset', (fnty_memset, callee_memset))
-        self.define('strlen', (fnty_strlen, callee_strlen))
-        self.define('strcpy', (fnty_strcpy, callee_strcpy))
-        self.define('strcmp', (fnty_strcmp, callee_strcmp))
+        self._declared_libc = set()
 
     def define(self, name, val):
         self.env[name] = val
 
     def lookup(self, name):
+        if name not in self.env and name in LIBC_FUNCTIONS:
+            self._declare_libc(name)
         return self.env[name]
+
+    def _declare_libc(self, name):
+        """Lazily declare a libc function on first use."""
+        ret_type, param_types, var_arg = LIBC_FUNCTIONS[name]
+        fnty = ir.FunctionType(ret_type, param_types, var_arg=var_arg)
+        func = ir.Function(self.module, fnty, name=name)
+        self.define(name, (fnty, func))
+        self._declared_libc.add(name)
 
     def new_label(self, name):
         self.nlabels += 1
@@ -243,8 +379,11 @@ class LLVMCodeGenerator(object):
 
         if node.op == '=':
             # Type coercion for store
-            if rv.type != lv.type and not isinstance(lv.type, ir.PointerType):
-                rv = self._implicit_convert(rv, lv.type)
+            if rv.type != lv.type:
+                if isinstance(rv.type, ir.PointerType) and isinstance(lv.type, ir.PointerType):
+                    rv = self.builder.bitcast(rv, lv.type)
+                else:
+                    rv = self._implicit_convert(rv, lv.type)
             self.builder.store(rv, lv_addr)
             return rv, lv_addr  # return value for chained assignment
         else:
@@ -321,7 +460,11 @@ class LLVMCodeGenerator(object):
 
         elif node.op == '!':
             operand, _ = self.codegen(node.expr)
-            if isinstance(operand.type, ir.IntType):
+            if isinstance(operand.type, ir.PointerType):
+                null = ir.Constant(operand.type, None)
+                cmp = self.builder.icmp_unsigned('==', operand, null, 'nottmp')
+                result = self.builder.zext(cmp, int64_t, 'notres')
+            elif isinstance(operand.type, ir.IntType):
                 cmp = self.builder.icmp_signed('==', operand, ir.Constant(operand.type, 0), 'nottmp')
                 result = self.builder.zext(cmp, int64_t, 'notres')
             else:
@@ -417,6 +560,9 @@ class LLVMCodeGenerator(object):
             if val.type.width == 1:
                 return val
             return self.builder.icmp_signed('!=', val, ir.Constant(val.type, 0), name)
+        elif isinstance(val.type, ir.PointerType):
+            null = ir.Constant(val.type, None)
+            return self.builder.icmp_unsigned('!=', val, null, name)
         else:
             return self.builder.fcmp_ordered('!=', val, ir.Constant(ir.DoubleType(), 0.0), name)
 
@@ -817,7 +963,6 @@ class LLVMCodeGenerator(object):
     def codegen_FuncCall(self, node):
 
         callee = None
-
         if isinstance(node.name, c_ast.ID):
             callee = node.name.name
 
@@ -827,68 +972,54 @@ class LLVMCodeGenerator(object):
         if node.args:
             call_args = [self.codegen(arg)[0] for arg in node.args.exprs]
 
-        # just for see and hard code it
-        if callee == "printf":
-            data_fmt = call_args[0]
-            global_fmt = ir.GlobalVariable(
-                self.module, data_fmt.type, "printf_format")
-            global_fmt.initializer = data_fmt
-            format_ptr = self.builder.bitcast(global_fmt, cstring)
-            return self.builder.call(
-                callee_func, [format_ptr]+call_args[1:], 'calltmp'), None
-        elif callee == 'malloc':
-            return self.builder.call(
-                callee_func, call_args[0:], 'calltmp'), None
-        elif callee == 'free':
-            # free(ptr) - need to bitcast to void*
-            ptr_arg = self.builder.bitcast(call_args[0], voidptr_t)
-            self.builder.call(callee_func, [ptr_arg])
-            return ir.Constant(int64_t, 0), None
-        elif callee == 'memset':
-            ptr_arg = self.builder.bitcast(call_args[0], voidptr_t)
-            val_arg = self.builder.trunc(call_args[1], int32_t) if isinstance(call_args[1].type, ir.IntType) and call_args[1].type.width > 32 else call_args[1]
-            size_arg = call_args[2]
-            return self.builder.call(callee_func, [ptr_arg, val_arg, size_arg], 'calltmp'), None
-        elif callee in ('strlen', 'strcpy', 'strcmp'):
-            # Convert string literal args ([N x i8]) to i8* via global
-            converted_args = []
-            for a in call_args:
-                if isinstance(a.type, ir.ArrayType) and a.type.element == int8_t:
-                    gv = ir.GlobalVariable(self.module, a.type, self.module.get_unique_name("str"))
-                    gv.initializer = a
-                    gv.global_constant = True
-                    ptr = self.builder.bitcast(gv, voidptr_t)
-                    converted_args.append(ptr)
-                else:
-                    converted_args.append(self.builder.bitcast(a, voidptr_t))
-            result = self.builder.call(callee_func, converted_args[:len(callee_func.args)], 'calltmp')
-            if callee == 'strcmp':
-                result = self.builder.sext(result, int64_t, 'strcmp_ext')
-            return result, None
-        else:
-            if callee_func is None or not isinstance(callee_func, ir.Function):
-                raise CodegenError('Call to unknown function', node.callee)
+        if callee_func is None or not isinstance(callee_func, ir.Function):
+            raise CodegenError('Call to unknown function', callee)
 
-            if node.args and len(callee_func.args) != len(node.args.exprs):
-                raise CodegenError('Call argument length mismatch', node.callee)
-            # Implicit type conversion for function arguments
-            converted = []
-            for i, arg in enumerate(call_args):
-                if i < len(callee_func.args):
-                    expected = callee_func.args[i].type
-                    if arg.type != expected:
-                        if isinstance(expected, ir.PointerType) and isinstance(arg.type, ir.ArrayType):
-                            # String literal / array constant -> pointer
-                            gv = ir.GlobalVariable(self.module, arg.type, self.module.get_unique_name("arg"))
-                            gv.initializer = arg
-                            gv.global_constant = True
-                            arg = self.builder.bitcast(gv, expected)
-                        elif isinstance(expected, ir.PointerType) and isinstance(arg.type, ir.PointerType):
-                            arg = self.builder.bitcast(arg, expected)
-                        else:
-                            arg = self._implicit_convert(arg, expected)
-                converted.append(arg)
-            return self.builder.call(callee_func, converted, 'calltmp'), None
+        # Convert arguments to match function parameter types
+        converted = self._convert_call_args(call_args, callee_func)
+
+        # Call and handle return type
+        is_void = isinstance(callee_func.return_value.type, ir.VoidType)
+        if is_void:
+            self.builder.call(callee_func, converted)
+            return ir.Constant(int64_t, 0), None
+
+        result = self.builder.call(callee_func, converted, 'calltmp')
+
+        # Widen small int returns (e.g., i32 from strcmp) to i64
+        if isinstance(result.type, ir.IntType) and result.type.width < 64:
+            result = self.builder.sext(result, int64_t, 'retext')
+
+        return result, None
+
+    def _convert_call_args(self, call_args, callee_func):
+        """Convert call arguments to match function parameter types."""
+        converted = []
+        param_types = [p.type for p in callee_func.args]
+
+        for i, arg in enumerate(call_args):
+            if i < len(param_types):
+                expected = param_types[i]
+                arg = self._coerce_arg(arg, expected)
+            # var_arg: extra args beyond declared params pass through
+            converted.append(arg)
+        return converted
+
+    def _coerce_arg(self, arg, expected):
+        """Coerce a single argument to the expected type."""
+        if arg.type == expected:
+            return arg
+        # String literal [N x i8] -> pointer
+        if isinstance(arg.type, ir.ArrayType) and isinstance(expected, ir.PointerType):
+            gv = ir.GlobalVariable(self.module, arg.type, self.module.get_unique_name("str"))
+            gv.initializer = arg
+            gv.global_constant = True
+            return self.builder.bitcast(gv, expected)
+        # Pointer -> different pointer: bitcast
+        if isinstance(arg.type, ir.PointerType) and isinstance(expected, ir.PointerType):
+            return self.builder.bitcast(arg, expected)
+        # Numeric conversions
+        return self._implicit_convert(arg, expected)
 
     def codegen_Decl(self, node):
 
@@ -1101,7 +1232,11 @@ class LLVMCodeGenerator(object):
                     gv.global_constant = True
                     init_val = self.builder.bitcast(gv, var_ir_type)
                 elif init_val.type != var_ir_type:
-                    init_val = self.builder.bitcast(init_val, var_ir_type)
+                    if isinstance(init_val.type, ir.IntType) and isinstance(var_ir_type, ir.PointerType):
+                        # int 0 -> null pointer (NULL)
+                        init_val = self.builder.inttoptr(init_val, var_ir_type)
+                    else:
+                        init_val = self.builder.bitcast(init_val, var_ir_type)
                 self.builder.store(init_val, var_addr)
         else:
             return None, None

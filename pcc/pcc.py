@@ -1,5 +1,6 @@
 
 from .evaluater.c_evaluator import CEvaluator
+import os
 import sys
 import click
 
@@ -10,8 +11,9 @@ import click
 def main(filename, llvmdump):
     """Pcc - a C compiler built on Python and LLVM."""
     pcc = CEvaluator()
+    base_dir = os.path.dirname(os.path.abspath(filename))
     with open(filename, "r") as f:
-        ret = pcc.evaluate(f.read(), llvmdump=llvmdump)
+        ret = pcc.evaluate(f.read(), llvmdump=llvmdump, base_dir=base_dir)
     sys.exit(ret if isinstance(ret, int) else 0)
 
 

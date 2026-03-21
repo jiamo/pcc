@@ -1,0 +1,154 @@
+"""Tests for libc functions: auto-declared from LIBC_FUNCTIONS registry."""
+import os
+import sys
+
+this_dir = os.path.dirname(__file__)
+parent_dir = os.path.dirname(this_dir)
+sys.path.insert(0, parent_dir)
+from pcc.evaluater.c_evaluator import CEvaluator
+import unittest
+
+
+class TestStdlib(unittest.TestCase):
+    def test_abs(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){ return abs(-42); }
+        ''')
+        assert ret == 42
+
+    def test_calloc(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                int *p = calloc(3, 8);
+                *(p + 0) = 10;
+                *(p + 1) = 20;
+                *(p + 2) = 30;
+                int s = *p + *(p+1) + *(p+2);
+                free(p);
+                return s;
+            }
+        ''', optimize=False)
+        assert ret == 60
+
+    def test_calloc_zeroed(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                int *p = calloc(1, 8);
+                int v = *p;
+                free(p);
+                return v;
+            }
+        ''', optimize=False)
+        assert ret == 0
+
+
+class TestString(unittest.TestCase):
+    def test_strcat(self):
+        """strcat concatenates strings in pre-allocated buffer."""
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                char *buf = malloc(20);
+                strcpy(buf, "hello");
+                strcat(buf, "world");
+                int len = strlen(buf);
+                free(buf);
+                return len;
+            }
+        ''', optimize=False)
+        assert ret == 10
+
+    def test_strncmp(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                return strncmp("hello", "help", 3);
+            }
+        ''', optimize=False)
+        assert ret == 0  # first 3 chars "hel" == "hel"
+
+    def test_memcpy(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                int src[3] = {10, 20, 30};
+                int dst[3] = {0, 0, 0};
+                memcpy(dst, src, 24);
+                return dst[0] + dst[1] + dst[2];
+            }
+        ''', optimize=False)
+        assert ret == 60
+
+    def test_memcmp(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                int a[2] = {1, 2};
+                int b[2] = {1, 2};
+                return memcmp(a, b, 16);
+            }
+        ''', optimize=False)
+        assert ret == 0
+
+    def test_strchr(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                char *s = "hello";
+                char *p = strchr(s, 108);
+                if (p) return *p;
+                return 0;
+            }
+        ''', optimize=False)
+        assert ret == 108  # 'l'
+
+
+class TestCtype(unittest.TestCase):
+    def test_toupper(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                return toupper(97);
+            }
+        ''')
+        assert ret == 65  # 'a' -> 'A'
+
+    def test_tolower(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                return tolower(65);
+            }
+        ''')
+        assert ret == 97  # 'A' -> 'a'
+
+    def test_isdigit(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                int d = isdigit(53);
+                int a = isdigit(65);
+                if (d && !a) return 1;
+                return 0;
+            }
+        ''')
+        assert ret == 1  # '5' is digit, 'A' is not
+
+
+class TestPuts(unittest.TestCase):
+    def test_puts_compiles(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                puts("hello");
+                return 0;
+            }
+        ''')
+        assert ret == 0
+
+
+if __name__ == '__main__':
+    unittest.main()
