@@ -34,6 +34,7 @@ _MEMORY_LINE = re.compile(r"^memory:\s+.*$", re.MULTILINE)
 _TOTAL_MEMORY_SUMMARY_LINE = re.compile(r"^\s*---- total memory: .*$", re.MULTILINE)
 _TIME_LINE = re.compile(r"^time: .*$", re.MULTILINE)
 _TOTAL_TIME_LINE = re.compile(r"^total time: .*$", re.MULTILINE)
+_CLOCK_TIME = re.compile(r"\b\d{2}:\d{2}:\d{2}\b")
 _FLOAT_RANDOM_RANGE_LINE = re.compile(
     r"^float random range in \d+ calls: \[[^\]]+\]$", re.MULTILINE
 )
@@ -452,6 +453,7 @@ def _normalize_runtime_stdout(stdout, bin_path):
     )
     stdout = _TIME_LINE.sub("time: <normalized>", stdout)
     stdout = _TOTAL_TIME_LINE.sub("total time: <normalized>", stdout)
+    stdout = _CLOCK_TIME.sub("<normalized time>", stdout)
     stdout = _FLOAT_RANDOM_RANGE_LINE.sub(
         "float random range in <normalized> calls: [<normalized>]", stdout
     )

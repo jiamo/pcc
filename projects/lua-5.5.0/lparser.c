@@ -2190,3 +2190,4 @@ LClosure *luaY_parser (lua_State *L, ZIO *z, Mbuffer *buff,
   L->top.p--;  /* remove scanner's table */
   return cl;  /* closure is on the stack, too */
 }
+

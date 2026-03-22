@@ -1,22 +1,32 @@
+import re
 import llvmlite.ir as ir
 import llvmlite.binding as llvm
 import os
 import subprocess
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor
+from itertools import repeat
 from ..codegen.c_codegen import LLVMCodeGenerator, postprocess_ir_text
 from ..parse.c_parser import CParser
 from ..preprocessor import preprocess
 
 from ctypes import (
     CFUNCTYPE,
+    c_float,
     c_double,
     c_int64,
     c_int32,
     c_int16,
     c_int8,
     c_char_p,
+    c_void_p,
     POINTER,
+)
+
+
+_TYPEDEF_CLEANUP = re.compile(
+    r"typedef\s+(int|char|short|long|double|float|void)\s+\1\s*;"
 )
 
 
@@ -40,6 +50,92 @@ def get_c_type_from_ir(ir_type):
         return c_int64
 
 
+def get_c_type_from_serialized_ir(ir_type_desc):
+    if ir_type_desc is None:
+        return None
+    kind = ir_type_desc[0]
+    if kind == "void":
+        return None
+    if kind == "int":
+        width = ir_type_desc[1]
+        if width == 8:
+            return c_int8
+        if width == 16:
+            return c_int16
+        if width == 32:
+            return c_int32
+        return c_int64
+    if kind == "float":
+        return c_float
+    if kind == "double":
+        return c_double
+    if kind == "ptr":
+        pointee = ir_type_desc[1]
+        if pointee is None or pointee[0] == "void":
+            return c_void_p
+        pointee_type = get_c_type_from_serialized_ir(pointee)
+        if pointee_type is None:
+            return c_void_p
+        return POINTER(pointee_type)
+    return c_int64
+
+
+def _serialize_ir_type(ir_type):
+    if ir_type is None:
+        return None
+    if isinstance(ir_type, ir.VoidType):
+        return ("void",)
+    if isinstance(ir_type, ir.IntType):
+        return ("int", ir_type.width)
+    if isinstance(ir_type, ir.FloatType):
+        return ("float",)
+    if isinstance(ir_type, ir.DoubleType):
+        return ("double",)
+    if isinstance(ir_type, ir.PointerType):
+        return ("ptr", _serialize_ir_type(ir_type.pointee))
+    return ("int", 64)
+
+
+def _compile_translation_unit_job(unit, base_dir, use_system_cpp):
+    codestr = unit.source
+    if use_system_cpp:
+        codestr = CEvaluator._system_cpp(codestr, base_dir)
+        codestr = _TYPEDEF_CLEANUP.sub("", codestr)
+    else:
+        codestr = preprocess(codestr, base_dir=base_dir)
+
+    ast = CParser().parse(codestr)
+    codegen = LLVMCodeGenerator(translation_unit_name=unit.name)
+    codegen.generate_code(ast)
+    ir_text = postprocess_ir_text(str(codegen.module))
+    return (
+        unit.name,
+        ir_text,
+        _serialize_ir_type(getattr(codegen, "return_type", None)),
+        codegen.external_definitions(),
+    )
+
+
+def _raise_if_duplicate_external_definitions(compiled_units):
+    seen = {}
+    for unit_name, _, _, external_defs in compiled_units:
+        for kind, symbol_name, display_name in external_defs:
+            previous = seen.get(symbol_name)
+            if previous is None:
+                seen[symbol_name] = (unit_name, kind, display_name)
+                continue
+            prev_unit, prev_kind, prev_name = previous
+            if prev_kind == kind and prev_name == display_name:
+                raise ValueError(
+                    f"duplicate external {kind} definition for '{display_name}' "
+                    f"across translation units '{prev_unit}' and '{unit_name}'"
+                )
+            raise ValueError(
+                f"conflicting external definitions for symbol '{symbol_name}' "
+                f"across translation units '{prev_unit}' and '{unit_name}'"
+            )
+
+
 class CEvaluator(object):
 
     def __init__(self):
@@ -51,6 +147,7 @@ class CEvaluator(object):
         self.parser = CParser()
         self.target = llvm.Target.from_default_triple()
         self.ee = None
+        self._bound_modules = []
 
     def evaluate(
         self,
@@ -61,18 +158,13 @@ class CEvaluator(object):
         base_dir=None,
         use_system_cpp=None,
         prog_args=None,
+        entry="main",
     ):
         if use_system_cpp is None:
             use_system_cpp = self._has_system_cpp()
         if use_system_cpp:
             codestr = self._system_cpp(codestr, base_dir)
-            import re
-
-            codestr = re.sub(
-                r"typedef\s+(int|char|short|long|double|float|void)\s+\1\s*;",
-                "",
-                codestr,
-            )
+            codestr = _TYPEDEF_CLEANUP.sub("", codestr)
         else:
             codestr = preprocess(codestr, base_dir=base_dir)
         ast = self.parser.parse(codestr)
@@ -108,12 +200,104 @@ class CEvaluator(object):
             with open("temp.bcode", "w") as f:
                 f.write(tempbcode)
 
-        return_type = get_c_type_from_ir(self.codegen.return_type)
+        func_ret_types = getattr(self.codegen, "func_return_types", {})
+        if entry in func_ret_types:
+            return_type = get_c_type_from_ir(func_ret_types[entry])
+        else:
+            return_type = get_c_type_from_ir(self.codegen.return_type)
+
+        main_addr = self.ee.get_function_address(entry)
+
+        if prog_args:
+            # Build argc/argv for main(int argc, char **argv)
+            argv_strings = ["pcc"] + list(prog_args)
+            argc = len(argv_strings)
+            ArgvType = c_char_p * (argc + 1)
+            argv = ArgvType(*[s.encode() for s in argv_strings], None)
+            fptr = CFUNCTYPE(return_type, c_int32, POINTER(c_char_p))(main_addr)
+            result = fptr(argc, argv)
+        else:
+            fptr = CFUNCTYPE(return_type)(main_addr)
+            if args is None:
+                args = []
+            result = fptr(*args)
+
+        return result
+
+    def _compile_translation_units(self, units, base_dir, use_system_cpp, jobs):
+        if jobs <= 1 or len(units) <= 1:
+            return [
+                _compile_translation_unit_job(unit, base_dir, use_system_cpp)
+                for unit in units
+            ]
+
+        max_workers = min(jobs, len(units))
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            return list(
+                executor.map(
+                    _compile_translation_unit_job,
+                    units,
+                    repeat(base_dir),
+                    repeat(use_system_cpp),
+                )
+            )
+
+    def evaluate_translation_units(
+        self,
+        units,
+        optimize=True,
+        llvmdump=False,
+        args=None,
+        base_dir=None,
+        use_system_cpp=None,
+        prog_args=None,
+        jobs=1,
+    ):
+        if use_system_cpp is None:
+            use_system_cpp = self._has_system_cpp()
+
+        compiled_units = self._compile_translation_units(
+            units, base_dir, use_system_cpp, jobs
+        )
+        _raise_if_duplicate_external_definitions(compiled_units)
+
+        target_machine = self.target.create_target_machine()
+        self.ee = llvm.create_mcjit_compiler(llvm.parse_assembly(""), target_machine)
+        self._bound_modules = []
+        main_return_type = None
+
+        for unit_name, ir_text, unit_return_type, _external_defs in compiled_units:
+            safe_name = re.sub(r"\W+", "_", unit_name)
+            if llvmdump:
+                with open(f"temp.{safe_name}.ir", "w") as f:
+                    f.write(ir_text)
+
+            llvmmod = llvm.parse_assembly(ir_text)
+
+            if optimize:
+                pto = llvm.create_pipeline_tuning_options(speed_level=2, size_level=0)
+                pb = llvm.create_pass_builder(target_machine, pto)
+                pm = pb.getModulePassManager()
+                pm.run(llvmmod, pb)
+
+                if llvmdump:
+                    with open(f"temp.{safe_name}.opt.ll", "w") as f:
+                        f.write(str(llvmmod))
+
+            self.ee.add_module(llvmmod)
+            self._bound_modules.append(llvmmod)
+            if unit_return_type is not None:
+                main_return_type = unit_return_type
+
+        self.ee.finalize_object()
+
+        return_type = get_c_type_from_serialized_ir(main_return_type)
+        if main_return_type is None:
+            return_type = c_int32
 
         main_addr = self.ee.get_function_address("main")
 
         if prog_args:
-            # Build argc/argv for main(int argc, char **argv)
             argv_strings = ["pcc"] + list(prog_args)
             argc = len(argv_strings)
             ArgvType = c_char_p * (argc + 1)
@@ -152,9 +336,7 @@ class CEvaluator(object):
         fake_libc = os.path.join(pcc_root, "utils", "fake_libc_include")
         base_dir = os.path.abspath(base_dir) if base_dir else os.getcwd()
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".c", dir=base_dir, delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".c", delete=False) as f:
             f.write(source)
             tmp_path = f.name
         try:

@@ -3,6 +3,7 @@ import re
 import struct
 from collections import ChainMap
 from contextlib import contextmanager
+from dataclasses import dataclass
 from llvmlite.ir import IRBuilder
 from ..ast import c_ast as c_ast
 
@@ -18,6 +19,26 @@ true_byte = int8_t(1)
 false_byte = int8_t(0)
 cstring = voidptr_t
 struct_types = {}
+
+
+class SemanticError(ValueError):
+    pass
+
+
+@dataclass
+class FileScopeObjectState:
+    type_key: str
+    linkage: str
+    definition_kind: str
+    symbol_name: str
+
+
+@dataclass
+class FileScopeFunctionState:
+    type_key: str
+    linkage: str
+    defined: bool
+    symbol_name: str
 
 # Libc function signature registry: name -> (return_type, [param_types], var_arg)
 # Covers: stdio.h, stdlib.h, string.h, ctype.h, math.h, unistd.h, time.h
@@ -228,6 +249,12 @@ class CodegenError(Exception):
     pass
 
 
+class ExternGlobalRef:
+    def __init__(self, symbol_name, ir_type):
+        self.symbol_name = symbol_name
+        self.ir_type = ir_type
+
+
 int16_t = ir.IntType(16)
 
 
@@ -364,8 +391,12 @@ def postprocess_ir_text(text):
         ):
             skip_dead = True
             continue
-        if repaired and _is_label(repaired[-1].strip()) and _is_label(s):
-            repaired.append(f'  br label %"{s[:-1]}"')
+        if repaired and _is_label(s):
+            prev = repaired[-1].strip()
+            if _is_label(prev):
+                repaired.append(f'  br label %"{s[:-1]}"')
+            elif prev not in {"", "{"} and not _is_terminator(prev):
+                repaired.append(f'  br label %"{s[:-1]}"')
         if s == "}" and repaired and _is_label(repaired[-1].strip()):
             repaired.append("  unreachable")
         repaired.append(raw)
@@ -553,7 +584,7 @@ def _resolve_node_type(node_type):
 
 class LLVMCodeGenerator(object):
 
-    def __init__(self):
+    def __init__(self, translation_unit_name=None):
         self.module = ir.Module()
         # Set proper data layout for struct padding/alignment
         import llvmlite.binding as _llvm
@@ -578,9 +609,217 @@ class LLVMCodeGenerator(object):
         self._expr_ir_types = {}
         self._labels = {}
         self._vaarg_counter = 0
+        self._file_scope_object_states = {}
+        self._file_scope_function_states = {}
+        self.translation_unit_name = self._sanitize_translation_unit_name(
+            translation_unit_name
+        )
 
     def define(self, name, val):
         self.env[name] = val
+
+    @staticmethod
+    def _sanitize_translation_unit_name(name):
+        if not name:
+            return None
+        return re.sub(r"\W+", "_", name)
+
+    def _is_file_scope_static(self, storage=None):
+        return (
+            self.translation_unit_name
+            and self.in_global
+            and storage
+            and "static" in storage
+        )
+
+    def _file_scope_symbol_name(self, name, storage=None):
+        if self._is_file_scope_static(storage):
+            return f"__pcc_internal_{self.translation_unit_name}_{name}"
+        return name
+
+    def _static_local_symbol_name(self, name):
+        if self.translation_unit_name:
+            return f"__static_{self.translation_unit_name}_{self.function.name}_{name}"
+        return f"__static_{self.function.name}_{name}"
+
+    def _create_bound_global(
+        self, bind_name, ir_type, symbol_name=None, external=False, storage=None
+    ):
+        actual_name = symbol_name or bind_name
+        gv = self.module.globals.get(actual_name)
+        if gv is None:
+            gv = ir.GlobalVariable(self.module, ir_type, actual_name)
+        if self._is_file_scope_static(storage):
+            gv.linkage = "internal"
+        elif not external and getattr(gv, "initializer", None) is None:
+            gv.initializer = ir.Constant(ir_type, None)
+        self.define(bind_name, (ir_type, gv))
+        return gv
+
+    def _decl_linkage(self, storage=None, existing_state=None):
+        if storage and "static" in storage:
+            return "internal"
+        if existing_state is not None:
+            return existing_state.linkage
+        return "external"
+
+    def _effective_file_scope_symbol_name(self, name, storage=None, existing_state=None):
+        if storage and "static" in storage:
+            return f"__pcc_internal_{self.translation_unit_name}_{name}"
+        if existing_state is not None and existing_state.linkage == "internal":
+            return existing_state.symbol_name
+        return name
+
+    def _file_scope_object_definition_kind(self, storage=None, has_initializer=False):
+        if storage and "extern" in storage and not has_initializer:
+            return "extern"
+        if has_initializer:
+            return "definition"
+        return "tentative"
+
+    def _prepare_file_scope_object(self, name, ir_type, storage=None, has_initializer=False):
+        if not self.in_global or name is None:
+            return None, True
+        if name in self._file_scope_function_states:
+            raise SemanticError(f"'{name}' redeclared as object after function declaration")
+
+        type_key = str(ir_type)
+        definition_kind = self._file_scope_object_definition_kind(
+            storage, has_initializer
+        )
+        state = self._file_scope_object_states.get(name)
+        linkage = self._decl_linkage(storage, existing_state=state)
+        symbol_name = self._effective_file_scope_symbol_name(
+            name, storage=storage, existing_state=state
+        )
+
+        if state is None:
+            state = FileScopeObjectState(
+                type_key=type_key,
+                linkage=linkage,
+                definition_kind=definition_kind,
+                symbol_name=symbol_name,
+            )
+            self._file_scope_object_states[name] = state
+            if definition_kind == "extern":
+                self._record_extern_global(name, ir_type, storage=storage)
+                return None, False
+            gv = self._create_bound_global(
+                name, ir_type, symbol_name=symbol_name, storage=storage
+            )
+            return gv, True
+
+        if state.type_key != type_key:
+            raise SemanticError(f"conflicting types for global '{name}'")
+        if state.linkage != linkage:
+            raise SemanticError(f"conflicting linkage for global '{name}'")
+        if state.symbol_name != symbol_name:
+            raise SemanticError(f"conflicting symbol binding for global '{name}'")
+
+        existing = self.module.globals.get(symbol_name)
+        if definition_kind == "extern":
+            if existing is not None:
+                self.define(name, (ir_type, existing))
+            else:
+                self._record_extern_global(name, ir_type, storage=storage)
+            return None, False
+
+        if existing is None:
+            gv = self._create_bound_global(
+                name, ir_type, symbol_name=symbol_name, storage=storage
+            )
+        else:
+            gv = existing
+            self.define(name, (ir_type, gv))
+
+        if state.definition_kind == "definition":
+            if definition_kind == "definition":
+                raise SemanticError(f"redefinition of global '{name}'")
+            return gv, False
+
+        if state.definition_kind == "tentative":
+            if definition_kind == "definition":
+                state.definition_kind = "definition"
+                return gv, True
+            return gv, False
+
+        state.definition_kind = definition_kind
+        return gv, True
+
+    def _register_file_scope_function(
+        self, name, function_type, storage=None, is_definition=False
+    ):
+        if not self.in_global or name is None:
+            return
+        if name in self._file_scope_object_states:
+            raise SemanticError(f"'{name}' redeclared as function after object declaration")
+
+        type_key = str(function_type)
+        state = self._file_scope_function_states.get(name)
+        linkage = self._decl_linkage(storage, existing_state=state)
+        symbol_name = self._effective_file_scope_symbol_name(
+            name, storage=storage, existing_state=state
+        )
+
+        if state is None:
+            self._file_scope_function_states[name] = FileScopeFunctionState(
+                type_key=type_key,
+                linkage=linkage,
+                defined=is_definition,
+                symbol_name=symbol_name,
+            )
+            return symbol_name
+
+        if state.type_key != type_key:
+            raise SemanticError(f"conflicting types for function '{name}'")
+        if state.linkage != linkage:
+            raise SemanticError(f"conflicting linkage for function '{name}'")
+        if state.symbol_name != symbol_name:
+            raise SemanticError(f"conflicting symbol binding for function '{name}'")
+        if is_definition:
+            if state.defined:
+                raise SemanticError(f"redefinition of function '{name}'")
+            state.defined = True
+        return state.symbol_name
+
+    def external_definitions(self):
+        defs = []
+        for name, state in self._file_scope_function_states.items():
+            if state.linkage == "external" and state.defined:
+                defs.append(("function", state.symbol_name, name))
+        for name, state in self._file_scope_object_states.items():
+            if (
+                state.linkage == "external"
+                and state.definition_kind in ("tentative", "definition")
+            ):
+                defs.append(("object", state.symbol_name, name))
+        return defs
+
+    def _is_global_extern_decl(self, node):
+        return (
+            self.in_global
+            and node.init is None
+            and node.storage
+            and "extern" in node.storage
+            and not isinstance(node.type, c_ast.FuncDecl)
+            and node.name is not None
+        )
+
+    def _extern_decl_ir_type(self, node_type):
+        if isinstance(node_type, c_ast.ArrayDecl):
+            return self._build_array_ir_type(node_type)
+        return self._resolve_ast_type(node_type)
+
+    def _record_extern_global(self, name, ir_type, storage=None):
+        self.define(
+            name,
+            (
+                ir_type,
+                ExternGlobalRef(
+                    self._file_scope_symbol_name(name, storage), ir_type
+                ),
+            ),
+        )
 
     def _mark_unsigned(self, binding):
         """Mark a concrete IR binding as having unsigned type."""
@@ -769,18 +1008,14 @@ class LLVMCodeGenerator(object):
             return existing
         try:
             gv = ir.GlobalVariable(self.module, ir_type, name)
-            if external:
-                gv.linkage = "external"
-            else:
+            if not external:
                 gv.initializer = ir.Constant(ir_type, None)
             return gv
         except Exception:
             gv = self.module.globals.get(name) or ir.GlobalVariable(
                 self.module, ir_type, self.module.get_unique_name(name)
             )
-            if external:
-                gv.linkage = "external"
-            elif getattr(gv, "initializer", None) is None:
+            if not external and getattr(gv, "initializer", None) is None:
                 gv.initializer = ir.Constant(ir_type, None)
             return gv
 
@@ -805,7 +1040,17 @@ class LLVMCodeGenerator(object):
                 gv_type = self._EXTERN_GLOBAL_VARS[name]
                 gv = self._safe_global_var(gv_type, name, external=True)
                 self.define(name, (gv_type, gv))
-        return self.env[name]
+        stored = self.env[name]
+        if not (isinstance(stored, tuple) and len(stored) == 2):
+            return stored
+        valtype, binding = stored
+        if isinstance(binding, ExternGlobalRef):
+            gv = self._safe_global_var(
+                binding.ir_type, binding.symbol_name, external=True
+            )
+            self.define(name, (binding.ir_type, gv))
+            return self.env[name]
+        return valtype, binding
 
     def _declare_libc(self, name):
         """Lazily declare a libc function on first use."""
@@ -872,7 +1117,14 @@ class LLVMCodeGenerator(object):
         return normal
 
     def create_entry_block_alloca(
-        self, name, type_str, size, array_list=None, point_level=0
+        self,
+        name,
+        type_str,
+        size,
+        array_list=None,
+        point_level=0,
+        storage=None,
+        symbol_name=None,
     ):
 
         ir_type = get_ir_type(type_str)
@@ -893,20 +1145,12 @@ class LLVMCodeGenerator(object):
             ret = self._alloca_in_entry(ir_type, name)
             self.define(name, (ir_type, ret))
         else:
-            existing = self.module.globals.get(name)
-            if existing:
-                ret = existing
-            else:
-                try:
-                    ret = ir.GlobalVariable(self.module, ir_type, name)
-                    ret.initializer = ir.Constant(ir_type, None)
-                except Exception:
-                    ret = self.module.globals.get(name) or ir.GlobalVariable(
-                        self.module, ir_type, self.module.get_unique_name(name)
-                    )
-                    if hasattr(ret, "initializer") and ret.initializer is None:
-                        ret.initializer = ir.Constant(ir_type, None)
-            self.define(name, (ir_type, ret))
+            ret = self._create_bound_global(
+                name,
+                ir_type,
+                symbol_name=symbol_name or self._file_scope_symbol_name(name, storage),
+                storage=storage,
+            )
 
         return ret, ir_type
 
@@ -2407,8 +2651,7 @@ class LLVMCodeGenerator(object):
 
         # append by name nor just add it
         after_loop_label = self.new_label("afterloop")
-        after_bb = ir.Block(self.builder.function, after_loop_label)
-        # self.builder.function.append_basic_block('afterloop')
+        after_bb = self.builder.function.append_basic_block(after_loop_label)
 
         self.builder.branch(test_bb)
         self.builder.position_at_end(test_bb)
@@ -2432,9 +2675,6 @@ class LLVMCodeGenerator(object):
             if node.next is not None:
                 self.codegen(node.next)
             self.builder.branch(test_bb)
-        # this append_basic_blook change the label
-        # after_bb = self.builder.function.append_basic_block(after_loop_label)
-        self.builder.function.basic_blocks.append(after_bb)
         self.builder.position_at_end(after_bb)
 
         return ir.values.Constant(ir.DoubleType(), 0.0), None
@@ -2472,11 +2712,17 @@ class LLVMCodeGenerator(object):
         return ir.values.Constant(ir.DoubleType(), 0.0)
 
     def codegen_Break(self, node):
-        self.builder.branch(self.lookup("break"))
+        target = self.lookup("break")
+        if isinstance(target, tuple):
+            target = target[1]
+        self.builder.branch(target)
         return None, None
 
     def codegen_Continue(self, node):
-        self.builder.branch(self.lookup("continue"))
+        target = self.lookup("continue")
+        if isinstance(target, tuple):
+            target = target[1]
+        self.builder.branch(target)
         return None, None
 
     def codegen_DoWhile(self, node):
@@ -2963,13 +3209,23 @@ class LLVMCodeGenerator(object):
             type_str = node.type.type.names
             ir_type = self._get_ir_type(type_str)
             # Create unique global name
-            global_name = f"__static_{self.function.name}_{node.name}"
-            gv = ir.GlobalVariable(self.module, ir_type, global_name)
+            global_name = self._static_local_symbol_name(node.name)
+            gv = self._create_bound_global(node.name, ir_type, symbol_name=global_name)
+            gv.linkage = "internal"
             if node.init:
                 gv.initializer = self._build_const_init(node.init, ir_type)
             else:
                 gv.initializer = self._zero_initializer(ir_type)
-            self.define(node.name, (ir_type, gv))
+            return None, None
+
+        if self._is_global_extern_decl(node):
+            ir_type = self._extern_decl_ir_type(node.type)
+            self._prepare_file_scope_object(
+                node.name,
+                ir_type,
+                storage=node.storage,
+                has_initializer=False,
+            )
             return None, None
 
         if isinstance(node.type, c_ast.Enum):
@@ -2978,16 +3234,6 @@ class LLVMCodeGenerator(object):
         # Forward function declaration: int foo(int x);
         if isinstance(node.type, c_ast.FuncDecl):
             funcname = node.name
-            # Skip if already exists (module globals, libc, or env)
-            existing = self.module.globals.get(funcname)
-            if existing:
-                if self._func_decl_returns_unsigned(node.type):
-                    self._mark_unsigned_return(existing)
-                self.define(funcname, (None, existing))
-                return None, None
-            if funcname in LIBC_FUNCTIONS:
-                self._declare_libc(funcname)
-                return None, None
             ir_type, _ = self.codegen(node.type)
             arg_types = []
             is_va = False
@@ -2999,18 +3245,37 @@ class LLVMCodeGenerator(object):
                     t = self._resolve_param_type(arg)
                     if t is not None:
                         arg_types.append(t)
+            function_type = ir.FunctionType(ir_type, arg_types, var_arg=is_va)
+            symbol_name = self._register_file_scope_function(
+                funcname,
+                function_type,
+                storage=node.storage,
+                is_definition=False,
+            )
+            # Skip if already exists (module globals, libc, or env)
+            existing = self.module.globals.get(symbol_name)
+            if existing:
+                if self._func_decl_returns_unsigned(node.type):
+                    self._mark_unsigned_return(existing)
+                self.define(funcname, (None, existing))
+                return None, None
+            if funcname in LIBC_FUNCTIONS:
+                self._declare_libc(funcname)
+                return None, None
             try:
                 func = ir.Function(
                     self.module,
-                    ir.FunctionType(ir_type, arg_types, var_arg=is_va),
-                    name=funcname,
+                    function_type,
+                    name=symbol_name,
                 )
+                if self._is_file_scope_static(node.storage):
+                    func.linkage = "internal"
                 if self._func_decl_returns_unsigned(node.type):
                     self._mark_unsigned_return(func)
                 self.define(funcname, (ir_type, func))
             except Exception:
                 # Already exists (libc or previous decl)
-                existing = self.module.globals.get(funcname)
+                existing = self.module.globals.get(symbol_name)
                 if existing:
                     if self._func_decl_returns_unsigned(node.type):
                         self._mark_unsigned_return(existing)
@@ -3040,18 +3305,27 @@ class LLVMCodeGenerator(object):
                         ret = self._alloca_in_entry(ir_type, name)
                         self.define(name, (ir_type, ret))
                     else:
-                        ret = ir.GlobalVariable(self.module, ir_type, name)
-                        self.define(name, (ir_type, ret))
+                        ret, write_initializer = self._prepare_file_scope_object(
+                            name,
+                            ir_type,
+                            storage=node.storage,
+                            has_initializer=node.init is not None,
+                        )
+                        if ret is None:
+                            return None, None
                     if node.init is not None:
                         if self.in_global:
-                            ret.initializer = self._build_const_init(node.init, ir_type)
+                            if write_initializer:
+                                ret.initializer = self._build_const_init(
+                                    node.init, ir_type
+                                )
                         else:
                             init_val, _ = self.codegen(node.init)
                             if init_val is not None:
                                 if init_val.type != ir_type:
                                     init_val = self._implicit_convert(init_val, ir_type)
                                 self._safe_store(init_val, ret)
-                    elif self.in_global:
+                    elif self.in_global and write_initializer:
                         ret.initializer = self._zero_initializer(ir_type)
                     return None, None
 
@@ -3068,13 +3342,20 @@ class LLVMCodeGenerator(object):
                         ret = self._alloca_in_entry(struct_type, name)
                         self.define(name, (struct_type, ret))
                     else:
-                        ret = ir.GlobalVariable(self.module, struct_type, name)
-                        self.define(name, (struct_type, ret))
+                        ret, write_initializer = self._prepare_file_scope_object(
+                            name,
+                            struct_type,
+                            storage=node.storage,
+                            has_initializer=node.init is not None,
+                        )
+                        if ret is None:
+                            return None, None
                     if node.init is not None:
                         if self.in_global:
-                            ret.initializer = self._build_const_init(
-                                node.init, struct_type
-                            )
+                            if write_initializer:
+                                ret.initializer = self._build_const_init(
+                                    node.init, struct_type
+                                )
                         else:
                             init_val, _ = self.codegen(node.init)
                             if init_val is not None:
@@ -3083,7 +3364,7 @@ class LLVMCodeGenerator(object):
                                         init_val, struct_type
                                     )
                                 self._safe_store(init_val, ret)
-                    elif self.in_global:
+                    elif self.in_global and write_initializer:
                         ret.initializer = self._zero_initializer(struct_type)
                     return None, None
                 else:
@@ -3092,13 +3373,20 @@ class LLVMCodeGenerator(object):
                         ret = self._alloca_in_entry(struct_type, name)
                         self.define(name, (struct_type, ret))
                     else:
-                        ret = ir.GlobalVariable(self.module, struct_type, name)
-                        self.define(name, (struct_type, ret))
+                        ret, write_initializer = self._prepare_file_scope_object(
+                            name,
+                            struct_type,
+                            storage=node.storage,
+                            has_initializer=node.init is not None,
+                        )
+                        if ret is None:
+                            return None, None
                     if node.init is not None:
                         if self.in_global:
-                            ret.initializer = self._build_const_init(
-                                node.init, struct_type
-                            )
+                            if write_initializer:
+                                ret.initializer = self._build_const_init(
+                                    node.init, struct_type
+                                )
                         else:
                             init_val, _ = self.codegen(node.init)
                             if init_val is not None:
@@ -3107,7 +3395,7 @@ class LLVMCodeGenerator(object):
                                         init_val, struct_type
                                     )
                                 self._safe_store(init_val, ret)
-                    elif self.in_global:
+                    elif self.in_global and write_initializer:
                         ret.initializer = self._zero_initializer(struct_type)
                     return None, None
             else:
@@ -3129,25 +3417,37 @@ class LLVMCodeGenerator(object):
                         init_val, _ = self.codegen(node.init)
                 else:
                     init_val = self._zero_initializer(ir_type)
-
-                var_addr, var_ir_type = self.create_entry_block_alloca(
-                    node.name, type_str, 1
-                )
-                if is_unsigned:
-                    self._mark_unsigned(var_addr)
-
                 if self.in_global:
-                    var_addr.initializer = init_val
+                    var_addr, write_initializer = self._prepare_file_scope_object(
+                        node.name,
+                        ir_type,
+                        storage=node.storage,
+                        has_initializer=node.init is not None,
+                    )
+                    if var_addr is None:
+                        return None, None
+                    var_ir_type = ir_type
+                    if write_initializer:
+                        var_addr.initializer = init_val
                 else:
+                    var_addr, var_ir_type = self.create_entry_block_alloca(
+                        node.name, type_str, 1, storage=node.storage
+                    )
+                    if is_unsigned:
+                        self._mark_unsigned(var_addr)
                     init_val = self._implicit_convert(init_val, ir_type)
                     self._safe_store(init_val, var_addr)
+                if self.in_global and is_unsigned:
+                    self._mark_unsigned(var_addr)
 
         elif isinstance(node.type, c_ast.ArrayDecl):
+            global_symbol_name = self._file_scope_symbol_name(node.name, node.storage)
             array_list = []
             array_node = node.type
             var_addr = None
             var_ir_type = None
             elem_ir_type = None
+            write_initializer = True
             while True:
                 array_next_type = array_node.type
                 if isinstance(array_next_type, c_ast.TypeDecl):
@@ -3176,12 +3476,14 @@ class LLVMCodeGenerator(object):
                         var_addr = self._alloca_in_entry(arr_ir, node.name)
                         self.define(node.name, (arr_ir, var_addr))
                     else:
-                        existing = self.module.globals.get(node.name)
-                        if existing:
-                            var_addr = existing
-                        else:
-                            var_addr = ir.GlobalVariable(self.module, arr_ir, node.name)
-                        self.define(node.name, (arr_ir, var_addr))
+                        var_addr, write_initializer = self._prepare_file_scope_object(
+                            node.name,
+                            arr_ir,
+                            storage=node.storage,
+                            has_initializer=node.init is not None,
+                        )
+                        if var_addr is None:
+                            return None, None
                     var_ir_type = arr_ir
                     break
                 else:
@@ -3195,13 +3497,14 @@ class LLVMCodeGenerator(object):
                 if not self.in_global:
                     var_addr = self._alloca_in_entry(var_ir_type, node.name)
                 else:
-                    existing = self.module.globals.get(node.name)
-                    if existing:
-                        var_addr = existing
-                    else:
-                        var_addr = ir.GlobalVariable(
-                            self.module, var_ir_type, node.name
-                        )
+                    var_addr, write_initializer = self._prepare_file_scope_object(
+                        node.name,
+                        var_ir_type,
+                        storage=node.storage,
+                        has_initializer=node.init is not None,
+                    )
+                    if var_addr is None:
+                        return None, None
                 self.define(node.name, (var_ir_type, var_addr))
 
             if self._has_unsigned_scalar_pointee(node.type):
@@ -3226,12 +3529,19 @@ class LLVMCodeGenerator(object):
                     var_ir_type = ir.ArrayType(elem_ir_type, actual_count)
                     var_ir_type.dim_array = [actual_count]
                     if self.in_global:
-                        new_name = self.module.get_unique_name(node.name)
-                        var_addr = ir.GlobalVariable(self.module, var_ir_type, new_name)
+                        new_name = self.module.get_unique_name(global_symbol_name)
+                        var_addr = self._create_bound_global(
+                            node.name,
+                            var_ir_type,
+                            symbol_name=new_name,
+                            storage=node.storage,
+                        )
                         self.define(node.name, (var_ir_type, var_addr))
                         if not hasattr(self, "_array_renames"):
                             self._array_renames = {}
-                        self._array_renames[f'@"{node.name}"'] = f'@"{new_name}"'
+                        self._array_renames[
+                            f'@"{global_symbol_name}"'
+                        ] = f'@"{new_name}"'
                     else:
                         var_addr = self._alloca_in_entry(var_ir_type, node.name)
                         self.define(node.name, (var_ir_type, var_addr))
@@ -3243,12 +3553,13 @@ class LLVMCodeGenerator(object):
             # char s[] = "hi"; or const char *names[] = {"a", helper};
             if node.init is not None:
                 if self.in_global:
-                    try:
-                        const_init = self._build_const_init(node.init, var_ir_type)
-                        str(const_init)
-                        var_addr.initializer = const_init
-                    except Exception:
-                        var_addr.initializer = self._zero_initializer(var_ir_type)
+                    if write_initializer:
+                        try:
+                            const_init = self._build_const_init(node.init, var_ir_type)
+                            str(const_init)
+                            var_addr.initializer = const_init
+                        except Exception:
+                            var_addr.initializer = self._zero_initializer(var_ir_type)
                 elif isinstance(node.init, c_ast.InitList):
                     self._init_array(
                         var_addr,
@@ -3271,7 +3582,7 @@ class LLVMCodeGenerator(object):
                             inbounds=True,
                         )
                         self.builder.store(int8_t(ord(ch)), elem_ptr)
-            elif self.in_global:
+            elif self.in_global and write_initializer:
                 var_addr.initializer = self._zero_initializer(var_ir_type)
 
         elif isinstance(node.type, c_ast.PtrDecl):
@@ -3279,6 +3590,7 @@ class LLVMCodeGenerator(object):
             point_level = 1
             sub_node = node.type
             resolved_pointee_type = None
+            write_initializer = True
 
             while True:
                 sub_next_type = sub_node.type
@@ -3309,11 +3621,14 @@ class LLVMCodeGenerator(object):
                         var_addr = self._alloca_in_entry(func_ir_type, node.name)
                         self.define(node.name, (func_ir_type, var_addr))
                     else:
-                        var_addr = ir.GlobalVariable(
-                            self.module, func_ir_type, node.name
+                        var_addr, write_initializer = self._prepare_file_scope_object(
+                            node.name,
+                            func_ir_type,
+                            storage=node.storage,
+                            has_initializer=node.init is not None,
                         )
-                        var_addr.initializer = ir.Constant(func_ir_type, None)
-                        self.define(node.name, (func_ir_type, var_addr))
+                        if var_addr is None:
+                            return None, None
                     if self._func_decl_returns_unsigned(sub_next_type):
                         self._mark_unsigned_return(var_addr)
                     if node.init is not None:
@@ -3335,25 +3650,52 @@ class LLVMCodeGenerator(object):
                     var_addr = self._alloca_in_entry(ir_type, node.name)
                     self.define(node.name, (ir_type, var_addr))
                 else:
-                    var_addr = ir.GlobalVariable(self.module, ir_type, node.name)
-                    self.define(node.name, (ir_type, var_addr))
+                    var_addr, write_initializer = self._prepare_file_scope_object(
+                        node.name,
+                        ir_type,
+                        storage=node.storage,
+                        has_initializer=node.init is not None,
+                    )
+                    if var_addr is None:
+                        return None, None
                 var_ir_type = ir_type
             else:
-                var_addr, var_ir_type = self.create_entry_block_alloca(
-                    node.name, type_str, 1, point_level=point_level
-                )
+                if self.in_global:
+                    pointee_ir_type = get_ir_type(type_str)
+                    if isinstance(pointee_ir_type, ir.VoidType):
+                        pointee_ir_type = int8_t
+                    for _ in range(point_level):
+                        pointee_ir_type = ir.PointerType(pointee_ir_type)
+                    var_ir_type = pointee_ir_type
+                    var_addr, write_initializer = self._prepare_file_scope_object(
+                        node.name,
+                        var_ir_type,
+                        storage=node.storage,
+                        has_initializer=node.init is not None,
+                    )
+                    if var_addr is None:
+                        return None, None
+                else:
+                    var_addr, var_ir_type = self.create_entry_block_alloca(
+                        node.name,
+                        type_str,
+                        1,
+                        point_level=point_level,
+                        storage=node.storage,
+                    )
 
             if self._has_unsigned_scalar_pointee(node.type):
                 self._mark_unsigned_pointee(var_addr)
 
             if node.init is not None:
                 if self.in_global:
-                    try:
-                        const_init = self._build_const_init(node.init, var_ir_type)
-                        str(const_init)
-                        var_addr.initializer = const_init
-                    except Exception:
-                        var_addr.initializer = ir.Constant(var_ir_type, None)
+                    if write_initializer:
+                        try:
+                            const_init = self._build_const_init(node.init, var_ir_type)
+                            str(const_init)
+                            var_addr.initializer = const_init
+                        except Exception:
+                            var_addr.initializer = ir.Constant(var_ir_type, None)
                 else:
                     init_val, _ = self.codegen(node.init)
                     if isinstance(init_val.type, ir.ArrayType) and isinstance(
@@ -3574,8 +3916,10 @@ class LLVMCodeGenerator(object):
         ir_type, _ = self.codegen(node.decl.type)
         funcname = node.decl.name
 
-        if funcname == "main":
-            self.return_type = ir_type  # for call in C
+        self.return_type = ir_type  # for call in C
+        if not hasattr(self, "func_return_types"):
+            self.func_return_types = {}
+        self.func_return_types[funcname] = ir_type
 
         arg_types = []
         is_var_arg = False
@@ -3588,24 +3932,33 @@ class LLVMCodeGenerator(object):
                 if t is not None:
                     arg_types.append(t)
 
+        function_type = ir.FunctionType(ir_type, arg_types, var_arg=is_var_arg)
+        symbol_name = self._register_file_scope_function(
+            funcname,
+            function_type,
+            storage=node.decl.storage,
+            is_definition=True,
+        )
+
         with self.new_function():
 
-            existing = self.module.globals.get(funcname)
+            existing = self.module.globals.get(symbol_name)
             if existing and isinstance(existing, ir.Function):
                 if existing.is_declaration:
                     self.function = existing
                 else:
-                    # Already defined — skip this duplicate definition
-                    return None, None
+                    raise SemanticError(f"redefinition of function '{funcname}'")
             else:
                 try:
                     self.function = ir.Function(
                         self.module,
-                        ir.FunctionType(ir_type, arg_types, var_arg=is_var_arg),
-                        name=funcname,
+                        function_type,
+                        name=symbol_name,
                     )
+                    if self._is_file_scope_static(node.decl.storage):
+                        self.function.linkage = "internal"
                 except Exception:
-                    return None, None
+                    raise SemanticError(f"failed to define function '{funcname}'")
             if self._func_decl_returns_unsigned(node.decl.type):
                 self._mark_unsigned_return(self.function)
             self.block = self.function.append_basic_block()

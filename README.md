@@ -3,9 +3,10 @@ Pcc
 
 What is this?
 --------------------
-Pcc is a C compiler based on ply + pycparser + llvmlite + llvm.
-We can run C programs like Python: `pcc test.c` to run C code.
-Pcc was inspired by: https://github.com/eliben/pykaleidoscope.
+Pcc is a C compiler written in Python, built on cpp + ply + pycparser + llvmlite + llvm.
+Run C programs like Python scripts: `pcc test.c`. Powerful enough to compile and run the full [Lua 5.5.0](https://github.com/lua/lua) interpreter (~30k lines of C).
+
+Inspired by: https://github.com/eliben/pykaleidoscope.
 
 Notice
 --------------------
@@ -28,6 +29,26 @@ pcc --llvmdump test.c              # dump LLVM IR
 pcc myproject/ -- arg1 arg2        # pass args to compiled program
 ```
 
+Use as a Python library:
+
+```python
+from pcc.evaluater.c_evaluator import CEvaluator
+
+pcc = CEvaluator()
+
+# Run main()
+pcc.evaluate(r'''
+#include <stdio.h>
+int main() { printf("Hello from pcc!\n"); return 0; }
+''')
+
+# Call any C function directly
+ret = pcc.evaluate(r'''
+int add(int a, int b) { return a + b; }
+''', entry="add", args=[3, 7])
+print(ret)  # 10
+```
+
 Development
 --------------------
 
@@ -40,15 +61,60 @@ uv run pytest    # run all 500+ tests
 
 Multi-file projects: put `.c` and `.h` files in a directory, one `.c` must contain `main()`. Pcc auto-discovers all `.c` files, merges them, and compiles.
 
-Lua Compilation Goal
+Compiling Lua 5.5.0
 --------------------
 
-The target is to compile and run [Lua 5.5.0](https://github.com/lua/lua) using pcc.
+Pcc can compile the entire [Lua 5.5.0](https://github.com/lua/lua) interpreter (~30k lines of C) and run Lua scripts directly.
+
+For one representative script (`math.lua`), these are the important cases:
+
+```bash
+git clone https://github.com/jiamo/pcc && cd pcc
+uv sync
+
+# 1) Canonical Lua tree in default directory mode: fails
+#    Reason: directory mode merges every .c into one TU, and projects/lua-5.5.0
+#    contains both onelua.c and the individual source files.
+uv run pcc projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
+
+# 2) Explicit amalgamation mode: works
+uv run pcc projects/lua-5.5.0/onelua.c -- projects/lua-5.5.0/testes/math.lua
+
+# 3) Canonical Lua tree, but collect only the sources used by `make -nB lua`: works
+uv run pcc --sources-from-make lua projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
+
+# 4) Same make-derived source list, but compile as separate translation units: works
+uv run pcc --separate-tus --sources-from-make lua projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
+
+# 5) Same separate-TU path, but compile translation units in parallel: works
+uv run pcc --separate-tus --sources-from-make lua --jobs 2 projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
+
+# 6) Canonical Lua tree with raw --separate-tus: fails
+#    Reason: onelua.c and the individual source files become separate TUs with
+#    duplicate external definitions at link semantics.
+uv run pcc --separate-tus projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
+
+# Run all 130+ Lua tests (pcc vs native, pcc vs makefile, makefile baseline)
+uv run pytest tests/test_lua.py -v
+```
 
 ```
-projects/lua-5.5.0/         - Lua 5.5.0 source code + Makefile
+projects/lua-5.5.0/         - canonical Lua 5.5.0 source tree, includes onelua.c and the standard multi-file sources
 projects/lua-5.5.0/testes/  - Lua test suite
 ```
+
+Use `projects/lua-5.5.0/onelua.c` when you want Lua's official amalgamation build.
+Use `--sources-from-make lua` when you want `pcc` to follow the same source list
+that Lua's makefile uses for the `lua` target.
+Use `--separate-tus` when you want normal multi-file C semantics: each `.c`
+file is compiled as its own translation unit instead of being merged into one
+big source string first.
+
+In other words:
+
+- default directory mode: merge all selected `.c` files into one TU
+- `--sources-from-make lua`: keep directory mode, but let `make -nB lua` choose which `.c` files participate
+- `--separate-tus`: compile each selected `.c` as a separate TU, then link them together
 
 ### Test Structure
 
@@ -118,55 +184,4 @@ Built-in typedefs: `size_t`, `ssize_t`, `ptrdiff_t`, `va_list`, `FILE`, `time_t`
 Supported C Features
 --------------------
 
-### Types
-`int`, `double`, `float`, `char`, `void`, `unsigned`/`signed`/`long`/`short` (all combinations),
-`size_t`, `int8_t`..`uint64_t`,
-pointers (multi-level), arrays (multi-dim),
-structs (named, anonymous, nested, with array/pointer/function-pointer members, pointer-to-struct),
-unions, enums (with constant expressions), typedef (scalar, struct, pointer, function pointer),
-`static` local variables, `const`/`volatile` qualifiers
-
-### Operators
-- Arithmetic: `+` `-` `*` `/` `%`
-- Bitwise: `&` `|` `^` `<<` `>>`
-- Comparison: `<` `>` `<=` `>=` `==` `!=` (including pointer comparison)
-- Logical: `&&` `||` (short-circuit evaluation)
-- Unary: `-x` `+x` `!x` `~x` `sizeof` `&x` `*p`
-- Increment/Decrement: `++x` `x++` `--x` `x--` (int and pointer, including struct members)
-- Assignment: `=` `+=` `-=` `*=` `/=` `%=` `<<=` `>>=` `&=` `|=` `^=` (including pointer `+=`/`-=`)
-- Ternary: `a ? b : c`
-- Pointer: `p + n`, `p - n`, `p - q`, `p++`, `p[i]`
-- Struct access: `.` and `->` (including nested `a.b.c` and `s->fn(args)`)
-- Chained: `a = b = c = 5`
-
-### Control Flow
-`if` / `else` / `else if`, `while`, `do-while`, `for` (all variants including `for(;;)`),
-`switch` / `case` / `default`, `goto` / `label`, `break`, `continue`, `return`
-
-### Functions
-Definitions, forward declarations, mutual recursion, void functions, variadic (`...`),
-pointer/array arguments, `static` local variables, function pointers (declaration, assignment,
-calling, as parameters, in structs, typedef'd), callback patterns
-
-### Libc Functions (133 total, auto-declared on first use)
-
-| Header | Functions |
-|--------|-----------|
-| stdio.h | printf, fprintf, sprintf, snprintf, puts, putchar, getchar, fopen, fclose, fread, fwrite, fseek, ftell, fgets, fputs, scanf, sscanf, ... |
-| stdlib.h | malloc, calloc, realloc, free, abs, labs, atoi, atol, atof, strtol, strtod, rand, srand, exit, abort, qsort, bsearch, getenv, system, ... |
-| string.h | strlen, strcmp, strncmp, strcpy, strncpy, strcat, strncat, strchr, strrchr, strstr, memset, memcpy, memmove, memcmp, memchr, strtok, ... |
-| ctype.h | isalpha, isdigit, isalnum, isspace, isupper, islower, isprint, ispunct, isxdigit, toupper, tolower, ... |
-| math.h | sin, cos, tan, asin, acos, atan, atan2, exp, log, log2, log10, pow, sqrt, cbrt, hypot, ceil, floor, round, trunc, fmod, fabs, ... |
-| time.h | time, clock, difftime |
-| unistd.h | sleep, usleep, read, write, open, close, getpid, getppid |
-| setjmp.h | setjmp, longjmp |
-| signal.h | signal, raise |
-
-### Literals
-Decimal, hex (`0xFF`), octal (`077`), char (`'a'`, `'\n'`), string (`"hello\n"`), double (`3.14`)
-
-### Other
-C comments (`/* */`, `//`), array initializer lists (1D and multi-dim),
-string escape sequences (`\n \t \\ \0 \r`), implicit type promotion (int/char/double/pointer),
-array-to-pointer decay, `NULL` pointer support, opaque/forward-declared structs,
-two-pass codegen (types first, functions second)
+Supports all C99 features needed to compile real-world projects like Lua 5.5.0: all types (int, float, double, char, void, structs, unions, enums, typedefs, pointers, arrays, function pointers), all operators, all control flow (if/else, for, while, do-while, switch, goto), variadic functions, preprocessor directives, and 133 libc functions auto-declared from stdio.h, stdlib.h, string.h, math.h, etc.
