@@ -1,10 +1,10 @@
 [project]
 name = "python-cc"
-version = "0.0.3"
+version = "0.0.4"
 description = "Pcc is a c compiler built on python and llvm."
 readme = "README.md"
-license = "BSD-3-Clause"
-requires-python = ">=3.10"
+license = "MIT"
+requires-python = ">=3.13"
 keywords = ["c", "compiler", "llvm", "ply"]
 dependencies = [
     "llvmlite==0.46.0",
@@ -15,7 +15,7 @@ dependencies = [
 pcc = "pcc.pcc:main"
 
 [project.urls]
-Homepage = "http://pypi.python.org/pypi/pcc/"
+Homepage = "https://github.com/jiamo/pcc"
 
 [build-system]
 requires = ["hatchling"]
