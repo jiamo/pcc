@@ -1,6 +1,6 @@
 [project]
 name = "python-cc"
-version = "0.0.5"
+version = "0.0.6"
 description = "Pcc is a c compiler built on python and llvm."
 readme = "README.md"
 license = "MIT"

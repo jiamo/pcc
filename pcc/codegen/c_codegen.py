@@ -1416,6 +1416,8 @@ class LLVMCodeGenerator(object):
                     addresult = handle(lv, rv, "addtmp")
             else:
                 addresult = handle(lv, rv, "addtmp")
+            if dispatch_type == dispatch_type_int and is_unsigned:
+                self._tag_unsigned(addresult)
             self._safe_store(addresult, lv_addr)
             return addresult, lv_addr
 
@@ -1440,6 +1442,8 @@ class LLVMCodeGenerator(object):
                     if is_inc
                     else self.builder.sub(lv, one, "dec")
                 )
+                if self._is_unsigned_val(lv):
+                    self._tag_unsigned(new_val)
             self._safe_store(new_val, lv_addr)
             result = lv if is_post else new_val
 
@@ -2543,7 +2547,10 @@ class LLVMCodeGenerator(object):
                 self._tag_unsigned(result)
             return result, None
         elif node.op == "^":
-            return self.builder.xor(lhs, rhs, "xortmp"), None
+            result = self.builder.xor(lhs, rhs, "xortmp")
+            if is_unsigned:
+                self._tag_unsigned(result)
+            return result, None
         elif node.op == "<<":
             result = self.builder.shl(lhs, rhs, "shltmp")
             if is_unsigned:
@@ -2551,7 +2558,9 @@ class LLVMCodeGenerator(object):
             return result, None
         elif node.op == ">>":
             if is_unsigned:
-                return self.builder.lshr(lhs, rhs, "shrtmp"), None
+                result = self.builder.lshr(lhs, rhs, "shrtmp")
+                self._tag_unsigned(result)
+                return result, None
             return self.builder.ashr(lhs, rhs, "shrtmp"), None
         else:
             func = self.module.globals.get("binary{0}".format(node.op))

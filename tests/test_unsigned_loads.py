@@ -134,3 +134,85 @@ def test_unsigned_char_pointer_arithmetic_uses_positive_offset():
     """
 
     assert _evaluate(source) == 0
+
+
+def test_unsigned_xor_result_stays_unsigned_for_modulo():
+    source = r"""
+        typedef unsigned int IdxT;
+
+        int main(void) {
+            IdxT lo = 1;
+            IdxT up = 1921;
+            unsigned int rnd = 3426782842u;
+            IdxT r4 = (up - lo) / 4;
+            IdxT p = (rnd ^ lo ^ up) % (r4 * 2) + (lo + r4);
+
+            return p == 731u ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_unsigned_xor_assignment_result_stays_unsigned_for_modulo():
+    source = r"""
+        int main(void) {
+            unsigned int x = 3426782842u;
+            unsigned int mod = 960u;
+
+            x ^= 1u;
+            x ^= 1921u;
+
+            return (x % mod) == 250u ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_unsigned_prefix_increment_result_stays_unsigned_for_modulo():
+    source = r"""
+        int main(void) {
+            unsigned int x = 3426781689u;
+
+            return ((++x % 960) == 250u) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_unsigned_prefix_decrement_result_stays_unsigned_for_modulo():
+    source = r"""
+        int main(void) {
+            unsigned int x = 0u;
+
+            return ((--x % 960) == 255u) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_unsigned_right_shift_result_stays_unsigned_for_modulo():
+    source = r"""
+        int main(void) {
+            unsigned int x = 0x80000000u;
+
+            return (((x >> 31) % 2) == 1u) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_unsigned_ternary_result_stays_unsigned_for_modulo():
+    source = r"""
+        int main(void) {
+            unsigned int u = 3426781690u;
+
+            return (((1 ? u : 1u) % 960) == 250u) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
