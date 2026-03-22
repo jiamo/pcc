@@ -12,6 +12,22 @@ Notice
 1. Some code skeleton comes from pykaleidoscope.
 2. ply and pycparser are embedded into this project for debug use.
 
+Install
+--------------------
+
+```bash
+pip install python-cc
+```
+
+This gives you the `pcc` command:
+
+```bash
+pcc hello.c                        # compile and run
+pcc myproject/                     # compile all .c files in directory
+pcc --llvmdump test.c              # dump LLVM IR
+pcc myproject/ -- arg1 arg2        # pass args to compiled program
+```
+
 Development
 --------------------
 
@@ -19,21 +35,7 @@ Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync          # install dependencies
-uv run pytest    # run all 400+ tests (~10s parallel)
-```
-
-Run pcc
---------------------
-
-```bash
-# Single file
-uv run pcc hello.c
-
-# Multi-file project (auto-collects all .c files, resolves .h includes)
-uv run pcc myproject/
-
-# Dump LLVM IR
-uv run pcc --llvmdump test.c
+uv run pytest    # run all 500+ tests
 ```
 
 Multi-file projects: put `.c` and `.h` files in a directory, one `.c` must contain `main()`. Pcc auto-discovers all `.c` files, merges them, and compiles.
@@ -59,8 +61,8 @@ Tests in `tests/test_lua.py` compare three builds:
 | **makefile** | `make` with project Makefile (separate compilation of each .c, static lib + link) |
 
 ```bash
-# Run all Lua tests (slow marker, ~5 min with 4 workers)
-uv run pytest tests/test_lua.py -m slow -v -n 4
+# Run all Lua tests (~25s with auto workers)
+uv run pytest tests/test_lua.py -v
 
 # Individual file compilation through pcc pipeline
 uv run pytest tests/test_lua.py::test_lua_source_compile -v
@@ -69,7 +71,8 @@ uv run pytest tests/test_lua.py::test_pcc_runtime_matches_native -v
 # pcc vs Makefile-built lua (official reference)
 uv run pytest tests/test_lua.py::test_pcc_runtime_matches_makefile -v
 # Lua test suite with Makefile-built binary (baseline)
-uv run pytest tests/test_lua.py::test_makefile_lua_test_suite -v```
+uv run pytest tests/test_lua.py::test_makefile_lua_test_suite -v
+```
 
 Note: `heavy.lua` is excluded from automated tests (runs ~2 min+, may timeout). Run manually:
 ```bash
