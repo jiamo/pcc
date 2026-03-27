@@ -4,7 +4,7 @@ Pcc
 What is this?
 --------------------
 Pcc is a C compiler written in Python, built on cpp + ply + pycparser + llvmlite + llvm.
-Run C programs like Python scripts: `pcc test.c`. Powerful enough to compile and run the full [Lua 5.5.0](https://github.com/lua/lua) interpreter (~30k lines of C).
+Run C programs like Python scripts: `pcc test.c`. Powerful enough to compile and run real-world C projects including Lua 5.5.0, SQLite, PostgreSQL (libpq), pcre, zlib, lz4, zstd, openssl, and readline — with 2000+ tests passing.
 
 Inspired by: https://github.com/eliben/pykaleidoscope.
 
@@ -56,7 +56,7 @@ Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync          # install dependencies
-uv run pytest    # run all 500+ tests
+uv run pytest    # run all 2000+ tests
 ```
 
 Compile Cache
