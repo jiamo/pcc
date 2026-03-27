@@ -109,6 +109,77 @@ class TestSizeof(unittest.TestCase):
         )
         assert ret == 5
 
+    def test_sizeof_structref_in_local_array_dim(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            struct S {
+                char buf[16];
+            };
+
+            int f(struct S *p){
+                char tmp[sizeof(p->buf)];
+                return sizeof(tmp) == 16 ? 0 : 1;
+            }
+
+            int main(){
+                struct S s;
+                return f(&s);
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+    def test_sizeof_minus_offsetof_in_local_array_dim(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            typedef struct {
+                int count;
+                char tail[8];
+            } Parse;
+
+            int main(){
+                char saveBuf[(sizeof(Parse)) - ((long) &((Parse *)0)->tail)];
+                return sizeof(saveBuf) == 8 ? 0 : 1;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+    def test_sizeof_binary_pointer_arithmetic_structref(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            struct S {
+                char pad;
+                int value;
+            };
+
+            int main(){
+                struct S items[2];
+                return sizeof((items + 1)->value);
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 4
+
+    def test_sizeof_binary_expr_uses_arithmetic_result_type(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(){
+                int x = 1;
+                return sizeof(x + 1);
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 4
+
 
 if __name__ == "__main__":
     unittest.main()

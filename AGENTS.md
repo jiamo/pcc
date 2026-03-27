@@ -16,18 +16,19 @@ The fastest way to get useful results is:
 ## Environment Rules
 
 - Use `uv run ...` for Python entrypoints. Do not rely on bare `python`; local `pyenv` state may not match the repository.
-- For reproducible runs, prefer unsetting `LC_ALL`:
+- **Codex-specific**: Codex sets `LC_ALL=C` which can break Python locale handling. Unset it with `env -u LC_ALL` before running commands. See https://github.com/openai/codex/issues/14723. Not needed for Claude Code or other agents.
 
 ```bash
+# Codex only:
 env -u LC_ALL uv run pytest -q
-env -u LC_ALL uv run python - <<'PY'
-print("ok")
-PY
 env -u LC_ALL uv run pcc hello.c
+# Claude Code / others:
+uv run pytest -q
+uv run pcc hello.c
 ```
 
 - While debugging one failure, prefer `-n0` so xdist does not hide ordering or temp-file problems.
-- Use `rg` / `rg --files` for source discovery.
+- Use ripgrep (`rg`), or your agent's built-in code search tools (e.g. Grep/Glob in Claude Code) for source discovery.
 - Do not leave temporary `.c` files inside real project directories. Directory-based source collection can accidentally compile them.
 
 
@@ -61,13 +62,16 @@ The repository has multiple ways to compile projects. Be explicit about which on
   Compile each `.c` as its own translation unit, then link at the LLVM/module layer.
 - `--sources-from-make GOAL`:
   Use `make -nB GOAL` to discover which `.c` files belong to a target.
+  It can also recover common preprocessor flags from real compile commands, but
+  only if the build system actually emits them. It cannot infer compatibility
+  flags that exist only in documentation, headers, or repository conventions.
 
 For Lua, these are the most useful entrypoints:
 
 ```bash
-env -u LC_ALL uv run pcc projects/lua-5.5.0/onelua.c -- projects/lua-5.5.0/testes/math.lua
-env -u LC_ALL uv run pcc --sources-from-make lua projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
-env -u LC_ALL uv run pcc --separate-tus --sources-from-make lua projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
+env -u LC_ALL uv run pcc --cpp-arg=-DLUA_USE_JUMPTABLE=0 --cpp-arg=-DLUA_NOBUILTIN projects/lua-5.5.0/onelua.c -- projects/lua-5.5.0/testes/math.lua
+env -u LC_ALL uv run pcc --cpp-arg=-DLUA_USE_JUMPTABLE=0 --cpp-arg=-DLUA_NOBUILTIN --sources-from-make lua projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
+env -u LC_ALL uv run pcc --cpp-arg=-DLUA_USE_JUMPTABLE=0 --cpp-arg=-DLUA_NOBUILTIN --separate-tus --sources-from-make lua projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
 ```
 
 
@@ -180,12 +184,34 @@ This class of bug is easy to miss with toy tests and shows up quickly in Lua, li
   `++x` / `--x` must preserve unsignedness on the expression result.
 - Bitwise operators on unsigned values:
   `&`, `|`, `^`, `~`, shifts, and compound assignments must preserve unsignedness where C requires it.
+- Function-scope static arrays:
+  `static const code lenfix[512] = { ... };` must become an internal global, not a stack allocation. If a returned pointer or cached table looks correct inside one helper but turns to garbage after the function returns, inspect block-scope `static` lowering first.
+- Function-scope static incomplete arrays:
+  `static const char my_version[] = "1.3.1";` must infer its top-level size from the initializer before the internal global is created. A zero-length `[0 x i8]` static local is a codegen bug, not a source quirk.
+- Function-scope aggregate init-lists:
+  `struct S s = {0};` and nested aggregate initializers must really zero and initialize the local object. If a real program shows impossible garbage in supposedly zero-initialized local state, inspect recursive local aggregate lowering before looking at the program logic.
+- File-scope incomplete arrays:
+  `extern int table[]; int table[] = { ... };` must end up as one real symbol. If IR contains both `@"table"` and `@"table.1"`, the compiler created a zero-length placeholder and then lost the real definition behind a renamed symbol.
+- Standalone tag definitions:
+  `struct S { ... };`, `union U { ... };`, and `enum E { ... };` with no declarator are type definitions, not object declarations. If a recursive type graph keeps one side opaque in IR, inspect `codegen_Decl()` before blaming the source program.
+- Forward-declared named structs with bitfields:
+  if `struct A` and `struct B` reference each other and one side contains bitfields, the final definition must reuse the existing identified tag type instead of inventing a fresh layout-only type. If `p->db == db` fails on obviously valid nested pointers, inspect named-struct finalization and tag reuse.
+- Casted function-pointer globals:
+  `static const entry table[] = { {(fnptr)target} };` must preserve the function address through the cast. Null-filled dispatch tables in VFS/syscall layers are usually constant-initializer bugs, not parser bugs.
 - Assignment expressions:
   The stored value and the expression result are both semantically meaningful.
 - Temporary probe files:
   Putting `foo_tmp.c` inside a project directory can accidentally change project collection behavior.
+- Build configuration vs compiler compatibility:
+  `--sources-from-make` can only recover flags that appear in real compile
+  commands. If a project still needs explicit `--cpp-arg` values after make
+  inference, first decide whether they are true build-configuration results
+  that should come from configured build metadata, or temporary compiler
+  compatibility flags that should remain explicit.
 - Fake libc changes:
   These can fix or break real programs without touching parser or codegen.
+- Darwin multi-TU MCJIT teardown:
+  A large program can run correctly and still die later during llvmlite/LLVM cleanup. If the runtime output is correct but the host Python process crashes during GC or teardown, treat that as a lifecycle/isolation problem, not automatically a codegen bug.
 
 
 ## Testing Policy
@@ -225,11 +251,12 @@ Before you stop, confirm all of the following:
 
 ## LLVM Version Mismatch
 
-`llvmlite` bundles its own LLVM version, which may be newer than the system `clang`. This matters when pcc writes IR to a file and compiles with `cc -c`:
+`llvmlite` bundles its own LLVM version, which may be newer than the system `clang`.
 
-- LLVM O2 optimizer can emit attributes the system clang doesn't understand: `nuw`, `nneg`, `range()`, `initializes()`, `dead_on_unwind`.
-- For this reason, the test path currently does **not** run LLVM optimization passes. The JIT path (via `evaluate()`) does run O2 and works fine because llvmlite's own LLVM parses its own output.
-- If you need to compile optimized IR with the system compiler, strip these attributes with regex post-processing.
+- Older repository paths wrote LLVM IR text to disk and then asked the system compiler to compile that IR. In that setup, LLVM O2 could emit attributes the system `clang` did not understand, such as `nuw`, `nneg`, `range()`, `initializes()`, and `dead_on_unwind`.
+- The current system-link path does **not** rely on the system compiler parsing LLVM IR text. `run_translation_units_with_system_cc()` optimizes each module with llvmlite's LLVM and emits native object files directly, then links those objects with `cc`.
+- The remaining limitation is not "no optimization". It is "no cross-translation-unit optimization" in the separate-TU path. Each TU gets optimized on its own before linking, but there is no LTO-style whole-program pass over the linked module set.
+- If you ever reintroduce a text-IR handoff to the system compiler, keep the attribute-stripping warning in mind and centralize those rewrites in `postprocess_ir_text()`.
 
 
 ## IR Fix Centralization
@@ -256,3 +283,13 @@ Current fixes in `postprocess_ir_text`:
 
 - `docs/investigations/lua-sort-random-pivot-signedness.md`
   Detailed report for a representative real-world debugging session that started as a flaky Lua `sort.lua` failure and ended as an unsigned-expression codegen fix.
+- `docs/investigations/pcre-op-lengths-incomplete-array-binding.md`
+  Detailed report for a PCRE failure that first looked like an MCJIT/link bottleneck and turned out to be a file-scope incomplete-array binding bug in global initializer lowering.
+- `docs/investigations/zlib-integration-static-local-arrays-and-layout.md`
+  Detailed report for a zlib integration session that exposed three different bug classes in sequence: enum layout, block-scope static arrays, and function-scope static incomplete arrays.
+- `docs/investigations/sqlite-integration-vfs-init-and-mcjit-lifecycle.md`
+  Detailed report for a SQLite integration session that exposed three different layers in sequence: casted syscall-table pointers, broken local aggregate zero-initialization, and Darwin MCJIT teardown instability.
+- `docs/investigations/sqlite-forward-declared-bitfield-struct-tags.md`
+  Detailed report for a later SQLite integration failure that first looked like a runtime logic bug and turned out to be incorrect handling of standalone tag definitions and forward-declared named bitfield structs in the type system.
+- `docs/investigations/make-derived-cpp-flags-vs-explicit-project-config.md`
+  Detailed report on why make-derived preprocessor inference covered PCRE but not Lua, zlib, or SQLite, and when explicit `--cpp-arg` values are the right interface instead of compiler-side project detection.

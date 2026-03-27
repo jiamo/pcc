@@ -9,10 +9,9 @@ from pcc.generator import c_generator
 from pcc.ast import  c_ast
 
 _c_parser = c_parser.CParser(
-                lex_optimize=False,
-                yacc_debug=True,
-                yacc_optimize=False,
-                yacctab='yacctab')
+                lex_optimize=True,
+                yacc_debug=False,
+                yacc_optimize=True)
 
 
 def compare_asts(ast1, ast2):

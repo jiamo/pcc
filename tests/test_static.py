@@ -55,6 +55,53 @@ class TestStaticLocal(unittest.TestCase):
         ''', optimize=False)
         assert ret == 23  # fa returns 3, fb returns 20
 
+    def test_static_incomplete_char_array_from_string_literal(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            const char *version(void) {
+                static const char my_version[] = "1.3.1";
+                return my_version;
+            }
+            int main(void) {
+                const char *p = version();
+                return (p[0] == '1' && p[4] == '1' && p[5] == '\\0') ? 0 : 1;
+            }
+            ''',
+            optimize=False,
+        )
+        assert ret == 0
+
+    def test_static_incomplete_int_array_from_init_list(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            int read_table(int idx) {
+                static const int table[] = {7, 11, 13};
+                return table[idx];
+            }
+            int main(void) {
+                return (read_table(0) == 7 && read_table(2) == 13) ? 0 : 1;
+            }
+            ''',
+            optimize=False,
+        )
+        assert ret == 0
+
+    def test_global_pointer_to_array_element_initializer(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            static unsigned char table[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+            static const unsigned char *ptr = &table[3];
+            int main(void) {
+                return (ptr[0] == 3 && ptr[2] == 5) ? 0 : 1;
+            }
+            ''',
+            optimize=False,
+        )
+        assert ret == 0
+
 
 if __name__ == '__main__':
     unittest.main()

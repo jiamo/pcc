@@ -1964,7 +1964,7 @@ class LRTable(object):
             exec('import %s' % module)
             parsetab = sys.modules[module]
 
-        if parsetab._tabversion != __tabversion__:
+        if getattr(parsetab, '_tabversion', '0.0') != __tabversion__:
             raise VersionError('yacc table file version is out of date')
 
         self.lr_action = parsetab._lr_action

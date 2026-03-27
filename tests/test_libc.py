@@ -105,6 +105,16 @@ class TestString(unittest.TestCase):
         ''', optimize=False)
         assert ret == 108  # 'l'
 
+    def test_setenv_and_getenv(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                if (setenv("PCC_TEST_ENV", "ok", 1) != 0) return 1;
+                return getenv("PCC_TEST_ENV")[0] == 'o' ? 0 : 2;
+            }
+        ''', optimize=False)
+        assert ret == 0
+
 
 class TestCtype(unittest.TestCase):
     def test_toupper(self):
@@ -136,6 +146,32 @@ class TestCtype(unittest.TestCase):
             }
         ''')
         assert ret == 1  # '5' is digit, 'A' is not
+
+    def test_wide_char_functions_are_declared(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            #include <wchar.h>
+            #include <wctype.h>
+
+            int main(){
+                wchar_t upper = 65;
+                if (!iswupper(upper)) return 1;
+                if (towlower(upper) != 97) return 2;
+                return wcwidth(upper) == 1 ? 0 : 3;
+            }
+        ''')
+        assert ret == 0
+
+    def test_multibyte_limit_macros_are_available(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            #include <limits.h>
+
+            int main(){
+                return (MB_CUR_MAX >= 1 && MB_LEN_MAX >= 1) ? 0 : 1;
+            }
+        ''')
+        assert ret == 0
 
 
 class TestPuts(unittest.TestCase):

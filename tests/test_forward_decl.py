@@ -35,6 +35,14 @@ class TestForwardDecl(unittest.TestCase):
         ''')
         assert ret == 1
 
+    def test_static_forward_declaration_without_definition_is_allowed(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            static int helper(void);
+            int main(void) { return 0; }
+        ''')
+        assert ret == 0
+
 
 if __name__ == '__main__':
     unittest.main()

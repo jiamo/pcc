@@ -148,6 +148,131 @@ class TestSwitch(unittest.TestCase):
         )
         assert ret == 0
 
+    def test_switch_scope_decl_before_first_case_is_visible_in_cases(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            typedef union {
+                int x;
+            } U;
+
+            int main(){
+                switch(1){
+                    U u;
+                    case 1:
+                        u.x = 3;
+                        return u.x == 3 ? 0 : 1;
+                    default:
+                        return 2;
+                }
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+    def test_switch_nested_case_labels_inside_case_block_direct_entry(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(){
+                int x = 2;
+                switch(x){
+                    case 1: {
+                        int shared;
+                        shared = 7;
+                        if (shared == 99) return 9;
+                    case 2:
+                    case 3:
+                        shared = 42;
+                        return shared == 42 ? 0 : 1;
+                    }
+                    default:
+                        return 2;
+                }
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+    def test_switch_nested_case_labels_inside_case_block_fallthrough(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(){
+                int x = 1;
+                switch(x){
+                    case 1: {
+                        int shared;
+                        shared = 7;
+                    case 2:
+                        return shared == 7 ? 0 : 1;
+                    }
+                    default:
+                        return 2;
+                }
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+    def test_switch_goto_label_after_terminated_path(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(){
+                int x = 1;
+                int result = 7;
+                switch(x){
+                    case 1:
+                        if (result == 7)
+                            goto done;
+                        return 3;
+                    done:
+                        break;
+                    default:
+                        return 4;
+                }
+                return result == 7 ? 0 : 1;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+    def test_switch_decl_before_first_case_inside_loop(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(){
+                int op = 0;
+                int hits = 0;
+                for(;;){
+                    switch(op){
+                        int nField;
+                        int p2;
+                        int iDb;
+                        int wrFlag;
+                        int res;
+                        long long iKey;
+                        case 0:
+                            hits = 1;
+                            break;
+                        default:
+                            return 3;
+                    }
+                    op++;
+                    if (hits) break;
+                }
+                return op == 1 && hits == 1 ? 0 : 1;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
 
 if __name__ == "__main__":
     unittest.main()

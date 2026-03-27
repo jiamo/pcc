@@ -182,5 +182,37 @@ class TestTimeGetpid(unittest.TestCase):
         assert ret == 1
 
 
+class TestLocaleExtra(unittest.TestCase):
+    def test_localeconv_decimal_point(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            #include <locale.h>
+
+            int main(){
+                setlocale(LC_ALL, "C");
+                return localeconv()->decimal_point[0] == '.';
+            }
+            ''',
+            optimize=False,
+        )
+        assert ret == 1
+
+    def test_pwd_header_declares_struct_passwd_fields(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            #include <pwd.h>
+
+            int main(){
+                return sizeof(((struct passwd *)0)->pw_dir) == sizeof(char *) &&
+                       sizeof(((struct passwd *)0)->pw_uid) == sizeof(uid_t);
+            }
+            ''',
+            optimize=False,
+        )
+        assert ret == 1
+
+
 if __name__ == '__main__':
     unittest.main()

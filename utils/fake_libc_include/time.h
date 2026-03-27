@@ -4,6 +4,14 @@
 #include "_fake_defines.h"
 #include "_fake_typedefs.h"
 
+#ifndef _FAKE_STRUCT_TIMESPEC
+#define _FAKE_STRUCT_TIMESPEC
+struct timespec {
+    time_t tv_sec;
+    long tv_nsec;
+};
+#endif
+
 struct tm {
     int tm_sec;
     int tm_min;
@@ -29,5 +37,6 @@ struct tm *localtime_r(const time_t *timer, struct tm *result);
 size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
 char *ctime(const time_t *timer);
 char *asctime(const struct tm *tm);
+int nanosleep(const struct timespec *req, struct timespec *rem);
 
 #endif

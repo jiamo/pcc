@@ -6,6 +6,10 @@
 # Copyright (C) 2008-2015, Eli Bendersky
 # License: BSD
 #------------------------------------------------------------------------------
+import os
+import sys
+import tempfile
+from contextlib import contextmanager
 
 from ..ply import yacc
 
@@ -13,6 +17,46 @@ from ..ast import c_ast
 from ..lex.c_lexer import CLexer
 from .plyparser import PLYParser, Coord, ParseError
 from ..ast.ast_transforms import fix_switch_cases
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
+
+
+_DEFAULT_PLY_LEXTAB = "pcc_lextab_v7"
+_DEFAULT_PLY_YACCTAB = "pcc_yacctab_v7"
+
+
+def _default_ply_cache_dir():
+    override = os.environ.get("PCC_PLY_CACHE_DIR")
+    if override:
+        return override
+    return os.path.join(tempfile.gettempdir(), "pcc-ply-cache")
+
+
+def _prepare_default_ply_cache_dir():
+    cache_dir = _default_ply_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    if cache_dir not in sys.path:
+        sys.path.insert(0, cache_dir)
+    return cache_dir
+
+
+@contextmanager
+def _ply_table_build_lock(enabled):
+    if not enabled or fcntl is None:
+        yield
+        return
+
+    cache_dir = _prepare_default_ply_cache_dir()
+    lock_path = os.path.join(cache_dir, ".pcc-ply-cache.lock")
+    with open(lock_path, "w") as lockfile:
+        fcntl.flock(lockfile, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lockfile, fcntl.LOCK_UN)
 
 
 class CParser(PLYParser):
@@ -69,45 +113,57 @@ class CParser(PLYParser):
                 Set this parameter to control the location of generated
                 lextab and yacctab files.
         """
+        uses_default_opt_lex_cache = lex_optimize and lextab == 'pycparser.lextab'
+        uses_default_opt_yacc_cache = yacc_optimize and yacctab == 'pycparser.yacctab'
+        uses_default_cache = uses_default_opt_lex_cache or uses_default_opt_yacc_cache
+        if uses_default_cache:
+            cache_dir = _prepare_default_ply_cache_dir()
+            if taboutputdir == '':
+                taboutputdir = cache_dir
+            if uses_default_opt_lex_cache:
+                lextab = _DEFAULT_PLY_LEXTAB
+            if uses_default_opt_yacc_cache:
+                yacctab = _DEFAULT_PLY_YACCTAB
+
         self.clex = CLexer(
             error_func=self._lex_error_func,
             on_lbrace_func=self._lex_on_lbrace_func,
             on_rbrace_func=self._lex_on_rbrace_func,
             type_lookup_func=self._lex_type_lookup_func)
 
-        self.clex.build(
-            optimize=lex_optimize,
-            lextab=lextab,
-            outputdir=taboutputdir)
-        self.tokens = self.clex.tokens
+        with _ply_table_build_lock(uses_default_cache):
+            self.clex.build(
+                optimize=lex_optimize,
+                lextab=lextab,
+                outputdir=taboutputdir)
+            self.tokens = self.clex.tokens
 
-        rules_with_opt = [
-            'abstract_declarator',
-            'assignment_expression',
-            'declaration_list',
-            'declaration_specifiers',
-            'designation',
-            'expression',
-            'identifier_list',
-            'init_declarator_list',
-            'initializer_list',
-            'parameter_type_list',
-            'specifier_qualifier_list',
-            'block_item_list',
-            'type_qualifier_list',
-            'struct_declarator_list'
-        ]
+            rules_with_opt = [
+                'abstract_declarator',
+                'assignment_expression',
+                'declaration_list',
+                'declaration_specifiers',
+                'expression',
+                'identifier_list',
+                'init_declarator_list',
+                'initializer_list',
+                'parameter_type_list',
+                'specifier_qualifier_list',
+                'block_item_list',
+                'type_qualifier_list',
+                'struct_declarator_list',
+            ]
 
-        for rule in rules_with_opt:
-            self._create_opt_rule(rule)
+            for rule in rules_with_opt:
+                self._create_opt_rule(rule)
 
-        self.cparser = yacc.yacc(
-            module=self,
-            start='translation_unit_or_empty',
-            debug=yacc_debug,
-            optimize=yacc_optimize,
-            tabmodule=yacctab,
-            outputdir=taboutputdir)
+            self.cparser = yacc.yacc(
+                module=self,
+                start='translation_unit_or_empty',
+                debug=yacc_debug,
+                optimize=yacc_optimize,
+                tabmodule=yacctab,
+                outputdir=taboutputdir)
 
         # Stack of scopes for keeping track of symbols. _scope_stack[-1] is
         # the current (topmost) scope. Each scope is a dictionary that
@@ -705,6 +761,7 @@ class CParser(PLYParser):
 
     def p_function_specifier(self, p):
         """ function_specifier  : INLINE
+                                | _NORETURN
         """
         p[0] = p[1]
 
@@ -714,9 +771,11 @@ class CParser(PLYParser):
                             | CHAR
                             | SHORT
                             | INT
+                            | INT128
                             | LONG
                             | FLOAT
                             | DOUBLE
+                            | _FLOAT16
                             | _COMPLEX
                             | SIGNED
                             | UNSIGNED
@@ -794,22 +853,25 @@ class CParser(PLYParser):
             coord=self._coord(p.lineno(2)))
 
     def p_struct_or_union_specifier_2(self, p):
-        """ struct_or_union_specifier : struct_or_union brace_open struct_declaration_list brace_close
+        """ struct_or_union_specifier : struct_or_union brace_open brace_close
+                                      | struct_or_union brace_open struct_declaration_list brace_close
         """
         klass = self._select_struct_union_class(p[1])
         p[0] = klass(
             name=None,
-            decls=p[3],
+            decls=[] if len(p) == 4 else p[3],
             coord=self._coord(p.lineno(2)))
 
     def p_struct_or_union_specifier_3(self, p):
-        """ struct_or_union_specifier   : struct_or_union ID brace_open struct_declaration_list brace_close
+        """ struct_or_union_specifier   : struct_or_union ID brace_open brace_close
+                                        | struct_or_union TYPEID brace_open brace_close
+                                        | struct_or_union ID brace_open struct_declaration_list brace_close
                                         | struct_or_union TYPEID brace_open struct_declaration_list brace_close
         """
         klass = self._select_struct_union_class(p[1])
         p[0] = klass(
             name=p[2],
-            decls=p[4],
+            decls=[] if len(p) == 5 else p[4],
             coord=self._coord(p.lineno(2)))
 
     def p_struct_or_union(self, p):
@@ -1182,21 +1244,26 @@ class CParser(PLYParser):
             p[0] = p[2]
 
     def p_initializer_list(self, p):
-        """ initializer_list    : designation_opt initializer
-                                | initializer_list COMMA designation_opt initializer
+        """ initializer_list    : initializer_item
+                                | initializer_list COMMA initializer_item
         """
-        if len(p) == 3: # single initializer
-            init = p[2] if p[1] is None else c_ast.NamedInitializer(p[1], p[2])
-            p[0] = c_ast.InitList([init], p[2].coord)
+        if len(p) == 2:
+            p[0] = c_ast.InitList([p[1]], p[1].coord)
         else:
-            init = p[4] if p[3] is None else c_ast.NamedInitializer(p[3], p[4])
-            p[1].exprs.append(init)
+            p[1].exprs.append(p[3])
             p[0] = p[1]
 
-    def p_designation(self, p):
-        """ designation : designator_list EQUALS
+    def p_initializer_item(self, p):
+        """ initializer_item    : initializer
+                                 | designator_list EQUALS initializer
+                                 | identifier COLON initializer
         """
-        p[0] = p[1]
+        if len(p) == 2:
+            p[0] = p[1]
+        elif p.slice[2].type == "EQUALS":
+            p[0] = c_ast.NamedInitializer(p[1], p[3])
+        else:
+            p[0] = c_ast.NamedInitializer([p[1]], p[3])
 
     # Designators are represented as a list of nodes, in the order in which
     # they're written in the code.
@@ -1459,9 +1526,12 @@ class CParser(PLYParser):
     def p_conditional_expression(self, p):
         """ conditional_expression  : binary_expression
                                     | binary_expression CONDOP expression COLON conditional_expression
+                                    | binary_expression CONDOP COLON conditional_expression
         """
         if len(p) == 2:
             p[0] = p[1]
+        elif len(p) == 5:
+            p[0] = c_ast.TernaryOp(p[1], None, p[4], p[1].coord)
         else:
             p[0] = c_ast.TernaryOp(p[1], p[3], p[5], p[1].coord)
 
@@ -1559,10 +1629,15 @@ class CParser(PLYParser):
         p[0] = c_ast.UnaryOp('p' + p[2], p[1], p[1].coord)
 
     def p_postfix_expression_6(self, p):
-        """ postfix_expression  : LPAREN type_name RPAREN brace_open initializer_list brace_close
+        """ postfix_expression  : LPAREN type_name RPAREN brace_open brace_close
                                 | LPAREN type_name RPAREN brace_open initializer_list COMMA brace_close
+                                | LPAREN type_name RPAREN brace_open initializer_list brace_close
         """
-        p[0] = c_ast.CompoundLiteral(p[2], p[5])
+        if len(p) == 6:
+            init = c_ast.InitList([], self._coord(p.lineno(4)))
+        else:
+            init = p[5]
+        p[0] = c_ast.CompoundLiteral(p[2], init)
 
     def p_primary_expression_1(self, p):
         """ primary_expression  : identifier """
@@ -1696,5 +1771,3 @@ if __name__ == "__main__":
     ## set debuglevel to 2 for debugging
     #t = parser.parse(buf, 'x.c', debuglevel=0)
     #t.show(showcoord=True)
-
-

@@ -1,9 +1,11 @@
 import llvmlite.ir as ir
+import math
 import re
 import struct
 from collections import ChainMap
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from itertools import count
 from llvmlite.ir import IRBuilder
 from ..ast import c_ast as c_ast
 
@@ -11,6 +13,7 @@ bool_t = ir.IntType(1)
 int8_t = ir.IntType(8)
 int32_t = ir.IntType(32)
 int64_t = ir.IntType(64)
+int128_t = ir.IntType(128)
 voidptr_t = int8_t.as_pointer()
 int64ptr_t = int64_t.as_pointer()
 true_bit = bool_t(1)
@@ -19,6 +22,7 @@ true_byte = int8_t(1)
 false_byte = int8_t(0)
 cstring = voidptr_t
 struct_types = {}
+_aggregate_namespace_counter = count(1)
 
 
 class SemanticError(ValueError):
@@ -31,6 +35,7 @@ class FileScopeObjectState:
     linkage: str
     definition_kind: str
     symbol_name: str
+    ir_type: object
 
 
 @dataclass
@@ -39,6 +44,30 @@ class FileScopeFunctionState:
     linkage: str
     defined: bool
     symbol_name: str
+
+
+@dataclass
+class StructFieldLayout:
+    name: object
+    byte_offset: int
+    semantic_ir_type: object
+    decl_type: object
+    is_bitfield: bool = False
+    storage_byte_offset: int = 0
+    storage_ir_type: object = None
+    bit_offset: int = 0
+    bit_width: int = 0
+    is_unsigned: bool = False
+
+
+@dataclass
+class BitFieldRef:
+    container_ptr: object
+    storage_ir_type: object
+    bit_offset: int
+    bit_width: int
+    semantic_ir_type: object
+    is_unsigned: bool
 
 # Libc function signature registry: name -> (return_type, [param_types], var_arg)
 # Covers: stdio.h, stdlib.h, string.h, ctype.h, math.h, unistd.h, time.h
@@ -113,6 +142,15 @@ LIBC_FUNCTIONS = {
     "qsort": (_VOID, [voidptr_t, _size_t, _size_t, voidptr_t], False),
     "bsearch": (voidptr_t, [voidptr_t, voidptr_t, _size_t, _size_t, voidptr_t], False),
     "getenv": (cstring, [cstring], False),
+    "getlogin": (cstring, [], False),
+    "getpwent": (voidptr_t, [], False),
+    "getpwnam": (voidptr_t, [cstring], False),
+    "getpwuid": (voidptr_t, [int32_t], False),
+    "setpwent": (_VOID, [], False),
+    "endpwent": (_VOID, [], False),
+    "setenv": (int32_t, [cstring, cstring, int32_t], False),
+    "putenv": (int32_t, [cstring], False),
+    "unsetenv": (int32_t, [cstring], False),
     "system": (int32_t, [cstring], False),
     # === string.h ===
     "strlen": (_size_t, [cstring], False),
@@ -122,6 +160,8 @@ LIBC_FUNCTIONS = {
     "strncpy": (cstring, [cstring, cstring, _size_t], False),
     "strcat": (cstring, [cstring, cstring], False),
     "strncat": (cstring, [cstring, cstring, _size_t], False),
+    "strlcpy": (_size_t, [cstring, cstring, _size_t], False),
+    "strlcat": (_size_t, [cstring, cstring, _size_t], False),
     "strchr": (cstring, [cstring, int32_t], False),
     "strrchr": (cstring, [cstring, int32_t], False),
     "strstr": (cstring, [cstring, cstring], False),
@@ -149,6 +189,34 @@ LIBC_FUNCTIONS = {
     "isgraph": (int32_t, [int32_t], False),
     "toupper": (int32_t, [int32_t], False),
     "tolower": (int32_t, [int32_t], False),
+    # === wchar.h / wctype.h ===
+    "mbtowc": (int32_t, [int32_t.as_pointer(), cstring, _size_t], False),
+    "wctomb": (int32_t, [cstring, int32_t], False),
+    "mbrlen": (_size_t, [cstring, _size_t, voidptr_t], False),
+    "mbrtowc": (_size_t, [int32_t.as_pointer(), cstring, _size_t, voidptr_t], False),
+    "mbsrtowcs": (_size_t, [int32_t.as_pointer(), voidptr_t, _size_t, voidptr_t], False),
+    "mbstowcs": (_size_t, [int32_t.as_pointer(), cstring, _size_t], False),
+    "wcrtomb": (_size_t, [cstring, int32_t, voidptr_t], False),
+    "wcsrtombs": (_size_t, [cstring, voidptr_t, _size_t, voidptr_t], False),
+    "wcstombs": (_size_t, [cstring, voidptr_t, _size_t], False),
+    "wcwidth": (int32_t, [int32_t], False),
+    "wcswidth": (int32_t, [voidptr_t, _size_t], False),
+    "wmemchr": (voidptr_t, [voidptr_t, int32_t, _size_t], False),
+    "wmemcpy": (voidptr_t, [voidptr_t, voidptr_t, _size_t], False),
+    "wmemmove": (voidptr_t, [voidptr_t, voidptr_t, _size_t], False),
+    "wmemcmp": (int32_t, [voidptr_t, voidptr_t, _size_t], False),
+    "iswalnum": (int32_t, [int32_t], False),
+    "iswalpha": (int32_t, [int32_t], False),
+    "iswcntrl": (int32_t, [int32_t], False),
+    "iswctype": (int32_t, [int32_t, int32_t], False),
+    "iswgraph": (int32_t, [int32_t], False),
+    "iswlower": (int32_t, [int32_t], False),
+    "iswprint": (int32_t, [int32_t], False),
+    "iswspace": (int32_t, [int32_t], False),
+    "iswupper": (int32_t, [int32_t], False),
+    "towlower": (int32_t, [int32_t], False),
+    "towupper": (int32_t, [int32_t], False),
+    "wctype": (int32_t, [cstring], False),
     # === math.h ===
     "sin": (_double, [_double], False),
     "cos": (_double, [_double], False),
@@ -174,7 +242,9 @@ LIBC_FUNCTIONS = {
     "round": (_double, [_double], False),
     "trunc": (_double, [_double], False),
     "fmod": (_double, [_double, _double], False),
+    "fabsf": (_float, [_float], False),
     "fabs": (_double, [_double], False),
+    "fabsl": (_double, [_double], False),
     "ldexp": (_double, [_double, int32_t], False),
     # === time.h ===
     "time": (_time_t, [voidptr_t], False),
@@ -182,36 +252,75 @@ LIBC_FUNCTIONS = {
     "difftime": (_double, [_time_t, _time_t], False),
     "gmtime_r": (voidptr_t, [voidptr_t, voidptr_t], False),
     "localtime_r": (voidptr_t, [voidptr_t, voidptr_t], False),
+    "nanosleep": (int32_t, [voidptr_t, voidptr_t], False),
     # === unistd.h (POSIX) ===
     "sleep": (int32_t, [int32_t], False),
+    "alarm": (int32_t, [int32_t], False),
     "usleep": (int32_t, [int32_t], False),
     "read": (int64_t, [int32_t, voidptr_t, _size_t], False),
     "write": (int64_t, [int32_t, voidptr_t, _size_t], False),
+    "getuid": (int32_t, [], False),
+    "geteuid": (int32_t, [], False),
     "open": (int32_t, [cstring, int32_t], True),
     "close": (int32_t, [int32_t], False),
+    "access": (int32_t, [cstring, int32_t], False),
+    "fcntl": (int32_t, [int32_t, int32_t], True),
+    "fsync": (int32_t, [int32_t], False),
+    "ftruncate": (int32_t, [int32_t, int64_t], False),
+    "pread": (int64_t, [int32_t, voidptr_t, _size_t, int64_t], False),
+    "pwrite": (int64_t, [int32_t, voidptr_t, _size_t, int64_t], False),
+    "unlink": (int32_t, [cstring], False),
+    "readlink": (int64_t, [cstring, cstring, _size_t], False),
     "getpid": (int32_t, [], False),
     "getppid": (int32_t, [], False),
+    "sysconf": (int64_t, [int32_t], False),
     "isatty": (int32_t, [int32_t], False),
     "mkstemp": (int32_t, [cstring], False),
+    "tcdrain": (int32_t, [int32_t], False),
+    "tcflow": (int32_t, [int32_t, int32_t], False),
+    "tcgetattr": (int32_t, [int32_t, voidptr_t], False),
+    "tcsetattr": (int32_t, [int32_t, int32_t, voidptr_t], False),
+    "select": (int32_t, [int32_t, voidptr_t, voidptr_t, voidptr_t, voidptr_t], False),
+    "pselect": (int32_t, [int32_t, voidptr_t, voidptr_t, voidptr_t, voidptr_t, voidptr_t], False),
     # === setjmp.h ===
     "setjmp": (int32_t, [voidptr_t], False),
     "longjmp": (_VOID, [voidptr_t, int32_t], False),
     "_setjmp": (int32_t, [voidptr_t], False),
     "_longjmp": (_VOID, [voidptr_t, int32_t], False),
+    "sigsetjmp": (int32_t, [voidptr_t, int32_t], False),
+    "siglongjmp": (_VOID, [voidptr_t, int32_t], False),
     # === signal.h ===
     "signal": (voidptr_t, [int32_t, voidptr_t], False),
     "sigaction": (int32_t, [int32_t, voidptr_t, voidptr_t], False),
+    "sigaddset": (int32_t, [voidptr_t, int32_t], False),
+    "sigdelset": (int32_t, [voidptr_t, int32_t], False),
     "sigemptyset": (int32_t, [voidptr_t], False),
+    "sigismember": (int32_t, [voidptr_t, int32_t], False),
+    "sigprocmask": (int32_t, [int32_t, voidptr_t, voidptr_t], False),
+    "sigsuspend": (int32_t, [voidptr_t], False),
+    "kill": (int32_t, [int32_t, int32_t], False),
     "raise": (int32_t, [int32_t], False),
     # === errno ===
     "__errno_location": (ir.IntType(32).as_pointer(), [], False),
     # === locale.h ===
     "setlocale": (cstring, [int32_t, cstring], False),
     "localeconv": (voidptr_t, [], False),
+    "nl_langinfo": (cstring, [int32_t], False),
     # === misc ===
     "tmpnam": (cstring, [cstring], False),
     "tmpfile": (voidptr_t, [], False),
     "__errno_location": (int32_t.as_pointer(), [], False),
+    "stat": (int32_t, [cstring, voidptr_t], False),
+    "fstat": (int32_t, [int32_t, voidptr_t], False),
+    "lstat": (int32_t, [cstring, voidptr_t], False),
+    "chmod": (int32_t, [cstring, int32_t], False),
+    "fchmod": (int32_t, [int32_t, int32_t], False),
+    "mkdir": (int32_t, [cstring, int32_t], False),
+    "umask": (int32_t, [int32_t], False),
+    "utime": (int32_t, [cstring, voidptr_t], False),
+    "utimes": (int32_t, [cstring, voidptr_t], False),
+    "futimes": (int32_t, [int32_t, voidptr_t], False),
+    "gettimeofday": (int32_t, [voidptr_t, voidptr_t], False),
     "gmtime": (voidptr_t, [voidptr_t], False),
     "localtime": (voidptr_t, [voidptr_t], False),
     "mktime": (_time_t, [voidptr_t], False),
@@ -223,10 +332,28 @@ LIBC_FUNCTIONS = {
     "__builtin_va_start": (_VOID, [voidptr_t], False),
     "__builtin_va_end": (_VOID, [voidptr_t], False),
     "__builtin_va_copy": (_VOID, [voidptr_t, voidptr_t], False),
+    "__builtin_alloca": (voidptr_t, [int64_t], False),
     "__builtin_expect": (int64_t, [int64_t, int64_t], False),
+    "__builtin_assume": (_VOID, [int64_t], False),
+    "__builtin_prefetch": (_VOID, [voidptr_t, int32_t, int32_t], False),
     "__builtin_unreachable": (_VOID, [], False),
+    "__builtin_add_overflow": (int32_t, [int64_t, int64_t, voidptr_t], False),
+    "__builtin_sub_overflow": (int32_t, [int64_t, int64_t, voidptr_t], False),
+    "__builtin_mul_overflow": (int32_t, [int64_t, int64_t, voidptr_t], False),
+    "__builtin_bswap16": (int32_t, [int32_t], False),
+    "__builtin_bswap32": (int32_t, [int32_t], False),
+    "__builtin_bswap64": (int64_t, [int64_t], False),
     "__builtin_clz": (int32_t, [int32_t], False),
+    "__builtin_clzll": (int32_t, [int64_t], False),
     "__builtin_ctz": (int32_t, [int32_t], False),
+    "__builtin_ctzll": (int32_t, [int64_t], False),
+    "__builtin_rotateleft32": (int32_t, [int32_t, int32_t], False),
+    "__builtin_rotateleft64": (int64_t, [int64_t, int64_t], False),
+    "__builtin_rotateright32": (int32_t, [int32_t, int32_t], False),
+    "__builtin_rotateright64": (int64_t, [int64_t, int64_t], False),
+    "__sync_synchronize": (_VOID, [], False),
+    "__atomic_load_n": (int64_t, [voidptr_t, int32_t], False),
+    "__atomic_store_n": (_VOID, [voidptr_t, int64_t, int32_t], False),
     "modf": (_double, [_double, ir.DoubleType().as_pointer()], False),
     "ldexp": (_double, [_double, int32_t], False),
     "__builtin_va_arg": (voidptr_t, [voidptr_t, int64_t], False),
@@ -302,25 +429,10 @@ _PCC_VAARG_CALL_RE = re.compile(
 )
 
 
-_INVALID_VOID_INSTR_RE = re.compile(
-    r"^(?:%\S+\s*=\s*)?(?:alloca|load|bitcast) void(?! \()([,\s]|$)|^store void(?! \()([,\s]|$)"
-)
-
-_LABEL_RE = re.compile(r"^[A-Za-z$._][A-Za-z0-9$._-]*:$")
-
-
 def postprocess_ir_text(text):
-    """Apply textual IR rewrites that llvmlite cannot express directly."""
+    """Apply the minimal textual lowering that llvmlite cannot express directly."""
 
-    # --- simple regex rewrites ---
     text = _PCC_VAARG_DECL_RE.sub("", text)
-    text = re.sub(
-        r"bitcast i64 (%\S+) to (i8\*|[^,\n]+\*)", r"inttoptr i64 \1 to \2", text
-    )
-    text = re.sub(
-        r"bitcast i8 (%\S+) to (i8\*|[^,\n]+\*)", r"inttoptr i8 \1 to \2", text
-    )
-    text = re.sub(r"ptrtoint \[\d+ x i8\] [^\n]+ to i64", "add i64 0, 0", text)
 
     def repl(match):
         lhs = match.group("lhs")
@@ -330,78 +442,7 @@ def postprocess_ir_text(text):
         return f"{lhs} = va_arg {argtype} {argval}, {rettype}"
 
     text = _PCC_VAARG_CALL_RE.sub(repl, text)
-
-    # --- line-level fixups ---
-    lines = []
-    for line in text.splitlines():
-        # Fix Python repr leak in array initializers → zeroinitializer
-        if "<ir.Constant" in line:
-            m = re.match(r'(@"[^"]*"\s*=\s*(?:global|constant)\s*\[[^\]]*\]).*', line)
-            if m:
-                line = m.group(1) + " zeroinitializer"
-            else:
-                continue
-        s = line.strip()
-        # Drop invalid void instructions (alloca void, load void, store void)
-        if _INVALID_VOID_INSTR_RE.match(s):
-            continue
-        lines.append(line)
-
-    # Deduplicate switch case values
-    deduped = []
-    for line in lines:
-        s = line.strip()
-        if s.startswith("switch i64 ") and "[" in line and "]" in line:
-            prefix, rest = line.split("[", 1)
-            case_text, suffix = rest.rsplit("]", 1)
-            cases = re.findall(r'(i64 -?\d+, label %"[^"]*")', case_text)
-            if cases:
-                seen = set()
-                unique = []
-                for case in cases:
-                    val = re.match(r"i64 (-?\d+)", case).group(1)
-                    if val not in seen:
-                        seen.add(val)
-                        unique.append(case)
-                line = prefix + "[" + " ".join(unique) + "]" + suffix
-        deduped.append(line)
-
-    # Repair control flow: drop dead code after terminators, bridge empty labels
-    def _is_label(s):
-        return bool(_LABEL_RE.match(s))
-
-    def _is_terminator(s):
-        return s.startswith(("br ", "ret ", "switch ", "unreachable", "resume "))
-
-    repaired = []
-    skip_dead = False
-    for raw in deduped:
-        s = raw.strip()
-        if skip_dead:
-            if _is_label(s):
-                skip_dead = False
-            else:
-                continue
-        if (
-            repaired
-            and _is_terminator(repaired[-1].strip())
-            and s
-            and raw.startswith("  ")
-            and not _is_label(s)
-        ):
-            skip_dead = True
-            continue
-        if repaired and _is_label(s):
-            prev = repaired[-1].strip()
-            if _is_label(prev):
-                repaired.append(f'  br label %"{s[:-1]}"')
-            elif prev not in {"", "{"} and not _is_terminator(prev):
-                repaired.append(f'  br label %"{s[:-1]}"')
-        if s == "}" and repaired and _is_label(repaired[-1].strip()):
-            repaired.append("  unreachable")
-        repaired.append(raw)
-
-    return "\n".join(repaired)
+    return text
 
 
 def get_ir_type_from_names(names):
@@ -431,12 +472,14 @@ def get_ir_type_from_names(names):
         "void": ir.VoidType(),
         "double": _double,
         "float": _float,
+        "_Float16": _float,
         "short": int16_t,
         "long": int64_t,
         "int short": int16_t,
         "int long": int64_t,
         "long long": int64_t,
         "int long long": int64_t,
+        "__int128": int128_t,
         "char unsigned": int8_t,
         "int unsigned": int32_t,
         "unsigned": int32_t,
@@ -445,6 +488,7 @@ def get_ir_type_from_names(names):
         "int long unsigned": int64_t,
         "long unsigned": int64_t,
         "long long unsigned": int64_t,
+        "__int128 unsigned": int128_t,
         # size_t, etc.
         "size_t": int64_t,
         "ssize_t": int64_t,
@@ -465,6 +509,8 @@ def get_ir_type_from_names(names):
     if "double" in names:
         return _double
     if "float" in names:
+        return _float
+    if "_Float16" in names:
         return _float
     # If it contains 'char', return i8
     if "char" in names:
@@ -490,14 +536,20 @@ def _resolve_node_type(node_type):
         if isinstance(inner, c_ast.FuncDecl):
             ret_type = _resolve_node_type(inner.type)
             param_types = []
+            is_var_arg = False
             if inner.args:
                 for p in inner.args.params:
                     if isinstance(p, c_ast.EllipsisParam):
+                        is_var_arg = True
                         continue
                     t = get_ir_type_from_node(p)
                     if not isinstance(t, ir.VoidType):
                         param_types.append(t)
-            return ir.FunctionType(ret_type, param_types).as_pointer()
+            return ir.FunctionType(
+                ret_type,
+                param_types,
+                var_arg=is_var_arg,
+            ).as_pointer()
         pointee = _resolve_node_type(inner)
         if isinstance(pointee, ir.VoidType):
             return voidptr_t
@@ -507,7 +559,7 @@ def _resolve_node_type(node_type):
             return get_ir_type(node_type.type.names)
         elif isinstance(node_type.type, c_ast.Struct):
             snode = node_type.type
-            if snode.decls:
+            if snode.decls is not None:
                 # Inline struct with declarations — build real type
                 member_types = []
                 for decl in snode.decls:
@@ -519,8 +571,15 @@ def _resolve_node_type(node_type):
             return int8_t  # opaque/forward-declared struct
         elif isinstance(node_type.type, c_ast.Union):
             unode = node_type.type
-            if unode.decls:
+            if unode.decls is not None:
                 # Inline union with declarations — compute max size
+                if len(unode.decls) == 0:
+                    ut = ir.LiteralStructType([])
+                    ut.members = []
+                    ut.member_types = {}
+                    ut.member_decl_types = {}
+                    ut.is_union = True
+                    return ut
                 max_size = 0
                 max_align = 1
                 member_types = {}
@@ -548,7 +607,7 @@ def _resolve_node_type(node_type):
                     ir_t = _resolve_union_member_type(decl.type)
                     member_types[decl.name] = ir_t
                     sz = ir_t.width // 8 if isinstance(ir_t, ir.IntType) else 8
-                    if isinstance(ir_t, ir.LiteralStructType):
+                    if _is_struct_ir_type(ir_t):
                         sz = sum(
                             e.width // 8 if isinstance(e, ir.IntType) else 8
                             for e in ir_t.elements
@@ -576,10 +635,16 @@ def _resolve_node_type(node_type):
                 ut.is_union = True
                 return ut
             return int8_t  # opaque/forward-declared union
+        elif isinstance(node_type.type, c_ast.Enum):
+            return int32_t
         return int64_t
     elif isinstance(node_type, c_ast.ArrayDecl):
         return voidptr_t  # array params decay to pointer
     return int64_t
+
+
+def _is_struct_ir_type(ir_type):
+    return isinstance(ir_type, (ir.LiteralStructType, ir.IdentifiedStructType))
 
 
 class LLVMCodeGenerator(object):
@@ -601,6 +666,8 @@ class LLVMCodeGenerator(object):
         self.env = ChainMap()
         self.nlabels = 0
         self.function = None
+        self._function_display_name = None
+        self._frame_address_marker = None
         self.in_global = True
         self._declared_libc = set()
         self._unsigned_bindings = set()  # alloca/global ids with unsigned type
@@ -609,10 +676,17 @@ class LLVMCodeGenerator(object):
         self._expr_ir_types = {}
         self._labels = {}
         self._vaarg_counter = 0
+        self._anon_type_counter = 0
         self._file_scope_object_states = {}
         self._file_scope_function_states = {}
+        self._future_file_scope_object_ir_types = {}
+        self._future_file_scope_function_ir_types = {}
         self.translation_unit_name = self._sanitize_translation_unit_name(
             translation_unit_name
+        )
+        base_namespace = self.translation_unit_name or "pcc"
+        self._aggregate_namespace = (
+            f"{base_namespace}_{next(_aggregate_namespace_counter)}"
         )
 
     def define(self, name, val):
@@ -624,6 +698,29 @@ class LLVMCodeGenerator(object):
             return None
         return re.sub(r"\W+", "_", name)
 
+    @staticmethod
+    def _tag_type_key(name):
+        return f"__struct_{name}"
+
+    def _next_anon_struct_name(self, kind):
+        self._anon_type_counter += 1
+        return (
+            f"__pcc_{self._aggregate_namespace}_{kind}_{self._anon_type_counter}"
+        )
+
+    def _aggregate_type_name(self, kind, name=None):
+        if name:
+            return f"__pcc_{self._aggregate_namespace}_{kind}_{name}"
+        return self._next_anon_struct_name(kind)
+
+    def _identified_aggregate_type(self, kind, name, body):
+        aggregate_type = self.module.context.get_identified_type(
+            self._aggregate_type_name(kind, name)
+        )
+        if aggregate_type.is_opaque:
+            aggregate_type.set_body(*body)
+        return aggregate_type
+
     def _is_file_scope_static(self, storage=None):
         return (
             self.translation_unit_name
@@ -632,8 +729,17 @@ class LLVMCodeGenerator(object):
             and "static" in storage
         )
 
-    def _file_scope_symbol_name(self, name, storage=None):
-        if self._is_file_scope_static(storage):
+    def _has_internal_inline_linkage(self, storage=None, funcspec=None):
+        return (
+            self.translation_unit_name
+            and self.in_global
+            and funcspec
+            and "inline" in funcspec
+            and not storage
+        )
+
+    def _file_scope_symbol_name(self, name, storage=None, funcspec=None, linkage=None):
+        if linkage == "internal" or self._is_file_scope_static(storage) or self._has_internal_inline_linkage(storage, funcspec):
             return f"__pcc_internal_{self.translation_unit_name}_{name}"
         return name
 
@@ -656,16 +762,28 @@ class LLVMCodeGenerator(object):
         self.define(bind_name, (ir_type, gv))
         return gv
 
-    def _decl_linkage(self, storage=None, existing_state=None):
+    def _decl_linkage(self, storage=None, funcspec=None, existing_state=None):
         if storage and "static" in storage:
+            return "internal"
+        if self._has_internal_inline_linkage(storage, funcspec):
             return "internal"
         if existing_state is not None:
             return existing_state.linkage
         return "external"
 
-    def _effective_file_scope_symbol_name(self, name, storage=None, existing_state=None):
-        if storage and "static" in storage:
-            return f"__pcc_internal_{self.translation_unit_name}_{name}"
+    def _effective_file_scope_symbol_name(
+        self, name, storage=None, funcspec=None, existing_state=None, linkage=None
+    ):
+        if linkage is None:
+            linkage = self._decl_linkage(
+                storage, funcspec=funcspec, existing_state=existing_state
+            )
+        if linkage == "internal":
+            if existing_state is not None and existing_state.linkage == "internal":
+                return existing_state.symbol_name
+            return self._file_scope_symbol_name(
+                name, storage=storage, funcspec=funcspec, linkage=linkage
+            )
         if existing_state is not None and existing_state.linkage == "internal":
             return existing_state.symbol_name
         return name
@@ -677,11 +795,54 @@ class LLVMCodeGenerator(object):
             return "definition"
         return "tentative"
 
+    def _is_incomplete_array_ir_type(self, ir_type):
+        return isinstance(ir_type, ir.ArrayType) and ir_type.count == 0
+
+    def _are_compatible_object_ir_types(self, existing_ir_type, new_ir_type):
+        if str(existing_ir_type) == str(new_ir_type):
+            return True
+        if not (
+            isinstance(existing_ir_type, ir.ArrayType)
+            and isinstance(new_ir_type, ir.ArrayType)
+        ):
+            return False
+        if str(existing_ir_type.element) != str(new_ir_type.element):
+            return False
+        return (
+            existing_ir_type.count == 0
+            or new_ir_type.count == 0
+            or existing_ir_type.count == new_ir_type.count
+        )
+
+    def _merge_object_ir_types(self, existing_ir_type, new_ir_type):
+        if self._is_incomplete_array_ir_type(existing_ir_type) and not self._is_incomplete_array_ir_type(new_ir_type):
+            return new_ir_type
+        return existing_ir_type
+
+    def _preferred_file_scope_object_ir_type(self, name, ir_type):
+        future_ir_type = self._future_file_scope_object_ir_types.get(name)
+        if future_ir_type is None:
+            return ir_type
+        if not self._are_compatible_object_ir_types(ir_type, future_ir_type):
+            return ir_type
+        return self._merge_object_ir_types(ir_type, future_ir_type)
+
+    def _preferred_file_scope_function_ir_type(self, name, function_type, has_prototype):
+        if has_prototype:
+            return function_type
+        future_type = self._future_file_scope_function_ir_types.get(name)
+        if future_type is None:
+            return function_type
+        if str(function_type.return_type) != str(future_type.return_type):
+            return function_type
+        return future_type
+
     def _prepare_file_scope_object(self, name, ir_type, storage=None, has_initializer=False):
         if not self.in_global or name is None:
             return None, True
         if name in self._file_scope_function_states:
             raise SemanticError(f"'{name}' redeclared as object after function declaration")
+        ir_type = self._preferred_file_scope_object_ir_type(name, ir_type)
 
         type_key = str(ir_type)
         definition_kind = self._file_scope_object_definition_kind(
@@ -699,6 +860,7 @@ class LLVMCodeGenerator(object):
                 linkage=linkage,
                 definition_kind=definition_kind,
                 symbol_name=symbol_name,
+                ir_type=ir_type,
             )
             self._file_scope_object_states[name] = state
             if definition_kind == "extern":
@@ -709,8 +871,11 @@ class LLVMCodeGenerator(object):
             )
             return gv, True
 
-        if state.type_key != type_key:
+        if not self._are_compatible_object_ir_types(state.ir_type, ir_type):
             raise SemanticError(f"conflicting types for global '{name}'")
+        merged_ir_type = self._merge_object_ir_types(state.ir_type, ir_type)
+        state.ir_type = merged_ir_type
+        state.type_key = str(merged_ir_type)
         if state.linkage != linkage:
             raise SemanticError(f"conflicting linkage for global '{name}'")
         if state.symbol_name != symbol_name:
@@ -719,9 +884,9 @@ class LLVMCodeGenerator(object):
         existing = self.module.globals.get(symbol_name)
         if definition_kind == "extern":
             if existing is not None:
-                self.define(name, (ir_type, existing))
+                self.define(name, (merged_ir_type, existing))
             else:
-                self._record_extern_global(name, ir_type, storage=storage)
+                self._record_extern_global(name, merged_ir_type, storage=storage)
             return None, False
 
         if existing is None:
@@ -747,7 +912,7 @@ class LLVMCodeGenerator(object):
         return gv, True
 
     def _register_file_scope_function(
-        self, name, function_type, storage=None, is_definition=False
+        self, name, function_type, storage=None, funcspec=None, is_definition=False
     ):
         if not self.in_global or name is None:
             return
@@ -756,9 +921,13 @@ class LLVMCodeGenerator(object):
 
         type_key = str(function_type)
         state = self._file_scope_function_states.get(name)
-        linkage = self._decl_linkage(storage, existing_state=state)
+        linkage = self._decl_linkage(storage, funcspec=funcspec, existing_state=state)
         symbol_name = self._effective_file_scope_symbol_name(
-            name, storage=storage, existing_state=state
+            name,
+            storage=storage,
+            funcspec=funcspec,
+            existing_state=state,
+            linkage=linkage,
         )
 
         if state is None:
@@ -781,6 +950,12 @@ class LLVMCodeGenerator(object):
                 raise SemanticError(f"redefinition of function '{name}'")
             state.defined = True
         return state.symbol_name
+
+    @staticmethod
+    def _function_arg_types_match(lhs_args, rhs_args):
+        if len(lhs_args) != len(rhs_args):
+            return False
+        return all(str(lhs) == str(rhs) for lhs, rhs in zip(lhs_args, rhs_args))
 
     def external_definitions(self):
         defs = []
@@ -805,12 +980,65 @@ class LLVMCodeGenerator(object):
             and node.name is not None
         )
 
-    def _extern_decl_ir_type(self, node_type):
+    def _extern_decl_ir_type(self, name, node_type):
         if isinstance(node_type, c_ast.ArrayDecl):
-            return self._build_array_ir_type(node_type)
+            ir_type = self._build_array_ir_type(node_type)
+        else:
+            ir_type = self._resolve_ast_type(node_type)
+        return self._preferred_file_scope_object_ir_type(name, ir_type)
+
+    def _static_local_ir_type(self, node_type, init_node=None):
+        if isinstance(node_type, c_ast.ArrayDecl):
+            return self._build_array_ir_type(node_type, init_node=init_node)
         return self._resolve_ast_type(node_type)
 
+    def _collect_file_scope_object_ir_types(self, ext_nodes):
+        merged_types = {}
+        for ext in ext_nodes:
+            if not (
+                isinstance(ext, c_ast.Decl)
+                and ext.name is not None
+                and not isinstance(ext.type, c_ast.FuncDecl)
+            ):
+                continue
+            try:
+                if isinstance(ext.type, c_ast.ArrayDecl):
+                    ir_type = self._build_array_ir_type(ext.type, init_node=ext.init)
+                else:
+                    ir_type = self._resolve_ast_type(ext.type)
+            except Exception:
+                continue
+            existing_ir_type = merged_types.get(ext.name)
+            if existing_ir_type is None:
+                merged_types[ext.name] = ir_type
+                continue
+            if self._are_compatible_object_ir_types(existing_ir_type, ir_type):
+                merged_types[ext.name] = self._merge_object_ir_types(
+                    existing_ir_type, ir_type
+                )
+        self._future_file_scope_object_ir_types = merged_types
+
+    def _collect_file_scope_function_ir_types(self, ext_nodes):
+        future_types = {}
+        for ext in ext_nodes:
+            decl = None
+            if isinstance(ext, c_ast.FuncDef):
+                decl = ext.decl
+            elif isinstance(ext, c_ast.Decl) and isinstance(ext.type, c_ast.FuncDecl):
+                decl = ext
+            if decl is None or decl.name is None:
+                continue
+            if getattr(decl.type, "args", None) is None:
+                continue
+            try:
+                function_type, _ = self._build_function_ir_type(decl.type)
+            except Exception:
+                continue
+            future_types[decl.name] = function_type
+        self._future_file_scope_function_ir_types = future_types
+
     def _record_extern_global(self, name, ir_type, storage=None):
+        ir_type = self._preferred_file_scope_object_ir_type(name, ir_type)
         self.define(
             name,
             (
@@ -937,6 +1165,34 @@ class LLVMCodeGenerator(object):
             return self._convert_int_value(val, int32_t, result_unsigned=False)
         return val
 
+    def _integer_promotion_ir_type(self, ir_type):
+        if not isinstance(ir_type, ir.IntType):
+            return ir_type
+        if ir_type.width < int32_t.width:
+            return int32_t
+        return ir_type
+
+    def _usual_arithmetic_conversion_ir_type(self, lhs_type, rhs_type):
+        lhs_type = self._integer_promotion_ir_type(lhs_type)
+        rhs_type = self._integer_promotion_ir_type(rhs_type)
+
+        if self._is_floating_ir_type(lhs_type) or self._is_floating_ir_type(rhs_type):
+            if self._is_floating_ir_type(lhs_type) and self._is_floating_ir_type(
+                rhs_type
+            ):
+                return self._common_float_type(lhs_type, rhs_type)
+            return lhs_type if self._is_floating_ir_type(lhs_type) else rhs_type
+
+        if isinstance(lhs_type, ir.IntType) and isinstance(rhs_type, ir.IntType):
+            return lhs_type if lhs_type.width >= rhs_type.width else rhs_type
+
+        return lhs_type
+
+    def _decay_ir_type(self, ir_type):
+        if isinstance(ir_type, ir.ArrayType):
+            return ir.PointerType(ir_type.element)
+        return ir_type
+
     def _usual_arithmetic_conversion(self, lhs, rhs):
         lhs = self._integer_promotion(lhs)
         rhs = self._integer_promotion(rhs)
@@ -986,10 +1242,18 @@ class LLVMCodeGenerator(object):
         return _float
 
     def _parse_float_constant(self, raw):
+        is_float32 = raw.endswith(("f", "F"))
         value = raw.rstrip("fFlL")
         if value.lower().startswith("0x") and "p" in value.lower():
-            return float.fromhex(value)
-        return float(value)
+            parsed = float.fromhex(value)
+        else:
+            parsed = float(value)
+        if is_float32:
+            try:
+                return struct.unpack("!f", struct.pack("!f", parsed))[0]
+            except OverflowError:
+                return math.copysign(float("inf"), parsed)
+        return parsed
 
     def _float_literal_ir_type(self, raw):
         if raw.endswith(("f", "F")):
@@ -1089,16 +1353,21 @@ class LLVMCodeGenerator(object):
     @contextmanager
     def new_function(self):
         oldfunc = self.function
+        old_display_name = self._function_display_name
+        old_frame_address_marker = self._frame_address_marker
         oldbuilder = self.builder
         oldenv = self.env
         oldlabels = self._labels
         self.in_global = False
         self.env = self.env.new_child()
         self._labels = {}
+        self._frame_address_marker = None
         try:
             yield
         finally:
             self.function = oldfunc
+            self._function_display_name = old_display_name
+            self._frame_address_marker = old_frame_address_marker
             self.builder = oldbuilder
             self.env = oldenv
             self._labels = oldlabels
@@ -1200,9 +1469,11 @@ class LLVMCodeGenerator(object):
         for i, ext in enumerate(node.ext):
             is_type_def = False
             if isinstance(ext, c_ast.Decl):
-                if isinstance(ext.type, (c_ast.Struct, c_ast.Union, c_ast.Enum)):
+                if ext.name is None and isinstance(
+                    ext.type, (c_ast.Struct, c_ast.Union, c_ast.Enum)
+                ):
                     is_type_def = True
-                elif isinstance(ext.type, c_ast.TypeDecl) and isinstance(
+                elif ext.name is None and isinstance(ext.type, c_ast.TypeDecl) and isinstance(
                     ext.type.type, (c_ast.Struct, c_ast.Union)
                 ):
                     is_type_def = True
@@ -1214,6 +1485,9 @@ class LLVMCodeGenerator(object):
                 except Exception:
                     pass
                 pass1.add(i)
+        remaining_exts = [ext for i, ext in enumerate(node.ext) if i not in pass1]
+        self._collect_file_scope_function_ir_types(remaining_exts)
+        self._collect_file_scope_object_ir_types(remaining_exts)
         for i, ext in enumerate(node.ext):
             if i not in pass1:
                 try:
@@ -1297,15 +1571,37 @@ class LLVMCodeGenerator(object):
         if node.type == "int":
             # Support hex (0xFF), octal (077), and decimal literals
             raw = node.value
-            is_unsigned = "u" in raw.lower() or "U" in raw
+            raw_lower = raw.lower()
+            has_unsigned_suffix = "u" in raw_lower
+            has_long_suffix = "l" in raw_lower
             val_str = raw.rstrip("uUlL")
             if val_str.startswith("0x") or val_str.startswith("0X"):
                 int_val = int(val_str, 16)
+                is_non_decimal = True
             elif val_str.startswith("0") and len(val_str) > 1 and val_str[1:].isdigit():
                 int_val = int(val_str, 8)
+                is_non_decimal = True
             else:
                 int_val = int(val_str)
-            result = ir.values.Constant(ir.IntType(64), int_val)
+                is_non_decimal = False
+
+            if has_long_suffix or int_val > 0xFFFFFFFF:
+                ir_type = int64_t
+                is_unsigned = has_unsigned_suffix
+            elif has_unsigned_suffix:
+                ir_type = int32_t
+                is_unsigned = True
+            elif is_non_decimal and int_val > 0x7FFFFFFF:
+                ir_type = int32_t
+                is_unsigned = True
+            elif int_val > 0x7FFFFFFF:
+                ir_type = int64_t
+                is_unsigned = False
+            else:
+                ir_type = int32_t
+                is_unsigned = False
+
+            result = ir.values.Constant(ir_type, int_val)
             if is_unsigned:
                 self._tag_unsigned(result)
             return result, None
@@ -1339,6 +1635,7 @@ class LLVMCodeGenerator(object):
         if lv is None or rv is None:
             return ir.Constant(int64_t, 0), None
         result = None
+        is_bitfield = isinstance(lv_addr, BitFieldRef)
 
         dispatch_type_double = 1
         dispatch_type_int = 0
@@ -1394,13 +1691,19 @@ class LLVMCodeGenerator(object):
 
         if node.op == "=":
             # Type coercion: match rv to the target's pointee type
-            if lv_addr and hasattr(lv_addr.type, "pointee"):
+            if is_bitfield:
+                target_type = lv_addr.semantic_ir_type
+            elif lv_addr and hasattr(lv_addr.type, "pointee"):
                 target_type = lv_addr.type.pointee
             else:
                 target_type = lv.type
             if rv.type != target_type:
                 rv = self._implicit_convert(rv, target_type)
-            self._safe_store(rv, lv_addr)
+            if is_bitfield:
+                self._store_bitfield(rv, lv_addr)
+                rv = self._load_bitfield(lv_addr)
+            else:
+                self._safe_store(rv, lv_addr)
             return rv, lv_addr  # return value for chained assignment
         else:
             # Pointer compound assignment: p += n, p -= n
@@ -1418,6 +1721,9 @@ class LLVMCodeGenerator(object):
                 addresult = handle(lv, rv, "addtmp")
             if dispatch_type == dispatch_type_int and is_unsigned:
                 self._tag_unsigned(addresult)
+            if is_bitfield:
+                self._store_bitfield(addresult, lv_addr)
+                return self._load_bitfield(lv_addr), lv_addr
             self._safe_store(addresult, lv_addr)
             return addresult, lv_addr
 
@@ -1444,8 +1750,12 @@ class LLVMCodeGenerator(object):
                 )
                 if self._is_unsigned_val(lv):
                     self._tag_unsigned(new_val)
-            self._safe_store(new_val, lv_addr)
-            result = lv if is_post else new_val
+            if isinstance(lv_addr, BitFieldRef):
+                self._store_bitfield(new_val, lv_addr)
+                result = lv if is_post else self._load_bitfield(lv_addr)
+            else:
+                self._safe_store(new_val, lv_addr)
+                result = lv if is_post else new_val
 
         elif node.op == "*":
             if (
@@ -1459,8 +1769,8 @@ class LLVMCodeGenerator(object):
                     node.expr.expr.args.exprs if node.expr.expr.args is not None else []
                 )
                 if isinstance(target_ptr_type, ir.PointerType) and va_args:
-                    ap_addr, _ = self.codegen(va_args[0])
-                    if isinstance(getattr(ap_addr, "type", None), ir.PointerType):
+                    ap_addr = self._builtin_va_list_storage(va_args[0])
+                    if ap_addr is not None:
                         self._vaarg_counter += 1
                         name = f"__pcc_va_arg_{self._vaarg_counter}"
                         placeholder = self.module.globals.get(name)
@@ -1483,6 +1793,11 @@ class LLVMCodeGenerator(object):
                 result_ptr = self._decay_array_value_to_pointer(name_ir, "derefarray")
             else:
                 result_ptr = name_ir
+            if isinstance(getattr(result_ptr, "type", None), ir.PointerType) and isinstance(
+                result_ptr.type.pointee, ir.ArrayType
+            ):
+                self._set_expr_ir_type(node, result_ptr.type.pointee)
+                return result_ptr, result_ptr
             result = self._safe_load(result_ptr)
             if self._is_unsigned_pointee(name_ir) or self._is_unsigned_pointee(
                 result_ptr
@@ -1556,12 +1871,15 @@ class LLVMCodeGenerator(object):
         if isinstance(expr, c_ast.Typename):
             ir_t = self._resolve_ast_type(expr.type)
             size = self._ir_type_size(ir_t)
+        elif isinstance(expr, c_ast.Constant) and expr.type == "string":
+            raw = expr.value[1:-1]
+            processed = self._process_escapes(raw)
+            size = len(self._string_bytes(processed + "\00"))
         elif isinstance(expr, c_ast.ID):
             ir_type, _ = self.lookup(expr.name)
             size = self._ir_type_size(ir_type)
         else:
-            val, _ = self.codegen(expr)
-            semantic_type = self._get_expr_ir_type(expr, getattr(val, "type", None))
+            semantic_type = self._infer_sizeof_operand_ir_type(expr)
             size = self._ir_type_size(semantic_type)
         result = ir.Constant(int64_t, size)
         return self._tag_unsigned(result)
@@ -1580,9 +1898,8 @@ class LLVMCodeGenerator(object):
             if isinstance(resolved, str):
                 # Could be a __struct_ reference or a base type name
                 if resolved.startswith("__struct_"):
-                    struct_name = resolved[len("__struct_") :]
-                    if struct_name in self.env:
-                        return self.env[struct_name][0]
+                    if resolved in self.env:
+                        return self.env[resolved][0]
                     return int8_t  # opaque
                 # Recursively resolve further typedefs
                 return self._resolve_type_str(resolved, depth + 1)
@@ -1725,11 +2042,162 @@ class LLVMCodeGenerator(object):
             return None
         return self._scalar_init_node(init_node.exprs[0])
 
+    def _struct_field_names(self, ir_type):
+        member_names = list(getattr(ir_type, "members", ()) or [])
+        if member_names:
+            return member_names
+        member_types = getattr(ir_type, "member_types", None)
+        if isinstance(member_types, dict):
+            return list(member_types.keys())
+        return []
+
+    def _ordered_struct_init_exprs(self, init_node, ir_type):
+        exprs = list(getattr(init_node, "exprs", None) or [])
+        field_names = self._struct_field_names(ir_type)
+        if not exprs or not field_names:
+            return exprs
+        if not any(isinstance(expr, c_ast.NamedInitializer) for expr in exprs):
+            return exprs
+
+        ordered = [None] * len(field_names)
+        cursor = 0
+        index_by_name = {name: i for i, name in enumerate(field_names)}
+
+        for expr in exprs:
+            if isinstance(expr, c_ast.NamedInitializer):
+                designators = getattr(expr, "name", None) or []
+                if len(designators) == 1 and isinstance(designators[0], c_ast.ID):
+                    target = index_by_name.get(designators[0].name)
+                    if target is not None:
+                        ordered[target] = expr.expr
+                        cursor = target + 1
+                continue
+
+            while cursor < len(ordered) and ordered[cursor] is not None:
+                cursor += 1
+            if cursor >= len(ordered):
+                break
+            ordered[cursor] = expr
+            cursor += 1
+
+        return ordered
+
+    def _build_const_address(self, init_node):
+        if isinstance(init_node, c_ast.ID):
+            try:
+                _, sym = self.lookup(init_node.name)
+            except Exception:
+                return None
+            if isinstance(sym, (ir.Function, ir.GlobalVariable)):
+                return sym
+            return None
+
+        if isinstance(init_node, c_ast.Cast):
+            return self._build_const_address(init_node.expr)
+
+        if isinstance(init_node, c_ast.ArrayRef):
+            base_addr = self._build_const_address(init_node.name)
+            if base_addr is None or not isinstance(
+                getattr(base_addr, "type", None), ir.PointerType
+            ):
+                return None
+            try:
+                idx_val = int(self._eval_const_expr(init_node.subscript))
+            except Exception:
+                return None
+            idx0 = ir.Constant(ir.IntType(32), 0)
+            idx = ir.Constant(ir.IntType(32), idx_val)
+            pointee = base_addr.type.pointee
+            try:
+                if isinstance(pointee, ir.ArrayType):
+                    return base_addr.gep([idx0, idx])
+                return base_addr.gep([idx])
+            except Exception:
+                return None
+
+        if isinstance(init_node, c_ast.BinaryOp) and init_node.op in ("+", "-"):
+            base_addr = self._build_const_address(init_node.left)
+            offset_node = init_node.right
+            offset_sign = 1
+            if base_addr is None and init_node.op == "+":
+                base_addr = self._build_const_address(init_node.right)
+                offset_node = init_node.left
+            elif base_addr is None:
+                return None
+            if base_addr is None or not isinstance(
+                getattr(base_addr, "type", None), ir.PointerType
+            ):
+                return None
+            try:
+                idx_val = int(self._eval_const_expr(offset_node))
+            except Exception:
+                return None
+            if init_node.op == "-":
+                idx_val = -idx_val
+            idx0 = ir.Constant(ir.IntType(32), 0)
+            idx = ir.Constant(ir.IntType(32), idx_val)
+            pointee = base_addr.type.pointee
+            try:
+                if isinstance(pointee, ir.ArrayType):
+                    return base_addr.gep([idx0, idx])
+                return base_addr.gep([idx])
+            except Exception:
+                return None
+
+        if isinstance(init_node, c_ast.StructRef):
+            base_addr = self._build_const_address(init_node.name)
+            if base_addr is None or not isinstance(
+                getattr(base_addr, "type", None), ir.PointerType
+            ):
+                return None
+            if (
+                init_node.type == "->"
+                and isinstance(base_addr.type.pointee, ir.ArrayType)
+            ):
+                idx0 = ir.Constant(ir.IntType(32), 0)
+                try:
+                    base_addr = base_addr.gep([idx0, idx0])
+                except Exception:
+                    return None
+            aggregate_type = base_addr.type.pointee
+            try:
+                offset, field_type = self._get_aggregate_field_info(
+                    aggregate_type, init_node.field.name
+                )
+            except Exception:
+                return None
+
+            if (
+                hasattr(aggregate_type, "members")
+                and init_node.field.name in aggregate_type.members
+                and not getattr(aggregate_type, "has_custom_layout", False)
+                and not getattr(aggregate_type, "is_union", False)
+            ):
+                idx0 = ir.Constant(ir.IntType(32), 0)
+                field_index = aggregate_type.members.index(init_node.field.name)
+                try:
+                    return base_addr.gep(
+                        [idx0, ir.Constant(ir.IntType(32), field_index)]
+                    )
+                except Exception:
+                    return None
+
+            try:
+                byte_base = base_addr.bitcast(ir.PointerType(int8_t))
+                byte_addr = byte_base.gep([ir.Constant(ir.IntType(32), offset)])
+                return byte_addr.bitcast(ir.PointerType(field_type))
+            except Exception:
+                return None
+
+        return None
+
     def _build_pointer_const(self, init_node, ir_type):
         if isinstance(init_node, c_ast.InitList):
             if init_node.exprs:
                 return self._build_pointer_const(init_node.exprs[0], ir_type)
             return ir.Constant(ir_type, None)
+        if isinstance(init_node, c_ast.Cast):
+            return self._build_pointer_const(init_node.expr, ir_type)
         if (
             isinstance(init_node, c_ast.Constant)
             and getattr(init_node, "type", None) == "string"
@@ -1750,22 +2218,23 @@ class LLVMCodeGenerator(object):
                     return sym
                 if isinstance(sym.type, ir.PointerType):
                     return sym.bitcast(ir_type)
+        if isinstance(init_node, c_ast.ArrayRef):
+            addr = self._build_const_address(init_node)
+            if addr is not None:
+                if addr.type == ir_type:
+                    return addr
+                if isinstance(addr.type, ir.PointerType):
+                    return addr.bitcast(ir_type)
         if (
             isinstance(init_node, c_ast.UnaryOp)
             and init_node.op == "&"
-            and isinstance(init_node.expr, c_ast.ID)
         ):
-            try:
-                _, sym = self.lookup(init_node.expr.name)
-            except Exception:
-                sym = None
-            if isinstance(sym, ir.Function):
-                return sym if sym.type == ir_type else sym.bitcast(ir_type)
-            if isinstance(sym, ir.GlobalVariable):
-                if sym.type == ir_type:
-                    return sym
-                if isinstance(sym.type, ir.PointerType):
-                    return sym.bitcast(ir_type)
+            addr = self._build_const_address(init_node.expr)
+            if addr is not None:
+                if addr.type == ir_type:
+                    return addr
+                if isinstance(addr.type, ir.PointerType):
+                    return addr.bitcast(ir_type)
         try:
             val = self._eval_const_expr(init_node)
             if val == 0:
@@ -1846,6 +2315,17 @@ class LLVMCodeGenerator(object):
             result -= 1 << bits
         return ir.Constant(int_type, result)
 
+    def _raw_bytes_to_unsigned_int(self, byte_values):
+        result = 0
+        width = len(byte_values)
+        for i, byte_val in enumerate(byte_values):
+            shift_bits = 8 * (i if self._is_little_endian() else (width - 1 - i))
+            raw = getattr(byte_val, "constant", 0)
+            if not isinstance(raw, int):
+                raw = 0
+            result |= (raw & 0xFF) << shift_bits
+        return result
+
     def _const_init_bytes(self, init_node, ir_type):
         size = self._ir_type_size(ir_type)
         if init_node is None:
@@ -1853,27 +2333,11 @@ class LLVMCodeGenerator(object):
 
         if getattr(ir_type, "is_union", False):
             raw = self._zero_bytes(size)
-            member_names = getattr(ir_type, "members", None) or list(
-                ir_type.member_types.keys()
+            field_name, member_type, member_init = self._select_union_initializer(
+                init_node, ir_type
             )
-            if not member_names:
+            if field_name is None:
                 return raw
-
-            first_name = member_names[0]
-            member_type = ir_type.member_types[first_name]
-            member_init = init_node
-            if isinstance(init_node, c_ast.InitList):
-                exprs = init_node.exprs or []
-                if not exprs:
-                    member_init = None
-                elif isinstance(member_type, (ir.ArrayType, ir.LiteralStructType)):
-                    member_init = (
-                        exprs[0]
-                        if len(exprs) == 1 and isinstance(exprs[0], c_ast.InitList)
-                        else init_node
-                    )
-                else:
-                    member_init = exprs[0]
 
             member_bytes = self._const_init_bytes(member_init, member_type)
             raw[: min(size, len(member_bytes))] = member_bytes[:size]
@@ -1934,16 +2398,62 @@ class LLVMCodeGenerator(object):
 
             return self._zero_bytes(size)
 
-        if isinstance(ir_type, ir.LiteralStructType):
+        if _is_struct_ir_type(ir_type):
+            if getattr(ir_type, "has_custom_layout", False):
+                raw = self._zero_bytes(size)
+                if not isinstance(init_node, c_ast.InitList):
+                    return raw
+
+                exprs = self._ordered_struct_init_exprs(init_node, ir_type)
+                for i, field_name in enumerate(getattr(ir_type, "members", ())):
+                    if i >= len(exprs):
+                        break
+                    expr = exprs[i]
+                    layout = ir_type.field_layouts.get(field_name)
+                    if layout is None:
+                        continue
+
+                    if layout.is_bitfield:
+                        scalar_node = self._scalar_init_node(expr)
+                        if scalar_node is None:
+                            continue
+                        try:
+                            field_value = int(self._eval_const_expr(scalar_node))
+                        except Exception:
+                            continue
+                        storage_size = self._ir_type_size(layout.storage_ir_type)
+                        start = layout.storage_byte_offset
+                        current = self._raw_bytes_to_unsigned_int(
+                            raw[start : start + storage_size]
+                        )
+                        field_mask = self._bitfield_mask(layout.bit_width)
+                        clear_mask = ((1 << (storage_size * 8)) - 1) ^ (
+                            field_mask << layout.bit_offset
+                        )
+                        current = (current & clear_mask) | (
+                            (field_value & field_mask) << layout.bit_offset
+                        )
+                        raw[start : start + storage_size] = self._const_int_to_bytes(
+                            current, storage_size
+                        )
+                        continue
+
+                    field_size = self._ir_type_size(layout.semantic_ir_type)
+                    field_bytes = self._const_init_bytes(expr, layout.semantic_ir_type)
+                    start = layout.byte_offset
+                    raw[start : start + field_size] = field_bytes[:field_size]
+                return raw
+
             raw = self._zero_bytes(size)
             if not isinstance(init_node, c_ast.InitList):
                 return raw
 
+            exprs = self._ordered_struct_init_exprs(init_node, ir_type)
             offset = 0
             for i, member_type in enumerate(ir_type.elements):
                 align = self._ir_type_align(member_type)
                 offset = (offset + align - 1) & ~(align - 1)
-                expr = init_node.exprs[i] if i < len(init_node.exprs) else None
+                expr = exprs[i] if i < len(exprs) else None
                 field_bytes = self._const_init_bytes(expr, member_type)
                 field_size = self._ir_type_size(member_type)
                 raw[offset : offset + field_size] = field_bytes[:field_size]
@@ -2015,11 +2525,36 @@ class LLVMCodeGenerator(object):
 
             return self._zero_initializer(ir_type)
 
-        if isinstance(ir_type, ir.LiteralStructType):
+        if _is_struct_ir_type(ir_type):
+            if getattr(ir_type, "has_custom_layout", False):
+                try:
+                    raw = self._const_init_bytes(init_node, ir_type)
+                    values = []
+                    offset = 0
+                    for member_type in ir_type.elements:
+                        field_size = self._ir_type_size(member_type)
+                        field_bytes = raw[offset : offset + field_size]
+                        if isinstance(member_type, ir.IntType):
+                            values.append(
+                                self._bytes_to_int_constant(field_bytes, member_type)
+                            )
+                        elif (
+                            isinstance(member_type, ir.ArrayType)
+                            and isinstance(member_type.element, ir.IntType)
+                            and member_type.element.width == 8
+                        ):
+                            values.append(ir.Constant(member_type, field_bytes))
+                        else:
+                            values.append(self._zero_initializer(member_type))
+                        offset += field_size
+                    return ir.Constant(ir_type, values)
+                except Exception:
+                    return self._zero_initializer(ir_type)
             if isinstance(init_node, c_ast.InitList):
+                exprs = self._ordered_struct_init_exprs(init_node, ir_type)
                 values = []
                 for i, member_type in enumerate(ir_type.elements):
-                    expr = init_node.exprs[i] if i < len(init_node.exprs) else None
+                    expr = exprs[i] if i < len(exprs) else None
                     values.append(self._build_const_init(expr, member_type))
                 try:
                     return ir.Constant(ir_type, values)
@@ -2044,20 +2579,206 @@ class LLVMCodeGenerator(object):
         """Recursively initialize array elements from an InitList."""
         for i, expr in enumerate(init_list.exprs):
             idx = prefix_idx + [ir.Constant(ir.IntType(32), i)]
-            if isinstance(expr, c_ast.InitList):
-                self._init_array(base_addr, expr, elem_ir_type, idx)
-            else:
-                val, _ = self.codegen(expr)
-                val = self._implicit_convert(val, elem_ir_type)
-                elem_ptr = self.builder.gep(base_addr, idx, inbounds=True)
-                self._safe_store(val, elem_ptr)
+            if isinstance(expr, c_ast.InitList) and isinstance(elem_ir_type, ir.ArrayType):
+                self._init_array(base_addr, expr, elem_ir_type.element, idx)
+                continue
+            elem_ptr = self.builder.gep(base_addr, idx, inbounds=True)
+            self._init_runtime_value(elem_ptr, elem_ir_type, expr)
 
-    def _build_array_ir_type(self, array_decl):
+    def _init_runtime_value(self, dest_ptr, target_type, init_node):
+        if dest_ptr is None or init_node is None:
+            return
+
+        if isinstance(target_type, ir.ArrayType):
+            if (
+                isinstance(init_node, c_ast.Constant)
+                and getattr(init_node, "type", None) == "string"
+                and isinstance(target_type.element, ir.IntType)
+                and target_type.element.width == 8
+            ):
+                raw = self._process_escapes(init_node.value[1:-1]) + "\00"
+                idx0 = ir.Constant(ir.IntType(32), 0)
+                for i, ch in enumerate(raw[: target_type.count]):
+                    elem_ptr = self.builder.gep(
+                        dest_ptr,
+                        [idx0, ir.Constant(ir.IntType(32), i)],
+                        inbounds=True,
+                    )
+                    self.builder.store(int8_t(ord(ch)), elem_ptr)
+                return
+            if isinstance(init_node, c_ast.InitList):
+                self._init_array(
+                    dest_ptr,
+                    init_node,
+                    target_type.element,
+                    [ir.Constant(ir.IntType(32), 0)],
+                )
+                return
+
+        if getattr(target_type, "is_union", False) or _is_struct_ir_type(target_type):
+            if isinstance(init_node, c_ast.InitList):
+                self._init_runtime_aggregate(dest_ptr, init_node, target_type)
+                return
+            init_val, _ = self.codegen(init_node)
+            if init_val is not None:
+                if init_val.type != target_type:
+                    init_val = self._implicit_convert(init_val, target_type)
+                self._safe_store(init_val, dest_ptr)
+            return
+
+        scalar_node = self._scalar_init_node(init_node)
+        if scalar_node is None:
+            return
+        init_val, _ = self.codegen(scalar_node)
+        if init_val is None:
+            return
+        if init_val.type != target_type:
+            init_val = self._implicit_convert(init_val, target_type)
+        self._safe_store(init_val, dest_ptr)
+
+    def _init_runtime_aggregate(self, base_addr, init_node, ir_type):
+        exprs = list(getattr(init_node, "exprs", None) or [])
+        if getattr(ir_type, "is_union", False):
+            field_name, field_type, member_init = self._select_union_initializer(
+                init_node, ir_type
+            )
+            if field_name is None or member_init is None:
+                return
+            field_ptr = self.builder.bitcast(
+                base_addr,
+                ir.PointerType(field_type),
+                name="unioninit",
+            )
+            self._init_runtime_value(field_ptr, field_type, member_init)
+            return
+
+        if getattr(ir_type, "has_custom_layout", False):
+            exprs = self._ordered_struct_init_exprs(init_node, ir_type)
+            for i, field_name in enumerate(getattr(ir_type, "members", ())):
+                if i >= len(exprs):
+                    break
+                expr = exprs[i]
+                layout = ir_type.field_layouts.get(field_name)
+                if layout is None:
+                    continue
+                if layout.is_bitfield:
+                    scalar_node = self._scalar_init_node(expr)
+                    if scalar_node is None:
+                        continue
+                    field_val, _ = self.codegen(scalar_node)
+                    if field_val is None:
+                        continue
+                    if field_val.type != layout.semantic_ir_type:
+                        field_val = self._implicit_convert(
+                            field_val,
+                            layout.semantic_ir_type,
+                        )
+                    ref = BitFieldRef(
+                        container_ptr=self._byte_offset_ptr(
+                            base_addr,
+                            layout.storage_byte_offset,
+                            ir.PointerType(layout.storage_ir_type),
+                            name="bitfieldptr",
+                        ),
+                        storage_ir_type=layout.storage_ir_type,
+                        bit_offset=layout.bit_offset,
+                        bit_width=layout.bit_width,
+                        semantic_ir_type=layout.semantic_ir_type,
+                        is_unsigned=layout.is_unsigned,
+                    )
+                    self._store_bitfield(field_val, ref)
+                    continue
+
+                field_ptr = self._byte_offset_ptr(
+                    base_addr,
+                    layout.byte_offset,
+                    ir.PointerType(layout.semantic_ir_type),
+                    name="fieldptr",
+                )
+                self._init_runtime_value(field_ptr, layout.semantic_ir_type, expr)
+            return
+
+        exprs = self._ordered_struct_init_exprs(init_node, ir_type)
+        for i, field_type in enumerate(ir_type.elements):
+            if i >= len(exprs):
+                break
+            expr = exprs[i]
+            field_addr = self.builder.gep(
+                base_addr,
+                [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), i)],
+                inbounds=True,
+            )
+            semantic_field_type = self._refine_member_ir_type(ir_type, i, field_type)
+            typed_field_addr = field_addr
+            target_ptr_type = ir.PointerType(semantic_field_type)
+            if field_addr.type != target_ptr_type:
+                try:
+                    typed_field_addr = self.builder.bitcast(
+                        field_addr,
+                        target_ptr_type,
+                    )
+                except Exception:
+                    typed_field_addr = field_addr
+            self._init_runtime_value(typed_field_addr, semantic_field_type, expr)
+
+    def _select_union_initializer(self, init_node, ir_type):
+        member_names = getattr(ir_type, "members", None) or list(
+            getattr(ir_type, "member_types", {}).keys()
+        )
+        if not member_names:
+            return None, None, None
+
+        field_name = member_names[0]
+        field_type = self._refine_member_ir_type(
+            ir_type,
+            field_name,
+            ir_type.member_types[field_name],
+        )
+        member_init = init_node
+
+        if isinstance(init_node, c_ast.InitList):
+            exprs = init_node.exprs or []
+            if not exprs:
+                return field_name, field_type, None
+
+            first_expr = exprs[0]
+            if isinstance(first_expr, c_ast.NamedInitializer):
+                designators = getattr(first_expr, "name", None) or []
+                if len(designators) == 1 and isinstance(designators[0], c_ast.ID):
+                    candidate = designators[0].name
+                    if candidate in ir_type.member_types:
+                        field_name = candidate
+                        field_type = self._refine_member_ir_type(
+                            ir_type,
+                            field_name,
+                            ir_type.member_types[field_name],
+                        )
+                        return field_name, field_type, first_expr.expr
+                first_expr = first_expr.expr
+
+            if isinstance(field_type, (ir.ArrayType, ir.IdentifiedStructType, ir.LiteralStructType)):
+                member_init = (
+                    first_expr
+                    if len(exprs) == 1 and isinstance(first_expr, c_ast.InitList)
+                    else init_node
+                )
+            else:
+                member_init = first_expr
+
+        return field_name, field_type, member_init
+
+    def _build_array_ir_type(self, array_decl, init_node=None):
         dims = []
         node = array_decl
+        inferred_top_dim = self._infer_array_count_from_initializer(init_node)
+        is_top_level = True
         while isinstance(node, c_ast.ArrayDecl):
-            dims.append(self._eval_dim(node.dim) if node.dim else 0)
+            dim = self._eval_dim(node.dim) if node.dim else 0
+            if dim == 0 and is_top_level and inferred_top_dim is not None:
+                dim = inferred_top_dim
+            dims.append(dim)
             node = node.type
+            is_top_level = False
         elem_ir_type = self._resolve_ast_type(node)
         if isinstance(elem_ir_type, ir.VoidType):
             elem_ir_type = int8_t
@@ -2069,15 +2790,29 @@ class LLVMCodeGenerator(object):
 
     def _resolve_param_type(self, param):
         """Resolve a function parameter type, handling typedefs and pointers."""
-        if isinstance(param.type, c_ast.ArrayDecl):
-            arr_type = self._build_array_ir_type(param.type)
-            return ir.PointerType(arr_type.element)
-        t = self._resolve_ast_type(param.type)
+        node_type = param.type if hasattr(param, "type") else param
+        if isinstance(node_type, c_ast.ArrayDecl):
+            inner = node_type.type
+            if isinstance(inner, c_ast.ArrayDecl):
+                return ir.PointerType(self._build_array_ir_type(inner))
+            elem_ir_type = self._resolve_ast_type(inner)
+            if isinstance(elem_ir_type, ir.VoidType):
+                elem_ir_type = int8_t
+            return ir.PointerType(elem_ir_type)
+        t = self._resolve_ast_type(node_type)
         if isinstance(t, ir.ArrayType):
             return ir.PointerType(t.element)
         if isinstance(t, ir.VoidType):
             return None  # void params mean "no params" in C
         return t
+
+    def _emit_vla_param_bound_side_effects(self, node_type):
+        current = node_type
+        while isinstance(current, c_ast.ArrayDecl):
+            dim = current.dim
+            if dim is not None and not isinstance(dim, c_ast.Constant):
+                self.codegen(dim)
+            current = current.type
 
     def _resolve_ast_type(self, node_type):
         """Recursively resolve an AST type to IR type, with typedef support."""
@@ -2096,6 +2831,9 @@ class LLVMCodeGenerator(object):
                 return self.codegen_Struct(node_type.type)
             elif isinstance(node_type.type, c_ast.Union):
                 return self.codegen_Union(node_type.type)
+            elif isinstance(node_type.type, c_ast.Enum):
+                self.codegen_Enum(node_type.type)
+                return int32_t
             return int64_t
         elif isinstance(node_type, c_ast.ArrayDecl):
             return voidptr_t
@@ -2110,26 +2848,74 @@ class LLVMCodeGenerator(object):
             return int(v, 0)  # handles hex/octal/decimal
         return self._eval_const_expr(dim_node)
 
+    def _infer_array_count_from_initializer(self, init_node):
+        if init_node is None:
+            return None
+        if isinstance(init_node, c_ast.InitList):
+            return len(init_node.exprs)
+        if (
+            isinstance(init_node, c_ast.Constant)
+            and getattr(init_node, "type", None) == "string"
+        ):
+            raw = init_node.value[1:-1]
+            return len(self._process_escapes(raw)) + 1
+        return None
+
     def _build_func_ptr_type(self, func_decl_node):
         """Build an IR function pointer type from a FuncDecl AST node."""
+        func_type, _ = self._build_function_ir_type(func_decl_node)
+        return func_type.as_pointer()
+
+    def _build_function_ir_type(self, func_decl_node):
+        """Build an IR function type from a FuncDecl AST node."""
         ret_ir, _ = self.codegen(func_decl_node)
         param_types = []
+        is_var_arg = False
         if func_decl_node.args:
             for param in func_decl_node.args.params:
                 if isinstance(param, c_ast.EllipsisParam):
+                    is_var_arg = True
                     continue
-                if isinstance(param, c_ast.Typename):
-                    t = self._resolve_ast_type(param.type)
-                    if not isinstance(t, ir.VoidType):
-                        param_types.append(t)
-                elif isinstance(param, c_ast.Decl):
+                if isinstance(param, (c_ast.Typename, c_ast.Decl)):
                     t = self._resolve_param_type(param)
                     if t is not None:
                         param_types.append(t)
         if isinstance(ret_ir, ir.VoidType):
             ret_ir = ir.VoidType()
-        func_type = ir.FunctionType(ret_ir, param_types)
-        return func_type.as_pointer()
+        return ir.FunctionType(ret_ir, param_types, var_arg=is_var_arg), ret_ir
+
+    def _funcdef_param_infos(self, node):
+        infos = []
+        is_var_arg = False
+        if not node.decl.type.args:
+            return infos, is_var_arg
+
+        knr_param_decls = {
+            decl.name: decl for decl in (getattr(node, "param_decls", None) or [])
+        }
+
+        for index, param in enumerate(node.decl.type.args.params):
+            if isinstance(param, c_ast.EllipsisParam):
+                is_var_arg = True
+                continue
+
+            decl = param
+            if isinstance(param, c_ast.ID):
+                decl = knr_param_decls.get(param.name)
+                if decl is None:
+                    infos.append((param.name, int32_t, None))
+                    continue
+
+            t = self._resolve_param_type(decl)
+            if t is None:
+                continue
+
+            pname = getattr(decl, "name", None)
+            if not isinstance(pname, str):
+                pname = f"arg{index}"
+            infos.append((pname, t, decl))
+
+        return infos, is_var_arg
 
     def _safe_load(self, ptr, name=""):
         """Load from ptr, guard against non-pointer types."""
@@ -2155,8 +2941,25 @@ class LLVMCodeGenerator(object):
             gv.global_constant = True
             gv.linkage = "internal"
             base = gv
+        elif not isinstance(getattr(value, "type", None), ir.PointerType):
+            base = self._alloca_in_entry(value.type, f"{name}.tmp")
+            self._safe_store(value, base)
         idx0 = ir.Constant(ir.IntType(32), 0)
         return self.builder.gep(base, [idx0, idx0], name=name)
+
+    def _decay_array_expr_to_pointer(self, expr_node, value, name="arrayexprdecay"):
+        """Apply array-to-pointer decay using the expression's semantic type."""
+        semantic_type = self._get_expr_ir_type(expr_node)
+        if isinstance(semantic_type, ir.ArrayType):
+            if isinstance(getattr(value, "type", None), ir.ArrayType):
+                return self._decay_array_value_to_pointer(value, name)
+            if (
+                isinstance(getattr(value, "type", None), ir.PointerType)
+                and value.type.pointee == semantic_type
+            ):
+                idx0 = ir.Constant(ir.IntType(32), 0)
+                return self.builder.gep(value, [idx0, idx0], name=name)
+        return self._decay_array_value_to_pointer(value, name)
 
     def _safe_store(self, value, ptr):
         """Store value to ptr, auto-converting types if needed."""
@@ -2177,11 +2980,9 @@ class LLVMCodeGenerator(object):
         """Convert val to target_type if needed (implicit C promotion/truncation)."""
         if val is None or isinstance(val.type, ir.VoidType):
             # Can't convert void — return a zero of target type
-            if isinstance(target_type, ir.PointerType):
-                return ir.Constant(target_type, None)
-            elif isinstance(target_type, ir.VoidType):
+            if isinstance(target_type, ir.VoidType):
                 return val
-            return ir.Constant(target_type, 0)
+            return self._zero_initializer(target_type)
         if val.type == target_type:
             return val
         if isinstance(val.type, ir.IntType) and self._is_floating_ir_type(target_type):
@@ -2242,6 +3043,49 @@ class LLVMCodeGenerator(object):
             return self.builder.bitcast(ptr, target_type)
         return val
 
+    def _is_scalar_ir_type(self, ir_type):
+        return (
+            isinstance(ir_type, (ir.IntType, ir.PointerType))
+            or self._is_floating_ir_type(ir_type)
+        )
+
+    def _is_aggregate_ir_type(self, ir_type):
+        return _is_struct_ir_type(ir_type) or getattr(ir_type, "is_union", False)
+
+    def _validate_explicit_cast(self, source_type, target_type):
+        if isinstance(target_type, ir.VoidType):
+            return
+
+        if self._is_aggregate_ir_type(target_type) or isinstance(
+            target_type, ir.ArrayType
+        ):
+            raise SemanticError("invalid cast to non-scalar type")
+
+        if self._is_aggregate_ir_type(source_type):
+            raise SemanticError("invalid cast from non-scalar type")
+
+        if isinstance(source_type, ir.ArrayType):
+            if not isinstance(target_type, ir.PointerType):
+                raise SemanticError("invalid cast from array type")
+            return
+
+        if self._is_floating_ir_type(source_type) and isinstance(
+            target_type, ir.PointerType
+        ):
+            raise SemanticError("invalid cast from floating type to pointer type")
+
+        if isinstance(source_type, ir.PointerType) and self._is_floating_ir_type(
+            target_type
+        ):
+            raise SemanticError("invalid cast from pointer type to floating type")
+
+        if self._is_scalar_ir_type(source_type) and self._is_scalar_ir_type(
+            target_type
+        ):
+            return
+
+        raise SemanticError("invalid cast expression")
+
     def _extend_call_result(self, result, returns_unsigned=False):
         if not isinstance(result.type, ir.IntType):
             return result
@@ -2267,6 +3111,9 @@ class LLVMCodeGenerator(object):
 
     def _ir_type_align(self, ir_type):
         """Return natural alignment of an IR type in bytes."""
+        custom_align = getattr(ir_type, "custom_align", None)
+        if custom_align is not None:
+            return custom_align
         if isinstance(ir_type, ir.IntType):
             return min(ir_type.width // 8, 8)
         elif isinstance(ir_type, ir.FloatType):
@@ -2277,7 +3124,7 @@ class LLVMCodeGenerator(object):
             return 8
         elif isinstance(ir_type, ir.ArrayType):
             return self._ir_type_align(ir_type.element)
-        elif isinstance(ir_type, ir.LiteralStructType):
+        elif _is_struct_ir_type(ir_type):
             if not ir_type.elements:
                 return 1
             return max(self._ir_type_align(e) for e in ir_type.elements)
@@ -2285,6 +3132,9 @@ class LLVMCodeGenerator(object):
 
     def _ir_type_size(self, ir_type):
         """Compute byte size of an IR type with proper alignment/padding."""
+        custom_size = getattr(ir_type, "custom_size", None)
+        if custom_size is not None:
+            return custom_size
         if isinstance(ir_type, ir.IntType):
             return ir_type.width // 8
         elif isinstance(ir_type, ir.FloatType):
@@ -2295,7 +3145,7 @@ class LLVMCodeGenerator(object):
             return 8
         elif isinstance(ir_type, ir.ArrayType):
             return int(ir_type.count) * self._ir_type_size(ir_type.element)
-        elif isinstance(ir_type, ir.LiteralStructType):
+        elif _is_struct_ir_type(ir_type):
             offset = 0
             for elem in ir_type.elements:
                 align = self._ir_type_align(elem)
@@ -2306,6 +3156,232 @@ class LLVMCodeGenerator(object):
             offset = (offset + struct_align - 1) & ~(struct_align - 1)
             return offset
         return 8
+
+    @staticmethod
+    def _align_up(value, align):
+        if align <= 1:
+            return value
+        return (value + align - 1) & ~(align - 1)
+
+    def _resolve_struct_member_ir_type(self, decl):
+        if isinstance(decl.type, c_ast.TypeDecl) and isinstance(
+            decl.type.type, c_ast.Struct
+        ):
+            return self.codegen_Struct(decl.type.type)
+        if isinstance(decl.type, c_ast.TypeDecl) and isinstance(
+            decl.type.type, c_ast.Union
+        ):
+            return self.codegen_Union(decl.type.type)
+        if isinstance(decl.type, c_ast.ArrayDecl):
+            def _build_array_type(arr_node):
+                dim = self._eval_dim(arr_node.dim) if arr_node.dim else 0
+                if isinstance(arr_node.type, c_ast.ArrayDecl):
+                    inner = _build_array_type(arr_node.type)
+                else:
+                    inner = self._resolve_ast_type(arr_node.type)
+                return ir.ArrayType(inner, dim)
+
+            return _build_array_type(decl.type)
+        if isinstance(decl.type, c_ast.PtrDecl):
+            return self._resolve_ast_type(decl.type)
+        if isinstance(decl.type, c_ast.TypeDecl):
+            return self._resolve_ast_type(decl.type)
+        return int64_t
+
+    def _bitfield_storage_ir_type(self, decl):
+        storage_ir_type = self._resolve_ast_type(decl.type)
+        if not isinstance(storage_ir_type, ir.IntType):
+            return int32_t
+        return storage_ir_type
+
+    def _raw_layout_struct_type(
+        self, size_bytes, align_bytes, type_name=None, existing_type=None
+    ):
+        align_map = {8: int64_t, 4: int32_t, 2: int16_t, 1: int8_t}
+        identified_name = type_name or self._aggregate_type_name("layout")
+        if size_bytes <= 0:
+            body = []
+        elif align_bytes <= 1:
+            body = [ir.ArrayType(int8_t, size_bytes)]
+        else:
+            align_type = align_map.get(align_bytes)
+            if align_type is None or size_bytes < align_bytes:
+                body = [ir.ArrayType(int8_t, size_bytes)]
+            else:
+                pad_size = size_bytes - align_bytes
+                if pad_size > 0:
+                    body = [align_type, ir.ArrayType(int8_t, pad_size)]
+                else:
+                    body = [align_type]
+        if existing_type is not None:
+            storage_type = existing_type
+        else:
+            storage_type = self.module.context.get_identified_type(identified_name)
+        if storage_type.is_opaque:
+            storage_type.set_body(*body)
+        storage_type.custom_size = size_bytes
+        storage_type.custom_align = align_bytes
+        storage_type.has_custom_layout = True
+        return storage_type
+
+    def _build_layout_backed_struct(self, node):
+        current_bit = 0
+        max_align = 1
+        member_names = []
+        member_decl_types = []
+        field_layouts = {}
+
+        for decl in node.decls:
+            if decl.bitsize is not None:
+                storage_ir_type = self._bitfield_storage_ir_type(decl)
+                storage_bits = storage_ir_type.width
+                bit_width = self._eval_const_expr(decl.bitsize)
+                max_align = max(max_align, self._ir_type_align(storage_ir_type))
+                if bit_width == 0:
+                    current_bit = self._align_up(current_bit, storage_bits)
+                    continue
+                unit_start = (current_bit // storage_bits) * storage_bits
+                if current_bit + bit_width > unit_start + storage_bits:
+                    current_bit = self._align_up(current_bit, storage_bits)
+                    unit_start = current_bit
+                layout = StructFieldLayout(
+                    name=decl.name,
+                    byte_offset=current_bit // 8,
+                    semantic_ir_type=storage_ir_type,
+                    decl_type=decl.type,
+                    is_bitfield=True,
+                    storage_byte_offset=unit_start // 8,
+                    storage_ir_type=storage_ir_type,
+                    bit_offset=current_bit - unit_start,
+                    bit_width=bit_width,
+                    is_unsigned=self._is_unsigned_scalar_decl_type(decl.type),
+                )
+                if decl.name is not None:
+                    field_layouts[decl.name] = layout
+                    member_names.append(decl.name)
+                    member_decl_types.append(decl.type)
+                current_bit += bit_width
+                continue
+
+            semantic_ir_type = self._resolve_struct_member_ir_type(decl)
+            align_bits = self._ir_type_align(semantic_ir_type) * 8
+            current_bit = self._align_up(current_bit, align_bits)
+            max_align = max(max_align, self._ir_type_align(semantic_ir_type))
+            layout = StructFieldLayout(
+                name=decl.name,
+                byte_offset=current_bit // 8,
+                semantic_ir_type=semantic_ir_type,
+                decl_type=decl.type,
+            )
+            if decl.name is not None:
+                field_layouts[decl.name] = layout
+                member_names.append(decl.name)
+                member_decl_types.append(decl.type)
+            current_bit += self._ir_type_size(semantic_ir_type) * 8
+
+        size_bits = self._align_up(current_bit, max_align * 8)
+        size_bytes = max(1, size_bits // 8)
+        type_name = None
+        existing_type = None
+        if node.name:
+            tag_key = self._tag_type_key(node.name)
+            if tag_key in self.env:
+                existing_type = self.env[tag_key][0]
+            type_name = self._aggregate_type_name("struct", node.name)
+        struct_type = self._raw_layout_struct_type(
+            size_bytes,
+            max_align,
+            type_name,
+            existing_type=existing_type,
+        )
+        struct_type.members = member_names
+        struct_type.member_decl_types = member_decl_types
+        struct_type.field_layouts = field_layouts
+        if node.name:
+            self.define(self._tag_type_key(node.name), (struct_type, None))
+        return struct_type
+
+    def _byte_offset_ptr(self, base_ptr, byte_offset, target_ptr_type, name="fieldptr"):
+        byte_ptr = self.builder.bitcast(base_ptr, voidptr_t, name=f"{name}.base")
+        if byte_offset:
+            byte_ptr = self.builder.gep(
+                byte_ptr,
+                [ir.Constant(ir.IntType(32), byte_offset)],
+                name=f"{name}.offs",
+            )
+        if byte_ptr.type != target_ptr_type:
+            return self.builder.bitcast(byte_ptr, target_ptr_type, name=name)
+        return byte_ptr
+
+    @staticmethod
+    def _bitfield_mask(bit_width):
+        if bit_width <= 0:
+            return 0
+        return (1 << bit_width) - 1
+
+    def _load_bitfield(self, ref):
+        align = max(1, self._ir_type_align(ref.storage_ir_type))
+        raw = self.builder.load(ref.container_ptr, align=align)
+        if ref.bit_offset:
+            raw = self.builder.lshr(
+                raw, ir.Constant(ref.storage_ir_type, ref.bit_offset), "bitshift"
+            )
+
+        semantic_width = ref.semantic_ir_type.width
+        if ref.is_unsigned:
+            if ref.bit_width < ref.storage_ir_type.width:
+                raw = self.builder.and_(
+                    raw,
+                    ir.Constant(ref.storage_ir_type, self._bitfield_mask(ref.bit_width)),
+                    "bitmask",
+                )
+            if raw.type.width > semantic_width:
+                raw = self.builder.trunc(raw, ref.semantic_ir_type, "bittrunc")
+            elif raw.type.width < semantic_width:
+                raw = self.builder.zext(raw, ref.semantic_ir_type, "bitzext")
+            self._tag_unsigned(raw)
+            return raw
+
+        if ref.bit_width < ref.storage_ir_type.width:
+            narrow_type = ir.IntType(ref.bit_width)
+            raw = self.builder.trunc(raw, narrow_type, "bitsigned.trunc")
+            return self.builder.sext(raw, ref.semantic_ir_type, "bitsigned.sext")
+        if raw.type.width > semantic_width:
+            return self.builder.trunc(raw, ref.semantic_ir_type, "bittrunc")
+        if raw.type.width < semantic_width:
+            return self.builder.sext(raw, ref.semantic_ir_type, "bitsext")
+        return raw
+
+    def _store_bitfield(self, value, ref):
+        if value is None:
+            return
+        align = max(1, self._ir_type_align(ref.storage_ir_type))
+        storage_value = self.builder.load(ref.container_ptr, align=align)
+        if value.type != ref.semantic_ir_type:
+            value = self._implicit_convert(value, ref.semantic_ir_type)
+        value = self._convert_int_value(
+            value, ref.storage_ir_type, result_unsigned=ref.is_unsigned
+        )
+        field_mask = self._bitfield_mask(ref.bit_width)
+        field_mask_const = ir.Constant(ref.storage_ir_type, field_mask)
+        if ref.bit_width < ref.storage_ir_type.width:
+            value = self.builder.and_(value, field_mask_const, "bitstore.mask")
+            if ref.bit_offset:
+                value = self.builder.shl(
+                    value,
+                    ir.Constant(ref.storage_ir_type, ref.bit_offset),
+                    "bitstore.shift",
+                )
+            clear_mask = ((1 << ref.storage_ir_type.width) - 1) ^ (
+                field_mask << ref.bit_offset
+            )
+            storage_value = self.builder.and_(
+                storage_value,
+                ir.Constant(ref.storage_ir_type, clear_mask),
+                "bitstore.clear",
+            )
+            value = self.builder.or_(storage_value, value, "bitstore.merge")
+        self.builder.store(value, ref.container_ptr, align=align)
 
     def _refine_member_ir_type(self, aggregate_type, member_key, field_type):
         """Prefer semantic member types over storage types when available."""
@@ -2331,8 +3407,8 @@ class LLVMCodeGenerator(object):
                 resolved, ir.PointerType
             ):
                 return semantic_field_type
-            if isinstance(
-                resolved, (ir.ArrayType, ir.LiteralStructType, ir.PointerType)
+            if isinstance(resolved, (ir.ArrayType, ir.PointerType)) or _is_struct_ir_type(
+                resolved
             ):
                 return resolved
         except Exception:
@@ -2348,6 +3424,14 @@ class LLVMCodeGenerator(object):
                 aggregate_type, field_name, field_type
             )
             return 0, semantic_field_type
+
+        if getattr(aggregate_type, "has_custom_layout", False):
+            layout = aggregate_type.field_layouts.get(field_name)
+            if layout is None:
+                raise CodegenError(f"Field '{field_name}' not found in aggregate")
+            if layout.is_bitfield:
+                raise CodegenError("offsetof on bit-field is not supported")
+            return layout.byte_offset, layout.semantic_ir_type
 
         if not hasattr(aggregate_type, "members"):
             raise CodegenError(f"Aggregate has no named fields: {aggregate_type}")
@@ -2393,6 +3477,153 @@ class LLVMCodeGenerator(object):
 
         raise CodegenError(f"Not an offsetof base: {type(node).__name__}")
 
+    def _infer_sizeof_operand_ir_type(self, node):
+        """Infer the operand type for sizeof without emitting runtime IR."""
+        cached = self._get_expr_ir_type(node)
+        if cached is not None:
+            return cached
+
+        if isinstance(node, c_ast.Constant):
+            if node.type == "int":
+                raw = node.value
+                lower = raw.lower()
+                val_str = raw.rstrip("uUlL")
+                if val_str.startswith("0x") or val_str.startswith("0X"):
+                    value = int(val_str, 16)
+                elif val_str.startswith("0") and len(val_str) > 1 and val_str[1:].isdigit():
+                    value = int(val_str, 8)
+                else:
+                    value = int(val_str)
+                if "l" in lower or value > 0x7FFFFFFF:
+                    return int64_t
+                return int32_t
+            if node.type == "char":
+                return int32_t
+            if node.type == "string":
+                raw = node.value[1:-1]
+                processed = self._process_escapes(raw)
+                return ir.ArrayType(int8_t, len(self._string_bytes(processed + "\00")))
+            return self._float_literal_ir_type(node.value)
+
+        if isinstance(node, c_ast.ID):
+            ir_type, _ = self.lookup(node.name)
+            return ir_type
+
+        if isinstance(node, c_ast.StructRef):
+            base_type = self._infer_sizeof_operand_ir_type(node.name)
+            aggregate_type = base_type
+            if node.type == "->":
+                if not isinstance(base_type, ir.PointerType):
+                    raise CodegenError(
+                        f"sizeof operand is not a pointer for '->': {base_type}"
+                    )
+                aggregate_type = base_type.pointee
+            _, field_type = self._get_aggregate_field_info(
+                aggregate_type, node.field.name
+            )
+            return field_type
+
+        if isinstance(node, c_ast.ArrayRef):
+            base_type = self._infer_sizeof_operand_ir_type(node.name)
+            if isinstance(base_type, ir.ArrayType):
+                return base_type.element
+            if isinstance(base_type, ir.PointerType):
+                return base_type.pointee
+            raise CodegenError(
+                f"sizeof operand is not indexable: {type(base_type).__name__}"
+            )
+
+        if isinstance(node, c_ast.Cast):
+            return self._resolve_ast_type(node.to_type.type)
+
+        if isinstance(node, c_ast.UnaryOp):
+            if node.op == "&":
+                return ir.PointerType(self._infer_sizeof_operand_ir_type(node.expr))
+            if node.op == "*":
+                base_type = self._infer_sizeof_operand_ir_type(node.expr)
+                if isinstance(base_type, ir.ArrayType):
+                    return base_type.element
+                if not isinstance(base_type, ir.PointerType):
+                    raise CodegenError(
+                        f"sizeof operand is not a pointer for '*': {base_type}"
+                    )
+                return base_type.pointee
+            if node.op in ("+", "-", "~"):
+                base_type = self._infer_sizeof_operand_ir_type(node.expr)
+                if isinstance(base_type, ir.IntType):
+                    return self._integer_promotion_ir_type(base_type)
+                return base_type
+            if node.op == "!":
+                return int32_t
+            if node.op in ("p++", "p--", "++", "--"):
+                return self._infer_sizeof_operand_ir_type(node.expr)
+            if node.op == "sizeof":
+                return int64_t
+
+        if isinstance(node, c_ast.BinaryOp):
+            lhs_type = self._decay_ir_type(
+                self._infer_sizeof_operand_ir_type(node.left)
+            )
+            rhs_type = self._decay_ir_type(
+                self._infer_sizeof_operand_ir_type(node.right)
+            )
+
+            if node.op in ("&&", "||", "==", "!=", "<", "<=", ">", ">="):
+                return int32_t
+
+            if (
+                node.op in ("+", "-")
+                and isinstance(lhs_type, ir.PointerType)
+                and isinstance(rhs_type, ir.IntType)
+            ):
+                return lhs_type
+            if (
+                node.op == "+"
+                and isinstance(rhs_type, ir.PointerType)
+                and isinstance(lhs_type, ir.IntType)
+            ):
+                return rhs_type
+            if (
+                node.op == "-"
+                and isinstance(lhs_type, ir.PointerType)
+                and isinstance(rhs_type, ir.PointerType)
+            ):
+                return int64_t
+
+            if node.op in ("<<", ">>") and isinstance(lhs_type, ir.IntType):
+                return self._integer_promotion_ir_type(lhs_type)
+
+            return self._usual_arithmetic_conversion_ir_type(lhs_type, rhs_type)
+
+        if isinstance(node, c_ast.TernaryOp):
+            true_type = self._infer_sizeof_operand_ir_type(node.iftrue)
+            false_type = self._infer_sizeof_operand_ir_type(node.iffalse)
+            if true_type == false_type:
+                return true_type
+            if (
+                isinstance(true_type, (ir.IntType, ir.FloatType, ir.DoubleType))
+                and isinstance(false_type, (ir.IntType, ir.FloatType, ir.DoubleType))
+            ):
+                return self._usual_arithmetic_conversion_ir_type(
+                    true_type, false_type
+                )
+            if isinstance(true_type, ir.PointerType) and isinstance(
+                false_type, ir.PointerType
+            ):
+                return true_type
+            return true_type
+
+        if isinstance(node, c_ast.ExprList) and node.exprs:
+            return self._infer_sizeof_operand_ir_type(node.exprs[-1])
+
+        if isinstance(node, c_ast.FuncCall):
+            if isinstance(node.name, c_ast.ID):
+                ret_type = getattr(self, "func_return_types", {}).get(node.name.name)
+                if ret_type is not None:
+                    return ret_type
+
+        raise CodegenError(f"Cannot infer sizeof operand type: {type(node).__name__}")
+
     def codegen_Typename(self, node):
         # Used inside sizeof(type) — not directly code-generated
         return None, None
@@ -2408,6 +3639,8 @@ class LLVMCodeGenerator(object):
         rhs, _ = self.codegen(node.right)
         if lhs is None or rhs is None:
             return ir.Constant(int64_t, 0), None
+        lhs = self._decay_array_expr_to_pointer(node.left, lhs, "lhsarraydecay")
+        rhs = self._decay_array_expr_to_pointer(node.right, rhs, "rhsarraydecay")
 
         # Pointer arithmetic: ptr + int or ptr - int
         if (
@@ -2769,8 +4002,8 @@ class LLVMCodeGenerator(object):
             cond_val = self.builder.ptrtoint(cond_val, int64_t)
         elif self._is_floating_ir_type(cond_val.type):
             cond_val = self.builder.fptosi(cond_val, int64_t)
-        elif isinstance(cond_val.type, ir.IntType) and cond_val.type.width != 64:
-            cond_val = self._implicit_convert(cond_val, int64_t)
+        elif isinstance(cond_val.type, ir.IntType) and cond_val.type.width < int32_t.width:
+            cond_val = self._integer_promotion(cond_val)
 
         after_bb = self.builder.function.append_basic_block("switch_end")
 
@@ -2783,11 +4016,57 @@ class LLVMCodeGenerator(object):
             switch_items = [node.stmt]
         else:
             switch_items = []
-        labels = [
-            item
-            for item in switch_items
-            if isinstance(item, (c_ast.Case, c_ast.Default))
-        ]
+        prelabel_items = []
+        hoisted_items = []
+        labels = []
+        label_bodies = {}
+
+        def contains_switch_label(item):
+            if isinstance(item, (c_ast.Case, c_ast.Default)):
+                return True
+            if isinstance(item, c_ast.Compound):
+                return any(
+                    contains_switch_label(child) for child in (item.block_items or [])
+                )
+            return False
+
+        def add_label(item):
+            labels.append(item)
+            label_bodies.setdefault(id(item), [])
+
+        def process_items(items, active_label):
+            active = active_label
+            items = list(items or [])
+            for idx, item in enumerate(items):
+                later_has_label = any(
+                    contains_switch_label(later) for later in items[idx + 1 :]
+                )
+                if isinstance(item, (c_ast.Case, c_ast.Default)):
+                    add_label(item)
+                    active = process_items(item.stmts or [], item)
+                    continue
+                if isinstance(item, c_ast.Compound) and contains_switch_label(item):
+                    active = process_items(item.block_items or [], active)
+                    continue
+                if active is None:
+                    prelabel_items.append(item)
+                    continue
+                if isinstance(item, c_ast.Decl) and later_has_label:
+                    if item.init is not None:
+                        raise CodegenError(
+                            "switch-scope declaration before later case with initializer is not supported"
+                        )
+                    hoisted_items.append(item)
+                    continue
+                if later_has_label and isinstance(
+                    item, (c_ast.Typedef, c_ast.EmptyStatement)
+                ):
+                    hoisted_items.append(item)
+                    continue
+                label_bodies[id(active)].append(item)
+            return active
+
+        process_items(switch_items, None)
 
         label_blocks = {}
         default_bb = after_bb
@@ -2800,10 +4079,20 @@ class LLVMCodeGenerator(object):
             if isinstance(item, c_ast.Default):
                 default_bb = bb
 
-        switch_inst = self.builder.switch(cond_val, default_bb)
-
         with self.new_scope():
             self.define("break", after_bb)
+
+            for item in prelabel_items + hoisted_items:
+                if isinstance(item, c_ast.Decl):
+                    if item.init is not None:
+                        raise CodegenError(
+                            "switch-scope declaration before first case with initializer is not supported"
+                        )
+                    self.codegen(item)
+                elif isinstance(item, (c_ast.Typedef, c_ast.EmptyStatement)):
+                    self.codegen(item)
+
+            switch_inst = self.builder.switch(cond_val, default_bb)
 
             for item in labels:
                 if not isinstance(item, c_ast.Case):
@@ -2825,10 +4114,12 @@ class LLVMCodeGenerator(object):
 
             for idx, item in enumerate(labels):
                 self.builder.position_at_end(label_blocks[id(item)])
-                for stmt in item.stmts or []:
-                    self.codegen(stmt)
+                for stmt in label_bodies.get(id(item), []):
                     if self.builder.block.is_terminated:
-                        break
+                        if isinstance(stmt, c_ast.Label):
+                            self.codegen(stmt)
+                        continue
+                    self.codegen(stmt)
                 if not self.builder.block.is_terminated:
                     next_bb = after_bb
                     if idx + 1 < len(labels):
@@ -2850,7 +4141,10 @@ class LLVMCodeGenerator(object):
         self.builder.cbranch(cmp, then_bb, else_bb)
 
         self.builder.position_at_end(then_bb)
-        true_val, _ = self.codegen(node.iftrue)
+        if node.iftrue is None:
+            true_val = cond_val
+        else:
+            true_val, _ = self.codegen(node.iftrue)
         true_bb_end = self.builder.block
 
         self.builder.position_at_end(else_bb)
@@ -2858,11 +4152,7 @@ class LLVMCodeGenerator(object):
         false_bb_end = self.builder.block
 
         def zero_value(target_type):
-            if isinstance(target_type, ir.PointerType):
-                return ir.Constant(target_type, None)
-            if self._is_floating_ir_type(target_type):
-                return ir.Constant(target_type, 0.0)
-            return ir.Constant(target_type, 0)
+            return self._zero_initializer(target_type)
 
         def pick_target_type(lhs, rhs):
             if lhs is None and rhs is None:
@@ -2921,19 +4211,48 @@ class LLVMCodeGenerator(object):
         self.builder.position_at_end(merge_bb)
         if not incoming:
             return zero_value(target), None
+        result_is_unsigned = isinstance(target, ir.IntType) and any(
+            self._is_unsigned_val(value) for _pred, value in incoming
+        )
+        result_has_unsigned_pointee = isinstance(target, ir.PointerType) and any(
+            self._is_unsigned_pointee(value) for _pred, value in incoming
+        )
+        result_has_unsigned_return = isinstance(target, ir.PointerType) and any(
+            self._is_unsigned_return(value) for _pred, value in incoming
+        )
         if len(incoming) == 1:
-            return incoming[0][1], None
+            result = incoming[0][1]
+            if result_is_unsigned:
+                self._tag_unsigned(result)
+            if result_has_unsigned_pointee:
+                self._tag_unsigned_pointee(result)
+            if result_has_unsigned_return:
+                self._tag_unsigned_return(result)
+            return result, None
 
         phi = self.builder.phi(target, "ternary")
         for pred, value in incoming:
             phi.add_incoming(value, pred)
+        if result_is_unsigned:
+            self._tag_unsigned(phi)
+        if result_has_unsigned_pointee:
+            self._tag_unsigned_pointee(phi)
+        if result_has_unsigned_return:
+            self._tag_unsigned_return(phi)
         return phi, None
 
     def codegen_Cast(self, node):
+        dest_ir_type = self._resolve_ast_type(node.to_type.type)
+        if isinstance(node.expr, c_ast.InitList) and (
+            isinstance(dest_ir_type, ir.ArrayType)
+            or _is_struct_ir_type(dest_ir_type)
+            or getattr(dest_ir_type, "is_union", False)
+        ):
+            return self._materialize_compound_literal(node.to_type.type, node.expr)
 
         expr, ptr = self.codegen(node.expr)
 
-        dest_ir_type = self._resolve_ast_type(node.to_type.type)
+        self._validate_explicit_cast(expr.type, dest_ir_type)
         # Check if casting to unsigned type
         is_unsigned = False
         if isinstance(node.to_type.type, c_ast.TypeDecl) and isinstance(
@@ -2982,6 +4301,9 @@ class LLVMCodeGenerator(object):
         self._tag_value_from_decl_type(result, node.to_type.type)
         return result, None
 
+    def codegen_CompoundLiteral(self, node):
+        return self._materialize_compound_literal(node.type.type, node.init)
+
     def codegen_FuncCall(self, node):
 
         callee = None
@@ -2993,13 +4315,111 @@ class LLVMCodeGenerator(object):
                 return self._codegen_builtin_va_end(node)
             if callee == "__builtin_va_copy":
                 return self._codegen_builtin_va_copy(node)
+            if callee == "__builtin_alloca":
+                return self._codegen_builtin_alloca(node)
             if callee == "__builtin_va_arg":
                 return ir.Constant(voidptr_t, None), None
+            if callee == "__builtin_expect":
+                return self._codegen_builtin_expect(node)
+            if callee == "__builtin_assume":
+                return ir.Constant(int64_t, 0), None
+            if callee == "__builtin_prefetch":
+                return ir.Constant(int64_t, 0), None
+            if callee == "__builtin_unreachable":
+                return self._codegen_builtin_unreachable(node)
+            if callee == "__builtin_add_overflow":
+                return self._codegen_builtin_overflow(node, "add")
+            if callee == "__builtin_sub_overflow":
+                return self._codegen_builtin_overflow(node, "sub")
+            if callee == "__builtin_mul_overflow":
+                return self._codegen_builtin_overflow(node, "mul")
+            if callee == "__builtin_bswap16":
+                return self._codegen_builtin_bswap(node, 16)
+            if callee == "__builtin_bswap32":
+                return self._codegen_builtin_bswap(node, 32)
+            if callee == "__builtin_bswap64":
+                return self._codegen_builtin_bswap(node, 64)
+            if callee == "__builtin_rotateleft32":
+                return self._codegen_builtin_rotate(node, 32, "left")
+            if callee == "__builtin_rotateleft64":
+                return self._codegen_builtin_rotate(node, 64, "left")
+            if callee == "__builtin_rotateright32":
+                return self._codegen_builtin_rotate(node, 32, "right")
+            if callee == "__builtin_rotateright64":
+                return self._codegen_builtin_rotate(node, 64, "right")
+            if callee == "__builtin_clz":
+                return self._codegen_builtin_bitcount(node, 32, "ctlz")
+            if callee == "__builtin_clzll":
+                return self._codegen_builtin_bitcount(node, 64, "ctlz")
+            if callee == "__builtin_ctz":
+                return self._codegen_builtin_bitcount(node, 32, "cttz")
+            if callee == "__builtin_ctzll":
+                return self._codegen_builtin_bitcount(node, 64, "cttz")
+            if callee == "__builtin_ffs":
+                return self._codegen_builtin_ffs(node, 32)
+            if callee == "__builtin_ffsll":
+                return self._codegen_builtin_ffs(node, 64)
+            if callee == "__builtin_frame_address":
+                return self._codegen_builtin_frame_address(node)
+            if callee == "__builtin_memcmp":
+                callee = "memcmp"
+            if callee == "__builtin_memchr":
+                callee = "memchr"
+            if callee == "__builtin_inf":
+                return ir.Constant(_double, float("inf")), None
+            if callee == "__builtin_inff":
+                return ir.Constant(_float, float("inf")), None
+            if callee == "__builtin_infl":
+                return ir.Constant(_double, float("inf")), None
+            if callee == "__builtin_nan":
+                return ir.Constant(_double, float("nan")), None
+            if callee == "__builtin_nanf":
+                return ir.Constant(_float, float("nan")), None
+            if callee == "__builtin_nanl":
+                return ir.Constant(_double, float("nan")), None
+            if callee in ("__builtin_isnan", "__builtin_isnanf", "__builtin_isnanl"):
+                return self._codegen_builtin_isnan(node)
+            if callee in ("__builtin_isfinite", "__builtin_finite"):
+                return self._codegen_builtin_isfinite(node)
+            if callee in ("__builtin_isinf", "__builtin_isinff", "__builtin_isinfl"):
+                return self._codegen_builtin_isinf(node)
+            if callee == "__builtin_signbit":
+                return self._codegen_builtin_signbit(node)
+            if callee == "__builtin_isunordered":
+                return self._codegen_builtin_isunordered(node)
+            if callee == "__builtin_isless":
+                return self._codegen_builtin_ordered_compare(node, "<", "isless")
+            if callee == "__builtin_islessequal":
+                return self._codegen_builtin_ordered_compare(
+                    node, "<=", "islessequal"
+                )
+            if callee == "__builtin_isgreater":
+                return self._codegen_builtin_ordered_compare(node, ">", "isgreater")
+            if callee == "__builtin_isgreaterequal":
+                return self._codegen_builtin_ordered_compare(
+                    node, ">=", "isgreaterequal"
+                )
+            if callee == "__builtin_islessgreater":
+                return self._codegen_builtin_islessgreater(node)
+            if callee == "__builtin_copysign":
+                return self._codegen_builtin_copysign(node, _double)
+            if callee == "__builtin_copysignf":
+                return self._codegen_builtin_copysign(node, _float)
+            if callee == "__builtin_copysignl":
+                return self._codegen_builtin_copysign(node, _double)
+            if callee == "__sync_synchronize":
+                return self._codegen_builtin_sync_synchronize(node)
+            if callee == "__atomic_load_n":
+                return self._codegen_builtin_atomic_load(node)
+            if callee == "__atomic_store_n":
+                return self._codegen_builtin_atomic_store(node)
         else:
             # Calling function pointer in struct: s.fn(args)
             call_args = []
+            arg_nodes = []
             if node.args:
-                call_args = [self.codegen(arg)[0] for arg in node.args.exprs]
+                arg_nodes = list(node.args.exprs)
+                call_args = [self.codegen(arg)[0] for arg in arg_nodes]
             fp_val, _ = self.codegen(node.name)
             if isinstance(fp_val.type, ir.PointerType) and isinstance(
                 fp_val.type.pointee, ir.FunctionType
@@ -3008,10 +4428,15 @@ class LLVMCodeGenerator(object):
                 ftype = fp_val.type.pointee
                 coerced = []
                 for j, a in enumerate(call_args):
+                    arg_node = arg_nodes[j] if j < len(arg_nodes) else None
                     if j < len(ftype.args):
-                        coerced.append(self._coerce_arg(a, ftype.args[j]))
+                        coerced.append(
+                            self._coerce_arg(a, ftype.args[j], arg_node=arg_node)
+                        )
                     else:
-                        coerced.append(a)
+                        coerced.append(
+                            self._default_arg_promotion(a, arg_node=arg_node)
+                        )
                 call_args = coerced
                 ret_type = ftype.return_type
                 if isinstance(ret_type, ir.VoidType):
@@ -3030,8 +4455,10 @@ class LLVMCodeGenerator(object):
         _, callee_func = self.lookup(callee)
 
         call_args = []
+        arg_nodes = []
         if node.args:
-            call_args = [self.codegen(arg)[0] for arg in node.args.exprs]
+            arg_nodes = list(node.args.exprs)
+            call_args = [self.codegen(arg)[0] for arg in arg_nodes]
 
         # Function pointer: load the pointer and call through it
         if not isinstance(callee_func, ir.Function):
@@ -3049,7 +4476,16 @@ class LLVMCodeGenerator(object):
                 ):
                     ftype = func_val.type.pointee
                     coerced = [
-                        self._coerce_arg(a, ftype.args[j]) if j < len(ftype.args) else a
+                        self._coerce_arg(
+                            a,
+                            ftype.args[j],
+                            arg_node=arg_nodes[j] if j < len(arg_nodes) else None,
+                        )
+                        if j < len(ftype.args)
+                        else self._default_arg_promotion(
+                            a,
+                            arg_node=arg_nodes[j] if j < len(arg_nodes) else None,
+                        )
                         for j, a in enumerate(call_args)
                     ]
                     ret_type = ftype.return_type
@@ -3070,7 +4506,9 @@ class LLVMCodeGenerator(object):
             return ir.Constant(int64_t, 0), None
 
         # Convert arguments to match function parameter types
-        converted = self._convert_call_args(call_args, callee_func)
+        converted = self._convert_call_args(
+            call_args, callee_func, arg_nodes=arg_nodes
+        )
 
         # Call and handle return type
         try:
@@ -3100,11 +4538,18 @@ class LLVMCodeGenerator(object):
             return existing
         return ir.Function(self.module, ir.FunctionType(ret_type, arg_types), name=name)
 
+    def _builtin_va_list_storage(self, expr):
+        value, addr = self.codegen(expr)
+        storage = addr if addr is not None else value
+        if not isinstance(getattr(storage, "type", None), ir.PointerType):
+            return None
+        return storage
+
     def _codegen_builtin_va_start(self, node):
         if not node.args or not node.args.exprs:
             return ir.Constant(int64_t, 0), None
-        ap_addr, _ = self.codegen(node.args.exprs[0])
-        if not isinstance(getattr(ap_addr, "type", None), ir.PointerType):
+        ap_addr = self._builtin_va_list_storage(node.args.exprs[0])
+        if ap_addr is None:
             return ir.Constant(int64_t, 0), None
         intrinsic = self._get_or_declare_intrinsic(
             "llvm.va_start", ir.VoidType(), [voidptr_t]
@@ -3118,8 +4563,8 @@ class LLVMCodeGenerator(object):
     def _codegen_builtin_va_end(self, node):
         if not node.args or not node.args.exprs:
             return ir.Constant(int64_t, 0), None
-        ap_addr, _ = self.codegen(node.args.exprs[0])
-        if not isinstance(getattr(ap_addr, "type", None), ir.PointerType):
+        ap_addr = self._builtin_va_list_storage(node.args.exprs[0])
+        if ap_addr is None:
             return ir.Constant(int64_t, 0), None
         intrinsic = self._get_or_declare_intrinsic(
             "llvm.va_end", ir.VoidType(), [voidptr_t]
@@ -3133,11 +4578,11 @@ class LLVMCodeGenerator(object):
     def _codegen_builtin_va_copy(self, node):
         if not node.args or len(node.args.exprs) < 2:
             return ir.Constant(int64_t, 0), None
-        dst_addr, _ = self.codegen(node.args.exprs[0])
-        src_addr, _ = self.codegen(node.args.exprs[1])
-        if not isinstance(getattr(dst_addr, "type", None), ir.PointerType):
+        dst_addr = self._builtin_va_list_storage(node.args.exprs[0])
+        src_addr = self._builtin_va_list_storage(node.args.exprs[1])
+        if dst_addr is None:
             return ir.Constant(int64_t, 0), None
-        if not isinstance(getattr(src_addr, "type", None), ir.PointerType):
+        if src_addr is None:
             return ir.Constant(int64_t, 0), None
         src_val = self._safe_load(src_addr)
         dst_pointee = dst_addr.type.pointee
@@ -3146,24 +4591,429 @@ class LLVMCodeGenerator(object):
         self._safe_store(src_val, dst_addr)
         return ir.Constant(int64_t, 0), None
 
-    def _convert_call_args(self, call_args, callee_func):
+    def _codegen_builtin_expect(self, node):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(int64_t, 0), None
+        value, _ = self.codegen(node.args.exprs[0])
+        return value, None
+
+    def _codegen_builtin_unreachable(self, node):
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self.builder.unreachable()
+            dead_bb = self.function.append_basic_block(name="after_unreachable")
+            self.builder.position_at_end(dead_bb)
+        return ir.Constant(int64_t, 0), None
+
+    def _codegen_builtin_alloca(self, node):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(voidptr_t, None), None
+
+        size_val, _ = self.codegen(node.args.exprs[0])
+        if not isinstance(getattr(size_val, "type", None), ir.IntType):
+            size_val = self._implicit_convert(size_val, int64_t)
+
+        return self.builder.alloca(int8_t, size=size_val, name="builtinalloca"), None
+
+    def _codegen_builtin_frame_address(self, node):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(voidptr_t, None), None
+        try:
+            level = int(self._eval_const_expr(node.args.exprs[0]))
+        except Exception:
+            level = 0
+        if level != 0 or self.builder is None:
+            return ir.Constant(voidptr_t, None), None
+        if self._frame_address_marker is None:
+            self._frame_address_marker = self._alloca_in_entry(
+                int8_t, "__builtin_frame_address"
+            )
+        if self._frame_address_marker.type == voidptr_t:
+            return self._frame_address_marker, None
+        return self.builder.bitcast(
+            self._frame_address_marker, voidptr_t, name="frameaddrcast"
+        ), None
+
+    def _codegen_builtin_ffs(self, node, width):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(int32_t, 0), None
+
+        arg, _ = self.codegen(node.args.exprs[0])
+        arg_type = ir.IntType(width)
+        if not isinstance(getattr(arg, "type", None), ir.IntType) or arg.type != arg_type:
+            arg = self._implicit_convert(arg, arg_type)
+
+        zero = ir.Constant(arg_type, 0)
+        is_zero = self.builder.icmp_unsigned("==", arg, zero, name="ffsiszero")
+        intrinsic = self._get_or_declare_intrinsic(
+            f"llvm.cttz.i{width}",
+            arg_type,
+            [arg_type, ir.IntType(1)],
+        )
+        cttz = self.builder.call(
+            intrinsic,
+            [arg, ir.Constant(ir.IntType(1), 0)],
+            name="ffstmp",
+        )
+        if cttz.type != int32_t:
+            cttz = self.builder.trunc(cttz, int32_t, name="ffsi32")
+        plus_one = self.builder.add(cttz, ir.Constant(int32_t, 1), name="ffsplusone")
+        result = self.builder.select(is_zero, ir.Constant(int32_t, 0), plus_one)
+        self._clear_unsigned(result)
+        return result, None
+
+    def _coerce_builtin_float_arg(self, expr, target_type=None):
+        value, _ = self.codegen(expr)
+        if target_type is None:
+            if isinstance(getattr(value, "type", None), ir.FloatType):
+                target_type = _float
+            else:
+                target_type = _double
+        if not self._is_floating_ir_type(getattr(value, "type", None)):
+            value = self._implicit_convert(value, target_type)
+        elif value.type != target_type:
+            value = self._implicit_convert(value, target_type)
+        return value
+
+    def _materialize_compound_literal(self, ast_type, init_node):
+        dest_ir_type = self._resolve_ast_type(ast_type)
+        if self.builder is None:
+            return self._build_const_init(init_node, dest_ir_type), None
+        tmp_ptr = self._alloca_in_entry(dest_ir_type, "compoundlit")
+        self._safe_store(self._zero_initializer(dest_ir_type), tmp_ptr)
+        self._init_runtime_value(tmp_ptr, dest_ir_type, init_node)
+        value = self._safe_load(tmp_ptr, name="compoundlitval")
+        self._tag_value_from_decl_type(value, ast_type)
+        return value, tmp_ptr
+
+    def _builtin_bool_to_i32(self, value, name):
+        return self.builder.zext(value, int32_t, name=name), None
+
+    def _codegen_builtin_isnan(self, node):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(int32_t, 0), None
+        value = self._coerce_builtin_float_arg(node.args.exprs[0])
+        result = self.builder.fcmp_unordered("!=", value, value, name="isnan")
+        return self._builtin_bool_to_i32(result, "isnani32")
+
+    def _codegen_builtin_isinf(self, node):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(int32_t, 0), None
+        value = self._coerce_builtin_float_arg(node.args.exprs[0])
+        pos_inf = ir.Constant(value.type, float("inf"))
+        neg_inf = ir.Constant(value.type, float("-inf"))
+        is_pos = self.builder.fcmp_ordered("==", value, pos_inf, name="isinfpos")
+        is_neg = self.builder.fcmp_ordered("==", value, neg_inf, name="isinfneg")
+        return self._builtin_bool_to_i32(
+            self.builder.or_(is_pos, is_neg, name="isinf"),
+            "isinfi32",
+        )
+
+    def _codegen_builtin_isfinite(self, node):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(int32_t, 0), None
+        value = self._coerce_builtin_float_arg(node.args.exprs[0])
+        not_nan = self.builder.fcmp_ordered("==", value, value, name="isfinitenotnan")
+        pos_inf = self.builder.fcmp_ordered(
+            "==", value, ir.Constant(value.type, float("inf")), name="isfiniteposinf"
+        )
+        neg_inf = self.builder.fcmp_ordered(
+            "==", value, ir.Constant(value.type, float("-inf")), name="isfiniteneginf"
+        )
+        is_inf = self.builder.or_(pos_inf, neg_inf, name="isfiniteisinf")
+        result = self.builder.and_(
+            not_nan,
+            self.builder.not_(is_inf, name="isfinite_not_inf"),
+            name="isfinite",
+        )
+        return self._builtin_bool_to_i32(result, "isfinitei32")
+
+    def _codegen_builtin_signbit(self, node):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(int32_t, 0), None
+        value = self._coerce_builtin_float_arg(node.args.exprs[0])
+        if isinstance(value.type, ir.FloatType):
+            int_type = ir.IntType(32)
+            sign_mask = ir.Constant(int_type, 0x80000000)
+        else:
+            int_type = ir.IntType(64)
+            sign_mask = ir.Constant(int_type, 0x8000000000000000)
+        bits = self.builder.bitcast(value, int_type, name="signbitbits")
+        masked = self.builder.and_(bits, sign_mask, name="signbitmask")
+        result = self.builder.icmp_unsigned(
+            "!=", masked, ir.Constant(int_type, 0), name="signbit"
+        )
+        return self._builtin_bool_to_i32(result, "signbiti32")
+
+    def _codegen_builtin_isunordered(self, node):
+        if not node.args or len(node.args.exprs) < 2:
+            return ir.Constant(int32_t, 0), None
+        lhs = self._coerce_builtin_float_arg(node.args.exprs[0])
+        rhs = self._coerce_builtin_float_arg(node.args.exprs[1], lhs.type)
+        lhs_nan = self.builder.fcmp_unordered("!=", lhs, lhs, name="lhsnan")
+        rhs_nan = self.builder.fcmp_unordered("!=", rhs, rhs, name="rhsnan")
+        result = self.builder.or_(lhs_nan, rhs_nan, name="isunord")
+        return self._builtin_bool_to_i32(result, "isunordi32")
+
+    def _codegen_builtin_ordered_compare(self, node, op, name):
+        if not node.args or len(node.args.exprs) < 2:
+            return ir.Constant(int32_t, 0), None
+        lhs = self._coerce_builtin_float_arg(node.args.exprs[0])
+        rhs = self._coerce_builtin_float_arg(node.args.exprs[1], lhs.type)
+        result = self.builder.fcmp_ordered(op, lhs, rhs, name=name)
+        return self._builtin_bool_to_i32(result, f"{name}i32")
+
+    def _codegen_builtin_islessgreater(self, node):
+        if not node.args or len(node.args.exprs) < 2:
+            return ir.Constant(int32_t, 0), None
+        lhs = self._coerce_builtin_float_arg(node.args.exprs[0])
+        rhs = self._coerce_builtin_float_arg(node.args.exprs[1], lhs.type)
+        result = self.builder.fcmp_ordered("!=", lhs, rhs, name="islessgreater")
+        return self._builtin_bool_to_i32(result, "islessgreateri32")
+
+    def _codegen_builtin_copysign(self, node, target_type):
+        if not node.args or len(node.args.exprs) < 2:
+            return ir.Constant(target_type, 0.0), None
+        magnitude = self._coerce_builtin_float_arg(node.args.exprs[0], target_type)
+        sign = self._coerce_builtin_float_arg(node.args.exprs[1], target_type)
+
+        if isinstance(target_type, ir.FloatType):
+            int_type = ir.IntType(32)
+            sign_mask = ir.Constant(int_type, 0x80000000)
+            value_mask = ir.Constant(int_type, 0x7FFFFFFF)
+        else:
+            int_type = ir.IntType(64)
+            sign_mask = ir.Constant(int_type, 0x8000000000000000)
+            value_mask = ir.Constant(int_type, 0x7FFFFFFFFFFFFFFF)
+
+        magnitude_bits = self.builder.bitcast(
+            magnitude, int_type, name="copysignmagbits"
+        )
+        sign_bits = self.builder.bitcast(sign, int_type, name="copysignsignbits")
+        magnitude_bits = self.builder.and_(
+            magnitude_bits, value_mask, name="copysignmag"
+        )
+        sign_bits = self.builder.and_(sign_bits, sign_mask, name="copysignsign")
+        result_bits = self.builder.or_(
+            magnitude_bits, sign_bits, name="copysignbits"
+        )
+        return self.builder.bitcast(result_bits, target_type, name="copysigntmp"), None
+
+    def _codegen_builtin_overflow(self, node, operation):
+        if not node.args or len(node.args.exprs) < 3:
+            return ir.Constant(int32_t, 0), None
+
+        lhs, _ = self.codegen(node.args.exprs[0])
+        rhs, _ = self.codegen(node.args.exprs[1])
+        out_ptr, _ = self.codegen(node.args.exprs[2])
+
+        if not isinstance(getattr(out_ptr, "type", None), ir.PointerType):
+            return ir.Constant(int32_t, 0), None
+
+        result_type = out_ptr.type.pointee
+        if not isinstance(result_type, ir.IntType):
+            return ir.Constant(int32_t, 0), None
+
+        lhs = self._implicit_convert(lhs, result_type)
+        rhs = self._implicit_convert(rhs, result_type)
+
+        is_unsigned = self._is_unsigned_val(lhs) or self._is_unsigned_val(rhs)
+        if is_unsigned:
+            self._tag_unsigned(lhs)
+            self._tag_unsigned(rhs)
+
+        intrinsic_prefix = {
+            ("add", False): "sadd",
+            ("add", True): "uadd",
+            ("sub", False): "ssub",
+            ("sub", True): "usub",
+            ("mul", False): "smul",
+            ("mul", True): "umul",
+        }[(operation, is_unsigned)]
+        pair_type = ir.LiteralStructType([result_type, ir.IntType(1)])
+        intrinsic = self._get_or_declare_intrinsic(
+            f"llvm.{intrinsic_prefix}.with.overflow.i{result_type.width}",
+            pair_type,
+            [result_type, result_type],
+        )
+        pair = self.builder.call(intrinsic, [lhs, rhs], name=f"{operation}ovtmp")
+        result = self.builder.extract_value(pair, 0, name=f"{operation}ovval")
+        overflow = self.builder.extract_value(pair, 1, name=f"{operation}ovflag")
+        if is_unsigned:
+            self._tag_unsigned(result)
+        self._safe_store(result, out_ptr)
+
+        overflow_i32 = self.builder.zext(overflow, int32_t, name=f"{operation}ovi32")
+        self._clear_unsigned(overflow_i32)
+        return overflow_i32, None
+
+    def _codegen_builtin_sync_synchronize(self, node):
+        self.builder.fence("seq_cst")
+        return ir.Constant(int64_t, 0), None
+
+    def _codegen_builtin_bswap(self, node, width):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(ir.IntType(width), 0), None
+
+        arg, _ = self.codegen(node.args.exprs[0])
+        arg_type = ir.IntType(width)
+        returns_unsigned = self._is_unsigned_val(arg)
+
+        if not isinstance(getattr(arg, "type", None), ir.IntType) or arg.type != arg_type:
+            arg = self._implicit_convert(arg, arg_type)
+
+        mask = ir.Constant(arg_type, 0xFF)
+        result = ir.Constant(arg_type, 0)
+        byte_count = width // 8
+
+        for index in range(byte_count):
+            piece = arg
+            if index:
+                piece = self.builder.lshr(
+                    piece,
+                    ir.Constant(arg_type, index * 8),
+                    name=f"bswapshr{index}",
+                )
+            piece = self.builder.and_(piece, mask, name=f"bswapmask{index}")
+            shift = (byte_count - 1 - index) * 8
+            if shift:
+                piece = self.builder.shl(
+                    piece,
+                    ir.Constant(arg_type, shift),
+                    name=f"bswapshl{index}",
+                )
+            result = self.builder.or_(result, piece, name=f"bswapor{index}")
+
+        return self._extend_call_result(result, returns_unsigned=returns_unsigned), None
+
+    def _codegen_builtin_rotate(self, node, width, direction):
+        if not node.args or len(node.args.exprs) < 2:
+            return ir.Constant(ir.IntType(width), 0), None
+
+        value, _ = self.codegen(node.args.exprs[0])
+        amount, _ = self.codegen(node.args.exprs[1])
+        value_type = ir.IntType(width)
+        returns_unsigned = self._is_unsigned_val(value)
+
+        if (
+            not isinstance(getattr(value, "type", None), ir.IntType)
+            or value.type != value_type
+        ):
+            value = self._implicit_convert(value, value_type)
+        if (
+            not isinstance(getattr(amount, "type", None), ir.IntType)
+            or amount.type != value_type
+        ):
+            amount = self._implicit_convert(amount, value_type)
+
+        mask = ir.Constant(value_type, width - 1)
+        amount = self.builder.and_(amount, mask, name=f"rot{direction}amt")
+        inverse = self.builder.sub(
+            ir.Constant(value_type, 0), amount, name=f"rot{direction}invtmp"
+        )
+        inverse = self.builder.and_(inverse, mask, name=f"rot{direction}inv")
+
+        if direction == "left":
+            lhs = self.builder.shl(value, amount, name=f"rot{direction}lhs")
+            rhs = self.builder.lshr(value, inverse, name=f"rot{direction}rhs")
+        else:
+            lhs = self.builder.lshr(value, amount, name=f"rot{direction}lhs")
+            rhs = self.builder.shl(value, inverse, name=f"rot{direction}rhs")
+
+        result = self.builder.or_(lhs, rhs, name=f"rot{direction}")
+        return self._extend_call_result(result, returns_unsigned=returns_unsigned), None
+
+    def _codegen_builtin_bitcount(self, node, width, intrinsic_base):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(int32_t, 0), None
+
+        arg, _ = self.codegen(node.args.exprs[0])
+        arg_type = ir.IntType(width)
+        if not isinstance(getattr(arg, "type", None), ir.IntType) or arg.type != arg_type:
+            arg = self._implicit_convert(arg, arg_type)
+
+        intrinsic = self._get_or_declare_intrinsic(
+            f"llvm.{intrinsic_base}.i{width}",
+            arg_type,
+            [arg_type, ir.IntType(1)],
+        )
+        result = self.builder.call(
+            intrinsic,
+            [arg, ir.Constant(ir.IntType(1), 0)],
+            name=f"{intrinsic_base}tmp",
+        )
+        if result.type != int32_t:
+            result = self.builder.trunc(result, int32_t, name=f"{intrinsic_base}i32")
+        self._clear_unsigned(result)
+        return result, None
+
+    def _atomic_ordering(self, node, is_store):
+        try:
+            value = self._eval_const_expr(node)
+        except Exception:
+            return "monotonic"
+        if is_store:
+            return {
+                0: "monotonic",  # __ATOMIC_RELAXED
+                3: "release",    # __ATOMIC_RELEASE
+                4: "release",    # __ATOMIC_ACQ_REL
+                5: "seq_cst",    # __ATOMIC_SEQ_CST
+            }.get(value, "monotonic")
+        return {
+            0: "monotonic",  # __ATOMIC_RELAXED
+            1: "acquire",    # __ATOMIC_CONSUME
+            2: "acquire",    # __ATOMIC_ACQUIRE
+            5: "seq_cst",    # __ATOMIC_SEQ_CST
+        }.get(value, "monotonic")
+
+    def _codegen_builtin_atomic_load(self, node):
+        if not node.args or len(node.args.exprs) < 2:
+            return ir.Constant(int64_t, 0), None
+        ptr, _ = self.codegen(node.args.exprs[0])
+        if not isinstance(getattr(ptr, "type", None), ir.PointerType):
+            return ir.Constant(int64_t, 0), None
+        pointee_type = ptr.type.pointee
+        align = max(1, self._ir_type_align(pointee_type))
+        ordering = self._atomic_ordering(node.args.exprs[1], is_store=False)
+        result = self.builder.load_atomic(ptr, ordering, align)
+        if self._is_unsigned_pointee(ptr):
+            self._tag_unsigned(result)
+        return result, ptr
+
+    def _codegen_builtin_atomic_store(self, node):
+        if not node.args or len(node.args.exprs) < 3:
+            return ir.Constant(int64_t, 0), None
+        ptr, _ = self.codegen(node.args.exprs[0])
+        value, _ = self.codegen(node.args.exprs[1])
+        if not isinstance(getattr(ptr, "type", None), ir.PointerType):
+            return ir.Constant(int64_t, 0), None
+        pointee_type = ptr.type.pointee
+        if value.type != pointee_type:
+            value = self._implicit_convert(value, pointee_type)
+        align = max(1, self._ir_type_align(pointee_type))
+        ordering = self._atomic_ordering(node.args.exprs[2], is_store=True)
+        self.builder.store_atomic(value, ptr, ordering, align)
+        return ir.Constant(int64_t, 0), None
+
+    def _convert_call_args(self, call_args, callee_func, arg_nodes=None):
         """Convert call arguments to match function parameter types."""
         converted = []
         param_types = [p.type for p in callee_func.args]
 
         for i, arg in enumerate(call_args):
+            arg_node = arg_nodes[i] if arg_nodes and i < len(arg_nodes) else None
             if i < len(param_types):
                 expected = param_types[i]
-                arg = self._coerce_arg(arg, expected)
+                arg = self._coerce_arg(arg, expected, arg_node=arg_node)
             else:
-                arg = self._default_arg_promotion(arg)
+                arg = self._default_arg_promotion(arg, arg_node=arg_node)
             converted.append(arg)
         return converted
 
-    def _default_arg_promotion(self, arg):
+    def _default_arg_promotion(self, arg, arg_node=None):
         """Apply C default argument promotions for variadic calls."""
         if arg is None or isinstance(getattr(arg, "type", None), ir.VoidType):
             return ir.Constant(int64_t, 0)
+        arg = self._decay_array_expr_to_pointer(arg_node, arg, "varargarraydecay")
         if isinstance(arg.type, ir.ArrayType):
             return self._implicit_convert(arg, ir.PointerType(arg.type.element))
         if isinstance(arg.type, ir.FloatType):
@@ -3172,7 +5022,7 @@ class LLVMCodeGenerator(object):
             return self._integer_promotion(arg)
         return arg
 
-    def _coerce_arg(self, arg, expected):
+    def _coerce_arg(self, arg, expected, arg_node=None):
         """Coerce a single argument to the expected type."""
         if arg is None or isinstance(getattr(arg, "type", None), ir.VoidType):
             return (
@@ -3180,16 +5030,13 @@ class LLVMCodeGenerator(object):
                 if isinstance(expected, ir.PointerType)
                 else ir.Constant(int64_t, 0)
             )
+        arg = self._decay_array_expr_to_pointer(arg_node, arg, "argarraydecay")
         if arg.type == expected:
             return arg
-        # String literal [N x i8] -> pointer
+        # Array values decay to pointers at the call site; do not try to
+        # synthesize globals from function-local SSA array values here.
         if isinstance(arg.type, ir.ArrayType) and isinstance(expected, ir.PointerType):
-            gv = ir.GlobalVariable(
-                self.module, arg.type, self.module.get_unique_name("str")
-            )
-            gv.initializer = arg
-            gv.global_constant = True
-            return self.builder.bitcast(gv, expected)
+            return self._implicit_convert(arg, expected)
         # Pointer -> different pointer: bitcast
         if isinstance(arg.type, ir.PointerType) and isinstance(
             expected, ir.PointerType
@@ -3212,11 +5059,27 @@ class LLVMCodeGenerator(object):
             ):
                 return None, None
 
-        # Static local variables: stored as globals with function-scoped names
+        # Standalone tag definitions such as:
+        #   struct S { ... };
+        #   union U { ... };
+        #   enum E { ... };
+        # do not declare objects. Register the aggregate/enum type and stop.
+        if node.name is None and isinstance(node.type, c_ast.TypeDecl):
+            inner = node.type.type
+            if isinstance(inner, c_ast.Struct):
+                self.codegen_Struct(inner)
+                return None, None
+            if isinstance(inner, c_ast.Union):
+                self.codegen_Union(inner)
+                return None, None
+            if isinstance(inner, c_ast.Enum):
+                self.codegen_Enum(inner)
+                return None, None
+
+        # Static local objects: stored as internal globals with function-scoped names
         is_static = node.storage and "static" in node.storage
-        if is_static and not self.in_global and isinstance(node.type, c_ast.TypeDecl):
-            type_str = node.type.type.names
-            ir_type = self._get_ir_type(type_str)
+        if is_static and not self.in_global and not isinstance(node.type, c_ast.FuncDecl):
+            ir_type = self._static_local_ir_type(node.type, init_node=node.init)
             # Create unique global name
             global_name = self._static_local_symbol_name(node.name)
             gv = self._create_bound_global(node.name, ir_type, symbol_name=global_name)
@@ -3228,7 +5091,7 @@ class LLVMCodeGenerator(object):
             return None, None
 
         if self._is_global_extern_decl(node):
-            ir_type = self._extern_decl_ir_type(node.type)
+            ir_type = self._extern_decl_ir_type(node.name, node.type)
             self._prepare_file_scope_object(
                 node.name,
                 ir_type,
@@ -3243,22 +5106,17 @@ class LLVMCodeGenerator(object):
         # Forward function declaration: int foo(int x);
         if isinstance(node.type, c_ast.FuncDecl):
             funcname = node.name
-            ir_type, _ = self.codegen(node.type)
-            arg_types = []
-            is_va = False
-            if node.type.args:
-                for arg in node.type.args.params:
-                    if isinstance(arg, c_ast.EllipsisParam):
-                        is_va = True
-                        continue
-                    t = self._resolve_param_type(arg)
-                    if t is not None:
-                        arg_types.append(t)
-            function_type = ir.FunctionType(ir_type, arg_types, var_arg=is_va)
+            function_type, ir_type = self._build_function_ir_type(node.type)
+            function_type = self._preferred_file_scope_function_ir_type(
+                funcname,
+                function_type,
+                getattr(node.type, "args", None) is not None,
+            )
             symbol_name = self._register_file_scope_function(
                 funcname,
                 function_type,
                 storage=node.storage,
+                funcspec=node.funcspec,
                 is_definition=False,
             )
             # Skip if already exists (module globals, libc, or env)
@@ -3268,17 +5126,12 @@ class LLVMCodeGenerator(object):
                     self._mark_unsigned_return(existing)
                 self.define(funcname, (None, existing))
                 return None, None
-            if funcname in LIBC_FUNCTIONS:
-                self._declare_libc(funcname)
-                return None, None
             try:
                 func = ir.Function(
                     self.module,
                     function_type,
                     name=symbol_name,
                 )
-                if self._is_file_scope_static(node.storage):
-                    func.linkage = "internal"
                 if self._func_decl_returns_unsigned(node.type):
                     self._mark_unsigned_return(func)
                 self.define(funcname, (ir_type, func))
@@ -3305,8 +5158,29 @@ class LLVMCodeGenerator(object):
             if isinstance(node.type.type, c_ast.IdentifierType):
                 # Check if the type resolves to a struct or pointer via typedef
                 resolved = self._resolve_type_str(node.type.type.names)
-                if isinstance(
-                    resolved, (ir.LiteralStructType, ir.PointerType, ir.ArrayType)
+                if isinstance(resolved, ir.FunctionType):
+                    funcname = node.type.declname
+                    symbol_name = self._register_file_scope_function(
+                        funcname,
+                        resolved,
+                        storage=node.storage,
+                        funcspec=node.funcspec,
+                        is_definition=False,
+                    )
+                    existing = self.module.globals.get(symbol_name)
+                    if existing:
+                        self.define(funcname, (resolved.return_type, existing))
+                        return None, None
+                    try:
+                        func = ir.Function(self.module, resolved, name=symbol_name)
+                        self.define(funcname, (resolved.return_type, func))
+                    except Exception:
+                        existing = self.module.globals.get(symbol_name)
+                        if existing:
+                            self.define(funcname, (resolved.return_type, existing))
+                    return None, None
+                if isinstance(resolved, (ir.PointerType, ir.ArrayType)) or _is_struct_ir_type(
+                    resolved
                 ):
                     name = node.type.declname
                     ir_type = resolved
@@ -3329,11 +5203,20 @@ class LLVMCodeGenerator(object):
                                     node.init, ir_type
                                 )
                         else:
-                            init_val, _ = self.codegen(node.init)
-                            if init_val is not None:
-                                if init_val.type != ir_type:
-                                    init_val = self._implicit_convert(init_val, ir_type)
-                                self._safe_store(init_val, ret)
+                            if isinstance(node.init, c_ast.InitList) and (
+                                getattr(ir_type, "is_union", False)
+                                or _is_struct_ir_type(ir_type)
+                            ):
+                                self._safe_store(self._zero_initializer(ir_type), ret)
+                                self._init_runtime_aggregate(ret, node.init, ir_type)
+                            else:
+                                init_val, _ = self.codegen(node.init)
+                                if init_val is not None:
+                                    if init_val.type != ir_type:
+                                        init_val = self._implicit_convert(
+                                            init_val, ir_type
+                                        )
+                                    self._safe_store(init_val, ret)
                     elif self.in_global and write_initializer:
                         ret.initializer = self._zero_initializer(ir_type)
                     return None, None
@@ -3345,8 +5228,15 @@ class LLVMCodeGenerator(object):
                     if isinstance(node.type.type, c_ast.Union)
                     else self.codegen_Struct
                 )
-                if node.type.type.name is None:
+                if node.type.type.name is None or getattr(node.type.type, "decls", None) is not None:
                     struct_type = codegen_fn(node.type.type)
+                    if self.in_global and node.name and node.type.type.name is None:
+                        # Preserve the repository's legacy behavior for
+                        # file-scope anonymous aggregates declared as:
+                        #   struct { ... } Name;
+                        # Existing tests rely on a later `struct Name`
+                        # resolving to the same aggregate type.
+                        self.define(self._tag_type_key(node.name), (struct_type, None))
                     if not self.in_global:
                         ret = self._alloca_in_entry(struct_type, name)
                         self.define(name, (struct_type, ret))
@@ -3366,18 +5256,28 @@ class LLVMCodeGenerator(object):
                                     node.init, struct_type
                                 )
                         else:
-                            init_val, _ = self.codegen(node.init)
-                            if init_val is not None:
-                                if init_val.type != struct_type:
-                                    init_val = self._implicit_convert(
-                                        init_val, struct_type
-                                    )
-                                self._safe_store(init_val, ret)
+                            if isinstance(node.init, c_ast.InitList):
+                                self._safe_store(
+                                    self._zero_initializer(struct_type), ret
+                                )
+                                self._init_runtime_aggregate(
+                                    ret, node.init, struct_type
+                                )
+                            else:
+                                init_val, _ = self.codegen(node.init)
+                                if init_val is not None:
+                                    if init_val.type != struct_type:
+                                        init_val = self._implicit_convert(
+                                            init_val, struct_type
+                                        )
+                                    self._safe_store(init_val, ret)
                     elif self.in_global and write_initializer:
                         ret.initializer = self._zero_initializer(struct_type)
                     return None, None
                 else:
-                    struct_type = self.env[node.type.type.name][0]
+                    struct_type = self.env[
+                        self._tag_type_key(node.type.type.name)
+                    ][0]
                     if not self.in_global:
                         ret = self._alloca_in_entry(struct_type, name)
                         self.define(name, (struct_type, ret))
@@ -3397,23 +5297,38 @@ class LLVMCodeGenerator(object):
                                     node.init, struct_type
                                 )
                         else:
-                            init_val, _ = self.codegen(node.init)
-                            if init_val is not None:
-                                if init_val.type != struct_type:
-                                    init_val = self._implicit_convert(
-                                        init_val, struct_type
-                                    )
-                                self._safe_store(init_val, ret)
+                            if isinstance(node.init, c_ast.InitList):
+                                self._safe_store(
+                                    self._zero_initializer(struct_type), ret
+                                )
+                                self._init_runtime_aggregate(
+                                    ret, node.init, struct_type
+                                )
+                            else:
+                                init_val, _ = self.codegen(node.init)
+                                if init_val is not None:
+                                    if init_val.type != struct_type:
+                                        init_val = self._implicit_convert(
+                                            init_val, struct_type
+                                        )
+                                    self._safe_store(init_val, ret)
                     elif self.in_global and write_initializer:
                         ret.initializer = self._zero_initializer(struct_type)
                     return None, None
             else:
-                type_str = node.type.type.names
-                is_unsigned = self._is_unsigned_type_names(type_str)
-                ir_type = self._get_ir_type(type_str)
-                type_str = self._resolve_type_str(type_str)
-                if isinstance(type_str, ir.Type):
-                    type_str = "int"  # fallback for alloca name
+                if isinstance(node.type.type, c_ast.IdentifierType):
+                    type_str = node.type.type.names
+                    is_unsigned = self._is_unsigned_type_names(type_str)
+                    ir_type = self._get_ir_type(type_str)
+                    type_str = self._resolve_type_str(type_str)
+                    if isinstance(type_str, ir.Type):
+                        type_str = "int"  # fallback for alloca name
+                else:
+                    if isinstance(node.type.type, c_ast.Enum):
+                        self.codegen_Enum(node.type.type)
+                    type_str = "int"
+                    is_unsigned = False
+                    ir_type = self._resolve_ast_type(node.type)
                 if self._is_floating_ir_type(ir_type):
                     init = 0.0
                 else:
@@ -3423,6 +5338,11 @@ class LLVMCodeGenerator(object):
                     if self.in_global:
                         init_val = self._build_const_init(node.init, ir_type)
                     else:
+                        var_addr, var_ir_type = self.create_entry_block_alloca(
+                            node.name, type_str, 1, storage=node.storage
+                        )
+                        if is_unsigned:
+                            self._mark_unsigned(var_addr)
                         init_val, _ = self.codegen(node.init)
                 else:
                     init_val = self._zero_initializer(ir_type)
@@ -3439,45 +5359,60 @@ class LLVMCodeGenerator(object):
                     if write_initializer:
                         var_addr.initializer = init_val
                 else:
-                    var_addr, var_ir_type = self.create_entry_block_alloca(
-                        node.name, type_str, 1, storage=node.storage
-                    )
-                    if is_unsigned:
-                        self._mark_unsigned(var_addr)
+                    if node.init is None:
+                        var_addr, var_ir_type = self.create_entry_block_alloca(
+                            node.name, type_str, 1, storage=node.storage
+                        )
+                        if is_unsigned:
+                            self._mark_unsigned(var_addr)
                     init_val = self._implicit_convert(init_val, ir_type)
                     self._safe_store(init_val, var_addr)
                 if self.in_global and is_unsigned:
                     self._mark_unsigned(var_addr)
 
         elif isinstance(node.type, c_ast.ArrayDecl):
-            global_symbol_name = self._file_scope_symbol_name(node.name, node.storage)
             array_list = []
             array_node = node.type
             var_addr = None
             var_ir_type = None
             elem_ir_type = None
             write_initializer = True
+            inferred_top_dim = self._infer_array_count_from_initializer(node.init)
             while True:
                 array_next_type = array_node.type
                 if isinstance(array_next_type, c_ast.TypeDecl):
                     dim_val = self._eval_dim(array_node.dim) if array_node.dim else 0
+                    if (
+                        dim_val == 0
+                        and array_node is node.type
+                        and inferred_top_dim is not None
+                    ):
+                        dim_val = inferred_top_dim
                     array_list.append(dim_val)
                     elem_ir_type = self._resolve_ast_type(array_next_type)
                     break
 
                 elif isinstance(array_next_type, c_ast.ArrayDecl):
-                    array_list.append(self._eval_dim(array_node.dim))
+                    dim_val = self._eval_dim(array_node.dim)
+                    if (
+                        dim_val == 0
+                        and array_node is node.type
+                        and inferred_top_dim is not None
+                    ):
+                        dim_val = inferred_top_dim
+                    array_list.append(dim_val)
                     array_node = array_next_type
                     continue
                 elif isinstance(array_next_type, c_ast.PtrDecl):
                     # Array of pointers: int *arr[3]
                     dim = self._eval_dim(array_node.dim)
-                    inner = array_next_type.type
-                    if isinstance(inner, c_ast.TypeDecl):
-                        elem_type_str = inner.type.names
-                    else:
-                        elem_type_str = "int"
-                    elem_ir = ir.PointerType(get_ir_type(elem_type_str))
+                    if (
+                        dim == 0
+                        and array_node is node.type
+                        and inferred_top_dim is not None
+                    ):
+                        dim = inferred_top_dim
+                    elem_ir = self._resolve_ast_type(array_next_type)
                     elem_ir_type = elem_ir
                     arr_ir = ir.ArrayType(elem_ir, dim)
                     arr_ir.dim_array = [dim]
@@ -3519,42 +5454,6 @@ class LLVMCodeGenerator(object):
             if self._has_unsigned_scalar_pointee(node.type):
                 self._mark_unsigned_pointee(var_addr)
 
-            # Infer the size of zero-length arrays from the initializer.
-            if (
-                isinstance(var_ir_type, ir.ArrayType)
-                and var_ir_type.count == 0
-                and node.init is not None
-            ):
-                actual_count = None
-                if isinstance(node.init, c_ast.InitList):
-                    actual_count = len(node.init.exprs)
-                elif (
-                    isinstance(node.init, c_ast.Constant)
-                    and getattr(node.init, "type", None) == "string"
-                ):
-                    raw = node.init.value[1:-1]
-                    actual_count = len(self._process_escapes(raw)) + 1
-                if actual_count is not None and elem_ir_type is not None:
-                    var_ir_type = ir.ArrayType(elem_ir_type, actual_count)
-                    var_ir_type.dim_array = [actual_count]
-                    if self.in_global:
-                        new_name = self.module.get_unique_name(global_symbol_name)
-                        var_addr = self._create_bound_global(
-                            node.name,
-                            var_ir_type,
-                            symbol_name=new_name,
-                            storage=node.storage,
-                        )
-                        self.define(node.name, (var_ir_type, var_addr))
-                        if not hasattr(self, "_array_renames"):
-                            self._array_renames = {}
-                        self._array_renames[
-                            f'@"{global_symbol_name}"'
-                        ] = f'@"{new_name}"'
-                    else:
-                        var_addr = self._alloca_in_entry(var_ir_type, node.name)
-                        self.define(node.name, (var_ir_type, var_addr))
-
             if self._has_unsigned_scalar_pointee(node.type):
                 self._mark_unsigned_pointee(var_addr)
 
@@ -3570,10 +5469,11 @@ class LLVMCodeGenerator(object):
                         except Exception:
                             var_addr.initializer = self._zero_initializer(var_ir_type)
                 elif isinstance(node.init, c_ast.InitList):
+                    self._safe_store(self._zero_initializer(var_ir_type), var_addr)
                     self._init_array(
                         var_addr,
                         node.init,
-                        elem_ir_type,
+                        var_ir_type.element,
                         [ir.Constant(ir.IntType(32), 0)],
                     )
                 elif (
@@ -3582,6 +5482,7 @@ class LLVMCodeGenerator(object):
                     and isinstance(elem_ir_type, ir.IntType)
                     and elem_ir_type.width == 8
                 ):
+                    self._safe_store(self._zero_initializer(var_ir_type), var_addr)
                     raw = self._process_escapes(node.init.value[1:-1]) + "\00"
                     idx0 = ir.Constant(ir.IntType(32), 0)
                     for i, ch in enumerate(raw[: var_ir_type.count]):
@@ -3611,12 +5512,16 @@ class LLVMCodeGenerator(object):
                     elif isinstance(sub_next_type.type, c_ast.Union):
                         resolved_pointee_type = self.codegen_Union(sub_next_type.type)
                         type_str = "union"
+                    elif isinstance(sub_next_type.type, c_ast.Enum):
+                        self.codegen_Enum(sub_next_type.type)
+                        resolved_pointee_type = int32_t
+                        type_str = "int"
                     else:
                         type_str = sub_next_type.type.names
                         resolved = self._get_ir_type(type_str)
                         if isinstance(resolved, ir.Type):
                             resolved_pointee_type = resolved
-                        if isinstance(resolved, ir.LiteralStructType):
+                        if _is_struct_ir_type(resolved):
                             type_str = "struct"
                     break
                 elif isinstance(sub_next_type, c_ast.PtrDecl):
@@ -3642,10 +5547,28 @@ class LLVMCodeGenerator(object):
                         self._mark_unsigned_return(var_addr)
                     if node.init is not None:
                         init_val, _ = self.codegen(node.init)
-                        # init_val is an ir.Function, bitcast to func ptr type
-                        if init_val.type != func_ir_type:
-                            init_val = self.builder.bitcast(init_val, func_ir_type)
-                        self._safe_store(init_val, var_addr)
+                        # For global scope, set as initializer directly
+                        if self.in_global and isinstance(var_addr, ir.GlobalVariable):
+                            # NULL (i64 0) → null pointer of correct type
+                            if (isinstance(init_val.type, ir.IntType)
+                                    and isinstance(init_val, ir.Constant)
+                                    and init_val.constant == 0):
+                                init_val = ir.Constant(
+                                    var_addr.value_type, None
+                                )
+                            var_addr.initializer = init_val
+                        else:
+                            if (
+                                isinstance(init_val, ir.Constant)
+                                and isinstance(init_val.type, ir.IntType)
+                                and init_val.constant == 0
+                            ):
+                                init_val = ir.Constant(func_ir_type, None)
+                            elif init_val.type != func_ir_type:
+                                init_val = self._implicit_convert(
+                                    init_val, func_ir_type
+                                )
+                            self._safe_store(init_val, var_addr)
                     return None, var_addr
                 pass
 
@@ -3707,17 +5630,13 @@ class LLVMCodeGenerator(object):
                             var_addr.initializer = ir.Constant(var_ir_type, None)
                 else:
                     init_val, _ = self.codegen(node.init)
+                    init_val = self._decay_array_expr_to_pointer(
+                        node.init, init_val, f"{node.name}.initdecay"
+                    )
                     if isinstance(init_val.type, ir.ArrayType) and isinstance(
                         var_ir_type, ir.PointerType
                     ):
-                        gv = ir.GlobalVariable(
-                            self.module,
-                            init_val.type,
-                            self.module.get_unique_name("str"),
-                        )
-                        gv.initializer = init_val
-                        gv.global_constant = True
-                        init_val = self.builder.bitcast(gv, var_ir_type)
+                        init_val = self._implicit_convert(init_val, var_ir_type)
                     elif init_val.type != var_ir_type:
                         init_val = self._implicit_convert(init_val, var_ir_type)
                     self._safe_store(init_val, var_addr)
@@ -3727,6 +5646,14 @@ class LLVMCodeGenerator(object):
         return None, var_addr
 
     def codegen_ID(self, node):
+        if node.name in {"__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"}:
+            func_name = self._function_display_name or (
+                self.function.name if self.function is not None else node.name
+            )
+            gv = self._make_global_string_constant(func_name, name_hint="funcname")
+            ptr = self._const_pointer_to_first_elem(gv, cstring)
+            node.ir_type = cstring
+            return ptr, gv
 
         valtype, var = self.lookup(node.name)
         node.ir_type = valtype
@@ -3813,7 +5740,7 @@ class LLVMCodeGenerator(object):
         # Non-array type (opaque struct etc): treat as pointer subscript
         if not isinstance(name_type, ir.ArrayType):
             ptr = (
-                self.builder.bitcast(name_ir, ir.PointerType(int8_t))
+                self._implicit_convert(name_ir, ir.PointerType(int8_t))
                 if not isinstance(name_ir.type, ir.PointerType)
                 else name_ir
             )
@@ -3896,22 +5823,30 @@ class LLVMCodeGenerator(object):
             retval, _ = self.codegen(node.expr)
             # Implicit convert to function return type
             func_ret_type = self.function.return_value.type
+            if isinstance(func_ret_type, ir.VoidType):
+                self.builder.ret_void()
+                return None, None
             if retval.type != func_ret_type:
                 retval = self._implicit_convert(retval, func_ret_type)
             self.builder.ret(retval)
         return None, None
 
     def codegen_Compound(self, node):
+        return self._codegen_compound_items(node, use_new_scope=True)
 
-        if node.block_items:
-            for stmt in node.block_items:
-                if self.builder and self.builder.block.is_terminated:
-                    # After a terminator (goto/break/continue/return),
-                    # only process labels — skip unreachable code
-                    if isinstance(stmt, c_ast.Label):
-                        self.codegen(stmt)
-                    continue
-                self.codegen(stmt)
+    def _codegen_compound_items(self, node, use_new_scope):
+        scope = self.new_scope() if use_new_scope else nullcontext()
+
+        with scope:
+            if node.block_items:
+                for stmt in node.block_items:
+                    if self.builder and self.builder.block.is_terminated:
+                        # After a terminator (goto/break/continue/return),
+                        # only process labels — skip unreachable code
+                        if isinstance(stmt, c_ast.Label):
+                            self.codegen(stmt)
+                        continue
+                    self.codegen(stmt)
         return None, None
 
     def codegen_FuncDecl(self, node):
@@ -3930,31 +5865,38 @@ class LLVMCodeGenerator(object):
             self.func_return_types = {}
         self.func_return_types[funcname] = ir_type
 
-        arg_types = []
-        is_var_arg = False
-        if node.decl.type.args:
-            for arg_type in node.decl.type.args.params:
-                if isinstance(arg_type, c_ast.EllipsisParam):
-                    is_var_arg = True
-                    continue
-                t = self._resolve_param_type(arg_type)
-                if t is not None:
-                    arg_types.append(t)
+        param_infos, is_var_arg = self._funcdef_param_infos(node)
+        arg_types = [param_type for _name, param_type, _decl in param_infos]
 
         function_type = ir.FunctionType(ir_type, arg_types, var_arg=is_var_arg)
+        prior_state = self._file_scope_function_states.get(funcname)
+        if node.param_decls and prior_state is not None:
+            prior_decl = self.module.globals.get(prior_state.symbol_name)
+            if isinstance(prior_decl, ir.Function):
+                prior_type = prior_decl.function_type
+                if self._function_arg_types_match(prior_type.args, arg_types):
+                    function_type = prior_type
         symbol_name = self._register_file_scope_function(
             funcname,
             function_type,
             storage=node.decl.storage,
+            funcspec=node.decl.funcspec,
             is_definition=True,
+        )
+        function_state = self._file_scope_function_states.get(funcname)
+        needs_internal_linkage = (
+            function_state is not None and function_state.linkage == "internal"
         )
 
         with self.new_function():
+            self._function_display_name = funcname
 
             existing = self.module.globals.get(symbol_name)
             if existing and isinstance(existing, ir.Function):
                 if existing.is_declaration:
                     self.function = existing
+                    if needs_internal_linkage:
+                        self.function.linkage = "internal"
                 else:
                     raise SemanticError(f"redefinition of function '{funcname}'")
             else:
@@ -3964,7 +5906,7 @@ class LLVMCodeGenerator(object):
                         function_type,
                         name=symbol_name,
                     )
-                    if self._is_file_scope_static(node.decl.storage):
+                    if needs_internal_linkage:
                         self.function.linkage = "internal"
                 except Exception:
                     raise SemanticError(f"failed to define function '{funcname}'")
@@ -3975,53 +5917,38 @@ class LLVMCodeGenerator(object):
             if len(self.env.maps) > 1:
                 self.env.maps[1][funcname] = (ir_type, self.function)
             self.define(funcname, (ir_type, self.function))
-            if node.decl.type.args:
-                param_idx = 0
-                for p in node.decl.type.args.params:
-                    if isinstance(p, c_ast.EllipsisParam):
-                        continue
-                    # Skip void params (f(void) means no params)
-                    if isinstance(p, c_ast.Typename) and isinstance(
-                        getattr(p, "type", None), c_ast.TypeDecl
+            for param_idx, (pname, arg_type, p) in enumerate(param_infos):
+                if param_idx >= len(arg_types):
+                    break
+                var = self._alloca_in_entry(arg_type, pname)
+                self.define(pname, (arg_type, var))
+                self._safe_store(self.function.args[param_idx], var)
+                # Track unsigned params
+                if isinstance(p, c_ast.Decl) and isinstance(
+                    getattr(p, "type", None), c_ast.TypeDecl
+                ):
+                    if isinstance(p.type.type, c_ast.IdentifierType):
+                        if self._is_unsigned_type_names(p.type.type.names):
+                            self._mark_unsigned(var)
+                if isinstance(p, c_ast.Decl):
+                    if self._has_unsigned_scalar_pointee(p.type):
+                        self._mark_unsigned_pointee(var)
+                    if isinstance(p.type, c_ast.PtrDecl) and self._func_decl_returns_unsigned(
+                        p.type.type
                     ):
-                        if isinstance(
-                            p.type.type, c_ast.IdentifierType
-                        ) and p.type.type.names == ["void"]:
-                            continue
-                    if param_idx >= len(arg_types):
-                        break
-                    arg_type = arg_types[param_idx]
-                    pname = p.name if isinstance(p.name, str) else f"arg{param_idx}"
-                    var = self._alloca_in_entry(arg_type, pname)
-                    self.define(pname, (arg_type, var))
-                    self._safe_store(self.function.args[param_idx], var)
-                    # Track unsigned params
-                    if isinstance(p, c_ast.Decl) and isinstance(
-                        getattr(p, "type", None), c_ast.TypeDecl
-                    ):
-                        if isinstance(p.type.type, c_ast.IdentifierType):
-                            if self._is_unsigned_type_names(p.type.type.names):
-                                self._mark_unsigned(var)
-                    if isinstance(p, c_ast.Decl):
-                        if self._has_unsigned_scalar_pointee(p.type):
-                            self._mark_unsigned_pointee(var)
-                        if isinstance(
-                            p.type, c_ast.PtrDecl
-                        ) and self._func_decl_returns_unsigned(p.type.type):
-                            self._mark_unsigned_return(var)
-                    param_idx += 1
+                        self._mark_unsigned_return(var)
 
-            self.codegen(node.body)
+            for _pname, _arg_type, p in param_infos:
+                if isinstance(p, c_ast.Decl):
+                    self._emit_vla_param_bound_side_effects(p.type)
+
+            self._codegen_compound_items(node.body, use_new_scope=False)
 
             if not self.builder.block.is_terminated:
                 if isinstance(ir_type, ir.VoidType):
                     self.builder.ret_void()
-                elif isinstance(ir_type, ir.PointerType):
-                    self.builder.ret(ir.Constant(ir_type, None))
-                elif self._is_floating_ir_type(ir_type):
-                    self.builder.ret(ir.Constant(ir_type, 0.0))
                 else:
-                    self.builder.ret(ir.Constant(ir_type, 0))
+                    self.builder.ret(self._zero_initializer(ir_type))
 
             return None, None
 
@@ -4029,63 +5956,58 @@ class LLVMCodeGenerator(object):
         # Generate LLVM types for struct members
 
         # If this is a reference to a named struct without decls, look it up
-        if node.name and (node.decls is None or len(node.decls) == 0):
-            if node.name in self.env:
-                return self.env[node.name][0]
-            # Opaque/forward-declared struct: treat as i8 (byte) for pointer use
-            opaque = ir.IntType(8)
-            self.define(node.name, (opaque, None))
+        if node.name and node.decls is None:
+            tag_key = self._tag_type_key(node.name)
+            if tag_key in self.env:
+                return self.env[tag_key][0]
+            opaque = self.module.context.get_identified_type(
+                self._aggregate_type_name("struct", node.name)
+            )
+            self.define(tag_key, (opaque, None))
             return opaque
+
+        if any(decl.bitsize is not None for decl in node.decls):
+            return self._build_layout_backed_struct(node)
 
         member_types = []
         member_names = []
         member_decl_types = []
         for decl in node.decls:
-            if isinstance(decl.type, c_ast.TypeDecl) and isinstance(
-                decl.type.type, c_ast.Struct
-            ):
-                nested_type = self.codegen_Struct(decl.type.type)
-                member_types.append(nested_type)
-            elif isinstance(decl.type, c_ast.TypeDecl) and isinstance(
-                decl.type.type, c_ast.Union
-            ):
-                nested_type = self.codegen_Union(decl.type.type)
-                member_types.append(nested_type)
-            elif isinstance(decl.type, c_ast.ArrayDecl):
-                # Handle multi-dimensional arrays: a[N][M] -> [N x [M x T]]
-                def _build_array_type(arr_node):
-                    dim = self._eval_dim(arr_node.dim) if arr_node.dim else 0
-                    if isinstance(arr_node.type, c_ast.ArrayDecl):
-                        inner = _build_array_type(arr_node.type)
-                    else:
-                        inner = self._resolve_ast_type(arr_node.type)
-                    return ir.ArrayType(inner, dim)
-
-                member_types.append(_build_array_type(decl.type))
-            elif isinstance(decl.type, c_ast.PtrDecl):
-                member_types.append(self._resolve_ast_type(decl.type))
-            elif isinstance(decl.type, c_ast.TypeDecl):
-                type_str = decl.type.type.names
-                member_types.append(self._get_ir_type(type_str))
-            else:
-                member_types.append(int64_t)  # fallback
+            member_types.append(self._resolve_struct_member_ir_type(decl))
             member_names.append(decl.name)
             member_decl_types.append(decl.type)
         # Create the struct type
-        struct_type = ir.LiteralStructType(member_types)
+        struct_type = self._identified_aggregate_type("struct", node.name, member_types)
         struct_type.members = member_names
         struct_type.member_decl_types = member_decl_types
 
         # Register named structs for later reuse
         if node.name:
-            self.define(node.name, (struct_type, None))
+            self.define(self._tag_type_key(node.name), (struct_type, None))
 
         return struct_type
 
     def codegen_Union(self, node):
         """Model union as a struct with alignment-preserving storage."""
-        if node.name and (node.decls is None or len(node.decls) == 0):
-            return self.env[node.name][0]
+        if node.name and node.decls is None:
+            tag_key = self._tag_type_key(node.name)
+            if tag_key in self.env:
+                return self.env[tag_key][0]
+            opaque = self.module.context.get_identified_type(
+                self._aggregate_type_name("union", node.name)
+            )
+            self.define(tag_key, (opaque, None))
+            return opaque
+
+        if node.decls is not None and len(node.decls) == 0:
+            union_type = self._identified_aggregate_type("union", node.name, [])
+            union_type.members = []
+            union_type.member_types = {}
+            union_type.member_decl_types = {}
+            union_type.is_union = True
+            if node.name:
+                self.define(self._tag_type_key(node.name), (union_type, None))
+            return union_type
 
         member_types = {}
         member_decl_types = {}
@@ -4112,18 +6034,17 @@ class LLVMCodeGenerator(object):
         align_size = max_align
         pad_size = max_size - align_size
         if pad_size > 0:
-            union_type = ir.LiteralStructType(
-                [align_type, ir.ArrayType(int8_t, pad_size)]
-            )
+            union_body = [align_type, ir.ArrayType(int8_t, pad_size)]
         else:
-            union_type = ir.LiteralStructType([align_type])
+            union_body = [align_type]
+        union_type = self._identified_aggregate_type("union", node.name, union_body)
         union_type.members = list(member_types.keys())
         union_type.member_types = member_types
         union_type.member_decl_types = member_decl_types
         union_type.is_union = True
 
         if node.name:
-            self.define(node.name, (union_type, None))
+            self.define(self._tag_type_key(node.name), (union_type, None))
 
         return union_type
 
@@ -4167,7 +6088,7 @@ class LLVMCodeGenerator(object):
                 )
                 struct_addr = inner_addr
         elif isinstance(node.name, c_ast.ID):
-            struct_instance_addr = self.env[node.name.name][1]
+            _, struct_instance_addr = self.lookup(node.name.name)
             if not isinstance(struct_instance_addr.type, ir.PointerType):
                 raise Exception("Invalid struct reference")
 
@@ -4227,6 +6148,66 @@ class LLVMCodeGenerator(object):
                         if semantic_base_type is not None
                         else (val.type if hasattr(val.type, "members") else int8_t)
                     )
+                if (
+                    addr is None
+                    and not isinstance(getattr(struct_addr, "type", None), ir.PointerType)
+                    and (
+                        getattr(struct_type, "has_custom_layout", False)
+                        or _is_struct_ir_type(struct_type)
+                    )
+                ):
+                    materialized = self._alloca_in_entry(val.type, "structrval")
+                    self._safe_store(val, materialized)
+                    struct_addr = materialized
+
+        if getattr(struct_type, "has_custom_layout", False):
+            layout = struct_type.field_layouts.get(node.field.name)
+            if layout is None:
+                raise RuntimeError(f"Field '{node.field.name}' not found in struct")
+
+            if layout.is_bitfield:
+                container_ptr = self._byte_offset_ptr(
+                    struct_addr,
+                    layout.storage_byte_offset,
+                    ir.PointerType(layout.storage_ir_type),
+                    name="bitfieldptr",
+                )
+                ref = BitFieldRef(
+                    container_ptr=container_ptr,
+                    storage_ir_type=layout.storage_ir_type,
+                    bit_offset=layout.bit_offset,
+                    bit_width=layout.bit_width,
+                    semantic_ir_type=layout.semantic_ir_type,
+                    is_unsigned=layout.is_unsigned,
+                )
+                val = self._load_bitfield(ref)
+                if layout.decl_type is not None:
+                    self._tag_value_from_decl_type(val, layout.decl_type)
+                self._set_expr_ir_type(node, layout.semantic_ir_type)
+                return val, ref
+
+            typed_field_addr = self._byte_offset_ptr(
+                struct_addr,
+                layout.byte_offset,
+                ir.PointerType(layout.semantic_ir_type),
+                name="fieldptr",
+            )
+            if isinstance(layout.semantic_ir_type, ir.ArrayType):
+                elem_ptr = self.builder.gep(
+                    typed_field_addr,
+                    [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)],
+                    name="arraydecay",
+                )
+                if layout.decl_type is not None:
+                    self._tag_value_from_decl_type(elem_ptr, layout.decl_type)
+                self._set_expr_ir_type(node, layout.semantic_ir_type)
+                return elem_ptr, typed_field_addr
+
+            field_value = self._safe_load(typed_field_addr)
+            if layout.decl_type is not None:
+                self._tag_value_from_decl_type(field_value, layout.decl_type)
+            self._set_expr_ir_type(node, layout.semantic_ir_type)
+            return field_value, typed_field_addr
 
         # Union access: all fields share offset 0, use bitcast
         if getattr(struct_type, "is_union", False):
@@ -4242,8 +6223,8 @@ class LLVMCodeGenerator(object):
                         resolved, ir.PointerType
                     ):
                         pass
-                    elif isinstance(
-                        resolved, (ir.ArrayType, ir.LiteralStructType, ir.PointerType)
+                    elif isinstance(resolved, (ir.ArrayType, ir.PointerType)) or _is_struct_ir_type(
+                        resolved
                     ):
                         semantic_field_type = resolved
                 except Exception:
@@ -4267,10 +6248,9 @@ class LLVMCodeGenerator(object):
 
         # Opaque struct (no members) — treat as byte-offset access
         if not hasattr(struct_type, "members"):
-            ptr = self.builder.bitcast(struct_addr, voidptr_t)
-            val = self._safe_load(self.builder.bitcast(ptr, ir.PointerType(int64_t)))
-            self._set_expr_ir_type(node, int64_t)
-            return val, ptr
+            raise SemanticError(
+                f"field '{node.field.name}' accessed on incomplete struct"
+            )
 
         field_index = None
         for i, field in enumerate(struct_type.members):
@@ -4301,7 +6281,9 @@ class LLVMCodeGenerator(object):
                     resolved, ir.PointerType
                 ):
                     pass  # keep original array type
-                elif isinstance(resolved, (ir.LiteralStructType, ir.PointerType)):
+                elif isinstance(resolved, ir.PointerType) or _is_struct_ir_type(
+                    resolved
+                ):
                     semantic_field_type = resolved
             except Exception:
                 pass
@@ -4385,16 +6367,35 @@ class LLVMCodeGenerator(object):
                 if enumerator.value:
                     current_val = self._eval_const_expr(enumerator.value)
                 self.define(
-                    enumerator.name, (int64_t, ir.Constant(int64_t, current_val))
+                    enumerator.name, (int32_t, ir.Constant(int32_t, current_val))
                 )
                 current_val += 1
         return None, None
 
     def _eval_const_expr(self, node):
         """Evaluate a constant expression at compile time (for enum values)."""
+        def is_float_value(value):
+            return isinstance(value, float)
+
+        def c_int_div(lhs, rhs):
+            return int(lhs / rhs)
+
+        def c_int_mod(lhs, rhs):
+            return lhs - c_int_div(lhs, rhs) * rhs
+
+        def c_float_div(lhs, rhs):
+            if rhs == 0.0:
+                if lhs == 0.0:
+                    return float("nan")
+                sign = math.copysign(1.0, lhs) * math.copysign(1.0, rhs)
+                return math.copysign(float("inf"), sign)
+            return lhs / rhs
+
         if isinstance(node, c_ast.Constant):
             if node.type == "string":
                 return 0  # string constants can't be int-evaluated
+            if node.type in ("float", "double"):
+                return self._parse_float_constant(node.value)
             v = node.value.rstrip("uUlL")
             if v.startswith("'"):
                 return self._char_constant_value(v)
@@ -4415,8 +6416,8 @@ class LLVMCodeGenerator(object):
                     raw = node.expr.value[1:-1]
                     processed = self._process_escapes(raw)
                     return len(self._string_bytes(processed + "\00"))
-                val = self._eval_const_expr(node.expr)
-                return 8  # default sizeof for expressions
+                ir_t = self._infer_sizeof_operand_ir_type(node.expr)
+                return self._ir_type_size(ir_t)
             if node.op == "&" and isinstance(node.expr, c_ast.StructRef):
                 offset, _ = self._eval_offsetof_structref(node.expr)
                 return offset
@@ -4432,12 +6433,13 @@ class LLVMCodeGenerator(object):
         elif isinstance(node, c_ast.BinaryOp):
             l = self._eval_const_expr(node.left)
             r = self._eval_const_expr(node.right)
+            use_float = is_float_value(l) or is_float_value(r)
             ops = {
                 "+": lambda a, b: a + b,
                 "-": lambda a, b: a - b,
                 "*": lambda a, b: a * b,
-                "/": lambda a, b: a // b,
-                "%": lambda a, b: a % b,
+                "/": lambda a, b: c_float_div(a, b) if use_float else c_int_div(a, b),
+                "%": lambda a, b: a % b if use_float else c_int_mod(a, b),
                 "<<": lambda a, b: a << b,
                 ">>": lambda a, b: a >> b,
                 "&": lambda a, b: a & b,
@@ -4469,6 +6471,14 @@ class LLVMCodeGenerator(object):
             return 0  # unknown identifier defaults to 0
         elif isinstance(node, c_ast.Cast):
             return self._eval_const_expr(node.expr)
+        elif isinstance(node, c_ast.FuncCall):
+            if isinstance(node.name, c_ast.ID):
+                callee = node.name.name
+                if callee in ("__builtin_inf", "__builtin_inff", "__builtin_infl"):
+                    return float("inf")
+                if callee in ("__builtin_nan", "__builtin_nanf", "__builtin_nanl"):
+                    return float("nan")
+            raise CodegenError(f"Not a constant expression: {type(node).__name__}")
         elif isinstance(node, c_ast.Typename):
             return 0
         raise CodegenError(f"Not a constant expression: {type(node).__name__}")
@@ -4512,7 +6522,7 @@ class LLVMCodeGenerator(object):
             elif isinstance(node.type.type, c_ast.Enum):
                 # typedef enum { A, B, C } MyEnum;
                 self.codegen_Enum(node.type.type)
-                self.define(f"__typedef_{node.name}", int64_t)
+                self.define(f"__typedef_{node.name}", int32_t)
         elif isinstance(node.type, c_ast.ArrayDecl):
             self.define(f"__typedef_{node.name}", self._build_array_ir_type(node.type))
         elif isinstance(node.type, c_ast.PtrDecl):
@@ -4536,4 +6546,7 @@ class LLVMCodeGenerator(object):
                 else:
                     ptr_type = ir.PointerType(base_ir)
                 self.define(f"__typedef_{node.name}", ptr_type)
+        elif isinstance(node.type, c_ast.FuncDecl):
+            func_type, _ = self._build_function_ir_type(node.type)
+            self.define(f"__typedef_{node.name}", func_type)
         return None, None

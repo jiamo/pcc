@@ -97,6 +97,17 @@ class TestFuncPtr(unittest.TestCase):
         ''', optimize=False)
         assert ret == 12  # 2+4+6
 
+    def test_local_function_pointer_can_be_initialized_to_null(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            typedef void (*fn_t)(int);
+            int main(){
+                fn_t fn = 0;
+                return fn == 0 ? 0 : 1;
+            }
+        ''', optimize=False)
+        assert ret == 0
+
     def test_comparator_pattern(self):
         """qsort-style comparator function pointer."""
         pcc = CEvaluator()
@@ -119,6 +130,71 @@ class TestFuncPtr(unittest.TestCase):
             }
         ''', optimize=False)
         assert ret == 88  # 35 + 53
+
+    def test_static_tagged_struct_initializer_keeps_function_pointers(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            typedef struct File File;
+            struct Methods;
+            struct File { const struct Methods *pMethods; };
+            struct Methods {
+                int iVersion;
+                int (*xClose)(File*);
+                int (*xWrite)(File*, const void*, int, long);
+            };
+            static int closef(File *x){ return x != 0; }
+            static int writef(File *x, const void *p, int n, long o){ return 2; }
+            static const struct Methods M = { 1, closef, writef };
+            int main(void){
+                File fobj;
+                fobj.pMethods = &M;
+                return fobj.pMethods->xWrite(&fobj, 0, 0, 0L) == 2 ? 0 : 1;
+            }
+        ''', optimize=False)
+        assert ret == 0
+
+    def test_global_initializer_keeps_cast_function_pointer(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            typedef int (*generic_fn)(void);
+            static int foo(void){ return 7; }
+            static generic_fn fp = (generic_fn)foo;
+            int main(void){
+                return fp && fp() == 7 ? 0 : 1;
+            }
+            ''',
+            optimize=False,
+        )
+        assert ret == 0
+
+    def test_static_struct_array_keeps_cast_function_pointers(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            typedef int (*generic_fn)(void);
+            struct Entry {
+                const char *name;
+                generic_fn current;
+                generic_fn fallback;
+            };
+            static int foo(void){ return 7; }
+            static struct Entry table[] = {
+                { "a", (generic_fn)foo, 0 },
+                { "b", 0, 0 },
+                { "c", (generic_fn)foo, 0 },
+            };
+            int main(void){
+                return table[0].current
+                    && table[2].current
+                    && table[0].current() == 7
+                    && table[2].current() == 7
+                    ? 0 : 1;
+            }
+            ''',
+            optimize=False,
+        )
+        assert ret == 0
 
 
 if __name__ == '__main__':

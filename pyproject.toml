@@ -25,7 +25,10 @@ build-backend = "hatchling.build"
 packages = ["pcc", "utils"]
 
 [tool.pytest.ini_options]
-addopts = "-n auto"
+addopts = "-n auto -m 'not integration'"
+markers = [
+    "integration: expensive end-to-end integration tests excluded from the default test run",
+]
 
 [dependency-groups]
 dev = [

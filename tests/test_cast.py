@@ -1,5 +1,6 @@
 import os
 import sys
+import pytest
 
 this_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(this_dir)
@@ -22,6 +23,28 @@ class TestInt(unittest.TestCase):
             ''', llvmdump=True)
 
         assert ret == 1
+
+
+def test_invalid_struct_scalar_casts_raise_value_error():
+    pcc = CEvaluator()
+
+    source = """
+        struct foo {
+            int a;
+        };
+
+        int main(void) {
+            struct foo xxx;
+            int i;
+
+            xxx = (struct foo)1;
+            i = (int)xxx;
+            return i;
+        }
+    """
+
+    with pytest.raises(ValueError, match="invalid cast"):
+        pcc.evaluate(source)
 
 # TODO  If is complext should finish the basic
 if __name__ == '__main__':

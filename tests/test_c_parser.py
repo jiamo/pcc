@@ -13,10 +13,9 @@ from pcc.ast.c_ast import *
 from pcc.parse.c_parser import CParser, Coord, ParseError
 
 _c_parser = c_parser.CParser(
-                lex_optimize=False,
-                yacc_debug=True,
-                yacc_optimize=False,
-                yacctab='yacctab')  ## TODO fix may be I need a yacctab cache dir
+                lex_optimize=True,
+                yacc_debug=False,
+                yacc_optimize=True)
 
 
 def expand_decl(decl):
@@ -513,6 +512,22 @@ class TestCParser_fundamentals(TestCParser_base):
             [
                 ([['ID', 'a']], [['Constant', 'int', '1'], ['Constant', 'int', '2']]),
                 ([['ID', 'b'], ['Constant', 'int', '0']], ['ID', 't'])])
+
+    def test_empty_named_struct_and_union_definitions(self):
+        ast = self.parse(
+            r'''
+            struct S {} s;
+            union U {} u;
+            '''
+        )
+
+        struct_decl = ast.ext[0]
+        union_decl = ast.ext[1]
+
+        self.assertEqual(struct_decl.type.type.name, 'S')
+        self.assertEqual(struct_decl.type.type.decls, [])
+        self.assertEqual(union_decl.type.type.name, 'U')
+        self.assertEqual(union_decl.type.type.decls, [])
 
     def test_enums(self):
         e1 = "enum mycolor op;"

@@ -36,6 +36,34 @@ class TestNamedStruct(unittest.TestCase):
         ''')
         assert ret == 30
 
+    def test_struct_tag_and_function_name_use_separate_namespaces(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            struct stat { int size; };
+            int stat(void){ return 7; }
+            int main(void){
+                struct stat value;
+                value.size = 3;
+                return stat() + value.size;
+            }
+        ''')
+        assert ret == 10
+
+    def test_named_struct_layout_does_not_leak_across_compilations(self):
+        first = CEvaluator()
+        ret = first.evaluate('''
+            struct S { char buf[1024]; };
+            int main(void){ return sizeof(((struct S *)0)->buf) == 1024 ? 0 : 1; }
+        ''')
+        assert ret == 0
+
+        second = CEvaluator()
+        ret = second.evaluate('''
+            struct S { char buf[16]; };
+            int main(void){ return sizeof(((struct S *)0)->buf) == 16 ? 0 : 1; }
+        ''')
+        assert ret == 0
+
 
 if __name__ == '__main__':
     unittest.main()

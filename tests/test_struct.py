@@ -29,5 +29,18 @@ class TestStruct(unittest.TestCase):
 
         assert (ret == 32)
 
+    def test_incomplete_struct_member_access_errors(self):
+        pcc = CEvaluator()
+        with self.assertRaisesRegex(ValueError, "incomplete struct"):
+            pcc.evaluate(
+                '''
+                struct Opaque;
+
+                int read_x(struct Opaque *p) {
+                    return p->x;
+                }
+                '''
+            )
+
 if __name__ == '__main__':
     unittest.main()

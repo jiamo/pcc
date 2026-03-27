@@ -58,6 +58,7 @@ _BACKGROUND_PID_LINE = re.compile(
     r"^\(if test fails now, it may leave a Lua script running in background, pid \d+\)$",
     re.MULTILINE,
 )
+LUA_CPP_ARGS = ("-DLUA_USE_JUMPTABLE=0", "-DLUA_NOBUILTIN")
 
 
 def _lua_preprocessor_prefix():
@@ -122,7 +123,11 @@ def _compile_lua_file(fname):
         with open(fpath) as f:
             src = f.read()
 
-        processed = CEvaluator._system_cpp(src, base_dir=lua_src_dir)
+        processed = CEvaluator._system_cpp(
+            src,
+            base_dir=lua_src_dir,
+            cpp_args=LUA_CPP_ARGS,
+        )
         processed = _TYPEDEF_CLEANUP.sub("", processed)
         stage = "preprocess"
 
@@ -208,7 +213,11 @@ def _compile_onelua():
             src = f.read()
 
         src = _lua_preprocessor_prefix() + src
-        processed = CEvaluator._system_cpp(src, base_dir=lua_src_dir)
+        processed = CEvaluator._system_cpp(
+            src,
+            base_dir=lua_src_dir,
+            cpp_args=LUA_CPP_ARGS,
+        )
         processed = _TYPEDEF_CLEANUP.sub("", processed)
         stage = "preprocess"
 

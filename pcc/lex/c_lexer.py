@@ -100,9 +100,9 @@ class CLexer(object):
     ## Reserved keywords
     ##
     keywords = (
-        '_BOOL', '_COMPLEX', 'AUTO', 'BREAK', 'CASE', 'CHAR', 'CONST',
+        '_BOOL', '_COMPLEX', '_FLOAT16', '_NORETURN', 'AUTO', 'BREAK', 'CASE', 'CHAR', 'CONST',
         'CONTINUE', 'DEFAULT', 'DO', 'DOUBLE', 'ELSE', 'ENUM', 'EXTERN',
-        'FLOAT', 'FOR', 'GOTO', 'IF', 'INLINE', 'INT', 'LONG',
+        'FLOAT', 'FOR', 'GOTO', 'IF', 'INLINE', 'INT', 'INT128', 'LONG',
         'REGISTER', 'OFFSETOF',
         'RESTRICT', 'RETURN', 'SHORT', 'SIGNED', 'SIZEOF', 'STATIC', 'STRUCT',
         'SWITCH', 'TYPEDEF', 'UNION', 'UNSIGNED', 'VOID',
@@ -115,8 +115,28 @@ class CLexer(object):
             keyword_map['_Bool'] = keyword
         elif keyword == '_COMPLEX':
             keyword_map['_Complex'] = keyword
+        elif keyword == '_FLOAT16':
+            keyword_map['_Float16'] = keyword
+        elif keyword == '_NORETURN':
+            keyword_map['_Noreturn'] = keyword
         else:
             keyword_map[keyword.lower()] = keyword
+
+    keyword_map['typeof'] = 'TYPEOF'
+    keyword_map['__typeof'] = 'TYPEOF'
+    keyword_map['__typeof__'] = 'TYPEOF'
+    keyword_map['__volatile'] = 'VOLATILE'
+    keyword_map['__volatile__'] = 'VOLATILE'
+    keyword_map['__const'] = 'CONST'
+    keyword_map['__const__'] = 'CONST'
+    keyword_map['__inline'] = 'INLINE'
+    keyword_map['__inline__'] = 'INLINE'
+    keyword_map['__signed'] = 'SIGNED'
+    keyword_map['__signed__'] = 'SIGNED'
+    keyword_map['__restrict'] = 'RESTRICT'
+    keyword_map['__restrict__'] = 'RESTRICT'
+    keyword_map['__int128'] = 'INT128'
+    keyword_map.pop('int128', None)
 
     ##
     ## All the tokens recognized by the lexer
@@ -128,6 +148,7 @@ class CLexer(object):
         # Type identifiers (identifiers previously defined as
         # types with typedef)
         'TYPEID',
+        'TYPEOF',
 
         # constants
         'INT_CONST_DEC', 'INT_CONST_OCT', 'INT_CONST_HEX', 'INT_CONST_BIN',
@@ -315,7 +336,7 @@ class CLexer(object):
     def t_pppragma_ID(self, t): pass
 
     def t_pppragma_error(self, t):
-        self._error('invalid #pragma directive', t)
+        t.lexer.skip(1)
 
     ##
     ## Rules for the normal state
@@ -491,5 +512,3 @@ class CLexer(object):
     def t_error(self, t):
         msg = 'Illegal character %s' % repr(t.value[0])
         self._error(msg, t)
-
-
