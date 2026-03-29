@@ -601,7 +601,12 @@ def _run_linked_mcjit_worker(
             result = fptr(*args)
 
         _write_result_and_exit({"ok": True, "result": int(result)}, 0)
-    except BaseException as exc:
+    except KeyboardInterrupt:
+        _write_result_and_exit(
+            {"ok": False, "error": "KeyboardInterrupt: compilation interrupted"},
+            1,
+        )
+    except Exception as exc:
         _write_result_and_exit({"ok": False, "error": repr(exc)}, 1)
 
 
@@ -656,6 +661,13 @@ class CEvaluator(object):
         use_compile_cache=True,
         cache_dir=None,
     ):
+        if not isinstance(codestr, str):
+            raise TypeError(
+                f"evaluate() expects a string of C source code, "
+                f"got {type(codestr).__name__}"
+            )
+        if not codestr.strip():
+            raise ValueError("evaluate() received empty source code")
         if use_system_cpp is None:
             use_system_cpp = self._has_system_cpp()
         snippet_base_dir = os.path.abspath(base_dir) if base_dir else os.getcwd()
@@ -884,6 +896,8 @@ class CEvaluator(object):
         use_compile_cache=True,
         cache_dir=None,
     ):
+        if not units:
+            raise ValueError("evaluate_translation_units() received no translation units")
         compiled_units = self.compile_translation_units(
             units,
             base_dir=base_dir,
@@ -1146,7 +1160,13 @@ class CEvaluator(object):
                 continue
             seen.add(include_dir)
             user_include_dirs.append(include_dir)
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".c", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".c",
+            delete=False,
+            encoding="utf-8",
+            errors="surrogateescape",
+        ) as f:
             f.write(source)
             tmp_path = f.name
         try:
@@ -1259,8 +1279,6 @@ class CEvaluator(object):
                 "-Dasm(...)=",
                 "-D__asm__(x)=",
                 "-D__asm(x)=",
-                "-D__alignof(x)=sizeof(x)",
-                "-D__alignof__(x)=sizeof(x)",
                 "-D_Nonnull=",
                 "-D_Nullable=",
                 "-D_Null_unspecified=",

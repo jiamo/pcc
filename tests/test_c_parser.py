@@ -46,7 +46,14 @@ def expand_decl(decl):
             else:
                 return ['Typename', nested]
         elif typ == ArrayDecl:
-            dimval = decl.dim.value if decl.dim else ''
+            if decl.dim is None:
+                dimval = ''
+            elif hasattr(decl.dim, 'value'):
+                dimval = decl.dim.value
+            elif hasattr(decl.dim, 'name'):
+                dimval = decl.dim.name
+            else:
+                dimval = ''
             return ['ArrayDecl', dimval, decl.dim_quals, nested]
         elif typ == PtrDecl:
             if decl.quals:
@@ -423,6 +430,20 @@ class TestCParser_fundamentals(TestCParser_base):
                         ['ArrayDecl', '5', [],
                             ['TypeDecl', ['IdentifierType', ['int']]]]]]],
                     ['TypeDecl', ['IdentifierType', ['int']]]]])
+
+        self.assertEqual(self.get_decl('void fooc(int [const 5]);'),
+            ['Decl', 'fooc',
+                ['FuncDecl',
+                    [['Typename', ['ArrayDecl', '5', ['const'],
+                        ['TypeDecl', ['IdentifierType', ['int']]]]]],
+                    ['TypeDecl', ['IdentifierType', ['void']]]]])
+
+        self.assertEqual(self.get_decl('void foovm(int [const *]);'),
+            ['Decl', 'foovm',
+                ['FuncDecl',
+                    [['Typename', ['ArrayDecl', '*', ['const'],
+                        ['TypeDecl', ['IdentifierType', ['int']]]]]],
+                    ['TypeDecl', ['IdentifierType', ['void']]]]])
 
     def test_qualifiers_storage_specifiers(self):
         def assert_qs(txt, index, quals, storage):
@@ -1278,10 +1299,23 @@ class TestCParser_fundamentals(TestCParser_base):
 
     def test_unified_wstring_literals(self):
         d1 = self.get_decl_init('char* s = L"hello" L"world";')
-        self.assertEqual(d1, ['Constant', 'string', 'L"helloworld"'])
+        self.assertEqual(d1, ['Constant', 'wstring', 'L"helloworld"'])
 
         d2 = self.get_decl_init('char* s = L"hello " L"world" L" and I";')
-        self.assertEqual(d2, ['Constant', 'string', 'L"hello world and I"'])
+        self.assertEqual(d2, ['Constant', 'wstring', 'L"hello world and I"'])
+
+    def test_mixed_unified_wstring_literals(self):
+        d1 = self.get_decl_init('char* s = L"hello" "world";')
+        self.assertEqual(d1, ['Constant', 'wstring', 'L"helloworld"'])
+
+        d2 = self.get_decl_init('char* s = "hello " L"world";')
+        self.assertEqual(d2, ['Constant', 'wstring', 'L"hello world"'])
+
+    def test_plain_identifier_function_call_still_parses(self):
+        t = self.parse('int baz(int x){return x;} int f(void){ return baz(1); }')
+        call = t.ext[1].body.block_items[0].expr
+        self.assertTrue(isinstance(call, FuncCall))
+        self.assertEqual(call.name.name, 'baz')
 
     def test_inline_specifier(self):
         ps2 = self.parse('static inline void inlinefoo(void);')
@@ -1833,6 +1867,23 @@ class TestCParser_typenames(TestCParser_base):
             typedef char TT;
             '''
         self.assertRaises(ParseError, self.parse, s2)
+
+    def test_inner_scope_declarator_can_reuse_typedef_name(self):
+        s = r'''
+            typedef struct s s;
+
+            struct s {
+                int value;
+            };
+
+            int main(void) {
+                goto label;
+                struct s s;
+            label:
+                return 0;
+            }
+            '''
+        self.assertTrue(isinstance(self.parse(s), FileAST))
 
 if __name__ == '__main__':
     #~ suite = unittest.TestLoader().loadTestsFromNames(

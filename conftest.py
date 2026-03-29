@@ -10,6 +10,7 @@ _AUTO_CLEAN_TARGET_DIRS = {
     "postgres": ("projects/postgresql-17.4/",),
     "readline": ("projects/readline-8.2/",),
     "zlib": ("projects/zlib-1.3.1/",),
+    "nginx": ("projects/nginx-1.28.3/",),
 }
 
 
@@ -33,17 +34,23 @@ def _upgrade_to_session_clean_lock(config):
     if lockfile is None:
         return None
     fcntl.flock(lockfile, fcntl.LOCK_UN)
-    fcntl.flock(lockfile, fcntl.LOCK_EX)
+    try:
+        fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        config._pcc_skip_auto_clean = True
+        lockfile.close()
+        config._pcc_auto_clean_lockfile = None
+        return None
     return lockfile
 
 
-def _tracked_dirty_paths(repo_root):
+def _status_paths(repo_root):
     result = subprocess.run(
         [
             "git",
             "status",
             "--porcelain",
-            "--untracked-files=no",
+            "--untracked-files=all",
         ],
         cwd=repo_root,
         capture_output=True,
@@ -52,42 +59,60 @@ def _tracked_dirty_paths(repo_root):
     if result.returncode != 0:
         return set()
 
-    dirty = set()
+    paths = set()
     for line in result.stdout.splitlines():
+        if len(line) < 3:
+            continue
+        if line.startswith("?? "):
+            paths.add(line[3:])
+            continue
         if len(line) < 4:
             continue
         path = line[3:]
         if " -> " in path:
             path = path.split(" -> ", 1)[1]
-        dirty.add(path)
-    return dirty
+        paths.add(path)
+    return paths
 
 
-def _auto_clean_targets(initial_dirty_paths):
+def _paths_touch_target(paths, prefixes):
+    return any(
+        path == prefix.rstrip("/") or path.startswith(prefix)
+        for path in paths
+        for prefix in prefixes
+    )
+
+
+def _auto_clean_targets(initial_status_paths, current_status_paths):
     targets = ["generated"]
     for target, prefixes in _AUTO_CLEAN_TARGET_DIRS.items():
-        if any(
-            dirty_path == prefix.rstrip("/") or dirty_path.startswith(prefix)
-            for dirty_path in initial_dirty_paths
-            for prefix in prefixes
-        ):
+        if _paths_touch_target(initial_status_paths, prefixes):
+            continue
+        if not _paths_touch_target(current_status_paths, prefixes):
             continue
         targets.append(target)
     return tuple(targets)
 
 
 def pytest_configure(config):
-    """Warm the parser cache before xdist workers start."""
+    """Warm caches before xdist workers start."""
     # Only run on the xdist controller (or when not using xdist).
     # Workers have 'workerinput' set; the controller does not.
     if not hasattr(config, 'workerinput'):
         _acquire_session_shared_lock(config)
-        config._pcc_auto_clean_targets = _auto_clean_targets(
-            _tracked_dirty_paths(_repo_root())
-        )
+        config._pcc_initial_status_paths = _status_paths(_repo_root())
         from pcc.parse.c_parser import CParser
 
         CParser()
+
+        # Ensure nginx is configured so all xdist workers discover the
+        # same parametrized test set.
+        nginx_dir = os.path.join(_repo_root(), "projects", "nginx-1.28.3")
+        nginx_makefile = os.path.join(nginx_dir, "objs", "Makefile")
+        if os.path.isdir(nginx_dir) and not os.path.isfile(nginx_makefile):
+            from tests.test_nginx import _ensure_nginx_configured
+
+            _ensure_nginx_configured()
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -95,7 +120,10 @@ def pytest_sessionfinish(session, exitstatus):
         return
 
     lockfile = _upgrade_to_session_clean_lock(session.config)
-    targets = getattr(session.config, "_pcc_auto_clean_targets", ("generated",))
+    if getattr(session.config, "_pcc_skip_auto_clean", False):
+        return
+    initial_status_paths = getattr(session.config, "_pcc_initial_status_paths", set())
+    targets = _auto_clean_targets(initial_status_paths, _status_paths(_repo_root()))
     try:
         pcc_run.clean(targets, repo_root=_repo_root())
     finally:

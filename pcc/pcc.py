@@ -171,7 +171,7 @@ def main(
                     )
                 ]
                 include_dirs = [base_dir]
-    except (FileNotFoundError, ValueError, RuntimeError) as e:
+    except (FileNotFoundError, ValueError, RuntimeError, OSError) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -224,6 +224,9 @@ def main(
     except (ValueError, RuntimeError) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+    except KeyboardInterrupt:
+        click.echo("\nInterrupted.", err=True)
+        sys.exit(130)
     sys.exit(ret if isinstance(ret, int) else 0)
 
 

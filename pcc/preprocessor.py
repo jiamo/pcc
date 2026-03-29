@@ -17,6 +17,7 @@ Supports:
 
 import re
 import os
+import warnings
 
 IDENTIFIER_RE = re.compile(r"[a-zA-Z_]\w*")
 
@@ -105,7 +106,7 @@ typedef long clock_t;
 typedef long time_t;
 typedef int pid_t;
 typedef unsigned int mode_t;
-typedef int FILE;
+typedef char FILE;
 """
 
 
@@ -343,7 +344,12 @@ class Preprocessor:
                 .replace("!", " not ")
             )
             return bool(eval(py_expr, {"__builtins__": {}}, {}))
-        except Exception:
+        except Exception as exc:
+            warnings.warn(
+                f"preprocessor: failed to evaluate #if expression: "
+                f"{py_expr!r} ({exc})",
+                stacklevel=2,
+            )
             return False
 
     def _expand_line(self, line):

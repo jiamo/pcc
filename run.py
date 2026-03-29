@@ -41,15 +41,6 @@ CLEAN_TARGETS = {
         make_dir="projects/readline-8.2",
         make_target="distclean",
         make_if_exists=("Makefile",),
-        restore_paths=(
-            "projects/readline-8.2/config.h",
-            "projects/readline-8.2/doc/Makefile",
-            "projects/readline-8.2/examples/Makefile",
-            "projects/readline-8.2/history.pc",
-            "projects/readline-8.2/readline.pc",
-            "projects/readline-8.2/shlib/Makefile",
-            "projects/readline-8.2/stamp-h",
-        ),
     ),
     "zlib": CleanTarget(
         make_dir="projects/zlib-1.3.1",
@@ -60,6 +51,10 @@ CLEAN_TARGETS = {
             "projects/zlib-1.3.1/zconf.h",
         ),
         remove_paths=("projects/zlib-1.3.1/zlib.pc",),
+    ),
+    "nginx": CleanTarget(
+        remove_paths=("projects/nginx-1.28.3/Makefile",),
+        remove_dirs=("projects/nginx-1.28.3/objs",),
     ),
 }
 
@@ -160,7 +155,7 @@ def main(argv=None):
         clean(args.targets)
         return 0
 
-    raise AssertionError(f"unhandled command: {args.command}")
+    raise RuntimeError(f"unhandled command: {args.command}")
 
 
 if __name__ == "__main__":

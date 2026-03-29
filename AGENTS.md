@@ -11,6 +11,16 @@ The fastest way to get useful results is:
 1. Reproduce with a tiny C program when possible.
 2. Compare against a native compiler built from the same source.
 3. Add one small regression test and one realistic integration confirmation.
+4. Do not consider a real-project bug "fixed" until the minimized regression
+   exists in `tests/` and passes without the project harness.
+
+The fastest way to create expensive regressions is the opposite:
+
+1. touch `c_codegen.py` or parser code with a broad speculative change
+2. skip the smallest reproducer
+3. delay regression checks until after several edits have stacked up
+
+Do not do that here.
 
 
 ## Environment Rules
@@ -125,7 +135,59 @@ If a large function is suspect:
 This is often faster than staring at 500 lines of codegen or IR.
 
 
-### 5. Separate data-layout bugs from expression-semantics bugs
+### 4a. Do not waste time on avoidable harness mistakes
+
+Some failures in this repository come from the test harness or shell usage, not
+from `pcc` itself.
+
+Rules:
+
+- When running a single pytest node id that contains `[` or `]`, always quote
+  it. `zsh` will treat it as a glob otherwise.
+- Do not use `uv run python - <<'PY' ...` or other stdin-backed Python entry
+  points when the code path uses `multiprocessing` with spawn. On macOS this can
+  fail with `FileNotFoundError` for `<stdin>` and produce fake compiler
+  failures. Use a real file path or drive the behavior through pytest.
+- If a manifest says "native passes, pcc fails" or similar, rerun the case
+  through the current harness before debugging `pcc`. These manifests drift.
+  A stale bucket is a test-data bug, not a compiler bug.
+- If you change parser grammar or lexer token sets, bump the default PLY cache
+  version in [`pcc/parse/c_parser.py`](/Users/jiamo/my/pcc/pcc/parse/c_parser.py).
+  Otherwise the repository can silently keep using an old `yacctab`/`lextab`
+  and make the parser look "still broken" after the source fix.
+- Treat this as mandatory, not optional cleanup. A parser/lexer fix is not
+  complete until the default PLY cache name has been bumped in the same
+  change whenever the grammar or token set changed.
+- After any parser or lexer grammar change, run a focused parser regression
+  first, then one representative compile/runtime case. Do not jump straight to
+  a large project suite.
+- Do not declare a run "done" until the command has produced its final summary.
+  Partial progress output is not a result.
+
+
+### 5. Do not stack unverified edits in shared codegen
+
+`pcc/codegen/c_codegen.py` is shared by almost every meaningful path in the
+repository. A "small local cleanup" there can easily break:
+
+- Lua startup
+- SQLite or zstd/lz4 integration
+- GCC torture baselines
+- parser-driven constant folding in unrelated code
+
+Rules:
+
+- Do not land a broad speculative patch in `c_codegen.py`.
+- If the change is not backed by a minimized reproducer, keep it in a scratch
+  probe, not the repository.
+- Every real-project fix must end with at least one minimized regression test
+  in `tests/`. Large-project-only validation is not enough.
+- After every shared-path edit, run focused regression checks immediately
+  before making the next edit.
+- If the first fix attempt does not clearly improve the minimized reproducer,
+  stop expanding the patch and go back to reduction.
+
+### 6. Separate data-layout bugs from expression-semantics bugs
 
 When a real program fails, two common classes are:
 
@@ -137,7 +199,7 @@ When a real program fails, two common classes are:
 If layout is suspicious, build a dedicated probe with `sizeof` and `offsetof` and compare native vs `pcc`. Once layout matches, move on.
 
 
-### 6. Prefer downstream-sensitive regression tests
+### 7. Prefer downstream-sensitive regression tests
 
 A good regression test does not just check "the bits look right right now". It checks an expression in a context where the next operation would be wrong if semantic metadata were lost.
 
@@ -148,6 +210,26 @@ Good examples:
 - unsigned expression used in `<`, `>`, `/`, `%`
 
 This matters because LLVM uses the same integer types for signed and unsigned values. The compiler must preserve signedness intent itself.
+
+
+### 8. Treat compile-time constant folding as a semantic subsystem
+
+This repository has two different places where integer semantics matter:
+
+- runtime lowering in LLVM IR
+- compile-time evaluation in `_eval_const_expr()`
+
+It is not enough to fix only the runtime path.
+
+Typical failure mode:
+
+- runtime unsigned comparisons are correct
+- but compile-time casts or ternary folding ignore width/signedness
+- macros such as `((size_t)(~(size_t)0))` fold to `-1`
+- a real project then compiles with the wrong constant and fails far away
+
+If a real program fails on a "simple constant", inspect `_eval_const_expr()` and
+macro-expanded source before assuming the runtime IR is wrong.
 
 
 ## Signedness Model
@@ -222,6 +304,23 @@ For every semantic bug fix:
 2. Confirm the original realistic reproducer is fixed.
 3. Run the full suite before finishing.
 
+For changes in shared parser/codegen paths, add a stricter gate:
+
+1. Run the smallest reproducer first.
+2. Run one existing sensitive integration check for the same bug class before
+   making another edit.
+3. Only then continue or broaden the patch.
+
+Recommended focused gates for high-risk changes:
+
+```bash
+env -u LC_ALL uv run pytest tests/test_c_parser.py -q -n0
+env -u LC_ALL uv run pytest 'tests/test_lua.py::test_onelua_compile_and_link' -q -n0
+env -u LC_ALL uv run pytest 'tests/test_lua.py::test_pcc_runtime_matches_native[math.lua]' -q -n0
+env -u LC_ALL uv run pytest tests/test_lz4.py -q -n0
+env -u LC_ALL uv run pytest tests/test_sqlite.py -q -n0
+```
+
 Useful commands:
 
 ```bash
@@ -259,17 +358,20 @@ Before you stop, confirm all of the following:
 - If you ever reintroduce a text-IR handoff to the system compiler, keep the attribute-stripping warning in mind and centralize those rewrites in `postprocess_ir_text()`.
 
 
-## IR Fix Centralization
+## IR Fix Policy
 
-All IR text-level fixes belong in `postprocess_ir_text()` in `pcc/codegen/c_codegen.py`, **not** in test helpers. This function is used by both the JIT path (`evaluate()`) and the test compilation path. Fixes that only exist in test code will not help `uv run pcc`.
+Do not put new semantic fixes into `postprocess_ir_text()` unless llvmlite
+cannot directly express the required LLVM instruction.
 
-Current fixes in `postprocess_ir_text`:
-- `bitcast int → ptr` → `inttoptr`
-- Python `<ir.Constant>` repr leak → `zeroinitializer`
-- `alloca/load/store void` → removed
-- duplicate switch case values → deduplicated
-- dead code after terminators → removed
-- consecutive empty labels → `br`/`unreachable` inserted
+Current policy:
+
+- semantic bugs belong in parser/codegen source logic
+- `postprocess_ir_text()` is only acceptable for narrow lowering gaps
+- do not hide CFG, type, or signedness bugs with text rewrites
+
+At the moment, the only acceptable remaining text-level lowering is the
+`va_arg` path. Anything else should be treated as a source-level compiler bug
+and fixed before the IR string is serialized.
 
 
 ## Packaging

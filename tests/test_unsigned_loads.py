@@ -115,6 +115,33 @@ def test_size_t_still_uses_unsigned_comparison_at_same_rank():
     assert _evaluate(source) == 0
 
 
+def test_constexpr_cast_to_size_t_keeps_unsigned_range_in_ternary():
+    source = r"""
+        #include <limits.h>
+        #include <stddef.h>
+
+        typedef union { long long a; int b; void *p; } Node;
+
+        #define cast(t, exp) ((t)(exp))
+        #define cast_int(i) cast(int, (i))
+        #define cast_sizet(i) cast(size_t, (i))
+        #define MAX_SIZET ((size_t)(~(size_t)0))
+        #define luaM_limitN(n,t)  ((cast_sizet(n) <= MAX_SIZET/sizeof(t)) ? (n) : cast_int((MAX_SIZET/sizeof(t))))
+        #define l_numbits(x) (sizeof(x) * CHAR_BIT)
+        #define MAXABITS (l_numbits(int) - 1)
+        #define MAXHBITS (MAXABITS - 1)
+        enum {
+            MAXHSIZE = luaM_limitN(1 << MAXHBITS, Node)
+        };
+
+        int main(void) {
+            return (MAXHSIZE == (1 << MAXHBITS)) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
 def test_unsigned_char_pointer_arithmetic_uses_positive_offset():
     source = r"""
         typedef unsigned char lu_byte;

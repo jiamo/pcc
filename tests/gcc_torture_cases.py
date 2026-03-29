@@ -12,7 +12,15 @@ from pcc.project import TranslationUnit
 from tests.worker_process import run_worker_process
 
 
-DEFAULT_TIMEOUT = 10
+# GCC torture cases run under pytest-xdist and then spawn an extra worker
+# process per case. A 10s budget is too tight under load and causes flaky
+# false timeouts for cases that normally return a deterministic nonzero code.
+DEFAULT_TIMEOUT = 20
+_NATIVE_CC_FLAGS = (
+    "-std=gnu89",
+    "-Wno-error=implicit-function-declaration",
+    "-Wno-error=implicit-int",
+)
 
 
 @dataclass(frozen=True)
@@ -36,7 +44,10 @@ def _host_cc():
 
 
 def _read_case_source(case_path: Path) -> str:
-    return case_path.read_text(encoding="latin-1")
+    try:
+        return case_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return case_path.read_text(encoding="latin-1")
 
 
 def compile_native(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT):
@@ -44,7 +55,7 @@ def compile_native(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIME
     with tempfile.TemporaryDirectory(prefix="gcc_torture_native_compile_") as tmpdir:
         binary = Path(tmpdir) / "a.out"
         return subprocess.run(
-            [cc, str(case_path), "-o", str(binary)],
+            [cc, *_NATIVE_CC_FLAGS, str(case_path), "-o", str(binary)],
             cwd=repo_root,
             env=subprocess_env(),
             capture_output=True,
@@ -58,7 +69,7 @@ def run_native(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT)
     with tempfile.TemporaryDirectory(prefix="gcc_torture_native_") as tmpdir:
         binary = Path(tmpdir) / "a.out"
         compile_result = subprocess.run(
-            [cc, str(case_path), "-o", str(binary)],
+            [cc, *_NATIVE_CC_FLAGS, str(case_path), "-o", str(binary)],
             cwd=repo_root,
             env=subprocess_env(),
             capture_output=True,

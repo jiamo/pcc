@@ -88,6 +88,23 @@ def test_c11_noreturn_function_specifier_parses_in_prototype_and_definition():
     assert _evaluate(source) == 0
 
 
+def test_block_scope_function_prototype_reuses_named_callee():
+    source = r"""
+        int f1(char *p) {
+            return *p + 1;
+        }
+
+        int main(void) {
+            char s = 1;
+            int f1(char *);
+
+            return f1(&s) == 2 ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
 def test_builtin_constant_p_falls_back_to_runtime_path_with_system_cpp():
     source = r"""
         int classify(unsigned short value) {
@@ -177,6 +194,135 @@ def test_builtin_alloca_allocates_runtime_stack_storage():
     assert _evaluate(source) == 0
 
 
+def test_alignof_extension_uses_alignment_not_size():
+    source = r"""
+        int main(void) {
+            if (__alignof__(void) != 1)
+                return 1;
+            if (__alignof__(double) != 8)
+                return 2;
+            if (__alignof__(long double) != 8)
+                return 3;
+            if (__alignof__(void (*)()) != 8)
+                return 4;
+            return 0;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_mixed_wide_string_and_wide_char_constant_compare_correctly():
+    source = r"""
+        int main(void) {
+            return L"a" "b"[1] == L'b' ? 0 : 1;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"wide string/char compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_vla_array_indexing_works_for_non_integer_element_types():
+    source = r"""
+        int f(int n) {
+            int i;
+            double v[n];
+            for (i = 0; i < n; i++)
+                v[i] = 0.0;
+            return 0;
+        }
+
+        int main(void) {
+            return f(8);
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"VLA indexing compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_floating_increment_and_decrement_lower_with_fadd_fsub():
+    source = r"""
+        int main(void) {
+            double x = 1.0;
+            double y = 2.0;
+
+            if ((y > x--) != 1)
+                return 1;
+            if (x != 0.0)
+                return 2;
+            if (++y != 3.0)
+                return 3;
+            return 0;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"floating inc/dec compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_builtin_va_arg_gnu_syntax_parses_and_runs():
+    source = r"""
+        typedef char *__builtin_va_list;
+        typedef __builtin_va_list va_list;
+
+        int pull_int(const char *fmt, ...) {
+            va_list ap;
+            int value;
+            __builtin_va_start(ap, fmt);
+            value = __builtin_va_arg(ap, int);
+            __builtin_va_end(ap);
+            return value;
+        }
+
+        int main(void) {
+            return pull_int("", 17) == 17 ? 0 : 1;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"builtin va_arg GNU syntax failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_builtin_va_arg_lowered_shape_parses_and_runs():
+    source = r"""
+        typedef char *__builtin_va_list;
+        typedef __builtin_va_list va_list;
+
+        int pull_int(const char *fmt, ...) {
+            va_list ap;
+            int value;
+            __builtin_va_start(ap, fmt);
+            value = (*((int*)__builtin_va_arg(&(ap), sizeof(int))));
+            __builtin_va_end(ap);
+            return value;
+        }
+
+        int main(void) {
+            return pull_int("", 17) == 17 ? 0 : 1;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"builtin va_arg lowered shape failed:\n{result.stdout}\n{result.stderr}"
+
+
 def test_empty_named_union_definition_is_zero_sized_but_loadable():
     source = r"""
         union U {} g = {};
@@ -229,6 +375,30 @@ def test_union_array_named_initializers_select_the_target_member():
                 && uv[3].i == 444
                 ? 0
                 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_pointer_to_array_local_declaration_indexes_nested_elements():
+    source = r"""
+        int main(void) {
+            char arr[2][4];
+            char (*p)[4];
+            char *q;
+            int v[4];
+
+            p = arr;
+            q = &arr[1][3];
+            arr[1][3] = 2;
+            v[0] = 2;
+
+            if (arr[1][3] != 2) return 1;
+            if (p[1][3] != 2) return 2;
+            if (*q != 2) return 3;
+            if (*v != 2) return 4;
+            return 0;
         }
     """
 
@@ -486,6 +656,46 @@ def test_runtime_designated_initializer_targets_named_struct_fields():
     assert _evaluate(source) == 0
 
 
+def test_designated_array_initializer_infers_missing_elements_and_count():
+    source = r"""
+        int values[] = { 5, [2] = 2, 3 };
+
+        int main(void) {
+            return (
+                sizeof(values) == 4 * sizeof(int) &&
+                values[0] == 5 &&
+                values[1] == 0 &&
+                values[2] == 2 &&
+                values[3] == 3
+            ) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_designated_array_initializer_reorders_struct_elements():
+    source = r"""
+        struct Pair {
+            int a;
+            int b;
+        };
+
+        struct Pair pairs[2] = { [1] = {3, 4}, [0] = {1, 2} };
+
+        int main(void) {
+            return (
+                pairs[0].a == 1 &&
+                pairs[0].b == 2 &&
+                pairs[1].a == 3 &&
+                pairs[1].b == 4
+            ) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
 def test_compound_literal_materializes_full_struct_object():
     source = r"""
         struct U {
@@ -517,6 +727,27 @@ def test_old_style_function_declaration_uses_later_definition_signature():
 
         int main(void) {
             return *call() == 3 ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_function_typed_parameter_decl_decays_to_function_pointer():
+    source = r"""
+        typedef int (*fptr1)();
+        int f1 (int (), int);
+
+        static int add1(int i) {
+            return i + 1;
+        }
+
+        int f1 (fptr1 fp, int i) {
+            return (*fp)(i);
+        }
+
+        int main(void) {
+            return f1(add1, 2) == 3 ? 0 : 1;
         }
     """
 
@@ -698,6 +929,104 @@ def test_knr_variadic_definition_inherits_prior_prototype():
     assert (
         result.returncode == 0
     ), f"K&R variadic definition compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_implicit_function_declaration_uses_future_typed_definition():
+    source = r"""
+        typedef struct {
+            char y;
+            char x[32];
+        } X;
+
+        int z(void) {
+            X value;
+            value.x[0] = value.x[31] = '0';
+            value.y = 0xf;
+            return f(value, value);
+        }
+
+        int main(void) {
+            return z() == 0x60 ? 0 : 1;
+        }
+
+        int f(X x, X y) {
+            if (x.y != y.y)
+                return 'F';
+            return x.x[0] + y.x[0];
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"implicit function future-typed definition compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_implicit_zero_arg_function_definition_compiles_under_gnu89_rules():
+    source = r"""
+        int main(void) {
+            f();
+            return 0;
+        }
+
+        f() {}
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"implicit zero-arg function compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_gnu_builtins_map_to_runtime_equivalents():
+    source = r"""
+        char buf[64];
+
+        int main(void) {
+            __builtin_strcpy(buf, "mystring");
+            if (__builtin_strcmp(buf, "mystring") != 0)
+                return 1;
+
+            __builtin_sprintf(buf, "%d", 42);
+            if (__builtin_strcmp(buf, "42") != 0)
+                return 2;
+
+            if (0)
+                __builtin_trap();
+
+            return 0;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"GNU builtin alias compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_alloca_without_builtin_prefix_and_classify_type_work():
+    source = r"""
+        int main(void) {
+            char *buf = (char *)alloca(4);
+            long double value = 1.25L;
+
+            buf[0] = 7;
+            if (buf[0] != 7)
+                return 1;
+            if (__builtin_classify_type(value) != 8)
+                return 2;
+            return 0;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"alloca/classify_type compat failed:\n{result.stdout}\n{result.stderr}"
 
 
 def test_system_cpp_strips_single_underscore_attribute_form():

@@ -457,6 +457,37 @@ class For(Node):
 
     attr_names = ()
 
+class GenericAssociation(Node):
+    __slots__ = ('type', 'expr', 'coord', '__weakref__')
+    def __init__(self, type, expr, coord=None):
+        self.type = type
+        self.expr = expr
+        self.coord = coord
+
+    def children(self):
+        nodelist = []
+        if self.type is not None: nodelist.append(("type", self.type))
+        if self.expr is not None: nodelist.append(("expr", self.expr))
+        return tuple(nodelist)
+
+    attr_names = ()
+
+class GenericSelection(Node):
+    __slots__ = ('expr', 'associations', 'coord', '__weakref__')
+    def __init__(self, expr, associations, coord=None):
+        self.expr = expr
+        self.associations = associations
+        self.coord = coord
+
+    def children(self):
+        nodelist = []
+        if self.expr is not None: nodelist.append(("expr", self.expr))
+        for i, child in enumerate(self.associations or []):
+            nodelist.append(("associations[%d]" % i, child))
+        return tuple(nodelist)
+
+    attr_names = ()
+
 class FuncCall(Node):
     __slots__ = ('name', 'args', 'coord', '__weakref__')
     def __init__(self, name, args, coord=None):
@@ -516,6 +547,19 @@ class Goto(Node):
         return tuple(nodelist)
 
     attr_names = ('name', )
+
+class ComputedGoto(Node):
+    __slots__ = ('expr', 'coord', '__weakref__')
+    def __init__(self, expr, coord=None):
+        self.expr = expr
+        self.coord = coord
+
+    def children(self):
+        nodelist = []
+        if self.expr is not None: nodelist.append(("expr", self.expr))
+        return tuple(nodelist)
+
+    attr_names = ()
 
 class ID(Node):
     __slots__ = ('name', 'coord', '__weakref__', "ir_type")
@@ -587,6 +631,17 @@ class Label(Node):
 
     attr_names = ('name', )
 
+class LabelAddress(Node):
+    __slots__ = ('name', 'coord', '__weakref__')
+    def __init__(self, name, coord=None):
+        self.name = name
+        self.coord = coord
+
+    def children(self):
+        return tuple()
+
+    attr_names = ('name', )
+
 class NamedInitializer(Node):
     __slots__ = ('name', 'expr', 'coord', '__weakref__')
     def __init__(self, name, expr, coord=None):
@@ -599,6 +654,21 @@ class NamedInitializer(Node):
         if self.expr is not None: nodelist.append(("expr", self.expr))
         for i, child in enumerate(self.name or []):
             nodelist.append(("name[%d]" % i, child))
+        return tuple(nodelist)
+
+    attr_names = ()
+
+class RangeDesignator(Node):
+    __slots__ = ('start', 'end', 'coord', '__weakref__')
+    def __init__(self, start, end, coord=None):
+        self.start = start
+        self.end = end
+        self.coord = coord
+
+    def children(self):
+        nodelist = []
+        if self.start is not None: nodelist.append(("start", self.start))
+        if self.end is not None: nodelist.append(("end", self.end))
         return tuple(nodelist)
 
     attr_names = ()
@@ -658,6 +728,19 @@ class Struct(Node):
         return tuple(nodelist)
 
     attr_names = ('name', )
+
+class StmtExpr(Node):
+    __slots__ = ('stmt', 'coord', '__weakref__')
+    def __init__(self, stmt, coord=None):
+        self.stmt = stmt
+        self.coord = coord
+
+    def children(self):
+        nodelist = []
+        if self.stmt is not None: nodelist.append(("stmt", self.stmt))
+        return tuple(nodelist)
+
+    attr_names = ()
 
 class StructRef(Node):
     __slots__ = ('name', 'type', 'field', 'coord', '__weakref__')
@@ -796,5 +879,3 @@ class While(Node):
         return tuple(nodelist)
 
     attr_names = ()
-
-

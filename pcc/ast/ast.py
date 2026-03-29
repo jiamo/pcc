@@ -140,7 +140,8 @@ class PrototypeAST(ASTNode):
         return self.isoperator and len(self.argnames) == 2
 
     def get_op_name(self):
-        assert self.isoperator
+        if not self.isoperator:
+            raise ValueError(f"get_op_name called on non-operator '{self.name}'")
         return self.name[-1]
 
     def dump(self, indent=0):

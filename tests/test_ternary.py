@@ -45,6 +45,21 @@ class TestTernary(unittest.TestCase):
             ''', llvmdump=True)
         assert ret == 0
 
+    def test_ternary_condition_with_local_variable_is_not_constant_folded(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                int x = 0;
+                int y = 1;
+                if (x ? 1 : 0)
+                    return 1;
+                if (y ? 0 : 1)
+                    return 2;
+                return 0;
+            }
+            ''', llvmdump=True)
+        assert ret == 0
+
 
 if __name__ == '__main__':
     unittest.main()

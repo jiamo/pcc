@@ -28,96 +28,110 @@ CLANG_C_RUNTIME_SUCCESS_CASES = (
 CLANG_C_RUNTIME_BOTH_FAIL_CASES = CLANG_C_MANIFEST.get("runtime_both_fail", [])
 
 
-@pytest.mark.parametrize("filename", CLANG_C_COMPILE_ONLY_SUCCESS_CASES)
-def test_clang_c_compile_only_succeeds_under_native_and_pcc(filename):
-    case_path = CLANG_C_TESTS_DIR / filename
-    assert case_path.is_file(), f"missing clang C test case: {case_path}"
+if CLANG_C_COMPILE_ONLY_SUCCESS_CASES:
 
-    native_result = compile_native(case_path, REPO_ROOT)
-    pcc_result = compile_pcc(case_path)
+    @pytest.mark.parametrize("filename", CLANG_C_COMPILE_ONLY_SUCCESS_CASES)
+    def test_clang_c_compile_only_succeeds_under_native_and_pcc(filename):
+        case_path = CLANG_C_TESTS_DIR / filename
+        assert case_path.is_file(), f"missing clang C test case: {case_path}"
 
-    assert native_result.returncode == 0, f"native cc failed for {filename}:\n{native_result.stderr}"
-    assert pcc_result.returncode == 0, f"pcc failed to compile {filename}:\n{pcc_result.stderr}"
+        native_result = compile_native(case_path, REPO_ROOT)
+        pcc_result = compile_pcc(case_path)
 
-
-@pytest.mark.parametrize("filename", CLANG_C_RUNTIME_SUCCESS_CASES)
-def test_clang_c_runtime_succeeds_under_native_and_pcc(filename):
-    case_path = CLANG_C_TESTS_DIR / filename
-    assert case_path.is_file(), f"missing clang C test case: {case_path}"
-
-    native_result = run_native(case_path, REPO_ROOT)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
-
-    assert (
-        pcc_result.returncode == native_result.returncode
-    ), f"{filename} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
+        assert native_result.returncode == 0, f"native cc failed for {filename}:\n{native_result.stderr}"
+        assert pcc_result.returncode == 0, f"pcc failed to compile {filename}:\n{pcc_result.stderr}"
 
 
-@pytest.mark.parametrize("filename", CLANG_C_RUNTIME_EXACT_MATCH_CASES)
-def test_clang_c_runtime_matches_native_exactly(filename):
-    case_path = CLANG_C_TESTS_DIR / filename
-    assert case_path.is_file(), f"missing clang C test case: {case_path}"
+if CLANG_C_RUNTIME_SUCCESS_CASES:
 
-    native_result = run_native(case_path, REPO_ROOT)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
+    @pytest.mark.parametrize("filename", CLANG_C_RUNTIME_SUCCESS_CASES)
+    def test_clang_c_runtime_succeeds_under_native_and_pcc(filename):
+        case_path = CLANG_C_TESTS_DIR / filename
+        assert case_path.is_file(), f"missing clang C test case: {case_path}"
 
-    assert (
-        pcc_result.returncode == native_result.returncode
-    ), f"{filename} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
-    assert (
-        pcc_result.stdout == native_result.stdout
-    ), f"{filename} stdout mismatch:\nnative={native_result.stdout!r}\npcc={pcc_result.stdout!r}"
-    assert (
-        pcc_result.stderr == native_result.stderr
-    ), f"{filename} stderr mismatch:\nnative={native_result.stderr!r}\npcc={pcc_result.stderr!r}"
+        native_result = run_native(case_path, REPO_ROOT)
+        pcc_result = run_pcc(case_path, REPO_ROOT)
+
+        assert (
+            pcc_result.returncode == native_result.returncode
+        ), f"{filename} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
 
 
-@pytest.mark.parametrize("filename", CLANG_C_COMPILE_ONLY_BOTH_FAIL_CASES)
-def test_clang_c_compile_only_both_native_and_pcc_reject_case(filename):
-    case_path = CLANG_C_TESTS_DIR / filename
-    assert case_path.is_file(), f"missing clang C test case: {case_path}"
+if CLANG_C_RUNTIME_EXACT_MATCH_CASES:
 
-    native_result = compile_native(case_path, REPO_ROOT)
-    pcc_result = compile_pcc(case_path)
+    @pytest.mark.parametrize("filename", CLANG_C_RUNTIME_EXACT_MATCH_CASES)
+    def test_clang_c_runtime_matches_native_exactly(filename):
+        case_path = CLANG_C_TESTS_DIR / filename
+        assert case_path.is_file(), f"missing clang C test case: {case_path}"
 
-    assert native_result.returncode != 0, f"native cc unexpectedly accepted {filename}"
-    assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {filename}"
+        native_result = run_native(case_path, REPO_ROOT)
+        pcc_result = run_pcc(case_path, REPO_ROOT)
 
-
-@pytest.mark.parametrize("filename", CLANG_C_COMPILE_ONLY_NATIVE_PASS_PCC_FAIL_CASES)
-def test_clang_c_compile_only_native_accepts_but_pcc_rejects_case(filename):
-    case_path = CLANG_C_TESTS_DIR / filename
-    assert case_path.is_file(), f"missing clang C test case: {case_path}"
-
-    native_result = compile_native(case_path, REPO_ROOT)
-    pcc_result = compile_pcc(case_path)
-
-    assert native_result.returncode == 0, f"native cc unexpectedly rejected {filename}:\n{native_result.stderr}"
-    assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {filename}"
+        assert (
+            pcc_result.returncode == native_result.returncode
+        ), f"{filename} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
+        assert (
+            pcc_result.stdout == native_result.stdout
+        ), f"{filename} stdout mismatch:\nnative={native_result.stdout!r}\npcc={pcc_result.stdout!r}"
+        assert (
+            pcc_result.stderr == native_result.stderr
+        ), f"{filename} stderr mismatch:\nnative={native_result.stderr!r}\npcc={pcc_result.stderr!r}"
 
 
-@pytest.mark.parametrize("filename", CLANG_C_COMPILE_ONLY_NATIVE_FAIL_PCC_PASS_CASES)
-def test_clang_c_compile_only_native_rejects_but_pcc_accepts_case(filename):
-    case_path = CLANG_C_TESTS_DIR / filename
-    assert case_path.is_file(), f"missing clang C test case: {case_path}"
+if CLANG_C_COMPILE_ONLY_BOTH_FAIL_CASES:
 
-    native_result = compile_native(case_path, REPO_ROOT)
-    pcc_result = compile_pcc(case_path)
+    @pytest.mark.parametrize("filename", CLANG_C_COMPILE_ONLY_BOTH_FAIL_CASES)
+    def test_clang_c_compile_only_both_native_and_pcc_reject_case(filename):
+        case_path = CLANG_C_TESTS_DIR / filename
+        assert case_path.is_file(), f"missing clang C test case: {case_path}"
 
-    assert native_result.returncode != 0, f"native cc unexpectedly accepted {filename}"
-    assert pcc_result.returncode == 0, f"pcc unexpectedly rejected {filename}:\n{pcc_result.stderr}"
+        native_result = compile_native(case_path, REPO_ROOT)
+        pcc_result = compile_pcc(case_path)
+
+        assert native_result.returncode != 0, f"native cc unexpectedly accepted {filename}"
+        assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {filename}"
 
 
-@pytest.mark.parametrize("filename", CLANG_C_RUNTIME_BOTH_FAIL_CASES)
-def test_clang_c_runtime_both_native_and_pcc_reject_case(filename):
-    case_path = CLANG_C_TESTS_DIR / filename
-    assert case_path.is_file(), f"missing clang C test case: {case_path}"
+if CLANG_C_COMPILE_ONLY_NATIVE_PASS_PCC_FAIL_CASES:
 
-    native_result = run_native(case_path, REPO_ROOT)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
+    @pytest.mark.parametrize("filename", CLANG_C_COMPILE_ONLY_NATIVE_PASS_PCC_FAIL_CASES)
+    def test_clang_c_compile_only_native_accepts_but_pcc_rejects_case(filename):
+        case_path = CLANG_C_TESTS_DIR / filename
+        assert case_path.is_file(), f"missing clang C test case: {case_path}"
 
-    assert native_result.returncode != 0, f"native runtime unexpectedly succeeded for {filename}"
-    assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {filename}"
+        native_result = compile_native(case_path, REPO_ROOT)
+        pcc_result = compile_pcc(case_path)
+
+        assert native_result.returncode == 0, f"native cc unexpectedly rejected {filename}:\n{native_result.stderr}"
+        assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {filename}"
+
+
+if CLANG_C_COMPILE_ONLY_NATIVE_FAIL_PCC_PASS_CASES:
+
+    @pytest.mark.parametrize("filename", CLANG_C_COMPILE_ONLY_NATIVE_FAIL_PCC_PASS_CASES)
+    def test_clang_c_compile_only_native_rejects_but_pcc_accepts_case(filename):
+        case_path = CLANG_C_TESTS_DIR / filename
+        assert case_path.is_file(), f"missing clang C test case: {case_path}"
+
+        native_result = compile_native(case_path, REPO_ROOT)
+        pcc_result = compile_pcc(case_path)
+
+        assert native_result.returncode != 0, f"native cc unexpectedly accepted {filename}"
+        assert pcc_result.returncode == 0, f"pcc unexpectedly rejected {filename}:\n{pcc_result.stderr}"
+
+
+if CLANG_C_RUNTIME_BOTH_FAIL_CASES:
+
+    @pytest.mark.parametrize("filename", CLANG_C_RUNTIME_BOTH_FAIL_CASES)
+    def test_clang_c_runtime_both_native_and_pcc_reject_case(filename):
+        case_path = CLANG_C_TESTS_DIR / filename
+        assert case_path.is_file(), f"missing clang C test case: {case_path}"
+
+        native_result = run_native(case_path, REPO_ROOT)
+        pcc_result = run_pcc(case_path, REPO_ROOT)
+
+        assert native_result.returncode != 0, f"native runtime unexpectedly succeeded for {filename}"
+        assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {filename}"
 
 
 def test_clang_c_manifest_covers_all_cases():

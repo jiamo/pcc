@@ -173,6 +173,22 @@ class TestCtype(unittest.TestCase):
         ''')
         assert ret == 0
 
+    def test_basic_integer_limit_macros_are_available(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            #include <limits.h>
+
+            int main(){
+                if (CHAR_BIT != 8) return 1;
+                if (SCHAR_MAX != 127 || SCHAR_MIN != -128) return 2;
+                if (SHRT_MAX != 32767 || SHRT_MIN != -32768) return 3;
+                if (INT_MAX != 2147483647 || INT_MIN != (-2147483647 - 1)) return 4;
+                if (UINT_MAX != 4294967295U) return 5;
+                return 0;
+            }
+        ''')
+        assert ret == 0
+
 
 class TestPuts(unittest.TestCase):
     def test_puts_compiles(self):

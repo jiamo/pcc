@@ -167,6 +167,25 @@ class TestSizeof(unittest.TestCase):
         )
         assert ret == 4
 
+    def test_sizeof_arrow_on_array_lvalue_decays_to_first_element_pointer(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            typedef struct {
+                long c[4];
+                long b, e, k;
+            } PT;
+
+            PT cases[2];
+
+            int main(){
+                return sizeof(cases->c) == sizeof(long) * 4 ? 0 : 1;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
     def test_sizeof_binary_expr_uses_arithmetic_result_type(self):
         pcc = CEvaluator()
         ret = pcc.evaluate(

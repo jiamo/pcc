@@ -100,7 +100,7 @@ class CLexer(object):
     ## Reserved keywords
     ##
     keywords = (
-        '_BOOL', '_COMPLEX', '_FLOAT16', '_NORETURN', 'AUTO', 'BREAK', 'CASE', 'CHAR', 'CONST',
+        '_ALIGNOF', '_BOOL', '_COMPLEX', '_FLOAT16', '_GENERIC', '_NORETURN', 'AUTO', 'BREAK', 'CASE', 'CHAR', 'CONST',
         'CONTINUE', 'DEFAULT', 'DO', 'DOUBLE', 'ELSE', 'ENUM', 'EXTERN',
         'FLOAT', 'FOR', 'GOTO', 'IF', 'INLINE', 'INT', 'INT128', 'LONG',
         'REGISTER', 'OFFSETOF',
@@ -113,10 +113,14 @@ class CLexer(object):
     for keyword in keywords:
         if keyword == '_BOOL':
             keyword_map['_Bool'] = keyword
+        elif keyword == '_ALIGNOF':
+            keyword_map['_Alignof'] = keyword
         elif keyword == '_COMPLEX':
             keyword_map['_Complex'] = keyword
         elif keyword == '_FLOAT16':
             keyword_map['_Float16'] = keyword
+        elif keyword == '_GENERIC':
+            keyword_map['_Generic'] = keyword
         elif keyword == '_NORETURN':
             keyword_map['_Noreturn'] = keyword
         else:
@@ -136,6 +140,9 @@ class CLexer(object):
     keyword_map['__restrict'] = 'RESTRICT'
     keyword_map['__restrict__'] = 'RESTRICT'
     keyword_map['__int128'] = 'INT128'
+    keyword_map['__alignof'] = '_ALIGNOF'
+    keyword_map['__alignof__'] = '_ALIGNOF'
+    keyword_map['__builtin_va_arg'] = 'BUILTIN_VA_ARG'
     keyword_map.pop('int128', None)
 
     ##
@@ -144,6 +151,7 @@ class CLexer(object):
     tokens = keywords + (
         # Identifiers
         'ID',
+        'BUILTIN_VA_ARG',
 
         # Type identifiers (identifiers previously defined as
         # types with typedef)

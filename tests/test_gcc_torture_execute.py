@@ -32,72 +32,82 @@ def _case_path(relative_path: str) -> Path:
     return GCC_TORTURE_DIR / relative_path
 
 
-@pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_SUCCESS_CASES)
-def test_gcc_torture_runtime_succeeds_under_native_and_pcc(relative_path):
-    case_path = _case_path(relative_path)
-    assert case_path.is_file(), f"missing gcc torture case: {case_path}"
+if GCC_TORTURE_RUNTIME_SUCCESS_CASES:
 
-    native_result = run_native(case_path, REPO_ROOT)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
+    @pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_SUCCESS_CASES)
+    def test_gcc_torture_runtime_succeeds_under_native_and_pcc(relative_path):
+        case_path = _case_path(relative_path)
+        assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
-    assert (
-        pcc_result.returncode == native_result.returncode
-    ), f"{relative_path} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
+        native_result = run_native(case_path, REPO_ROOT)
+        pcc_result = run_pcc(case_path, REPO_ROOT)
 
-
-@pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_EXACT_MATCH_CASES)
-def test_gcc_torture_runtime_matches_native_exactly(relative_path):
-    case_path = _case_path(relative_path)
-    assert case_path.is_file(), f"missing gcc torture case: {case_path}"
-
-    native_result = run_native(case_path, REPO_ROOT)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
-
-    assert (
-        pcc_result.returncode == native_result.returncode
-    ), f"{relative_path} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
-    assert (
-        pcc_result.stdout == native_result.stdout
-    ), f"{relative_path} stdout mismatch:\nnative={native_result.stdout!r}\npcc={pcc_result.stdout!r}"
-    assert (
-        pcc_result.stderr == native_result.stderr
-    ), f"{relative_path} stderr mismatch:\nnative={native_result.stderr!r}\npcc={pcc_result.stderr!r}"
+        assert (
+            pcc_result.returncode == native_result.returncode
+        ), f"{relative_path} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
 
 
-@pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_BOTH_FAIL_CASES)
-def test_gcc_torture_runtime_both_native_and_pcc_reject_case(relative_path):
-    case_path = _case_path(relative_path)
-    assert case_path.is_file(), f"missing gcc torture case: {case_path}"
+if GCC_TORTURE_RUNTIME_EXACT_MATCH_CASES:
 
-    native_result = run_native(case_path, REPO_ROOT)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
+    @pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_EXACT_MATCH_CASES)
+    def test_gcc_torture_runtime_matches_native_exactly(relative_path):
+        case_path = _case_path(relative_path)
+        assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
-    assert native_result.returncode != 0, f"native runtime unexpectedly succeeded for {relative_path}"
-    assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {relative_path}"
+        native_result = run_native(case_path, REPO_ROOT)
+        pcc_result = run_pcc(case_path, REPO_ROOT)
 
-
-@pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_NATIVE_FAIL_PCC_PASS_CASES)
-def test_gcc_torture_runtime_native_rejects_but_pcc_accepts_case(relative_path):
-    case_path = _case_path(relative_path)
-    assert case_path.is_file(), f"missing gcc torture case: {case_path}"
-
-    native_result = run_native(case_path, REPO_ROOT)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
-
-    assert native_result.returncode != 0, f"native runtime unexpectedly succeeded for {relative_path}"
-    assert pcc_result.returncode == 0, f"pcc unexpectedly rejected {relative_path}:\n{pcc_result.stderr}"
+        assert (
+            pcc_result.returncode == native_result.returncode
+        ), f"{relative_path} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
+        assert (
+            pcc_result.stdout == native_result.stdout
+        ), f"{relative_path} stdout mismatch:\nnative={native_result.stdout!r}\npcc={pcc_result.stdout!r}"
+        assert (
+            pcc_result.stderr == native_result.stderr
+        ), f"{relative_path} stderr mismatch:\nnative={native_result.stderr!r}\npcc={pcc_result.stderr!r}"
 
 
-@pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_NATIVE_PASS_PCC_FAIL_CASES)
-def test_gcc_torture_runtime_native_accepts_but_pcc_rejects_case(relative_path):
-    case_path = _case_path(relative_path)
-    assert case_path.is_file(), f"missing gcc torture case: {case_path}"
+if GCC_TORTURE_RUNTIME_BOTH_FAIL_CASES:
 
-    native_result = run_native(case_path, REPO_ROOT)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
+    @pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_BOTH_FAIL_CASES)
+    def test_gcc_torture_runtime_both_native_and_pcc_reject_case(relative_path):
+        case_path = _case_path(relative_path)
+        assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
-    assert native_result.returncode == 0, f"native runtime unexpectedly rejected {relative_path}:\n{native_result.stderr}"
-    assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {relative_path}"
+        native_result = run_native(case_path, REPO_ROOT)
+        pcc_result = run_pcc(case_path, REPO_ROOT)
+
+        assert native_result.returncode != 0, f"native runtime unexpectedly succeeded for {relative_path}"
+        assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {relative_path}"
+
+
+if GCC_TORTURE_RUNTIME_NATIVE_FAIL_PCC_PASS_CASES:
+
+    @pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_NATIVE_FAIL_PCC_PASS_CASES)
+    def test_gcc_torture_runtime_native_rejects_but_pcc_accepts_case(relative_path):
+        case_path = _case_path(relative_path)
+        assert case_path.is_file(), f"missing gcc torture case: {case_path}"
+
+        native_result = run_native(case_path, REPO_ROOT)
+        pcc_result = run_pcc(case_path, REPO_ROOT)
+
+        assert native_result.returncode != 0, f"native runtime unexpectedly succeeded for {relative_path}"
+        assert pcc_result.returncode == 0, f"pcc unexpectedly rejected {relative_path}:\n{pcc_result.stderr}"
+
+
+if GCC_TORTURE_RUNTIME_NATIVE_PASS_PCC_FAIL_CASES:
+
+    @pytest.mark.parametrize("relative_path", GCC_TORTURE_RUNTIME_NATIVE_PASS_PCC_FAIL_CASES)
+    def test_gcc_torture_runtime_native_accepts_but_pcc_rejects_case(relative_path):
+        case_path = _case_path(relative_path)
+        assert case_path.is_file(), f"missing gcc torture case: {case_path}"
+
+        native_result = run_native(case_path, REPO_ROOT)
+        pcc_result = run_pcc(case_path, REPO_ROOT)
+
+        assert native_result.returncode == 0, f"native runtime unexpectedly rejected {relative_path}:\n{native_result.stderr}"
+        assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {relative_path}"
 
 
 def test_gcc_torture_runtime_timeout_cases_are_explicitly_tracked():

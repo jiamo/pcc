@@ -75,6 +75,16 @@ temp.*
 
 projects/readline-8.2/Makefile
 projects/readline-8.2/config.status
+projects/readline-8.2/confdefs.h
+projects/readline-8.2/config.h
+projects/readline-8.2/conftest.c
+projects/readline-8.2/conftest.err
+projects/readline-8.2/doc/Makefile
+projects/readline-8.2/examples/Makefile
+projects/readline-8.2/history.pc
+projects/readline-8.2/readline.pc
+projects/readline-8.2/shlib/Makefile
+projects/readline-8.2/stamp-h
 
 
 redis
@@ -134,3 +144,5 @@ projects/zlib-1.3.1/trees.o
 projects/zlib-1.3.1/uncompr.o
 projects/zlib-1.3.1/zlib.pc
 projects/zlib-1.3.1/zutil.o
+projects/nginx-1.28.3/Makefile
+projects/nginx-1.28.3/objs/

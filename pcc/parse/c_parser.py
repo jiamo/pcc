@@ -24,8 +24,8 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
 
-_DEFAULT_PLY_LEXTAB = "pcc_lextab_v7"
-_DEFAULT_PLY_YACCTAB = "pcc_yacctab_v7"
+_DEFAULT_PLY_LEXTAB = "pcc_lextab_v11"
+_DEFAULT_PLY_YACCTAB = "pcc_yacctab_v17"
 
 
 def _default_ply_cache_dir():
@@ -206,7 +206,8 @@ class CParser(PLYParser):
         self._scope_stack.append(dict())
 
     def _pop_scope(self):
-        assert len(self._scope_stack) > 1
+        if len(self._scope_stack) <= 1:
+            raise RuntimeError("internal error: cannot pop the global scope")
         self._scope_stack.pop()
 
     def _add_typedef_name(self, name, coord):
@@ -465,7 +466,8 @@ class CParser(PLYParser):
                 del spec['type'][-1]
 
         for decl in decls:
-            assert decl['decl'] is not None
+            if decl['decl'] is None:
+                raise RuntimeError("internal error: declarator missing in declaration")
             if is_typedef:
                 declaration = c_ast.Typedef(
                     name=None,
@@ -506,7 +508,8 @@ class CParser(PLYParser):
     def _build_function_definition(self, spec, decl, param_decls, body):
         """ Builds a function definition.
         """
-        assert 'typedef' not in spec['storage']
+        if 'typedef' in spec['storage']:
+            raise RuntimeError("internal error: typedef in function definition")
 
         declaration = self._build_declarations(
             spec=spec,
@@ -892,7 +895,8 @@ class CParser(PLYParser):
         """ struct_declaration : specifier_qualifier_list struct_declarator_list_opt SEMI
         """
         spec = p[1]
-        assert 'typedef' not in spec['storage']
+        if 'typedef' in spec['storage']:
+            raise RuntimeError("internal error: typedef in struct declaration")
 
         if p[2] is not None:
             decls = self._build_declarations(
@@ -1036,6 +1040,7 @@ class CParser(PLYParser):
 
     def p_direct_declarator_1(self, p):
         """ direct_declarator   : ID
+                                | TYPEID
         """
         p[0] = c_ast.TypeDecl(
             declname=p[1],
@@ -1219,6 +1224,42 @@ class CParser(PLYParser):
 
         p[0] = decl
 
+    def p_parameter_declaration_3(self, p):
+        """ parameter_declaration   : declaration_specifiers LBRACKET type_qualifier_list assignment_expression_opt RBRACKET
+                                    | declaration_specifiers LBRACKET STATIC type_qualifier_list_opt assignment_expression RBRACKET
+                                    | declaration_specifiers LBRACKET type_qualifier_list STATIC assignment_expression RBRACKET
+                                    | declaration_specifiers LBRACKET type_qualifier_list TIMES RBRACKET
+        """
+        spec = p[1]
+        if not spec['type']:
+            spec['type'] = [c_ast.IdentifierType(['int'],
+                coord=self._coord(p.lineno(1)))]
+
+        if p.slice[-2].type == "TIMES":
+            dim = c_ast.ID(p[4], self._coord(p.lineno(4)))
+            dim_quals = p[3] if p[3] is not None else []
+        elif p.slice[3].type == "STATIC" or p.slice[4].type == "STATIC":
+            listed_quals = [item if isinstance(item, list) else [item]
+                for item in [p[3], p[4]]]
+            dim_quals = [qual for sublist in listed_quals for qual in sublist
+                if qual is not None]
+            dim = p[5]
+        else:
+            dim_quals = (p[3] if p[3] is not None else [])
+            dim = p[4]
+
+        decl = c_ast.ArrayDecl(
+            type=c_ast.TypeDecl(None, None, None),
+            dim=dim,
+            dim_quals=dim_quals,
+            coord=self._coord(p.lineno(2)))
+        typename = c_ast.Typename(
+            name='',
+            quals=spec['qual'],
+            type=decl,
+            coord=self._coord(p.lineno(2)))
+        p[0] = self._fix_decl_name_type(typename, spec['type'])
+
     def p_identifier_list(self, p):
         """ identifier_list : identifier
                             | identifier_list COMMA identifier
@@ -1276,9 +1317,17 @@ class CParser(PLYParser):
 
     def p_designator(self, p):
         """ designator  : LBRACKET constant_expression RBRACKET
+                        | LBRACKET constant_expression ELLIPSIS constant_expression RBRACKET
                         | PERIOD identifier
         """
-        p[0] = p[2]
+        if len(p) == 4:
+            p[0] = p[2]
+        elif len(p) == 6:
+            p[0] = c_ast.RangeDesignator(
+                p[2], p[4], self._coord(p.lineno(1))
+            )
+        else:
+            p[0] = p[2]
 
     def p_type_name(self, p):
         """ type_name   : specifier_qualifier_list abstract_declarator_opt
@@ -1325,46 +1374,76 @@ class CParser(PLYParser):
         p[0] = p[2]
 
     def p_direct_abstract_declarator_2(self, p):
-        """ direct_abstract_declarator  : direct_abstract_declarator LBRACKET assignment_expression_opt RBRACKET
+        """ direct_abstract_declarator  : direct_abstract_declarator LBRACKET type_qualifier_list_opt assignment_expression_opt RBRACKET
         """
         arr = c_ast.ArrayDecl(
             type=None,
-            dim=p[3],
-            dim_quals=[],
+            dim=p[4] if len(p) > 5 else p[3],
+            dim_quals=(p[3] if len(p) > 5 else []) or [],
             coord=p[1].coord)
 
         p[0] = self._type_modify_decl(decl=p[1], modifier=arr)
 
     def p_direct_abstract_declarator_3(self, p):
-        """ direct_abstract_declarator  : LBRACKET assignment_expression_opt RBRACKET
+        """ direct_abstract_declarator  : LBRACKET type_qualifier_list_opt assignment_expression_opt RBRACKET
         """
         p[0] = c_ast.ArrayDecl(
             type=c_ast.TypeDecl(None, None, None),
-            dim=p[2],
-            dim_quals=[],
+            dim=p[3] if len(p) > 4 else p[2],
+            dim_quals=(p[2] if len(p) > 4 else []) or [],
             coord=self._coord(p.lineno(1)))
 
     def p_direct_abstract_declarator_4(self, p):
-        """ direct_abstract_declarator  : direct_abstract_declarator LBRACKET TIMES RBRACKET
+        """ direct_abstract_declarator  : direct_abstract_declarator LBRACKET STATIC type_qualifier_list_opt assignment_expression RBRACKET
+                                        | direct_abstract_declarator LBRACKET type_qualifier_list STATIC assignment_expression RBRACKET
         """
+        listed_quals = [item if isinstance(item, list) else [item]
+            for item in [p[3], p[4]]]
+        dim_quals = [qual for sublist in listed_quals for qual in sublist
+            if qual is not None]
         arr = c_ast.ArrayDecl(
             type=None,
-            dim=c_ast.ID(p[3], self._coord(p.lineno(3))),
-            dim_quals=[],
+            dim=p[5],
+            dim_quals=dim_quals,
             coord=p[1].coord)
 
         p[0] = self._type_modify_decl(decl=p[1], modifier=arr)
 
     def p_direct_abstract_declarator_5(self, p):
-        """ direct_abstract_declarator  : LBRACKET TIMES RBRACKET
+        """ direct_abstract_declarator  : LBRACKET STATIC type_qualifier_list_opt assignment_expression RBRACKET
+                                        | LBRACKET type_qualifier_list STATIC assignment_expression RBRACKET
+        """
+        listed_quals = [item if isinstance(item, list) else [item]
+            for item in [p[2], p[3]]]
+        dim_quals = [qual for sublist in listed_quals for qual in sublist
+            if qual is not None]
+        p[0] = c_ast.ArrayDecl(
+            type=c_ast.TypeDecl(None, None, None),
+            dim=p[4],
+            dim_quals=dim_quals,
+            coord=self._coord(p.lineno(1)))
+
+    def p_direct_abstract_declarator_6(self, p):
+        """ direct_abstract_declarator  : direct_abstract_declarator LBRACKET type_qualifier_list_opt TIMES RBRACKET
+        """
+        arr = c_ast.ArrayDecl(
+            type=None,
+            dim=c_ast.ID(p[4], self._coord(p.lineno(4))),
+            dim_quals=p[3] if p[3] is not None else [],
+            coord=p[1].coord)
+
+        p[0] = self._type_modify_decl(decl=p[1], modifier=arr)
+
+    def p_direct_abstract_declarator_7(self, p):
+        """ direct_abstract_declarator  : LBRACKET type_qualifier_list_opt TIMES RBRACKET
         """
         p[0] = c_ast.ArrayDecl(
             type=c_ast.TypeDecl(None, None, None),
             dim=c_ast.ID(p[3], self._coord(p.lineno(3))),
-            dim_quals=[],
+            dim_quals=p[2] if p[2] is not None else [],
             coord=self._coord(p.lineno(1)))
 
-    def p_direct_abstract_declarator_6(self, p):
+    def p_direct_abstract_declarator_8(self, p):
         """ direct_abstract_declarator  : direct_abstract_declarator LPAREN parameter_type_list_opt RPAREN
         """
         func = c_ast.FuncDecl(
@@ -1374,7 +1453,7 @@ class CParser(PLYParser):
 
         p[0] = self._type_modify_decl(decl=p[1], modifier=func)
 
-    def p_direct_abstract_declarator_7(self, p):
+    def p_direct_abstract_declarator_9(self, p):
         """ direct_abstract_declarator  : LPAREN parameter_type_list_opt RPAREN
         """
         p[0] = c_ast.FuncDecl(
@@ -1407,7 +1486,9 @@ class CParser(PLYParser):
             coord=self._coord(p.lineno(1)))
 
     def p_labeled_statement_1(self, p):
-        """ labeled_statement : ID COLON statement """
+        """ labeled_statement : ID COLON statement
+                              | TYPEID COLON statement
+        """
         p[0] = c_ast.Label(p[1], p[3], self._coord(p.lineno(1)))
 
     def p_labeled_statement_2(self, p):
@@ -1449,8 +1530,14 @@ class CParser(PLYParser):
                          p[4], p[6], p[8], self._coord(p.lineno(1)))
 
     def p_jump_statement_1(self, p):
-        """ jump_statement  : GOTO ID SEMI """
+        """ jump_statement  : GOTO ID SEMI
+                            | GOTO TYPEID SEMI
+        """
         p[0] = c_ast.Goto(p[2], self._coord(p.lineno(1)))
+
+    def p_jump_statement_1b(self, p):
+        """ jump_statement  : GOTO TIMES expression SEMI """
+        p[0] = c_ast.ComputedGoto(p[3], self._coord(p.lineno(1)))
 
     def p_jump_statement_2(self, p):
         """ jump_statement  : BREAK SEMI """
@@ -1583,11 +1670,19 @@ class CParser(PLYParser):
     def p_unary_expression_3(self, p):
         """ unary_expression    : SIZEOF unary_expression
                                 | SIZEOF LPAREN type_name RPAREN
+                                | _ALIGNOF unary_expression
+                                | _ALIGNOF LPAREN type_name RPAREN
         """
         p[0] = c_ast.UnaryOp(
             p[1],
             p[2] if len(p) == 3 else p[3],
             self._coord(p.lineno(1)))
+
+    def p_unary_expression_4(self, p):
+        """ unary_expression    : LAND ID
+                                | LAND TYPEID
+        """
+        p[0] = c_ast.UnaryOp("&&", c_ast.ID(p[2], self._coord(p.lineno(2))), self._coord(p.lineno(1)))
 
     def p_unary_operator(self, p):
         """ unary_operator  : AND
@@ -1639,6 +1734,31 @@ class CParser(PLYParser):
             init = p[5]
         p[0] = c_ast.CompoundLiteral(p[2], init)
 
+    def p_postfix_expression_7(self, p):
+        """ postfix_expression  : BUILTIN_VA_ARG LPAREN assignment_expression COMMA type_name RPAREN """
+        coord = self._coord(p.lineno(1))
+        ptr_type = c_ast.Typename(
+            None,
+            getattr(p[5], "quals", None),
+            c_ast.PtrDecl([], p[5].type, coord),
+            coord,
+        )
+        call = c_ast.FuncCall(
+            c_ast.ID("__builtin_va_arg", coord),
+            c_ast.ExprList([p[3]], coord),
+            coord,
+        )
+        p[0] = c_ast.UnaryOp("*", c_ast.Cast(ptr_type, call, coord), coord)
+
+    def p_postfix_expression_8(self, p):
+        """ postfix_expression  : BUILTIN_VA_ARG LPAREN assignment_expression COMMA assignment_expression RPAREN """
+        coord = self._coord(p.lineno(1))
+        p[0] = c_ast.FuncCall(
+            c_ast.ID("__builtin_va_arg", coord),
+            c_ast.ExprList([p[3], p[5]], coord),
+            coord,
+        )
+
     def p_primary_expression_1(self, p):
         """ primary_expression  : identifier """
         p[0] = p[1]
@@ -1658,12 +1778,43 @@ class CParser(PLYParser):
         p[0] = p[2]
 
     def p_primary_expression_5(self, p):
+        """ primary_expression  : LPAREN compound_statement RPAREN """
+        p[0] = c_ast.StmtExpr(p[2], self._coord(p.lineno(1)))
+
+    def p_primary_expression_6(self, p):
+        """ primary_expression  : _GENERIC LPAREN assignment_expression COMMA generic_assoc_list RPAREN
+        """
+        p[0] = c_ast.GenericSelection(p[3], p[5], self._coord(p.lineno(1)))
+
+    def p_primary_expression_7(self, p):
         """ primary_expression  : OFFSETOF LPAREN type_name COMMA identifier RPAREN
         """
         coord = self._coord(p.lineno(1))
         p[0] = c_ast.FuncCall(c_ast.ID(p[1], coord),
                               c_ast.ExprList([p[3], p[5]], coord),
                               coord)
+
+
+    def p_generic_assoc_list(self, p):
+        """ generic_assoc_list : generic_association
+                               | generic_assoc_list COMMA generic_association
+        """
+        if len(p) == 2:
+            p[0] = [p[1]]
+        else:
+            p[1].append(p[3])
+            p[0] = p[1]
+
+    def p_generic_association(self, p):
+        """ generic_association : type_name COLON assignment_expression
+                                | DEFAULT COLON assignment_expression
+        """
+        assoc_type = None if p.slice[1].type == "DEFAULT" else p[1]
+        p[0] = c_ast.GenericAssociation(
+            assoc_type,
+            p[3],
+            self._coord(p.lineno(1)),
+        )
 
     def p_argument_expression_list(self, p):
         """ argument_expression_list    : assignment_expression
@@ -1721,13 +1872,22 @@ class CParser(PLYParser):
     def p_unified_wstring_literal(self, p):
         """ unified_wstring_literal : WSTRING_LITERAL
                                     | unified_wstring_literal WSTRING_LITERAL
+                                    | unified_wstring_literal STRING_LITERAL
+                                    | STRING_LITERAL WSTRING_LITERAL
         """
         if len(p) == 2: # single literal
             p[0] = c_ast.Constant(
-                'string', p[1], self._coord(p.lineno(1)))
+                'wstring', p[1], self._coord(p.lineno(1)))
         else:
-            p[1].value = p[1].value.rstrip()[:-1] + p[2][2:]
-            p[0] = p[1]
+            if isinstance(p[1], c_ast.Constant):
+                p[1].value = p[1].value.rstrip()[:-1] + p[2][1 + (p[2][0] == 'L') :]
+                p[0] = p[1]
+            else:
+                p[0] = c_ast.Constant(
+                    'wstring',
+                    'L' + p[1][:-1] + p[2][2:],
+                    self._coord(p.lineno(1)),
+                )
 
     def p_brace_open(self, p):
         """ brace_open  :   LBRACE

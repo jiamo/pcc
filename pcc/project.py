@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import warnings
 from dataclasses import dataclass
 
 
@@ -301,7 +302,7 @@ def _collect_input_units(path, sources_from_make=None):
         if sources_from_make:
             raise ValueError("--sources-from-make requires a directory input")
         base_dir = os.path.dirname(path)
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
             return [TranslationUnit(os.path.basename(path), path, f.read())], base_dir
 
     if os.path.isdir(path):
@@ -312,7 +313,7 @@ def _collect_input_units(path, sources_from_make=None):
         units = []
         for fname in c_files:
             fpath = _resolve_source_path(path, fname)
-            with open(fpath, "r") as f:
+            with open(fpath, "r", encoding="utf-8", errors="surrogateescape") as f:
                 units.append(TranslationUnit(fname, fpath, f.read()))
         return units, path
 
@@ -997,7 +998,12 @@ def _has_main(source, path=None, include_dirs=None):
             base_dir=os.path.dirname(path),
             include_dirs=include_dirs,
         )
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"pcc: preprocessing failed for main() detection in "
+            f"{path!r}: {exc}; falling back to regex match",
+            stacklevel=2,
+        )
         return True
 
     return bool(main_pattern.search(processed))

@@ -61,7 +61,10 @@ def fix_switch_cases(switch_node):
 
         A fixed AST node is returned. The argument may be modified.
     """
-    assert isinstance(switch_node, c_ast.Switch)
+    if not isinstance(switch_node, c_ast.Switch):
+        raise TypeError(
+            f"fix_switch_cases expects a Switch node, got {type(switch_node).__name__}"
+        )
     if not isinstance(switch_node.stmt, c_ast.Compound):
         return switch_node
 

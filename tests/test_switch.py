@@ -218,6 +218,93 @@ class TestSwitch(unittest.TestCase):
         )
         assert ret == 0
 
+    def test_switch_if_guarded_case_label_respects_false_condition(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(void){
+                int x = 0;
+                switch(x){
+                    case 0:
+                        if (0)
+                    case 1:
+                        return 1;
+                        break;
+                }
+                return 0;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+    def test_switch_if_guarded_default_break_does_not_fallthrough(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(void){
+                int x = 41;
+                switch(x){
+                    if (0) {
+                        return 9;
+                    default:
+                        return 0;
+                        break;
+                    case 42:
+                        return 1;
+                    }
+                }
+                return 2;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+    def test_switch_case_labels_nested_inside_if_block(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(){
+                int i = 41;
+                switch(i){
+                    if (0) {
+                        return 9;
+                    case 42:
+                        return 8;
+                    case 41:
+                        return 0;
+                    }
+                }
+                return 7;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
+    def test_switch_default_label_nested_inside_if_block(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            """
+            int main(){
+                int i = 41;
+                switch(i){
+                    if (0) {
+                        return 9;
+                    default:
+                        return 0;
+                    case 42:
+                        return 8;
+                    }
+                }
+                return 7;
+            }
+            """,
+            llvmdump=True,
+        )
+        assert ret == 0
+
     def test_switch_goto_label_after_terminated_path(self):
         pcc = CEvaluator()
         ret = pcc.evaluate(

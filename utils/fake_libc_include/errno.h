@@ -70,6 +70,9 @@
 #ifndef ENAMETOOLONG
 #define ENAMETOOLONG 63
 #endif
+#ifndef ETIMEDOUT
+#define ETIMEDOUT 60
+#endif
 #ifndef ENOLCK
 #define ENOLCK 77
 #endif

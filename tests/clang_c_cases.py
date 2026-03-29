@@ -54,6 +54,8 @@ def case_config(case_path: Path) -> ClangCCaseConfig:
             if token.startswith("-std="):
                 native_cflags.append(token)
                 cpp_args.append(token)
+            elif token == "-w" or token.startswith("-W"):
+                native_cflags.append(token)
             elif token in {"-fblocks", "-fwritable-strings"}:
                 native_cflags.append(token)
 
@@ -71,9 +73,14 @@ def compile_native(case_path: Path, repo_root: Path) -> subprocess.CompletedProc
 
     config = case_config(case_path)
     with tempfile.TemporaryDirectory(prefix="clang_c_native_compile_") as tmpdir:
-        binary = Path(tmpdir) / "a.out"
+        output = Path(tmpdir) / ("a.o" if config.mode == "compile_only" else "a.out")
+        cmd = [cc, *config.native_cflags, str(case_path)]
+        if config.mode == "compile_only":
+            cmd.extend(["-c", "-o", str(output)])
+        else:
+            cmd.extend(["-o", str(output)])
         return subprocess.run(
-            [cc, *config.native_cflags, str(case_path), "-o", str(binary)],
+            cmd,
             cwd=repo_root,
             env=subprocess_env(),
             capture_output=True,
@@ -154,7 +161,10 @@ def _run_lines(source: str) -> list[str]:
 
 
 def _read_case_source(case_path: Path) -> str:
-    return case_path.read_text(encoding="latin-1")
+    try:
+        return case_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return case_path.read_text(encoding="latin-1")
 
 
 def _run_pcc_worker(mode: str, case_path: Path, timeout: int) -> PccCompileResult:

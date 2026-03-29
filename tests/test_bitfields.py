@@ -177,6 +177,49 @@ class TestBitfields(unittest.TestCase):
         )
         assert ret == 0
 
+    def test_positive_enum_bitfield_uses_zero_extension(self):
+        ret = CEvaluator().evaluate(
+            r'''
+            enum tree_code {
+                SOME_CODE = 148,
+                LAST_AND_UNUSED_TREE_CODE
+            };
+
+            union tree_node;
+            typedef union tree_node *tree;
+
+            struct tree_common {
+                union tree_node *chain;
+                union tree_node *type;
+                enum tree_code code : 8;
+                unsigned side_effects_flag : 1;
+            };
+
+            union tree_node {
+                struct tree_common common;
+            };
+
+            enum c_tree_code {
+                C_DUMMY_TREE_CODE = LAST_AND_UNUSED_TREE_CODE,
+                STMT_EXPR,
+                LAST_C_TREE_CODE
+            };
+
+            enum cplus_tree_code {
+                CP_DUMMY_TREE_CODE = LAST_C_TREE_CODE,
+                AMBIG_CONV,
+                LAST_CPLUS_TREE_CODE
+            };
+
+            int main(void) {
+                union tree_node convs;
+                convs.common.code = AMBIG_CONV;
+                return ((enum tree_code) convs.common.code) == AMBIG_CONV ? 0 : 1;
+            }
+            '''
+        )
+        assert ret == 0
+
 
 if __name__ == "__main__":
     unittest.main()
