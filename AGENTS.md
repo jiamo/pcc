@@ -380,6 +380,17 @@ and fixed before the IR string is serialized.
 - PyPI package name is `python-cc` (not `pcc`, which is taken).
 - GitHub Actions uses Trusted Publisher (OIDC). The PyPI project name must match `pyproject.toml`'s `name` field exactly.
 
+## Release Process
+
+To publish a new version:
+
+1. Update `version` in `pyproject.toml`.
+2. Commit and push to `master`.
+3. Create and push a git tag: `git tag v0.0.X && git push origin v0.0.X`
+4. Create a GitHub Release: `gh release create v0.0.X --title "v0.0.X" --notes "Release notes here"`
+
+GitHub Actions will automatically build and publish to PyPI via Trusted Publisher when the tag is pushed.
+
 
 ## Additional Reading
 

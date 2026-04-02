@@ -17,6 +17,7 @@ from click.core import ParameterSource
 
 @click.command(context_settings={"ignore_unknown_options": True})
 @click.option("--llvmdump", is_flag=True, default=False, help="Dump LLVM IR to temp files")
+@click.option("-g", "--debug", "emit_debug", is_flag=True, default=False, help="Generate DWARF debug information")
 @click.option(
     "--separate-tus",
     is_flag=True,
@@ -87,6 +88,38 @@ from click.core import ParameterSource
     metavar="PATH=GOAL",
     help="Repeat to run `make -C PATH GOAL` before collecting or linking sources.",
 )
+@click.option(
+    "-O",
+    "opt_level",
+    type=click.IntRange(0, 3),
+    default=2,
+    show_default=True,
+    help="Optimization level: 0 (none), 1 (basic), 2 (default), 3 (aggressive).",
+)
+@click.option(
+    "--target",
+    "target_triple",
+    metavar="TRIPLE",
+    help="LLVM target triple for cross-compilation (e.g. x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu).",
+)
+@click.option(
+    "--emit-obj",
+    "emit_obj",
+    metavar="PATH",
+    help="Emit object file to PATH instead of running. Useful for cross-compilation.",
+)
+@click.option(
+    "--emit-asm",
+    "emit_asm",
+    metavar="PATH",
+    help="Emit assembly to PATH instead of running.",
+)
+@click.option(
+    "--emit-llvm",
+    "emit_llvm",
+    metavar="PATH",
+    help="Emit LLVM IR to PATH instead of running.",
+)
 @click.argument('path')
 @click.argument('prog_args', nargs=-1, type=click.UNPROCESSED)
 @click.pass_context
@@ -94,6 +127,7 @@ def main(
     ctx,
     path,
     llvmdump,
+    emit_debug,
     separate_tus,
     jobs,
     system_link,
@@ -105,6 +139,11 @@ def main(
     link_args,
     prepare_cmds,
     ensure_make_goal_specs,
+    opt_level,
+    target_triple,
+    emit_obj,
+    emit_asm,
+    emit_llvm,
     prog_args,
 ):
     """Pcc - a C compiler built on Python and LLVM.
@@ -175,12 +214,57 @@ def main(
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    pcc = CEvaluator()
+    emit_mode = emit_obj or emit_asm or emit_llvm
+    if target_triple and not emit_mode and not system_link:
+        click.echo(
+            "Error: --target requires --emit-obj, --emit-asm, --emit-llvm, or --system-link",
+            err=True,
+        )
+        sys.exit(1)
+
+    pcc = CEvaluator(target_triple=target_triple)
     try:
+        # Emit mode: compile to file instead of running
+        if emit_mode:
+            if use_multi_input:
+                compiled_units = pcc.compile_translation_units(
+                    units,
+                    base_dir=base_dir,
+                    jobs=jobs,
+                    include_dirs=include_dirs,
+                    cpp_args=merged_cpp_args,
+                    use_compile_cache=not no_cache,
+                    cache_dir=cache_dir,
+                )
+            else:
+                snippet_unit = TranslationUnit(
+                    name=os.path.basename(path),
+                    path=os.path.abspath(path) if os.path.isfile(path) else None,
+                    source=source,
+                )
+                compiled_units = pcc.compile_translation_units(
+                    [snippet_unit],
+                    base_dir=base_dir,
+                    jobs=1,
+                    include_dirs=include_dirs,
+                    cpp_args=merged_cpp_args,
+                    use_compile_cache=not no_cache,
+                    cache_dir=cache_dir,
+                )
+            pcc.emit_compiled_units(
+                compiled_units,
+                emit_obj=emit_obj,
+                emit_asm=emit_asm,
+                emit_llvm=emit_llvm,
+                optimize=opt_level,
+            )
+            sys.exit(0)
+
         if use_multi_input or system_link:
             if system_link:
                 run = pcc.run_translation_units_with_system_cc(
                     units,
+                    optimize=opt_level,
                     llvmdump=llvmdump,
                     base_dir=base_dir,
                     prog_args=list(prog_args),
@@ -199,6 +283,7 @@ def main(
             else:
                 ret = pcc.evaluate_translation_units(
                     units,
+                    optimize=opt_level,
                     llvmdump=llvmdump,
                     base_dir=base_dir,
                     prog_args=list(prog_args),
@@ -212,6 +297,7 @@ def main(
         else:
             ret = pcc.evaluate(
                 source,
+                optimize=opt_level,
                 llvmdump=llvmdump,
                 base_dir=base_dir,
                 prog_args=list(prog_args),
@@ -221,9 +307,16 @@ def main(
                 use_compile_cache=not no_cache,
                 cache_dir=cache_dir,
             )
-    except (ValueError, RuntimeError) as e:
+    except (ValueError, RuntimeError, KeyError, TypeError, AttributeError) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+    except Exception as e:
+        # Catch codegen/parse errors with clean output
+        err_name = type(e).__name__
+        if err_name in ("ParseError", "SemanticError", "CodegenError"):
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+        raise
     except KeyboardInterrupt:
         click.echo("\nInterrupted.", err=True)
         sys.exit(130)

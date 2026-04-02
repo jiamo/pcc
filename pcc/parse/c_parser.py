@@ -24,8 +24,8 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
 
-_DEFAULT_PLY_LEXTAB = "pcc_lextab_v11"
-_DEFAULT_PLY_YACCTAB = "pcc_yacctab_v17"
+_DEFAULT_PLY_LEXTAB = "pcc_lextab_v13"
+_DEFAULT_PLY_YACCTAB = "pcc_yacctab_v19"
 
 
 def _default_ply_cache_dir():
@@ -411,7 +411,9 @@ class CParser(PLYParser):
             Returns the declaration specifier, with the new
             specifier incorporated.
         """
-        spec = declspec or dict(qual=[], storage=[], type=[], function=[])
+        spec = declspec or dict(qual=[], storage=[], type=[], function=[], alignment=[])
+        if kind not in spec:
+            spec[kind] = []
         spec[kind].insert(0, newspec)
         return spec
 
@@ -574,6 +576,8 @@ class CParser(PLYParser):
     def p_translation_unit_2(self, p):
         """ translation_unit    : translation_unit external_declaration
         """
+        if p[1] is None:
+            p[1] = []
         if p[2] is not None:
             p[1].extend(p[2])
         p[0] = p[1]
@@ -602,6 +606,11 @@ class CParser(PLYParser):
         """ external_declaration    : SEMI
         """
         p[0] = None
+
+    def p_external_declaration_5(self, p):
+        """ external_declaration    : static_assert
+        """
+        p[0] = [p[1]]
 
     def p_pp_directive(self, p):
         """ pp_directive  : PPHASH
@@ -723,6 +732,15 @@ class CParser(PLYParser):
         """
         p[0] = p[1]
 
+    def p_static_assert(self, p):
+        """ static_assert : _STATIC_ASSERT LPAREN constant_expression COMMA unified_string_literal RPAREN SEMI
+                          | _STATIC_ASSERT LPAREN constant_expression RPAREN SEMI
+        """
+        if len(p) == 8:
+            p[0] = c_ast.StaticAssert(p[3], p[5], self._coord(p.lineno(1)))
+        else:
+            p[0] = c_ast.StaticAssert(p[3], None, self._coord(p.lineno(1)))
+
     # Since each declaration is a list of declarations, this
     # rule will combine all the declarations and return a single
     # list
@@ -753,12 +771,24 @@ class CParser(PLYParser):
         """
         p[0] = self._add_declaration_specifier(p[2], p[1], 'function')
 
+    def p_declaration_specifiers_5(self, p):
+        """ declaration_specifiers  : alignment_specifier declaration_specifiers_opt
+        """
+        p[0] = self._add_declaration_specifier(p[2], p[1], 'alignment')
+
+    def p_alignment_specifier(self, p):
+        """ alignment_specifier : _ALIGNAS LPAREN type_name RPAREN
+                                | _ALIGNAS LPAREN constant_expression RPAREN
+        """
+        p[0] = c_ast.Alignas(p[3], self._coord(p.lineno(1)))
+
     def p_storage_class_specifier(self, p):
         """ storage_class_specifier : AUTO
                                     | REGISTER
                                     | STATIC
                                     | EXTERN
                                     | TYPEDEF
+                                    | _THREAD_LOCAL
         """
         p[0] = p[1]
 
@@ -1467,6 +1497,7 @@ class CParser(PLYParser):
     def p_block_item(self, p):
         """ block_item  : declaration
                         | statement
+                        | static_assert
         """
         p[0] = p[1] if isinstance(p[1], list) else [p[1]]
 
@@ -1793,6 +1824,12 @@ class CParser(PLYParser):
         p[0] = c_ast.FuncCall(c_ast.ID(p[1], coord),
                               c_ast.ExprList([p[3], p[5]], coord),
                               coord)
+
+    def p_primary_expression_nullptr(self, p):
+        """ primary_expression  : NULLPTR
+        """
+        p[0] = c_ast.Constant('nullptr_t', 'nullptr', self._coord(p.lineno(1)))
+
 
 
     def p_generic_assoc_list(self, p):

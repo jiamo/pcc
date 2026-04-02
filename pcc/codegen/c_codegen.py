@@ -472,6 +472,8 @@ def get_ir_type_from_names(names):
             "restrict",
             "inline",
             "_Noreturn",
+            "_Thread_local",
+            "thread_local",
             "signed",
             "extern",
             "static",
@@ -663,7 +665,7 @@ def _is_struct_ir_type(ir_type):
 
 class LLVMCodeGenerator(object):
 
-    def __init__(self, translation_unit_name=None):
+    def __init__(self, translation_unit_name=None, emit_debug=False):
         self.module = ir.Module()
         # Set proper data layout for struct padding/alignment
         import llvmlite.binding as _llvm
@@ -673,6 +675,11 @@ class LLVMCodeGenerator(object):
         _tm = _llvm.Target.from_default_triple().create_target_machine()
         self.module.triple = _triple
         self.module.data_layout = str(_tm.target_data)
+        self.emit_debug = emit_debug
+        self._di_file = None
+        self._di_compile_unit = None
+        self._di_scope = None
+        self._di_basic_types = {}
 
         #
         self.builder = None
@@ -1405,7 +1412,13 @@ class LLVMCodeGenerator(object):
                 gv_type = self._EXTERN_GLOBAL_VARS[name]
                 gv = self._safe_global_var(gv_type, name, external=True)
                 self.define(name, (gv_type, gv))
-        stored = self.env[name]
+        try:
+            stored = self.env[name]
+        except KeyError:
+            # Support implicit function declarations (C89/C99):
+            # if the name is called as a function, auto-declare it as
+            # int name(...) to match traditional C behavior.
+            raise SemanticError(f"use of undeclared identifier '{name}'")
         if not (isinstance(stored, tuple) and len(stored) == 2):
             return stored
         valtype, binding = stored
@@ -1520,7 +1533,98 @@ class LLVMCodeGenerator(object):
             self._current_scope_id = old_scope_id
             self.in_global = True
 
+    def _init_debug_info(self):
+        """Initialize DWARF debug info metadata."""
+        if not self.emit_debug:
+            return
+        filename = self.translation_unit_name or "unknown.c"
+        import os
+        dirname = os.getcwd()
+        self._di_file = self.module.add_debug_info("DIFile", {
+            "filename": filename,
+            "directory": dirname,
+        })
+        self._di_compile_unit = self.module.add_debug_info("DICompileUnit", {
+            "language": ir.DIToken("DW_LANG_C99"),
+            "file": self._di_file,
+            "producer": "pcc 0.0.8",
+            "isOptimized": False,
+            "runtimeVersion": 0,
+            "emissionKind": ir.DIToken("FullDebug"),
+        }, is_distinct=True)
+        self._di_scope = self._di_file
+        self.module.add_named_metadata("llvm.dbg.cu", [self._di_compile_unit])
+        di_flags = self.module.add_named_metadata("llvm.module.flags")
+        i32 = ir.IntType(32)
+        # Dwarf Version = 4
+        di_flags.add(self.module.add_metadata([
+            ir.Constant(i32, 7), ir.MetaDataString(self.module, "Dwarf Version"), ir.Constant(i32, 4),
+        ]))
+        # Debug Info Version = 3
+        di_flags.add(self.module.add_metadata([
+            ir.Constant(i32, 1), ir.MetaDataString(self.module, "Debug Info Version"), ir.Constant(i32, 3),
+        ]))
+
+    def _di_get_basic_type(self, ir_type):
+        """Get or create a DIBasicType for the given IR type."""
+        key = str(ir_type)
+        if key in self._di_basic_types:
+            return self._di_basic_types[key]
+        if isinstance(ir_type, ir.IntType):
+            name = f"int{ir_type.width}_t"
+            size = ir_type.width
+            encoding = ir.DIToken("DW_ATE_signed")
+        elif isinstance(ir_type, ir.DoubleType):
+            name, size, encoding = "double", 64, ir.DIToken("DW_ATE_float")
+        elif isinstance(ir_type, ir.FloatType):
+            name, size, encoding = "float", 32, ir.DIToken("DW_ATE_float")
+        else:
+            name, size, encoding = "void", 0, ir.DIToken("DW_ATE_signed")
+        dt = self.module.add_debug_info("DIBasicType", {
+            "name": name, "size": size, "encoding": encoding,
+        })
+        self._di_basic_types[key] = dt
+        return dt
+
+    def _di_create_function(self, func, funcname, ret_ir_type, line):
+        """Attach DISubprogram metadata to a function."""
+        if not self.emit_debug or self._di_file is None:
+            return
+        di_ret = self._di_get_basic_type(ret_ir_type)
+        di_sub_type = self.module.add_debug_info("DISubroutineType", {
+            "types": self.module.add_metadata([di_ret]),
+        })
+        di_sp = self.module.add_debug_info("DISubprogram", {
+            "name": funcname,
+            "file": self._di_file,
+            "line": max(line, 1),
+            "type": di_sub_type,
+            "isLocal": func.linkage == "internal",
+            "unit": self._di_compile_unit,
+            "scope": self._di_file,
+        }, is_distinct=True)
+        func.set_metadata("dbg", di_sp)
+        self._di_scope = di_sp
+
+    def _di_set_location(self, inst, node):
+        """Set debug location on an instruction from an AST node's coord."""
+        if not self.emit_debug or self._di_scope is None:
+            return
+        coord = getattr(node, "coord", None)
+        if coord is None:
+            return
+        line = getattr(coord, "line", 0) or 0
+        col = getattr(coord, "column", 0) or 0
+        di_loc = self.module.add_debug_info("DILocation", {
+            "line": max(line, 1),
+            "column": max(col, 0),
+            "scope": self._di_scope,
+        })
+        if hasattr(inst, "set_metadata"):
+            inst.set_metadata("dbg", di_loc)
+
     def generate_code(self, node):
+        self._init_debug_info()
         normal = self.codegen(node)
 
         # for else end have no instruction
@@ -1810,12 +1914,39 @@ class LLVMCodeGenerator(object):
             array = ir.ArrayType(ir.IntType(8), len(data))
             tmp = ir.values.Constant(array, data)
             return tmp, None
+        elif node.type == "nullptr_t":
+            return ir.Constant(ir.PointerType(ir.IntType(8)), None), None
         else:
             ir_type = self._float_literal_ir_type(node.value)
             return (
                 ir.values.Constant(ir_type, self._parse_float_constant(node.value)),
                 None,
             )
+
+    def codegen_StaticAssert(self, node):
+        # Evaluate the condition as a compile-time constant
+        try:
+            cond_val, _ = self.codegen(node.cond)
+            if isinstance(cond_val, ir.Constant):
+                val = cond_val.constant
+                if isinstance(val, int) and val == 0:
+                    msg = node.message
+                    if hasattr(msg, 'value'):
+                        msg = msg.value.strip('"')
+                    msg = msg or "static assertion failed"
+                    raise SemanticError(
+                        f"_Static_assert failed: {msg}"
+                    )
+        except SemanticError:
+            raise
+        except Exception:
+            pass
+        return None, None
+
+    def codegen_Alignas(self, node):
+        # Alignment specifier is handled at declaration level; as a standalone
+        # expression it's a no-op in codegen.
+        return None, None
 
     def codegen_Assignment(self, node):
 
@@ -2327,7 +2458,7 @@ class LLVMCodeGenerator(object):
         return gv
 
     def _const_pointer_to_first_elem(self, gv, target_type):
-        idx0 = ir.Constant(ir.IntType(32), 0)
+        idx0 = ir.Constant(int64_t, 0)
         ptr = gv.gep([idx0, idx0])
         return ptr if ptr.type == target_type else ptr.bitcast(target_type)
 
@@ -2849,8 +2980,8 @@ class LLVMCodeGenerator(object):
                 idx_val = int(self._eval_const_expr(init_node.subscript))
             except Exception:
                 return None
-            idx0 = ir.Constant(ir.IntType(32), 0)
-            idx = ir.Constant(ir.IntType(32), idx_val)
+            idx0 = ir.Constant(int64_t, 0)
+            idx = ir.Constant(int64_t, idx_val)
             pointee = base_addr.type.pointee
             try:
                 if isinstance(pointee, ir.ArrayType):
@@ -2878,8 +3009,8 @@ class LLVMCodeGenerator(object):
                 return None
             if init_node.op == "-":
                 idx_val = -idx_val
-            idx0 = ir.Constant(ir.IntType(32), 0)
-            idx = ir.Constant(ir.IntType(32), idx_val)
+            idx0 = ir.Constant(int64_t, 0)
+            idx = ir.Constant(int64_t, idx_val)
             pointee = base_addr.type.pointee
             try:
                 if isinstance(pointee, ir.ArrayType):
@@ -2898,7 +3029,7 @@ class LLVMCodeGenerator(object):
                 init_node.type == "->"
                 and isinstance(base_addr.type.pointee, ir.ArrayType)
             ):
-                idx0 = ir.Constant(ir.IntType(32), 0)
+                idx0 = ir.Constant(int64_t, 0)
                 try:
                     base_addr = base_addr.gep([idx0, idx0])
                 except Exception:
@@ -2917,7 +3048,7 @@ class LLVMCodeGenerator(object):
                 and not getattr(aggregate_type, "has_custom_layout", False)
                 and not getattr(aggregate_type, "is_union", False)
             ):
-                idx0 = ir.Constant(ir.IntType(32), 0)
+                idx0 = ir.Constant(int64_t, 0)
                 field_index = aggregate_type.members.index(init_node.field.name)
                 try:
                     return base_addr.gep(
@@ -2928,7 +3059,7 @@ class LLVMCodeGenerator(object):
 
             try:
                 byte_base = base_addr.bitcast(ir.PointerType(int8_t))
-                byte_addr = byte_base.gep([ir.Constant(ir.IntType(32), offset)])
+                byte_addr = byte_base.gep([ir.Constant(int64_t, offset)])
                 return byte_addr.bitcast(ir.PointerType(field_type))
             except Exception:
                 return None
@@ -3390,7 +3521,7 @@ class LLVMCodeGenerator(object):
     def _init_array(self, base_addr, init_list, elem_ir_type, prefix_idx):
         """Recursively initialize array elements from an InitList."""
         for i, expr in enumerate(init_list.exprs):
-            idx = prefix_idx + [ir.Constant(ir.IntType(32), i)]
+            idx = prefix_idx + [ir.Constant(int64_t, i)]
             if isinstance(expr, c_ast.InitList) and isinstance(elem_ir_type, ir.ArrayType):
                 self._init_array(base_addr, expr, elem_ir_type.element, idx)
                 continue
@@ -3407,11 +3538,11 @@ class LLVMCodeGenerator(object):
         if isinstance(target_type, ir.ArrayType):
             if self._is_array_string_initializer(init_node, target_type):
                 data = self._string_literal_data(init_node)
-                idx0 = ir.Constant(ir.IntType(32), 0)
+                idx0 = ir.Constant(int64_t, 0)
                 for i, value in enumerate(data[: target_type.count]):
                     elem_ptr = self.builder.gep(
                         dest_ptr,
-                        [idx0, ir.Constant(ir.IntType(32), i)],
+                        [idx0, ir.Constant(int64_t, i)],
                         inbounds=True,
                     )
                     self.builder.store(ir.Constant(target_type.element, value), elem_ptr)
@@ -3423,7 +3554,7 @@ class LLVMCodeGenerator(object):
                     dest_ptr,
                     c_ast.InitList(ordered_exprs, init_node.coord),
                     target_type.element,
-                    [ir.Constant(ir.IntType(32), 0)],
+                    [ir.Constant(int64_t, 0)],
                 )
                 return
 
@@ -3518,7 +3649,7 @@ class LLVMCodeGenerator(object):
             expr = exprs[i]
             field_addr = self.builder.gep(
                 base_addr,
-                [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), i)],
+                [ir.Constant(int64_t, 0), ir.Constant(ir.IntType(32), i)],
                 inbounds=True,
             )
             semantic_field_type = self._refine_member_ir_type(ir_type, i, field_type)
@@ -3810,7 +3941,7 @@ class LLVMCodeGenerator(object):
         elif not isinstance(getattr(value, "type", None), ir.PointerType):
             base = self._alloca_in_entry(value.type, f"{name}.tmp")
             self._safe_store(value, base)
-        idx0 = ir.Constant(ir.IntType(32), 0)
+        idx0 = ir.Constant(int64_t, 0)
         return self.builder.gep(base, [idx0, idx0], name=name)
 
     def _decay_array_expr_to_pointer(self, expr_node, value, name="arrayexprdecay"):
@@ -3823,7 +3954,7 @@ class LLVMCodeGenerator(object):
                 isinstance(getattr(value, "type", None), ir.PointerType)
                 and value.type.pointee == semantic_type
             ):
-                idx0 = ir.Constant(ir.IntType(32), 0)
+                idx0 = ir.Constant(int64_t, 0)
                 return self.builder.gep(value, [idx0, idx0], name=name)
         return self._decay_array_value_to_pointer(value, name)
 
@@ -4353,7 +4484,7 @@ class LLVMCodeGenerator(object):
         if byte_offset:
             byte_ptr = self.builder.gep(
                 byte_ptr,
-                [ir.Constant(ir.IntType(32), byte_offset)],
+                [ir.Constant(int64_t, byte_offset)],
                 name=f"{name}.offs",
             )
         if byte_ptr.type != target_ptr_type:
@@ -6060,7 +6191,7 @@ class LLVMCodeGenerator(object):
 
         try:
             _, callee_func = self.lookup(callee)
-        except KeyError:
+        except (KeyError, SemanticError):
             _, callee_func = self._declare_implicit_function(
                 callee,
                 call_arg_count=len(node.args.exprs) if node.args else 0,
@@ -7364,11 +7495,11 @@ class LLVMCodeGenerator(object):
                 elif self._is_array_string_initializer(node.init, var_ir_type):
                     self._safe_store(self._zero_initializer(var_ir_type), var_addr)
                     data = self._string_literal_data(node.init)
-                    idx0 = ir.Constant(ir.IntType(32), 0)
+                    idx0 = ir.Constant(int64_t, 0)
                     for i, value in enumerate(data[: var_ir_type.count]):
                         elem_ptr = self.builder.gep(
                             var_addr,
-                            [idx0, ir.Constant(ir.IntType(32), i)],
+                            [idx0, ir.Constant(int64_t, i)],
                             inbounds=True,
                         )
                         self.builder.store(ir.Constant(elem_ir_type, value), elem_ptr)
@@ -7557,7 +7688,7 @@ class LLVMCodeGenerator(object):
         if isinstance(valtype, ir.ArrayType):
             ptr = self.builder.gep(
                 var,
-                [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)],
+                [ir.Constant(int64_t, 0), ir.Constant(int64_t, 0)],
                 name="arraydecay",
             )
             if self._is_unsigned_pointee_binding(var):
@@ -7654,13 +7785,16 @@ class LLVMCodeGenerator(object):
 
         # GEP requires a pointer base; if name_ptr is a pointer to array, use GEP
         if isinstance(name_ptr.type, ir.PointerType):
-            zero = ir.Constant(ir.IntType(32), 0)
-            idx = (
-                self.builder.trunc(subscript_ir, ir.IntType(32))
-                if isinstance(subscript_ir.type, ir.IntType)
-                and subscript_ir.type.width > 32
-                else subscript_ir
-            )
+            zero = ir.Constant(int64_t, 0)
+            if isinstance(subscript_ir.type, ir.IntType):
+                if subscript_ir.type.width < 64:
+                    idx = self.builder.sext(subscript_ir, int64_t)
+                elif subscript_ir.type.width > 64:
+                    idx = self.builder.trunc(subscript_ir, int64_t)
+                else:
+                    idx = subscript_ir
+            else:
+                idx = subscript_ir
             elem_ptr = self.builder.gep(name_ptr, [zero, idx], name="arridx")
 
             # If element is sub-array, return pointer (array decay)
@@ -7912,6 +8046,11 @@ class LLVMCodeGenerator(object):
                     raise SemanticError(f"failed to define function '{funcname}'")
             if self._func_decl_returns_unsigned(node.decl.type):
                 self._mark_unsigned_return(self.function)
+            # Add stack protector attribute for security hardening
+            self.function.attributes.add("sspstrong")
+            # Attach DWARF debug info
+            func_line = getattr(getattr(node, "coord", None), "line", 1) or 1
+            self._di_create_function(self.function, funcname, ir_type, func_line)
             self.block = self.function.append_basic_block()
             self.builder = ir.IRBuilder(self.block)
             if len(self.env.maps) > 1:
@@ -8078,7 +8217,7 @@ class LLVMCodeGenerator(object):
         if isinstance(semantic_field_type, ir.ArrayType):
             elem_ptr = self.builder.gep(
                 typed_field_addr,
-                [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)],
+                [ir.Constant(int64_t, 0), ir.Constant(int64_t, 0)],
                 name="arraydecay",
             )
             if decl_type is not None:
@@ -8190,7 +8329,7 @@ class LLVMCodeGenerator(object):
 
         field_addr = self.builder.gep(
             aggregate_addr,
-            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_index)],
+            [ir.Constant(int64_t, 0), ir.Constant(ir.IntType(32), field_index)],
             inbounds=True,
         )
 
@@ -8327,7 +8466,7 @@ class LLVMCodeGenerator(object):
 
         field_addr = self.builder.gep(
             aggregate_addr,
-            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_index)],
+            [ir.Constant(int64_t, 0), ir.Constant(ir.IntType(32), field_index)],
             inbounds=True,
         )
         field_type = self._aggregate_member_ir_type(aggregate_type, field_index)
@@ -8399,7 +8538,7 @@ class LLVMCodeGenerator(object):
                 if isinstance(struct_instance_addr.type.pointee, ir.ArrayType):
                     ptr_val = self.builder.gep(
                         struct_instance_addr,
-                        [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)],
+                        [ir.Constant(int64_t, 0), ir.Constant(int64_t, 0)],
                         name="structrefarraydecay",
                     )
                 else:
@@ -8681,14 +8820,29 @@ class LLVMCodeGenerator(object):
             l = self._eval_const_expr(node.left)
             r = self._eval_const_expr(node.right)
             use_float = is_float_value(l) or is_float_value(r)
+
+            def c_shift_left(a, b):
+                # C semantics: truncate to 64-bit before shifting
+                return cast_int_value(int(a) << int(b), 64, False)
+
+            def c_shift_right(a, b):
+                # Arithmetic right shift on 64-bit signed value
+                a = cast_int_value(int(a), 64, False)
+                return a >> int(b)
+
+            def c_arith(a, b, op):
+                if use_float:
+                    return op(a, b)
+                return cast_int_value(op(int(a), int(b)), 64, False)
+
             ops = {
-                "+": lambda a, b: a + b,
-                "-": lambda a, b: a - b,
-                "*": lambda a, b: a * b,
+                "+": lambda a, b: c_arith(a, b, lambda x, y: x + y),
+                "-": lambda a, b: c_arith(a, b, lambda x, y: x - y),
+                "*": lambda a, b: c_arith(a, b, lambda x, y: x * y),
                 "/": lambda a, b: c_float_div(a, b) if use_float else c_int_div(a, b),
                 "%": lambda a, b: a % b if use_float else c_int_mod(a, b),
-                "<<": lambda a, b: a << b,
-                ">>": lambda a, b: a >> b,
+                "<<": lambda a, b: c_shift_left(a, b) if not use_float else 0,
+                ">>": lambda a, b: c_shift_right(a, b) if not use_float else 0,
                 "&": lambda a, b: a & b,
                 "|": lambda a, b: a | b,
                 "^": lambda a, b: a ^ b,
