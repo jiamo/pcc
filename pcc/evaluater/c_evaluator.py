@@ -133,6 +133,85 @@ def _compile_cache_path(cache_dir, cache_key):
     return os.path.join(cache_dir, cache_key[:2], f"{cache_key[2:]}.json")
 
 
+def _native_cache_path(cache_dir, cache_key):
+    ext = ".dylib" if sys.platform == "darwin" else ".so"
+    return os.path.join(cache_dir, cache_key[:2], f"{cache_key[2:]}{ext}")
+
+
+def _build_native_cache(cache_dir, cache_key, ir_text, target, opt_level):
+    """Compile IR to a shared library and cache it on disk."""
+    so_path = _native_cache_path(cache_dir, cache_key)
+    if os.path.isfile(so_path):
+        return so_path
+    parent = os.path.dirname(so_path)
+    os.makedirs(parent, exist_ok=True)
+
+    try:
+        target_machine = target.create_target_machine()
+        llvmmod = llvm.parse_assembly(ir_text)
+        if opt_level > 0:
+            pto = llvm.create_pipeline_tuning_options(
+                speed_level=opt_level, size_level=0
+            )
+            pb = llvm.create_pass_builder(target_machine, pto)
+            pm = pb.getModulePassManager()
+            pm.run(llvmmod, pb)
+        obj_bytes = target_machine.emit_object(llvmmod)
+    except Exception:
+        return None
+
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        return None
+
+    tmp_obj = None
+    tmp_so = None
+    try:
+        fd, tmp_obj = tempfile.mkstemp(prefix=".tmp-", suffix=".o", dir=parent)
+        with os.fdopen(fd, "wb") as f:
+            f.write(obj_bytes)
+        fd2, tmp_so = tempfile.mkstemp(prefix=".tmp-", suffix=".so", dir=parent)
+        os.close(fd2)
+        flag = "-dynamiclib" if sys.platform == "darwin" else "-shared"
+        r = subprocess.run(
+            [cc, flag, "-o", tmp_so, tmp_obj],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+        os.replace(tmp_so, so_path)
+        tmp_so = None
+        return so_path
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        for p in (tmp_obj, tmp_so):
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def _load_native_cache(cache_dir, cache_key, entry, return_type, arg_types=None):
+    """Load a cached shared library and return the function pointer."""
+    so_path = _native_cache_path(cache_dir, cache_key)
+    if not os.path.isfile(so_path):
+        return None
+    try:
+        import ctypes
+        lib = ctypes.CDLL(so_path)
+        func = getattr(lib, entry, None)
+        if func is None:
+            return None
+        func.restype = return_type
+        if arg_types:
+            func.argtypes = arg_types
+        return func
+    except (OSError, AttributeError):
+        return None
+
+
 def _load_compiled_artifact(cache_dir, cache_key):
     path = _compile_cache_path(cache_dir, cache_key)
     try:
@@ -476,9 +555,9 @@ def _preprocess_translation_unit_source(
     return _normalize_preprocessed_source(codestr)
 
 
-def _compile_preprocessed_translation_unit_artifact(unit_name, codestr):
+def _compile_preprocessed_translation_unit_artifact(unit_name, codestr, emit_debug=False):
     ast = CParser().parse(codestr)
-    codegen = LLVMCodeGenerator(translation_unit_name=unit_name)
+    codegen = LLVMCodeGenerator(translation_unit_name=unit_name, emit_debug=emit_debug)
     codegen.generate_code(ast)
     return {
         "unit_name": unit_name,
@@ -612,17 +691,23 @@ def _run_linked_mcjit_worker(
 
 class CEvaluator(object):
 
-    def __init__(self):
+    def __init__(self, target_triple=None):
 
-        llvm.initialize_native_target()
-        llvm.initialize_native_asmprinter()
+        llvm.initialize_all_targets()
+        llvm.initialize_all_asmprinters()
 
         self.codegen = LLVMCodeGenerator()
         self.parser = CParser()
-        self.target = llvm.Target.from_default_triple()
+        self.target_triple = target_triple or llvm.get_default_triple()
+        self.target = llvm.Target.from_triple(self.target_triple)
+        self.is_cross = target_triple is not None and target_triple != llvm.get_default_triple()
         self.ee = None
         self._bound_modules = []
         self._bound_target_machine = None
+        # In-memory JIT cache: maps (ir_text_hash, entry, opt_level) →
+        # (execution_engine, target_machine, module, func_addr, return_type, fptr)
+        # Keeps the engine alive so the function pointer stays valid.
+        self._jit_cache = {}
 
     def _detach_execution_engine(self):
         leaked = []
@@ -668,6 +753,43 @@ class CEvaluator(object):
             )
         if not codestr.strip():
             raise ValueError("evaluate() received empty source code")
+
+        opt_level = self._normalize_opt_level(optimize)
+
+        # Fast path 1: in-memory JIT cache keyed on source text + entry + opt.
+        # Avoids ALL work — preprocessing, parsing, codegen, LLVM, and JIT.
+        if not llvmdump and not prog_args:
+            src_hash = hashlib.sha256(codestr.encode("utf-8")).hexdigest()
+            jit_key = (src_hash, entry, opt_level)
+            cached = self._jit_cache.get(jit_key)
+            if cached is not None:
+                _ee, _tm, _mod, _fptr, _return_type = cached
+                if args is None:
+                    args = []
+                return _fptr(*args)
+
+            # Fast path 2: native .so disk cache keyed on source text.
+            # Avoids preprocessing, parsing, codegen, LLVM — only ctypes.CDLL.
+            if (
+                not self.is_cross
+                and _compile_cache_enabled(use_compile_cache)
+            ):
+                normalized_cache_dir = _normalize_compile_cache_dir(cache_dir)
+                native_key = hashlib.sha256(
+                    f"{_COMPILE_CACHE_VERSION}\0{_COMPILER_CACHE_FINGERPRINT}\0"
+                    f"{entry}\0O{opt_level}\0{codestr}".encode("utf-8")
+                ).hexdigest()
+                native_func = _load_native_cache(
+                    normalized_cache_dir, native_key, entry, c_int32,
+                )
+                if native_func is not None:
+                    self._jit_cache[jit_key] = (
+                        None, None, None, native_func, c_int32,
+                    )
+                    if args is None:
+                        args = []
+                    return native_func(*args)
+
         if use_system_cpp is None:
             use_system_cpp = self._has_system_cpp()
         snippet_base_dir = os.path.abspath(base_dir) if base_dir else os.getcwd()
@@ -687,15 +809,34 @@ class CEvaluator(object):
         )
         ir_text = artifact["ir_text"]
 
+        # Build native shared-library disk cache for future fast cold starts.
+        if (
+            not llvmdump
+            and not prog_args
+            and not self.is_cross
+            and _compile_cache_enabled(use_compile_cache)
+        ):
+            normalized_cache_dir = _normalize_compile_cache_dir(cache_dir)
+            native_key = hashlib.sha256(
+                f"{_COMPILE_CACHE_VERSION}\0{_COMPILER_CACHE_FINGERPRINT}\0"
+                f"{entry}\0O{opt_level}\0{codestr}".encode("utf-8")
+            ).hexdigest()
+            _build_native_cache(
+                normalized_cache_dir, native_key, ir_text,
+                self.target, opt_level,
+            )
+
         if llvmdump:
             with open("temp.ir", "w") as f:
                 f.write(ir_text)
 
         llvmmod = llvm.parse_assembly(ir_text)
 
-        if optimize:
+        if opt_level > 0:
             target_machine = self.target.create_target_machine()
-            pto = llvm.create_pipeline_tuning_options(speed_level=2, size_level=0)
+            pto = llvm.create_pipeline_tuning_options(
+                speed_level=opt_level, size_level=0
+            )
             pb = llvm.create_pass_builder(target_machine, pto)
             pm = pb.getModulePassManager()
             pm.run(llvmmod, pb)
@@ -732,6 +873,15 @@ class CEvaluator(object):
             fptr = CFUNCTYPE(return_type)(main_addr)
             if args is None:
                 args = []
+            # Cache the JIT state for future calls
+            if not llvmdump:
+                src_hash = hashlib.sha256(codestr.encode("utf-8")).hexdigest()
+                jit_key = (src_hash, entry, opt_level)
+                self._jit_cache[jit_key] = (
+                    self.ee, target_machine, llvmmod, fptr, return_type,
+                )
+                # Prevent _detach_execution_engine from freeing cached engines
+                self.ee = None
             result = fptr(*args)
 
         return result
@@ -776,6 +926,16 @@ class CEvaluator(object):
                 )
             )
 
+    @staticmethod
+    def _normalize_opt_level(optimize):
+        """Convert optimize parameter to integer opt level (0-3).
+
+        Accepts bool (True→2, False→0) or int (0-3) for backward compat.
+        """
+        if isinstance(optimize, bool):
+            return 2 if optimize else 0
+        return max(0, min(3, int(optimize)))
+
     def _prepare_llvm_module(
         self, unit_name, ir_text, target_machine, optimize=True, llvmdump=False
     ):
@@ -786,8 +946,11 @@ class CEvaluator(object):
 
         llvmmod = llvm.parse_assembly(ir_text)
 
-        if optimize:
-            pto = llvm.create_pipeline_tuning_options(speed_level=2, size_level=0)
+        opt_level = self._normalize_opt_level(optimize)
+        if opt_level > 0:
+            pto = llvm.create_pipeline_tuning_options(
+                speed_level=opt_level, size_level=0
+            )
             pb = llvm.create_pass_builder(target_machine, pto)
             pm = pb.getModulePassManager()
             pm.run(llvmmod, pb)
@@ -1083,6 +1246,44 @@ class CEvaluator(object):
             cwd=base_dir or os.getcwd(),
         )
 
+    def emit_compiled_units(
+        self,
+        compiled_units,
+        emit_obj=None,
+        emit_asm=None,
+        emit_llvm=None,
+        optimize=True,
+    ):
+        """Emit compiled translation units to file(s) instead of running."""
+        target_machine = self.target.create_target_machine()
+
+        combined = None
+        for unit_name, ir_text, _unit_return_type, _external_defs in compiled_units:
+            llvmmod = self._prepare_llvm_module(
+                unit_name, ir_text, target_machine, optimize=optimize,
+            )
+            if combined is None:
+                combined = llvmmod
+            else:
+                combined.link_in(llvmmod)
+
+        if combined is None:
+            raise ValueError("No translation units to emit")
+
+        if emit_llvm:
+            with open(emit_llvm, "w") as f:
+                f.write(str(combined))
+
+        if emit_asm:
+            asm_text = target_machine.emit_assembly(combined)
+            with open(emit_asm, "w") as f:
+                f.write(asm_text)
+
+        if emit_obj:
+            obj_bytes = target_machine.emit_object(combined)
+            with open(emit_obj, "wb") as f:
+                f.write(obj_bytes)
+
     def run_translation_units_with_system_cc(
         self,
         units,
@@ -1330,10 +1531,14 @@ class CEvaluator(object):
                 "-D__builtin_huge_val()=(1e309)",
                 "-D__builtin_huge_valf()=(1e39f)",
                 "-D__builtin_huge_vall()=((long double)1e309)",
-                "-D_Alignas(x)=",
-                "-Dalignas(x)=",
-                "-D_Static_assert(x,y)=",
-                "-Dstatic_assert(x,y)=",
+                "-D_Alignas(x)=_Alignas(x)",
+                "-Dalignas(x)=_Alignas(x)",
+                # Strip _Static_assert in system-cpp mode because host headers
+                # may embed __builtin_types_compatible_p or other unparseable
+                # builtins inside static assertions. User code _Static_assert
+                # still works via the built-in preprocessor path.
+                "-D_Static_assert(x,...)=",
+                "-Dstatic_assert(x,...)=",
             ]
             # Host headers on macOS emit __builtin_va_arg(ap, type), while
             # pcc already supports the fake-libc-expanded shape that casts a

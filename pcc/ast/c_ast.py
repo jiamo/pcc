@@ -879,3 +879,30 @@ class While(Node):
         return tuple(nodelist)
 
     attr_names = ()
+
+class StaticAssert(Node):
+    __slots__ = ('cond', 'message', 'coord', '__weakref__')
+    def __init__(self, cond, message=None, coord=None):
+        self.cond = cond
+        self.message = message
+        self.coord = coord
+
+    def children(self):
+        nodelist = []
+        if self.cond is not None: nodelist.append(("cond", self.cond))
+        return tuple(nodelist)
+
+    attr_names = ('message', )
+
+class Alignas(Node):
+    __slots__ = ('alignment', 'coord', '__weakref__')
+    def __init__(self, alignment, coord=None):
+        self.alignment = alignment
+        self.coord = coord
+
+    def children(self):
+        nodelist = []
+        if self.alignment is not None: nodelist.append(("alignment", self.alignment))
+        return tuple(nodelist)
+
+    attr_names = ()

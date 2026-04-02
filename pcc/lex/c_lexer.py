@@ -100,10 +100,12 @@ class CLexer(object):
     ## Reserved keywords
     ##
     keywords = (
-        '_ALIGNOF', '_BOOL', '_COMPLEX', '_FLOAT16', '_GENERIC', '_NORETURN', 'AUTO', 'BREAK', 'CASE', 'CHAR', 'CONST',
+        '_ALIGNAS', '_ALIGNOF', '_BOOL', '_COMPLEX', '_FLOAT16', '_GENERIC',
+        '_NORETURN', '_STATIC_ASSERT', '_THREAD_LOCAL',
+        'AUTO', 'BREAK', 'CASE', 'CHAR', 'CONST',
         'CONTINUE', 'DEFAULT', 'DO', 'DOUBLE', 'ELSE', 'ENUM', 'EXTERN',
         'FLOAT', 'FOR', 'GOTO', 'IF', 'INLINE', 'INT', 'INT128', 'LONG',
-        'REGISTER', 'OFFSETOF',
+        'NULLPTR', 'REGISTER', 'OFFSETOF',
         'RESTRICT', 'RETURN', 'SHORT', 'SIGNED', 'SIZEOF', 'STATIC', 'STRUCT',
         'SWITCH', 'TYPEDEF', 'UNION', 'UNSIGNED', 'VOID',
         'VOLATILE', 'WHILE',
@@ -113,6 +115,8 @@ class CLexer(object):
     for keyword in keywords:
         if keyword == '_BOOL':
             keyword_map['_Bool'] = keyword
+        elif keyword == '_ALIGNAS':
+            keyword_map['_Alignas'] = keyword
         elif keyword == '_ALIGNOF':
             keyword_map['_Alignof'] = keyword
         elif keyword == '_COMPLEX':
@@ -123,9 +127,21 @@ class CLexer(object):
             keyword_map['_Generic'] = keyword
         elif keyword == '_NORETURN':
             keyword_map['_Noreturn'] = keyword
+        elif keyword == '_STATIC_ASSERT':
+            keyword_map['_Static_assert'] = keyword
+        elif keyword == '_THREAD_LOCAL':
+            keyword_map['_Thread_local'] = keyword
+        elif keyword == 'NULLPTR':
+            keyword_map['nullptr'] = keyword
         else:
             keyword_map[keyword.lower()] = keyword
 
+    # C23 convenience aliases (bool/true/false remain identifiers for C11
+    # compat with typedef _Bool bool; in stdbool.h — handled by preprocessor)
+    keyword_map['alignas'] = '_ALIGNAS'
+    keyword_map['alignof'] = '_ALIGNOF'
+    keyword_map['static_assert'] = '_STATIC_ASSERT'
+    keyword_map['thread_local'] = '_THREAD_LOCAL'
     keyword_map['typeof'] = 'TYPEOF'
     keyword_map['__typeof'] = 'TYPEOF'
     keyword_map['__typeof__'] = 'TYPEOF'
@@ -143,6 +159,7 @@ class CLexer(object):
     keyword_map['__alignof'] = '_ALIGNOF'
     keyword_map['__alignof__'] = '_ALIGNOF'
     keyword_map['__builtin_va_arg'] = 'BUILTIN_VA_ARG'
+    keyword_map['__thread'] = '_THREAD_LOCAL'
     keyword_map.pop('int128', None)
 
     ##

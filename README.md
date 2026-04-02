@@ -4,7 +4,7 @@ Pcc
 What is this?
 --------------------
 Pcc is a C compiler written in Python, built on cpp + ply + pycparser + llvmlite + llvm.
-Run C programs like Python scripts: `pcc test.c`. Powerful enough to compile and run real-world C projects including Lua 5.5.0, SQLite, PostgreSQL (libpq), pcre, zlib, lz4, zstd, openssl, and readline — with 2000+ tests passing.
+Run C programs like Python scripts: `pcc test.c`. Powerful enough to compile and run real-world C projects including Lua 5.5.0, SQLite, PostgreSQL (libpq), nginx, pcre, zlib, lz4, zstd, openssl, and readline — with 4900+ tests passing (including 220 c-testsuite, 161 clang C, and 1684 GCC torture conformance cases).
 
 Inspired by: https://github.com/eliben/pykaleidoscope.
 
@@ -56,7 +56,7 @@ Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync          # install dependencies
-uv run pytest    # run all 2000+ tests
+uv run pytest    # run all 4900+ tests
 ```
 
 Compile Cache
@@ -376,6 +376,87 @@ The PostgreSQL test file covers:
 - `pcc`-compiled `libpq` linked with PostgreSQL's own support archives from the same tree
 - a real query roundtrip against a temporary native PostgreSQL server
 
+Compiling nginx 1.28.3
+--------------------
+
+`pcc` can compile all ~130 nginx source files through its full pipeline
+(preprocess → parse → codegen → LLVM IR → verify), and produce a working
+nginx binary via `--system-link`.
+
+nginx uses system pcre2 and zlib (via `pkg-config`), so no repo-local
+library setup is needed.
+
+```bash
+# Configure nginx (only needed once)
+cd projects/nginx-1.28.3 && ./configure --with-cc-opt=-Wno-error && cd ../..
+
+# Run all nginx tests (per-file compilation + system-link binary)
+uv run pytest tests/test_nginx.py -v
+```
+
+Tests in `tests/test_nginx.py`:
+
+| Test | What it does |
+|------|-------------|
+| `test_nginx_make_goal_collects_source_files` | Verifies make-goal discovery finds nginx sources without pcre/zlib contamination |
+| `test_nginx_source_compile[<file>]` | Each `.c` file through pcc: preprocess → parse → codegen → IR serialize → LLVM verify |
+| `test_nginx_native_build` | Builds nginx natively as a baseline |
+| `test_nginx_full_system_link` | Compiles all sources with pcc, links with system cc, verifies the binary runs `nginx -V` |
+
+c-testsuite
+--------------------
+
+The project includes 220 test cases from [c-testsuite](https://github.com/c-testsuite/c-testsuite),
+a standard C conformance test suite. Each case is run through both the native
+compiler and `pcc`, comparing return codes and stdout/stderr.
+
+```bash
+uv run pytest tests/test_c_testsuite.py -v
+```
+
+A manifest at `tests/c_testsuite_manifest.json` categorizes every case into:
+- `runtime_exact_match` — pcc output matches native exactly
+- `runtime_returncode_match_only` — return code matches, output may differ
+- `runtime_native_pass_pcc_fail` — known pcc failures tracked as expected
+- `runtime_timeout` — cases that hang or take too long
+
+Clang C Tests
+--------------------
+
+161 test cases derived from Clang's C test suite, covering compile-only
+checks and runtime correctness. Each case is compared between the native
+compiler and `pcc`.
+
+```bash
+uv run pytest tests/test_clang_c.py -v
+```
+
+A manifest at `tests/clang_c_manifest.json` categorizes cases into:
+- `compile_only_success` — both native and pcc compile successfully
+- `compile_only_both_fail` / `compile_only_native_pass_pcc_fail` / `compile_only_native_fail_pcc_pass` — compile-only edge cases
+- `runtime_exact_match` — pcc runtime output matches native exactly
+- `runtime_returncode_match_only` — return code matches, output may differ
+- `runtime_both_fail` — both native and pcc fail at runtime
+
+GCC Torture Execute
+--------------------
+
+1684 test cases from GCC's `torture/execute` suite — a comprehensive
+stress test of C compiler correctness. Each case runs through both the
+native compiler and `pcc`, comparing return codes and output.
+
+```bash
+uv run pytest tests/test_gcc_torture_execute.py -v
+```
+
+A manifest at `tests/gcc_torture_manifest.json` categorizes cases into:
+- `runtime_exact_match` — pcc output matches native exactly
+- `runtime_returncode_match_only` — return code matches, output may differ
+- `runtime_both_fail` — both native and pcc fail
+- `runtime_native_pass_pcc_fail` — known pcc failures tracked as expected
+- `runtime_native_fail_pcc_pass` — pcc accepts but native rejects
+- `runtime_timeout` — cases that hang or take too long
+
 Add C test cases
 --------------------
 
@@ -413,4 +494,4 @@ Built-in typedefs: `size_t`, `ssize_t`, `ptrdiff_t`, `va_list`, `FILE`, `time_t`
 Supported C Features
 --------------------
 
-Supports all C99 features needed to compile real-world projects like Lua 5.5.0: all types (int, float, double, char, void, structs, unions, enums, typedefs, pointers, arrays, function pointers), all operators, all control flow (if/else, for, while, do-while, switch, goto), variadic functions, preprocessor directives, and 133 libc functions auto-declared from stdio.h, stdlib.h, string.h, math.h, etc.
+Supports all C99 features needed to compile real-world projects like Lua 5.5.0 and nginx: all types (int, float, double, char, void, structs, unions, enums, typedefs, pointers, arrays, function pointers), all operators, all control flow (if/else, for, while, do-while, switch, goto), variadic functions, preprocessor directives, and 133 libc functions auto-declared from stdio.h, stdlib.h, string.h, math.h, etc.
