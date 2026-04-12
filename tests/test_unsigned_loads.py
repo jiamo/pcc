@@ -163,6 +163,20 @@ def test_unsigned_char_pointer_arithmetic_uses_positive_offset():
     assert _evaluate(source) == 0
 
 
+def test_multidim_unsigned_short_subscript_keeps_unsigned_load():
+    source = r"""
+        #include <stdint.h>
+
+        uint16_t g[1][1] = {{65535U}};
+
+        int main(void) {
+            return g[0][0] == 65535U ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
 def test_unsigned_xor_result_stays_unsigned_for_modulo():
     source = r"""
         typedef unsigned int IdxT;
@@ -215,6 +229,20 @@ def test_unsigned_prefix_decrement_result_stays_unsigned_for_modulo():
             unsigned int x = 0u;
 
             return ((--x % 960) == 255u) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_unsigned_long_long_subtraction_wraps_without_nuw():
+    source = r"""
+        static unsigned long long negl(unsigned long long x) {
+            return 0 - x;
+        }
+
+        int main(void) {
+            return negl(1000ULL) == 0xfffffffffffffc18ULL ? 0 : 1;
         }
     """
 

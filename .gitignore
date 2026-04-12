@@ -146,3 +146,5 @@ projects/zlib-1.3.1/zlib.pc
 projects/zlib-1.3.1/zutil.o
 projects/nginx-1.28.3/Makefile
 projects/nginx-1.28.3/objs/
+.claude/
+.pi

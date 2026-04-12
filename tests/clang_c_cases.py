@@ -14,6 +14,12 @@ from tests.worker_process import run_worker_process
 
 
 RUN_LINE_RE = re.compile(r"^\s*//\s*RUN:\s*(.*)$")
+PCC_STD_COMPAT_MAP = {
+    "c23": "c2x",
+    "gnu23": "gnu2x",
+    "c2y": "c2x",
+    "gnu2y": "gnu2x",
+}
 
 
 @dataclass(frozen=True)
@@ -41,6 +47,7 @@ def case_config(case_path: Path) -> ClangCCaseConfig:
     mode = "runtime"
     native_cflags: list[str] = []
     cpp_args: list[str] = []
+    pcc_run_line = _compiler_run_segment(run_lines[0]) if run_lines else ""
 
     if any(
         token in line
@@ -50,14 +57,24 @@ def case_config(case_path: Path) -> ClangCCaseConfig:
         mode = "compile_only"
 
     for line in run_lines:
-        for token in line.split():
+        for token in _compiler_run_segment(line).split():
             if token.startswith("-std="):
                 native_cflags.append(token)
-                cpp_args.append(token)
             elif token == "-w" or token.startswith("-W"):
                 native_cflags.append(token)
             elif token in {"-fblocks", "-fwritable-strings"}:
                 native_cflags.append(token)
+
+    for token in pcc_run_line.split():
+        if token.startswith("-std="):
+            std_value = token.split("=", 1)[1]
+            if not (
+                std_value.startswith("c++")
+                or std_value.startswith("gnu++")
+            ):
+                cpp_args.append(f"-std={PCC_STD_COMPAT_MAP.get(std_value, std_value)}")
+        elif token.startswith("-D") or token.startswith("-U"):
+            cpp_args.append(token)
 
     return ClangCCaseConfig(
         mode=mode,
@@ -158,6 +175,10 @@ def _run_lines(source: str) -> list[str]:
     if current:
         collected.append(current.strip())
     return collected
+
+
+def _compiler_run_segment(line: str) -> str:
+    return line.split("|", 1)[0].strip()
 
 
 def _read_case_source(case_path: Path) -> str:

@@ -1,10 +1,13 @@
+import json
 import os
 import sqlite3
+import subprocess
 
 import pytest
 
 from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.project import collect_translation_units, translation_unit_include_dirs
+from tests.parallel_jobs import translation_unit_jobs
 
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
@@ -34,6 +37,75 @@ def _sqlite_db_path(tmp_path):
     return tmp_path / "runtime.sqlite3"
 
 
+def _run_sqlite_prepare_probe(tmp_path, sqlite_pcc_object, sql):
+    sql_literal = json.dumps(sql)
+    main_path = tmp_path / "main.c"
+    main_path.write_text(
+        f"""
+#include <stdio.h>
+#include "sqlite-amalgamation-3490100/sqlite3.h"
+
+int main(void) {{
+    sqlite3 *db = 0;
+    sqlite3_stmt *stmt = 0;
+    const char *tail = 0;
+    const char *sql = {sql_literal};
+    int rc = sqlite3_open(":memory:", &db);
+    if (rc != SQLITE_OK) {{
+        fprintf(stderr, "open rc=%d msg=%s\\n", rc, sqlite3_errmsg(db));
+        return 1;
+    }}
+
+    rc = sqlite3_prepare_v2(db, sql, -1, &stmt, &tail);
+    if (rc != SQLITE_OK) {{
+        fprintf(
+            stderr,
+            "prepare rc=%d errcode=%d ext=%d offset=%d tail_off=%ld msg=%s\\n",
+            rc,
+            sqlite3_errcode(db),
+            sqlite3_extended_errcode(db),
+            sqlite3_error_offset(db),
+            tail ? (long)(tail - sql) : -1L,
+            sqlite3_errmsg(db)
+        );
+        fprintf(stderr, "tail=%s\\n", tail ? tail : "<null>");
+        sqlite3_close(db);
+        return 2;
+    }}
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return 0;
+}}
+""".lstrip(),
+        encoding="utf-8",
+    )
+    bin_path = tmp_path / "probe.out"
+    compile_run = subprocess.run(
+        [
+            "cc",
+            "-I",
+            PROJECTS_DIR,
+            str(main_path),
+            str(sqlite_pcc_object),
+            "-o",
+            str(bin_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert (
+        compile_run.returncode == 0
+    ), f"sqlite probe build failed:\n{compile_run.stdout}\n{compile_run.stderr}"
+    return subprocess.run(
+        [str(bin_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 def _assert_sqlite_db_contents(db_path):
     conn = sqlite3.connect(db_path)
     try:
@@ -56,14 +128,70 @@ def sqlite_compiled_units():
     compiled_units = CEvaluator().compile_translation_units(
         units,
         base_dir=base_dir,
-        jobs=2,
+        jobs=translation_unit_jobs(),
         include_dirs=translation_unit_include_dirs(units),
         cpp_args=SQLITE_CPP_ARGS,
     )
     return compiled_units, base_dir
 
 
+@pytest.fixture(scope="module")
+def sqlite_pcc_object(tmp_path_factory):
+    units, base_dir = _sqlite_units()
+    sqlite_units = [unit for unit in units if unit.name == "sqlite3.c"]
+    compiled_units = CEvaluator().compile_translation_units(
+        sqlite_units,
+        base_dir=base_dir,
+        jobs=1,
+        include_dirs=translation_unit_include_dirs(units),
+        cpp_args=SQLITE_CPP_ARGS,
+    )
+    obj_dir = tmp_path_factory.mktemp("sqlite_prepare_obj")
+    obj_path = obj_dir / "sqlite3.o"
+    CEvaluator().emit_compiled_units(
+        compiled_units,
+        emit_obj=str(obj_path),
+        optimize=False,
+    )
+    return obj_path
+
+
 @pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.integration
+def test_sqlite_prepare_select_literal_regression(tmp_path, sqlite_pcc_object):
+    result = _run_sqlite_prepare_probe(tmp_path, sqlite_pcc_object, "select 1;")
+
+    assert (
+        result.returncode == 0
+    ), f"sqlite prepare(select 1) failed:\n{result.stdout}\n{result.stderr}"
+
+
+@pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.integration
+def test_sqlite_prepare_string_literal_regression(tmp_path, sqlite_pcc_object):
+    result = _run_sqlite_prepare_probe(tmp_path, sqlite_pcc_object, "select 'x';")
+
+    assert (
+        result.returncode == 0
+    ), f"sqlite prepare(select 'x') failed:\n{result.stdout}\n{result.stderr}"
+
+
+@pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.integration
+def test_sqlite_prepare_create_table_regression(tmp_path, sqlite_pcc_object):
+    result = _run_sqlite_prepare_probe(
+        tmp_path,
+        sqlite_pcc_object,
+        "create table t(id integer primary key, name text, score integer);",
+    )
+
+    assert (
+        result.returncode == 0
+    ), f"sqlite prepare(create table) failed:\n{result.stdout}\n{result.stderr}"
+
+
+@pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.integration
 def test_sqlite_runtime_with_mcjit_depends_on(tmp_path, sqlite_compiled_units):
     compiled_units, _base_dir = sqlite_compiled_units
     db_path = _sqlite_db_path(tmp_path)
@@ -80,6 +208,7 @@ def test_sqlite_runtime_with_mcjit_depends_on(tmp_path, sqlite_compiled_units):
 
 
 @pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.integration
 def test_sqlite_runtime_with_system_link_depends_on(tmp_path, sqlite_compiled_units):
     compiled_units, base_dir = sqlite_compiled_units
     db_path = _sqlite_db_path(tmp_path)

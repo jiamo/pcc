@@ -17,6 +17,7 @@ from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.parse.c_parser import CParser
 from pcc.codegen.c_codegen import LLVMCodeGenerator, postprocess_ir_text
 from pcc.project import TranslationUnit
+from tests.parallel_jobs import translation_unit_jobs
 
 this_dir = os.path.dirname(__file__)
 project_dir = os.path.dirname(this_dir)
@@ -167,7 +168,7 @@ def pcre_compiled_units():
     compiled_units = CEvaluator().compile_translation_units(
         units,
         base_dir=projects_dir,
-        jobs=2,
+        jobs=translation_unit_jobs(),
         cpp_args=PCRE_CPP_ARGS,
     )
     return compiled_units
@@ -186,6 +187,7 @@ def test_pcre_native_runtime(native_pcre_bin):
 
 
 @pytest.mark.skipif(not os.path.isdir(pcre_dir), reason="pcre-8.45 not found")
+@pytest.mark.integration
 def test_pcre_pcc_runtime_with_system_link(pcre_compiled_units):
     result = CEvaluator().run_compiled_translation_units_with_system_cc(
         pcre_compiled_units,
@@ -202,6 +204,7 @@ def test_pcre_pcc_runtime_with_system_link(pcre_compiled_units):
 
 
 @pytest.mark.skipif(not os.path.isdir(pcre_dir), reason="pcre-8.45 not found")
+@pytest.mark.integration
 def test_pcre_pcc_runtime_with_mcjit(pcre_compiled_units):
     result = CEvaluator().evaluate_compiled_translation_units(
         pcre_compiled_units,

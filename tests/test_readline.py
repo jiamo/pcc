@@ -13,6 +13,7 @@ from pcc.project import (
     collect_translation_units,
     translation_unit_include_dirs,
 )
+from tests.parallel_jobs import translation_unit_jobs
 
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
@@ -109,6 +110,7 @@ def _readline_history_units():
     )
 
 
+@pytest.mark.integration
 def test_readline_runtime_with_mcjit_depends_on():
     units, base_dir = _readline_history_units()
 
@@ -116,7 +118,7 @@ def test_readline_runtime_with_mcjit_depends_on():
         units,
         optimize=True,
         base_dir=base_dir,
-        jobs=2,
+        jobs=translation_unit_jobs(),
         include_dirs=translation_unit_include_dirs(units),
         cpp_args=_readline_history_cpp_args(),
         link_args=READLINE_HISTORY_LINK_ARGS,
@@ -125,6 +127,7 @@ def test_readline_runtime_with_mcjit_depends_on():
     assert result == 0
 
 
+@pytest.mark.integration
 def test_readline_runtime_with_system_link_depends_on():
     units, base_dir = _readline_units()
 
@@ -132,7 +135,7 @@ def test_readline_runtime_with_system_link_depends_on():
         units,
         optimize=True,
         base_dir=base_dir,
-        jobs=2,
+        jobs=translation_unit_jobs(),
         include_dirs=translation_unit_include_dirs(units),
         cpp_args=_readline_cpp_args(),
         timeout=180,

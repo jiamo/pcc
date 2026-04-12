@@ -1,0 +1,60 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Typedef",
+      "name": "Point",
+      "quals": [],
+      "storage": [
+        "typedef"
+      ],
+      "type": {
+        "_t": "TypeDecl",
+        "declname": "Point",
+        "quals": [],
+        "type": {
+          "_t": "Struct",
+          "decls": [
+            {
+              "_t": "Decl",
+              "funcspec": [],
+              "name": "x",
+              "quals": [],
+              "storage": [],
+              "type": {
+                "_t": "TypeDecl",
+                "declname": "x",
+                "quals": [],
+                "type": {
+                  "_t": "IdentifierType",
+                  "names": [
+                    "int"
+                  ]
+                }
+              }
+            },
+            {
+              "_t": "Decl",
+              "funcspec": [],
+              "name": "y",
+              "quals": [],
+              "storage": [],
+              "type": {
+                "_t": "TypeDecl",
+                "declname": "y",
+                "quals": [],
+                "type": {
+                  "_t": "IdentifierType",
+                  "names": [
+                    "int"
+                  ]
+                }
+              }
+            }
+          ],
+          "name": "P"
+        }
+      }
+    }
+  ]
+}

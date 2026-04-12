@@ -111,8 +111,8 @@ t_FLOAT = r'((\d+)(\.\d+)(e(\+|-)?(\d+))? | (\d+)e(\+|-)?(\d+))([lL]|[fF])?'
 # String literal
 t_STRING = r'\"([^\\\n]|(\\.))*?\"'
 
-# Character constant 'c' or L'c'
-t_CHARACTER = r'(L)?\'([^\\\n]|(\\.))*?\''
+# Character constant 'c' or prefixed variants like L'c', u'c', U'c'
+t_CHARACTER = r'([LuU])?\'([^\\\n]|(\\.))*?\''
 
 # Comment (C-Style)
 def t_COMMENT(t):
@@ -128,6 +128,5 @@ def t_CPPCOMMENT(t):
 
 
     
-
 
 

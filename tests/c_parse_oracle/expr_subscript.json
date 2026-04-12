@@ -1,0 +1,81 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "Return",
+            "expr": {
+              "_t": "ArrayRef",
+              "name": {
+                "_t": "ID",
+                "name": "a"
+              },
+              "subscript": {
+                "_t": "Constant",
+                "type": "int",
+                "value": "3"
+              }
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "f",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Decl",
+                "funcspec": [],
+                "name": "a",
+                "quals": [],
+                "storage": [],
+                "type": {
+                  "_t": "ArrayDecl",
+                  "dim": {
+                    "_t": "Constant",
+                    "type": "int",
+                    "value": "10"
+                  },
+                  "dim_quals": [],
+                  "type": {
+                    "_t": "TypeDecl",
+                    "declname": "a",
+                    "quals": [],
+                    "type": {
+                      "_t": "IdentifierType",
+                      "names": [
+                        "int"
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "f",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "Return",
+            "expr": {
+              "_t": "Constant",
+              "type": "int",
+              "value": "42"
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "f",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Typename",
+                "name": null,
+                "quals": [],
+                "type": {
+                  "_t": "TypeDecl",
+                  "declname": null,
+                  "quals": [],
+                  "type": {
+                    "_t": "IdentifierType",
+                    "names": [
+                      "void"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "f",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

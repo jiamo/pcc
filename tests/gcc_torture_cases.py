@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -95,6 +96,23 @@ def compile_pcc(case_path: Path, timeout: int = DEFAULT_TIMEOUT) -> PccCompileRe
 def run_pcc(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT) -> PccCompileResult:
     del repo_root
     return _run_pcc_worker("run", case_path, timeout)
+
+
+def run_native_and_pcc(
+    case_path: Path,
+    repo_root: Path,
+    timeout: int = DEFAULT_TIMEOUT,
+):
+    """Run the native clang build and the pcc build concurrently.
+
+    Both inner functions are subprocess-driven (GIL-free), so a 2-thread
+    pool cuts per-test latency roughly in half. Returns (native, pcc) in
+    the same order the serial callers expect.
+    """
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_native = ex.submit(run_native, case_path, repo_root, timeout)
+        f_pcc = ex.submit(run_pcc, case_path, repo_root, timeout)
+        return f_native.result(), f_pcc.result()
 
 
 def _run_pcc_worker(mode: str, case_path: Path, timeout: int) -> PccCompileResult:

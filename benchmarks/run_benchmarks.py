@@ -1,272 +1,475 @@
 #!/usr/bin/env python3
-"""Benchmark runner: compares pcc vs cc -O0 vs cc -O2.
+"""Benchmark pcc against clang/cc at O1/O2/O3.
 
-Measures compile time and execution time separately.
+Measures compile time and execution time separately using standalone binaries.
 
 Usage:
-    uv run python benchmarks/run_benchmarks.py
+    env -u LC_ALL uv run python benchmarks/run_benchmarks.py
 """
 
+from __future__ import annotations
+
+import argparse
+import math
 import os
+import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
-
-BENCHMARKS_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(BENCHMARKS_DIR)
-
-BENCH_FILES = [
-    "fib35.c",
-    "sieve_large.c",
-    "matmul.c",
-    "nbody.c",
-]
-
-CC = "cc"
-WARMUP_RUNS = 1
-TIMED_RUNS = 3
+from pathlib import Path
 
 
-def find_cc():
-    import shutil
-    for candidate in ("cc", "clang", "gcc"):
-        if shutil.which(candidate):
-            return candidate
+BENCHMARKS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BENCHMARKS_DIR.parent
+DEFAULT_BENCHES = sorted(path.name for path in BENCHMARKS_DIR.glob("*.c"))
+DEFAULT_OPT_LEVELS = (1, 2, 3)
+
+
+def clean_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    return env
+
+
+def find_clang() -> str:
+    for candidate in ("clang", "cc", "gcc"):
+        path = shutil.which(candidate)
+        if path:
+            return path
     raise RuntimeError("No system C compiler found")
 
 
-def run_native(src_path, opt_level, tmpdir):
-    """Compile and run with native cc. Returns (compile_time, exec_time, output)."""
-    bin_path = os.path.join(tmpdir, "a.out")
-    needs_math = False
-    with open(src_path) as f:
-        content = f.read()
-        if "#include <math.h>" in content:
-            needs_math = True
-
-    cc = find_cc()
-    compile_cmd = [cc, f"-O{opt_level}", "-o", bin_path, src_path]
-    if needs_math:
-        compile_cmd.append("-lm")
-
-    # Warmup
-    for _ in range(WARMUP_RUNS):
-        subprocess.run(compile_cmd, capture_output=True, timeout=60)
-        if os.path.exists(bin_path):
-            subprocess.run([bin_path], capture_output=True, timeout=60)
-            os.unlink(bin_path)
-
-    # Timed compile
-    compile_times = []
-    for _ in range(TIMED_RUNS):
-        if os.path.exists(bin_path):
-            os.unlink(bin_path)
-        t0 = time.perf_counter()
-        r = subprocess.run(compile_cmd, capture_output=True, timeout=60)
-        t1 = time.perf_counter()
-        if r.returncode != 0:
-            return None, None, f"compile failed: {r.stderr[:200]}"
-        compile_times.append(t1 - t0)
-
-    # Timed execute
-    exec_times = []
-    output = ""
-    for _ in range(TIMED_RUNS):
-        t0 = time.perf_counter()
-        r = subprocess.run([bin_path], capture_output=True, text=True, timeout=120)
-        t1 = time.perf_counter()
-        exec_times.append(t1 - t0)
-        output = r.stdout.strip()
-
-    avg_compile = sum(compile_times) / len(compile_times)
-    avg_exec = sum(exec_times) / len(exec_times)
-    return avg_compile, avg_exec, output
+def needs_math_lib(src_path: Path) -> bool:
+    return "#include <math.h>" in src_path.read_text()
 
 
-def run_pcc(src_path, tmpdir):
-    """Compile and run with pcc. Returns (compile_time, exec_time, output).
-
-    pcc compile+execute are combined, so we measure total time.
-    We also measure --system-link mode for separate compile/exec timing.
-    """
-    pcc_cmd = [
-        sys.executable, "-m", "pcc",
-        "--no-cache",
-        src_path,
-    ]
-
-    needs_math = False
-    with open(src_path) as f:
-        if "#include <math.h>" in f.read():
-            needs_math = True
-
-    # Warmup
-    for _ in range(WARMUP_RUNS):
-        subprocess.run(pcc_cmd, capture_output=True, timeout=300, cwd=PROJECT_ROOT)
-
-    # Timed total (compile + execute via MCJIT)
-    total_times = []
-    output = ""
-    for _ in range(TIMED_RUNS):
-        t0 = time.perf_counter()
-        r = subprocess.run(
-            pcc_cmd,
-            capture_output=True, text=True, timeout=300,
-            cwd=PROJECT_ROOT,
-        )
-        t1 = time.perf_counter()
-        total_times.append(t1 - t0)
-        output = r.stdout.strip()
-        if r.returncode != 0 and not output:
-            output = f"exit={r.returncode}"
-
-    avg_total = sum(total_times) / len(total_times)
-
-    # System-link mode for separate compile/exec measurement
-    bin_path = os.path.join(tmpdir, "pcc_out")
-    sl_cmd = [
-        sys.executable, "-m", "pcc",
-        "--no-cache",
-        "--system-link",
-        src_path,
-    ]
-    if needs_math:
-        sl_cmd.extend(["--link-arg=-lm"])
-
-    compile_times = []
-    exec_times = []
-    for _ in range(TIMED_RUNS):
-        t0 = time.perf_counter()
-        r = subprocess.run(
-            sl_cmd,
-            capture_output=True, text=True, timeout=300,
-            cwd=PROJECT_ROOT,
-        )
-        t1 = time.perf_counter()
-        compile_times.append(t1 - t0)
-
-    avg_compile = sum(compile_times) / len(compile_times)
-    return avg_total, avg_compile, output
+def timed_run(cmd, *, cwd=None, timeout=300, env=None, text=True):
+    t0 = time.perf_counter()
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=text,
+        timeout=timeout,
+        env=env,
+    )
+    elapsed = time.perf_counter() - t0
+    return elapsed, result
 
 
-def format_time(seconds):
-    if seconds is None:
+def avg(values):
+    return statistics.fmean(values) if values else None
+
+
+def geometric_mean(values):
+    clean = [value for value in values if value and value > 0]
+    if not clean:
+        return None
+    return math.exp(statistics.fmean(math.log(value) for value in clean))
+
+
+def format_seconds(value):
+    if value is None:
         return "N/A"
-    if seconds < 0.001:
-        return f"{seconds*1e6:.0f}us"
-    if seconds < 1.0:
-        return f"{seconds*1000:.1f}ms"
-    return f"{seconds:.3f}s"
+    if value < 0.001:
+        return f"{value * 1e6:.0f}us"
+    if value < 1:
+        return f"{value * 1e3:.1f}ms"
+    return f"{value:.3f}s"
+
+
+def format_ratio(lhs, rhs):
+    if lhs is None or rhs in (None, 0):
+        return "N/A"
+    return f"{lhs / rhs:.2f}x"
+
+
+def format_error(exc: Exception) -> str:
+    if isinstance(exc, subprocess.TimeoutExpired):
+        cmd = exc.cmd[0] if isinstance(exc.cmd, list) and exc.cmd else exc.cmd
+        return f"timeout after {exc.timeout}s: {cmd}"
+    return str(exc)
+
+
+def classify_ratio(value, tie_band=0.05):
+    if value is None:
+        return "error"
+    if value <= 1.0 - tie_band:
+        return "faster"
+    if value >= 1.0 + tie_band:
+        return "slower"
+    return "tied"
+
+
+def build_native(src_path: Path, opt_level: int, workdir: Path, runs: int):
+    cc = find_clang()
+    bin_path = workdir / f"clang_O{opt_level}.out"
+    cmd = [cc, f"-O{opt_level}", "-o", str(bin_path), str(src_path)]
+    if needs_math_lib(src_path):
+        cmd.append("-lm")
+
+    compile_times = []
+    for _ in range(runs):
+        bin_path.unlink(missing_ok=True)
+        elapsed, result = timed_run(cmd, env=clean_env(), timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"native compile failed for {src_path.name} O{opt_level}: "
+                f"{result.stderr or result.stdout}"
+            )
+        compile_times.append(elapsed)
+
+    return bin_path, avg(compile_times)
+
+
+def build_pcc(src_path: Path, opt_level: int, workdir: Path, runs: int):
+    cc = find_clang()
+    obj_path = workdir / f"pcc_O{opt_level}.o"
+    bin_path = workdir / f"pcc_O{opt_level}.out"
+    compile_cmd = [
+        sys.executable,
+        "-m",
+        "pcc",
+        "--no-cache",
+        "-O",
+        str(opt_level),
+        "--emit-obj",
+        str(obj_path),
+        str(src_path),
+    ]
+    link_cmd = [cc, str(obj_path), "-o", str(bin_path)]
+    if needs_math_lib(src_path):
+        link_cmd.append("-lm")
+
+    compile_times = []
+    for _ in range(runs):
+        obj_path.unlink(missing_ok=True)
+        bin_path.unlink(missing_ok=True)
+        compile_elapsed, compile_result = timed_run(
+            compile_cmd,
+            cwd=PROJECT_ROOT,
+            env=clean_env(),
+            timeout=300,
+        )
+        if compile_result.returncode != 0:
+            raise RuntimeError(
+                f"pcc compile failed for {src_path.name} O{opt_level}: "
+                f"{compile_result.stderr or compile_result.stdout}"
+            )
+        link_elapsed, link_result = timed_run(
+            link_cmd,
+            cwd=PROJECT_ROOT,
+            env=clean_env(),
+            timeout=120,
+        )
+        if link_result.returncode != 0:
+            raise RuntimeError(
+                f"link failed for {src_path.name} O{opt_level}: "
+                f"{link_result.stderr or link_result.stdout}"
+            )
+        compile_times.append(compile_elapsed + link_elapsed)
+
+    return bin_path, avg(compile_times)
+
+
+def benchmark_binary(bin_path: Path, runs: int):
+    exec_times = []
+    stdout = None
+    stderr = None
+    returncode = None
+    for _ in range(runs):
+        elapsed, result = timed_run(
+            [str(bin_path)],
+            env=clean_env(),
+            timeout=300,
+        )
+        exec_times.append(elapsed)
+        stdout = result.stdout
+        stderr = result.stderr
+        returncode = result.returncode
+    return {
+        "exec_time_s": avg(exec_times),
+        "stdout": stdout or "",
+        "stderr": stderr or "",
+        "returncode": returncode,
+    }
+
+
+def benchmark_source(src_path: Path, opt_levels: tuple[int, ...], runs: int):
+    result = {"name": src_path.name, "compiler": find_clang(), "levels": {}}
+    with tempfile.TemporaryDirectory(prefix="pcc_bench_") as tmpdir:
+        workdir = Path(tmpdir)
+
+        for opt_level in opt_levels:
+            level = {"ok": False}
+            try:
+                native_bin, native_compile = build_native(src_path, opt_level, workdir, runs)
+                native_exec = benchmark_binary(native_bin, runs)
+
+                pcc_bin, pcc_compile = build_pcc(src_path, opt_level, workdir, runs)
+                pcc_exec = benchmark_binary(pcc_bin, runs)
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                level["error"] = format_error(exc)
+                result["levels"][opt_level] = level
+                continue
+
+            level.update(
+                {
+                    "ok": True,
+                    "native": {
+                        "compile_time_s": native_compile,
+                        **native_exec,
+                    },
+                    "pcc": {
+                        "compile_time_s": pcc_compile,
+                        **pcc_exec,
+                    },
+                    "outputs_match": (
+                        pcc_exec["stdout"] == native_exec["stdout"]
+                        and pcc_exec["returncode"] == native_exec["returncode"]
+                    ),
+                }
+            )
+            result["levels"][opt_level] = level
+
+    return result
+
+
+def print_compile_table(results, opt_levels):
+    print("Compile Time")
+    for opt_level in opt_levels:
+        print(f"O{opt_level}")
+        print(
+            f"{'Benchmark':<16} {'clang':>12} {'pcc':>12} {'pcc/clang':>12}"
+        )
+        for result in results:
+            level = result["levels"][opt_level]
+            if not level.get("ok"):
+                print(
+                    f"{result['name']:<16} "
+                    f"{'ERROR':>12} "
+                    f"{'ERROR':>12} "
+                    f"{'N/A':>12}"
+                )
+                continue
+            native = level["native"]["compile_time_s"]
+            pcc = level["pcc"]["compile_time_s"]
+            print(
+                f"{result['name']:<16} "
+                f"{format_seconds(native):>12} "
+                f"{format_seconds(pcc):>12} "
+                f"{format_ratio(pcc, native):>12}"
+            )
+        print()
+
+
+def print_exec_table(results, opt_levels):
+    print("Execution Time")
+    for opt_level in opt_levels:
+        print(f"O{opt_level}")
+        print(
+            f"{'Benchmark':<16} {'clang':>12} {'pcc':>12} {'pcc/clang':>12} {'match':>8}"
+        )
+        for result in results:
+            level = result["levels"][opt_level]
+            if not level.get("ok"):
+                print(
+                    f"{result['name']:<16} "
+                    f"{'ERROR':>12} "
+                    f"{'ERROR':>12} "
+                    f"{'N/A':>12} "
+                    f"{'error':>8}"
+                )
+                continue
+            native = level["native"]["exec_time_s"]
+            pcc = level["pcc"]["exec_time_s"]
+            print(
+                f"{result['name']:<16} "
+                f"{format_seconds(native):>12} "
+                f"{format_seconds(pcc):>12} "
+                f"{format_ratio(pcc, native):>12} "
+                f"{str(level['outputs_match']):>8}"
+            )
+        print()
+
+
+def print_total_table(results, opt_levels):
+    print("Compile + Execute Total")
+    for opt_level in opt_levels:
+        print(f"O{opt_level}")
+        print(
+            f"{'Benchmark':<16} {'clang':>12} {'pcc':>12} {'pcc/clang':>12}"
+        )
+        for result in results:
+            level = result["levels"][opt_level]
+            if not level.get("ok"):
+                print(
+                    f"{result['name']:<16} "
+                    f"{'ERROR':>12} "
+                    f"{'ERROR':>12} "
+                    f"{'N/A':>12}"
+                )
+                continue
+            native = (
+                level["native"]["compile_time_s"] + level["native"]["exec_time_s"]
+            )
+            pcc = level["pcc"]["compile_time_s"] + level["pcc"]["exec_time_s"]
+            print(
+                f"{result['name']:<16} "
+                f"{format_seconds(native):>12} "
+                f"{format_seconds(pcc):>12} "
+                f"{format_ratio(pcc, native):>12}"
+            )
+        print()
+
+
+def print_summary(results, opt_levels):
+    print("Summary")
+    for opt_level in opt_levels:
+        compile_ratios = []
+        exec_ratios = []
+        total_ratios = []
+        exec_counts = {"faster": 0, "tied": 0, "slower": 0}
+        match_count = 0
+        ok_count = 0
+
+        for result in results:
+            level = result["levels"][opt_level]
+            if not level.get("ok"):
+                continue
+            native_compile = level["native"]["compile_time_s"]
+            native_exec = level["native"]["exec_time_s"]
+            pcc_compile = level["pcc"]["compile_time_s"]
+            pcc_exec = level["pcc"]["exec_time_s"]
+
+            compile_ratio = pcc_compile / native_compile
+            exec_ratio = pcc_exec / native_exec
+            total_ratio = (pcc_compile + pcc_exec) / (native_compile + native_exec)
+
+            compile_ratios.append(compile_ratio)
+            exec_ratios.append(exec_ratio)
+            total_ratios.append(total_ratio)
+            exec_counts[classify_ratio(exec_ratio)] += 1
+            ok_count += 1
+            if level["outputs_match"]:
+                match_count += 1
+
+        print(
+            f"  O{opt_level}: "
+            f"compile geomean={format_ratio(geometric_mean(compile_ratios), 1.0)} "
+            f"exec geomean={format_ratio(geometric_mean(exec_ratios), 1.0)} "
+            f"total geomean={format_ratio(geometric_mean(total_ratios), 1.0)} "
+            f"exec faster={exec_counts['faster']} "
+            f"tied={exec_counts['tied']} slower={exec_counts['slower']} "
+            f"matched={match_count}/{ok_count} "
+            f"completed={ok_count}/{len(results)}"
+        )
+    print()
+
+
+def print_pcc_opt_delta_summary(results, opt_levels):
+    if len(opt_levels) < 2:
+        return
+
+    baseline_opt = opt_levels[0]
+    print("PCC Opt-Level Deltas")
+    for opt_level in opt_levels[1:]:
+        compile_ratios = []
+        exec_ratios = []
+        total_ratios = []
+        ok_count = 0
+
+        for result in results:
+            baseline = result["levels"].get(baseline_opt)
+            current = result["levels"].get(opt_level)
+            if not baseline or not baseline.get("ok") or not current or not current.get("ok"):
+                continue
+
+            baseline_compile = baseline["pcc"]["compile_time_s"]
+            baseline_exec = baseline["pcc"]["exec_time_s"]
+            current_compile = current["pcc"]["compile_time_s"]
+            current_exec = current["pcc"]["exec_time_s"]
+
+            compile_ratios.append(current_compile / baseline_compile)
+            exec_ratios.append(current_exec / baseline_exec)
+            total_ratios.append(
+                (current_compile + current_exec) / (baseline_compile + baseline_exec)
+            )
+            ok_count += 1
+
+        print(
+            f"  pcc O{opt_level}/O{baseline_opt}: "
+            f"compile geomean={format_ratio(geometric_mean(compile_ratios), 1.0)} "
+            f"exec geomean={format_ratio(geometric_mean(exec_ratios), 1.0)} "
+            f"total geomean={format_ratio(geometric_mean(total_ratios), 1.0)} "
+            f"completed={ok_count}/{len(results)}"
+        )
+    print()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--bench",
+        action="append",
+        dest="benches",
+        help="Benchmark filename under benchmarks/ (repeatable). Defaults to all.",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=3,
+        help="Timed runs per compile/execute measurement.",
+    )
+    parser.add_argument(
+        "--opt-level",
+        action="append",
+        dest="opt_levels",
+        type=int,
+        choices=(0, 1, 2, 3),
+        help="Optimization level to benchmark. Repeat for multiple levels.",
+    )
+    return parser.parse_args()
 
 
 def main():
-    print("=" * 80)
-    print("PCC Benchmark Suite")
-    print("=" * 80)
-    print(f"Runs: {TIMED_RUNS} (averaged), Warmup: {WARMUP_RUNS}")
+    args = parse_args()
+    benches = args.benches or DEFAULT_BENCHES
+    opt_levels = tuple(args.opt_levels or DEFAULT_OPT_LEVELS)
 
-    cc = find_cc()
-    cc_version = subprocess.run(
-        [cc, "--version"], capture_output=True, text=True
-    ).stdout.split("\n")[0]
-    print(f"Native compiler: {cc} ({cc_version})")
+    compiler = find_clang()
+    compiler_version = subprocess.run(
+        [compiler, "--version"],
+        capture_output=True,
+        text=True,
+        env=clean_env(),
+    ).stdout.splitlines()[0]
+
+    print("=" * 80)
+    print("PCC vs Clang Benchmarks")
+    print("=" * 80)
+    print(f"Compiler: {compiler_version}")
+    print(f"Benchmarks: {len(benches)}")
+    print(f"Runs per measurement: {args.runs}")
+    print(f"Optimization levels: {', '.join(f'O{level}' for level in opt_levels)}")
     print()
 
     results = []
+    for bench_name in benches:
+        src_path = BENCHMARKS_DIR / bench_name
+        if not src_path.is_file():
+            raise FileNotFoundError(f"Benchmark source not found: {src_path}")
+        print(f"Running {bench_name} ...")
+        results.append(benchmark_source(src_path, opt_levels, args.runs))
 
-    for bench_file in BENCH_FILES:
-        src_path = os.path.join(BENCHMARKS_DIR, bench_file)
-        if not os.path.exists(src_path):
-            print(f"  SKIP {bench_file} (not found)")
-            continue
-
-        print(f"Running {bench_file}...")
-
-        with tempfile.TemporaryDirectory(prefix="pcc_bench_") as tmpdir:
-            # Native -O0
-            cc_o0_compile, cc_o0_exec, cc_o0_out = run_native(src_path, 0, tmpdir)
-            # Native -O2
-            cc_o2_compile, cc_o2_exec, cc_o2_out = run_native(src_path, 2, tmpdir)
-            # pcc
-            pcc_total, pcc_sl_total, pcc_out = run_pcc(src_path, tmpdir)
-
-        results.append({
-            "name": bench_file,
-            "cc_o0_compile": cc_o0_compile,
-            "cc_o0_exec": cc_o0_exec,
-            "cc_o0_out": cc_o0_out,
-            "cc_o2_compile": cc_o2_compile,
-            "cc_o2_exec": cc_o2_exec,
-            "cc_o2_out": cc_o2_out,
-            "pcc_total": pcc_total,
-            "pcc_sl_total": pcc_sl_total,
-            "pcc_out": pcc_out,
-        })
-
-    # Print results table
     print()
-    print("=" * 80)
-    print("Results")
-    print("=" * 80)
-    print()
-
-    # Compile time table
-    header = f"{'Benchmark':<20} {'cc -O0':>12} {'cc -O2':>12} {'pcc(MCJIT)':>14} {'pcc(syslink)':>14}"
-    print("Compile + Execute Time (total)")
-    print("-" * len(header))
-    print(header)
-    print("-" * len(header))
-    for r in results:
-        cc_o0_total = (r["cc_o0_compile"] or 0) + (r["cc_o0_exec"] or 0)
-        cc_o2_total = (r["cc_o2_compile"] or 0) + (r["cc_o2_exec"] or 0)
-        print(
-            f"{r['name']:<20} "
-            f"{format_time(cc_o0_total):>12} "
-            f"{format_time(cc_o2_total):>12} "
-            f"{format_time(r['pcc_total']):>14} "
-            f"{format_time(r['pcc_sl_total']):>14}"
-        )
-    print()
-
-    # Execution time only (native)
-    print("Execution Time Only (native compile excluded)")
-    print("-" * 60)
-    print(f"{'Benchmark':<20} {'cc -O0 exec':>15} {'cc -O2 exec':>15}")
-    print("-" * 60)
-    for r in results:
-        print(
-            f"{r['name']:<20} "
-            f"{format_time(r['cc_o0_exec']):>15} "
-            f"{format_time(r['cc_o2_exec']):>15}"
-        )
-    print()
-
-    # Ratio table
-    print("Slowdown vs cc -O0 (total time)")
-    print("-" * 60)
-    print(f"{'Benchmark':<20} {'pcc(MCJIT)/O0':>15} {'pcc(syslink)/O0':>17}")
-    print("-" * 60)
-    for r in results:
-        cc_o0_total = (r["cc_o0_compile"] or 0) + (r["cc_o0_exec"] or 0)
-        if cc_o0_total > 0:
-            mcjit_ratio = (r["pcc_total"] or 0) / cc_o0_total
-            sl_ratio = (r["pcc_sl_total"] or 0) / cc_o0_total
-            print(
-                f"{r['name']:<20} "
-                f"{mcjit_ratio:>14.1f}x "
-                f"{sl_ratio:>16.1f}x"
-            )
-    print()
-
-    # Output correctness
-    print("Output Correctness")
-    print("-" * 60)
-    for r in results:
-        match = r["pcc_out"] == r["cc_o0_out"]
-        status = "PASS" if match else "MISMATCH"
-        print(f"  {r['name']:<20} {status}  (pcc={r['pcc_out']!r}, cc={r['cc_o0_out']!r})")
-    print()
+    print_compile_table(results, opt_levels)
+    print_exec_table(results, opt_levels)
+    print_total_table(results, opt_levels)
+    print_summary(results, opt_levels)
+    print_pcc_opt_delta_summary(results, opt_levels)
 
 
 if __name__ == "__main__":

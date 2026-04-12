@@ -9,7 +9,6 @@
 import os
 import sys
 import tempfile
-from contextlib import contextmanager
 
 from ..ply import yacc
 
@@ -24,7 +23,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
 
-_DEFAULT_PLY_LEXTAB = "pcc_lextab_v13"
+_DEFAULT_PLY_LEXTAB = "pcc_lextab_v14"
 _DEFAULT_PLY_YACCTAB = "pcc_yacctab_v19"
 
 
@@ -43,20 +42,31 @@ def _prepare_default_ply_cache_dir():
     return cache_dir
 
 
-@contextmanager
-def _ply_table_build_lock(enabled):
-    if not enabled or fcntl is None:
-        yield
-        return
+class _ply_table_build_lock:
+    """Context manager guarding PLY's on-disk table build. Implemented
+    as an explicit class (not ``@contextmanager``) so the self-host
+    audit doesn't flag the enclosing ``yield``."""
 
-    cache_dir = _prepare_default_ply_cache_dir()
-    lock_path = os.path.join(cache_dir, ".pcc-ply-cache.lock")
-    with open(lock_path, "w") as lockfile:
-        fcntl.flock(lockfile, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lockfile, fcntl.LOCK_UN)
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self._lockfile = None
+
+    def __enter__(self):
+        if not self.enabled or fcntl is None:
+            return self
+        cache_dir = _prepare_default_ply_cache_dir()
+        lock_path = os.path.join(cache_dir, ".pcc-ply-cache.lock")
+        self._lockfile = open(lock_path, "w")
+        fcntl.flock(self._lockfile, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._lockfile is not None:
+            try:
+                fcntl.flock(self._lockfile, fcntl.LOCK_UN)
+            finally:
+                self._lockfile.close()
+                self._lockfile = None
 
 
 class CParser(PLYParser):

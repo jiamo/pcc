@@ -71,12 +71,16 @@ class TestString(unittest.TestCase):
         assert ret == 0  # first 3 chars "hel" == "hel"
 
     def test_memcpy(self):
+        # Note: original test passed size 24 which is UB — the arrays are
+        # only 12 bytes each, so memcpy would overrun. Clang with stack
+        # checks aborts (exit 133); undefined behavior means the pcc result
+        # is equally valid but different. Use the correct size 12.
         pcc = CEvaluator()
         ret = pcc.evaluate('''
             int main(){
                 int src[3] = {10, 20, 30};
                 int dst[3] = {0, 0, 0};
-                memcpy(dst, src, 24);
+                memcpy(dst, src, 12);
                 return dst[0] + dst[1] + dst[2];
             }
         ''', optimize=False)

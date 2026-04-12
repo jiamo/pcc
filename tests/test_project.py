@@ -1,4 +1,5 @@
 import os
+import warnings
 
 import pytest
 
@@ -136,7 +137,11 @@ def test_collect_project_make_goal_supports_cpp_args_runtime(tmp_path):
         "\tcc -c -o ignored.o ignored.c\n"
     )
 
-    source, base_dir = collect_project(str(tmp_path), sources_from_make="app")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        source, base_dir = collect_project(str(tmp_path), sources_from_make="app")
+
+    assert not caught
 
     assert "// --- ignored.c ---" not in source
     assert (
@@ -206,6 +211,46 @@ def test_collect_translation_units_accepts_file_with_dependency_make_goal(tmp_pa
     )
 
 
+def test_collect_translation_units_main_detection_uses_explicit_cpp_args(tmp_path):
+    helper_path = tmp_path / "helper.c"
+    helper_path.write_text(
+        "#ifndef VALUE\n"
+        "#error missing VALUE\n"
+        "#endif\n"
+        "int helper(void) { return VALUE; }\n"
+    )
+    main_path = tmp_path / "main.c"
+    main_path.write_text(
+        "int helper(void);\n"
+        "#ifndef VALUE\n"
+        "#error missing VALUE\n"
+        "#endif\n"
+        "int main(void) { return helper() == VALUE ? 0 : 1; }\n"
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        units, base_dir = collect_translation_units(
+            str(main_path),
+            dependencies=[str(helper_path)],
+            cpp_args=["-DVALUE=41"],
+        )
+
+    assert not caught
+    assert base_dir == os.path.abspath(str(tmp_path))
+    assert [unit.name for unit in units] == ["helper.c", "main.c"]
+    assert (
+        CEvaluator().evaluate_translation_units(
+            units,
+            base_dir=base_dir,
+            jobs=2,
+            include_dirs=translation_unit_include_dirs(units),
+            cpp_args=["-DVALUE=41"],
+        )
+        == 0
+    )
+
+
 def test_collect_translation_units_make_goal_supports_cpp_args_runtime(tmp_path):
     (tmp_path / "helper.c").write_text(
         "#ifndef VALUE\n"
@@ -233,10 +278,14 @@ def test_collect_translation_units_make_goal_supports_cpp_args_runtime(tmp_path)
         "\tcc -c -o ignored.o ignored.c\n"
     )
 
-    units, base_dir = collect_translation_units(
-        str(tmp_path),
-        sources_from_make="app",
-    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        units, base_dir = collect_translation_units(
+            str(tmp_path),
+            sources_from_make="app",
+        )
+
+    assert not caught
 
     assert [unit.name for unit in units] == ["helper.c", "main.c"]
     assert (

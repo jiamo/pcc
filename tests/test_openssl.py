@@ -52,6 +52,7 @@ def _openssl_smoke_units():
     return collect_translation_units(
         OPENSSL_TEST_MAIN,
         dependencies=list(OPENSSL_SMOKE_SOURCES),
+        cpp_args=_openssl_smoke_cpp_args(),
     )
 
 

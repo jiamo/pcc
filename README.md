@@ -1,253 +1,436 @@
-Pcc
-====================
+# pcc
 
-What is this?
---------------------
-Pcc is a C compiler written in Python, built on cpp + ply + pycparser + llvmlite + llvm.
-Run C programs like Python scripts: `pcc test.c`. Powerful enough to compile and run real-world C projects including Lua 5.5.0, SQLite, PostgreSQL (libpq), nginx, pcre, zlib, lz4, zstd, openssl, and readline — with 4900+ tests passing (including 220 c-testsuite, 161 clang C, and 1684 GCC torture conformance cases).
+[![PyPI](https://img.shields.io/pypi/v/python-cc)](https://pypi.org/project/python-cc/)
+[![Python](https://img.shields.io/pypi/pyversions/python-cc)](https://pypi.org/project/python-cc/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Inspired by: https://github.com/eliben/pykaleidoscope.
+A Python-implemented LLVM compiler toolchain for **C** and an experimental native frontend for **Python**.
 
-Notice
---------------------
-1. Some code skeleton comes from pykaleidoscope.
-2. ply and pycparser are embedded into this project for debug use.
+`pcc` started as a compiler experiment and has grown into a large repository with:
 
-Install
---------------------
+- a real C compilation pipeline
+- an experimental Python-to-native pipeline
+- project collection/build orchestration for multi-file codebases
+- a multi-tier optimization/pass framework
+- compile caching and system-link workflows
+- large integration targets such as Lua, SQLite, PostgreSQL `libpq`, nginx, zlib, lz4, zstd, PCRE, OpenSSL, and readline
+- thousands of regression and corpus tests against native toolchains
+
+The C frontend is the most mature subsystem today. The Python frontend is actively evolving, but already supports typed-native code, CPython fallback for imported modules, and direct C interop through `pcc.extern`.
+
+---
+
+## Why `pcc`
+
+`pcc` is designed for people who want more than a toy parser but still want a compiler they can read, debug, and extend quickly.
+
+### What makes it different
+
+- **Compiler implementation in Python** for fast iteration
+- **LLVM backend** for object emission, optimization, and native execution
+- **Real-project workflows**: single-file, merged-directory, separate-TU, make-derived source selection, dependency builds, and host linking
+- **Compiler as a library**: use `CEvaluator`, `build(...)`, or `module(...)`
+- **Large-scale validation**: Lua, SQLite, PostgreSQL, nginx, GCC torture, Clang C tests, and more
+- **A pass framework with measurable tiers** instead of treating optimization as a single opaque backend step
+
+---
+
+## Project status at a glance
+
+| Area | Status | Notes |
+|---|---|---|
+| C frontend | advanced | real-project tested, most mature part of the repo |
+| Python frontend | experimental | typed-native path + CPython fallback + extern-C bridge |
+| Build orchestration | strong | directory mode, `--separate-tus`, `--sources-from-make`, `--depends-on`, `--system-link` |
+| Validation | broad | 4900+ tests passing across unit, corpus, and integration coverage |
+| Python corpus | active | 108/139 end-to-end corpus tests passing as of 2026-04-20 |
+| Performance tooling | mature | microbenchmark matrix + standalone benchmark suite + pass attribution |
+
+---
+
+## Bootstrap / self-host status
+
+`pcc` is actively working toward a three-stage self-host bootstrap for its
+Python frontend:
+
+1. CPython-hosted `pcc` builds `pcc1`
+2. `pcc1` builds `pcc2`
+3. `pcc2` builds `pcc3`
+
+Current verified progress in this repository:
+
+- the `llvm_capi` text-first builder / binding path is landed and covered by
+  dedicated parity and end-to-end tests
+- experimental multi-file Python compilation is landed for native sibling
+  imports and shared cross-module type inference
+- stage 1 can now produce a `pcc1` executable in the supported development
+  environment
+
+Current boundary:
+
+- the bootstrap path is not closed yet; stage 2 / stage 3 still need
+  reliability work
+- some bootstrap flows may still link `libpython`, so the pure self-host
+  target is not claimed yet
+
+For milestone details, see:
+
+- [python-frontend-plan.md](docs/plans/python-frontend-plan.md)
+- [p6c6-bootstrap-spike-report.md](docs/plans/p6c6-bootstrap-spike-report.md)
+- [llvmcapi-beta4-backlog.md](docs/plans/llvmcapi-beta4-backlog.md)
+
+---
+
+## Quick start
+
+### Install
 
 ```bash
 pip install python-cc
 ```
 
-This gives you the `pcc` command:
+For repository development:
 
 ```bash
-pcc hello.c                        # compile and run
-pcc myproject/                     # compile all .c files in directory
-pcc --llvmdump test.c              # dump LLVM IR
-pcc myproject/ -- arg1 arg2        # pass args to compiled program
+git clone https://github.com/jiamo/pcc
+cd pcc
+uv sync
 ```
 
-Use as a Python library:
+### Compile and run C
+
+```bash
+pcc hello.c
+pcc myproject/
+pcc --llvmdump hello.c
+pcc myproject/ -- arg1 arg2
+```
+
+### Compile and run Python
+
+```bash
+pcc hello.py
+pcc hello.py -o hello
+pcc hello.py --emit-llvm
+```
+
+### Use the evaluator directly
 
 ```python
 from pcc.evaluater.c_evaluator import CEvaluator
 
-pcc = CEvaluator()
+cc = CEvaluator()
 
-# Run main()
-pcc.evaluate(r'''
+cc.evaluate(r'''
 #include <stdio.h>
-int main() { printf("Hello from pcc!\n"); return 0; }
+int main(void) {
+    printf("hello from pcc\\n");
+    return 0;
+}
 ''')
 
-# Call any C function directly
-ret = pcc.evaluate(r'''
+result = cc.evaluate(r'''
 int add(int a, int b) { return a + b; }
 ''', entry="add", args=[3, 7])
-print(ret)  # 10
+print(result)  # 10
 ```
 
-Development
---------------------
+### Use C from Python with `module(...)`
 
-Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
-
-```bash
-uv sync          # install dependencies
-uv run pytest    # run all 4900+ tests
+```c
+// arith.c
+int add(int a, int b) { return a + b; }
+int mul(int a, int b) { return a * b; }
 ```
-
-Compile Cache
---------------------
-
-`pcc` keeps a translation-unit compile cache on disk by default.
-
-CLI:
-
-```bash
-uv run pcc hello.c
-uv run pcc --cache-dir .pcc-cache hello.c
-uv run pcc --no-cache hello.c
-```
-
-Library:
 
 ```python
-from pcc.evaluater.c_evaluator import CEvaluator
+from pcc import module
 
-evaluator = CEvaluator()
-evaluator.evaluate("int main(void) { return 0; }\n")
-evaluator.evaluate("int main(void) { return 0; }\n")  # hits cache
+m = module("arith.c")
+print(m.add(3, 4))
+print(m.mul(5, 6))
+print(m.__pcc_artifact__.exports)
 ```
 
-Notes:
+---
 
-- the cache key is based on the preprocessed source plus the active compiler implementation fingerprint
-- unchanged translation units are reused across repeated `evaluate(...)`, `evaluate_translation_units(...)`, `compile_translation_units(...)`, and CLI runs
-- only dirty translation units are recompiled in multi-TU builds
-- set `PCC_COMPILE_CACHE_DIR` to override the default cache location
-- set `PCC_DISABLE_COMPILE_CACHE=1` or pass `--no-cache` to disable it
+## System architecture
 
-Multi-file projects: put `.c` and `.h` files in a directory, one `.c` must contain `main()`. Pcc auto-discovers all `.c` files, merges them, and compiles.
+`pcc` is organized as a layered compiler platform rather than a single monolithic script.
 
-Third-Party Project Integrations
---------------------
+```text
+CLI / API
+  -> project collection
+  -> C frontend or Python frontend
+  -> pass framework
+  -> LLVM optimization / emission
+  -> MCJIT, object emission, or system-link execution
+  -> tests / integrations / benchmarks
+```
 
-For real library integrations in `projects/`, the dependency boundary is explicit:
+### Core layers
 
-- each integration keeps a small driver such as `projects/test_pcre_main.c` or `projects/test_postgres_main.c`
-- the library sources come from that project's own source tree under `projects/<name>/`
-- `--depends-on PATH[=GOAL]` and `--sources-from-make GOAL` only collect sources and CPP args from the named dependency path
-- `pcc` does not implicitly borrow `.c` files or link libraries from unrelated project trees
+| Layer | Main paths | Responsibility |
+|---|---|---|
+| CLI and public API | `pcc/pcc.py`, `pcc/api.py` | end-user commands and embeddable build/module APIs |
+| Project collection | `pcc/project.py` | collect translation units, infer source sets from make, handle dependencies |
+| C frontend | `pcc/evaluater/`, `pcc/codegen/`, `pcc/parse/`, `pcc/lex/` | preprocess, parse, analyze, and lower C to LLVM IR |
+| Pass framework | `pcc/passes/` | HighTier / MidTier / LowTier / BackendTier optimization plumbing |
+| Python frontend | `pcc/py_frontend/`, `pcc/py_runtime/`, `pcc/extern/` | parse typed Python, infer types, emit LLVM IR, bridge to runtime or CPython |
+| Validation | `tests/`, `projects/`, `bench/`, `benchmarks/` | correctness, integration, and performance coverage |
 
-So for example:
+Read the full architecture guide here:
 
-- PCRE uses `projects/pcre-8.45/` plus `projects/test_pcre_main.c`
-- SQLite uses `projects/sqlite-amalgamation-3490100/sqlite3.c` plus `projects/test_sqlite_main.c`
-- PostgreSQL uses `projects/postgresql-17.4/` plus `projects/test_postgres_main.c` / `projects/test_postgres_query_main.c`
+- [docs/system-architecture.md](docs/system-architecture.md)
 
-If a project needs extra native support archives at runtime, those are built from the same source tree and called out explicitly in the tests.
+---
 
-Compiling Lua 5.5.0
---------------------
+## Build modes for real projects
 
-Pcc can compile the entire [Lua 5.5.0](https://github.com/lua/lua) interpreter (~30k lines of C) and run Lua scripts directly.
+`pcc` supports several compilation models because large C projects are not all built the same way.
 
-For one representative script (`math.lua`), these are the recommended entrypoints:
+| Mode | Command shape | Best for |
+|---|---|---|
+| Single file | `pcc hello.c` | small programs, reproducers |
+| Directory merge | `pcc myproject/` | quick project experiments |
+| Separate translation units | `pcc --separate-tus myproject/` | more realistic C semantics |
+| Make-derived source set | `pcc --sources-from-make lua projects/lua-5.5.0` | upstream projects with real build logic |
+| Driver + dependency project | `pcc --depends-on projects/pcre-8.45=libpcre.la projects/test_pcre_main.c` | library integration testing |
+| Host linking | `pcc --system-link ...` | large binaries and realistic final link behavior |
+
+---
+
+## C frontend capabilities
+
+The C pipeline is built on preprocessing + parsing + semantic lowering to LLVM IR.
+
+### Highlights
+
+- C99-oriented frontend with support for the features needed by real projects in this repo
+- multi-file compilation in merged or separate-TU modes
+- explicit signedness tracking on top of LLVM integer types
+- compile-time constant evaluation and runtime lowering handled as separate semantic layers
+- translation-unit compile cache
+- object, assembly, and LLVM IR emission
+- MCJIT execution for evaluator workflows and system-link workflows for larger binaries
+
+### Public C APIs
+
+#### `CEvaluator`
+
+Use the compiler as an in-process evaluator for C source strings.
+
+#### `build(...)`
+
+```python
+from pcc.api import build
+
+artifact = build(
+    ["src/main.c", "src/util.c"],
+    include_dirs=["include"],
+    libs=["m"],
+    optimize=2,
+    kind="exe",
+)
+print(artifact.output_path)
+```
+
+#### `module(...)`
+
+Compile one or more C files into a shared library and load it with `ctypes`.
+
+```python
+from pcc import module
+
+m = module(["src/a.c", "src/b.c"], include_dirs=["include"], libs=["z"])
+print(m.__pcc_artifact__.pass_report)
+```
+
+---
+
+## Python frontend
+
+`pcc hello.py` uses an experimental Python frontend that lowers Python through LLVM as well.
+
+### What works today
+
+- typed Python lowered directly to native LLVM IR
+- no PyObject layer for pure typed/native programs
+- CPython C-API fallback when `import` is used
+- direct C calls through `pcc.extern`
+- classes, exceptions, dunders, and selected stdlib coverage in the current corpus
+
+### Python path selection
+
+For `.py` inputs, the main CLI surface is intentionally small. The Python path
+dispatch happens before the C-specific validation, so flags such as
+`--jobs`, `--separate-tus`, `--target`, `--system-link`, and `--backend`
+do not currently change Python compilation behavior.
+
+#### Main `pcc foo.py` controls
+
+| Surface | Choices | Effect | Notes |
+|---|---|---|---|
+| invocation mode | `pcc foo.py` | compile to a temporary native executable and run it immediately | arguments after `--` are forwarded to the produced program |
+| output mode | `pcc foo.py -o prog` | compile and save a native executable to `prog` | does not auto-run after build |
+| IR mode | `pcc foo.py --emit-llvm` | emit LLVM IR only and stop before linking | bare form writes `<stem>.ll`; `-o` can override the output path |
+| logging | `pcc foo.py --verbose` | print parse / type inference / codegen / link timings | Python pipeline only |
+
+#### Automatic routing inside the Python pipeline
+
+| Trigger | Route selected | Result |
+|---|---|---|
+| no `import` and the code stays in the typed/native subset | typed-native path | lowers directly to LLVM IR and can stay libpython-free |
+| any `import` is present | CPython fallback path | links `libpython` and routes imported values through CPython C-API shims |
+| default parser configuration | native parser + lift | uses `pcc.parse.py_parse` + `pcc.parse.py_lift` |
+
+#### Internal / debug toggles for `.py`
+
+| Env var | Choices | Effect |
+|---|---|---|
+| `PCC_USE_CPYTHON_AST` | unset / `1` | when set to `1`, opts out of the native Python parser and uses the legacy stdlib-`ast` parser path |
+| `PCC_USE_LLVMLITE` | unset / `1` | when set to `1`, forces all subsystems, including Python codegen, back to `llvmlite` |
+| `PCC_USE_LLVMLITE_PY` | unset / `1` | when set to `1`, forces only the Python frontend codegen path back to `llvmlite` |
+
+#### Experimental multi-file Python entry
+
+| Surface | Choices | Effect | Notes |
+|---|---|---|---|
+| command | `python scripts/pcc_multi.py` | compile several `.py` files into one native output | separate from the main `pcc` CLI |
+| required flags | `--entry`, `--out` | choose the entry module and output path | `--entry` uses dotted module names |
+| optional flags | `--emit-llvm`, `--verbose` | emit combined LLVM IR or print timings | mirrors the single-file Python pipeline options |
+| source mapping syntax | `path.py` or `path.py=module.name` | lets callers assign explicit dotted module names | useful for `__main__.py`, `__init__.py`, and relative imports |
+| current limitation | unresolved imports / full bootstrap closure | known native sibling function/class imports are supported, but unresolved imports may still fall back to the CPython import path and pull `libpython`; stage 2/3 bootstrap is not closed yet | bootstrap reliability work is still in progress |
+
+#### Related: `.c` path environment controls
+
+For `.c` inputs, the main execution mode is still selected by CLI flags such as
+`--separate-tus`, `--system-link`, `--sources-from-make`, `--depends-on`,
+`--target`, `--emit-obj`, `--emit-asm`, and `--emit-llvm`. Environment
+variables mainly affect backend selection, parser choice, caching, LLVM
+pipeline behavior, and diagnostics.
+
+Common controls:
+
+| Env var | Effect | Notes |
+|---|---|---|
+| `PCC_BACKEND` | choose the C backend (`llvm`, `llvm_capi`, `self`) | same surface as `--backend` |
+| `PCC_USE_PLY_C_PARSER=1` | opt out of the native C parser and use the legacy PLY parser | parser compatibility / regression isolation |
+| `PCC_PLY_CACHE_DIR` | override the PLY lextab / yacctab cache directory | only matters on the legacy PLY parser path |
+| `PCC_COMPILE_CACHE_DIR` | override the translation-unit compile cache directory | defaults under `~/.cache` or `XDG_CACHE_HOME` |
+| `PCC_DISABLE_COMPILE_CACHE=1` | disable the translation-unit compile cache | useful for debugging cache-key issues |
+| `PCC_DISABLE_PASSES` | disable named managed passes | comma-separated pass names |
+| `PCC_LLVM_DISABLE_PASSES` | disable named concrete LLVM passes | comma-separated pass names |
+| `PCC_CHEAP_LLVM_PIPELINE` | enable the cheap LLVM pass bundle, or provide a custom cheap-pass list | affects the low-opt / O0-style backend path |
+| `PCC_LLVM_PIPELINE` | run an external text LLVM pipeline | `1`, `true`, or `default` selects the default pipeline; custom specs are also accepted |
+| `PCC_LLVM_OPT_BIN` | point at a matching LLVM `opt` binary | required when using the external LLVM text pipeline or LLVM pass selection that needs `opt` |
+| `PCC_LIBLLVM_PATH` | point at `libLLVM-C` explicitly | used by the native LLVM-C binding path |
+| `PCC_USE_LLVMLITE=1` | force all subsystems back to `llvmlite` | reverse-opt-out from the native LLVM-C path |
+| `PCC_USE_LLVMLITE_C=1` | force only the C codegen path back to `llvmlite` | useful for C-only regression isolation |
+| `PCC_USE_LLVMLITE_PASSES=1` | force only the pass layer back to `llvmlite` | useful for pass-only regression isolation |
+
+Diagnostics:
+
+| Env var | Effect | Notes |
+|---|---|---|
+| `PCC_DUMP_BAD_IR=/path` | dump invalid or unparsable LLVM IR to disk when LLVM parsing fails | writes per-TU `.ll` snapshots for inspection |
+| `PCC_DEBUG_PHI_TYPES=/path` | append SSA phi type-mismatch diagnostics to a log file | supports parallel builds by appending |
+| `PCC_DEBUG_SSA_LOWER_FAIL=1` | print traceback when SSA lowering fails and falls back | diagnostic only; does not change correctness behavior |
+
+### Example: typed-native Python
+
+```python
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+def main() -> None:
+    for i in range(10):
+        print(fib(i))
+
+main()
+```
+
+### Example: pure native FFI with `pcc.extern`
+
+```python
+from pcc.extern import extern, c_int
+
+getpid = extern("getpid", (), c_int)
+
+pid: int = getpid()
+print(pid)
+```
+
+### Python corpus status
+
+As of 2026-04-20, `tests/py_corpus/` has **108/139** passing end-to-end cases:
+
+| Phase | Pass | Coverage |
+|---|---:|---|
+| phase1 | 23/25 | typed Python MVP |
+| phase2 | 15/30 | core Python data semantics |
+| phase3 | 31/45 | classes, MRO, dunders, exceptions |
+| phase4 | 37/37 | CPython fallback path |
+| phase6c | 2/2 | extern-C direct calls |
+
+Related docs:
+
+- [docs/python-tutorial.md](docs/python-tutorial.md)
+- [docs/python-howto.md](docs/python-howto.md)
+- [docs/python-limitations.md](docs/python-limitations.md)
+- [docs/python-scorecard.md](docs/python-scorecard.md)
+- [docs/changelog.md](docs/changelog.md)
+
+---
+
+## Real-world integration coverage
+
+One of `pcc`'s strengths is that correctness work is validated against real software, not just toy examples.
+
+| Integration | Representative path | Typical workflow |
+|---|---|---|
+| Lua 5.5.0 | `projects/lua-5.5.0/` | single-file amalgamation or make-derived source list |
+| PCRE 8.45 | `projects/pcre-8.45/` + `projects/test_pcre_main.c` | driver + dependency-project build |
+| zlib 1.3.1 | `projects/zlib-1.3.1/` + `projects/test_zlib_main.c` | make-derived dependency build |
+| SQLite 3.49.1 | `projects/sqlite-amalgamation-3490100/sqlite3.c` + `projects/test_sqlite_main.c` | amalgamation + driver |
+| PostgreSQL 17.4 `libpq` | `projects/postgresql-17.4/` + `projects/test_postgres_main.c` | make-goal discovery + support archives |
+| nginx 1.28.3 | `projects/nginx-1.28.3/` | compile all project sources and system-link |
+| Other libraries | `tests/test_lz4.py`, `tests/test_zstd.py`, `tests/test_openssl.py`, `tests/test_readline.py` | focused integration suites |
+
+### Representative commands
+
+#### Lua 5.5.0
 
 ```bash
-git clone https://github.com/jiamo/pcc && cd pcc
-uv sync
-
-# 1) Lua's official amalgamation build
 uv run pcc \
   --cpp-arg=-DLUA_USE_JUMPTABLE=0 \
   --cpp-arg=-DLUA_NOBUILTIN \
   projects/lua-5.5.0/onelua.c -- projects/lua-5.5.0/testes/math.lua
+```
 
-# 2) Follow the same source list as Lua's makefile `lua` target
+```bash
 uv run pcc \
   --cpp-arg=-DLUA_USE_JUMPTABLE=0 \
   --cpp-arg=-DLUA_NOBUILTIN \
-  --sources-from-make lua projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
-
-# 3) Same make-derived source list, but with normal multi-file C semantics
-uv run pcc \
-  --cpp-arg=-DLUA_USE_JUMPTABLE=0 \
-  --cpp-arg=-DLUA_NOBUILTIN \
-  --separate-tus --sources-from-make lua --jobs 2 projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
-
-# Run all 130+ Lua tests (pcc vs native, pcc vs makefile, makefile baseline)
-uv run pytest tests/test_lua.py -v
+  --separate-tus --sources-from-make lua --jobs 2 \
+  projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
 ```
 
-```
-projects/lua-5.5.0/         - canonical Lua 5.5.0 source tree, includes onelua.c and the standard multi-file sources
-projects/lua-5.5.0/testes/  - Lua test suite
-```
-
-Summary:
-
-- `projects/lua-5.5.0/onelua.c`
-  Use this when you want Lua's official single-file amalgamation build.
-- `--sources-from-make lua`
-  Use this when you want `pcc` to follow the same source list as Lua's `lua` make target.
-- `--separate-tus --sources-from-make lua --jobs 2`
-  Use this when you want normal multi-file C semantics plus parallel TU compilation.
-- Lua also needs `--cpp-arg=-DLUA_USE_JUMPTABLE=0 --cpp-arg=-DLUA_NOBUILTIN` when built through `pcc`; keep those choices explicit instead of relying on compiler-side project detection.
-- Do not use raw `projects/lua-5.5.0` directory mode for Lua.
-  The canonical tree contains both `onelua.c` and the individual source files, so naive directory collection produces duplicate-definition conflicts.
-
-### Test Structure
-
-Tests in `tests/test_lua.py` compare three builds:
-
-| Build | Method |
-|-------|--------|
-| **pcc** | `onelua.c` → pcc preprocess/parse/codegen → LLVM IR → cc compile+link |
-| **native** | `onelua.c` → `cc -O0` single-file compile |
-| **makefile** | `make` with project Makefile (separate compilation of each .c, static lib + link) |
+#### PCRE 8.45
 
 ```bash
-# Run all Lua tests (~25s with auto workers)
-uv run pytest tests/test_lua.py -v
-
-# Individual file compilation through pcc pipeline
-uv run pytest tests/test_lua.py::test_lua_source_compile -v
-# pcc vs native (same onelua.c, test pcc as C compiler)
-uv run pytest tests/test_lua.py::test_pcc_runtime_matches_native -v
-# pcc vs Makefile-built lua (official reference)
-uv run pytest tests/test_lua.py::test_pcc_runtime_matches_makefile -v
-# Lua test suite with Makefile-built binary (baseline)
-uv run pytest tests/test_lua.py::test_makefile_lua_test_suite -v
-```
-
-Note: `heavy.lua` is excluded from automated tests (runs ~2 min+, may timeout). Run manually:
-```bash
-# Build Makefile lua, then run heavy.lua directly
-cd projects/lua-5.5.0 && make CC=cc CWARNS= MYCFLAGS="-std=c99 -DLUA_USE_MACOSX" MYLDFLAGS= MYLIBS=
-./lua testes/heavy.lua
-```
-
-Compiling PCRE 8.45
---------------------
-
-`pcc` also supports a "main file + dependency project" workflow through
-`--depends-on PATH[=GOAL]`.
-
-For PCRE, the test driver lives at `projects/test_pcre_main.c`, while the
-library sources remain under `projects/pcre-8.45/`.
-
-```bash
-# Build the PCRE sources selected by the `libpcre.la` make target with the test main
 uv run pcc \
   --cpp-arg=-DHAVE_CONFIG_H \
   --depends-on projects/pcre-8.45=libpcre.la \
   projects/test_pcre_main.c
-
-# The explicit separate-TU form is equivalent here
-uv run pcc \
-  --cpp-arg=-DHAVE_CONFIG_H \
-  --separate-tus \
-  --depends-on projects/pcre-8.45=libpcre.la \
-  projects/test_pcre_main.c
 ```
 
-Use `PATH=GOAL` when the dependency directory contains more `.c` files than the
-real target needs. `pcc` will ask `make -n GOAL` for the participating source
-files and fall back to `make -nB GOAL` only when needed.
-
-In practice:
-
-- `--depends-on projects/pcre-8.45=libpcre.la projects/test_pcre_main.c`
-  is the recommended PCRE entrypoint
-- PCRE expects `config.h`, so pass `--cpp-arg=-DHAVE_CONFIG_H` explicitly instead of relying on compiler-side auto-detection
-- `--depends-on` already uses the multi-input path, so `--separate-tus` is optional here
-
-Compiling zlib 1.3.1
---------------------
-
-zlib fits the same workflow:
-
-- keep the library sources under `projects/zlib-1.3.1/`
-- keep a small driver at `projects/test_zlib_main.c`
-- use `--depends-on PATH=GOAL` to let `pcc` collect the real library sources
+#### zlib 1.3.1
 
 ```bash
-# Build the zlib sources selected by the libz.a target and run the test driver
 uv run pcc \
-  --cpp-arg=-DHAVE_UNISTD_H \
-  --cpp-arg=-DHAVE_STDARG_H \
-  --cpp-arg=-U__ARM_FEATURE_CRC32 \
-  --depends-on projects/zlib-1.3.1=libz.a \
-  projects/test_zlib_main.c
-
-# The explicit separate-TU form is also supported
-uv run pcc \
-  --separate-tus \
-  --jobs 2 \
   --cpp-arg=-DHAVE_UNISTD_H \
   --cpp-arg=-DHAVE_STDARG_H \
   --cpp-arg=-U__ARM_FEATURE_CRC32 \
@@ -255,35 +438,10 @@ uv run pcc \
   projects/test_zlib_main.c
 ```
 
-Notes:
-
-- zlib's source tree ships an unconfigured `Makefile`, so `pcc` falls back to `Makefile.in` when collecting sources from `libz.a`
-- zlib also needs a few explicit configuration-style defines; pass them with `--cpp-arg` instead of relying on compiler-side project detection
-- `--depends-on projects/zlib-1.3.1=libz.a projects/test_zlib_main.c` is the core zlib entrypoint, paired with the `--cpp-arg` flags shown above
-- `--separate-tus` is optional here as well; `--depends-on` already uses the multi-input path
-
-Compiling SQLite 3.49.1
------------------------
-
-SQLite uses the same "driver + dependency source" model, but the dependency is
-the amalgamation file directly:
+#### SQLite 3.49.1
 
 ```bash
-# Run the SQLite smoke driver against a real on-disk database path
 uv run pcc \
-  --cpp-arg=-U__APPLE__ \
-  --cpp-arg=-U__MACH__ \
-  --cpp-arg=-U__DARWIN__ \
-  --cpp-arg=-DSQLITE_THREADSAFE=0 \
-  --cpp-arg=-DSQLITE_OMIT_WAL=1 \
-  --cpp-arg=-DSQLITE_MAX_MMAP_SIZE=0 \
-  --depends-on projects/sqlite-amalgamation-3490100/sqlite3.c \
-  projects/test_sqlite_main.c /tmp/pcc_sqlite.db
-
-# Explicit separate-TU form
-uv run pcc \
-  --separate-tus \
-  --jobs 2 \
   --cpp-arg=-U__APPLE__ \
   --cpp-arg=-U__MACH__ \
   --cpp-arg=-U__DARWIN__ \
@@ -294,24 +452,7 @@ uv run pcc \
   projects/test_sqlite_main.c /tmp/pcc_sqlite.db
 ```
 
-Notes:
-
-- `projects/test_sqlite_main.c` now exercises DDL via `sqlite3_exec`, prepared inserts with binds/resets, `sqlite3_last_insert_rowid`, `sqlite3_changes`, aggregate queries, updates, rollback, and reopen/persistence checks
-- SQLite also needs a few explicit compile-time knobs when built through `pcc`; pass them with `--cpp-arg` as shown above instead of relying on compiler-side project detection
-- pass a real database file path if you want to exercise Unix VFS/open/reopen behavior; omitting the argument falls back to `:memory:`
-- on macOS, the multi-TU MCJIT runtime is isolated in a subprocess to avoid llvmlite teardown crashes after successful execution
-
-Compiling PostgreSQL 17.4 `libpq`
------------------------
-
-PostgreSQL is integrated in two layers:
-
-- `projects/test_postgres_main.c`
-  Builds `libpq` through `--depends-on projects/postgresql-17.4/src/interfaces/libpq=libpq.a` and runs a basic `PQconninfoParse` / `PQlibVersion` smoke test.
-- `projects/test_postgres_query_main.c`
-  Used by `tests/test_postgres.py` to connect to a real PostgreSQL server, run SQL, and verify results.
-
-Direct `pcc` entrypoint for the `libpq` smoke binary on an already-prepared tree:
+#### PostgreSQL 17.4 `libpq`
 
 ```bash
 uv run pcc --system-link --jobs 2 \
@@ -323,175 +464,184 @@ uv run pcc --system-link --jobs 2 \
   projects/test_postgres_main.c
 ```
 
-This route asks `pcc` to compile both the `libpq` sources and the repo-local zlib project sources, then hand the resulting objects to the host C compiler for final linking. Plain `uv run pcc --depends-on ... projects/test_postgres_main.c` still uses MCJIT by default; the `--system-link` form is the closer match to PostgreSQL's real multi-object build.
-
-From a fresh checkout, use the generic prepare/build hooks to create the supporting native artifacts first:
+#### nginx 1.28.3
 
 ```bash
-env -u LC_ALL uv run pcc --system-link --jobs 2 \
-  --prepare-cmd 'cd projects/zlib-1.3.1 && ./configure --static' \
-  --prepare-cmd 'cd projects/postgresql-17.4 && CPPFLAGS=-I../zlib-1.3.1 LDFLAGS=-L../zlib-1.3.1 ./configure --with-zlib --without-readline --without-openssl --without-icu --without-ldap --without-gssapi' \
-  --ensure-make-goal projects/zlib-1.3.1=libz.a \
-  --ensure-make-goal projects/postgresql-17.4/src/backend=generated-headers \
-  --ensure-make-goal projects/postgresql-17.4/src/port=pg_config_paths.h \
-  --ensure-make-goal projects/postgresql-17.4/src/port=libpgport_shlib.a \
-  --ensure-make-goal projects/postgresql-17.4/src/common=libpgcommon_shlib.a \
-  --depends-on projects/postgresql-17.4/src/interfaces/libpq=libpq.a \
-  --depends-on projects/zlib-1.3.1=libz.a \
-  --link-arg=projects/postgresql-17.4/src/common/libpgcommon_shlib.a \
-  --link-arg=projects/postgresql-17.4/src/port/libpgport_shlib.a \
-  --link-arg=-lm \
-  projects/test_postgres_main.c
-```
-
-`--prepare-cmd` and `--ensure-make-goal` are generic CLI features; PostgreSQL just happens to be a good stress case for them.
-
-To clean generated integration artifacts afterwards:
-
-```bash
-uv run python run.py clean
-```
-
-You can also clean specific targets only, for example `uv run python run.py clean zlib readline postgres`.
-
-Important dependency boundary:
-
-- the PostgreSQL integration tests configure `projects/postgresql-17.4/` against the repo-local `projects/readline-8.2/` and `projects/zlib-1.3.1/` trees
-- they do not use repo-local `projects/openssl-3.4.1/` in this path; PostgreSQL's native `libpq` build rejects the current static OpenSSL integration during its own reference check
-- for runtime tests, the native support archives `src/common/libpgcommon_shlib.a` and `src/port/libpgport_shlib.a` are built from the same PostgreSQL source tree
-- the full query test also builds native `postgres`, `initdb`, and `pg_ctl` from the same tree, stages a temporary `make install DESTDIR=...` runtime, starts a local server, then runs the `pcc`-built client against it
-
-The test helpers auto-configure PostgreSQL if needed, including a temporary include overlay so PostgreSQL picks the repo-local GNU Readline headers instead of the macOS system editline headers.
-
-Then run:
-
-```bash
-env -u LC_ALL uv run pytest tests/test_postgres.py -q -n0
-```
-
-The PostgreSQL test file covers:
-
-- make-goal source discovery for `libpq.a`
-- make-derived CPP arg collection without leaking recursive submake flags
-- `pcc`-compiled `libpq` linked with PostgreSQL's own support archives from the same tree
-- a real query roundtrip against a temporary native PostgreSQL server
-
-Compiling nginx 1.28.3
---------------------
-
-`pcc` can compile all ~130 nginx source files through its full pipeline
-(preprocess → parse → codegen → LLVM IR → verify), and produce a working
-nginx binary via `--system-link`.
-
-nginx uses system pcre2 and zlib (via `pkg-config`), so no repo-local
-library setup is needed.
-
-```bash
-# Configure nginx (only needed once)
 cd projects/nginx-1.28.3 && ./configure --with-cc-opt=-Wno-error && cd ../..
-
-# Run all nginx tests (per-file compilation + system-link binary)
 uv run pytest tests/test_nginx.py -v
 ```
 
-Tests in `tests/test_nginx.py`:
+---
 
-| Test | What it does |
-|------|-------------|
-| `test_nginx_make_goal_collects_source_files` | Verifies make-goal discovery finds nginx sources without pcre/zlib contamination |
-| `test_nginx_source_compile[<file>]` | Each `.c` file through pcc: preprocess → parse → codegen → IR serialize → LLVM verify |
-| `test_nginx_native_build` | Builds nginx natively as a baseline |
-| `test_nginx_full_system_link` | Compiles all sources with pcc, links with system cc, verifies the binary runs `nginx -V` |
+## Performance and optimization
 
-c-testsuite
---------------------
+`pcc` keeps a substantial amount of optimization and benchmark infrastructure in-tree.
 
-The project includes 220 test cases from [c-testsuite](https://github.com/c-testsuite/c-testsuite),
-a standard C conformance test suite. Each case is run through both the native
-compiler and `pcc`, comparing return codes and stdout/stderr.
+### Benchmark harnesses
 
-```bash
-uv run pytest tests/test_c_testsuite.py -v
-```
+- `bench/bench.py` — 80-case microbenchmark matrix, pass ablations, clean exec-only summaries
+- `benchmarks/run_benchmarks.py` — 46 standalone C programs, compile/exec/total timings
+- `benchmarks/quantify_passes.py` — aggregate pass-cost attribution
 
-A manifest at `tests/c_testsuite_manifest.json` categorizes every case into:
-- `runtime_exact_match` — pcc output matches native exactly
-- `runtime_returncode_match_only` — return code matches, output may differ
-- `runtime_native_pass_pcc_fail` — known pcc failures tracked as expected
-- `runtime_timeout` — cases that hang or take too long
+### Current headline numbers
 
-Clang C Tests
---------------------
+As documented in the benchmark sections of the repo, recent one-run macOS results include:
 
-161 test cases derived from Clang's C test suite, covering compile-only
-checks and runtime correctness. Each case is compared between the native
-compiler and `pcc`.
+- **80-case microbenchmark**, `pcc -O2` vs `clang -O2`: compile `1.12x`, exec `1.00x`, total `1.08x`, with `78/80` matched and clean
+- **46-file standalone suite**, `pcc/clang` geomeans at `O2`: compile `3.53x`, exec `1.00x`, total `2.00x`
+- **pcc-only O2/O0** on the 46-file suite: compile `1.02x`, exec `0.41x`, total `0.71x`
+
+Interpretation:
+
+- `pcc` is already near `clang` at runtime on the microbenchmark suite once LLVM `-O2` is enabled
+- compile-time cost is still meaningfully higher on the standalone suite
+- the pass framework is measured separately from LLVM backend optimization rather than being conflated with it
+
+### Reproduce benchmark runs
 
 ```bash
-uv run pytest tests/test_clang_c.py -v
+uv run python bench/bench.py --opt-level 1 --opt-level 2 --opt-level 3 --runs 1 --top-passes 12
+uv run python bench/bench.py --opt-level 1 --opt-level 2 --opt-level 3 --runs 1 --group-matrix
+uv run python bench/bench.py --opt-level 0 --opt-level 2 --runs 1 --top-passes 12
+uv run python benchmarks/run_benchmarks.py --opt-level 0 --opt-level 2 --runs 1
+uv run python benchmarks/run_benchmarks.py --opt-level 1 --opt-level 2 --opt-level 3 --runs 1
+uv run python benchmarks/quantify_passes.py --top 12
 ```
 
-A manifest at `tests/clang_c_manifest.json` categorizes cases into:
-- `compile_only_success` — both native and pcc compile successfully
-- `compile_only_both_fail` / `compile_only_native_pass_pcc_fail` / `compile_only_native_fail_pcc_pass` — compile-only edge cases
-- `runtime_exact_match` — pcc runtime output matches native exactly
-- `runtime_returncode_match_only` — return code matches, output may differ
-- `runtime_both_fail` — both native and pcc fail at runtime
+---
 
-GCC Torture Execute
---------------------
+## Testing and quality gates
 
-1684 test cases from GCC's `torture/execute` suite — a comprehensive
-stress test of C compiler correctness. Each case runs through both the
-native compiler and `pcc`, comparing return codes and output.
+`pcc` is validated with both focused regressions and large external suites.
+
+### Major suites
+
+| Suite | Scale | Purpose |
+|---|---:|---|
+| `tests/test_c_testsuite.py` | 220 cases | C conformance-style corpus |
+| `tests/test_clang_c.py` | 161 cases | Clang-derived C coverage |
+| `tests/test_gcc_torture_execute.py` | 1684 cases | GCC torture runtime stress |
+| `tests/test_lua.py` | 130+ Lua scripts / modes | real interpreter integration |
+| `tests/test_sqlite.py`, `tests/test_postgres.py`, `tests/test_nginx.py` | project-scale | large software validation |
+| `tests/py_corpus/` | 139 programs | Python frontend end-to-end corpus |
+
+### Common commands
 
 ```bash
-uv run pytest tests/test_gcc_torture_execute.py -v
+uv run pytest                # default suite (excludes expensive integration tests)
+uv run pytest -m integration # expensive end-to-end integration suite
+uv run pytest tests/test_lua.py -q -n0
+uv run pytest tests/test_sqlite.py -q -n0
+uv run pytest tests/test_postgres.py -q -n0
+uv run pytest tests/test_nginx.py -q -n0
 ```
 
-A manifest at `tests/gcc_torture_manifest.json` categorizes cases into:
-- `runtime_exact_match` — pcc output matches native exactly
-- `runtime_returncode_match_only` — return code matches, output may differ
-- `runtime_both_fail` — both native and pcc fail
-- `runtime_native_pass_pcc_fail` — known pcc failures tracked as expected
-- `runtime_native_fail_pcc_pass` — pcc accepts but native rejects
-- `runtime_timeout` — cases that hang or take too long
+---
 
-Add C test cases
---------------------
+## Compile cache
+
+`pcc` keeps a translation-unit compile cache on disk by default.
+
+### CLI
 
 ```bash
-# Single file: add to c_tests/ with expected return value
-echo '// EXPECT: 42
-int main(){ return 42; }' > c_tests/mytest.c
-
-# Multi-file project: create a directory with main.c
-mkdir c_tests/myproject
-# ... add .c and .h files, main.c must have: // EXPECT: N
-
-# Run all C file tests
-uv run pytest tests/test_c_files.py -v
+uv run pcc hello.c
+uv run pcc --cache-dir .pcc-cache hello.c
+uv run pcc --no-cache hello.c
 ```
 
-Preprocessor
---------------------
+### Library usage
 
-```c
-#include <stdio.h>          // system headers: 133 libc functions auto-declared
-#include "mylib.h"          // user headers: read and inline file content
-#define MAX_SIZE 100        // object-like macro
-#define MAX(a,b) ((a)>(b)?(a):(b))  // function-like macro
-#define DEBUG               // flag for conditional compilation
-#ifdef / #ifndef / #if / #elif / #else / #endif  // conditional compilation
-#if defined(X) && (VERSION >= 3)  // expression evaluation with defined()
-#undef NAME                 // undefine macro
+```python
+from pcc.evaluater.c_evaluator import CEvaluator
+
+ev = CEvaluator()
+ev.evaluate("int main(void) { return 0; }\n")
+ev.evaluate("int main(void) { return 0; }\n")  # cache hit
 ```
 
-Built-in macros: `NULL`, `EOF`, `EXIT_SUCCESS`, `EXIT_FAILURE`, `RAND_MAX`, `INT_MAX`, `INT_MIN`, `LLONG_MAX`, `CHAR_BIT`, `true`, `false`, `__STDC__`
+### Cache characteristics
 
-Built-in typedefs: `size_t`, `ssize_t`, `ptrdiff_t`, `va_list`, `FILE`, `time_t`, `clock_t`, `pid_t`
+- keyed from source/preprocess context and compiler fingerprint inputs
+- reused across evaluator runs, translation-unit compilation, and CLI workflows
+- useful for repeated large-project iteration
+- controlled via `--cache-dir`, `--no-cache`, and `PCC_COMPILE_CACHE_DIR`
 
-Supported C Features
---------------------
+---
 
-Supports all C99 features needed to compile real-world projects like Lua 5.5.0 and nginx: all types (int, float, double, char, void, structs, unions, enums, typedefs, pointers, arrays, function pointers), all operators, all control flow (if/else, for, while, do-while, switch, goto), variadic functions, preprocessor directives, and 133 libc functions auto-declared from stdio.h, stdlib.h, string.h, math.h, etc.
+## Documentation map
+
+| Topic | Path |
+|---|---|
+| System architecture | [docs/system-architecture.md](docs/system-architecture.md) |
+| Python tutorial | [docs/python-tutorial.md](docs/python-tutorial.md) |
+| Python how-to | [docs/python-howto.md](docs/python-howto.md) |
+| Python limitations | [docs/python-limitations.md](docs/python-limitations.md) |
+| Python scorecard | [docs/python-scorecard.md](docs/python-scorecard.md) |
+| Changelog | [docs/changelog.md](docs/changelog.md) |
+| Investigation reports | [docs/investigations/](docs/investigations/) |
+| Design plans | [docs/plans/](docs/plans/) |
+| Contributor/agent notes | [AGENTS.md](AGENTS.md) |
+
+Recommended deep-dive investigation docs:
+
+- [docs/investigations/lua-sort-random-pivot-signedness.md](docs/investigations/lua-sort-random-pivot-signedness.md)
+- [docs/investigations/pcre-op-lengths-incomplete-array-binding.md](docs/investigations/pcre-op-lengths-incomplete-array-binding.md)
+- [docs/investigations/zlib-integration-static-local-arrays-and-layout.md](docs/investigations/zlib-integration-static-local-arrays-and-layout.md)
+- [docs/investigations/sqlite-integration-vfs-init-and-mcjit-lifecycle.md](docs/investigations/sqlite-integration-vfs-init-and-mcjit-lifecycle.md)
+- [docs/investigations/sqlite-forward-declared-bitfield-struct-tags.md](docs/investigations/sqlite-forward-declared-bitfield-struct-tags.md)
+- [docs/investigations/nbody-shootout-fp-contract-and-vectorization.md](docs/investigations/nbody-shootout-fp-contract-and-vectorization.md)
+
+---
+
+## Repository map
+
+| Path | Role |
+|---|---|
+| `pcc/pcc.py` | CLI entrypoint |
+| `pcc/api.py` | build/module APIs |
+| `pcc/project.py` | source collection and build orchestration |
+| `pcc/evaluater/c_evaluator.py` | C compilation/execution coordinator |
+| `pcc/codegen/c_codegen.py` | C semantic lowering |
+| `pcc/passes/` | optimization framework |
+| `pcc/py_frontend/` | Python frontend |
+| `pcc/py_runtime/` | Python runtime archive |
+| `pcc/extern/` | extern-C bridge |
+| `utils/fake_libc_include/` | fake libc headers |
+| `tests/` | correctness and integration suites |
+| `projects/` | third-party software used as stress targets |
+| `bench/`, `benchmarks/` | performance tooling |
+
+---
+
+## Supported C feature set
+
+`pcc` supports the C features needed by the real-world integrations in this repo, including:
+
+- scalar types, pointers, arrays, structs, unions, enums, typedefs, and function pointers
+- arithmetic, comparison, casts, bitwise ops, shifts, and control flow
+- variadic functions
+- preprocessing with macro expansion and conditional compilation
+- multi-file builds and project-style source collection
+
+The practical standard here is not “can it parse a feature in isolation”, but “can it preserve the right semantics once the code is lowered to LLVM IR and exercised by real software”.
+
+---
+
+## Development
+
+Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
+
+```bash
+uv sync
+uv run pytest
+uv run pytest -m integration
+```
+
+If you are contributing compiler changes, read [AGENTS.md](AGENTS.md) first. It documents the repository's debugging playbook, testing policy, C signedness model, project workflows, and definition of done.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,0 +1,42 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "StaticAssert",
+      "cond": {
+        "_t": "BinaryOp",
+        "left": {
+          "_t": "UnaryOp",
+          "expr": {
+            "_t": "Typename",
+            "name": null,
+            "quals": [],
+            "type": {
+              "_t": "TypeDecl",
+              "declname": null,
+              "quals": [],
+              "type": {
+                "_t": "IdentifierType",
+                "names": [
+                  "int"
+                ]
+              }
+            }
+          },
+          "op": "sizeof"
+        },
+        "op": ">=",
+        "right": {
+          "_t": "Constant",
+          "type": "int",
+          "value": "4"
+        }
+      },
+      "message": {
+        "_t": "Constant",
+        "type": "string",
+        "value": "\"too small\""
+      }
+    }
+  ]
+}

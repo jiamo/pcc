@@ -78,5 +78,6 @@ def parse_file(filename, use_cpp=False, cpp_path='cpp', cpp_args='',
             text = f.read()
 
     if parser is None:
-        parser = CParser()
+        from . import make_c_parser
+        parser = make_c_parser()
     return parser.parse(text, filename)

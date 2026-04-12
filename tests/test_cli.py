@@ -3,6 +3,7 @@ import subprocess
 
 from click.testing import CliRunner
 
+from pcc.passes import find_opt_binary
 from pcc.pcc import main
 
 
@@ -217,6 +218,99 @@ def test_cpp_arg_supports_depends_on_multi_input(tmp_path):
     result = CliRunner().invoke(
         main,
         ["--cpp-arg=-DVALUE=41", "--depends-on", str(helper_path), str(main_path)],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_backend_llvm_flag_is_accepted(tmp_path):
+    main_path = tmp_path / "main.c"
+    main_path.write_text("int main(void) { return 0; }\n")
+
+    result = CliRunner().invoke(
+        main,
+        ["--backend", "llvm", str(main_path)],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_backend_self_can_run_simple_program(tmp_path):
+    main_path = tmp_path / "main.c"
+    main_path.write_text("int main(void) { return 0; }\n")
+
+    result = CliRunner().invoke(
+        main,
+        ["--backend", "self", str(main_path)],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_backend_self_emit_asm_starts_aarch64_mvp(tmp_path):
+    main_path = tmp_path / "main.c"
+    asm_path = tmp_path / "main.s"
+    main_path.write_text("int main(void) { return 7; }\n")
+
+    result = CliRunner().invoke(
+        main,
+        ["--backend", "self", "--emit-asm", str(asm_path), str(main_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert asm_path.is_file()
+    asm_text = asm_path.read_text()
+    assert "_main:" in asm_text
+    assert "movz w0, #7" in asm_text
+
+
+def test_pass_option_can_select_single_repo_pass_at_o0(tmp_path):
+    main_path = tmp_path / "main.c"
+    main_path.write_text("int main(void) { return 0; }\n")
+
+    result = CliRunner().invoke(
+        main,
+        ["-O0", "--pass", "canonicalize", str(main_path)],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_pass_option_can_select_registered_llvm_alias_at_o0(tmp_path):
+    main_path = tmp_path / "main.c"
+    main_path.write_text("int main(void) { return 0; }\n")
+
+    result = CliRunner().invoke(
+        main,
+        ["-O0", "--pass", "function-attrs", str(main_path)],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_disable_pass_rejects_unknown_name(tmp_path):
+    main_path = tmp_path / "main.c"
+    main_path.write_text("int main(void) { return 0; }\n")
+
+    result = CliRunner().invoke(
+        main,
+        ["--disable-pass", "definitely-not-a-pass", str(main_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "unknown pass name(s): definitely-not-a-pass" in result.output
+
+
+def test_pass_option_can_select_single_llvm_pass_when_opt_available(tmp_path):
+    if find_opt_binary() is None:
+        return
+
+    main_path = tmp_path / "main.c"
+    main_path.write_text("int main(void) { return 0; }\n")
+
+    result = CliRunner().invoke(
+        main,
+        ["--pass", "instcombine", str(main_path)],
     )
 
     assert result.exit_code == 0

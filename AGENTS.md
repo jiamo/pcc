@@ -406,3 +406,5 @@ GitHub Actions will automatically build and publish to PyPI via Trusted Publishe
   Detailed report for a later SQLite integration failure that first looked like a runtime logic bug and turned out to be incorrect handling of standalone tag definitions and forward-declared named bitfield structs in the type system.
 - `docs/investigations/make-derived-cpp-flags-vs-explicit-project-config.md`
   Detailed report on why make-derived preprocessor inference covered PCRE but not Lua, zlib, or SQLite, and when explicit `--cpp-arg` values are the right interface instead of compiler-side project detection.
+- `docs/investigations/nbody-shootout-fp-contract-and-vectorization.md`
+  Detailed report on why `nbody_shootout` was not just a "missing vectorization" issue, how LLVM `contract` flags fixed the catastrophic regression, and which follow-up optimization directions were ruled in or out.

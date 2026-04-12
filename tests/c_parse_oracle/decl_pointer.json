@@ -1,0 +1,27 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": "p",
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "PtrDecl",
+        "quals": [],
+        "type": {
+          "_t": "TypeDecl",
+          "declname": "p",
+          "quals": [],
+          "type": {
+            "_t": "IdentifierType",
+            "names": [
+              "int"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

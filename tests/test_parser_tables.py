@@ -1,7 +1,12 @@
 import sys
 from pathlib import Path
 
-from pcc.parse.c_parser import CParser, _default_ply_cache_dir
+from pcc.parse.c_parser import (
+    CParser,
+    _DEFAULT_PLY_LEXTAB,
+    _DEFAULT_PLY_YACCTAB,
+    _default_ply_cache_dir,
+)
 
 
 def test_cparser_ignores_stale_yacctab_without_tabversion(tmp_path, monkeypatch):
@@ -39,5 +44,5 @@ def test_default_cparser_uses_stable_cache_and_does_not_dirty_cwd(tmp_path, monk
     assert not (tmp_path / "parser.out").exists()
 
     cache_dir = Path(_default_ply_cache_dir())
-    assert (cache_dir / "pcc_yacctab.py").exists()
-    assert (cache_dir / "pcc_lextab.py").exists()
+    assert (cache_dir / f"{_DEFAULT_PLY_YACCTAB}.py").exists()
+    assert (cache_dir / f"{_DEFAULT_PLY_LEXTAB}.py").exists()

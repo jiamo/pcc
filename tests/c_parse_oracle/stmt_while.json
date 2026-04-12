@@ -1,0 +1,79 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "While",
+            "cond": {
+              "_t": "ID",
+              "name": "a"
+            },
+            "stmt": {
+              "_t": "UnaryOp",
+              "expr": {
+                "_t": "ID",
+                "name": "a"
+              },
+              "op": "p--"
+            }
+          },
+          {
+            "_t": "Return",
+            "expr": {
+              "_t": "ID",
+              "name": "a"
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "f",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Decl",
+                "funcspec": [],
+                "name": "a",
+                "quals": [],
+                "storage": [],
+                "type": {
+                  "_t": "TypeDecl",
+                  "declname": "a",
+                  "quals": [],
+                  "type": {
+                    "_t": "IdentifierType",
+                    "names": [
+                      "int"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "f",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

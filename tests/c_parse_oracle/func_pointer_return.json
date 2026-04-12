@@ -1,0 +1,51 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": "make",
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "FuncDecl",
+        "args": {
+          "_t": "ParamList",
+          "params": [
+            {
+              "_t": "Typename",
+              "name": null,
+              "quals": [],
+              "type": {
+                "_t": "TypeDecl",
+                "declname": null,
+                "quals": [],
+                "type": {
+                  "_t": "IdentifierType",
+                  "names": [
+                    "void"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "type": {
+          "_t": "PtrDecl",
+          "quals": [],
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "make",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -8,6 +8,7 @@ from pcc.project import (
     collect_translation_units,
     translation_unit_include_dirs,
 )
+from tests.parallel_jobs import translation_unit_jobs
 
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
@@ -34,7 +35,7 @@ def zstd_compiled_units():
     compiled_units = CEvaluator().compile_translation_units(
         units,
         base_dir=base_dir,
-        jobs=2,
+        jobs=translation_unit_jobs(),
         include_dirs=translation_unit_include_dirs(units),
         cpp_args=_zstd_cpp_args(),
     )
@@ -42,6 +43,7 @@ def zstd_compiled_units():
 
 
 @pytest.mark.skipif(not os.path.isdir(ZSTD_LIB_DIR), reason="zstd-1.5.6/lib not found")
+@pytest.mark.integration
 def test_zstd_runtime_with_mcjit_depends_on(zstd_compiled_units):
     compiled_units, _base_dir = zstd_compiled_units
 
@@ -54,6 +56,7 @@ def test_zstd_runtime_with_mcjit_depends_on(zstd_compiled_units):
 
 
 @pytest.mark.skipif(not os.path.isdir(ZSTD_LIB_DIR), reason="zstd-1.5.6/lib not found")
+@pytest.mark.integration
 def test_zstd_runtime_with_system_link_depends_on(zstd_compiled_units):
     compiled_units, base_dir = zstd_compiled_units
 

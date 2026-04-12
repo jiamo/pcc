@@ -13,6 +13,7 @@ from tests.worker_process import run_worker_process
 
 
 DEFAULT_TIMEOUT = 10
+XDIST_TIMEOUT = 20
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,14 @@ def subprocess_env():
     env = os.environ.copy()
     env.pop("LC_ALL", None)
     return env
+
+
+def _default_timeout() -> int:
+    # pytest-xdist runs many cases in parallel, and each pcc case also spawns
+    # an extra worker process. A 10s budget becomes flaky under that load.
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        return XDIST_TIMEOUT
+    return DEFAULT_TIMEOUT
 
 
 def _host_cc():
@@ -83,7 +92,13 @@ def read_expected_output(case_path: Path) -> str:
     return ""
 
 
-def run_native(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT):
+def run_native(
+    case_path: Path,
+    repo_root: Path,
+    timeout: int | None = None,
+):
+    if timeout is None:
+        timeout = _default_timeout()
     cc = _host_cc()
     config = case_config(case_path)
     with tempfile.TemporaryDirectory(prefix="c_testsuite_native_") as tmpdir:
@@ -108,7 +123,13 @@ def run_native(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT)
         )
 
 
-def run_pcc(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT) -> PccCompileResult:
+def run_pcc(
+    case_path: Path,
+    repo_root: Path,
+    timeout: int | None = None,
+) -> PccCompileResult:
+    if timeout is None:
+        timeout = _default_timeout()
     del repo_root
     return _run_pcc_worker("run", case_path, timeout)
 

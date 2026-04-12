@@ -67,6 +67,112 @@ def test_clang_builtins_and___func___work_with_system_link():
     ), f"clang builtin compat failed:\n{result.stdout}\n{result.stderr}"
 
 
+def test_signed_int_min_wrap_survives_optimized_codegen():
+    source = r"""
+        #define INT_MIN (-2147483647 - 1)
+
+        int test_add(int x) {
+            return x + INT_MIN;
+        }
+
+        int test_sub(int x) {
+            return x - INT_MIN;
+        }
+
+        int main(void) {
+            unsigned int add_bits = (unsigned int)test_add(0x12345678);
+            unsigned int sub_bits = (unsigned int)test_sub((int)0x92345678u);
+            if (add_bits != 0x92345678u) return 1;
+            if (sub_bits != 0x12345678u) return 2;
+            return 0;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_unsigned_bitfield_assignment_to_int_clears_unsigned_metadata():
+    source = r"""
+        struct foo {
+            unsigned y : 1;
+            unsigned x : 32;
+        };
+
+        int f(struct foo x) {
+            int t = x.x;
+            if (t < 0) return 1;
+            return t + 1;
+        }
+
+        int main(void) {
+            struct foo x;
+            x.x = -1;
+            return f(x) == 0 ? 1 : 0;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_hex_unsigned_int_literal_zero_extends_when_assigned_to_long():
+    source = r"""
+        int main(void) {
+            long value = 0x89ABCDEF;
+            return value < 0 ? 1 : 0;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_large_negative_long_long_global_initializer_survives_default_pipeline():
+    source = r"""
+        long long b = -754324895235774564;
+
+        int main(void) {
+            return b < 0 ? 0 : 1;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_for_condition_assignment_remains_loop_variant_after_default_pipeline():
+    source = r"""
+        static int scan_quote(const unsigned char *z) {
+            int i, c;
+            int delim = z[0];
+
+            for (i = 1; (c = z[i]) != 0; i++) {
+                if (c == delim) {
+                    return i;
+                }
+            }
+
+            return i;
+        }
+
+        int main(void) {
+            if (scan_quote((const unsigned char*)"'x';") != 2) return 1;
+            if (scan_quote((const unsigned char*)"\"x\";") != 2) return 2;
+            if (scan_quote((const unsigned char*)"'xx") != 3) return 3;
+            return 0;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_c11_noreturn_function_specifier_parses_in_prototype_and_definition():
     source = r"""
         _Noreturn void die(void);
@@ -121,6 +227,31 @@ def test_builtin_constant_p_falls_back_to_runtime_path_with_system_cpp():
     assert (
         result.returncode == 0
     ), f"__builtin_constant_p compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_builtin_constant_p_lowers_without_system_cpp_macro_fallback():
+    source = r"""
+        int main(void) {
+            return __builtin_constant_p(1 + 2) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_builtin_assume_aligned_lowers_without_declaration():
+    source = r"""
+        int *helper(int *p) {
+            return __builtin_assume_aligned(p, 16);
+        }
+
+        int main(void) {
+            int value = 7;
+            return *helper(&value) == 7 ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
 
 
 def test_system_cpp_normalizes_choose_expr_malloc_abs_and_sync_add_fetch():
@@ -899,6 +1030,54 @@ def test_system_cpp_normalizes_simple_typeof_identifier_declarations():
     assert (
         result.returncode == 0
     ), f"typeof(identifier) compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_system_cpp_normalizes_initialized_and_declaration_only_typeof_forms():
+    source = r"""
+        static int f(void) {
+            return 7;
+        }
+
+        int main(void) {
+            typeof(&f) ignored;
+            double placeholder = 10.0;
+            typeof(placeholder) y = placeholder;
+            typeof((placeholder + 1.0)) z = 1;
+
+            (void)ignored;
+            return y == 10.0 && z == 1 ? 0 : 1;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"typeof(expr) declaration compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_system_cpp_injects_bool_true_false_and_wchar_t_when_missing():
+    source = r"""
+        int wmain(int argc, wchar_t *argv[]) {
+            (void)argc;
+            (void)argv;
+            return 0;
+        }
+
+        bool dllmain(void) {
+            return true;
+        }
+
+        int main(void) {
+            return dllmain() ? 0 : 1;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"bool/wchar_t system-cpp compat failed:\n{result.stdout}\n{result.stderr}"
 
 
 def test_knr_variadic_definition_inherits_prior_prototype():

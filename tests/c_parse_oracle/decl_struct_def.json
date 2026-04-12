@@ -1,0 +1,56 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": null,
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "Struct",
+        "decls": [
+          {
+            "_t": "Decl",
+            "funcspec": [],
+            "name": "val",
+            "quals": [],
+            "storage": [],
+            "type": {
+              "_t": "TypeDecl",
+              "declname": "val",
+              "quals": [],
+              "type": {
+                "_t": "IdentifierType",
+                "names": [
+                  "int"
+                ]
+              }
+            }
+          },
+          {
+            "_t": "Decl",
+            "funcspec": [],
+            "name": "next",
+            "quals": [],
+            "storage": [],
+            "type": {
+              "_t": "PtrDecl",
+              "quals": [],
+              "type": {
+                "_t": "TypeDecl",
+                "declname": "next",
+                "quals": [],
+                "type": {
+                  "_t": "Struct",
+                  "name": "Node"
+                }
+              }
+            }
+          }
+        ],
+        "name": "Node"
+      }
+    }
+  ]
+}

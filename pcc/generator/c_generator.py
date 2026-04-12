@@ -23,9 +23,67 @@ class CGenerator(object):
     def _make_indent(self):
         return ' ' * self.indent_level
 
+    # Dispatch table keyed by concrete ``c_ast`` node class. Built
+    # lazily on first use — see ``_build_dispatch``. Keeping this
+    # explicit avoids the ``getattr(self, "visit_" + name)`` pattern
+    # flagged by ``scripts/audit_selfhost.py`` as a self-host blocker.
+    _dispatch = None
+
     def visit(self, node):
-        method = 'visit_' + node.__class__.__name__
-        return getattr(self, method, self.generic_visit)(node)
+        owner = type(self)
+        disp = owner.__dict__.get("_dispatch")
+        if disp is None:
+            disp = owner._build_dispatch()
+            owner._dispatch = disp
+        fn = disp.get(type(node))
+        if fn is None:
+            return self.generic_visit(node)
+        return fn(self, node)
+
+    @classmethod
+    def _build_dispatch(cls):
+        return {
+            c_ast.Constant: cls.visit_Constant,
+            c_ast.ID: cls.visit_ID,
+            c_ast.ArrayRef: cls.visit_ArrayRef,
+            c_ast.StructRef: cls.visit_StructRef,
+            c_ast.FuncCall: cls.visit_FuncCall,
+            c_ast.UnaryOp: cls.visit_UnaryOp,
+            c_ast.BinaryOp: cls.visit_BinaryOp,
+            c_ast.Assignment: cls.visit_Assignment,
+            c_ast.IdentifierType: cls.visit_IdentifierType,
+            c_ast.Decl: cls.visit_Decl,
+            c_ast.DeclList: cls.visit_DeclList,
+            c_ast.Typedef: cls.visit_Typedef,
+            c_ast.Cast: cls.visit_Cast,
+            c_ast.ExprList: cls.visit_ExprList,
+            c_ast.InitList: cls.visit_InitList,
+            c_ast.Enum: cls.visit_Enum,
+            c_ast.FuncDef: cls.visit_FuncDef,
+            c_ast.FileAST: cls.visit_FileAST,
+            c_ast.Compound: cls.visit_Compound,
+            c_ast.EmptyStatement: cls.visit_EmptyStatement,
+            c_ast.ParamList: cls.visit_ParamList,
+            c_ast.Return: cls.visit_Return,
+            c_ast.Break: cls.visit_Break,
+            c_ast.Continue: cls.visit_Continue,
+            c_ast.TernaryOp: cls.visit_TernaryOp,
+            c_ast.If: cls.visit_If,
+            c_ast.For: cls.visit_For,
+            c_ast.While: cls.visit_While,
+            c_ast.DoWhile: cls.visit_DoWhile,
+            c_ast.Switch: cls.visit_Switch,
+            c_ast.Case: cls.visit_Case,
+            c_ast.Default: cls.visit_Default,
+            c_ast.Label: cls.visit_Label,
+            c_ast.Goto: cls.visit_Goto,
+            c_ast.EllipsisParam: cls.visit_EllipsisParam,
+            c_ast.Struct: cls.visit_Struct,
+            c_ast.Typename: cls.visit_Typename,
+            c_ast.Union: cls.visit_Union,
+            c_ast.NamedInitializer: cls.visit_NamedInitializer,
+            c_ast.FuncDecl: cls.visit_FuncDecl,
+        }
 
     def generic_visit(self, node):
         #~ print('generic:', type(node))

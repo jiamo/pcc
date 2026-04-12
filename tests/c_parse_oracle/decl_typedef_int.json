@@ -1,0 +1,24 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Typedef",
+      "name": "my_int",
+      "quals": [],
+      "storage": [
+        "typedef"
+      ],
+      "type": {
+        "_t": "TypeDecl",
+        "declname": "my_int",
+        "quals": [],
+        "type": {
+          "_t": "IdentifierType",
+          "names": [
+            "int"
+          ]
+        }
+      }
+    }
+  ]
+}

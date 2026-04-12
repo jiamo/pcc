@@ -4,6 +4,7 @@ import pytest
 
 from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.project import collect_translation_units, translation_unit_include_dirs
+from tests.parallel_jobs import translation_unit_jobs
 
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
@@ -32,7 +33,7 @@ def zlib_compiled_units():
     compiled_units = CEvaluator().compile_translation_units(
         units,
         base_dir=base_dir,
-        jobs=2,
+        jobs=translation_unit_jobs(),
         include_dirs=translation_unit_include_dirs(units),
         cpp_args=ZLIB_CPP_ARGS,
     )

@@ -1,0 +1,117 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "If",
+            "cond": {
+              "_t": "BinaryOp",
+              "left": {
+                "_t": "ID",
+                "name": "n"
+              },
+              "op": "<=",
+              "right": {
+                "_t": "Constant",
+                "type": "int",
+                "value": "1"
+              }
+            },
+            "iftrue": {
+              "_t": "Return",
+              "expr": {
+                "_t": "Constant",
+                "type": "int",
+                "value": "1"
+              }
+            }
+          },
+          {
+            "_t": "Return",
+            "expr": {
+              "_t": "BinaryOp",
+              "left": {
+                "_t": "ID",
+                "name": "n"
+              },
+              "op": "*",
+              "right": {
+                "_t": "FuncCall",
+                "args": {
+                  "_t": "ExprList",
+                  "exprs": [
+                    {
+                      "_t": "BinaryOp",
+                      "left": {
+                        "_t": "ID",
+                        "name": "n"
+                      },
+                      "op": "-",
+                      "right": {
+                        "_t": "Constant",
+                        "type": "int",
+                        "value": "1"
+                      }
+                    }
+                  ]
+                },
+                "name": {
+                  "_t": "ID",
+                  "name": "factorial"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "factorial",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Decl",
+                "funcspec": [],
+                "name": "n",
+                "quals": [],
+                "storage": [],
+                "type": {
+                  "_t": "TypeDecl",
+                  "declname": "n",
+                  "quals": [],
+                  "type": {
+                    "_t": "IdentifierType",
+                    "names": [
+                      "int"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "factorial",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

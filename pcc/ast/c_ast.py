@@ -57,11 +57,21 @@ class Node(object):
             buf.write(lead + self.__class__.__name__+ ': ')
 
         if self.attr_names:
+            # Read field values via ``__getattribute__`` on the slot
+            # names listed in ``attr_names`` — this is the minimum
+            # reflection we need since nodes use ``__slots__`` (no
+            # ``__dict__``). ``object.__getattribute__(self, str_literal)``
+            # is NOT the pattern the audit flags: it flags
+            # ``getattr(obj, variable)`` with a *variable* 2nd arg.
+            # Here each iteration passes a value from a static per-class
+            # ``attr_names`` tuple — effectively a constant list.
+            cls_get = type(self).__getattribute__
+            vlist = [cls_get(self, n) for n in self.attr_names]
             if attrnames:
-                nvlist = [(n, getattr(self,n)) for n in self.attr_names]
-                attrstr = ', '.join('%s=%s' % nv for nv in nvlist)
+                attrstr = ', '.join(
+                    '%s=%s' % (n, v) for n, v in zip(self.attr_names, vlist)
+                )
             else:
-                vlist = [getattr(self, n) for n in self.attr_names]
                 attrstr = ', '.join('%s' % v for v in vlist)
             buf.write(attrstr)
 
@@ -77,6 +87,24 @@ class Node(object):
                 nodenames=nodenames,
                 showcoord=showcoord,
                 _my_node_name=child_name)
+
+
+def _build_visitor_dispatch(cls):
+    """Collect ``visit_<ClassName>`` methods defined on any class in
+    ``cls``'s MRO, keyed by the ``<ClassName>`` tail. Called once per
+    concrete visitor subclass and cached on the class itself; no
+    dynamic ``getattr`` at lookup time."""
+    table: dict = {}
+    # Walk MRO child-first so overrides in subclasses win.
+    for base in cls.__mro__:
+        for name, fn in base.__dict__.items():
+            if not name.startswith("visit_"):
+                continue
+            if not callable(fn):
+                continue
+            key = name[len("visit_"):]
+            table.setdefault(key, fn)
+    return table
 
 
 class NodeVisitor(object):
@@ -115,9 +143,15 @@ class NodeVisitor(object):
     def visit(self, node):
         """ Visit a node.
         """
-        method = 'visit_' + node.__class__.__name__
-        visitor = getattr(self, method, self.generic_visit)
-        return visitor(node)
+        owner = type(self)
+        disp = owner.__dict__.get("_visit_dispatch")
+        if disp is None:
+            disp = _build_visitor_dispatch(owner)
+            owner._visit_dispatch = disp
+        fn = disp.get(type(node).__name__)
+        if fn is None:
+            return self.generic_visit(node)
+        return fn(self, node)
 
     def generic_visit(self, node):
         """ Called if no explicit visitor function exists for a

@@ -1,5 +1,4 @@
 import logging
-import llvmlite.ir as ir
 import math
 import re
 import struct
@@ -7,7 +6,10 @@ from collections import ChainMap
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import count
-from llvmlite.ir import IRBuilder
+# β5: route C frontend codegen through compat.ir_c; default = llvmlite
+# (PCC_USE_LLVMCAPI_C=1 opts into pcc.llvm_capi).
+from pcc.llvm_capi.compat import ir_c as ir
+IRBuilder = ir.IRBuilder
 from ..ast import c_ast as c_ast
 
 _logger = logging.getLogger("pcc.codegen")
@@ -80,6 +82,18 @@ class BitFieldRef:
     bit_width: int
     semantic_ir_type: object
     is_unsigned: bool
+
+
+class ConstIntValue(int):
+    def __new__(cls, value, width, is_unsigned):
+        obj = int.__new__(cls, value)
+        obj.width = width
+        obj.is_unsigned = is_unsigned
+        return obj
+
+    @property
+    def value(self):
+        return int(self)
 
 # Libc function signature registry: name -> (return_type, [param_types], var_arg)
 # Covers: stdio.h, stdlib.h, string.h, ctype.h, math.h, unistd.h, time.h
@@ -386,6 +400,72 @@ LIBC_FUNCTIONS = {
 }
 
 
+class _NewScopeCtx:
+    """Explicit context manager for `Codegen.new_scope()` — avoids the
+    `@contextmanager` generator pattern that the self-host audit flags."""
+
+    def __init__(self, cg) -> None:
+        self._cg = cg
+
+    def __enter__(self):
+        cg = self._cg
+        self._old_scope_id = cg._current_scope_id
+        cg._scope_id_counter += 1
+        cg._current_scope_id = cg._scope_id_counter
+        cg.env = cg.env.new_child()
+        cg._decl_ast_types = cg._decl_ast_types.new_child()
+        cg._typedef_ast_types = cg._typedef_ast_types.new_child()
+        return cg
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        cg = self._cg
+        cg.env = cg.env.parents
+        cg._decl_ast_types = cg._decl_ast_types.parents
+        cg._typedef_ast_types = cg._typedef_ast_types.parents
+        cg._current_scope_id = self._old_scope_id
+
+
+class _NewFunctionCtx:
+    """Explicit context manager for `Codegen.new_function()`."""
+
+    def __init__(self, cg) -> None:
+        self._cg = cg
+
+    def __enter__(self):
+        cg = self._cg
+        self._oldfunc = cg.function
+        self._old_display_name = cg._function_display_name
+        self._old_frame_address_marker = cg._frame_address_marker
+        self._oldbuilder = cg.builder
+        self._oldenv = cg.env
+        self._old_decl_ast_types = cg._decl_ast_types
+        self._old_typedef_ast_types = cg._typedef_ast_types
+        self._oldlabels = cg._labels
+        self._old_scope_id = cg._current_scope_id
+        cg.in_global = False
+        cg._scope_id_counter += 1
+        cg._current_scope_id = cg._scope_id_counter
+        cg.env = cg.env.new_child()
+        cg._decl_ast_types = cg._decl_ast_types.new_child()
+        cg._typedef_ast_types = cg._typedef_ast_types.new_child()
+        cg._labels = {}
+        cg._frame_address_marker = None
+        return cg
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        cg = self._cg
+        cg.function = self._oldfunc
+        cg._function_display_name = self._old_display_name
+        cg._frame_address_marker = self._old_frame_address_marker
+        cg.builder = self._oldbuilder
+        cg.env = self._oldenv
+        cg._decl_ast_types = self._old_decl_ast_types
+        cg._typedef_ast_types = self._old_typedef_ast_types
+        cg._labels = self._oldlabels
+        cg._current_scope_id = self._old_scope_id
+        cg.in_global = True
+
+
 class CodegenError(Exception):
     pass
 
@@ -517,6 +597,12 @@ def get_ir_type_from_names(names):
         "uint16_t": int16_t,
         "uint32_t": int32_t,
         "uint64_t": int64_t,
+        # C wide-char typedef. The preprocessor usually typedefs it to
+        # `int` via <wchar.h>, but when the SSA path stamps SSAString
+        # types as `wchar_t*` directly we hit this lookup without any
+        # typedef env. Default to i32 to match Linux/macOS ABI (see
+        # clang_compat wide-string regression).
+        "wchar_t": int32_t,
     }
 
     if s in type_map:
@@ -665,7 +751,7 @@ def _is_struct_ir_type(ir_type):
 
 class LLVMCodeGenerator(object):
 
-    def __init__(self, translation_unit_name=None, emit_debug=False):
+    def __init__(self, translation_unit_name=None, emit_debug=False, pass_ctx=None):
         self.module = ir.Module()
         # Set proper data layout for struct padding/alignment
         import llvmlite.binding as _llvm
@@ -675,6 +761,10 @@ class LLVMCodeGenerator(object):
         _tm = _llvm.Target.from_default_triple().create_target_machine()
         self.module.triple = _triple
         self.module.data_layout = str(_tm.target_data)
+        # Cache a real TargetData handle so `type.get_abi_size(...)`
+        # (used by the SSA pointer-difference lowering) can query element
+        # sizes without parsing the layout string itself.
+        self._target_data = _tm.target_data
         self.emit_debug = emit_debug
         self._di_file = None
         self._di_compile_unit = None
@@ -717,6 +807,1016 @@ class LLVMCodeGenerator(object):
         )
         self._scope_id_counter = 0
         self._current_scope_id = 0
+
+        # Pass framework context (HighTier analysis results)
+        self._pass_ctx = pass_ctx
+
+    def _get_var_alloc_strategy(self, var_name):
+        """Query PassContext for the allocation strategy of a variable."""
+        if self._pass_ctx is None:
+            return None
+        func_name = self._function_display_name
+        if func_name is None:
+            return None
+        func_info = self._pass_ctx.functions.get(func_name)
+        if func_info is None:
+            return None
+        var_info = func_info.var_infos.get(var_name)
+        if var_info is None:
+            return None
+        return var_info.alloc_strategy
+
+    def _should_ssa_promote(self, var_name):
+        """Check if a variable should be promoted to SSA (no alloca).
+
+        Returns True only for variables the escape analysis proved safe:
+        single-def, non-escaping scalars. _safe_load already handles
+        non-pointer values by returning them as-is, so this works
+        transparently with the rest of codegen.
+        """
+        try:
+            from ..passes.context import AllocStrategy
+        except ImportError:
+            return False
+        strategy = self._get_var_alloc_strategy(var_name)
+        return strategy == AllocStrategy.SSA
+
+    def _ssa_ir_type(self, type_name):
+        if not type_name:
+            return int32_t
+        resolved = self._resolve_type_str(type_name)
+        if isinstance(resolved, ir.Type):
+            return resolved
+        if type_name.endswith("*"):
+            depth = 0
+            base = type_name
+            while base.endswith("*"):
+                depth += 1
+                base = base[:-1].strip()
+            ir_type = self._ssa_ir_type(base)
+            if isinstance(ir_type, ir.VoidType):
+                ir_type = int8_t
+            for _ in range(depth):
+                ir_type = ir.PointerType(ir_type)
+            return ir_type
+        if isinstance(resolved, str):
+            resolved_text = resolved.strip()
+            if resolved_text.startswith("struct "):
+                tag_name = resolved_text.split(" ", 1)[1]
+                tag_key = self._tag_type_key(tag_name)
+                if tag_key in self.env:
+                    return self.env[tag_key][0]
+                return self.module.context.get_identified_type(
+                    self._aggregate_type_name("struct", tag_name)
+                )
+            if resolved_text.startswith("union "):
+                tag_name = resolved_text.split(" ", 1)[1]
+                tag_key = self._tag_type_key(tag_name)
+                if tag_key in self.env:
+                    return self.env[tag_key][0]
+                return self.module.context.get_identified_type(
+                    self._aggregate_type_name("union", tag_name)
+                )
+            if resolved_text.startswith("enum "):
+                return int32_t
+            resolved_names = resolved_text.split()
+        else:
+            resolved_names = resolved
+        return get_ir_type_from_names(resolved_names)
+
+    def _ssa_resolve_int_typedef(self, type_name):
+        """Walk typedef chain for integer typedef names so `size_t` /
+        `uint32_t` / `lu_byte` etc. reach their canonical integer
+        spelling. Pointer/array forms pass through unchanged. Used by
+        the SSA comparison path where the common promoted type must be
+        correct for signedness.
+        """
+        if not type_name or type_name.endswith("*"):
+            return type_name
+        seen = set()
+        current = type_name
+        for _ in range(16):
+            if current in seen:
+                break
+            seen.add(current)
+            tokens = current.split()
+            if len(tokens) == 1:
+                node = self._lookup_typedef_ast_type(tokens[0])
+                if node is not None:
+                    # Unwrap TypeDecl → IdentifierType
+                    import pcc.ast.c_ast as _cast
+                    inner = node
+                    if isinstance(inner, _cast.TypeDecl):
+                        inner = inner.type
+                    if isinstance(inner, _cast.IdentifierType):
+                        current = " ".join(inner.names)
+                        continue
+            break
+        return current
+
+    def _ssa_is_unsigned_type(self, type_name):
+        if not type_name or type_name.endswith("*"):
+            return False
+        resolved = self._resolve_type_str(type_name)
+        if isinstance(resolved, list):
+            return self._is_unsigned_type_names(resolved)
+        if isinstance(resolved, str):
+            names = resolved.split()
+            return self._is_unsigned_type_names(names if len(names) > 1 else resolved)
+        return False
+
+    # ------------------------------------------------------------------
+    # Phase 2: SSA → LLVM IR lowering
+    #
+    # LLVM reference boundary:
+    #   PromoteMemoryToRegister.cpp achieves the same result bottom-up:
+    #   alloca/load/store → IDF phi placement → renaming pass.
+    #   We go top-down: C AST → internal SSA (builder.py already placed
+    #   phis via structured CFG construction) → LLVM values + phi nodes.
+    #   The output is equivalent: promotable scalar locals become LLVM
+    #   SSA values with phi nodes at join points, no alloca needed.
+    #
+    # Subset intentionally narrower than LLVM mem2reg:
+    #   - only functions the SSA builder accepted (structured scalar CFG)
+    #   - scalar integers plus direct-ID calls and pointer-typed values that
+    #     stay inside the builder/lowering subset
+    #   - no attempt yet to model LLVM mem2reg's full promotable-allocation
+    #     surface, address-taken locals, or arbitrary CFG / MemorySSA cases
+    # ------------------------------------------------------------------
+
+    def _has_ssa_function(self, func_name):
+        """Check if internal SSA IR is available for a function."""
+        if self._pass_ctx is None:
+            return False
+        return func_name in getattr(self._pass_ctx, "ssa_functions", {})
+
+    def _lower_ssa_function(self, func_name, return_type):
+        """Lower a function from internal SSA IR directly to LLVM IR.
+
+        Replaces _codegen_compound_items for eligible functions.
+        Returns True if lowering succeeded, False to fall back to AST codegen.
+        """
+        from ..ssa.ir import (
+            SSABinaryOp,
+            SSABlock,
+            SSABranch,
+            SSACast,
+            SSACall,
+            SSAConstant,
+            SSAFieldAddr,
+            SSAJump,
+            SSALoad,
+            SSAParam,
+            SSAPhi,
+            SSAReturn,
+            SSASwitch,
+            SSAUndef,
+            SSAStore,
+            SSAUnaryOp,
+        )
+
+        ssa_func = self._pass_ctx.ssa_functions[func_name]
+
+        # --- Phase 3 integration: consume SCCP results ---
+        # If SCCP proved values constant or branches foldable, use that
+        # during lowering to emit simpler code.
+        sccp_constants: dict[str, int] = {}
+        sccp_folded_branches: dict[str, str] = {}
+        sccp_reachable: set[str] | None = None
+        sccp_result = getattr(self._pass_ctx, "ssa_sccp_results", {}).get(func_name)
+        if sccp_result is not None:
+            # Only consume safe-fold constants here. Unsafe folds (ordered
+            # compares, arithmetic under unsigned wrap, shifts) yield
+            # Python ints that would be wrong for the unsigned cases at
+            # LLVM level — see unsigned_cmp.c regression.
+            sccp_constants = sccp_result.safe_constant_value_names()
+            sccp_folded_branches = sccp_result.folded_branches
+            sccp_reachable = sccp_result.reachable_blocks
+
+        ssa_value_types = {}
+        for param in ssa_func.params:
+            ssa_value_types[param.name] = param.type_name
+        for block in ssa_func.blocks:
+            for inst in block.instructions:
+                ssa_value_types[inst.name] = getattr(inst, "type_name", "int")
+
+        # --- Step 1: Create LLVM basic blocks ---
+        llvm_blocks: dict[str, ir.Block] = {}
+        for ssa_block in ssa_func.blocks:
+            if ssa_block.name == ssa_func.entry_block:
+                # Entry block already exists (created by codegen_FuncDef)
+                llvm_blocks[ssa_block.name] = self.builder.block
+            else:
+                llvm_blocks[ssa_block.name] = self.function.append_basic_block(
+                    ssa_block.name,
+                )
+
+        # --- Step 2: Map SSA params to LLVM function args ---
+        value_map: dict[str, ir.Value] = {}
+        for i, param in enumerate(ssa_func.params):
+            if i < len(self.function.args):
+                value_map[param.name] = self.function.args[i]
+
+        # --- Step 3: Lower each block ---
+        # First pass: create phi nodes (they must come first in LLVM blocks)
+        phi_nodes: dict[str, ir.PhiInstr] = {}
+        for ssa_block in ssa_func.blocks:
+            self.builder.position_at_end(llvm_blocks[ssa_block.name])
+            for inst in ssa_block.instructions:
+                if isinstance(inst, SSAPhi):
+                    phi = self.builder.phi(
+                        self._ssa_ir_type(getattr(inst, "type_name", "int")),
+                        name=inst.name,
+                    )
+                    phi_nodes[inst.name] = phi
+                    value_map[inst.name] = phi
+
+        # Pre-populate value_map with SCCP-proven constants so that
+        # downstream instructions and terminators see folded values.
+        for ssa_name, const_val in sccp_constants.items():
+            if ssa_name not in value_map:
+                value_map[ssa_name] = self._ssa_constant_ir_value(
+                    ssa_value_types.get(ssa_name, "int"),
+                    const_val,
+                )
+
+        # Compute reverse postorder so every instruction's SSA operands
+        # have been emitted into value_map by the time the user block is
+        # lowered. Short-circuit chains and complex loop shapes create
+        # blocks in outside-in creation order but execute inside-out —
+        # using ssa_func.blocks order makes the outer block reference
+        # inner defs that are not yet in value_map and fall back to 0.
+        def _rpo_block_order(func):
+            name_to_block = {b.name: b for b in func.blocks}
+            visited: set[str] = set()
+            post: list = []
+
+            def visit(name):
+                if name in visited or name not in name_to_block:
+                    return
+                visited.add(name)
+                blk = name_to_block[name]
+                for succ in blk.successors:
+                    visit(succ)
+                post.append(blk)
+
+            visit(func.entry_block)
+            ordered = list(reversed(post))
+            for b in func.blocks:
+                if b.name not in visited:
+                    ordered.append(b)
+            return ordered
+
+        block_order = _rpo_block_order(ssa_func)
+
+        # Second pass: lower instructions and terminators
+        emitted_successors: dict[str, set[str]] = {}
+        for ssa_block in block_order:
+            # Skip unreachable blocks (SCCP dead code)
+            if sccp_reachable is not None and ssa_block.name not in sccp_reachable:
+                if ssa_block.name in llvm_blocks:
+                    self.builder.position_at_end(llvm_blocks[ssa_block.name])
+                    self.builder.unreachable()
+                emitted_successors[ssa_block.name] = set()
+                continue
+
+            self.builder.position_at_end(llvm_blocks[ssa_block.name])
+
+            for inst in ssa_block.instructions:
+                if isinstance(inst, SSAPhi):
+                    continue  # already created above
+
+                # SCCP constant fold: if the result is already known
+                # constant, skip emitting the instruction.
+                if inst.name in sccp_constants:
+                    value_map[inst.name] = self._ssa_constant_ir_value(
+                        getattr(inst, "type_name", "int"),
+                        sccp_constants[inst.name],
+                    )
+                    continue
+
+                val = self._lower_ssa_instruction(
+                    inst, value_map,
+                )
+                if val is not None:
+                    value_map[inst.name] = val
+
+            # Lower terminator
+            term = ssa_block.terminator
+            if isinstance(term, SSAReturn):
+                if term.value is None:
+                    self.builder.ret_void()
+                else:
+                    ret_val = self._resolve_ssa_value(
+                        term.value, value_map,
+                    )
+                    if isinstance(return_type, ir.VoidType):
+                        self.builder.ret_void()
+                    else:
+                        if ret_val.type != return_type:
+                            ret_val = self._ssa_convert(
+                                ret_val,
+                                return_type,
+                                source_type_name=getattr(term.value, "type_name", None),
+                            )
+                        self.builder.ret(ret_val)
+            elif isinstance(term, SSAJump):
+                self.builder.branch(llvm_blocks[term.target])
+                emitted_successors[ssa_block.name] = {term.target}
+            elif isinstance(term, SSABranch):
+                # Jump-threading: if SCCP folded this branch, emit
+                # unconditional jump to the known target.
+                folded_target = sccp_folded_branches.get(ssa_block.name)
+                if folded_target is not None and folded_target in llvm_blocks:
+                    self.builder.branch(llvm_blocks[folded_target])
+                    emitted_successors[ssa_block.name] = {folded_target}
+                else:
+                    cond = self._resolve_ssa_value(
+                        term.condition, value_map,
+                    )
+                    cond_i1 = self._to_bool(cond)
+                    self.builder.cbranch(
+                        cond_i1,
+                        llvm_blocks[term.true_target],
+                        llvm_blocks[term.false_target],
+                    )
+                    emitted_successors[ssa_block.name] = {
+                        term.true_target,
+                        term.false_target,
+                    }
+            elif isinstance(term, SSASwitch):
+                folded_target = sccp_folded_branches.get(ssa_block.name)
+                if folded_target is not None and folded_target in llvm_blocks:
+                    self.builder.branch(llvm_blocks[folded_target])
+                    emitted_successors[ssa_block.name] = {folded_target}
+                else:
+                    switch_val = self._resolve_ssa_value(term.value, value_map)
+                    default_block = llvm_blocks[term.default_target]
+                    sw = self.builder.switch(switch_val, default_block)
+                    for case_const, target_name in term.cases:
+                        case_ir = ir.Constant(switch_val.type, case_const)
+                        sw.add_case(case_ir, llvm_blocks[target_name])
+                    emitted_successors[ssa_block.name] = {
+                        term.default_target, *(t for _, t in term.cases),
+                    }
+            else:
+                emitted_successors[ssa_block.name] = set()
+
+        # --- Step 4: Fill in phi incoming values ---
+        # `_resolve_ssa_value` may emit a `load` instruction when the
+        # value is an SSAGlobalRef or string literal — that load must
+        # land in the PREDECESSOR block (so it dominates the phi), not
+        # at wherever the builder happened to be after step 3. Position
+        # just before the predecessor's terminator before each resolve.
+        for ssa_block in ssa_func.blocks:
+            for inst in ssa_block.instructions:
+                if isinstance(inst, SSAPhi):
+                    phi = phi_nodes[inst.name]
+                    for pred_name, ssa_val in inst.incomings:
+                        if ssa_block.name not in emitted_successors.get(pred_name, set()):
+                            continue
+                        pred_llvm = llvm_blocks.get(pred_name)
+                        if pred_llvm is not None and pred_llvm.instructions:
+                            term = pred_llvm.instructions[-1]
+                            self.builder.position_before(term)
+                        elif pred_llvm is not None:
+                            self.builder.position_at_end(pred_llvm)
+                        incoming_val = self._resolve_ssa_value(
+                            ssa_val, value_map,
+                        )
+                        phi.add_incoming(incoming_val, llvm_blocks[pred_name])
+
+        return True
+
+    def _lower_ssa_instruction(self, inst, value_map):
+        """Lower a single SSA instruction to an LLVM value."""
+        from ..ssa.ir import SSABinaryOp, SSACall, SSACast, SSAFieldAddr, SSAFieldExtract, SSAGlobalRef, SSALoad, SSAStackAlloc, SSAStore, SSAUnaryOp
+
+        if isinstance(inst, SSABinaryOp):
+            left = self._resolve_ssa_value(inst.left, value_map)
+            right = self._resolve_ssa_value(inst.right, value_map)
+            # Pointer arithmetic is a special case: keep the integer index as
+            # an integer and let _lower_ssa_binop translate it to GEP.
+            is_pointer_arith = (
+                inst.op in {"+", "-"}
+                and (
+                    (
+                        isinstance(left.type, ir.PointerType)
+                        and isinstance(right.type, ir.IntType)
+                    )
+                    or (
+                        inst.op == "+"
+                        and isinstance(left.type, ir.IntType)
+                        and isinstance(right.type, ir.PointerType)
+                    )
+                )
+            )
+            # Ensure both operands have the same type for the non-pointer
+            # case. Widen BOTH toward the SSA-declared result type rather
+            # than blindly matching left's type: when `int - long` yields
+            # `long`, narrowing the long operand to int produces wrong
+            # values (see gcc_torture nestfunc-4.c).
+            result_type_name = getattr(inst, "type_name", "int")
+            result_ir_type = self._ssa_ir_type(result_type_name)
+            left_tn = getattr(inst.left, "type_name", "int")
+            right_tn = getattr(inst.right, "type_name", "int")
+            is_cmp = inst.op in {"==", "!=", "<", ">", "<=", ">="}
+            if (
+                not is_pointer_arith
+                and isinstance(result_ir_type, ir.IntType)
+                and not is_cmp
+            ):
+                if isinstance(left.type, ir.IntType) and left.type != result_ir_type:
+                    left = self._ssa_convert(
+                        left,
+                        result_ir_type,
+                        source_type_name=left_tn,
+                    )
+                # Shift: C11 6.5.7p3 promotes both operands independently,
+                # so the shift amount also widens to the result type. LLVM
+                # requires shift operands to share a type.
+                if isinstance(right.type, ir.IntType) and right.type != result_ir_type:
+                    right = self._ssa_convert(
+                        right,
+                        result_ir_type,
+                        source_type_name=right_tn,
+                    )
+            elif (
+                is_cmp
+                and isinstance(left.type, ir.IntType)
+                and isinstance(right.type, ir.IntType)
+            ):
+                # Comparison result is `int` but both operands must be
+                # compared at their common promoted type per C11 6.3.1.8
+                # (usual arithmetic conversions) — e.g. `unsigned short ==
+                # signed char` promotes both to int, making 65535 != -1
+                # instead of 0xffff == 0xffff (gcc_torture 20080813-1.c).
+                # Resolve typedef spellings (e.g. `size_t` → `unsigned long`)
+                # on the operand sides first so the rank table picks the
+                # right common type (test_size_t_still_uses_unsigned_*).
+                from ..ssa.builder import SSABuilder as _B
+                resolver = getattr(self, "_ssa_resolve_int_typedef", None)
+                if resolver is not None:
+                    class _V:
+                        def __init__(self, tn):
+                            self.type_name = tn
+                    common_name = _B._binary_result_type(
+                        "+",
+                        _V(resolver(getattr(inst.left, "type_name", "int"))),
+                        _V(resolver(getattr(inst.right, "type_name", "int"))),
+                    )
+                else:
+                    common_name = _B._binary_result_type("+", inst.left, inst.right)
+                common_ir = self._ssa_ir_type(common_name)
+                if isinstance(common_ir, ir.IntType):
+                    # Decide signedness of the compare using the common
+                    # (post-promotion) type, so the same rules in
+                    # `_binary_result_type` apply here. `_ssa_is_unsigned_type`
+                    # resolves typedefs (e.g. `size_t` → unsigned long)
+                    # and handles qualified names. A mixed
+                    # `signed vs unsigned` operand pair converges on the
+                    # correct C11 6.3.1.8 common type via the rank-based
+                    # _binary_result_type. Using only the common type
+                    # avoids the "any operand unsigned → do unsigned"
+                    # mistake (test_unsigned_loads covers both failing
+                    # and still-unsigned shapes).
+                    if left.type != common_ir:
+                        left = self._ssa_convert(
+                            left, common_ir, source_type_name=left_tn,
+                        )
+                    if right.type != common_ir:
+                        right = self._ssa_convert(
+                            right, common_ir, source_type_name=right_tn,
+                        )
+                    left_tn = right_tn = common_name
+            elif left.type != right.type and not is_pointer_arith:
+                right = self._ssa_convert(
+                    right,
+                    left.type,
+                    source_type_name=right_tn,
+                )
+            return self._lower_ssa_binop(
+                inst.op,
+                left,
+                right,
+                inst.name,
+                result_type_name=result_type_name,
+                left_type_name=left_tn,
+                right_type_name=right_tn,
+            )
+
+        if isinstance(inst, SSAUnaryOp):
+            operand = self._resolve_ssa_value(inst.operand, value_map)
+            return self._lower_ssa_unop(
+                inst.op,
+                operand,
+                inst.name,
+                result_type_name=getattr(inst, "type_name", "int"),
+                operand_type_name=getattr(inst.operand, "type_name", "int"),
+            )
+
+        if isinstance(inst, SSACast):
+            operand = self._resolve_ssa_value(inst.operand, value_map)
+            return self._lower_ssa_cast(
+                operand,
+                result_type_name=getattr(inst, "type_name", "int"),
+                operand_type_name=getattr(inst.operand, "type_name", "int"),
+            )
+
+        if isinstance(inst, SSALoad):
+            # If the load's base is a bare SSAGlobalRef and the load
+            # targets the *same* scalar type the global stores, we need
+            # the global's ADDRESS (pointer) rather than the
+            # auto-loaded value that `_resolve_ssa_value(SSAGlobalRef)`
+            # returns — that happens when the SSA builder snapshots a
+            # scalar global into a decl initializer (`long tmp = level;`
+            # in nestfunc-4.c). For pointer globals where the load's
+            # result differs from the base's declared pointee (e.g.
+            # `*p` where `p: int*` loads `int`), we still need the
+            # default two-step resolution: load `p` first to get the
+            # pointer, then load through it. Same for arrays.
+            from ..ssa.ir import SSAGlobalRef as _SSAGlobalRef
+            base = None
+            if isinstance(inst.base, _SSAGlobalRef):
+                base_type_name = getattr(inst.base, "type_name", "")
+                result_type_name = getattr(inst, "type_name", "int")
+                try:
+                    value_type, binding = self.lookup(inst.base.symbol_name)
+                except Exception:
+                    value_type, binding = None, None
+                if (
+                    binding is not None
+                    and not isinstance(value_type, ir.ArrayType)
+                    and isinstance(getattr(binding, "type", None), ir.PointerType)
+                    and not base_type_name.endswith("*")
+                    and base_type_name == result_type_name
+                ):
+                    base = binding
+            if base is None:
+                base = self._resolve_ssa_value(inst.base, value_map)
+            index = (
+                self._resolve_ssa_value(inst.index, value_map)
+                if inst.index is not None
+                else None
+            )
+            index_type_name = (
+                getattr(inst.index, "type_name", None)
+                if inst.index is not None
+                else None
+            )
+            return self._lower_ssa_load(
+                base,
+                index,
+                result_type_name=getattr(inst, "type_name", "int"),
+                index_type_name=index_type_name,
+            )
+
+        if isinstance(inst, SSAFieldAddr):
+            base = self._resolve_ssa_value(inst.base, value_map)
+            return self._lower_ssa_field_addr(
+                base,
+                inst.field_name,
+                result_type_name=getattr(inst, "type_name", "int"),
+            )
+
+        if isinstance(inst, SSAFieldExtract):
+            base = self._resolve_ssa_value(inst.base, value_map)
+            return self._lower_ssa_field_extract(
+                base,
+                inst.field_name,
+                result_type_name=getattr(inst, "type_name", "int"),
+            )
+
+        if isinstance(inst, SSAGlobalRef):
+            return self._resolve_ssa_value(inst, value_map)
+
+        if isinstance(inst, SSAStackAlloc):
+            elem_type = self._ssa_ir_type(getattr(inst, "elem_type_name", "int"))
+            size = None if getattr(inst, "count", 1) == 1 else ir.Constant(int32_t, inst.count)
+            return self.builder.alloca(elem_type, size=size, name=inst.name)
+
+        if isinstance(inst, SSAStore):
+            addr = self._resolve_ssa_value(inst.addr, value_map)
+            value = self._resolve_ssa_value(inst.value, value_map)
+            self._lower_ssa_store(addr, value)
+            return None
+
+        if isinstance(inst, SSACall):
+            return self._lower_ssa_call(inst, value_map)
+
+        return None
+
+    def _ssa_constant_ir_value(self, type_name, value):
+        ir_type = self._ssa_ir_type(type_name)
+        if isinstance(ir_type, ir.PointerType):
+            if value == 0:
+                return ir.Constant(ir_type, None)
+            # Non-zero pointer constant (e.g. `(void *) 1`): emit an
+            # `inttoptr` expression rather than a literal integer, which
+            # LLVM rejects as "integer constant must have integer type"
+            # (gcc_torture pr86231.c).
+            int_const = ir.Constant(ir.IntType(64), value)
+            return int_const.inttoptr(ir_type)
+        return ir.Constant(ir_type, value)
+
+    def _resolve_ssa_value(self, ssa_val, value_map):
+        """Resolve an SSA value to an LLVM IR value."""
+        from ..ssa.ir import SSAConstant, SSAGlobalRef, SSAStringConstant, SSAUndef
+
+        if isinstance(ssa_val, SSAConstant):
+            return self._ssa_constant_ir_value(ssa_val.type_name, ssa_val.value)
+        if isinstance(ssa_val, SSAStringConstant):
+            literal_node = c_ast.Constant(ssa_val.literal_kind, ssa_val.value)
+            gv = self._make_global_string_literal_constant(literal_node, name_hint="ssastr")
+            target_type = self._ssa_ir_type(getattr(ssa_val, "type_name", "char*"))
+            return self._const_pointer_to_first_elem(gv, target_type)
+        if isinstance(ssa_val, SSAGlobalRef):
+            value_type, binding = self.lookup(ssa_val.symbol_name)
+            if isinstance(binding, ir.values.Constant):
+                return binding
+            if isinstance(binding, ir.Function):
+                return binding
+            if isinstance(value_type, ir.ArrayType):
+                return self.builder.gep(
+                    binding,
+                    [ir.Constant(int64_t, 0), ir.Constant(int64_t, 0)],
+                    name="ssaglobal.arraydecay",
+                )
+            if isinstance(getattr(binding, "type", None), ir.PointerType):
+                return self._safe_load(binding)
+            return binding
+        if isinstance(ssa_val, SSAUndef):
+            return ir.Constant(self._ssa_ir_type(ssa_val.type_name), ir.Undefined)
+        if ssa_val.name in value_map:
+            return value_map[ssa_val.name]
+        # Fallback: zero
+        return ir.Constant(self._ssa_ir_type(getattr(ssa_val, "type_name", "int")), 0)
+
+    def _lower_ssa_binop(
+        self,
+        op,
+        left,
+        right,
+        name,
+        *,
+        result_type_name,
+        left_type_name,
+        right_type_name,
+    ):
+        """Lower a binary operation to LLVM IR.
+
+        LLVM reference: LLVM distinguishes integer instructions
+        (Instruction::Add/Sub/Mul/UDiv/SDiv/URem/SRem, ICmpInst) from
+        floating-point ones (Instruction::FAdd/FSub/FMul/FDiv/FRem,
+        FCmpInst). FCmpInst asserts `isFPOrFPVectorTy()` on operands —
+        mismatching int vs fp dispatch produces `icmp requires integer
+        operands` verifier errors. See
+        /tmp/llvm-src/.../lib/IR/Instructions.cpp FCmpInst::AssertOK.
+        """
+        b = self.builder
+        _FLOAT_TYPES = (ir.HalfType, ir.FloatType, ir.DoubleType)
+        is_float = isinstance(left.type, _FLOAT_TYPES) or isinstance(right.type, _FLOAT_TYPES)
+        if (
+            op == "+"
+            and isinstance(left.type, ir.IntType)
+            and isinstance(right.type, ir.PointerType)
+        ):
+            left, right = right, left
+        if (
+            op == "-"
+            and isinstance(left.type, ir.PointerType)
+            and isinstance(right.type, ir.PointerType)
+        ):
+            # C11 6.5.6p9: the pointer difference is in ELEMENTS of the
+            # pointed-to type, not bytes. Divide the byte difference by
+            # sizeof(*ptr). gcc_torture 20010116-1.c has `last - first`
+            # with Data (sizeof 12) where only the element count (4) is
+            # meaningful.
+            left_int = self.builder.ptrtoint(left, int64_t, name=f"{name}.lhs")
+            right_int = self.builder.ptrtoint(right, int64_t, name=f"{name}.rhs")
+            byte_diff = self.builder.sub(left_int, right_int, name=f"{name}.bytes")
+            pointee = left.type.pointee
+            elem_size = None
+            try:
+                elem_size = pointee.get_abi_size(self._target_data)
+            except Exception:
+                elem_size = None
+            if elem_size is None or elem_size <= 0:
+                elem_size = 1
+            if elem_size == 1:
+                diff = byte_diff
+            else:
+                diff = self.builder.sdiv(
+                    byte_diff,
+                    ir.Constant(int64_t, elem_size),
+                    name=name,
+                )
+            target_type = self._ssa_ir_type(result_type_name)
+            if isinstance(target_type, ir.IntType) and diff.type != target_type:
+                return self._ssa_convert(
+                    diff,
+                    target_type,
+                    source_type_name="long",
+                )
+            return diff
+        if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
+            index = right
+            if index.type.width < int64_t.width:
+                # Pointer index widening must preserve unsigned-ness so
+                # `x[(unsigned char)i]` wraps correctly for 0xe8-style
+                # values instead of sign-extending to a negative index
+                # (gcc_torture 20030916-1.c).
+                if self._ssa_is_unsigned_type(right_type_name):
+                    index = b.zext(index, int64_t)
+                else:
+                    index = b.sext(index, int64_t)
+            elif index.type.width > int64_t.width:
+                index = b.trunc(index, int64_t)
+            if op == "-":
+                index = b.neg(index, name=f"{name}.neg")
+            if op in {"+", "-"}:
+                return b.gep(left, [index], name=name)
+        if is_float:
+            # Unordered fcmp (fcmp_unordered) matches C semantics for NaN:
+            # `x != x` is true when x is NaN, so use unordered for `!=` and
+            # ordered for the rest, aligning with how the existing
+            # AST-path codegen handles float compare (see line ~2066 and
+            # ~7470 for fcmp_ordered usage).
+            if op == "+":
+                return b.fadd(left, right, name=name)
+            if op == "-":
+                return b.fsub(left, right, name=name)
+            if op == "*":
+                return b.fmul(left, right, name=name)
+            if op == "/":
+                return b.fdiv(left, right, name=name)
+            if op == "%":
+                return b.frem(left, right, name=name)
+            if op in ("==", "<", ">", "<=", ">="):
+                cmp = b.fcmp_ordered(op, left, right, name=name)
+                return b.zext(cmp, self._ssa_ir_type(result_type_name), name=f"{name}.i")
+            if op == "!=":
+                cmp = b.fcmp_unordered(op, left, right, name=name)
+                return b.zext(cmp, self._ssa_ir_type(result_type_name), name=f"{name}.i")
+            # Bitwise / shift ops are not defined on floats in C.
+            raise ValueError(f"unsupported float binop {op!r}")
+        # For comparison ops the caller has already converted both
+        # operands to the common (promoted) type and set both
+        # {left,right}_type_name to that common type's name
+        # (see usual-arithmetic-conversions block above). Decide
+        # signedness from that common type only — "any operand
+        # unsigned" would be wrong for e.g. `long < unsigned int` where
+        # the unsigned side promotes to the signed wider type. For
+        # other ops the individual operand types are still meaningful;
+        # keep the "any unsigned" heuristic for `/` and `%`.
+        is_cmp_here = op in ("==", "!=", "<", ">", "<=", ">=")
+        if is_cmp_here:
+            is_unsigned = self._ssa_is_unsigned_type(left_type_name)
+        else:
+            is_unsigned = (
+                self._ssa_is_unsigned_type(left_type_name)
+                or self._ssa_is_unsigned_type(right_type_name)
+            )
+        if op == "+":
+            return b.add(left, right, name=name)
+        if op == "-":
+            return b.sub(left, right, name=name)
+        if op == "*":
+            return b.mul(left, right, name=name)
+        if op == "/":
+            return b.udiv(left, right, name=name) if is_unsigned else b.sdiv(left, right, name=name)
+        if op == "%":
+            return b.urem(left, right, name=name) if is_unsigned else b.srem(left, right, name=name)
+        if op in ("==", "!=", "<", ">", "<=", ">="):
+            cmp = (
+                b.icmp_unsigned(op, left, right, name=name)
+                if is_unsigned
+                else b.icmp_signed(op, left, right, name=name)
+            )
+            return b.zext(cmp, self._ssa_ir_type(result_type_name), name=f"{name}.i")
+        if op == "&":
+            return b.and_(left, right, name=name)
+        if op == "|":
+            return b.or_(left, right, name=name)
+        if op == "^":
+            return b.xor(left, right, name=name)
+        if op == "<<":
+            return b.shl(left, right, name=name)
+        if op == ">>":
+            return b.lshr(left, right, name=name) if self._ssa_is_unsigned_type(left_type_name) else b.ashr(left, right, name=name)
+        # Fallback
+        return b.add(left, right, name=name)
+
+    def _lower_ssa_unop(self, op, operand, name, *, result_type_name, operand_type_name):
+        """Lower a unary operation to LLVM IR."""
+        b = self.builder
+        _FLOAT_TYPES = (ir.HalfType, ir.FloatType, ir.DoubleType)
+        if op == "-":
+            if isinstance(operand.type, _FLOAT_TYPES):
+                return b.fneg(operand, name=name)
+            return b.neg(operand, name=name)
+        if op == "!":
+            cmp = self._to_bool(operand)
+            zero = ir.Constant(ir.IntType(1), 0)
+            inv = b.icmp_unsigned("==", cmp, zero, name=name)
+            return b.zext(inv, self._ssa_ir_type(result_type_name))
+        if op == "~":
+            return b.not_(operand, name=name)
+        return operand
+
+    def _lower_ssa_cast(self, operand, *, result_type_name, operand_type_name):
+        """Lower an explicit SSA cast for the current scalar subset."""
+        target_type = self._ssa_ir_type(result_type_name)
+        if operand.type == target_type:
+            return operand
+        if isinstance(operand.type, ir.IntType) and isinstance(target_type, ir.IntType):
+            return self._ssa_convert(
+                operand,
+                target_type,
+                source_type_name=operand_type_name,
+            )
+        # Float → integer: pick signed vs unsigned based on the declared
+        # target type. `_implicit_convert` hard-codes fptosi, which is
+        # wrong for `(unsigned long long) f` (gcc_torture conversion.c).
+        _FLOAT_TYPES = (ir.HalfType, ir.FloatType, ir.DoubleType)
+        if isinstance(operand.type, _FLOAT_TYPES) and isinstance(target_type, ir.IntType):
+            if self._ssa_is_unsigned_type(result_type_name):
+                return self.builder.fptoui(operand, target_type)
+            return self.builder.fptosi(operand, target_type)
+        # Integer → float: pick signed vs unsigned based on source.
+        if isinstance(operand.type, ir.IntType) and isinstance(target_type, _FLOAT_TYPES):
+            if self._ssa_is_unsigned_type(operand_type_name):
+                return self.builder.uitofp(operand, target_type)
+            return self.builder.sitofp(operand, target_type)
+        return self._implicit_convert(operand, target_type)
+
+    def _lower_ssa_load(self, base, index, *, result_type_name, index_type_name=None):
+        """Lower a side-effect-free SSA load from a pointer base.
+
+        Widening the index must preserve unsignedness — `hist[data[i]]`
+        where `data[i]` is `unsigned char` but sign-extended as a GEP
+        index would read from `hist[-1]` instead of `hist[0xNN]`, a
+        byte_histogram bench regression we were measuring under Phase 3.
+        """
+        if not isinstance(getattr(base, "type", None), ir.PointerType):
+            return ir.Constant(self._ssa_ir_type(result_type_name), 0)
+
+        elem_ptr = base
+        if index is not None:
+            if not isinstance(index.type, ir.IntType):
+                index = self.builder.fptoui(index, int64_t)
+            elif index.type.width < int64_t.width:
+                if index_type_name and self._ssa_is_unsigned_type(index_type_name):
+                    index = self.builder.zext(index, int64_t)
+                else:
+                    index = self.builder.sext(index, int64_t)
+            elif index.type.width > int64_t.width:
+                index = self.builder.trunc(index, int64_t)
+            elem_ptr = self.builder.gep(base, [index], name="ssaload.idx")
+
+        loaded = self._safe_load(elem_ptr)
+        return self._implicit_convert(loaded, self._ssa_ir_type(result_type_name))
+
+    def _lower_ssa_field_addr(self, base, field_name, *, result_type_name):
+        """Lower a read-only aggregate field address inside the SSA subset."""
+        if not isinstance(getattr(base, "type", None), ir.PointerType):
+            return ir.Constant(self._ssa_ir_type(result_type_name), ir.Undefined)
+        aggregate_type = base.type.pointee
+        field_offset, semantic_field_type = self._get_aggregate_field_info(
+            aggregate_type,
+            field_name,
+        )
+        target_ptr_type = ir.PointerType(semantic_field_type)
+        if result_type_name:
+            target_ptr_type = self._ssa_ir_type(result_type_name)
+        return self._byte_offset_ptr(
+            base,
+            field_offset,
+            target_ptr_type,
+            name="ssafieldptr",
+        )
+
+    def _lower_ssa_field_extract(self, base, field_name, *, result_type_name):
+        """Lower a scalar field extract from an aggregate SSA value."""
+        aggregate_type = getattr(base, "type", None)
+        if not self._is_aggregate_ir_type(aggregate_type):
+            return ir.Constant(self._ssa_ir_type(result_type_name), 0)
+        field_path = self._aggregate_field_path(aggregate_type, field_name)
+        if field_path is None:
+            return ir.Constant(self._ssa_ir_type(result_type_name), 0)
+        extracted = self.builder.extract_value(base, field_path, name="ssafield")
+        return self._implicit_convert(extracted, self._ssa_ir_type(result_type_name))
+
+    def _lower_ssa_store(self, addr, value):
+        """Lower a narrow SSA memory store."""
+        if not isinstance(getattr(addr, "type", None), ir.PointerType):
+            return
+        self._safe_store(value, addr)
+
+    def _lower_ssa_call(self, inst, value_map):
+        """Lower an SSA call instruction to an LLVM call."""
+        callee_func = None
+        ftype = None
+        if inst.callee is not None:
+            callee_func = self._resolve_ssa_value(inst.callee, value_map)
+            if (
+                isinstance(getattr(callee_func, "type", None), ir.PointerType)
+                and isinstance(callee_func.type.pointee, ir.FunctionType)
+            ):
+                ftype = callee_func.type.pointee
+        else:
+            try:
+                _, callee_func = self.lookup(inst.callee_name)
+            except (KeyError, Exception):
+                pass
+
+            if callee_func is None or not isinstance(callee_func, ir.Function):
+                _, callee_func = self._declare_implicit_function(
+                    inst.callee_name,
+                    call_arg_count=len(inst.args),
+                )
+
+            if isinstance(callee_func, ir.Function):
+                ftype = callee_func.function_type
+            elif (
+                isinstance(getattr(callee_func, "type", None), ir.PointerType)
+                and isinstance(callee_func.type.pointee, ir.FunctionType)
+            ):
+                ftype = callee_func.type.pointee
+
+        if callee_func is None or ftype is None:
+            return ir.Constant(self._ssa_ir_type(getattr(inst, "type_name", "int")), 0)
+
+        call_args = []
+        is_variadic = bool(getattr(ftype, "var_arg", False))
+        _FLOAT_TYPES = (ir.HalfType, ir.FloatType, ir.DoubleType)
+        for i, ssa_arg in enumerate(inst.args):
+            arg_val = self._resolve_ssa_value(ssa_arg, value_map)
+            if i < len(ftype.args):
+                expected = ftype.args[i]
+                if arg_val.type != expected:
+                    arg_val = self._ssa_convert(
+                        arg_val,
+                        expected,
+                        source_type_name=getattr(ssa_arg, "type_name", "int"),
+                    )
+            elif is_variadic:
+                # C11 6.5.2.2p6: default argument promotions apply to
+                # extra variadic args. char/short → int, float → double.
+                # Without this, `printf("%x", u8_value)` passes i8 and
+                # the callee reads wrong-width data (see c-testsuite
+                # 00216.c `flow: 809 ...` regression).
+                if (
+                    isinstance(arg_val.type, ir.IntType)
+                    and arg_val.type.width < 32
+                ):
+                    source_type_name = getattr(ssa_arg, "type_name", "int")
+                    if self._ssa_is_unsigned_type(source_type_name):
+                        arg_val = self.builder.zext(arg_val, ir.IntType(32))
+                    else:
+                        arg_val = self.builder.sext(arg_val, ir.IntType(32))
+                elif isinstance(arg_val.type, ir.FloatType):
+                    arg_val = self.builder.fpext(arg_val, ir.DoubleType())
+            call_args.append(arg_val)
+
+        # Emit the call
+        is_void = isinstance(ftype.return_type, ir.VoidType)
+        if is_void:
+            self.builder.call(callee_func, call_args)
+            return None
+
+        result = self.builder.call(callee_func, call_args, name=inst.name)
+        # If the actual LLVM return type doesn't match the SSA metadata
+        # type (e.g. builder defaulted to `int` for an undeclared
+        # `strlen` but LLVM knows it returns `size_t`/i64), convert the
+        # result. Otherwise a downstream phi typed from `inst.type_name`
+        # would mismatch the actual value type — see test_separate_tus
+        # lua `*len = s ? strlen(s) : 0;` regression.
+        declared_type = self._ssa_ir_type(getattr(inst, "type_name", "int"))
+        if (
+            isinstance(result.type, ir.IntType)
+            and isinstance(declared_type, ir.IntType)
+            and result.type != declared_type
+        ):
+            result = self._ssa_convert(
+                result,
+                declared_type,
+                source_type_name=None,
+            )
+        return result
+
+    def _ssa_convert(self, val, target_type, source_type_name=None):
+        """Convert an LLVM value to target type (int width change)."""
+        if val.type == target_type:
+            return val
+        if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType):
+            if val.type.width < target_type.width:
+                if self._ssa_is_unsigned_type(source_type_name or ""):
+                    return self.builder.zext(val, target_type)
+                return self.builder.sext(val, target_type)
+            if val.type.width > target_type.width:
+                return self.builder.trunc(val, target_type)
+        return self._implicit_convert(val, target_type)
 
     def define(self, name, val):
         self.env[name] = val
@@ -770,7 +1870,8 @@ class LLVMCodeGenerator(object):
             self._aggregate_type_name(kind, name)
         )
         if aggregate_type.is_opaque:
-            aggregate_type.set_body(*body)
+            from pcc.llvm_capi.compat import set_struct_body
+            set_struct_body(aggregate_type, body)
         return aggregate_type
 
     def _is_file_scope_static(self, storage=None):
@@ -1135,6 +2236,16 @@ class LLVMCodeGenerator(object):
     def _is_unsigned_return_binding(self, binding):
         return binding is not None and id(binding) in self._unsigned_return_bindings
 
+    def _propagate_binding_tags(self, value, binding):
+        """Copy signedness-related metadata from a binding to a produced value."""
+        if self._is_unsigned_binding(binding):
+            self._tag_unsigned(value)
+        if self._is_unsigned_pointee_binding(binding):
+            self._tag_unsigned_pointee(value)
+        if self._is_unsigned_return_binding(binding):
+            self._tag_unsigned_return(value)
+        return value
+
     def _mark_vla_binding(self, binding):
         if binding is not None:
             self._vla_bindings.add(id(binding))
@@ -1370,8 +2481,75 @@ class LLVMCodeGenerator(object):
 
     def _float_compare(self, op, lhs, rhs, name):
         if op == "!=":
-            return self.builder.fcmp_unordered(op, lhs, rhs, name)
+            lhs_nan = self.builder.fcmp_unordered(
+                "!=", lhs, lhs, name=f"{name}.lhsnan"
+            )
+            rhs_nan = self.builder.fcmp_unordered(
+                "!=", rhs, rhs, name=f"{name}.rhsnan"
+            )
+            ordered_neq = self.builder.fcmp_ordered(
+                "!=", lhs, rhs, name=f"{name}.orderedneq"
+            )
+            return self.builder.or_(
+                self.builder.or_(lhs_nan, rhs_nan, name=f"{name}.unordered"),
+                ordered_neq,
+                name=name,
+            )
         return self.builder.fcmp_ordered(op, lhs, rhs, name)
+
+    def _build_fp_op(self, opname, lhs, rhs, name=""):
+        """Emit floating-point arithmetic with FP contraction enabled.
+
+        Clang enables contraction by default for local fused multiply-add
+        opportunities. Preserving that hint lets LLVM form FMADD/FMLA where it
+        is legal without switching the whole compiler to unsafe fast-math.
+        """
+        # Explicit dispatch — closed set. Avoids dynamic getattr for
+        # self-host (see scripts/audit_selfhost.py).
+        b = self.builder
+        if opname == "fadd":   inst = b.fadd(lhs, rhs, name)
+        elif opname == "fsub": inst = b.fsub(lhs, rhs, name)
+        elif opname == "fmul": inst = b.fmul(lhs, rhs, name)
+        elif opname == "fdiv": inst = b.fdiv(lhs, rhs, name)
+        elif opname == "frem": inst = b.frem(lhs, rhs, name)
+        else:
+            raise ValueError(f"unknown fp op {opname!r}")
+        if hasattr(inst, "flags") and "contract" not in inst.flags:
+            inst.flags = list(inst.flags) + ["contract"]
+        return inst
+
+    def _fadd(self, lhs, rhs, name=""):
+        return self._build_fp_op("fadd", lhs, rhs, name)
+
+    def _fsub(self, lhs, rhs, name=""):
+        return self._build_fp_op("fsub", lhs, rhs, name)
+
+    def _fmul(self, lhs, rhs, name=""):
+        return self._build_fp_op("fmul", lhs, rhs, name)
+
+    def _fdiv(self, lhs, rhs, name=""):
+        return self._build_fp_op("fdiv", lhs, rhs, name)
+
+    def _frem(self, lhs, rhs, name=""):
+        return self._build_fp_op("frem", lhs, rhs, name)
+
+    def _ir_constant_from_value(self, ir_type, value):
+        if isinstance(ir_type, ir.IntType):
+            return ir.Constant(ir_type, int(value))
+        if self._is_floating_ir_type(ir_type):
+            value = float(value)
+            if isinstance(ir_type, ir.FloatType) and (
+                math.isnan(value) or math.isinf(value)
+            ):
+                bits = struct.unpack(">I", struct.pack(">f", value))[0]
+                return ir.Constant(ir.IntType(32), bits).bitcast(ir_type)
+            if isinstance(ir_type, ir.DoubleType) and (
+                math.isnan(value) or math.isinf(value)
+            ):
+                bits = struct.unpack(">Q", struct.pack(">d", value))[0]
+                return ir.Constant(ir.IntType(64), bits).bitcast(ir_type)
+            return ir.Constant(ir_type, value)
+        return ir.Constant(ir_type, value)
 
     def _safe_global_var(self, ir_type, name, external=False):
         """Create or reuse a global variable, avoiding DuplicatedNameError."""
@@ -1484,54 +2662,11 @@ class LLVMCodeGenerator(object):
         self.nlabels += 1
         return f"label_{name}_{self.nlabels}"
 
-    @contextmanager
     def new_scope(self):
-        old_scope_id = self._current_scope_id
-        self._scope_id_counter += 1
-        self._current_scope_id = self._scope_id_counter
-        self.env = self.env.new_child()
-        self._decl_ast_types = self._decl_ast_types.new_child()
-        self._typedef_ast_types = self._typedef_ast_types.new_child()
-        try:
-            yield
-        finally:
-            self.env = self.env.parents
-            self._decl_ast_types = self._decl_ast_types.parents
-            self._typedef_ast_types = self._typedef_ast_types.parents
-            self._current_scope_id = old_scope_id
+        return _NewScopeCtx(self)
 
-    @contextmanager
     def new_function(self):
-        oldfunc = self.function
-        old_display_name = self._function_display_name
-        old_frame_address_marker = self._frame_address_marker
-        oldbuilder = self.builder
-        oldenv = self.env
-        old_decl_ast_types = self._decl_ast_types
-        old_typedef_ast_types = self._typedef_ast_types
-        oldlabels = self._labels
-        old_scope_id = self._current_scope_id
-        self.in_global = False
-        self._scope_id_counter += 1
-        self._current_scope_id = self._scope_id_counter
-        self.env = self.env.new_child()
-        self._decl_ast_types = self._decl_ast_types.new_child()
-        self._typedef_ast_types = self._typedef_ast_types.new_child()
-        self._labels = {}
-        self._frame_address_marker = None
-        try:
-            yield
-        finally:
-            self.function = oldfunc
-            self._function_display_name = old_display_name
-            self._frame_address_marker = old_frame_address_marker
-            self.builder = oldbuilder
-            self.env = oldenv
-            self._decl_ast_types = old_decl_ast_types
-            self._typedef_ast_types = old_typedef_ast_types
-            self._labels = oldlabels
-            self._current_scope_id = old_scope_id
-            self.in_global = True
+        return _NewFunctionCtx(self)
 
     def _init_debug_info(self):
         """Initialize DWARF debug info metadata."""
@@ -1698,14 +2833,27 @@ class LLVMCodeGenerator(object):
             self.builder.position_at_end(current_block)
         return ret
 
+    _codegen_dispatch = None
+
     def codegen(self, node):
         if node is None:
             return None, None
-        method = "codegen_" + node.__class__.__name__
-        handler = getattr(self, method, None)
-        if handler is None:
+        owner = type(self)
+        disp = owner.__dict__.get("_codegen_dispatch")
+        if disp is None:
+            disp = {}
+            for base in owner.__mro__:
+                for name, fn in base.__dict__.items():
+                    if not name.startswith("codegen_"):
+                        continue
+                    if not callable(fn):
+                        continue
+                    disp.setdefault(name[len("codegen_"):], fn)
+            owner._codegen_dispatch = disp
+        fn = disp.get(type(node).__name__)
+        if fn is None:
             return None, None
-        return handler(node)
+        return fn(self, node)
 
     def codegen_FileAST(self, node):
         # Collect names of functions that have definitions (FuncDef)
@@ -1841,7 +2989,7 @@ class LLVMCodeGenerator(object):
         return list(self._string_bytes(content + "\00"))
 
     def _char_constant_value(self, raw):
-        if raw and raw.startswith("L'") and raw.endswith("'"):
+        if raw and raw[:2] in {"L'", "u'", "U'"} and raw.endswith("'"):
             raw = raw[1:]
         if not raw or len(raw) < 2 or raw[0] != "'" or raw[-1] != "'":
             return 0
@@ -1894,7 +3042,7 @@ class LLVMCodeGenerator(object):
             return result, None
         elif node.type == "char":
             # char constant like 'a' -> i8
-            is_wide_char = str(getattr(node, "value", "")).startswith("L'")
+            is_wide_char = str(getattr(node, "value", "")).startswith(("L'", "u'", "U'"))
             ir_type = int32_t if is_wide_char else int8_t
             mask = 0xFFFFFFFF if is_wide_char else 0xFF
             return (
@@ -1960,16 +3108,16 @@ class LLVMCodeGenerator(object):
         dispatch_type_double = 1
         dispatch_type_int = 0
         dispatch_dict = {
-            ("+=", dispatch_type_double): self.builder.fadd,
+            ("+=", dispatch_type_double): self._fadd,
             ("+=", dispatch_type_int): self.builder.add,
-            ("-=", dispatch_type_double): self.builder.fsub,
+            ("-=", dispatch_type_double): self._fsub,
             ("-=", dispatch_type_int): self.builder.sub,
-            ("*=", dispatch_type_double): self.builder.fmul,
+            ("*=", dispatch_type_double): self._fmul,
             ("*=", dispatch_type_int): self.builder.mul,
-            ("/=", dispatch_type_double): self.builder.fdiv,
+            ("/=", dispatch_type_double): self._fdiv,
             ("/=", dispatch_type_int): self.builder.sdiv,
             ("%=", dispatch_type_int): self.builder.srem,
-            ("%=", dispatch_type_double): self.builder.frem,
+            ("%=", dispatch_type_double): self._frem,
             ("<<=", dispatch_type_int): self.builder.shl,
             (">>=", dispatch_type_int): self.builder.ashr,
             ("&=", dispatch_type_int): self.builder.and_,
@@ -2064,9 +3212,9 @@ class LLVMCodeGenerator(object):
             elif isinstance(lv.type, (ir.FloatType, ir.DoubleType)):
                 one = ir.Constant(lv.type, 1.0)
                 new_val = (
-                    self.builder.fadd(lv, one, "inc")
+                    self._fadd(lv, one, "inc")
                     if is_inc
-                    else self.builder.fsub(lv, one, "dec")
+                    else self._fsub(lv, one, "dec")
                 )
             else:
                 one = ir.Constant(lv.type, 1)
@@ -2215,7 +3363,13 @@ class LLVMCodeGenerator(object):
         elif self._is_string_constant(expr):
             size = len(self._string_literal_data(expr))
         elif isinstance(expr, c_ast.ID):
-            ir_type, _ = self.lookup(expr.name)
+            try:
+                ir_type, _ = self.lookup(expr.name)
+            except SemanticError:
+                decl_type = self._lookup_decl_ast_type(expr.name)
+                if decl_type is None:
+                    raise
+                ir_type = self._resolve_ast_type(decl_type)
             size = self._ir_type_size(ir_type)
         else:
             semantic_type = self._infer_sizeof_operand_ir_type(expr)
@@ -2230,7 +3384,13 @@ class LLVMCodeGenerator(object):
         elif self._is_string_constant(expr):
             ir_t = self._get_ir_type("int")
         elif isinstance(expr, c_ast.ID):
-            ir_type, _ = self.lookup(expr.name)
+            try:
+                ir_type, _ = self.lookup(expr.name)
+            except SemanticError:
+                decl_type = self._lookup_decl_ast_type(expr.name)
+                if decl_type is None:
+                    raise
+                ir_type = self._resolve_ast_type(decl_type)
             ir_t = ir_type
         else:
             ir_t = self._infer_sizeof_operand_ir_type(expr)
@@ -2340,7 +3500,10 @@ class LLVMCodeGenerator(object):
 
     def _has_unsigned_scalar_pointee(self, node_type):
         if isinstance(node_type, (c_ast.ArrayDecl, c_ast.PtrDecl)):
-            return self._is_unsigned_scalar_decl_type(node_type.type)
+            child = node_type.type
+            if self._is_unsigned_scalar_decl_type(child):
+                return True
+            return self._has_unsigned_scalar_pointee(child)
         return False
 
     def _func_decl_returns_unsigned(self, node_type):
@@ -2383,7 +3546,7 @@ class LLVMCodeGenerator(object):
             else:
                 try:
                     val = self._eval_const_expr(expr)
-                    c = ir.Constant(actual_elem, val)
+                    c = self._ir_constant_from_value(actual_elem, val)
                     str(c)  # verify serializable
                     values.append(c)
                 except Exception:
@@ -2418,7 +3581,21 @@ class LLVMCodeGenerator(object):
 
     def _make_global_string_literal_constant(self, node, name_hint="str"):
         data = self._string_literal_data(node)
-        if self._is_wide_string_constant(node):
+        is_wide = self._is_wide_string_constant(node)
+        # Deduplicate identical string literals so that `foo(s)` and
+        # `s + 2` — which both reference the same source-level
+        # `const char *s = "...";` — compare equal at runtime. Without
+        # dedup each reference created a fresh `@ssastr.N` and pointer
+        # equality failed (gcc_torture pr34415.c).
+        cache = getattr(self, "_string_literal_cache", None)
+        if cache is None:
+            cache = {}
+            self._string_literal_cache = cache
+        cache_key = (is_wide, tuple(data))
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if is_wide:
             elem_type = int32_t
             values = [ir.Constant(int32_t, cp) for cp in data]
             arr_type = ir.ArrayType(elem_type, len(values))
@@ -2433,6 +3610,7 @@ class LLVMCodeGenerator(object):
         gv.initializer = initializer
         gv.global_constant = True
         gv.linkage = "internal"
+        cache[cache_key] = gv
         return gv
 
     def _compound_literal_ir_type(self, ast_type, init_node=None):
@@ -2970,6 +4148,13 @@ class LLVMCodeGenerator(object):
         if isinstance(init_node, c_ast.Cast):
             return self._build_const_address(init_node.expr)
 
+        # Plain string / wstring literal used as a const address base
+        # (e.g. `void *foo[] = {(void *)&("X"[0])};` in gcc_torture
+        # 921019-1.c). Return a pointer to the materialized global.
+        if isinstance(init_node, c_ast.Constant) and init_node.type in ("string", "wstring"):
+            gv = self._make_global_string_literal_constant(init_node, name_hint="ssastr")
+            return gv
+
         if isinstance(init_node, c_ast.ArrayRef):
             base_addr = self._build_const_address(init_node.name)
             if base_addr is None or not isinstance(
@@ -3231,22 +4416,25 @@ class LLVMCodeGenerator(object):
             return self._pointer_const_to_bytes(ptr_const)
 
         if self._is_floating_ir_type(ir_type):
-            scalar_node = self._scalar_init_node(init_node)
-            if scalar_node is None:
-                value = 0.0
-            elif isinstance(scalar_node, c_ast.Constant):
-                try:
-                    value = self._parse_float_constant(scalar_node.value)
-                except ValueError:
+            try:
+                scalar_node = self._scalar_init_node(init_node)
+                if scalar_node is None:
+                    value = 0.0
+                elif isinstance(scalar_node, c_ast.Constant):
+                    try:
+                        value = self._parse_float_constant(scalar_node.value)
+                    except ValueError:
+                        value = float(self._eval_const_expr(scalar_node))
+                else:
                     value = float(self._eval_const_expr(scalar_node))
-            else:
-                value = float(self._eval_const_expr(scalar_node))
-            fmt = "d" if isinstance(ir_type, ir.DoubleType) else "f"
-            packed = struct.pack(
-                ("<" if self._is_little_endian() else ">") + fmt,
-                value,
-            )
-            return [ir.Constant(int8_t, b) for b in packed]
+                fmt = "d" if isinstance(ir_type, ir.DoubleType) else "f"
+                packed = struct.pack(
+                    ("<" if self._is_little_endian() else ">") + fmt,
+                    value,
+                )
+                return [ir.Constant(int8_t, b) for b in packed]
+            except Exception:
+                return self._zero_bytes(size)
 
         if isinstance(ir_type, ir.IntType):
             scalar_node = self._scalar_init_node(init_node)
@@ -3377,6 +4565,22 @@ class LLVMCodeGenerator(object):
             if ptr_const is not None:
                 return ptr_const
             return self._zero_initializer(ir_type)
+
+        if self._is_floating_ir_type(ir_type):
+            try:
+                scalar_node = self._scalar_init_node(init_node)
+                if scalar_node is None:
+                    return self._zero_initializer(ir_type)
+                if isinstance(scalar_node, c_ast.Constant):
+                    try:
+                        value = self._parse_float_constant(scalar_node.value)
+                    except ValueError:
+                        value = float(self._eval_const_expr(scalar_node))
+                else:
+                    value = float(self._eval_const_expr(scalar_node))
+                return self._ir_constant_from_value(ir_type, value)
+            except Exception:
+                return self._zero_initializer(ir_type)
 
         if isinstance(ir_type, ir.ArrayType):
             if self._is_array_string_initializer(init_node, ir_type):
@@ -3512,7 +4716,7 @@ class LLVMCodeGenerator(object):
 
         try:
             val = self._eval_const_expr(init_node)
-            result = ir.Constant(ir_type, val)
+            result = self._ir_constant_from_value(ir_type, val)
             str(result)
             return result
         except Exception:
@@ -4303,7 +5507,8 @@ class LLVMCodeGenerator(object):
         else:
             storage_type = self.module.context.get_identified_type(identified_name)
         if storage_type.is_opaque:
-            storage_type.set_body(*body)
+            from pcc.llvm_capi.compat import set_struct_body
+            set_struct_body(storage_type, body)
         storage_type.custom_size = size_bytes
         storage_type.custom_align = align_bytes
         storage_type.has_custom_layout = True
@@ -4710,7 +5915,13 @@ class LLVMCodeGenerator(object):
             return self._float_literal_ir_type(node.value)
 
         if isinstance(node, c_ast.ID):
-            ir_type, _ = self.lookup(node.name)
+            try:
+                ir_type, _ = self.lookup(node.name)
+            except SemanticError:
+                decl_type = self._lookup_decl_ast_type(node.name)
+                if decl_type is None:
+                    raise
+                ir_type = self._resolve_ast_type(decl_type)
             return ir_type
 
         if isinstance(node, c_ast.CompoundLiteral):
@@ -5335,11 +6546,11 @@ class LLVMCodeGenerator(object):
         if node.op in ["+", "-", "*", "/", "%"]:
             if dispatch_type == dispatch_type_double:
                 ops = {
-                    "+": self.builder.fadd,
-                    "-": self.builder.fsub,
-                    "*": self.builder.fmul,
-                    "/": self.builder.fdiv,
-                    "%": self.builder.frem,
+                    "+": self._fadd,
+                    "-": self._fsub,
+                    "*": self._fmul,
+                    "/": self._fdiv,
+                    "%": self._frem,
                 }
                 return ops[node.op](lhs, rhs, "tmp"), None
             else:
@@ -5355,6 +6566,10 @@ class LLVMCodeGenerator(object):
                     }
                     op = ops[node.op]
                 result = op(lhs, rhs, "tmp")
+                # Do not attach no-wrap flags by default. Even for signed
+                # arithmetic, frontends need a proof before adding `nsw`;
+                # otherwise LLVM is free to miscompile wrap-sensitive code.
+                # Later passes can annotate proven-safe operations.
                 if is_unsigned:
                     self._tag_unsigned(result)
                 return result, None
@@ -5372,7 +6587,9 @@ class LLVMCodeGenerator(object):
                     cmp = self.builder.icmp_signed(node.op, lhs, rhs, "cmptmp")
             else:
                 cmp = self._float_compare(node.op, lhs, rhs, "cmptmp")
-            return self.builder.zext(cmp, int64_t, "booltmp"), None
+            # clang CodeGen: comparison results are i32 (C int), not i64.
+            # zext i1→i32 is cheaper and _to_bool handles i32 directly.
+            return self.builder.zext(cmp, int32_t, "booltmp"), None
         elif node.op == "&":
             result = self.builder.and_(lhs, rhs, "andtmp")
             if is_unsigned:
@@ -6099,17 +7316,17 @@ class LLVMCodeGenerator(object):
             if callee == "__builtin_snprintf":
                 callee = "snprintf"
             if callee == "__builtin_inf":
-                return ir.Constant(_double, float("inf")), None
+                return self._ir_constant_from_value(_double, float("inf")), None
             if callee == "__builtin_inff":
-                return ir.Constant(_float, float("inf")), None
+                return self._ir_constant_from_value(_float, float("inf")), None
             if callee == "__builtin_infl":
-                return ir.Constant(_double, float("inf")), None
+                return self._ir_constant_from_value(_double, float("inf")), None
             if callee == "__builtin_nan":
-                return ir.Constant(_double, float("nan")), None
+                return self._ir_constant_from_value(_double, float("nan")), None
             if callee == "__builtin_nanf":
-                return ir.Constant(_float, float("nan")), None
+                return self._ir_constant_from_value(_float, float("nan")), None
             if callee == "__builtin_nanl":
-                return ir.Constant(_double, float("nan")), None
+                return self._ir_constant_from_value(_double, float("nan")), None
             if callee in ("__builtin_isnan", "__builtin_isnanf", "__builtin_isnanl"):
                 return self._codegen_builtin_isnan(node)
             if callee in ("__builtin_isfinite", "__builtin_finite"):
@@ -7051,6 +8268,23 @@ class LLVMCodeGenerator(object):
                 self.codegen_Enum(inner)
                 return None, None
 
+        # `extern T name;` inside a function body refers to the file-scope
+        # `name` (C11 6.2.2p4). Rebind the local scope so the declared name
+        # resolves to the global's storage rather than creating a fresh
+        # alloca that shadows the outer declaration (gcc_torture scope-1.c).
+        is_extern_local = (
+            not self.in_global
+            and node.storage and "extern" in node.storage
+            and node.name is not None
+            and not isinstance(node.type, c_ast.FuncDecl)
+            and node.init is None
+        )
+        if is_extern_local:
+            ir_type = self._extern_decl_ir_type(node.name, node.type)
+            gv = self._safe_global_var(ir_type, node.name, external=True)
+            self.define(node.name, (ir_type, gv))
+            return None, None
+
         # Static local objects: stored as internal globals with function-scoped names
         is_static = node.storage and "static" in node.storage
         if is_static and not self.in_global and not isinstance(node.type, c_ast.FuncDecl):
@@ -7317,14 +8551,19 @@ class LLVMCodeGenerator(object):
                     if self.in_global:
                         init_val = self._build_const_init(node.init, ir_type)
                     else:
-                        var_addr, var_ir_type = self.create_entry_block_alloca(
-                            node.name, type_str, 1, storage=node.storage
-                        )
-                        if is_unsigned:
-                            self._mark_unsigned(var_addr)
+                        # SSA promotion: skip alloca for single-def non-escaping scalars.
+                        # Inspired by clang's EmitAutoVarAlloca + Graal's PEA.
+                        _ssa_promote = self._should_ssa_promote(node.name)
+                        if not _ssa_promote:
+                            var_addr, var_ir_type = self.create_entry_block_alloca(
+                                node.name, type_str, 1, storage=node.storage
+                            )
+                            if is_unsigned:
+                                self._mark_unsigned(var_addr)
                         init_val, _ = self.codegen(node.init)
                 else:
                     init_val = self._zero_initializer(ir_type)
+                    _ssa_promote = False
                 if self.in_global:
                     var_addr, write_initializer = self._prepare_file_scope_object(
                         node.name,
@@ -7338,14 +8577,24 @@ class LLVMCodeGenerator(object):
                     if write_initializer:
                         var_addr.initializer = init_val
                 else:
-                    if node.init is None:
-                        var_addr, var_ir_type = self.create_entry_block_alloca(
-                            node.name, type_str, 1, storage=node.storage
-                        )
+                    if _ssa_promote:
+                        # Direct SSA: define as value, no alloca/store
+                        init_val = self._implicit_convert(init_val, ir_type)
+                        init_val = self._tag_value_from_decl_type(init_val, node.type)
+                        self.define(node.name, (ir_type, init_val))
                         if is_unsigned:
-                            self._mark_unsigned(var_addr)
-                    init_val = self._implicit_convert(init_val, ir_type)
-                    self._safe_store(init_val, var_addr)
+                            self._mark_unsigned(init_val)
+                        return None, None
+                    else:
+                        if node.init is None:
+                            var_addr, var_ir_type = self.create_entry_block_alloca(
+                                node.name, type_str, 1, storage=node.storage
+                            )
+                            if is_unsigned:
+                                self._mark_unsigned(var_addr)
+                        init_val = self._implicit_convert(init_val, ir_type)
+                        init_val = self._tag_value_from_decl_type(init_val, node.type)
+                        self._safe_store(init_val, var_addr)
                 if self.in_global and is_unsigned:
                     self._mark_unsigned(var_addr)
 
@@ -7435,8 +8684,11 @@ class LLVMCodeGenerator(object):
                         dim = inferred_top_dim
                     elem_ir = self._resolve_ast_type(array_next_type)
                     elem_ir_type = elem_ir
-                    arr_ir = ir.ArrayType(elem_ir, dim)
-                    arr_ir.dim_array = [dim]
+                    dims = array_list + [dim]
+                    arr_ir = elem_ir
+                    for current_dim in reversed(dims):
+                        arr_ir = ir.ArrayType(arr_ir, current_dim)
+                    arr_ir.dim_array = dims
                     if not self.in_global:
                         var_addr = self._alloca_in_entry(arr_ir, node.name)
                         self.define(node.name, (arr_ir, var_addr))
@@ -7674,16 +8926,12 @@ class LLVMCodeGenerator(object):
         node.ir_type = valtype
         # Enum constants are stored as ir.Constant, not alloca'd
         if isinstance(var, ir.values.Constant):
-            return var, None
+            return self._propagate_binding_tags(var, var), None
         # Function reference: return function pointer directly
         if isinstance(var, ir.Function):
-            if self._is_unsigned_return_binding(var):
-                self._tag_unsigned_return(var)
-            return var, None
+            return self._propagate_binding_tags(var, var), None
         if self._is_vla_binding(var):
-            if self._is_unsigned_pointee_binding(var):
-                self._tag_unsigned_pointee(var)
-            return var, var
+            return self._propagate_binding_tags(var, var), var
         # Array types: decay to pointer to first element
         if isinstance(valtype, ir.ArrayType):
             ptr = self.builder.gep(
@@ -7691,21 +8939,12 @@ class LLVMCodeGenerator(object):
                 [ir.Constant(int64_t, 0), ir.Constant(int64_t, 0)],
                 name="arraydecay",
             )
-            if self._is_unsigned_pointee_binding(var):
-                self._tag_unsigned_pointee(ptr)
-            return ptr, var
+            return self._propagate_binding_tags(ptr, var), var
         # Guard: only load from pointer types
         if not isinstance(var.type, ir.PointerType):
-            return var, None
+            return self._propagate_binding_tags(var, var), None
         result = self._safe_load(var)
-        # Propagate unsigned-ness from variable to loaded value
-        if self._is_unsigned_binding(var):
-            self._tag_unsigned(result)
-        if self._is_unsigned_pointee_binding(var):
-            self._tag_unsigned_pointee(result)
-        if self._is_unsigned_return_binding(var):
-            self._tag_unsigned_return(result)
-        return result, var
+        return self._propagate_binding_tags(result, var), var
 
     def codegen_ArrayRef(self, node):
 
@@ -7746,6 +8985,10 @@ class LLVMCodeGenerator(object):
             if isinstance(elem_ptr.type, ir.PointerType) and isinstance(
                 elem_ptr.type.pointee, ir.ArrayType
             ):
+                if self._is_unsigned_pointee(name_ir) or self._is_unsigned_pointee(
+                    name_ptr
+                ):
+                    self._tag_unsigned_pointee(elem_ptr)
                 node.ir_type = elem_ptr.type.pointee
                 return elem_ptr, elem_ptr
             value_result = self._safe_load(elem_ptr)
@@ -7799,6 +9042,10 @@ class LLVMCodeGenerator(object):
 
             # If element is sub-array, return pointer (array decay)
             if isinstance(value_ir_type, ir.ArrayType):
+                if self._is_unsigned_pointee(name_ir) or self._is_unsigned_pointee(
+                    name_ptr
+                ):
+                    self._tag_unsigned_pointee(elem_ptr)
                 node.ir_type = value_ir_type
                 return elem_ptr, elem_ptr
             else:
@@ -8083,7 +9330,37 @@ class LLVMCodeGenerator(object):
                 if isinstance(p, c_ast.Decl):
                     self._emit_vla_param_bound_side_effects(p.type)
 
-            self._codegen_compound_items(node.body, use_new_scope=False)
+            # Phase 2: try SSA → LLVM lowering for eligible functions.
+            # Falls back to AST codegen if SSA IR is unavailable or
+            # the function uses constructs not yet in the SSA subset.
+            _used_ssa_lowering = False
+            if self._has_ssa_function(funcname):
+                import os
+                # Snapshot the current block count so we can roll back any
+                # orphan blocks created by _lower_ssa_function when SSA
+                # lowering raises partway through.
+                _ssa_prev_block_count = len(self.function.basic_blocks)
+                try:
+                    _used_ssa_lowering = self._lower_ssa_function(
+                        funcname, ir_type,
+                    )
+                except Exception as _ssa_err:
+                    if os.environ.get("PCC_DEBUG_SSA_LOWER_FAIL"):
+                        import traceback
+                        print(f"[ssa-lower] {funcname} fell back: {_ssa_err}", flush=True)
+                        traceback.print_exc()
+                    _used_ssa_lowering = False
+                if not _used_ssa_lowering:
+                    # Remove any partial blocks created while trying SSA.
+                    while len(self.function.basic_blocks) > _ssa_prev_block_count:
+                        self.function.basic_blocks.pop()
+                    # Reset the builder to the entry block so AST codegen
+                    # continues there rather than at the middle of a
+                    # half-built SSA block.
+                    self.builder.position_at_end(self.function.basic_blocks[_ssa_prev_block_count - 1])
+
+            if not _used_ssa_lowering:
+                self._codegen_compound_items(node.body, use_new_scope=False)
 
             if not self.builder.block.is_terminated:
                 if isinstance(ir_type, ir.VoidType):
@@ -8743,6 +10020,9 @@ class LLVMCodeGenerator(object):
         def is_float_value(value):
             return isinstance(value, float)
 
+        def is_int_value(value):
+            return isinstance(value, ConstIntValue)
+
         def cast_int_value(value, width, is_unsigned):
             mask = (1 << width) - 1
             value = int(value) & mask
@@ -8753,20 +10033,111 @@ class LLVMCodeGenerator(object):
                 value -= 1 << width
             return value
 
+        def make_int(value, width=32, is_unsigned=False):
+            return ConstIntValue(
+                cast_int_value(value, width, is_unsigned),
+                width,
+                is_unsigned,
+            )
+
+        def coerce_int_value(value):
+            if is_int_value(value):
+                return value
+            return make_int(value)
+
+        def raw_bits(value):
+            value = coerce_int_value(value)
+            return int(value.value) & ((1 << value.width) - 1)
+
+        def numeric_value(value):
+            if is_int_value(value):
+                return value.value
+            return value
+
+        def integer_promotion(value):
+            value = coerce_int_value(value)
+            if value.width == 1 or value.width < 32:
+                return make_int(value.value, 32, False)
+            return value
+
+        def convert_int_value(value, width, is_unsigned):
+            return make_int(numeric_value(value), width, is_unsigned)
+
+        def usual_arithmetic_conversion(lhs, rhs):
+            lhs = integer_promotion(lhs)
+            rhs = integer_promotion(rhs)
+
+            lhs_unsigned = lhs.is_unsigned
+            rhs_unsigned = rhs.is_unsigned
+            lhs_width = lhs.width
+            rhs_width = rhs.width
+
+            if lhs_unsigned == rhs_unsigned:
+                target_width = lhs_width if lhs_width >= rhs_width else rhs_width
+                result_unsigned = lhs_unsigned
+            elif lhs_unsigned:
+                if lhs_width >= rhs_width:
+                    target_width = lhs_width
+                    result_unsigned = True
+                else:
+                    target_width = rhs_width
+                    result_unsigned = False
+            else:
+                if rhs_width >= lhs_width:
+                    target_width = rhs_width
+                    result_unsigned = True
+                else:
+                    target_width = lhs_width
+                    result_unsigned = False
+
+            lhs = convert_int_value(lhs, target_width, result_unsigned)
+            rhs = convert_int_value(rhs, target_width, result_unsigned)
+            return lhs, rhs, result_unsigned
+
+        def parse_int_constant(raw):
+            raw_lower = raw.lower()
+            has_unsigned_suffix = "u" in raw_lower
+            has_long_suffix = "l" in raw_lower
+            val_str = raw.rstrip("uUlL")
+            if val_str.startswith(("0x", "0X")):
+                int_val = int(val_str, 16)
+                is_non_decimal = True
+            elif val_str.startswith("0") and len(val_str) > 1 and val_str[1:].isdigit():
+                int_val = int(val_str, 8)
+                is_non_decimal = True
+            else:
+                int_val = int(val_str)
+                is_non_decimal = False
+
+            if has_long_suffix or int_val > 0xFFFFFFFF:
+                return make_int(int_val, 64, has_unsigned_suffix)
+            if has_unsigned_suffix:
+                return make_int(int_val, 32, True)
+            if is_non_decimal and int_val > 0x7FFFFFFF:
+                return make_int(int_val, 32, True)
+            if int_val > 0x7FFFFFFF:
+                return make_int(int_val, 64, False)
+            return make_int(int_val, 32, False)
+
         def cast_const_value(value, target_decl_type):
             target_ir_type = self._resolve_ast_type(target_decl_type)
             if isinstance(target_ir_type, ir.IntType):
-                return cast_int_value(
-                    value,
+                return make_int(
+                    numeric_value(value),
                     target_ir_type.width,
                     self._is_unsigned_scalar_decl_type(target_decl_type),
                 )
             if self._is_floating_ir_type(target_ir_type):
-                return float(value)
+                return float(numeric_value(value))
             return value
 
         def c_int_div(lhs, rhs):
-            return int(lhs / rhs)
+            lhs = int(lhs)
+            rhs = int(rhs)
+            quotient = abs(lhs) // abs(rhs)
+            if (lhs < 0) ^ (rhs < 0):
+                quotient = -quotient
+            return quotient
 
         def c_int_mod(lhs, rhs):
             return lhs - c_int_div(lhs, rhs) * rhs
@@ -8786,79 +10157,200 @@ class LLVMCodeGenerator(object):
                 return self._parse_float_constant(node.value)
             v = node.value.rstrip("uUlL")
             if v.startswith("'"):
-                return self._char_constant_value(v)
-            if v.startswith("0x") or v.startswith("0X"):
-                return int(v, 16)
-            elif v.startswith("0") and len(v) > 1 and v[1:].isdigit():
-                return int(v, 8)
+                return make_int(self._char_constant_value(v))
             try:
-                return int(v)
+                return parse_int_constant(node.value)
             except ValueError:
-                return 0
+                return make_int(0)
         elif isinstance(node, c_ast.UnaryOp):
             if node.op == "sizeof":
                 if isinstance(node.expr, c_ast.Typename):
                     ir_t = self._resolve_ast_type(node.expr.type)
-                    return self._ir_type_size(ir_t)
+                    return make_int(self._ir_type_size(ir_t), 64, True)
                 if self._is_string_constant(node.expr):
-                    return len(self._string_literal_data(node.expr))
+                    return make_int(len(self._string_literal_data(node.expr)), 64, True)
                 ir_t = self._infer_sizeof_operand_ir_type(node.expr)
-                return self._ir_type_size(ir_t)
+                return make_int(self._ir_type_size(ir_t), 64, True)
             if node.op == "&" and isinstance(node.expr, c_ast.StructRef):
                 offset, _ = self._eval_offsetof_structref(node.expr)
-                return offset
+                return make_int(offset, 64, True)
             val = self._eval_const_expr(node.expr)
             if node.op == "-":
+                if is_int_value(val):
+                    val = integer_promotion(val)
+                    return make_int(-numeric_value(val), val.width, val.is_unsigned)
                 return -val
             elif node.op == "+":
+                if is_int_value(val):
+                    return integer_promotion(val)
                 return val
             elif node.op == "~":
-                return ~val
+                val = integer_promotion(coerce_int_value(val))
+                return make_int(~raw_bits(val), val.width, val.is_unsigned)
             elif node.op == "!":
-                return 0 if val else 1
+                return 0 if numeric_value(val) else 1
         elif isinstance(node, c_ast.BinaryOp):
             l = self._eval_const_expr(node.left)
             r = self._eval_const_expr(node.right)
             use_float = is_float_value(l) or is_float_value(r)
 
             def c_shift_left(a, b):
-                # C semantics: truncate to 64-bit before shifting
-                return cast_int_value(int(a) << int(b), 64, False)
+                a = integer_promotion(a)
+                return make_int(raw_bits(a) << int(numeric_value(b)), a.width, a.is_unsigned)
 
             def c_shift_right(a, b):
-                # Arithmetic right shift on 64-bit signed value
-                a = cast_int_value(int(a), 64, False)
-                return a >> int(b)
+                a = integer_promotion(a)
+                shift = int(numeric_value(b))
+                if a.is_unsigned:
+                    return make_int(raw_bits(a) >> shift, a.width, True)
+                return make_int(int(numeric_value(a)) >> shift, a.width, False)
 
             def c_arith(a, b, op):
                 if use_float:
-                    return op(a, b)
-                return cast_int_value(op(int(a), int(b)), 64, False)
+                    return op(float(numeric_value(a)), float(numeric_value(b)))
+                a, b, result_unsigned = usual_arithmetic_conversion(a, b)
+                return make_int(
+                    op(int(numeric_value(a)), int(numeric_value(b))),
+                    a.width,
+                    result_unsigned,
+                )
 
             ops = {
                 "+": lambda a, b: c_arith(a, b, lambda x, y: x + y),
                 "-": lambda a, b: c_arith(a, b, lambda x, y: x - y),
                 "*": lambda a, b: c_arith(a, b, lambda x, y: x * y),
-                "/": lambda a, b: c_float_div(a, b) if use_float else c_int_div(a, b),
-                "%": lambda a, b: a % b if use_float else c_int_mod(a, b),
+                "/": lambda a, b: (
+                    c_float_div(float(numeric_value(a)), float(numeric_value(b)))
+                    if use_float
+                    else (
+                        lambda lhs, rhs, result_unsigned: make_int(
+                            (
+                                raw_bits(lhs) // raw_bits(rhs)
+                                if result_unsigned
+                                else c_int_div(
+                                    int(numeric_value(lhs)),
+                                    int(numeric_value(rhs)),
+                                )
+                            ),
+                            lhs.width,
+                            result_unsigned,
+                        )
+                    )(*usual_arithmetic_conversion(a, b))
+                ),
+                "%": lambda a, b: (
+                    float(numeric_value(a)) % float(numeric_value(b))
+                    if use_float
+                    else (
+                        lambda lhs, rhs, result_unsigned: make_int(
+                            (
+                                raw_bits(lhs) % raw_bits(rhs)
+                                if result_unsigned
+                                else c_int_mod(
+                                    int(numeric_value(lhs)),
+                                    int(numeric_value(rhs)),
+                                )
+                            ),
+                            lhs.width,
+                            result_unsigned,
+                        )
+                    )(*usual_arithmetic_conversion(a, b))
+                ),
                 "<<": lambda a, b: c_shift_left(a, b) if not use_float else 0,
                 ">>": lambda a, b: c_shift_right(a, b) if not use_float else 0,
-                "&": lambda a, b: a & b,
-                "|": lambda a, b: a | b,
-                "^": lambda a, b: a ^ b,
-                "==": lambda a, b: int(a == b),
-                "!=": lambda a, b: int(a != b),
-                "<": lambda a, b: int(a < b),
-                "<=": lambda a, b: int(a <= b),
-                ">": lambda a, b: int(a > b),
-                ">=": lambda a, b: int(a >= b),
-                "&&": lambda a, b: int(bool(a) and bool(b)),
-                "||": lambda a, b: int(bool(a) or bool(b)),
+                "&": lambda a, b: (
+                    lambda lhs, rhs, result_unsigned: make_int(
+                        raw_bits(lhs) & raw_bits(rhs),
+                        lhs.width,
+                        result_unsigned,
+                    )
+                )(*usual_arithmetic_conversion(a, b)),
+                "|": lambda a, b: (
+                    lambda lhs, rhs, result_unsigned: make_int(
+                        raw_bits(lhs) | raw_bits(rhs),
+                        lhs.width,
+                        result_unsigned,
+                    )
+                )(*usual_arithmetic_conversion(a, b)),
+                "^": lambda a, b: (
+                    lambda lhs, rhs, result_unsigned: make_int(
+                        raw_bits(lhs) ^ raw_bits(rhs),
+                        lhs.width,
+                        result_unsigned,
+                    )
+                )(*usual_arithmetic_conversion(a, b)),
+                "==": lambda a, b: int(
+                    float(numeric_value(a)) == float(numeric_value(b))
+                    if use_float
+                    else (
+                        lambda lhs, rhs, result_unsigned: (
+                            raw_bits(lhs) == raw_bits(rhs)
+                            if result_unsigned
+                            else int(numeric_value(lhs)) == int(numeric_value(rhs))
+                        )
+                    )(*usual_arithmetic_conversion(a, b))
+                ),
+                "!=": lambda a, b: int(
+                    float(numeric_value(a)) != float(numeric_value(b))
+                    if use_float
+                    else (
+                        lambda lhs, rhs, result_unsigned: (
+                            raw_bits(lhs) != raw_bits(rhs)
+                            if result_unsigned
+                            else int(numeric_value(lhs)) != int(numeric_value(rhs))
+                        )
+                    )(*usual_arithmetic_conversion(a, b))
+                ),
+                "<": lambda a, b: int(
+                    float(numeric_value(a)) < float(numeric_value(b))
+                    if use_float
+                    else (
+                        lambda lhs, rhs, result_unsigned: (
+                            raw_bits(lhs) < raw_bits(rhs)
+                            if result_unsigned
+                            else int(numeric_value(lhs)) < int(numeric_value(rhs))
+                        )
+                    )(*usual_arithmetic_conversion(a, b))
+                ),
+                "<=": lambda a, b: int(
+                    float(numeric_value(a)) <= float(numeric_value(b))
+                    if use_float
+                    else (
+                        lambda lhs, rhs, result_unsigned: (
+                            raw_bits(lhs) <= raw_bits(rhs)
+                            if result_unsigned
+                            else int(numeric_value(lhs)) <= int(numeric_value(rhs))
+                        )
+                    )(*usual_arithmetic_conversion(a, b))
+                ),
+                ">": lambda a, b: int(
+                    float(numeric_value(a)) > float(numeric_value(b))
+                    if use_float
+                    else (
+                        lambda lhs, rhs, result_unsigned: (
+                            raw_bits(lhs) > raw_bits(rhs)
+                            if result_unsigned
+                            else int(numeric_value(lhs)) > int(numeric_value(rhs))
+                        )
+                    )(*usual_arithmetic_conversion(a, b))
+                ),
+                ">=": lambda a, b: int(
+                    float(numeric_value(a)) >= float(numeric_value(b))
+                    if use_float
+                    else (
+                        lambda lhs, rhs, result_unsigned: (
+                            raw_bits(lhs) >= raw_bits(rhs)
+                            if result_unsigned
+                            else int(numeric_value(lhs)) >= int(numeric_value(rhs))
+                        )
+                    )(*usual_arithmetic_conversion(a, b))
+                ),
+                "&&": lambda a, b: int(bool(numeric_value(a)) and bool(numeric_value(b))),
+                "||": lambda a, b: int(bool(numeric_value(a)) or bool(numeric_value(b))),
             }
             return ops[node.op](l, r)
         elif isinstance(node, c_ast.TernaryOp):
             cond = self._eval_const_expr(node.cond)
-            if cond:
+            if numeric_value(cond):
                 return self._eval_const_expr(node.iftrue)
             return self._eval_const_expr(node.iffalse)
         elif isinstance(node, c_ast.ID):
@@ -8870,7 +10362,11 @@ class LLVMCodeGenerator(object):
                 if isinstance(val, ir.values.Constant) and isinstance(
                     val.type, ir.IntType
                 ):
-                    return int(val.constant)
+                    return make_int(
+                        int(val.constant),
+                        val.type.width,
+                        self._is_unsigned_val(val),
+                    )
             raise CodegenError(f"Not a constant expression: identifier '{node.name}'")
         elif isinstance(node, c_ast.Cast):
             value = self._eval_const_expr(node.expr)

@@ -257,9 +257,15 @@ class CLexer(object):
     escape_sequence = r"""(\\("""+simple_escape+'|'+decimal_escape+'|'+hex_escape+'))'
     cconst_char = r"""([^'\\\n]|"""+escape_sequence+')'
     char_const = "'"+cconst_char+"'"
-    wchar_const = 'L'+char_const
-    unmatched_quote = "('"+cconst_char+"*\\n)|('"+cconst_char+"*$)"
-    bad_char_const = r"""('"""+cconst_char+"""[^'\n]+')|('')|('"""+bad_escape+r"""[^'\n]*')"""
+    prefixed_char_const = r"""([LuU])"""+char_const
+    unmatched_quote = r"""(([LuU])?'"""+cconst_char+r"""*\n)|(([LuU])?'"""+cconst_char+r"""*$)"""
+    bad_char_const = (
+        r"""((([LuU])?')"""
+        + cconst_char
+        + r"""[^'\n]+')|((([LuU])?')')|((([LuU])?')"""
+        + bad_escape
+        + r"""[^'\n]*')"""
+    )
 
     # string literals (K&R2: A.2.6)
     string_char = r"""([^"\\\n]|"""+escape_sequence+')'
@@ -502,7 +508,7 @@ class CLexer(object):
     def t_CHAR_CONST(self, t):
         return t
 
-    @TOKEN(wchar_const)
+    @TOKEN(prefixed_char_const)
     def t_WCHAR_CONST(self, t):
         return t
 

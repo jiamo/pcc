@@ -49,12 +49,13 @@ _MAKE_VAR_REF_RE = re.compile(r"\$\(([^()]+)\)|\${([^{}]+)}")
 _AUTOCONF_PLACEHOLDER_RE = re.compile(r"@[A-Za-z0-9_]+@")
 
 
-def collect_project(path, sources_from_make=None):
+def collect_project(path, sources_from_make=None, cpp_args=None):
     """Collect C source from a file or directory.
 
     Args:
         path: path to a .c file or a directory
         sources_from_make: optional make goal used to derive participating .c files
+        cpp_args: optional extra preprocessor args used while locating main()
 
     Returns:
         (merged_source, base_dir)
@@ -69,12 +70,23 @@ def collect_project(path, sources_from_make=None):
             return f.read(), base_dir
 
     if os.path.isdir(path):
-        return _collect_directory(path, sources_from_make=sources_from_make), path
+        return (
+            _collect_directory(
+                path,
+                sources_from_make=sources_from_make,
+                cpp_args=_main_detection_cpp_args(
+                    path,
+                    sources_from_make=sources_from_make,
+                    cpp_args=cpp_args,
+                ),
+            ),
+            path,
+        )
 
     raise FileNotFoundError(f"Not found: {path}")
 
 
-def collect_translation_units(path, sources_from_make=None, dependencies=None):
+def collect_translation_units(path, sources_from_make=None, dependencies=None, cpp_args=None):
     """Collect translation units from a file or directory.
 
     When dependencies are provided, the primary input must contribute the single
@@ -87,6 +99,12 @@ def collect_translation_units(path, sources_from_make=None, dependencies=None):
         path,
         sources_from_make=sources_from_make,
         dependencies=dependencies,
+        cpp_args=_main_detection_cpp_args(
+            path,
+            sources_from_make=sources_from_make,
+            dependencies=dependencies,
+            cpp_args=cpp_args,
+        ),
     )
 
 
@@ -118,6 +136,23 @@ def collect_cpp_args(path, sources_from_make=None, dependencies=None):
         seen.add(key)
         flattened.extend(group)
     return flattened
+
+
+def _main_detection_cpp_args(
+    path,
+    sources_from_make=None,
+    dependencies=None,
+    cpp_args=None,
+):
+    # Use the same macro/include context as the real compile so main()
+    # detection does not warn on expected project-specific preprocess state.
+    return tuple(
+        collect_cpp_args(
+            path,
+            sources_from_make=sources_from_make,
+            dependencies=dependencies,
+        )
+    ) + tuple(cpp_args or ())
 
 
 def parse_dependency_specs(specs):
@@ -203,7 +238,7 @@ def translation_unit_include_dirs(units):
 
 
 def _collect_translation_units_with_dependencies(
-    path, sources_from_make=None, dependencies=None
+    path, sources_from_make=None, dependencies=None, cpp_args=None
 ):
     path = os.path.abspath(path)
     dependency_specs = parse_dependency_specs(dependencies)
@@ -215,7 +250,11 @@ def _collect_translation_units_with_dependencies(
         if os.path.isfile(path):
             return primary_units, base_dir
         return (
-            _collect_directory_units(path, sources_from_make=sources_from_make),
+            _collect_directory_units(
+                path,
+                sources_from_make=sources_from_make,
+                cpp_args=cpp_args,
+            ),
             base_dir,
         )
 
@@ -224,7 +263,7 @@ def _collect_translation_units_with_dependencies(
         dep_units, _ = _collect_input_units(
             dep.path, sources_from_make=dep.sources_from_make
         )
-        dep_main_units, dep_other_units = _split_main_units(dep_units)
+        dep_main_units, dep_other_units = _split_main_units(dep_units, cpp_args=cpp_args)
         if dep_main_units:
             names = ", ".join(unit.name for unit in dep_main_units)
             raise ValueError(
@@ -232,7 +271,10 @@ def _collect_translation_units_with_dependencies(
             )
         dependency_units.extend(dep_other_units)
 
-    primary_main_units, primary_other_units = _split_main_units(primary_units)
+    primary_main_units, primary_other_units = _split_main_units(
+        primary_units,
+        cpp_args=cpp_args,
+    )
     if os.path.isfile(path):
         if len(primary_main_units) != 1:
             raise ValueError(
@@ -248,7 +290,7 @@ def _collect_translation_units_with_dependencies(
     return dependency_units + primary_other_units + primary_main_units, base_dir
 
 
-def _collect_directory(dirpath, sources_from_make=None):
+def _collect_directory(dirpath, sources_from_make=None, cpp_args=None):
     """Merge all .c files in a directory into one source string."""
     c_files = _project_c_files(dirpath, sources_from_make=sources_from_make)
 
@@ -263,7 +305,7 @@ def _collect_directory(dirpath, sources_from_make=None):
         fpath = _resolve_source_path(dirpath, fname)
         with open(fpath, 'r') as f:
             content = f.read()
-        if _has_main(content, fpath, include_dirs=[dirpath]):
+        if _has_main(content, fpath, include_dirs=[dirpath], cpp_args=cpp_args):
             main_file = (fname, content)
         else:
             other_files.append((fname, content))
@@ -283,10 +325,10 @@ def _collect_directory(dirpath, sources_from_make=None):
     return '\n'.join(parts)
 
 
-def _collect_directory_units(dirpath, sources_from_make=None):
+def _collect_directory_units(dirpath, sources_from_make=None, cpp_args=None):
     """Collect a directory as independent translation units."""
     units, _ = _collect_input_units(dirpath, sources_from_make=sources_from_make)
-    main_files, other_units = _split_main_units(units)
+    main_files, other_units = _split_main_units(units, cpp_args=cpp_args)
 
     if not main_files:
         raise ValueError(f"No main() function found in {dirpath}/*.c")
@@ -334,12 +376,17 @@ def _collect_input_cpp_arg_groups(path, sources_from_make=None):
     raise FileNotFoundError(f"Not found: {path}")
 
 
-def _split_main_units(units):
+def _split_main_units(units, cpp_args=None):
     main_units = []
     other_units = []
     include_dirs = translation_unit_include_dirs(units)
     for unit in units:
-        if _has_main(unit.source, unit.path, include_dirs=include_dirs):
+        if _has_main(
+            unit.source,
+            unit.path,
+            include_dirs=include_dirs,
+            cpp_args=cpp_args,
+        ):
             main_units.append(unit)
         else:
             other_units.append(unit)
@@ -979,7 +1026,7 @@ def _resolve_source_path(dirpath, source_path):
     return os.path.join(dirpath, source_path)
 
 
-def _has_main(source, path=None, include_dirs=None):
+def _has_main(source, path=None, include_dirs=None, cpp_args=None):
     """Check if source contains a main() function definition."""
     main_pattern = re.compile(
         r"\b(?:int|void)\s+main\s*\([^;{}]*\)\s*\{",
@@ -997,6 +1044,7 @@ def _has_main(source, path=None, include_dirs=None):
             source,
             base_dir=os.path.dirname(path),
             include_dirs=include_dirs,
+            cpp_args=cpp_args,
         )
     except Exception as exc:
         warnings.warn(

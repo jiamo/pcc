@@ -17,6 +17,7 @@ from pcc.project import (
     collect_translation_units,
     translation_unit_include_dirs,
 )
+from tests.parallel_jobs import translation_unit_jobs
 
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
@@ -594,7 +595,7 @@ def test_postgres_runtime_with_system_link_depends_on_repo_local_zlib_project():
         units,
         optimize=True,
         base_dir=base_dir,
-        jobs=2,
+        jobs=translation_unit_jobs(),
         include_dirs=translation_unit_include_dirs(units),
         cpp_args=_postgres_project_cpp_args(),
         link_args=_postgres_link_args(include_native_zlib=False),
@@ -609,6 +610,7 @@ def test_postgres_runtime_with_system_link_depends_on_repo_local_zlib_project():
     assert "OK" in result.stdout
 
 
+@pytest.mark.integration
 def test_postgres_cli_system_link_depends_on():
     _ensure_postgres_support_archives()
 
@@ -706,7 +708,7 @@ def test_postgres_runtime_query_against_native_server(tmp_path):
             query_units,
             optimize=True,
             base_dir=base_dir,
-            jobs=2,
+            jobs=translation_unit_jobs(),
             include_dirs=query_include_dirs,
             cpp_args=query_cpp_args,
             link_args=_postgres_link_args(),
@@ -743,6 +745,7 @@ def test_postgres_runtime_query_against_native_server(tmp_path):
             )
 
 
+@pytest.mark.integration
 def test_postgres_runtime_with_system_link_depends_on():
     _ensure_postgres_support_archives()
 
@@ -752,7 +755,7 @@ def test_postgres_runtime_with_system_link_depends_on():
         units,
         optimize=True,
         base_dir=base_dir,
-        jobs=2,
+        jobs=translation_unit_jobs(),
         include_dirs=translation_unit_include_dirs(units),
         cpp_args=_postgres_cpp_args(),
         link_args=_postgres_link_args(),

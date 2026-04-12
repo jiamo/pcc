@@ -12,19 +12,22 @@ from pcc.parse.c_parser import CParser
 from pcc.codegen.c_codegen import LLVMCodeGenerator, postprocess_ir_text
 
 
-def _compile_and_run(source):
+def _generate_ir(source):
     processed = CEvaluator._system_cpp(source, base_dir=parent_dir)
     ast = CParser().parse(processed)
     cg = LLVMCodeGenerator()
     cg.generate_code(ast)
+    return postprocess_ir_text(str(cg.module))
 
+
+def _compile_and_run(source):
     with tempfile.TemporaryDirectory(prefix="pcc_float_semantics_") as tmpdir:
         ir_path = os.path.join(tmpdir, "float_semantics.ll")
         obj_path = os.path.join(tmpdir, "float_semantics.o")
         bin_path = os.path.join(tmpdir, "float_semantics_bin")
 
         with open(ir_path, "w") as f:
-            f.write(postprocess_ir_text(str(cg.module)))
+            f.write(_generate_ir(source))
 
         r = subprocess.run(
             ["cc", "-c", "-w", ir_path, "-o", obj_path],
@@ -92,3 +95,15 @@ def test_huge_val_macros_match_infinity():
 
     r = _compile_and_run(source)
     assert r.returncode == 0, r.stderr
+
+
+def test_float_arithmetic_emits_contract_flags():
+    source = r"""
+        double mix(double a, double b, double c) {
+            return a * b + c;
+        }
+    """
+
+    ir_text = _generate_ir(source)
+    assert "fmul contract double" in ir_text
+    assert "fadd contract double" in ir_text

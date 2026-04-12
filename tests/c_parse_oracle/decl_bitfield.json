@@ -1,0 +1,64 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": null,
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "Struct",
+        "decls": [
+          {
+            "_t": "Decl",
+            "bitsize": {
+              "_t": "Constant",
+              "type": "int",
+              "value": "3"
+            },
+            "funcspec": [],
+            "name": "a",
+            "quals": [],
+            "storage": [],
+            "type": {
+              "_t": "TypeDecl",
+              "declname": "a",
+              "quals": [],
+              "type": {
+                "_t": "IdentifierType",
+                "names": [
+                  "unsigned"
+                ]
+              }
+            }
+          },
+          {
+            "_t": "Decl",
+            "bitsize": {
+              "_t": "Constant",
+              "type": "int",
+              "value": "5"
+            },
+            "funcspec": [],
+            "name": "b",
+            "quals": [],
+            "storage": [],
+            "type": {
+              "_t": "TypeDecl",
+              "declname": "b",
+              "quals": [],
+              "type": {
+                "_t": "IdentifierType",
+                "names": [
+                  "unsigned"
+                ]
+              }
+            }
+          }
+        ],
+        "name": "F"
+      }
+    }
+  ]
+}

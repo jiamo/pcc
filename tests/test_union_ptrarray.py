@@ -6,6 +6,8 @@ this_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(this_dir)
 sys.path.insert(0, parent_dir)
 from pcc.evaluater.c_evaluator import CEvaluator
+from pcc.codegen.c_codegen import LLVMCodeGenerator
+from pcc.parse.c_parser import CParser
 import unittest
 
 
@@ -61,6 +63,39 @@ class TestArrayOfPointers(unittest.TestCase):
             }
         ''', optimize=False)
         assert ret == 6
+
+    def test_multidim_ptr_array_ir_keeps_all_dimensions(self):
+        cg = LLVMCodeGenerator()
+        ast = CParser().parse(
+            '''
+            int a = 11;
+            int b = 22;
+            int *grid[2][2] = {{&a, &b}, {&b, &a}};
+
+            int main(void) {
+                return 0;
+            }
+            '''
+        )
+        cg.generate_code(ast)
+        ir_str = str(cg.module)
+        assert "grid" in ir_str
+        assert "[2 x [2 x i32*]]" in ir_str
+
+    def test_multidim_ptr_array_runtime(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            int a = 11;
+            int b = 22;
+            int *grid[2][2] = {{&a, &b}, {&b, &a}};
+
+            int main(void) {
+                return *grid[0][0] + *grid[0][1] + *grid[1][0] + *grid[1][1];
+            }
+            '''
+        )
+        assert ret == 66
 
 
 class TestSizeofChar(unittest.TestCase):

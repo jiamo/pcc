@@ -110,6 +110,267 @@ typedef char FILE;
 """
 
 
+class _CppExprError(Exception):
+    """Raised by ``_eval_cpp_expr`` when a ``#if`` expression is
+    malformed or contains a construct beyond the narrow subset we
+    recognize."""
+
+
+def _eval_cpp_expr(src: str) -> int:
+    """Evaluate a C preprocessor ``#if`` expression to an integer.
+
+    Accepts the subset the preprocessor produces after macro expansion
+    and unknown-identifier→0 replacement: integer literals (decimal,
+    hex, octal, binary, with optional L/U/LL suffix), parens, unary
+    ``+ - ~ !``, binary ``* / %``, ``+ -``, shifts ``<< >>``, compare
+    ``< <= > >= == !=``, bitwise ``& ^ |``, logical ``&& ||``, ternary
+    ``a ? b : c``. No function calls, no names. C semantics for
+    booleans (``!0 == 1``, ``!x == 0`` for nonzero x).
+
+    Short-circuits ``&&``/``||`` and the untaken ``?:`` branch so dead
+    ``1/0`` on the other side doesn't raise — matches C.
+
+    Raises :class:`_CppExprError` on any failure in the live path.
+    """
+    p = _CppExprParser(src)
+    tree = p.parse_ternary()
+    p.skip_ws()
+    if p.pos < len(p.src):
+        raise _CppExprError(f"trailing input at pos {p.pos}: {p.src[p.pos:]!r}")
+    return _eval_tree(tree)
+
+
+def _eval_tree(node) -> int:
+    """Evaluate a preprocessor-expression tree with C short-circuit
+    semantics. Each node is a tuple: ``(op, *args)``."""
+    op = node[0]
+    if op == "lit":
+        return node[1]
+    if op == "u+":
+        return _eval_tree(node[1])
+    if op == "u-":
+        return -_eval_tree(node[1])
+    if op == "~":
+        return ~_eval_tree(node[1])
+    if op == "!":
+        return 0 if _eval_tree(node[1]) else 1
+    if op == "&&":
+        return 1 if _eval_tree(node[1]) and _eval_tree(node[2]) else 0
+    if op == "||":
+        return 1 if _eval_tree(node[1]) or _eval_tree(node[2]) else 0
+    if op == "?:":
+        return _eval_tree(node[2]) if _eval_tree(node[1]) else _eval_tree(node[3])
+    l = _eval_tree(node[1])
+    r = _eval_tree(node[2])
+    if op == "+":  return l + r
+    if op == "-":  return l - r
+    if op == "*":  return l * r
+    if op == "/":
+        if r == 0:
+            raise _CppExprError("division by zero")
+        return int(l / r) if (l < 0) ^ (r < 0) else l // r
+    if op == "%":
+        if r == 0:
+            raise _CppExprError("modulo by zero")
+        q = int(l / r) if (l < 0) ^ (r < 0) else l // r
+        return l - q * r
+    if op == "<<": return l << r
+    if op == ">>": return l >> r
+    if op == "<":  return 1 if l < r else 0
+    if op == "<=": return 1 if l <= r else 0
+    if op == ">":  return 1 if l > r else 0
+    if op == ">=": return 1 if l >= r else 0
+    if op == "==": return 1 if l == r else 0
+    if op == "!=": return 1 if l != r else 0
+    if op == "|":  return l | r
+    if op == "^":  return l ^ r
+    if op == "&":  return l & r
+    raise _CppExprError(f"unknown op {op}")
+
+
+class _CppExprParser:
+    """Recursive-descent parser producing a small tagged-tuple tree."""
+
+    def __init__(self, src: str) -> None:
+        self.src = src
+        self.pos = 0
+
+    def skip_ws(self) -> None:
+        while self.pos < len(self.src) and self.src[self.pos] in " \t\r\n":
+            self.pos += 1
+
+    def _peek_tok(self, tok: str) -> bool:
+        self.skip_ws()
+        return self.src.startswith(tok, self.pos)
+
+    def _eat(self, tok: str) -> bool:
+        if self._peek_tok(tok):
+            self.pos += len(tok)
+            return True
+        return False
+
+    def _expect(self, tok: str) -> None:
+        if not self._eat(tok):
+            raise _CppExprError(f"expected {tok!r} at pos {self.pos}")
+
+    def parse_ternary(self):
+        cond = self.parse_or()
+        if self._eat("?"):
+            then_n = self.parse_ternary()
+            self._expect(":")
+            else_n = self.parse_ternary()
+            return ("?:", cond, then_n, else_n)
+        return cond
+
+    def parse_or(self):
+        v = self.parse_and()
+        while self._eat("||"):
+            v = ("||", v, self.parse_and())
+        return v
+
+    def parse_and(self):
+        v = self.parse_bitor()
+        while self._eat("&&"):
+            v = ("&&", v, self.parse_bitor())
+        return v
+
+    def parse_bitor(self):
+        v = self.parse_bitxor()
+        while self._peek_tok("|") and not self._peek_tok("||"):
+            self.pos += 1
+            v = ("|", v, self.parse_bitxor())
+        return v
+
+    def parse_bitxor(self):
+        v = self.parse_bitand()
+        while self._eat("^"):
+            v = ("^", v, self.parse_bitand())
+        return v
+
+    def parse_bitand(self):
+        v = self.parse_eq()
+        while self._peek_tok("&") and not self._peek_tok("&&"):
+            self.pos += 1
+            v = ("&", v, self.parse_eq())
+        return v
+
+    def parse_eq(self):
+        v = self.parse_rel()
+        while True:
+            if self._eat("=="):
+                v = ("==", v, self.parse_rel())
+            elif self._eat("!="):
+                v = ("!=", v, self.parse_rel())
+            else:
+                break
+        return v
+
+    def parse_rel(self):
+        v = self.parse_shift()
+        while True:
+            if self._eat("<="):
+                v = ("<=", v, self.parse_shift())
+            elif self._eat(">="):
+                v = (">=", v, self.parse_shift())
+            elif self._peek_tok("<") and not self._peek_tok("<<"):
+                self.pos += 1
+                v = ("<", v, self.parse_shift())
+            elif self._peek_tok(">") and not self._peek_tok(">>"):
+                self.pos += 1
+                v = (">", v, self.parse_shift())
+            else:
+                break
+        return v
+
+    def parse_shift(self):
+        v = self.parse_add()
+        while True:
+            if self._eat("<<"):
+                v = ("<<", v, self.parse_add())
+            elif self._eat(">>"):
+                v = (">>", v, self.parse_add())
+            else:
+                break
+        return v
+
+    def parse_add(self):
+        v = self.parse_mul()
+        while True:
+            if self._eat("+"):
+                v = ("+", v, self.parse_mul())
+            elif self._eat("-"):
+                v = ("-", v, self.parse_mul())
+            else:
+                break
+        return v
+
+    def parse_mul(self):
+        v = self.parse_unary()
+        while True:
+            if self._eat("*"):
+                v = ("*", v, self.parse_unary())
+            elif self._eat("/"):
+                v = ("/", v, self.parse_unary())
+            elif self._eat("%"):
+                v = ("%", v, self.parse_unary())
+            else:
+                break
+        return v
+
+    def parse_unary(self):
+        self.skip_ws()
+        if self._eat("+"):
+            return ("u+", self.parse_unary())
+        if self._eat("-"):
+            return ("u-", self.parse_unary())
+        if self._eat("~"):
+            return ("~", self.parse_unary())
+        if self._eat("!"):
+            return ("!", self.parse_unary())
+        return self.parse_primary()
+
+    def parse_primary(self):
+        self.skip_ws()
+        if self._eat("("):
+            v = self.parse_ternary()
+            self._expect(")")
+            return v
+        return ("lit", self.parse_number())
+
+    def parse_number(self) -> int:
+        self.skip_ws()
+        s = self.src
+        start = self.pos
+        if start >= len(s) or not s[start].isdigit():
+            raise _CppExprError(
+                f"expected integer at pos {start}: {s[start:start + 20]!r}"
+            )
+        if s[start] == "0" and start + 1 < len(s) and s[start + 1] in "xXbB":
+            base = 16 if s[start + 1] in "xX" else 2
+            self.pos = start + 2
+            digits_start = self.pos
+            valid = "0123456789abcdefABCDEF" if base == 16 else "01"
+            while self.pos < len(s) and s[self.pos] in valid:
+                self.pos += 1
+            digits = s[digits_start:self.pos]
+            if not digits:
+                raise _CppExprError(f"empty hex/bin literal at pos {start}")
+            val = int(digits, base)
+        elif s[start] == "0":
+            self.pos = start + 1
+            while self.pos < len(s) and s[self.pos] in "01234567":
+                self.pos += 1
+            val = int(s[start:self.pos], 8)
+        else:
+            self.pos = start
+            while self.pos < len(s) and s[self.pos].isdigit():
+                self.pos += 1
+            val = int(s[start:self.pos])
+        while self.pos < len(s) and s[self.pos] in "uUlL":
+            self.pos += 1
+        return val
+
+
 class Macro:
     """Represents a #define macro (object-like or function-like)."""
 
@@ -334,20 +595,15 @@ class Preprocessor:
         expanded = self._expand_line(expanded)
         # Replace any remaining identifiers with 0 (C standard behavior)
         expanded = re.sub(r"\b[a-zA-Z_]\w*\b", "0", expanded)
-        # Evaluate using Python
+        # Evaluate using a narrow integer-only expression evaluator.
+        # eval() is out of scope for the self-host target (see
+        # scripts/audit_selfhost.py banned-builtin list).
         try:
-            # C uses && || ! instead of and or not, but Python handles these as bitwise
-            # Convert C logical operators
-            py_expr = (
-                expanded.replace("&&", " and ")
-                .replace("||", " or ")
-                .replace("!", " not ")
-            )
-            return bool(eval(py_expr, {"__builtins__": {}}, {}))
-        except Exception as exc:
+            return bool(_eval_cpp_expr(expanded))
+        except _CppExprError as exc:
             warnings.warn(
                 f"preprocessor: failed to evaluate #if expression: "
-                f"{py_expr!r} ({exc})",
+                f"{expanded!r} ({exc})",
                 stacklevel=2,
             )
             return False

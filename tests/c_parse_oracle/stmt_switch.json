@@ -1,0 +1,118 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "Switch",
+            "cond": {
+              "_t": "ID",
+              "name": "a"
+            },
+            "stmt": {
+              "_t": "Compound",
+              "block_items": [
+                {
+                  "_t": "Case",
+                  "expr": {
+                    "_t": "Constant",
+                    "type": "int",
+                    "value": "1"
+                  },
+                  "stmts": [
+                    {
+                      "_t": "Return",
+                      "expr": {
+                        "_t": "Constant",
+                        "type": "int",
+                        "value": "1"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "_t": "Case",
+                  "expr": {
+                    "_t": "Constant",
+                    "type": "int",
+                    "value": "2"
+                  },
+                  "stmts": [
+                    {
+                      "_t": "Return",
+                      "expr": {
+                        "_t": "Constant",
+                        "type": "int",
+                        "value": "2"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "_t": "Default",
+                  "stmts": [
+                    {
+                      "_t": "Return",
+                      "expr": {
+                        "_t": "Constant",
+                        "type": "int",
+                        "value": "0"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "f",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Decl",
+                "funcspec": [],
+                "name": "a",
+                "quals": [],
+                "storage": [],
+                "type": {
+                  "_t": "TypeDecl",
+                  "declname": "a",
+                  "quals": [],
+                  "type": {
+                    "_t": "IdentifierType",
+                    "names": [
+                      "int"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "f",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

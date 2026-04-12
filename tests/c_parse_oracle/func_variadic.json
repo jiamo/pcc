@@ -1,0 +1,52 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": "sum",
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "FuncDecl",
+        "args": {
+          "_t": "ParamList",
+          "params": [
+            {
+              "_t": "Decl",
+              "funcspec": [],
+              "name": "n",
+              "quals": [],
+              "storage": [],
+              "type": {
+                "_t": "TypeDecl",
+                "declname": "n",
+                "quals": [],
+                "type": {
+                  "_t": "IdentifierType",
+                  "names": [
+                    "int"
+                  ]
+                }
+              }
+            },
+            {
+              "_t": "EllipsisParam"
+            }
+          ]
+        },
+        "type": {
+          "_t": "TypeDecl",
+          "declname": "sum",
+          "quals": [],
+          "type": {
+            "_t": "IdentifierType",
+            "names": [
+              "int"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

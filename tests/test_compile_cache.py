@@ -1,10 +1,30 @@
 import pcc.evaluater.c_evaluator as c_evaluator
 
 from click.testing import CliRunner
+from pathlib import Path
 
 from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.pcc import main
 from pcc.project import TranslationUnit
+
+
+def test_default_compile_cache_dir_prefers_xdg_cache_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
+    monkeypatch.delenv("PCC_COMPILE_CACHE_DIR", raising=False)
+
+    path = Path(c_evaluator._default_compile_cache_dir())
+
+    assert path == tmp_path / "xdg-cache" / "pcc" / "compile-cache"
+
+
+def test_default_compile_cache_dir_falls_back_to_home_cache(monkeypatch, tmp_path):
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.delenv("PCC_COMPILE_CACHE_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    path = Path(c_evaluator._default_compile_cache_dir())
+
+    assert path == tmp_path / "home" / ".cache" / "pcc" / "compile-cache"
 
 
 def test_evaluate_uses_disk_compile_cache_by_default(tmp_path, monkeypatch):
@@ -129,4 +149,104 @@ def test_cli_no_cache_bypasses_disk_compile_cache(tmp_path, monkeypatch):
         ["--cache-dir", str(cache_dir), "--no-cache", str(main_path)],
     )
     assert result.exit_code == 0, result.output
+    assert compiled_names == ["__pcc_eval__.c"]
+
+
+def test_compiler_cache_fingerprint_tracks_ssa_package_files():
+    tracked_files = {
+        Path(path)
+        .relative_to(Path(c_evaluator.__file__).resolve().parents[1])
+        .as_posix()
+        for path in c_evaluator._compiler_cache_tracked_files()
+    }
+
+    assert "ssa/__init__.py" in tracked_files
+    assert "ssa/builder.py" in tracked_files
+    assert "ssa/sccp.py" in tracked_files
+
+
+def test_compile_cache_key_tracks_disabled_pass_selection(monkeypatch):
+    source = "int main(void) { return 0; }\n"
+
+    default_key = c_evaluator._compile_cache_key("probe.c", source)
+
+    monkeypatch.setenv("PCC_DISABLE_PASSES", "adce")
+    disabled_key = c_evaluator._compile_cache_key("probe.c", source)
+
+    assert disabled_key != default_key
+
+
+def test_compile_cache_key_tracks_backend_selection():
+    source = "int main(void) { return 0; }\n"
+
+    llvm_key = c_evaluator._compile_cache_key(
+        "probe.c",
+        source,
+        backend_sig="llvm:llvmlite-default:support",
+    )
+    llvm_capi_key = c_evaluator._compile_cache_key(
+        "probe.c",
+        source,
+        backend_sig="llvm_capi:llvm-capi-wip:support",
+    )
+
+    assert llvm_capi_key != llvm_key
+
+
+def test_evaluate_cache_misses_when_disabled_pass_selection_changes(
+    tmp_path,
+    monkeypatch,
+):
+    cache_dir = tmp_path / "compile-cache"
+    monkeypatch.setenv("PCC_COMPILE_CACHE_DIR", str(cache_dir))
+
+    source = "int main(void) { int x = 1 + 2; x = 0; return x; }\n"
+    evaluator = CEvaluator()
+
+    assert evaluator.evaluate(source, optimize=False, use_system_cpp=False) == 0
+
+    original_compile = c_evaluator._compile_translation_unit_artifact_job
+    compiled_names = []
+
+    def tracking_compile(*args, **kwargs):
+        compiled_names.append(args[0].name)
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(
+        c_evaluator,
+        "_compile_translation_unit_artifact_job",
+        tracking_compile,
+    )
+    monkeypatch.setenv("PCC_DISABLE_PASSES", "adce")
+
+    assert evaluator.evaluate(source, optimize=False, use_system_cpp=False) == 0
+    assert compiled_names == ["__pcc_eval__.c"]
+
+
+def test_evaluate_cache_misses_when_backend_changes(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "compile-cache"
+    monkeypatch.setenv("PCC_COMPILE_CACHE_DIR", str(cache_dir))
+
+    source = "int main(void) { return 0; }\n"
+
+    assert CEvaluator().evaluate(source, optimize=False, use_system_cpp=False) == 0
+
+    original_compile = c_evaluator._compile_translation_unit_artifact_job
+    compiled_names = []
+
+    def tracking_compile(*args, **kwargs):
+        compiled_names.append(args[0].name)
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(
+        c_evaluator,
+        "_compile_translation_unit_artifact_job",
+        tracking_compile,
+    )
+
+    assert CEvaluator(backend="llvm_capi").evaluate(
+        source,
+        optimize=False,
+        use_system_cpp=False,
+    ) == 0
     assert compiled_names == ["__pcc_eval__.c"]

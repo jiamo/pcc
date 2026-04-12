@@ -1,0 +1,101 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": null,
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "Struct",
+        "decls": [
+          {
+            "_t": "Decl",
+            "funcspec": [],
+            "name": "x",
+            "quals": [],
+            "storage": [],
+            "type": {
+              "_t": "TypeDecl",
+              "declname": "x",
+              "quals": [],
+              "type": {
+                "_t": "IdentifierType",
+                "names": [
+                  "int"
+                ]
+              }
+            }
+          }
+        ],
+        "name": "P"
+      }
+    },
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "Return",
+            "expr": {
+              "_t": "StructRef",
+              "field": {
+                "_t": "ID",
+                "name": "x"
+              },
+              "name": {
+                "_t": "ID",
+                "name": "p"
+              },
+              "type": "."
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "f",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Decl",
+                "funcspec": [],
+                "name": "p",
+                "quals": [],
+                "storage": [],
+                "type": {
+                  "_t": "TypeDecl",
+                  "declname": "p",
+                  "quals": [],
+                  "type": {
+                    "_t": "Struct",
+                    "name": "P"
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "f",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

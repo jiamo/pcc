@@ -12,9 +12,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import fcntl
+import hashlib
 import pytest
 import llvmlite.ir as ir
 import llvmlite.binding as llvm
+import pcc.evaluater.c_evaluator as c_evaluator
 from pcc.codegen.c_codegen import postprocess_ir_text
 
 this_dir = os.path.dirname(__file__)
@@ -59,6 +62,63 @@ _BACKGROUND_PID_LINE = re.compile(
     re.MULTILINE,
 )
 LUA_CPP_ARGS = ("-DLUA_USE_JUMPTABLE=0", "-DLUA_NOBUILTIN")
+
+
+def _test_cache_root():
+    override = os.environ.get("PCC_TEST_CACHE_DIR")
+    if override:
+        base_dir = os.path.abspath(os.path.expanduser(override))
+    else:
+        xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+        if xdg_cache_home:
+            base_dir = os.path.abspath(os.path.expanduser(xdg_cache_home))
+        else:
+            base_dir = os.path.join(os.path.expanduser("~"), ".cache")
+    root = os.path.join(base_dir, "pcc", "test-artifacts")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _artifact_lock(lock_name):
+    lock_path = os.path.join(_test_cache_root(), f"{lock_name}.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    lockfile = open(lock_path, "w")
+    fcntl.flock(lockfile, fcntl.LOCK_EX)
+    return lockfile
+
+
+def _release_artifact_lock(lockfile):
+    try:
+        fcntl.flock(lockfile, fcntl.LOCK_UN)
+    finally:
+        lockfile.close()
+
+
+def _cache_key(*pieces, file_paths=()):
+    hasher = hashlib.sha256()
+    for piece in pieces:
+        hasher.update(str(piece).encode("utf-8"))
+        hasher.update(b"\0")
+    for path in file_paths:
+        hasher.update(os.path.relpath(path, lua_src_dir).encode("utf-8"))
+        hasher.update(b"\0")
+        with open(path, "rb") as f:
+            hasher.update(f.read())
+        hasher.update(b"\0")
+    return hasher.hexdigest()[:16]
+
+
+def _lua_make_tree_files():
+    paths = []
+    for root, dirs, files in os.walk(lua_src_dir):
+        dirs[:] = sorted(d for d in dirs if d != "testes")
+        for fname in sorted(files):
+            if fname.endswith((".o", ".a")):
+                continue
+            if fname in {"lua", "all"}:
+                continue
+            paths.append(os.path.join(root, fname))
+    return tuple(paths)
 
 
 def _lua_preprocessor_prefix():
@@ -207,8 +267,23 @@ def _compile_onelua():
     if not os.path.isfile(onelua_path):
         return "init", "onelua.c not found"
 
+    cache_key = _cache_key(
+        "lua-pcc",
+        platform.system(),
+        LUA_CPP_ARGS,
+        _lua_preprocessor_prefix(),
+        c_evaluator._COMPILER_CACHE_FINGERPRINT,
+        file_paths=(onelua_path,),
+    )
+    cache_dir = os.path.join(_test_cache_root(), f"lua-pcc-{cache_key}")
+    bin_path = os.path.join(cache_dir, "lua_bin")
+    lockfile = _artifact_lock(f"lua-pcc-{cache_key}")
     stage = "init"
     try:
+        if os.path.isfile(bin_path):
+            return "ok", bin_path
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        os.makedirs(cache_dir, exist_ok=True)
         with open(onelua_path) as f:
             src = f.read()
 
@@ -240,10 +315,8 @@ def _compile_onelua():
         stage = "ir_serialize"
 
         # Write IR and compile with system clang
-        tmpdir = tempfile.mkdtemp(prefix="pcc_lua_")
-        ir_path = os.path.join(tmpdir, "onelua.ll")
-        obj_path = os.path.join(tmpdir, "onelua.o")
-        bin_path = os.path.join(tmpdir, "lua_bin")
+        ir_path = os.path.join(cache_dir, "onelua.ll")
+        obj_path = os.path.join(cache_dir, "onelua.o")
 
         with open(ir_path, "w") as f:
             f.write(ir_text)
@@ -271,6 +344,8 @@ def _compile_onelua():
         return "ok", bin_path
     except Exception as e:
         return stage, f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        _release_artifact_lock(lockfile)
 
 
 def _compile_native_onelua():
@@ -279,10 +354,22 @@ def _compile_native_onelua():
     if not os.path.isfile(onelua_path):
         return "init", "onelua.c not found"
 
+    cache_key = _cache_key(
+        "lua-native",
+        platform.system(),
+        _lua_preprocessor_prefix(),
+        file_paths=(onelua_path,),
+    )
+    cache_dir = os.path.join(_test_cache_root(), f"lua-native-{cache_key}")
+    bin_path = os.path.join(cache_dir, "lua_native")
+    lockfile = _artifact_lock(f"lua-native-{cache_key}")
+    stage = "compile"
     try:
-        tmpdir = tempfile.mkdtemp(prefix="pcc_native_lua_")
-        bin_path = os.path.join(tmpdir, "lua_native")
-        wrapper_path = os.path.join(tmpdir, "onelua_wrapper.c")
+        if os.path.isfile(bin_path):
+            return "ok", bin_path
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        os.makedirs(cache_dir, exist_ok=True)
+        wrapper_path = os.path.join(cache_dir, "onelua_wrapper.c")
         with open(wrapper_path, "w") as f:
             f.write(_lua_preprocessor_prefix())
             f.write(f'#include "{onelua_path}"\n')
@@ -308,6 +395,8 @@ def _compile_native_onelua():
         return "ok", bin_path
     except Exception as e:
         return "compile", f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        _release_artifact_lock(lockfile)
 
 
 def _compile_lua_test_libs(libs_dir):
@@ -402,9 +491,22 @@ def _compile_makefile_lua():
     if not os.path.isfile(makefile_path):
         return "init", "makefile not found"
 
+    cache_key = _cache_key(
+        "lua-make",
+        platform.system(),
+        _lua_preprocessor_prefix(),
+        file_paths=_lua_make_tree_files(),
+    )
+    cache_dir = os.path.join(_test_cache_root(), f"lua-make-{cache_key}")
+    build_dir = os.path.join(cache_dir, "lua-build")
+    bin_path = os.path.join(build_dir, "lua")
+    lockfile = _artifact_lock(f"lua-make-{cache_key}")
+    stage = "make"
     try:
-        tmpdir = tempfile.mkdtemp(prefix="pcc_make_lua_")
-        build_dir = os.path.join(tmpdir, "lua-build")
+        if os.path.isfile(bin_path):
+            return "ok", bin_path
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        os.makedirs(cache_dir, exist_ok=True)
         shutil.copytree(
             lua_src_dir,
             build_dir,
@@ -426,13 +528,14 @@ def _compile_makefile_lua():
         if r.returncode != 0:
             return "make", r.stderr[:300]
 
-        bin_path = os.path.join(build_dir, "lua")
         if not os.path.isfile(bin_path):
             return "make", "lua binary not produced"
 
         return "ok", bin_path
     except Exception as e:
-        return "make", f"{type(e).__name__}: {str(e)[:120]}"
+        return stage, f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        _release_artifact_lock(lockfile)
 
 
 def _run_lua_script(bin_path, test_file, tests_dir=lua_tests_dir):

@@ -1,0 +1,54 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": null,
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "Union",
+        "decls": [
+          {
+            "_t": "Decl",
+            "funcspec": [],
+            "name": "i",
+            "quals": [],
+            "storage": [],
+            "type": {
+              "_t": "TypeDecl",
+              "declname": "i",
+              "quals": [],
+              "type": {
+                "_t": "IdentifierType",
+                "names": [
+                  "int"
+                ]
+              }
+            }
+          },
+          {
+            "_t": "Decl",
+            "funcspec": [],
+            "name": "f",
+            "quals": [],
+            "storage": [],
+            "type": {
+              "_t": "TypeDecl",
+              "declname": "f",
+              "quals": [],
+              "type": {
+                "_t": "IdentifierType",
+                "names": [
+                  "float"
+                ]
+              }
+            }
+          }
+        ],
+        "name": "U"
+      }
+    }
+  ]
+}

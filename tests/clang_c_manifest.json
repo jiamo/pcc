@@ -12,13 +12,10 @@
     "crash-invalid-array.c",
     "cxx-as-c.c",
     "declare_variant_messages.c",
-    "env31-c.c",
-    "format-bool.c",
     "nullability.c",
     "pch-config-macros.c",
     "pr9812.c",
     "pragma-fenv_access.c",
-    "putenv-stack-array.c",
     "sarif-multi-diagnostic-test.c",
     "warn-deprecated-non-prototype.c",
     "warn-thread-safety-analysis.c"
@@ -35,7 +32,9 @@
     "code_align.c",
     "custom-diag-werror-interaction.c",
     "deprecate-macro.c",
+    "env31-c.c",
     "embed.c",
+    "format-bool.c",
     "format-strings-pedantic.c",
     "gh87867.c",
     "invalid-ptr-checker.c",
@@ -44,6 +43,7 @@
     "n3262.c",
     "n3623.c",
     "nonnull.c",
+    "putenv-stack-array.c",
     "sarif-diagnostics-taint-test.c",
     "ucn-cstring.c",
     "undefined-internal-typeof-c23.c",
@@ -173,5 +173,10 @@
     "modules-minimize-extension.c",
     "multi_file.c",
     "single_file.c"
+  ],
+  "runtime_timeout": [
+    "csmith-seed-11.c",
+    "csmith-seed-18.c",
+    "csmith-seed-5.c"
   ]
 }

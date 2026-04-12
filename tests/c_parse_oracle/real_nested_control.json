@@ -1,0 +1,132 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "If",
+            "cond": {
+              "_t": "BinaryOp",
+              "left": {
+                "_t": "ID",
+                "name": "x"
+              },
+              "op": "<",
+              "right": {
+                "_t": "Constant",
+                "type": "int",
+                "value": "0"
+              }
+            },
+            "iffalse": {
+              "_t": "If",
+              "cond": {
+                "_t": "BinaryOp",
+                "left": {
+                  "_t": "ID",
+                  "name": "x"
+                },
+                "op": "==",
+                "right": {
+                  "_t": "Constant",
+                  "type": "int",
+                  "value": "0"
+                }
+              },
+              "iffalse": {
+                "_t": "Compound",
+                "block_items": [
+                  {
+                    "_t": "Return",
+                    "expr": {
+                      "_t": "Constant",
+                      "type": "int",
+                      "value": "1"
+                    }
+                  }
+                ]
+              },
+              "iftrue": {
+                "_t": "Compound",
+                "block_items": [
+                  {
+                    "_t": "Return",
+                    "expr": {
+                      "_t": "Constant",
+                      "type": "int",
+                      "value": "0"
+                    }
+                  }
+                ]
+              }
+            },
+            "iftrue": {
+              "_t": "Compound",
+              "block_items": [
+                {
+                  "_t": "Return",
+                  "expr": {
+                    "_t": "UnaryOp",
+                    "expr": {
+                      "_t": "Constant",
+                      "type": "int",
+                      "value": "1"
+                    },
+                    "op": "-"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "classify",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Decl",
+                "funcspec": [],
+                "name": "x",
+                "quals": [],
+                "storage": [],
+                "type": {
+                  "_t": "TypeDecl",
+                  "declname": "x",
+                  "quals": [],
+                  "type": {
+                    "_t": "IdentifierType",
+                    "names": [
+                      "int"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "classify",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

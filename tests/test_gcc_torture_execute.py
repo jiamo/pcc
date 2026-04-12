@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.gcc_torture_cases import run_native, run_pcc
+from tests.gcc_torture_cases import run_native, run_pcc, run_native_and_pcc
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,8 +39,7 @@ if GCC_TORTURE_RUNTIME_SUCCESS_CASES:
         case_path = _case_path(relative_path)
         assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
-        native_result = run_native(case_path, REPO_ROOT)
-        pcc_result = run_pcc(case_path, REPO_ROOT)
+        native_result, pcc_result = run_native_and_pcc(case_path, REPO_ROOT)
 
         assert (
             pcc_result.returncode == native_result.returncode
@@ -54,8 +53,7 @@ if GCC_TORTURE_RUNTIME_EXACT_MATCH_CASES:
         case_path = _case_path(relative_path)
         assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
-        native_result = run_native(case_path, REPO_ROOT)
-        pcc_result = run_pcc(case_path, REPO_ROOT)
+        native_result, pcc_result = run_native_and_pcc(case_path, REPO_ROOT)
 
         assert (
             pcc_result.returncode == native_result.returncode
@@ -75,8 +73,7 @@ if GCC_TORTURE_RUNTIME_BOTH_FAIL_CASES:
         case_path = _case_path(relative_path)
         assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
-        native_result = run_native(case_path, REPO_ROOT)
-        pcc_result = run_pcc(case_path, REPO_ROOT)
+        native_result, pcc_result = run_native_and_pcc(case_path, REPO_ROOT)
 
         assert native_result.returncode != 0, f"native runtime unexpectedly succeeded for {relative_path}"
         assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {relative_path}"
@@ -89,8 +86,7 @@ if GCC_TORTURE_RUNTIME_NATIVE_FAIL_PCC_PASS_CASES:
         case_path = _case_path(relative_path)
         assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
-        native_result = run_native(case_path, REPO_ROOT)
-        pcc_result = run_pcc(case_path, REPO_ROOT)
+        native_result, pcc_result = run_native_and_pcc(case_path, REPO_ROOT)
 
         assert native_result.returncode != 0, f"native runtime unexpectedly succeeded for {relative_path}"
         assert pcc_result.returncode == 0, f"pcc unexpectedly rejected {relative_path}:\n{pcc_result.stderr}"
@@ -103,8 +99,7 @@ if GCC_TORTURE_RUNTIME_NATIVE_PASS_PCC_FAIL_CASES:
         case_path = _case_path(relative_path)
         assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
-        native_result = run_native(case_path, REPO_ROOT)
-        pcc_result = run_pcc(case_path, REPO_ROOT)
+        native_result, pcc_result = run_native_and_pcc(case_path, REPO_ROOT)
 
         assert native_result.returncode == 0, f"native runtime unexpectedly rejected {relative_path}:\n{native_result.stderr}"
         assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {relative_path}"

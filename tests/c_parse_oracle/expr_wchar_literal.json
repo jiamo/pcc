@@ -1,0 +1,93 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "Decl",
+            "funcspec": [],
+            "name": "wc",
+            "quals": [],
+            "storage": [],
+            "type": {
+              "_t": "TypeDecl",
+              "declname": "wc",
+              "quals": [],
+              "type": {
+                "_t": "IdentifierType",
+                "names": [
+                  "int"
+                ]
+              }
+            }
+          },
+          {
+            "_t": "Assignment",
+            "lvalue": {
+              "_t": "ID",
+              "name": "wc"
+            },
+            "op": "=",
+            "rvalue": {
+              "_t": "Constant",
+              "type": "char",
+              "value": "L'\\0'"
+            }
+          },
+          {
+            "_t": "Return",
+            "expr": {
+              "_t": "ID",
+              "name": "wc"
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "f",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Typename",
+                "name": null,
+                "quals": [],
+                "type": {
+                  "_t": "TypeDecl",
+                  "declname": null,
+                  "quals": [],
+                  "type": {
+                    "_t": "IdentifierType",
+                    "names": [
+                      "void"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "f",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

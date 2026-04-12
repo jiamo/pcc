@@ -1,0 +1,149 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "Decl",
+            "funcspec": [],
+            "init": {
+              "_t": "Constant",
+              "type": "int",
+              "value": "0"
+            },
+            "name": "s",
+            "quals": [],
+            "storage": [],
+            "type": {
+              "_t": "TypeDecl",
+              "declname": "s",
+              "quals": [],
+              "type": {
+                "_t": "IdentifierType",
+                "names": [
+                  "int"
+                ]
+              }
+            }
+          },
+          {
+            "_t": "For",
+            "cond": {
+              "_t": "BinaryOp",
+              "left": {
+                "_t": "ID",
+                "name": "i"
+              },
+              "op": "<",
+              "right": {
+                "_t": "Constant",
+                "type": "int",
+                "value": "10"
+              }
+            },
+            "init": {
+              "_t": "DeclList",
+              "decls": [
+                {
+                  "_t": "Decl",
+                  "funcspec": [],
+                  "init": {
+                    "_t": "Constant",
+                    "type": "int",
+                    "value": "0"
+                  },
+                  "name": "i",
+                  "quals": [],
+                  "storage": [],
+                  "type": {
+                    "_t": "TypeDecl",
+                    "declname": "i",
+                    "quals": [],
+                    "type": {
+                      "_t": "IdentifierType",
+                      "names": [
+                        "int"
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "next": {
+              "_t": "UnaryOp",
+              "expr": {
+                "_t": "ID",
+                "name": "i"
+              },
+              "op": "p++"
+            },
+            "stmt": {
+              "_t": "Assignment",
+              "lvalue": {
+                "_t": "ID",
+                "name": "s"
+              },
+              "op": "+=",
+              "rvalue": {
+                "_t": "ID",
+                "name": "i"
+              }
+            }
+          },
+          {
+            "_t": "Return",
+            "expr": {
+              "_t": "ID",
+              "name": "s"
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "f",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Typename",
+                "name": null,
+                "quals": [],
+                "type": {
+                  "_t": "TypeDecl",
+                  "declname": null,
+                  "quals": [],
+                  "type": {
+                    "_t": "IdentifierType",
+                    "names": [
+                      "void"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "f",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

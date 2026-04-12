@@ -1,0 +1,25 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": "e",
+      "quals": [],
+      "storage": [
+        "extern"
+      ],
+      "type": {
+        "_t": "TypeDecl",
+        "declname": "e",
+        "quals": [],
+        "type": {
+          "_t": "IdentifierType",
+          "names": [
+            "int"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -27,6 +27,7 @@ from pcc.project import (
     collect_translation_units,
     translation_unit_include_dirs,
 )
+from tests.parallel_jobs import translation_unit_jobs
 
 llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()
@@ -375,7 +376,7 @@ def test_nginx_full_system_link():
     compiled_units = CEvaluator().compile_translation_units(
         units,
         base_dir=base_dir,
-        jobs=2,
+        jobs=translation_unit_jobs(),
         use_system_cpp=False,
     )
 

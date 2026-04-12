@@ -1,0 +1,33 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": null,
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "Enum",
+        "name": "Color",
+        "values": {
+          "_t": "EnumeratorList",
+          "enumerators": [
+            {
+              "_t": "Enumerator",
+              "name": "RED"
+            },
+            {
+              "_t": "Enumerator",
+              "name": "GREEN"
+            },
+            {
+              "_t": "Enumerator",
+              "name": "BLUE"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

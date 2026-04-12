@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import pytest
 
 this_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(this_dir)
@@ -59,6 +60,75 @@ class TestIncludeUser(unittest.TestCase):
                 base_dir=tmpdir,
             )
             assert ret == 7
+
+    def test_missing_user_header_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(RuntimeError, match="system cpp failed"):
+                CEvaluator().evaluate(
+                    """
+                    #include "missing_header.h"
+                    int main(){ return 0; }
+                    """,
+                    base_dir=tmpdir,
+                )
+
+    def test_cpp11_style_attributes_are_ignored(self):
+        ret = CEvaluator().evaluate(
+            """
+            int main(void) {
+                int a[4];
+                [[clang::code_align(8)]]
+                for (int i = 0; i < 4; ++i) {
+                    a[i] = i;
+                }
+                return a[3] == 3 ? 0 : 1;
+            }
+            """,
+            use_system_cpp=False,
+        )
+        assert ret == 0
+
+    def test_clang_pragma_lines_are_ignored(self):
+        ret = CEvaluator().evaluate(
+            """
+            #define foo 7
+            #pragma clang deprecated(foo)
+            int main(void) { return foo; }
+            """
+        )
+        assert ret == 7
+
+    def test_embed_directive_is_rewritten_to_zero_byte(self):
+        ret = CEvaluator().evaluate(
+            """
+            int main(void) {
+                const unsigned char data[] = {
+                    #embed "ignored.bin"
+                };
+                return data[0];
+            }
+            """
+        )
+        assert ret == 0
+
+    def test_missing_clang_fixture_headers_are_rewritten(self):
+        ret = CEvaluator().evaluate(
+            """
+            #include "Inputs/system-header-simulator.h"
+            #include "../Inputs/system-header-simulator-for-malloc.h"
+
+            int main(void) {
+                char env[] = "NAME=value";
+                void *p = malloc(4);
+                if (p == NULL) return 1;
+                if (strlen(env) != 10) return 2;
+                if (scanf == 0) return 3;
+                free(p);
+                return 0;
+            }
+            """
+        )
+        assert ret == 0
 
 
 class TestDefine(unittest.TestCase):

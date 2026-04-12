@@ -39,6 +39,21 @@ class TestChar(unittest.TestCase):
         ir_str = str(cg.module)
         assert 'i8' in ir_str
 
+    def test_unicode_prefixed_char_constants_parse(self):
+        """u'' and U'' character prefixes should be accepted."""
+        cg = LLVMCodeGenerator()
+        p = CParser()
+        ast = p.parse(r'''
+            int main(){
+                int a = u'A';
+                int b = U'B';
+                return a + b == ('A' + 'B') ? 0 : 1;
+            }
+        ''')
+        cg.generate_code(ast)
+        ir_str = str(cg.module)
+        assert "main" in ir_str
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,0 +1,32 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "init": {
+        "_t": "Constant",
+        "type": "int",
+        "value": "42"
+      },
+      "name": "c",
+      "quals": [
+        "const"
+      ],
+      "storage": [],
+      "type": {
+        "_t": "TypeDecl",
+        "declname": "c",
+        "quals": [
+          "const"
+        ],
+        "type": {
+          "_t": "IdentifierType",
+          "names": [
+            "int"
+          ]
+        }
+      }
+    }
+  ]
+}

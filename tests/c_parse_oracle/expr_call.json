@@ -1,0 +1,118 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "name": "g",
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "FuncDecl",
+        "args": {
+          "_t": "ParamList",
+          "params": [
+            {
+              "_t": "Typename",
+              "name": null,
+              "quals": [],
+              "type": {
+                "_t": "TypeDecl",
+                "declname": null,
+                "quals": [],
+                "type": {
+                  "_t": "IdentifierType",
+                  "names": [
+                    "int"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "type": {
+          "_t": "TypeDecl",
+          "declname": "g",
+          "quals": [],
+          "type": {
+            "_t": "IdentifierType",
+            "names": [
+              "int"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "_t": "FuncDef",
+      "body": {
+        "_t": "Compound",
+        "block_items": [
+          {
+            "_t": "Return",
+            "expr": {
+              "_t": "FuncCall",
+              "args": {
+                "_t": "ExprList",
+                "exprs": [
+                  {
+                    "_t": "ID",
+                    "name": "a"
+                  }
+                ]
+              },
+              "name": {
+                "_t": "ID",
+                "name": "g"
+              }
+            }
+          }
+        ]
+      },
+      "decl": {
+        "_t": "Decl",
+        "funcspec": [],
+        "name": "f",
+        "quals": [],
+        "storage": [],
+        "type": {
+          "_t": "FuncDecl",
+          "args": {
+            "_t": "ParamList",
+            "params": [
+              {
+                "_t": "Decl",
+                "funcspec": [],
+                "name": "a",
+                "quals": [],
+                "storage": [],
+                "type": {
+                  "_t": "TypeDecl",
+                  "declname": "a",
+                  "quals": [],
+                  "type": {
+                    "_t": "IdentifierType",
+                    "names": [
+                      "int"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "type": {
+            "_t": "TypeDecl",
+            "declname": "f",
+            "quals": [],
+            "type": {
+              "_t": "IdentifierType",
+              "names": [
+                "int"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

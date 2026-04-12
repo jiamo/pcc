@@ -1,0 +1,52 @@
+{
+  "_t": "FileAST",
+  "ext": [
+    {
+      "_t": "Decl",
+      "funcspec": [],
+      "init": {
+        "_t": "InitList",
+        "exprs": [
+          {
+            "_t": "Constant",
+            "type": "int",
+            "value": "1"
+          },
+          {
+            "_t": "Constant",
+            "type": "int",
+            "value": "2"
+          },
+          {
+            "_t": "Constant",
+            "type": "int",
+            "value": "3"
+          }
+        ]
+      },
+      "name": "a",
+      "quals": [],
+      "storage": [],
+      "type": {
+        "_t": "ArrayDecl",
+        "dim": {
+          "_t": "Constant",
+          "type": "int",
+          "value": "3"
+        },
+        "dim_quals": [],
+        "type": {
+          "_t": "TypeDecl",
+          "declname": "a",
+          "quals": [],
+          "type": {
+            "_t": "IdentifierType",
+            "names": [
+              "int"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

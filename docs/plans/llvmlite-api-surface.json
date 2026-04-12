@@ -1,0 +1,975 @@
+{
+  "buckets": {
+    "ir.Aggregate.wrap_constant_value": {
+      "other": 292
+    },
+    "ir.AllocaInstr.__init__": {
+      "other": 291
+    },
+    "ir.AllocaInstr.descr": {
+      "other": 252
+    },
+    "ir.ArgumentAttributes.__init__": {
+      "other": 51852
+    },
+    "ir.ArrayType.__init__": {
+      "py_frontend_codegen": 286
+    },
+    "ir.ArrayType.format_constant": {
+      "other": 43
+    },
+    "ir.ArrayType.gep": {
+      "other": 407
+    },
+    "ir.AttributeSet.__init__": {
+      "other": 73357
+    },
+    "ir.AttributeSet.add": {
+      "other": 12
+    },
+    "ir.BaseStructType.format_constant": {
+      "other": 27
+    },
+    "ir.BaseStructType.structure_repr": {
+      "other": 41
+    },
+    "ir.Block.__init__": {
+      "other": 504
+    },
+    "ir.Block.descr": {
+      "other": 465
+    },
+    "ir.CallInstr.__init__": {
+      "other": 1098
+    },
+    "ir.CallInstr.descr": {
+      "other": 1012
+    },
+    "ir.CastInstr.__init__": {
+      "other": 97
+    },
+    "ir.CastInstr.descr": {
+      "other": 93
+    },
+    "ir.CompareInstr.__init__": {
+      "other": 82
+    },
+    "ir.CompareInstr.descr": {
+      "other": 77
+    },
+    "ir.Constant.__init__": {
+      "other": 53,
+      "py_frontend_codegen": 1583
+    },
+    "ir.DoubleType.format_constant": {
+      "other": 1
+    },
+    "ir.ExtractValue.__init__": {
+      "other": 16
+    },
+    "ir.ExtractValue.descr": {
+      "other": 14
+    },
+    "ir.FormattedConstant.__init__": {
+      "other": 23
+    },
+    "ir.Function.__init__": {
+      "py_frontend_codegen": 19309
+    },
+    "ir.Function.append_basic_block": {
+      "py_frontend_codegen": 504
+    },
+    "ir.Function.descr": {
+      "other": 8293
+    },
+    "ir.Function.descr_body": {
+      "other": 243
+    },
+    "ir.Function.descr_prototype": {
+      "other": 8293
+    },
+    "ir.FunctionAttributes.__init__": {
+      "other": 19309
+    },
+    "ir.FunctionAttributes.add": {
+      "py_frontend_codegen": 12
+    },
+    "ir.FunctionType.__init__": {
+      "py_frontend_codegen": 19309
+    },
+    "ir.GEPInstr.__init__": {
+      "other": 384
+    },
+    "ir.GEPInstr.descr": {
+      "other": 370
+    },
+    "ir.GlobalValue.__init__": {
+      "other": 19635
+    },
+    "ir.GlobalVariable.__init__": {
+      "py_frontend_codegen": 326
+    },
+    "ir.GlobalVariable.descr": {
+      "other": 300
+    },
+    "ir.IRBuilder.__init__": {
+      "codegen": 2,
+      "py_frontend_codegen": 348
+    },
+    "ir.IRBuilder.add": {
+      "py_frontend_codegen": 37
+    },
+    "ir.IRBuilder.alloca": {
+      "py_frontend_codegen": 291
+    },
+    "ir.IRBuilder.and_": {
+      "py_frontend_codegen": 6
+    },
+    "ir.IRBuilder.ashr": {
+      "py_frontend_codegen": 1
+    },
+    "ir.IRBuilder.bitcast": {
+      "py_frontend_codegen": 85
+    },
+    "ir.IRBuilder.branch": {
+      "py_frontend_codegen": 104
+    },
+    "ir.IRBuilder.call": {
+      "py_frontend_codegen": 1082
+    },
+    "ir.IRBuilder.cbranch": {
+      "py_frontend_codegen": 66
+    },
+    "ir.IRBuilder.extract_value": {
+      "py_frontend_codegen": 16
+    },
+    "ir.IRBuilder.fadd": {
+      "py_frontend_codegen": 1
+    },
+    "ir.IRBuilder.fdiv": {
+      "py_frontend_codegen": 1
+    },
+    "ir.IRBuilder.fmul": {
+      "py_frontend_codegen": 1
+    },
+    "ir.IRBuilder.gep": {
+      "py_frontend_codegen": 384
+    },
+    "ir.IRBuilder.icmp_signed": {
+      "py_frontend_codegen": 82
+    },
+    "ir.IRBuilder.invoke": {
+      "py_frontend_codegen": 16
+    },
+    "ir.IRBuilder.landingpad": {
+      "py_frontend_codegen": 16
+    },
+    "ir.IRBuilder.load": {
+      "py_frontend_codegen": 445
+    },
+    "ir.IRBuilder.mul": {
+      "py_frontend_codegen": 6
+    },
+    "ir.IRBuilder.neg": {
+      "py_frontend_codegen": 25
+    },
+    "ir.IRBuilder.not_": {
+      "py_frontend_codegen": 1
+    },
+    "ir.IRBuilder.or_": {
+      "py_frontend_codegen": 1
+    },
+    "ir.IRBuilder.phi": {
+      "py_frontend_codegen": 9
+    },
+    "ir.IRBuilder.position_at_end": {
+      "py_frontend_codegen": 320
+    },
+    "ir.IRBuilder.position_before": {
+      "py_frontend_codegen": 111
+    },
+    "ir.IRBuilder.ptrtoint": {
+      "py_frontend_codegen": 2
+    },
+    "ir.IRBuilder.ret": {
+      "py_frontend_codegen": 131
+    },
+    "ir.IRBuilder.ret_void": {
+      "py_frontend_codegen": 140
+    },
+    "ir.IRBuilder.sdiv": {
+      "py_frontend_codegen": 3
+    },
+    "ir.IRBuilder.select": {
+      "py_frontend_codegen": 31
+    },
+    "ir.IRBuilder.shl": {
+      "py_frontend_codegen": 1
+    },
+    "ir.IRBuilder.sitofp": {
+      "py_frontend_codegen": 4
+    },
+    "ir.IRBuilder.srem": {
+      "py_frontend_codegen": 5
+    },
+    "ir.IRBuilder.store": {
+      "py_frontend_codegen": 335
+    },
+    "ir.IRBuilder.sub": {
+      "other": 25,
+      "py_frontend_codegen": 12
+    },
+    "ir.IRBuilder.trunc": {
+      "py_frontend_codegen": 1
+    },
+    "ir.IRBuilder.unreachable": {
+      "py_frontend_codegen": 32
+    },
+    "ir.IRBuilder.xor": {
+      "other": 1,
+      "py_frontend_codegen": 6
+    },
+    "ir.IRBuilder.zext": {
+      "py_frontend_codegen": 5
+    },
+    "ir.Instruction.__init__": {
+      "other": 3384
+    },
+    "ir.Instruction.descr": {
+      "other": 104
+    },
+    "ir.IntType.format_constant": {
+      "other": 1096
+    },
+    "ir.IntType.wrap_constant_value": {
+      "other": 1140
+    },
+    "ir.InvokeInstr.__init__": {
+      "other": 16
+    },
+    "ir.InvokeInstr.descr": {
+      "other": 14
+    },
+    "ir.LandingPadInstr.__init__": {
+      "other": 16
+    },
+    "ir.LandingPadInstr.add_clause": {
+      "py_frontend_codegen": 16
+    },
+    "ir.LandingPadInstr.descr": {
+      "other": 14
+    },
+    "ir.LiteralStructType.__init__": {
+      "py_frontend_codegen": 43
+    },
+    "ir.LoadInstr.__init__": {
+      "other": 445
+    },
+    "ir.LoadInstr.descr": {
+      "other": 399
+    },
+    "ir.Module.__init__": {
+      "codegen": 2,
+      "py_frontend_codegen": 142
+    },
+    "ir.Module.add_global": {
+      "other": 19635
+    },
+    "ir.Module.get_identified_types": {
+      "other": 60
+    },
+    "ir.NamedValue.__init__": {
+      "other": 75375
+    },
+    "ir.PhiInstr.__init__": {
+      "other": 9
+    },
+    "ir.PhiInstr.add_incoming": {
+      "py_frontend_codegen": 18
+    },
+    "ir.PhiInstr.descr": {
+      "other": 9
+    },
+    "ir.PointerType.__init__": {
+      "other": 20350
+    },
+    "ir.Ret.__init__": {
+      "other": 271
+    },
+    "ir.Ret.descr": {
+      "other": 261
+    },
+    "ir.SelectInstr.__init__": {
+      "other": 31
+    },
+    "ir.SelectInstr.descr": {
+      "other": 29
+    },
+    "ir.StoreInstr.__init__": {
+      "other": 335
+    },
+    "ir.StoreInstr.descr": {
+      "other": 301
+    },
+    "ir.Terminator.__init__": {
+      "other": 441
+    },
+    "ir.Terminator.descr": {
+      "other": 162
+    },
+    "ir.Type.as_pointer": {
+      "codegen": 10,
+      "other": 20333,
+      "py_frontend_codegen": 7
+    },
+    "ir.Type.format_constant": {
+      "other": 23
+    },
+    "ir.Type.wrap_constant_value": {
+      "other": 204
+    },
+    "ir.Unreachable.__init__": {
+      "other": 32
+    },
+    "ir.Unreachable.descr": {
+      "other": 28
+    },
+    "llvm.ContextRef.__init__": {
+      "other": 657
+    },
+    "llvm.ModuleRef.__init__": {
+      "other": 657
+    },
+    "llvm.ModuleRef.verify": {
+      "ir_passes": 657
+    },
+    "llvm.Target.create_target_machine": {
+      "codegen": 2
+    },
+    "llvm.ValueRef.__init__": {
+      "other": 5649
+    },
+    "llvm.get_default_triple": {
+      "codegen": 2,
+      "evaluater": 1
+    },
+    "llvm.initialize_all_asmprinters": {
+      "evaluater": 1
+    },
+    "llvm.initialize_all_targets": {
+      "evaluater": 1
+    },
+    "llvm.initialize_native_target": {
+      "codegen": 2
+    },
+    "llvm.parse_assembly": {
+      "ir_passes": 657
+    }
+  },
+  "counts": {
+    "ir.Aggregate.wrap_constant_value": 292,
+    "ir.AllocaInstr.__init__": 291,
+    "ir.AllocaInstr.descr": 252,
+    "ir.ArgumentAttributes.__init__": 51852,
+    "ir.ArrayType.__init__": 286,
+    "ir.ArrayType.format_constant": 43,
+    "ir.ArrayType.gep": 407,
+    "ir.AttributeSet.__init__": 73357,
+    "ir.AttributeSet.add": 12,
+    "ir.BaseStructType.format_constant": 27,
+    "ir.BaseStructType.structure_repr": 41,
+    "ir.Block.__init__": 504,
+    "ir.Block.descr": 465,
+    "ir.CallInstr.__init__": 1098,
+    "ir.CallInstr.descr": 1012,
+    "ir.CastInstr.__init__": 97,
+    "ir.CastInstr.descr": 93,
+    "ir.CompareInstr.__init__": 82,
+    "ir.CompareInstr.descr": 77,
+    "ir.Constant.__init__": 1636,
+    "ir.DoubleType.format_constant": 1,
+    "ir.ExtractValue.__init__": 16,
+    "ir.ExtractValue.descr": 14,
+    "ir.FormattedConstant.__init__": 23,
+    "ir.Function.__init__": 19309,
+    "ir.Function.append_basic_block": 504,
+    "ir.Function.descr": 8293,
+    "ir.Function.descr_body": 243,
+    "ir.Function.descr_prototype": 8293,
+    "ir.FunctionAttributes.__init__": 19309,
+    "ir.FunctionAttributes.add": 12,
+    "ir.FunctionType.__init__": 19309,
+    "ir.GEPInstr.__init__": 384,
+    "ir.GEPInstr.descr": 370,
+    "ir.GlobalValue.__init__": 19635,
+    "ir.GlobalVariable.__init__": 326,
+    "ir.GlobalVariable.descr": 300,
+    "ir.IRBuilder.__init__": 350,
+    "ir.IRBuilder.add": 37,
+    "ir.IRBuilder.alloca": 291,
+    "ir.IRBuilder.and_": 6,
+    "ir.IRBuilder.ashr": 1,
+    "ir.IRBuilder.bitcast": 85,
+    "ir.IRBuilder.branch": 104,
+    "ir.IRBuilder.call": 1082,
+    "ir.IRBuilder.cbranch": 66,
+    "ir.IRBuilder.extract_value": 16,
+    "ir.IRBuilder.fadd": 1,
+    "ir.IRBuilder.fdiv": 1,
+    "ir.IRBuilder.fmul": 1,
+    "ir.IRBuilder.gep": 384,
+    "ir.IRBuilder.icmp_signed": 82,
+    "ir.IRBuilder.invoke": 16,
+    "ir.IRBuilder.landingpad": 16,
+    "ir.IRBuilder.load": 445,
+    "ir.IRBuilder.mul": 6,
+    "ir.IRBuilder.neg": 25,
+    "ir.IRBuilder.not_": 1,
+    "ir.IRBuilder.or_": 1,
+    "ir.IRBuilder.phi": 9,
+    "ir.IRBuilder.position_at_end": 320,
+    "ir.IRBuilder.position_before": 111,
+    "ir.IRBuilder.ptrtoint": 2,
+    "ir.IRBuilder.ret": 131,
+    "ir.IRBuilder.ret_void": 140,
+    "ir.IRBuilder.sdiv": 3,
+    "ir.IRBuilder.select": 31,
+    "ir.IRBuilder.shl": 1,
+    "ir.IRBuilder.sitofp": 4,
+    "ir.IRBuilder.srem": 5,
+    "ir.IRBuilder.store": 335,
+    "ir.IRBuilder.sub": 37,
+    "ir.IRBuilder.trunc": 1,
+    "ir.IRBuilder.unreachable": 32,
+    "ir.IRBuilder.xor": 7,
+    "ir.IRBuilder.zext": 5,
+    "ir.Instruction.__init__": 3384,
+    "ir.Instruction.descr": 104,
+    "ir.IntType.format_constant": 1096,
+    "ir.IntType.wrap_constant_value": 1140,
+    "ir.InvokeInstr.__init__": 16,
+    "ir.InvokeInstr.descr": 14,
+    "ir.LandingPadInstr.__init__": 16,
+    "ir.LandingPadInstr.add_clause": 16,
+    "ir.LandingPadInstr.descr": 14,
+    "ir.LiteralStructType.__init__": 43,
+    "ir.LoadInstr.__init__": 445,
+    "ir.LoadInstr.descr": 399,
+    "ir.Module.__init__": 144,
+    "ir.Module.add_global": 19635,
+    "ir.Module.get_identified_types": 60,
+    "ir.NamedValue.__init__": 75375,
+    "ir.PhiInstr.__init__": 9,
+    "ir.PhiInstr.add_incoming": 18,
+    "ir.PhiInstr.descr": 9,
+    "ir.PointerType.__init__": 20350,
+    "ir.Ret.__init__": 271,
+    "ir.Ret.descr": 261,
+    "ir.SelectInstr.__init__": 31,
+    "ir.SelectInstr.descr": 29,
+    "ir.StoreInstr.__init__": 335,
+    "ir.StoreInstr.descr": 301,
+    "ir.Terminator.__init__": 441,
+    "ir.Terminator.descr": 162,
+    "ir.Type.as_pointer": 20350,
+    "ir.Type.format_constant": 23,
+    "ir.Type.wrap_constant_value": 204,
+    "ir.Unreachable.__init__": 32,
+    "ir.Unreachable.descr": 28,
+    "llvm.ContextRef.__init__": 657,
+    "llvm.ModuleRef.__init__": 657,
+    "llvm.ModuleRef.verify": 657,
+    "llvm.Target.create_target_machine": 2,
+    "llvm.ValueRef.__init__": 5649,
+    "llvm.get_default_triple": 3,
+    "llvm.initialize_all_asmprinters": 1,
+    "llvm.initialize_all_targets": 1,
+    "llvm.initialize_native_target": 2,
+    "llvm.parse_assembly": 657
+  },
+  "samples": {
+    "ir.Aggregate.wrap_constant_value": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:449"
+    ],
+    "ir.AllocaInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:752"
+    ],
+    "ir.AllocaInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.ArgumentAttributes.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:1112"
+    ],
+    "ir.ArrayType.__init__": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:501",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:448",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:466",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:702",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:750"
+    ],
+    "ir.ArrayType.format_constant": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:466"
+    ],
+    "ir.ArrayType.gep": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:563",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:406"
+    ],
+    "ir.AttributeSet.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:897",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:1059",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:84",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:85"
+    ],
+    "ir.AttributeSet.add": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:904"
+    ],
+    "ir.BaseStructType.format_constant": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:466"
+    ],
+    "ir.BaseStructType.structure_repr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/types.py:673"
+    ],
+    "ir.Block.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:966"
+    ],
+    "ir.Block.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:1008"
+    ],
+    "ir.CallInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:881",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:184"
+    ],
+    "ir.CallInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.CastInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:164"
+    ],
+    "ir.CastInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.CompareInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:575"
+    ],
+    "ir.CompareInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.Constant.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/types.py:87",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1973",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:508",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:512",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:555"
+    ],
+    "ir.DoubleType.format_constant": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:466"
+    ],
+    "ir.ExtractValue.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:974"
+    ],
+    "ir.ExtractValue.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.FormattedConstant.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:414"
+    ],
+    "ir.Function.__init__": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/runtime_abi.py:237",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:381",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:593",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:336",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1436"
+    ],
+    "ir.Function.append_basic_block": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:604",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:337",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2790",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2791",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1728"
+    ],
+    "ir.Function.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:1019"
+    ],
+    "ir.Function.descr_body": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:1014"
+    ],
+    "ir.Function.descr_prototype": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:1011"
+    ],
+    "ir.FunctionAttributes.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:946"
+    ],
+    "ir.FunctionAttributes.add": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1443"
+    ],
+    "ir.FunctionType.__init__": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/runtime_abi.py:236",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:380",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:587",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:335",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1435"
+    ],
+    "ir.GEPInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:927"
+    ],
+    "ir.GEPInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.GlobalValue.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:942",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:800"
+    ],
+    "ir.GlobalVariable.__init__": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:505",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:449",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:206",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:471",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:707"
+    ],
+    "ir.GlobalVariable.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.IRBuilder.__init__": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:605",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:343",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:900",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:510",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:596"
+    ],
+    "ir.IRBuilder.add": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2392",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2487",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1922"
+    ],
+    "ir.IRBuilder.alloca": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:614",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:905",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/marshal.py:238",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:531",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:537"
+    ],
+    "ir.IRBuilder.and_": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2362",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2464",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2485"
+    ],
+    "ir.IRBuilder.ashr": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2370"
+    ],
+    "ir.IRBuilder.bitcast": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:667",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:684",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:663"
+    ],
+    "ir.IRBuilder.branch": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2809",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1737",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1743",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1759",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1769"
+    ],
+    "ir.IRBuilder.call": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2912",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:965",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:969",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:977",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2111"
+    ],
+    "ir.IRBuilder.cbranch": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2796",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1732",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2799",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1763",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1911"
+    ],
+    "ir.IRBuilder.extract_value": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1590"
+    ],
+    "ir.IRBuilder.fadd": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2409"
+    ],
+    "ir.IRBuilder.fdiv": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2377"
+    ],
+    "ir.IRBuilder.fmul": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2413"
+    ],
+    "ir.IRBuilder.gep": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:513",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:484",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:478",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:714",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:736"
+    ],
+    "ir.IRBuilder.icmp_signed": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2456",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2458",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2460",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2477",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2479"
+    ],
+    "ir.IRBuilder.invoke": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1505",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2917"
+    ],
+    "ir.IRBuilder.landingpad": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1583"
+    ],
+    "ir.IRBuilder.load": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2306",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1899",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1921",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2257",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:948"
+    ],
+    "ir.IRBuilder.mul": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2396"
+    ],
+    "ir.IRBuilder.neg": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2524"
+    ],
+    "ir.IRBuilder.not_": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2530"
+    ],
+    "ir.IRBuilder.or_": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2364"
+    ],
+    "ir.IRBuilder.phi": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2812"
+    ],
+    "ir.IRBuilder.position_at_end": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2805",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2811",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1734",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1739",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1747"
+    ],
+    "ir.IRBuilder.position_before": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:902",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/marshal.py:235"
+    ],
+    "ir.IRBuilder.ptrtoint": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2680",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2681"
+    ],
+    "ir.IRBuilder.ret": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:735",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:362",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:630"
+    ],
+    "ir.IRBuilder.ret_void": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:628",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:549",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:604"
+    ],
+    "ir.IRBuilder.sdiv": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2452"
+    ],
+    "ir.IRBuilder.select": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2467",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2488",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:975",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1909"
+    ],
+    "ir.IRBuilder.shl": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2368"
+    ],
+    "ir.IRBuilder.sitofp": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:3577"
+    ],
+    "ir.IRBuilder.srem": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2453",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2475"
+    ],
+    "ir.IRBuilder.store": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:615",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:830",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1886",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1923",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1676"
+    ],
+    "ir.IRBuilder.sub": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:555",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2466",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2394"
+    ],
+    "ir.IRBuilder.trunc": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:3649"
+    ],
+    "ir.IRBuilder.unreachable": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1507",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1670",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1614",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1497"
+    ],
+    "ir.IRBuilder.xor": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2366",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2462",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2483",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:548"
+    ],
+    "ir.IRBuilder.zext": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/marshal.py:153"
+    ],
+    "ir.Instruction.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:534",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:464",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:444",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:36",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:202"
+    ],
+    "ir.Instruction.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.IntType.format_constant": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:466"
+    ],
+    "ir.IntType.wrap_constant_value": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:449"
+    ],
+    "ir.InvokeInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:913"
+    ],
+    "ir.InvokeInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.LandingPadInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:1028"
+    ],
+    "ir.LandingPadInstr.add_clause": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1589"
+    ],
+    "ir.LandingPadInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.LiteralStructType.__init__": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:1582",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/class_gen.py:802"
+    ],
+    "ir.LoadInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:764"
+    ],
+    "ir.LoadInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.Module.__init__": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:145",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:196",
+      "/Users/jiamo/my/pcc/pcc/codegen/c_codegen.py:753"
+    ],
+    "ir.Module.add_global": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:950",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:808"
+    ],
+    "ir.Module.get_identified_types": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/module.py:220"
+    ],
+    "ir.NamedValue.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:786",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:1110",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:1159",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:14"
+    ],
+    "ir.PhiInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:991"
+    ],
+    "ir.PhiInstr.add_incoming": [
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2814",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2815",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2817",
+      "/Users/jiamo/my/pcc/pcc/py_frontend/codegen/layer1.py:2818"
+    ],
+    "ir.PhiInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.PointerType.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/types.py:165"
+    ],
+    "ir.Ret.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:863",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:856"
+    ],
+    "ir.Ret.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.SelectInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:634"
+    ],
+    "ir.SelectInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.StoreInstr.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:780"
+    ],
+    "ir.StoreInstr.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.Terminator.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/instructions.py:228",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:838",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:830"
+    ],
+    "ir.Terminator.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "ir.Type.as_pointer": [
+      "/Users/jiamo/my/pcc/pcc/codegen/c_codegen.py:20",
+      "/Users/jiamo/my/pcc/pcc/codegen/c_codegen.py:21",
+      "/Users/jiamo/my/pcc/pcc/codegen/c_codegen.py:217",
+      "/Users/jiamo/my/pcc/pcc/codegen/c_codegen.py:220",
+      "/Users/jiamo/my/pcc/pcc/codegen/c_codegen.py:221"
+    ],
+    "ir.Type.format_constant": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:466"
+    ],
+    "ir.Type.wrap_constant_value": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:449"
+    ],
+    "ir.Unreachable.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/builder.py:998"
+    ],
+    "ir.Unreachable.descr": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/ir/values.py:548"
+    ],
+    "llvm.ContextRef.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/binding/context.py:10"
+    ],
+    "llvm.ModuleRef.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/binding/module.py:20"
+    ],
+    "llvm.ModuleRef.verify": [
+      "/Users/jiamo/my/pcc/pcc/ir_passes/parity.py:325",
+      "/Users/jiamo/my/pcc/pcc/ir_passes/parity.py:129",
+      "/Users/jiamo/my/pcc/pcc/ir_passes/adce.py:193",
+      "/Users/jiamo/my/pcc/pcc/ir_passes/adce.py:187",
+      "/Users/jiamo/my/pcc/pcc/ir_passes/adce.py:122"
+    ],
+    "llvm.Target.create_target_machine": [
+      "/Users/jiamo/my/pcc/pcc/codegen/c_codegen.py:759"
+    ],
+    "llvm.ValueRef.__init__": [
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/binding/module.py:223",
+      "/Users/jiamo/my/pcc/.venv/lib/python3.13/site-packages/llvmlite/binding/value.py:403"
+    ],
+    "llvm.get_default_triple": [
+      "/Users/jiamo/my/pcc/pcc/codegen/c_codegen.py:758",
+      "/Users/jiamo/my/pcc/pcc/evaluater/c_evaluator.py:1246"
+    ],
+    "llvm.initialize_all_asmprinters": [
+      "/Users/jiamo/my/pcc/pcc/evaluater/c_evaluator.py:1241"
+    ],
+    "llvm.initialize_all_targets": [
+      "/Users/jiamo/my/pcc/pcc/evaluater/c_evaluator.py:1240"
+    ],
+    "llvm.initialize_native_target": [
+      "/Users/jiamo/my/pcc/pcc/codegen/c_codegen.py:757"
+    ],
+    "llvm.parse_assembly": [
+      "/Users/jiamo/my/pcc/pcc/ir_passes/parity.py:324",
+      "/Users/jiamo/my/pcc/pcc/ir_passes/parity.py:128",
+      "/Users/jiamo/my/pcc/pcc/ir_passes/adce.py:192",
+      "/Users/jiamo/my/pcc/pcc/ir_passes/adce.py:187",
+      "/Users/jiamo/my/pcc/pcc/ir_passes/adce.py:122"
+    ]
+  }
+}
