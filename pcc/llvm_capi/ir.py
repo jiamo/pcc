@@ -24,6 +24,145 @@ from __future__ import annotations
 from typing import Iterable, Optional
 
 
+def _hex64(value: int) -> str:
+    digits = "0123456789ABCDEF"
+    out = ""
+    shift = 60
+    while shift >= 0:
+        out += digits[(value >> shift) & 15]
+        shift -= 4
+    return "0x" + out
+
+
+def _float64_to_bits_ir(f: float) -> int:
+    """Return the IEEE 754 binary64 bit pattern using pcc-friendly ops."""
+    if f != f:
+        return 0x7FF8000000000000
+    inf = 1e309
+    if f == inf:
+        return 0x7FF0000000000000
+    if f == -inf:
+        return 0xFFF0000000000000
+    if f == 0.0:
+        text = str(f)
+        if len(text) > 0 and text[0] == "-":
+            return 0x8000000000000000
+        return 0
+    sign = 0
+    if f < 0.0:
+        sign = 1
+        f = -f
+    exp = 0
+    while f >= 2.0:
+        f = f * 0.5
+        exp += 1
+    while f < 1.0:
+        f = f * 2.0
+        exp -= 1
+    mantissa_bits = int((f - 1.0) * 4503599627370496.0)
+    biased_exp = exp + 1023
+    if biased_exp <= 0:
+        return sign << 63
+    if biased_exp >= 0x7FF:
+        return (sign << 63) | 0x7FF0000000000000
+    return (sign << 63) | (biased_exp << 52) | mantissa_bits
+
+
+def _bits_to_float64_ir(bits: int) -> float:
+    sign = (bits >> 63) & 1
+    biased_exp = (bits >> 52) & 0x7FF
+    mantissa = bits & ((1 << 52) - 1)
+    inf = 1e309
+    if biased_exp == 0x7FF:
+        if mantissa == 0:
+            return -inf if sign else inf
+        return inf - inf
+    if biased_exp == 0:
+        if mantissa == 0:
+            return -0.0 if sign else 0.0
+        f = mantissa / 4503599627370496.0
+        i = 0
+        while i < 11:
+            f = f * 0.0009765625
+            i += 1
+        f = f * 2.0
+        return -f if sign else f
+    m_frac = 1.0 + mantissa / 4503599627370496.0
+    exp = biased_exp - 1023
+    f = m_frac
+    if exp >= 0:
+        i = 0
+        while i < exp:
+            f = f * 2.0
+            i += 1
+    else:
+        i = 0
+        while i < -exp:
+            f = f * 0.5
+            i += 1
+    return -f if sign else f
+
+
+def _round_to_float32_ir(f: float) -> float:
+    inf = 1e309
+    if f != f or f == inf or f == -inf or f == 0.0:
+        return f
+    bits = _float64_to_bits_ir(f)
+    sign = (bits >> 63) & 1
+    biased_exp = (bits >> 52) & 0x7FF
+    mantissa = bits & ((1 << 52) - 1)
+    f32_exp = biased_exp - 1023 + 127
+    bits_to_drop = 52 - 23
+    keep = mantissa >> bits_to_drop
+    halfway = 1 << (bits_to_drop - 1)
+    remainder = mantissa & ((1 << bits_to_drop) - 1)
+    if remainder > halfway:
+        keep += 1
+    elif remainder == halfway and (keep & 1):
+        keep += 1
+    if keep >= (1 << 23):
+        keep = 0
+        f32_exp += 1
+    if f32_exp >= 255:
+        return -inf if sign else inf
+    if f32_exp <= 0:
+        return -0.0 if sign else 0.0
+    new_biased_exp = f32_exp - 127 + 1023
+    new_mantissa = keep << bits_to_drop
+    new_bits = (sign << 63) | (new_biased_exp << 52) | new_mantissa
+    return _bits_to_float64_ir(new_bits)
+
+
+def _round_to_float16_ir(f: float) -> float:
+    inf = 1e309
+    if f != f or f == inf or f == -inf or f == 0.0:
+        return f
+    bits = _float64_to_bits_ir(f)
+    sign = (bits >> 63) & 1
+    biased_exp = (bits >> 52) & 0x7FF
+    mantissa = bits & ((1 << 52) - 1)
+    f16_exp = biased_exp - 1023 + 15
+    bits_to_drop = 52 - 10
+    keep = mantissa >> bits_to_drop
+    halfway = 1 << (bits_to_drop - 1)
+    remainder = mantissa & ((1 << bits_to_drop) - 1)
+    if remainder > halfway:
+        keep += 1
+    elif remainder == halfway and (keep & 1):
+        keep += 1
+    if keep >= (1 << 10):
+        keep = 0
+        f16_exp += 1
+    if f16_exp >= 31:
+        return -inf if sign else inf
+    if f16_exp <= 0:
+        return -0.0 if sign else 0.0
+    new_biased_exp = f16_exp - 15 + 1023
+    new_mantissa = keep << bits_to_drop
+    new_bits = (sign << 63) | (new_biased_exp << 52) | new_mantissa
+    return _bits_to_float64_ir(new_bits)
+
+
 # ---------------------------------------------------------------------------
 # Type hierarchy — each Type knows how to render itself as LLVM text.
 # ---------------------------------------------------------------------------
@@ -89,8 +228,10 @@ class IntType(Type):
         return obj
 
     def __init__(self, width: int) -> None:
-        # width is already set in __new__; nothing to do.
-        pass
+        # Keep this visible to pcc's native class-field collector.
+        # __new__ handles CPython interning, but the self-host scaffold
+        # constructs IntType instances through __init__ directly.
+        self.width = width
 
     def __str__(self) -> str:
         return f"i{self.width}"
@@ -257,6 +398,29 @@ class IdentifiedStructType(BaseStructType):
         return f"%{self.name}"
 
 
+def _type_gep_result(base_ty: Type, indices) -> Type:
+    idxs = list(indices)
+    result: Type = base_ty
+    i = 0
+    while i < len(idxs):
+        if isinstance(result, ArrayType):
+            result = result.element
+        elif isinstance(result, BaseStructType):
+            first = idxs[i]
+            if isinstance(first, Value):
+                try:
+                    first = int(first.value)
+                except (AttributeError, TypeError, ValueError):
+                    return result
+            if first < 0 or first >= len(result.elements):
+                return result
+            result = result.elements[first]
+        else:
+            return result
+        i += 1
+    return result
+
+
 class Context:
     """LLVM context — interns identified struct types per name."""
 
@@ -312,13 +476,24 @@ class Value:
     Setting ``.flags`` rewrites that record to include the fast-math
     flags (matches llvmlite's mutable ``flags`` list on instrs)."""
 
-    __slots__ = ("type", "_ref", "_instr", "_flags")
+    __slots__ = (
+        "type",
+        "_ref",
+        "_instr",
+        "_flags",
+        "_is_unsigned",
+        "_pcc_unsigned_pointee",
+        "_pcc_unsigned_return",
+    )
 
     def __init__(self, ty: Type, ref: str) -> None:
         self.type = ty
         self._ref = ref  # text used when this value is referenced as an operand
         self._instr = None
         self._flags: list[str] = []
+        self._is_unsigned = False
+        self._pcc_unsigned_pointee = False
+        self._pcc_unsigned_return = False
 
     def __str__(self) -> str:
         return self._ref
@@ -340,21 +515,43 @@ class Value:
             return
         old = self._instr.text
         # Find the opcode position: optional "%name = " prefix, then opcode.
-        prefix, _, rest = old.partition(" = ")
-        if rest:
-            body = rest
-            head = prefix + " = "
+        eq = old.find(" = ")
+        if eq >= 0:
+            body = old[eq + 3:]
+            head = old[:eq] + " = "
         else:
             body = old
             head = ""
         # First token is opcode; inject flags between opcode and rest.
-        op, space, tail = body.partition(" ")
+        split = body.find(" ")
+        if split >= 0:
+            op = body[:split]
+            tail = body[split + 1:]
+        else:
+            op = body
+            tail = ""
         flag_text = ("".join(f" {f}" for f in self._flags)).lstrip()
         if flag_text:
             new = f"{head}{op} {flag_text} {tail}"
         else:
             new = f"{head}{op} {tail}"
         self._instr.text = new
+
+    def bitcast(self, target_ty: Type) -> "Value":
+        expr = f"bitcast ({self.type} {self._ref} to {target_ty})"
+        return Value(target_ty, expr)
+
+    def gep(self, indices, inbounds: bool = True) -> "Value":
+        indices_list = list(indices)
+        idx_text = ", ".join(f"{i.type} {i}" for i in indices_list)
+        base_ty = self.type.pointee if isinstance(self.type, PointerType) else self.type
+        result_pointee = _type_gep_result(base_ty, indices_list[1:])
+        inb = "inbounds " if inbounds else ""
+        expr = (
+            f"getelementptr {inb}({base_ty}, {self.type} "
+            f"{self._ref}, {idx_text})"
+        )
+        return Value(PointerType(result_pointee), expr)
 
 
 class Constant(Value):
@@ -381,6 +578,42 @@ class Constant(Value):
         return Value(target_ty, expr)
 
     @staticmethod
+    def _format_int(value) -> str:
+        if value == 0:
+            return "0"
+        neg = value < 0
+        if neg:
+            value = 0 - value
+        out = ""
+        while value > 0:
+            digit = value % 10
+            if digit == 0:
+                ch = "0"
+            elif digit == 1:
+                ch = "1"
+            elif digit == 2:
+                ch = "2"
+            elif digit == 3:
+                ch = "3"
+            elif digit == 4:
+                ch = "4"
+            elif digit == 5:
+                ch = "5"
+            elif digit == 6:
+                ch = "6"
+            elif digit == 7:
+                ch = "7"
+            elif digit == 8:
+                ch = "8"
+            else:
+                ch = "9"
+            out = ch + out
+            value = value // 10
+        if neg:
+            return "-" + out
+        return out
+
+    @staticmethod
     def _format(ty: Type, value) -> str:
         # Already a Value/Constant — use its pre-formatted ref text.
         if isinstance(value, Value):
@@ -393,18 +626,15 @@ class Constant(Value):
         if isinstance(ty, IntType):
             if isinstance(value, bool):
                 return "1" if value else "0"
-            return str(int(value))
+            return Constant._format_int(value)
         if isinstance(ty, (FloatType, DoubleType, HalfType)):
-            import math
-            import struct as _struct
-            f = float(value)
-            # Always emit the hex-bits form for doubles — LLVM accepts
-            # both decimal and hex, but hex is unambiguous for inf /
-            # NaN / denormals and avoids round-trip drift on values
-            # like 0.1 that don't have exact binary representations.
-            # Matches llvmlite's default for double constants.
-            raw = _struct.unpack(">Q", _struct.pack(">d", f))[0]
-            return f"0x{raw:016X}"
+            f = value * 1.0
+            if isinstance(ty, FloatType):
+                f = _round_to_float32_ir(f)
+            elif isinstance(ty, HalfType):
+                f = _round_to_float16_ir(f)
+            raw = _float64_to_bits_ir(f)
+            return _hex64(raw)
         if isinstance(ty, ArrayType):
             # [count x elem] [ <elem1>, <elem2>, ... ]
             # value is a sequence of Python-side values
@@ -412,7 +642,7 @@ class Constant(Value):
             # Each operand is printed as ``<elem_ty> <val>``
             body = ", ".join(f"{ty.element} {p}" for p in parts)
             return f"[{body}]"
-        if isinstance(ty, LiteralStructType):
+        if isinstance(ty, BaseStructType):
             # struct constant: { <ty1> <val1>, <ty2> <val2>, ... }
             parts = []
             for elem_ty, val in zip(ty.elements, value):
@@ -581,6 +811,7 @@ class Function:
         # Mark external if no blocks ever appended — subset of llvmlite's
         # behavior (``declare`` vs ``define``).
         module._functions.append(self)
+        module.globals[name] = self
 
     def append_basic_block(self, name: str = "") -> Block:
         if not name:
@@ -651,8 +882,8 @@ class Function:
         # Argument list text
         arg_parts = []
         for arg in self.args:
-            if arg.name:
-                arg_parts.append(f"{arg.type} %{arg.name}")
+            if arg._name:
+                arg_parts.append(f"{arg.type} %{arg._name}")
             else:
                 arg_parts.append(f"{arg.type} {arg._ref}")
         if fty.var_arg:
@@ -670,7 +901,7 @@ class Function:
         if self.attributes._attrs:
             attrs_text = " " + " ".join(sorted(self.attributes._attrs))
 
-        if self.is_declaration:
+        if not self.blocks:
             arg_type_only = ", ".join(str(t) for t in fty.args)
             if fty.var_arg:
                 arg_type_only = f"{arg_type_only}, ..." if arg_type_only else "..."
@@ -696,9 +927,6 @@ class FunctionAttributes:
 
     def add(self, attr: str) -> None:
         self._attrs.add(attr)
-
-    def __iter__(self):
-        return iter(self._attrs)
 
     def __bool__(self) -> bool:
         return bool(self._attrs) or self.personality is not None
@@ -731,25 +959,25 @@ class GlobalVariable(Value):
         self.unnamed_addr = False
         self._ref = f"@{name}"
         module._globals.append(self)
+        module.globals[name] = self
 
     def gep(self, indices, inbounds: bool = True) -> Value:
         """Constant-expression GEP on this global — emits inline as
         ``getelementptr (inbounds) (<ty>, ptr @name, i32 i0, i32 i1, ...)``.
         Used by codegen to materialize a pointer-to-first-element of
         a global array or struct without a separate builder call."""
+        indices_list = list(indices)
         idx_parts = []
-        for v in indices:
+        for v in indices_list:
             idx_parts.append(f"{v.type} {v}")
         idx_text = ", ".join(idx_parts)
         inb = "inbounds " if inbounds else ""
-        # Result type is just ``ptr`` (opaque pointers in LLVM 15+).
-        # Emit the constant-expression form as the _ref so it can be
-        # used as an operand directly.
+        result_pointee = _type_gep_result(self.value_type, indices_list[1:])
         expr = (
             f"getelementptr {inb}({self.value_type}, {self.type} "
             f"@{self.name}, {idx_text})"
         )
-        return Value(PointerType(self.value_type), expr)
+        return Value(PointerType(result_pointee), expr)
 
     def render(self) -> str:
         linkage = f"{self.linkage} " if self.linkage else ""
@@ -785,6 +1013,7 @@ class Module:
         self.data_layout = ""
         self._functions: list[Function] = []
         self._globals: list[GlobalVariable] = []
+        self.globals: dict = {}
         # Named metadata (e.g. ``!llvm.dbg.cu = !{!0}``) — β4.3 surface.
         self._named_metadata: dict[str, list] = {}
         self.context = context or global_context
@@ -807,32 +1036,15 @@ class Module:
     def global_values(self) -> list[GlobalVariable]:
         return list(self._globals)
 
-    @property
-    def globals(self) -> dict:
-        """Dict view of ``name -> (Function | GlobalVariable)``.
-        llvmlite exposes this on Module; pcc codegen uses
-        ``module.globals.get(name)`` to probe for existing declarations."""
-        out: dict = {}
-        for gv in self._globals:
-            out[gv.name] = gv
-        for fn in self._functions:
-            out[fn.name] = fn
-        return out
-
     def get_global(self, name: str):
         """Retrieve a global by name (Function or GlobalVariable).
         Returns None if absent — matches llvmlite's ``.globals.get``."""
-        for fn in self._functions:
-            if fn.name == name:
-                return fn
-        for gv in self._globals:
-            if gv.name == name:
-                return gv
-        return None
+        return self.globals.get(name)
 
     def add_global(self, gv: GlobalVariable) -> None:
         if gv not in self._globals:
             self._globals.append(gv)
+        self.globals[gv.name] = gv
 
     def add_named_metadata(self, name: str, node=None) -> None:
         """β4.3 placeholder — collect named metadata nodes."""
@@ -910,8 +1122,8 @@ class IRBuilder:
     # so that code keeps working.
     @property
     def _anchor(self) -> int:
-        if self._pos == self._END and self.block is not None:
-            return len(self.block._instrs)
+        if self._pos == self._END and self._block is not None:
+            return len(self._block._instrs)
         return int(self._pos)
 
     @_anchor.setter
@@ -926,12 +1138,12 @@ class IRBuilder:
     # ------------- positioning -------------
 
     def position_at_end(self, block: Block) -> None:
-        self.block = block
+        self._block = block
         self._fn = block.parent
         self._pos = self._END
 
     def position_at_start(self, block: Block) -> None:
-        self.block = block
+        self._block = block
         self._fn = block.parent
         self._pos = 0
 
@@ -944,7 +1156,7 @@ class IRBuilder:
         if isinstance(instr_or_block, InstructionRecord):
             # Find the record's index within its block
             blk = instr_or_block.block
-            self.block = blk
+            self._block = blk
             self._fn = blk.parent
             for i, rec in enumerate(blk._instrs):
                 if rec is instr_or_block:
@@ -954,7 +1166,7 @@ class IRBuilder:
             self._pos = "end"
             return
         # Fallback — position at start of the inferred block
-        blk = getattr(instr_or_block, "block", None) or self.block
+        blk = getattr(instr_or_block, "block", None) or self._block
         if blk is not None:
             self.position_at_start(blk)
 
@@ -979,9 +1191,9 @@ class IRBuilder:
         attach the defining instruction to the returned ``Value`` —
         required for mutable-flags rewrites (fast-math contract flag).
         """
-        if self.block is None:
+        if self._block is None:
             raise ValueError("IRBuilder has no current block")
-        blk = self.block
+        blk = self._block
         n = len(blk._instrs)
         if self._pos >= n:
             blk.append(line)
@@ -993,47 +1205,61 @@ class IRBuilder:
         self._pos += 1
         return rec
 
+    def _next_name(self, name: str) -> str:
+        fn = self._fn
+        if fn is None:
+            raise ValueError("IRBuilder has no current function")
+        if name == "":
+            fn._name_counter += 1
+            return f".{fn._name_counter}"
+        n = fn._name_registry.get(name, 0)
+        fn._name_registry[name] = n + 1
+        if n == 0:
+            return name
+        candidate = f"{name}.{n}"
+        while candidate in fn._name_registry:
+            n += 1
+            candidate = f"{name}.{n}"
+        fn._name_registry[candidate] = 1
+        return candidate
+
     def _next(self, name: str, ty: Type) -> Value:
         """Produce a new local SSA value with ``name`` (or a fresh temp
         if empty). Uniqueifies against the function's name registry
         so repeated ``name="x"`` calls get ``%x``, ``%x.1``, ``%x.2``
         — same as llvmlite."""
-        if not name:
-            name = self._fn._fresh()
-        else:
-            name = self._fn._unique(name)
-        return Value(ty, f"%{name}")
+        return Value(ty, f"%{self._next_name(name)}")
 
     # ------------- return / branch / terminator -------------
 
     def ret(self, value: Value) -> Value:
         self._emit(f"ret {value.type} {value}")
-        if self.block is not None:
-            self.block._terminated = True
+        if self._block is not None:
+            self._block._terminated = True
         return Value(VoidType(), "")
 
     def ret_void(self) -> Value:
         self._emit("ret void")
-        if self.block is not None:
-            self.block._terminated = True
+        if self._block is not None:
+            self._block._terminated = True
         return Value(VoidType(), "")
 
     def branch(self, target: Block) -> Value:
         self._emit(f"br label %{target.name}")
-        if self.block is not None:
-            self.block._terminated = True
+        if self._block is not None:
+            self._block._terminated = True
         return Value(VoidType(), "")
 
     def cbranch(self, cond: Value, t: Block, f: Block) -> Value:
         self._emit(f"br i1 {cond}, label %{t.name}, label %{f.name}")
-        if self.block is not None:
-            self.block._terminated = True
+        if self._block is not None:
+            self._block._terminated = True
         return Value(VoidType(), "")
 
     def unreachable(self) -> Value:
         self._emit("unreachable")
-        if self.block is not None:
-            self.block._terminated = True
+        if self._block is not None:
+            self._block._terminated = True
         return Value(VoidType(), "")
 
     def switch(self, value: Value, default_block: Block) -> "SwitchInstr":
@@ -1041,8 +1267,8 @@ class IRBuilder:
         the caller extends via ``add_case(int_value, target_block)``."""
         sw = SwitchInstr(self, value, default_block)
         self._emit(sw._render())
-        if self.block is not None:
-            self.block._terminated = True
+        if self._block is not None:
+            self._block._terminated = True
         return sw
 
     # ------------- memory -------------
@@ -1067,6 +1293,11 @@ class IRBuilder:
         )
         return Value(VoidType(), "")
 
+    def fence(self, ordering: str, syncscope: Optional[str] = None) -> Value:
+        scope_text = f'syncscope("{syncscope}") ' if syncscope else ""
+        self._emit(f"fence {scope_text}{ordering}")
+        return Value(VoidType(), "")
+
     def gep(
         self,
         ptr: Value,
@@ -1079,8 +1310,7 @@ class IRBuilder:
         indices_list = list(indices)
         base_ty = ptr.type.pointee if isinstance(ptr.type, PointerType) else ptr.type
         result_pointee = base_ty
-        if len(indices_list) > 1 and isinstance(base_ty, (BaseStructType, ArrayType)):
-            result_pointee = base_ty.gep(indices_list[1:])
+        result_pointee = _type_gep_result(base_ty, indices_list[1:])
         # GEP result is a pointer to the drilled type
         result_ptr_ty = PointerType(result_pointee)
         v = self._next(name, result_ptr_ty)
@@ -1128,9 +1358,29 @@ class IRBuilder:
         self._emit(f"{v} = sitofp {value.type} {value} to {ty}")
         return v
 
+    def uitofp(self, value: Value, ty: Type, name: str = "") -> Value:
+        v = self._next(name, ty)
+        self._emit(f"{v} = uitofp {value.type} {value} to {ty}")
+        return v
+
     def fptosi(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
         self._emit(f"{v} = fptosi {value.type} {value} to {ty}")
+        return v
+
+    def fptoui(self, value: Value, ty: Type, name: str = "") -> Value:
+        v = self._next(name, ty)
+        self._emit(f"{v} = fptoui {value.type} {value} to {ty}")
+        return v
+
+    def fpext(self, value: Value, ty: Type, name: str = "") -> Value:
+        v = self._next(name, ty)
+        self._emit(f"{v} = fpext {value.type} {value} to {ty}")
+        return v
+
+    def fptrunc(self, value: Value, ty: Type, name: str = "") -> Value:
+        v = self._next(name, ty)
+        self._emit(f"{v} = fptrunc {value.type} {value} to {ty}")
         return v
 
     # ------------- integer arithmetic -------------
@@ -1219,6 +1469,12 @@ class IRBuilder:
     def frem(self, a: Value, b: Value, name: str = "") -> Value:
         return self._fp_binop("frem", a, b, name)
 
+    def fneg(self, value: Value, name: str = "") -> Value:
+        v = self._next(name, value.type)
+        rec = self._emit(f"{v} = fneg {value.type} {value}")
+        v._instr = rec
+        return v
+
     # ------------- comparisons -------------
 
     def icmp_signed(self, op: str, a: Value, b: Value, name: str = "") -> Value:
@@ -1280,6 +1536,8 @@ class IRBuilder:
                 fty = fn.type.pointee
                 ret_ty = fty.return_type
                 arg_types = ", ".join(str(t) for t in fty.args)
+                if fty.var_arg:
+                    arg_types = f"{arg_types}, ..." if arg_types else "..."
                 sig_text = f"{ret_ty} ({arg_types})"
             else:
                 ret_ty = VoidType()
@@ -1308,7 +1566,8 @@ class IRBuilder:
         return v
 
     def phi(self, ty: Type, name: str = "") -> "PhiInstr":
-        v = PhiInstr(self, ty, name or self._fn._fresh())
+        phi_name = self._next_name(name)
+        v = PhiInstr(self, ty, phi_name)
         self._emit(v._placeholder_line)
         return v
 
@@ -1334,6 +1593,8 @@ class IRBuilder:
             fty = fn.type.pointee
             ret_ty = fty.return_type
             arg_types = ", ".join(str(t) for t in fty.args)
+            if fty.var_arg:
+                arg_types = f"{arg_types}, ..." if arg_types else "..."
             sig_text = f"{ret_ty} ({arg_types})"
 
         if isinstance(ret_ty, VoidType):
@@ -1341,22 +1602,51 @@ class IRBuilder:
                 f"invoke {sig_text} {callee_ref}({args_text}) "
                 f"to label %{normal_block.name} unwind label %{unwind_block.name}"
             )
-            if self.block is not None:
-                self.block._terminated = True
+            if self._block is not None:
+                self._block._terminated = True
             return Value(VoidType(), "")
         v = self._next(name, ret_ty)
         self._emit(
             f"{v} = invoke {sig_text} {callee_ref}({args_text}) "
             f"to label %{normal_block.name} unwind label %{unwind_block.name}"
         )
-        if self.block is not None:
-            self.block._terminated = True
+        if self._block is not None:
+            self._block._terminated = True
+        return v
+
+    def atomic_rmw(
+        self,
+        op: str,
+        ptr: Value,
+        val: Value,
+        ordering: str,
+        name: str = "",
+    ) -> Value:
+        v = self._next(name, val.type)
+        self._emit(f"{v} = atomicrmw {op} {ptr.type} {ptr}, {val.type} {val} {ordering}")
+        return v
+
+    def cmpxchg(
+        self,
+        ptr: Value,
+        cmp: Value,
+        val: Value,
+        success_ordering: str,
+        failure_ordering: str,
+        name: str = "",
+    ) -> Value:
+        pair_ty = LiteralStructType([cmp.type, IntType(1)])
+        v = self._next(name, pair_ty)
+        self._emit(
+            f"{v} = cmpxchg {ptr.type} {ptr}, {cmp.type} {cmp}, "
+            f"{val.type} {val} {success_ordering} {failure_ordering}"
+        )
         return v
 
     def landingpad(
         self, ty: Type, name: str = "", cleanup: bool = False,
     ) -> "LandingPadInstr":
-        v = LandingPadInstr(self, ty, name or self._fn._fresh(), cleanup)
+        v = LandingPadInstr(self, ty, self._next_name(name), cleanup)
         self._emit(v._placeholder_line)
         return v
 
@@ -1403,7 +1693,7 @@ class PhiInstr(Value):
         )
         # Update the emitted line in-place — scan records for the
         # prior placeholder and replace its text field.
-        blk = self._builder.block
+        blk: Block = self._builder._block
         if blk is None:
             return
         for rec in blk._instrs:
@@ -1522,6 +1812,189 @@ class FilterClause:
     def render(self) -> str:
         vals_text = ", ".join(f"{v.type} {v}" for v in self.values)
         return f"filter {self.ty} [{vals_text}]"
+
+
+# ---------------------------------------------------------------------------
+# ON-mode scaffold ABI helpers.
+# ---------------------------------------------------------------------------
+#
+# The Python frontend's closed-world IR scaffold calls these helpers from the
+# compiler being self-hosted. They allocate real pcc.llvm_capi.ir objects and
+# keep target-program runtime symbols as IR objects, not native addresses in
+# the compiler binary.
+
+
+def scaffold_IntType(width: int):
+    return IntType(width)
+
+
+def scaffold_PointerType(pointee):
+    return PointerType(pointee)
+
+
+def scaffold_ArrayType(element, count: int):
+    return ArrayType(element, count)
+
+
+def scaffold_Constant_i64(ty, value: int):
+    return Constant(ty, value)
+
+
+def scaffold_Constant_f64(ty, value: float):
+    return Constant(ty, value)
+
+
+def scaffold_Constant_none(ty):
+    return Constant(ty, None)
+
+
+def scaffold_Constant_obj(ty, value):
+    return Constant(ty, value)
+
+
+def scaffold_IRBuilder(block):
+    return IRBuilder(block)
+
+
+def scaffold_Context():
+    return Context()
+
+
+def scaffold_IdentifiedStructType(context, name):
+    return IdentifiedStructType(context, name)
+
+
+def VoidType___init__():
+    return VoidType()
+
+
+def FloatType___init__():
+    return FloatType()
+
+
+def HalfType___init__():
+    return HalfType()
+
+
+def DoubleType___init__():
+    return DoubleType()
+
+
+def FunctionType___init__0(return_type):
+    return FunctionType(return_type, ())
+
+
+def FunctionType___init__1(return_type, arg0):
+    return FunctionType(return_type, (arg0,))
+
+
+def FunctionType___init__1_varargs(return_type, arg0):
+    return FunctionType(return_type, (arg0,), var_arg=True)
+
+
+def FunctionType___init__0_dyn_va(return_type, var_arg):
+    return FunctionType(return_type, (), var_arg=bool(var_arg))
+
+
+def FunctionType___init__1_dyn_va(return_type, arg0, var_arg):
+    return FunctionType(return_type, (arg0,), var_arg=bool(var_arg))
+
+
+def FunctionType___init__2_dyn_va(return_type, arg0, arg1, var_arg):
+    return FunctionType(return_type, (arg0, arg1), var_arg=bool(var_arg))
+
+
+def FunctionType___init__2(return_type, arg0, arg1):
+    return FunctionType(return_type, (arg0, arg1))
+
+
+def FunctionType___init___dyn(return_type, args, var_arg):
+    return FunctionType(return_type, args, var_arg=bool(var_arg))
+
+
+def Function___init___named(module, function_type, name):
+    return Function(module, function_type, name=name)
+
+
+def GlobalVariable___init___named(module, ty, name):
+    return GlobalVariable(module, ty, name=name)
+
+
+def Module___init___named(name):
+    return Module(name=name)
+
+
+def Module___init__():
+    return Module(name="")
+
+
+def LiteralStructType___init__3(arg0, arg1, arg2):
+    return LiteralStructType((arg0, arg1, arg2))
+
+
+def IRBuilder_call0(builder, fn):
+    return IRBuilder.call(builder, fn, ())
+
+
+def IRBuilder_call1(builder, fn, arg0):
+    return IRBuilder.call(builder, fn, (arg0,))
+
+
+def IRBuilder_call2(builder, fn, arg0, arg1):
+    return IRBuilder.call(builder, fn, (arg0, arg1))
+
+
+def IRBuilder_call3(builder, fn, arg0, arg1, arg2):
+    return IRBuilder.call(builder, fn, (arg0, arg1, arg2))
+
+
+def IRBuilder_call4(builder, fn, arg0, arg1, arg2, arg3):
+    return IRBuilder.call(builder, fn, (arg0, arg1, arg2, arg3))
+
+
+def IRBuilder_call5(builder, fn, arg0, arg1, arg2, arg3, arg4):
+    return IRBuilder.call(builder, fn, (arg0, arg1, arg2, arg3, arg4))
+
+
+def IRBuilder_call6(builder, fn, arg0, arg1, arg2, arg3, arg4, arg5):
+    return IRBuilder.call(builder, fn, (arg0, arg1, arg2, arg3, arg4, arg5))
+
+
+def IRBuilder_call7(builder, fn, arg0, arg1, arg2, arg3, arg4, arg5, arg6):
+    return IRBuilder.call(builder, fn, (arg0, arg1, arg2, arg3, arg4, arg5, arg6))
+
+
+def IRBuilder_call_dyn(builder, fn, args):
+    return IRBuilder.call(builder, fn, args)
+
+
+def IRBuilder_gep1(builder, ptr, idx0):
+    return IRBuilder.gep(builder, ptr, (idx0,))
+
+
+def IRBuilder_gep2_inbounds(builder, ptr, idx0, idx1):
+    return IRBuilder.gep(builder, ptr, (idx0, idx1), inbounds=True)
+
+
+def IRBuilder_add_incoming(phi: PhiInstr, value: Value, block: Block):
+    phi._incomings.append((value, block))
+    phi._refresh()
+
+
+def IRBuilder_as_pointer(ty):
+    return PointerType(ty)
+
+
+def scaffold_IRBuilder_append_basic_block(builder, name):
+    return scaffold_Function_append_basic_block(builder._fn, name)
+
+
+def scaffold_Function_append_basic_block(fn, name):
+    if not name:
+        name = "bb"
+    blk = Block(fn, name)
+    fn.blocks.append(blk)
+    return blk
 
 
 # ---------------------------------------------------------------------------

@@ -58,8 +58,8 @@ def _pick(use_llvmlite: bool):
         from llvmlite import ir as _ir
         from llvmlite import binding as _bind
         return _ir, _bind
-    from pcc.llvm_capi import ir as _ir
-    from pcc.llvm_capi import binding as _bind
+    from . import ir as _ir
+    from . import binding as _bind
     return _ir, _bind
 
 

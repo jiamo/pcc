@@ -248,10 +248,10 @@ def test_rpo_function_attrs_has_ir_equivalent_backing():
     )
 
 
-def test_callsite_splitting_has_ir_subset_backing():
+def test_callsite_splitting_has_ir_equivalent_backing():
     entry = llvm_python_translation("callsite-splitting")
     assert entry is not None
-    assert entry.status == "subset"
+    assert entry.status == "equivalent"
     assert entry.implementation_tier == "mixed"
     assert (
         entry.ir_pass_class
@@ -292,10 +292,10 @@ def test_loop_simplify_has_ir_equivalent_backing():
     )
 
 
-def test_loop_instsimplify_has_ir_subset_backing():
+def test_loop_instsimplify_has_ir_equivalent_backing():
     entry = llvm_python_translation("loop-instsimplify")
     assert entry is not None
-    assert entry.status == "subset"
+    assert entry.status == "equivalent"
     assert entry.implementation_tier == "mixed"
     assert (
         entry.ir_pass_class
@@ -303,10 +303,10 @@ def test_loop_instsimplify_has_ir_subset_backing():
     )
 
 
-def test_loop_sink_has_ir_subset_backing():
+def test_loop_sink_has_ir_equivalent_backing():
     entry = llvm_python_translation("loop-sink")
     assert entry is not None
-    assert entry.status == "subset"
+    assert entry.status == "equivalent"
     assert entry.implementation_tier == "mixed"
     assert (
         entry.ir_pass_class
@@ -347,10 +347,10 @@ def test_lower_expect_has_ir_equivalent_backing():
     )
 
 
-def test_inferattrs_has_ir_subset_backing():
+def test_inferattrs_has_ir_equivalent_backing():
     entry = llvm_python_translation("inferattrs")
     assert entry is not None
-    assert entry.status == "subset"
+    assert entry.status == "equivalent"
     assert entry.implementation_tier == "mixed"
     assert (
         entry.ir_pass_class
@@ -425,10 +425,10 @@ def test_lower_constant_intrinsics_has_ir_equivalent_backing():
     )
 
 
-def test_require_has_ir_subset_backing():
+def test_require_has_ir_equivalent_backing():
     entry = llvm_python_translation("require")
     assert entry is not None
-    assert entry.status == "subset"
+    assert entry.status == "equivalent"
     assert entry.implementation_tier == "mixed"
     assert entry.ir_pass_class == "pcc.ir_passes.meta_passes:RequireIRPass"
 
@@ -476,15 +476,39 @@ def test_rel_lookup_table_converter_has_ir_equivalent_backing():
     )
 
 
-def test_extra_simple_loop_unswitch_has_ir_subset_backing():
+def test_extra_simple_loop_unswitch_has_ir_equivalent_backing():
     entry = llvm_python_translation("extra-simple-loop-unswitch-passes")
     assert entry is not None
-    assert entry.status == "subset"
+    assert entry.status == "equivalent"
     assert entry.implementation_tier == "mixed"
     assert (
         entry.ir_pass_class
         == "pcc.ir_passes.simple_loop_unswitch:SimpleLoopUnswitchPass"
     )
+
+
+def test_simple_loop_unswitch_has_ir_equivalent_backing():
+    entry = llvm_python_translation("simple-loop-unswitch")
+    assert entry is not None
+    assert entry.status == "equivalent"
+    assert entry.implementation_tier == "mixed"
+    assert (
+        entry.ir_pass_class
+        == "pcc.ir_passes.simple_loop_unswitch:SimpleLoopUnswitchPass"
+    )
+
+
+def test_loop_distribution_and_vector_leaf_passes_have_ir_equivalent_backing():
+    for name, ir_class in (
+        ("loop-distribute", "pcc.ir_passes.loop_distribute:LoopDistributePass"),
+        ("loop-vectorize", "pcc.ir_passes.loop_vectorize:LoopVectorizePass"),
+        ("slp-vectorizer", "pcc.ir_passes.slp_vectorizer:SLPVectorizerPass"),
+    ):
+        entry = llvm_python_translation(name)
+        assert entry is not None
+        assert entry.status == "equivalent"
+        assert entry.implementation_tier == "mixed"
+        assert entry.ir_pass_class == ir_class
 
 
 def test_transform_warning_has_ir_equivalent_backing():

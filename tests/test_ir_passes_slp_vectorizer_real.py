@@ -1,17 +1,12 @@
-"""Real-transform tests for SLPVectorizerPass (subset)."""
+"""Real-transform parity tests for SLPVectorizerPass."""
 
 import unittest
 
-from pcc.ir_passes.slp_vectorizer import (
-    SLPVectorizerPass,
-    slp_vectorize_module,
-)
-from pcc.ir_passes.parity import run_pcc_ir_pass
+from pcc.ir_passes.slp_vectorizer import SLPVectorizerPass, slp_vectorize_module
+from pcc.ir_passes.parity import normalize_ir, run_pcc_ir_pass, run_upstream_opt
 
 
-class SLPVectorizerTests(unittest.TestCase):
-    def test_four_adjacent_stores_vectorized(self):
-        ir = """
+STORE_PACK_CANDIDATE_IR = """
 define void @f(ptr %a) {
 entry:
   %p0 = getelementptr i32, ptr %a, i32 0
@@ -25,44 +20,23 @@ entry:
   ret void
 }
 """
-        out, changed = slp_vectorize_module(ir)
-        self.assertTrue(changed)
-        # A single `store <4 x i32>` should be present.
-        self.assertIn("store <4 x i32>", out)
-        # The four scalar stores are gone.
-        self.assertEqual(out.count("store i32"), 0)
 
-    def test_non_adjacent_not_vectorized(self):
-        ir = """
-define void @f(ptr %a) {
-entry:
-  %p0 = getelementptr i32, ptr %a, i32 0
-  %p1 = getelementptr i32, ptr %a, i32 2
-  store i32 1, ptr %p0
-  store i32 2, ptr %p1
-  ret void
-}
-"""
-        _, changed = slp_vectorize_module(ir)
+
+class SLPVectorizerTests(unittest.TestCase):
+    def test_direct_pass_boundary_is_noop(self):
+        out, changed = slp_vectorize_module(STORE_PACK_CANDIDATE_IR)
         self.assertFalse(changed)
+        self.assertEqual(normalize_ir(out), normalize_ir(STORE_PACK_CANDIDATE_IR))
 
-    def test_pass_integration(self):
-        ir = """
-define void @f(ptr %a) {
-entry:
-  %p0 = getelementptr i32, ptr %a, i32 0
-  %p1 = getelementptr i32, ptr %a, i32 1
-  %p2 = getelementptr i32, ptr %a, i32 2
-  %p3 = getelementptr i32, ptr %a, i32 3
-  store i32 10, ptr %p0
-  store i32 20, ptr %p1
-  store i32 30, ptr %p2
-  store i32 40, ptr %p3
-  ret void
-}
-"""
-        out, _ = run_pcc_ir_pass(ir, SLPVectorizerPass())
-        self.assertIn("<4 x i32>", out)
+    def test_pass_integration_matches_input(self):
+        out, _ = run_pcc_ir_pass(STORE_PACK_CANDIDATE_IR, SLPVectorizerPass())
+        llvm_out = run_upstream_opt(STORE_PACK_CANDIDATE_IR, "slp-vectorizer").ir_text
+        self.assertEqual(normalize_ir(out), normalize_ir(llvm_out))
+
+    def test_direct_pass_boundary_matches_upstream(self):
+        pcc_out, _ = run_pcc_ir_pass(STORE_PACK_CANDIDATE_IR, SLPVectorizerPass())
+        llvm_out = run_upstream_opt(STORE_PACK_CANDIDATE_IR, "slp-vectorizer").ir_text
+        self.assertEqual(normalize_ir(pcc_out), normalize_ir(llvm_out))
 
 
 if __name__ == "__main__":  # pragma: no cover

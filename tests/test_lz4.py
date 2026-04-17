@@ -42,6 +42,22 @@ def lz4_compiled_units():
     return compiled_units, base_dir
 
 
+@pytest.fixture(scope="module")
+def lz4_compiled_units_self():
+    units, base_dir = _lz4_units()
+    compiled_units = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).compile_translation_units(
+        units,
+        base_dir=base_dir,
+        jobs=translation_unit_jobs(),
+        include_dirs=translation_unit_include_dirs(units),
+        cpp_args=_lz4_cpp_args(),
+    )
+    return compiled_units, base_dir
+
+
 @pytest.mark.skipif(not os.path.isdir(LZ4_LIB_DIR), reason="lz4-1.10.0/lib not found")
 def test_lz4_make_goal_dependency_collects_library_sources():
     units, base_dir = _lz4_units()
@@ -84,6 +100,29 @@ def test_lz4_runtime_with_system_link_depends_on(lz4_compiled_units):
     assert (
         result.returncode == 0
     ), f"lz4 system-link runtime failed:\n{result.stdout}\n{result.stderr}"
+    assert "lz4 version 1.10.0" in result.stdout
+    assert "block roundtrip: hello, lz4!" in result.stdout
+    assert "frame roundtrip: hello, lz4!" in result.stdout
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not os.path.isdir(LZ4_LIB_DIR), reason="lz4-1.10.0/lib not found")
+def test_lz4_runtime_with_self_backend_system_link_depends_on(lz4_compiled_units_self):
+    compiled_units, base_dir = lz4_compiled_units_self
+
+    result = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).run_compiled_translation_units_with_system_cc(
+        compiled_units,
+        optimize=True,
+        base_dir=base_dir,
+        timeout=180,
+    )
+
+    assert (
+        result.returncode == 0
+    ), f"lz4 self backend system-link runtime failed:\n{result.stdout}\n{result.stderr}"
     assert "lz4 version 1.10.0" in result.stdout
     assert "block roundtrip: hello, lz4!" in result.stdout
     assert "frame roundtrip: hello, lz4!" in result.stdout

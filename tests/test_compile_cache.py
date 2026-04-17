@@ -250,3 +250,13 @@ def test_evaluate_cache_misses_when_backend_changes(tmp_path, monkeypatch):
         use_system_cpp=False,
     ) == 0
     assert compiled_names == ["__pcc_eval__.c"]
+
+
+def test_evaluator_backend_self_env_can_run_simple_program(monkeypatch):
+    monkeypatch.setenv("PCC_BACKEND", "self")
+
+    assert CEvaluator().evaluate(
+        "int main(void) { return 0; }\n",
+        optimize=False,
+        use_system_cpp=False,
+    ) == 0

@@ -133,9 +133,29 @@ def extern(
     )
 
 
+def c_abi_export(symbol: str):
+    """Decorator that forces pcc to emit the decorated function under
+    the given unmangled C-ABI symbol name instead of the usual
+    ``user_<module>_<name>`` mangling. Required when a pcc-Python
+    function is meant to replace a py_runtime/*.c symbol at link time
+    (Phase 4c runtime-high migration).
+
+    Codegen recognizes ``@c_abi_export("name")`` by decorator name and
+    uses the literal string argument as the LLVM symbol. The returned
+    wrapper is a no-op at the Python level — it just round-trips the
+    function through so the decorator syntax stays valid when the
+    module is imported under CPython.
+    """
+    def _wrap(fn):
+        fn.__pcc_c_abi_symbol__ = symbol
+        return fn
+    return _wrap
+
+
 __all__ = [
     "ExternFn",
     "extern",
+    "c_abi_export",
     "c_void", "c_bool",
     "c_int8", "c_int16", "c_int32", "c_int64",
     "c_uint8", "c_uint16", "c_uint32", "c_uint64",

@@ -149,6 +149,38 @@ def test_readline_runtime_with_system_link_depends_on():
     assert "OK" in result.stdout
 
 
+def test_readline_runtime_with_self_backend_system_link_depends_on():
+    units, base_dir = _readline_units()
+
+    compiled = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).compile_translation_units(
+        units,
+        base_dir=base_dir,
+        jobs=translation_unit_jobs(),
+        include_dirs=translation_unit_include_dirs(units),
+        cpp_args=_readline_cpp_args(),
+    )
+
+    result = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).run_compiled_translation_units_with_system_cc(
+        compiled,
+        optimize=True,
+        base_dir=base_dir,
+        timeout=180,
+    )
+
+    assert (
+        result.returncode == 0
+    ), f"readline self backend system-link runtime failed:\n{result.stdout}\n{result.stderr}"
+    assert "readline version 8.2" in result.stdout
+    assert "history entry: readline" in result.stdout
+    assert "OK" in result.stdout
+
+
 def test_readline_make_goal_dependency_collects_library_sources():
     units, base_dir = _readline_units()
 

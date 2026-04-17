@@ -268,7 +268,7 @@ PyObject *py_dict_get_default(PyObject *dict, PyObject *key, PyObject *def) {
     return def;
 }
 
-int py_dict_contains(PyObject *dict, PyObject *key) {
+int64_t py_dict_contains(PyObject *dict, PyObject *key) {
     if (dict == NULL || key == NULL) return 0;
     PyDictObject *d = (PyDictObject *)dict;
     int64_t hash = py_obj_hash(key);
@@ -277,7 +277,7 @@ int py_dict_contains(PyObject *dict, PyObject *key) {
     return ix >= 0 ? 1 : 0;
 }
 
-int py_dict_del(PyObject *dict, PyObject *key) {
+int64_t py_dict_del(PyObject *dict, PyObject *key) {
     if (dict == NULL || key == NULL) return -1;
     PyDictObject *d = (PyDictObject *)dict;
     int64_t hash = py_obj_hash(key);

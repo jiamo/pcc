@@ -1,3 +1,5 @@
-if __name__ == '__main__':
-    from .pcc import main
-    main()
+from pcc.cli_bootstrap import bootstrap_cli_sys_argv_exit
+
+
+if __name__ == "__main__":
+    bootstrap_cli_sys_argv_exit()

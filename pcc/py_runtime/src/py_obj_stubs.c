@@ -27,14 +27,31 @@
 /* ---- Float ------------------------------------------------------------ */
 
 PyObject *py_float_from_f64(double v) {
-    (void)v;
-    /* TODO(phase3): allocate PyFloatObject. */
-    return NULL;
+    PyFloatObject *f = (PyFloatObject *)malloc(sizeof(PyFloatObject));
+    if (f == NULL) return NULL;
+    f->h.refcount = 1;
+    f->h.type_tag = PY_TYPE_FLOAT;
+    f->h.flags = 0;
+    f->value = v;
+    return (PyObject *)f;
 }
 
 double py_float_to_f64(PyObject *o) {
-    (void)o;
-    /* TODO(phase3) */
+    if (o == NULL) return 0.0;
+    if (((uintptr_t)o & 1) == 1) {
+        int64_t v = (int64_t)(((intptr_t)o) >> 1);
+        return (double)v;
+    }
+    const PyObjectHeader *h = (const PyObjectHeader *)o;
+    if (h->type_tag == PY_TYPE_FLOAT) {
+        return ((const PyFloatObject *)o)->value;
+    }
+    if (h->type_tag == PY_TYPE_INT) {
+        return py_bigint_to_double((const PyIntObject *)o);
+    }
+    if (h->type_tag == PY_TYPE_BOOL) {
+        return o == py_True ? 1.0 : 0.0;
+    }
     return 0.0;
 }
 
@@ -67,6 +84,9 @@ PyObject *py_obj_str(PyObject *o) {
         py_incref(o);
         return o;
     }
+    if (tag == PY_TYPE_INT) {
+        return py_int_to_str_obj(o);
+    }
     if (tag == PY_TYPE_EXC) {
         PyObject *msg = py_exc_get_message(o);
         if (msg != NULL) {
@@ -79,7 +99,8 @@ PyObject *py_obj_str(PyObject *o) {
          * singleton (future work). */
         return NULL;
     }
-    /* TODO(phase3): dunder __str__ dispatch for user classes etc. */
+    PyObject *dunder = py_user_str_dispatch(o);
+    if (dunder != NULL) return dunder;
     return NULL;
 }
 

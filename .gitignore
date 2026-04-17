@@ -148,3 +148,14 @@ projects/nginx-1.28.3/Makefile
 projects/nginx-1.28.3/objs/
 .claude/
 .pi
+
+pcc/py_runtime/libpy_runtime.a
+pcc/py_runtime/build_libpython/
+pcc/py_runtime/libpy_runtime_libpython.a
+$exe
+.tmp_00031_dbg2.c
+pcc/py_runtime/libpy_runtime_pcc.a
+pcc/py_runtime/libpy_runtime_pcc_py.a
+pcc/py_runtime/build_pcc/
+pcc/py_runtime/build_py/
+pcc/py_runtime/libpy_runtime_pcc_py_libpython.a

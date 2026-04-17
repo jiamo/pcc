@@ -234,6 +234,45 @@ def test_direct_builtin_va_start_and_va_copy_work_with_system_style_va_list():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_old_style_strlen_call_inside_vararg_function_uses_real_call_abi():
+    code = r'''
+        #include <stdarg.h>
+
+        extern __SIZE_TYPE__ strlen ();
+        extern void abort(void);
+
+        void check(int tag, char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt);
+            if (strlen(fmt) != 15)
+                abort();
+            va_end(ap);
+        }
+
+        int main(void) {
+            char *text = "0123456789abcdef";
+            check(0, text + 1, 1, 2, 3);
+            return 0;
+        }
+    '''
+
+    unit = TranslationUnit(
+        name="old_style_vararg_strlen.c",
+        path=os.path.join(parent_dir, "old_style_vararg_strlen.c"),
+        source=code,
+    )
+
+    result = CEvaluator().run_translation_units_with_system_cc(
+        [unit],
+        optimize=False,
+        base_dir=parent_dir,
+        jobs=1,
+        include_dirs=[],
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_cast_variadic_function_pointer_keeps_varargs_and_promotions():
     pcc = CEvaluator()
     ret = pcc.evaluate(

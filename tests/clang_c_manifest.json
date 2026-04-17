@@ -16,7 +16,6 @@
     "pch-config-macros.c",
     "pr9812.c",
     "pragma-fenv_access.c",
-    "sarif-multi-diagnostic-test.c",
     "warn-deprecated-non-prototype.c",
     "warn-thread-safety-analysis.c"
   ],
@@ -44,6 +43,7 @@
     "n3623.c",
     "nonnull.c",
     "putenv-stack-array.c",
+    "sarif-multi-diagnostic-test.c",
     "sarif-diagnostics-taint-test.c",
     "ucn-cstring.c",
     "undefined-internal-typeof-c23.c",

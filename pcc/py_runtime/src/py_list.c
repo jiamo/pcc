@@ -145,28 +145,32 @@ PyObject *py_list_concat(PyObject *a, PyObject *b) {
     return out;
 }
 
-/* Compare two PyObjects for equality under the rules we need for list
- * membership. Pointer equality first (cheap + correct for interned
- * singletons and tagged ints), then a narrow value-equality fallback for
- * int-vs-int across tagged/heap representations. */
-static int py_obj_eq_fallback(PyObject *a, PyObject *b) {
-    if (a == b) return 1;
-    if (a == NULL || b == NULL) return 0;
-
-    int32_t ta = py_type_of(a);
-    int32_t tb = py_type_of(b);
-    if (ta == PY_TYPE_INT && tb == PY_TYPE_INT) {
-        return py_int_value_i64(a) == py_int_value_i64(b);
+/* ``[x] * n`` / ``n * [x]`` — returns a fresh list of length
+ * ``src->length * count`` with each source slot copied ``count`` times
+ * in order. Matches CPython's list-repeat semantics (elements share
+ * refs with the source; incref'd once per copy). ``count <= 0`` yields
+ * an empty list. */
+PyObject *py_list_repeat(PyObject *src, int64_t count) {
+    if (src == NULL) return NULL;
+    PyListObject *ls = (PyListObject *)src;
+    int64_t out_len = count > 0 ? ls->length * count : 0;
+    PyObject *out = py_list_new(out_len > 0 ? out_len : 4);
+    if (out == NULL) return NULL;
+    PyListObject *lo = (PyListObject *)out;
+    for (int64_t k = 0; k < (count > 0 ? count : 0); k++) {
+        for (int64_t i = 0; i < ls->length; i++) {
+            py_incref(ls->items[i]);
+            lo->items[lo->length++] = ls->items[i];
+        }
     }
-    /* TODO(phase2): dispatch str eq, bool eq, tuple eq, etc. */
-    return 0;
+    return out;
 }
 
-int py_list_contains(PyObject *lst, PyObject *item) {
+int64_t py_list_contains(PyObject *lst, PyObject *item) {
     if (lst == NULL) return 0;
     PyListObject *l = (PyListObject *)lst;
     for (int64_t i = 0; i < l->length; i++) {
-        if (py_obj_eq_fallback(l->items[i], item)) return 1;
+        if (py_obj_eq(l->items[i], item)) return 1;
     }
     return 0;
 }
@@ -374,7 +378,7 @@ void py_list_remove(PyObject *lst, PyObject *item) {
     PyListObject *l = (PyListObject *)lst;
 
     for (int64_t i = 0; i < l->length; i++) {
-        if (py_obj_eq_fallback(l->items[i], item)) {
+        if (py_obj_eq(l->items[i], item)) {
             py_decref(l->items[i]);
             if (i < l->length - 1) {
                 memmove(&l->items[i],
@@ -401,7 +405,7 @@ int64_t py_list_index(PyObject *lst, PyObject *item) {
     if (lst == NULL) return -1;
     PyListObject *l = (PyListObject *)lst;
     for (int64_t i = 0; i < l->length; i++) {
-        if (py_obj_eq_fallback(l->items[i], item)) return i;
+        if (py_obj_eq(l->items[i], item)) return i;
     }
     return -1;
 }

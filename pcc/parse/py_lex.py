@@ -13,9 +13,6 @@ they simplify decisions.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator
-
-
 # Token kinds. Keep in sync with parser expectations.
 TK_NEWLINE  = "NEWLINE"
 TK_INDENT   = "INDENT"
@@ -28,14 +25,14 @@ TK_KEYWORD  = "KEYWORD"
 TK_EOF      = "EOF"
 
 
-KEYWORDS = frozenset({
+KEYWORDS = (
     "False", "None", "True",
     "and", "as", "assert", "async", "await", "break", "class",
     "continue", "def", "del", "elif", "else", "except", "finally",
     "for", "from", "global", "if", "import", "in", "is", "lambda",
     "nonlocal", "not", "or", "pass", "raise", "return", "try",
     "while", "with", "yield",
-})
+)
 
 # Multi-character operators matched longest-first.
 _OPS_MULTI = (
@@ -43,7 +40,7 @@ _OPS_MULTI = (
     "<=", ">=", "==", "!=", "+=", "-=", "*=", "/=", "%=", "&=",
     "|=", "^=", ":=",
 )
-_OPS_SINGLE = set("+-*/%@&|^~<>=()[]{},:.;")
+_OPS_SINGLE = "+-*/%@&|^~<>=()[]{},:.;"
 
 
 @dataclass(frozen=True)
@@ -63,8 +60,7 @@ class Lexer:
 
     Caller usage::
 
-        for tok in Lexer(source, filename="hello.py"):
-            ...
+        tokens = Lexer(source, filename="hello.py").tokenize()
 
     The iterator yields tokens in source order, ending with a single
     ``TK_EOF`` token. Indentation is tracked as virtual INDENT /
@@ -84,16 +80,10 @@ class Lexer:
 
     # ------------------------------------------------------ entry
 
-    def __iter__(self) -> Iterator[Token]:
-        # Build the full token list eagerly and iterate it. Avoids
-        # ``yield`` — ``scripts/audit_selfhost.py`` flags generator
-        # functions as self-host blockers (no coroutine state machine
-        # in codegen yet).
-        return iter(self.tokenize())
-
     def tokenize(self) -> list[Token]:
         """Run the lexer to completion, returning all tokens."""
         out: list[Token] = []
+        indent_stack: list[int] = self._indent_stack
         while self.pos < len(self.src):
             if self._at_line_start and self._paren_depth == 0:
                 self._emit_indent(out)
@@ -144,8 +134,8 @@ class Lexer:
             out.append(self._read_op())
         if not self._at_line_start:
             out.append(Token(TK_NEWLINE, "\n", self.line, self.col))
-        while len(self._indent_stack) > 1:
-            self._indent_stack.pop()
+        while len(indent_stack) > 1:
+            indent_stack.pop()
             out.append(Token(TK_DEDENT, "", self.line, self.col))
         out.append(Token(TK_EOF, "", self.line, self.col))
         return out
@@ -156,7 +146,8 @@ class Lexer:
         p = self.pos + off
         return self.src[p] if p < len(self.src) else ""
 
-    def _emit_indent(self, out: list) -> None:
+    def _emit_indent(self, out: list[Token]) -> None:
+        indent_stack: list[int] = self._indent_stack
         depth = 0
         p = self.pos
         while p < len(self.src) and self.src[p] in " \t":
@@ -166,21 +157,21 @@ class Lexer:
             self.pos = p
             self.col = depth + 1
             return
-        top = self._indent_stack[-1]
+        top = indent_stack[-1]
         if depth > top:
-            self._indent_stack.append(depth)
+            indent_stack.append(depth)
             out.append(Token(TK_INDENT, "", self.line, 1))
-        while depth < self._indent_stack[-1]:
-            self._indent_stack.pop()
+        while depth < indent_stack[-1]:
+            indent_stack.pop()
             out.append(Token(TK_DEDENT, "", self.line, 1))
-        if depth != self._indent_stack[-1]:
+        if depth != indent_stack[-1]:
             raise LexError(
                 f"{self.filename}:{self.line}: inconsistent indentation"
             )
         self.pos = p
         self.col = depth + 1
 
-    def _emit_newline(self, out: list) -> None:
+    def _emit_newline(self, out: list[Token]) -> None:
         if self._paren_depth == 0:
             out.append(Token(TK_NEWLINE, "\n", self.line, self.col))
             self._at_line_start = True
@@ -321,11 +312,14 @@ class Lexer:
 
     def _read_op(self) -> Token:
         start_col = self.col
+        src: str = self.src
+        pos: int = self.pos
         # Try 3-, 2-, then 1-char operators.
         for op in _OPS_MULTI:
-            if self.src.startswith(op, self.pos):
-                self.pos += len(op)
-                self.col += len(op)
+            op_len = len(op)
+            if src[pos:pos + op_len] == op:
+                self.pos = pos + op_len
+                self.col += op_len
                 return Token(TK_OP, op, self.line, start_col)
         ch = self.src[self.pos]
         if ch in _OPS_SINGLE:

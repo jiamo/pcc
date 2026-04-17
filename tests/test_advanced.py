@@ -92,6 +92,21 @@ class TestPtrSubtraction(unittest.TestCase):
         ''', optimize=False)
         assert ret == 3
 
+    def test_char_pointer_subtraction_uses_byte_offsets(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            struct Mixed {
+                char a;
+                int b;
+                char c;
+            };
+            int main(){
+                struct Mixed m;
+                return (int)((char*)&m.b - (char*)&m);
+            }
+        ''', optimize=False)
+        assert ret == 4
+
 
 class TestEnumBitwise(unittest.TestCase):
     def test_enum_flags(self):
@@ -116,6 +131,171 @@ class TestArrayLength(unittest.TestCase):
             }
         ''')
         assert ret == 10
+
+
+class TestFunctionDeclarationCompatibility(unittest.TestCase):
+    def test_empty_parameter_list_declaration_matches_definition(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main();
+            int main(){
+                return 0;
+            }
+        ''', optimize=False)
+        assert ret == 0
+
+    def test_extern_empty_parameter_list_matches_definition(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            extern void touch();
+            int g = 0;
+            void touch(){
+                g = 7;
+            }
+            int main(){
+                touch();
+                return g;
+            }
+        ''', optimize=False)
+        assert ret == 7
+
+    def test_empty_parameter_list_definition_accepts_extra_aggregate_arg(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            struct S {
+                int *a;
+                int b:16;
+                unsigned int p:9;
+            } t;
+
+            unsigned int foo() {
+                return t.p;
+            }
+
+            int main() {
+                t.p = 8;
+                if (foo(t) != 8)
+                    return 1;
+                return 0;
+            }
+        ''', optimize=False)
+        assert ret == 0
+
+    def test_prior_prototype_conflicts_with_empty_parameter_list_definition(self):
+        pcc = CEvaluator()
+        with self.assertRaisesRegex(Exception, "conflicting types for function 'blapp'"):
+            pcc.evaluate('''
+                void blapp(int);
+                void blapp() { }
+                int main(){ return 0; }
+            ''', optimize=False)
+
+
+class TestLocalExternBindings(unittest.TestCase):
+    def test_block_scope_extern_reuses_file_scope_definition(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int v = 3;
+            int main(){
+                int v = 4;
+                {
+                    extern int v;
+                    if (v != 3) return 1;
+                }
+                return 0;
+            }
+        ''', optimize=False)
+        assert ret == 0
+
+
+class TestOffsetofLikeFieldAddress(unittest.TestCase):
+    def test_null_struct_pointer_field_address_lowers_to_field_offset(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            struct S {
+                int i[18];
+                char f;
+                char b[2];
+            };
+            int main(){
+                return (int)(unsigned long)&((struct S *)0)->b;
+            }
+        ''', optimize=False)
+        assert ret == 73
+
+    def test_non_null_struct_pointer_field_address_preserves_runtime_base(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            struct S {
+                int i;
+                int j;
+            };
+            struct R {
+                int k;
+                struct S a;
+            };
+            struct R g;
+            int main(){
+                struct S *b = &((struct R *)&g)->a;
+                g.a.i = 0;
+                b->i = 3;
+                return g.a.i;
+            }
+        ''', optimize=False)
+        assert ret == 3
+
+
+class TestOversizedArrayRejection(unittest.TestCase):
+    def test_global_array_at_clang_limit_is_rejected(self):
+        pcc = CEvaluator()
+        with self.assertRaisesRegex(Exception, r"array is too large"):
+            pcc.evaluate('''
+                typedef unsigned long long U;
+                char buf[(1ULL << 61)];
+                int main(){ return sizeof(buf); }
+            ''', optimize=False)
+
+
+class TestForwardLabelIntoBlock(unittest.TestCase):
+    def test_goto_into_block_after_uninitialized_decl(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int main(){
+                goto inner;
+                {
+                    int b;
+                inner:
+                    b = 1234;
+                    return b;
+                }
+            }
+        ''', optimize=False)
+        assert ret == 1234
+
+
+class TestBindingMetadataIsolation(unittest.TestCase):
+    def test_unsigned_binding_tags_do_not_leak_across_functions(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate('''
+            int test2(unsigned int x){
+                return -((int)(x >> 31));
+            }
+
+            int test3(int x){
+                int y;
+                y = 31;
+                return -(x >> y);
+            }
+
+            int main(){
+                if (test2((unsigned int)-1) != -1)
+                    return 1;
+                if (test3(-1) != 1)
+                    return 2;
+                return 0;
+            }
+        ''', optimize=False)
+        assert ret == 0
 
 
 class TestPowerFunction(unittest.TestCase):

@@ -30,12 +30,11 @@
 
 #define PY_SET_INITIAL_CAPACITY  8  /* must be power of 2 */
 
-/* ---- Tombstone sentinel ------------------------------------------------ */
-/* A non-NULL PyObject* that doesn't overlap any real object. We point at
- * a tiny static byte so incref/decref will never mistake it for a real
- * header, and py_set_* always checks for it before dereferencing. */
-static char py_set_dummy_storage = 0;
-PyObject *const py_set_dummy = (PyObject *)&py_set_dummy_storage;
+/* Tombstone sentinel moved to py_substrate.c so py_set.c can be
+ * replaced by a pcc-Python port (py_set.py) without losing the
+ * sentinel symbol. The const pointer value is accessed via
+ * py_subs_set_dummy() from the Python port, and imported via
+ * the extern declaration in py_internal.h for C callers. */
 
 /* ---- Forward decls ----------------------------------------------------- */
 static int py_set_rehash(PySetObject *s, int64_t new_capacity);
@@ -170,7 +169,7 @@ void py_set_add(PyObject *set, PyObject *item) {
     (void)py_set_maybe_grow(s);
 }
 
-int py_set_contains(PyObject *set, PyObject *item) {
+int64_t py_set_contains(PyObject *set, PyObject *item) {
     if (set == NULL || item == NULL) return 0;
     PySetObject *s = (PySetObject *)set;
     int64_t hash = py_obj_hash(item);
@@ -180,7 +179,7 @@ int py_set_contains(PyObject *set, PyObject *item) {
     return found;
 }
 
-int py_set_remove(PyObject *set, PyObject *item) {
+int64_t py_set_remove(PyObject *set, PyObject *item) {
     if (set == NULL || item == NULL) return -1;
     PySetObject *s = (PySetObject *)set;
     int64_t hash = py_obj_hash(item);

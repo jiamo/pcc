@@ -1,6 +1,6 @@
 [project]
 name = "python-cc"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pcc is a c compiler built on python and llvm."
 readme = "README.md"
 license = "MIT"
@@ -8,11 +8,10 @@ requires-python = ">=3.13"
 keywords = ["c", "compiler", "llvm", "ply"]
 dependencies = [
     "llvmlite==0.46.0",
-    "click",
 ]
 
 [project.scripts]
-pcc = "pcc.pcc:main"
+pcc = "pcc.cli_core:cli_main"
 
 [project.urls]
 Homepage = "https://github.com/jiamo/pcc"
@@ -26,6 +25,24 @@ exclude = ["projects/", "c_tests/", "tests/"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["pcc", "utils"]
+# Make sure non-.py files needed by the runtime build / lazy first-run
+# rebuild are part of the wheel. hatchling auto-includes the package
+# directory tree, but we list these explicitly so future moves don't
+# silently drop them.
+include = [
+    "pcc/py_runtime/src/**",
+    "pcc/py_runtime/include/**",
+    "pcc/py_runtime/py/**",
+    "pcc/py_runtime/Makefile",
+]
+
+# Runtime archive is built at wheel-time by hatch_build.py using pcc
+# itself (defaults to --backend self, no cc/clang). The hook drops
+# libpy_runtime_pcc_py.a into the wheel via force_include if the build
+# succeeds; otherwise the lazy first-run path in
+# pcc.py_frontend.pipeline rebuilds it on the user's machine.
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
 
 [tool.pytest.ini_options]
 addopts = "-n auto -m 'not integration'"
@@ -35,6 +52,7 @@ markers = [
 
 [dependency-groups]
 dev = [
+    "click",
     "pytest>=9.0.2",
     "pytest-xdist>=3.8.0",
 ]

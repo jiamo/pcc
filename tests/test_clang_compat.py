@@ -67,6 +67,75 @@ def test_clang_builtins_and___func___work_with_system_link():
     ), f"clang builtin compat failed:\n{result.stdout}\n{result.stderr}"
 
 
+def test___func___subscript_loads_character_under_system_link():
+    source = r"""
+        int helper(void) {
+            return __func__[0] == 'h' ? 0 : 1;
+        }
+
+        int main(void) {
+            return helper();
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_file_scope_union_nested_aggregate_initializer_preserves_first_member():
+    source = r"""
+        struct S0 { short f0; };
+        union U1 {
+            struct S0 f0;
+            unsigned int f1;
+            signed char f2;
+            short f3;
+            struct S0 f4;
+        };
+
+        static union U1 g_127 = {{-1}};
+
+        int main(void) {
+            return g_127.f0.f0 == -1 ? 0 : 1;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_system_stdout_external_global_is_not_materialized_as_null():
+    source = r"""
+        #include <stdio.h>
+
+        int main(void) {
+            return fprintf(stdout, "%s\n", "ok") < 0;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ok\n"
+
+
+def test_file_scope_float_initializer_uses_valid_float_literal_encoding():
+    source = r"""
+        struct H { float a; };
+        struct H h = { 11.1f };
+
+        int main(void) {
+            return h.a > 11.0f ? 0 : 1;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_signed_int_min_wrap_survives_optimized_codegen():
     source = r"""
         #define INT_MIN (-2147483647 - 1)

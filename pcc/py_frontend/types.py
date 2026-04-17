@@ -15,7 +15,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from . import py_ast
 from .py_ast import (
     BoolType,
     ClassType,
@@ -26,9 +25,15 @@ from .py_ast import (
     FuncType,
     IntType,
     ListType,
+    ListExpr,
+    Name,
+    NoneLit,
     NoneType,
     SourceSpan,
+    StrLit,
     StrType,
+    Subscript,
+    TupleExpr,
     TupleType,
     Type,
 )
@@ -102,12 +107,14 @@ _BUILTIN_NAMED_TYPES: dict[str, Type] = {
     "NoneType": TYPE_NONE,
     "object": TYPE_DYN,
     "Any": TYPE_DYN,
+    "set": DynType(name="set"),
+    "frozenset": DynType(name="set"),
 }
 
 
 def _name_ident(expr: Expr) -> Optional[str]:
     """Return the identifier if ``expr`` is a bare ``Name``, else ``None``."""
-    if isinstance(expr, py_ast.Name):
+    if isinstance(expr, Name):
         return expr.ident
     return None
 
@@ -134,19 +141,24 @@ def parse_annotation(expr: Expr) -> Type:
         # inference pass can refine later once class defs are collected.
         return ClassType(name=ident, module="", fields=(), bases=())
 
+    if isinstance(expr, StrLit) and expr.value:
+        if expr.value in _BUILTIN_NAMED_TYPES:
+            return _BUILTIN_NAMED_TYPES[expr.value]
+        return ClassType(name=expr.value, module="", fields=(), bases=())
+
     # A NoneLit used as an annotation (``-> None`` parses that way in some
     # frontends; robustness only).
-    if isinstance(expr, py_ast.NoneLit):
+    if isinstance(expr, NoneLit):
         return TYPE_NONE
 
     # Subscripted generic: list[int], dict[str, int], tuple[int, str], ...
-    if isinstance(expr, py_ast.Subscript):
+    if isinstance(expr, Subscript):
         head = _name_ident(expr.obj)
         idx = expr.idx
 
         # Collect the index expressions (Subscript holds a single Expr; for
         # multi-arg generics the parser may lower this as a TupleExpr).
-        if isinstance(idx, py_ast.TupleExpr):
+        if isinstance(idx, TupleExpr):
             idx_exprs = tuple(idx.elems)
         else:
             idx_exprs = (idx,)
@@ -181,7 +193,7 @@ def parse_annotation(expr: Expr) -> Type:
             # Callable[[A, B], R] — best-effort.
             if len(idx_exprs) == 2:
                 params_expr, ret_expr = idx_exprs
-                if isinstance(params_expr, py_ast.ListExpr):
+                if isinstance(params_expr, ListExpr):
                     params = tuple(
                         parse_annotation(p) for p in params_expr.elems
                     )
@@ -210,16 +222,113 @@ def parse_annotation(expr: Expr) -> Type:
 def type_eq(a: Type, b: Type) -> bool:
     """Structural equality on ``Type`` instances.
 
-    Dataclasses already provide structural ``__eq__``, but we special-case
-    ``DynType`` so that ``DynType`` compares equal only to itself (avoiding
-    accidental equality when different instances are compared by identity
-    elsewhere).
+    Keep this explicit instead of relying on dataclass ``__eq__``. The
+    self-hosted runtime does not yet provide CPython-complete generated
+    dunder equality for frozen dataclasses, and type inference must not
+    depend on that dynamic path.
     """
     if a is b:
         return True
-    if type(a) is not type(b):
-        return False
-    return a == b
+    primitive_name = (
+        a.name == "int"
+        or a.name == "float"
+        or a.name == "bool"
+        or a.name == "str"
+        or a.name == "None"
+        or a.name == "dyn"
+    )
+    if a.name == b.name and primitive_name:
+        return True
+    if isinstance(a, IntType) or isinstance(b, IntType):
+        if not (isinstance(a, IntType) and isinstance(b, IntType)):
+            return False
+        return a.name == b.name
+    if isinstance(a, FloatType) or isinstance(b, FloatType):
+        if not (isinstance(a, FloatType) and isinstance(b, FloatType)):
+            return False
+        return a.name == b.name
+    if isinstance(a, BoolType) or isinstance(b, BoolType):
+        return (
+            isinstance(a, BoolType)
+            and isinstance(b, BoolType)
+            and a.name == b.name
+        )
+    if isinstance(a, NoneType) or isinstance(b, NoneType):
+        return (
+            isinstance(a, NoneType)
+            and isinstance(b, NoneType)
+            and a.name == b.name
+        )
+    if isinstance(a, StrType) or isinstance(b, StrType):
+        return (
+            isinstance(a, StrType)
+            and isinstance(b, StrType)
+            and a.name == b.name
+        )
+    if isinstance(a, DynType) or isinstance(b, DynType):
+        return (
+            isinstance(a, DynType)
+            and isinstance(b, DynType)
+            and a.name == b.name
+        )
+    if isinstance(a, ListType) or isinstance(b, ListType):
+        if not (isinstance(a, ListType) and isinstance(b, ListType)):
+            return False
+        return a.name == b.name and type_eq(a.elem, b.elem)
+    if isinstance(a, DictType) or isinstance(b, DictType):
+        if not (isinstance(a, DictType) and isinstance(b, DictType)):
+            return False
+        return (
+            a.name == b.name
+            and type_eq(a.key, b.key)
+            and type_eq(a.value, b.value)
+        )
+    if isinstance(a, TupleType) or isinstance(b, TupleType):
+        if not (isinstance(a, TupleType) and isinstance(b, TupleType)):
+            return False
+        if a.name != b.name or len(a.elems) != len(b.elems):
+            return False
+        i = 0
+        while i < len(a.elems):
+            if not type_eq(a.elems[i], b.elems[i]):
+                return False
+            i += 1
+        return True
+    if isinstance(a, FuncType) or isinstance(b, FuncType):
+        if not (isinstance(a, FuncType) and isinstance(b, FuncType)):
+            return False
+        if a.name != b.name or len(a.params) != len(b.params):
+            return False
+        i = 0
+        while i < len(a.params):
+            if not type_eq(a.params[i], b.params[i]):
+                return False
+            i += 1
+        return type_eq(a.ret, b.ret)
+    if isinstance(a, ClassType) or isinstance(b, ClassType):
+        if not (isinstance(a, ClassType) and isinstance(b, ClassType)):
+            return False
+        if (
+            a.name != b.name
+            or a.module != b.module
+            or len(a.fields) != len(b.fields)
+            or len(a.bases) != len(b.bases)
+        ):
+            return False
+        i = 0
+        while i < len(a.fields):
+            a_name, a_ty = a.fields[i]
+            b_name, b_ty = b.fields[i]
+            if a_name != b_name or not type_eq(a_ty, b_ty):
+                return False
+            i += 1
+        i = 0
+        while i < len(a.bases):
+            if not type_eq(a.bases[i], b.bases[i]):
+                return False
+            i += 1
+        return True
+    return a.name == b.name
 
 
 def is_numeric(t: Type) -> bool:

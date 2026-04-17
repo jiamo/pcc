@@ -23,8 +23,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pcc.py_frontend import py_ast as pa
-from pcc.parse import py_parse as pp
+from ..py_frontend import py_ast as pa
+from . import py_parse as pp
 
 
 _DYN = pa.DynType(name="dyn")
@@ -69,10 +69,49 @@ class _Lifter:
         # getattr(self, f"_s_{type(s).__name__[1:]}") for self-host:
         # scripts/audit_selfhost.py flags dynamic-attr patterns.
         t = type(s)
-        m = _STMT_DISPATCH.get(t)
-        if m is None:
-            raise LiftError(f"no stmt lifter for {t.__name__}")
-        return m(self, s)
+        if t is pp._Pass:
+            return self._s_Pass(s)
+        if t is pp._Break:
+            return self._s_Break(s)
+        if t is pp._Continue:
+            return self._s_Continue(s)
+        if t is pp._Return:
+            return self._s_Return(s)
+        if t is pp._Expr:
+            return self._s_Expr(s)
+        if t is pp._Assign:
+            return self._s_Assign(s)
+        if t is pp._AugAssign:
+            return self._s_AugAssign(s)
+        if t is pp._If:
+            return self._s_If(s)
+        if t is pp._While:
+            return self._s_While(s)
+        if t is pp._For:
+            return self._s_For(s)
+        if t is pp._FuncDef:
+            return self._s_FuncDef(s)
+        if t is pp._ClassDef:
+            return self._s_ClassDef(s)
+        if t is pp._Import:
+            return self._s_Import(s)
+        if t is pp._ImportFrom:
+            return self._s_ImportFrom(s)
+        if t is pp._Raise:
+            return self._s_Raise(s)
+        if t is pp._Try:
+            return self._s_Try(s)
+        if t is pp._With:
+            return self._s_With(s)
+        if t is pp._Global:
+            return self._s_Global(s)
+        if t is pp._Nonlocal:
+            return self._s_Nonlocal(s)
+        if t is pp._Del:
+            return self._s_Del(s)
+        if t is pp._Assert:
+            return self._s_Assert(s)
+        raise LiftError(f"no stmt lifter for {t.__name__}")
 
     def _s_Pass(self, s: pp._Pass) -> pa.Pass:
         return pa.Pass(span=self._span(s.line))
@@ -163,6 +202,7 @@ class _Lifter:
             annotation=_lift_type(ann) if ann is not None else None,
             default=default_expr,
             kind=kmap.get(kind, "pos"),
+            has_default=default is not None,
         )
 
     def _s_ClassDef(self, s: pp._ClassDef) -> pa.ClassDef:
@@ -261,23 +301,105 @@ class _Lifter:
 
     def lift_expr(self, e) -> pa.Expr:
         t = type(e)
-        m = _EXPR_DISPATCH.get(t)
-        if m is None:
-            raise LiftError(f"no expr lifter for {t.__name__}")
-        return m(self, e)
+        if t is pp._Num:
+            return self._e_Num(e)
+        if t is pp._Str:
+            return self._e_Str(e)
+        if t is pp._FString:
+            return self._e_FString(e)
+        if t is pp._Bool:
+            return self._e_Bool(e)
+        if t is pp._None:
+            return self._e_None(e)
+        if t is pp._Name:
+            return self._e_Name(e)
+        if t is pp._BinOp:
+            return self._e_BinOp(e)
+        if t is pp._UnaryOp:
+            return self._e_UnaryOp(e)
+        if t is pp._Compare:
+            return self._e_Compare(e)
+        if t is pp._BoolOp:
+            return self._e_BoolOp(e)
+        if t is pp._Call:
+            return self._e_Call(e)
+        if t is pp._Attr:
+            return self._e_Attr(e)
+        if t is pp._Subscript:
+            return self._e_Subscript(e)
+        if t is pp._List:
+            return self._e_List(e)
+        if t is pp._Tuple:
+            return self._e_Tuple(e)
+        if t is pp._Dict:
+            return self._e_Dict(e)
+        if t is pp._Set:
+            return self._e_Set(e)
+        if t is pp._Ternary:
+            return self._e_Ternary(e)
+        if t is pp._Lambda:
+            return self._e_Lambda(e)
+        if t is pp._Comp:
+            return self._e_Comp(e)
+        if t is pp._Yield:
+            return self._e_Yield(e)
+        if t is pp._Starred:
+            return self._e_Starred(e)
+        if t is pp._Assign:
+            return self._e_Assign(e)
+        raise LiftError(f"no expr lifter for {t.__name__}")
 
     def _e_Num(self, e: pp._Num) -> pa.Expr:
         span = self._span(e.line)
-        if isinstance(e.value, int):
-            return pa.IntLit(span=span, ty=pa.IntType(name="int"), value=e.value)
-        return pa.FloatLit(span=span, ty=pa.FloatType(name="float"), value=e.value)
+        if e.is_int:
+            return pa.IntLit(
+                span=span,
+                ty=pa.IntType(name="int", width=64, signed=True),
+                value=e.value,
+            )
+        return pa.FloatLit(
+            span=span,
+            ty=pa.FloatType(name="float", width=64),
+            value=e.value,
+        )
 
     def _e_Str(self, e: pp._Str) -> pa.StrLit:
-        # Process escapes — the parser returned the raw string body.
+        cooked: list[str] = []
+        for raw_text, is_raw in e.parts:
+            cooked.append(raw_text if is_raw else _decode_escapes(raw_text))
         return pa.StrLit(
             span=self._span(e.line), ty=pa.StrType(name="str"),
-            value=_decode_escapes(e.value),
+            value="".join(cooked),
         )
+
+    def _e_FString(self, e: pp._FString) -> pa.Expr:
+        span = self._span(e.line)
+        pieces: list[pa.Expr] = []
+        for part in e.parts:
+            if type(part) is pp._FStringText:
+                text = part.text if part.is_raw else _decode_escapes(part.text)
+                if text:
+                    pieces.append(pa.StrLit(
+                        span=span, ty=pa.StrType(name="str"), value=text,
+                    ))
+                continue
+            inner = self.lift_expr(part)
+            pieces.append(pa.Call(
+                span=span, ty=pa.StrType(name="str"),
+                func=pa.Name(span=span, ty=_DYN, ident="str"),
+                args=(inner,), kwargs=(),
+            ))
+        if not pieces:
+            return pa.StrLit(span=span, ty=pa.StrType(name="str"), value="")
+        out = pieces[0]
+        i = 1
+        while i < len(pieces):
+            out = pa.BinOp(
+                span=span, ty=pa.StrType(name="str"),
+                op="+", lhs=out, rhs=pieces[i],
+            )
+            i += 1
+        return out
 
     def _e_Bool(self, e: pp._Bool) -> pa.BoolLit:
         return pa.BoolLit(
@@ -488,28 +610,42 @@ class _Lifter:
 # Map a lifted type-expression AST node to a pcc ``Type``. Best effort;
 # unknown shapes fall back to ``DynType``.
 _TYPE_NAME_MAP = {
-    "int": pa.IntType(name="int"),
+    "int": pa.IntType(name="int", width=64, signed=True),
     "i8": pa.IntType(name="int", width=8),
     "i16": pa.IntType(name="int", width=16),
     "i32": pa.IntType(name="int", width=32),
     "i64": pa.IntType(name="int", width=64),
-    "float": pa.FloatType(name="float"),
+    "float": pa.FloatType(name="float", width=64),
     "bool": pa.BoolType(name="bool"),
     "str": pa.StrType(name="str"),
     "None": pa.NoneType(name="None"),
+    "object": _DYN,
+    "Any": _DYN,
+    "set": _DYN,
+    "frozenset": _DYN,
 }
+
+
+def _class_type(name: str) -> pa.ClassType:
+    return pa.ClassType(name=name, module="", fields=(), bases=())
 
 
 def _lift_type(node) -> pa.Type:
     if node is None:
         return _DYN
     if isinstance(node, pp._Name):
-        return _TYPE_NAME_MAP.get(node.ident, _DYN)
+        ty = _TYPE_NAME_MAP.get(node.ident)
+        if ty is not None:
+            return ty
+        return _class_type(node.ident)
     if isinstance(node, pp._None):
         return pa.NoneType(name="None")
     if isinstance(node, pp._Attr):
         # e.g. ``pcc.IntType`` — resolve the tail token only.
-        return _TYPE_NAME_MAP.get(node.name, _DYN)
+        ty = _TYPE_NAME_MAP.get(node.name)
+        if ty is not None:
+            return ty
+        return _DYN
     if isinstance(node, pp._Subscript):
         base = node.obj
         if isinstance(base, pp._Name):
@@ -591,57 +727,6 @@ def _decode_escapes(raw: str) -> str:
         out.append(c)
         i += 1
     return "".join(out)
-
-
-_STMT_DISPATCH = {
-    pp._Pass:       _Lifter._s_Pass,
-    pp._Break:      _Lifter._s_Break,
-    pp._Continue:   _Lifter._s_Continue,
-    pp._Return:     _Lifter._s_Return,
-    pp._Expr:       _Lifter._s_Expr,
-    pp._Assign:     _Lifter._s_Assign,
-    pp._AugAssign:  _Lifter._s_AugAssign,
-    pp._If:         _Lifter._s_If,
-    pp._While:      _Lifter._s_While,
-    pp._For:        _Lifter._s_For,
-    pp._FuncDef:    _Lifter._s_FuncDef,
-    pp._ClassDef:   _Lifter._s_ClassDef,
-    pp._Import:     _Lifter._s_Import,
-    pp._ImportFrom: _Lifter._s_ImportFrom,
-    pp._Raise:      _Lifter._s_Raise,
-    pp._Try:        _Lifter._s_Try,
-    pp._With:       _Lifter._s_With,
-    pp._Global:     _Lifter._s_Global,
-    pp._Nonlocal:   _Lifter._s_Nonlocal,
-    pp._Del:        _Lifter._s_Del,
-    pp._Assert:     _Lifter._s_Assert,
-}
-
-
-_EXPR_DISPATCH = {
-    pp._Num:       _Lifter._e_Num,
-    pp._Str:       _Lifter._e_Str,
-    pp._Bool:      _Lifter._e_Bool,
-    pp._None:      _Lifter._e_None,
-    pp._Name:      _Lifter._e_Name,
-    pp._BinOp:     _Lifter._e_BinOp,
-    pp._UnaryOp:   _Lifter._e_UnaryOp,
-    pp._Compare:   _Lifter._e_Compare,
-    pp._BoolOp:    _Lifter._e_BoolOp,
-    pp._Call:      _Lifter._e_Call,
-    pp._Attr:      _Lifter._e_Attr,
-    pp._Subscript: _Lifter._e_Subscript,
-    pp._List:      _Lifter._e_List,
-    pp._Tuple:     _Lifter._e_Tuple,
-    pp._Dict:      _Lifter._e_Dict,
-    pp._Set:       _Lifter._e_Set,
-    pp._Ternary:   _Lifter._e_Ternary,
-    pp._Lambda:    _Lifter._e_Lambda,
-    pp._Comp:      _Lifter._e_Comp,
-    pp._Yield:     _Lifter._e_Yield,
-    pp._Starred:   _Lifter._e_Starred,
-    pp._Assign:    _Lifter._e_Assign,
-}
 
 
 def parse_and_lift(src: str, filename: str, module_name: str) -> pa.Module:

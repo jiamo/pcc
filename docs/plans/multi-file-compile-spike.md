@@ -72,8 +72,8 @@ Passes:
 | 2 | Native cross-module function imports | `ImportFrom` of known-native modules → extern function decl; drop the `py_cpy_import` on those lines | ✅ landed |
 | 3 | Native cross-module class imports | Same for `from .foo import MyClass` | ✅ landed |
 | 4 | Shared type registry | Inference sees cross-module function / class types so DynType leaks shrink | ✅ landed |
-| 5 | Bootstrap stage-1 gate | `scripts/bootstrap.sh --stage 1` produces a runnable `pcc1` binary (CPython-backed stage-1 can still link libpython transitively via `click`, but native pcc code is self-sufficient) | open — blocked on steps 3-4 + builtin constructors |
-| 6 | Bootstrap stage-2/3 gates | `pcc1` compiles `pcc.py` → `pcc2`; `cmp pcc2 pcc3` structural / byte-identical | open — blocked on 5 |
+| 5 | Bootstrap stage-1 gate | `scripts/bootstrap.sh --stage 1` produces a runnable `pcc1` binary (CPython-backed stage-1 can still link libpython transitively via `click`, but native pcc code is self-sufficient) | ✅ landed on supported macOS arm64 dev host |
+| 6 | Bootstrap stage-2/3 gates | `pcc1` compiles `pcc.py` → `pcc2`; `cmp pcc2 pcc3` structural / byte-identical | ✅ landed on supported macOS arm64 dev host; `pcc2`/`pcc3` are byte-identical after stripping Mach-O code-signature metadata from comparison copies; pure self-host closure remains open due `libpython` / environment assumptions |
 
 ### Steps 1-2 landing notes
 

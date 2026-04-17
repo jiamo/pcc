@@ -305,6 +305,18 @@ void py_class_add_method(PyClassObject *cls, const char *name, PyObject *func) {
 /* Walk MRO and return the first method with the matching name. */
 PyObject *py_class_lookup(PyClassObject *cls, const char *name) {
     if (!cls || !name) return NULL;
+    if (strcmp(name, "__name__") == 0) {
+        const char *cls_name = cls->name ? cls->name : "";
+        return py_str_new(cls_name, (int64_t)strlen(cls_name));
+    }
+    if (strcmp(name, "__mro__") == 0) {
+        PyObject *t = py_tuple_new(cls->n_mro);
+        if (!t) return NULL;
+        for (int32_t i = 0; i < cls->n_mro; i++) {
+            py_tuple_set_item(t, i, (PyObject *)cls->mro[i]);
+        }
+        return t;
+    }
     for (int32_t i = 0; i < cls->n_mro; i++) {
         PyClassObject *m = cls->mro[i];
         if (!m) continue;
@@ -378,6 +390,11 @@ static int32_t lookup_field_index(PyClassObject *cls, const char *name) {
 
 PyObject *py_instance_getattr(PyInstanceObject *inst, const char *name) {
     if (!inst || !name) return NULL;
+    if (strcmp(name, "__class__") == 0) {
+        PyObject *cls = (PyObject *)inst->cls;
+        py_incref(cls);
+        return cls;
+    }
     int32_t idx = lookup_field_index(inst->cls, name);
     if (idx >= 0) {
         /* Return a new reference so callers can uniformly py_decref. */
@@ -390,7 +407,7 @@ PyObject *py_instance_getattr(PyInstanceObject *inst, const char *name) {
     return py_class_lookup(inst->cls, name);
 }
 
-int py_instance_setattr(PyInstanceObject *inst, const char *name, PyObject *value) {
+int64_t py_instance_setattr(PyInstanceObject *inst, const char *name, PyObject *value) {
     if (!inst || !name) return -1;
     int32_t idx = lookup_field_index(inst->cls, name);
     if (idx < 0) return -1;
@@ -398,9 +415,79 @@ int py_instance_setattr(PyInstanceObject *inst, const char *name, PyObject *valu
     return 0;
 }
 
+static PyInstanceObject *dataclass_copy_instance(PyObject *obj,
+                                                 PyClassObject **cls_out) {
+    if (!obj || PY_IS_TAGGED_INT(obj)) return NULL;
+    int32_t tag = py_header(obj)->type_tag;
+    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return NULL;
+
+    PyInstanceObject *src = (PyInstanceObject *)obj;
+    PyClassObject *cls = src->cls;
+    if (!cls) return NULL;
+    if (cls_out) *cls_out = cls;
+
+    PyInstanceObject *dst = (PyInstanceObject *)py_instance_new(cls);
+    if (!dst) return NULL;
+
+    for (int32_t i = 0; i < cls->n_fields; i++) {
+        PyObject *v = src->fields[i];
+        if (!v) continue;
+        py_incref(v);
+        dst->fields[i] = v;
+    }
+    return dst;
+}
+
+PyObject *py_dataclass_replace(PyObject *obj, int64_t n_overrides,
+                               const char **names, PyObject **values) {
+    PyClassObject *cls = NULL;
+    PyInstanceObject *dst = dataclass_copy_instance(obj, &cls);
+    if (!dst || !cls) return NULL;
+
+    for (int64_t i = 0; i < n_overrides; i++) {
+        const char *name = names ? names[i] : NULL;
+        PyObject *value = values ? values[i] : NULL;
+        int32_t idx = lookup_field_index(cls, name);
+        if (idx < 0) {
+            py_decref((PyObject *)dst);
+            return NULL;
+        }
+        py_instance_set_field(dst, idx, value);
+    }
+
+    return (PyObject *)dst;
+}
+
+PyObject *py_dataclass_replace_from_dict(PyObject *obj, PyObject *overrides) {
+    PyClassObject *cls = NULL;
+    PyInstanceObject *dst = dataclass_copy_instance(obj, &cls);
+    if (!dst || !cls) return NULL;
+
+    if (!overrides || PY_IS_TAGGED_INT(overrides) ||
+        py_header(overrides)->type_tag != PY_TYPE_DICT) {
+        py_decref((PyObject *)dst);
+        return NULL;
+    }
+
+    PyDictObject *d = (PyDictObject *)overrides;
+    for (int64_t i = 0; i < d->entries_used; i++) {
+        DictEntry *e = &d->entries[i];
+        if (!e->key) continue;
+        const char *name = py_str_utf8(e->key);
+        int32_t idx = lookup_field_index(cls, name);
+        if (idx < 0) {
+            py_decref((PyObject *)dst);
+            return NULL;
+        }
+        py_instance_set_field(dst, idx, e->value);
+    }
+
+    return (PyObject *)dst;
+}
+
 /* ---- isinstance ------------------------------------------------------- */
 
-int py_isinstance(PyObject *obj, PyClassObject *cls) {
+int64_t py_isinstance(PyObject *obj, PyClassObject *cls) {
     if (!obj || !cls) return 0;
     if (PY_IS_TAGGED_INT(obj)) return 0;
     int32_t tag = py_header(obj)->type_tag;

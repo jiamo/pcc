@@ -1,0 +1,207 @@
+{
+  "_comment": [
+    "Frozen baseline for the stage1 closure probe (Issue 1 + Issue 9).",
+    "Captured 2026-04-28. Numbers come from running:",
+    "  PCC_PROBE_CLOSURE=tight python3 scripts/probe_stage1_closure.py",
+    "  python3 scripts/probe_fallback_categories.py",
+    "Test: tests/test_fallback_baseline.py asserts current numbers do",
+    "not regress past these values. Path A (closed-world IR scaffold)",
+    "must monotonically reduce these toward zero; new code must never",
+    "increase them.",
+    "Per-file target after Path A: every file in per_module = 0."
+  ],
+  "closure": {
+    "mode": "tight",
+    "files": 15,
+    "per_module_pass": 15,
+    "multi_compile_ok": true,
+    "ir_lines": 269228
+  },
+  "totals": {
+    "fallbacks_total": 16987,
+    "actions_total": 4379,
+    "plumbing_total": 12608,
+    "bridge_calls_total": 463,
+    "non_bridge_fallbacks_total": 16524
+  },
+  "by_action": {
+    "getattr": 2165,
+    "call": 2132,
+    "import": 5,
+    "setattr": 59,
+    "truthy": 3,
+    "subscript": 11,
+    "len": 4
+  },
+  "top_symbols": {
+    "_native_bridge_calls": 463,
+    "_non_bridge_cpy_calls": 16524,
+    "py_cpy_decref": 6624,
+    "py_cpy_from_pcc_obj": 4958,
+    "py_cpy_getattr": 2165,
+    "py_cpy_call_kw": 1095,
+    "py_cpy_to_pcc_obj": 463,
+    "py_cpy_call2": 635,
+    "py_cpy_call1": 329,
+    "py_cpy_from_i64": 328,
+    "py_cpy_from_pccstr": 225,
+    "py_cpy_call3": 51,
+    "py_cpy_import": 5,
+    "py_cpy_call_noargs": 21,
+    "py_cpy_setattr": 59,
+    "py_cpy_truthy": 3,
+    "py_cpy_ensure_init": 3,
+    "py_cpy_getitem": 11,
+    "py_cpy_from_f64": 7,
+    "py_cpy_len": 4
+  },
+  "per_module": {
+    "pcc.py_frontend.codegen.layer1": 19386,
+    "pcc.py_frontend.codegen.runtime_abi": 0,
+    "pcc.py_frontend.pipeline": 244,
+    "pcc.py_frontend.codegen.class_gen": 1151,
+    "pcc.parse.py_lift": 910,
+    "pcc.py_frontend.type_infer": 652,
+    "pcc.py_frontend.codegen.marshal": 328,
+    "pcc.py_frontend.types": 156,
+    "pcc.py_frontend.export_meta": 82,
+    "pcc.cli_bootstrap": 29,
+    "pcc.parse.py_parse": 10,
+    "pcc.__main__": 4
+  },
+  "_on_mode_comment": [
+    "Multi-file ON-mode (`--ir-scaffold=on`) totals captured the same",
+    "way as the OFF block above. Once the ratchet here goes monotone-",
+    "down, the long-term goal is to flip the default to ON.",
+    "Captured 2026-04-29 after the builder-alias / native zip-next /",
+    "CPython scalar equality bridge wave, then the native ord()/UTF-8,",
+    "static-internal cleanup, native platform.machine(), native",
+    "subprocess.check_output(text=True), native TemporaryDirectory,",
+    "statement-only subprocess.run(check=True), shutil.which,",
+    "shlex.split, sys.executable path-chain, native comprehension",
+    "callback elimination, and host-tool self-backend waves. Bridge-aware fields split",
+    "temporary CPython-to-pcc bridge calls from all other py_cpy_*",
+    "calls; both must move monotonically down for Issue 1 to close."
+  ],
+  "on_mode_totals": {
+    "fallbacks_total_multi": 0,
+    "bridge_calls_multi": 0,
+    "non_bridge_fallbacks_multi": 0
+  },
+  "on_mode_per_module": {
+    "pcc.py_frontend.codegen.layer1": 3510,
+    "pcc.py_frontend.pipeline": 244,
+    "pcc.py_frontend.type_infer": 652,
+    "pcc.py_frontend.codegen.class_gen": 399,
+    "pcc.parse.py_lift": 910,
+    "pcc.py_frontend.types": 156,
+    "pcc.py_frontend.export_meta": 82,
+    "pcc.py_frontend.codegen.marshal": 25,
+    "pcc.cli_bootstrap": 29,
+    "pcc.parse.py_parse": 10,
+    "pcc.py_frontend.codegen.runtime_abi": 0,
+    "pcc.__main__": 4
+  },
+  "_recapture_log": [
+    {
+      "date": "2026-04-28",
+      "delta": "pipeline.py 1583→1598 (+15), cli_bootstrap.py 25→29 (+4)",
+      "reason": "Phase 1 --ir-scaffold flag plumbing (mirror of --python-libpython parsing). Aggregate unchanged at 27853 (multi-file resolution masks per-module shifts)."
+    },
+    {
+      "date": "2026-04-28-late",
+      "delta": "layer1.py 22992→23236 (+244), pipeline.py 1598→1751 (+153)",
+      "reason": "Issue 11.A.1 (float() str-arg folding helpers) + Issue 11.A scaffold table additions in layer1.py. Issue 11.B.1 _expand_recursive_stdlib + recursive_stdlib param plumbing in pipeline.py. New features have intentional dynamic-Python cost; expected to drop again as ir.py-itself work proceeds."
+    },
+    {
+      "date": "2026-04-28-recapture-A",
+      "delta": "pipeline.py 1751→1196 (-555), layer1.py 23236→23372 (+136), runtime_abi.py 6023→6197 (+174), type_infer.py 850→863 (+13). Net OFF total 27853→27989 (within ratchet). Added ON-mode lock at 3706 multi / 9929 per-module sum.",
+      "reason": "Native dispatch wave: os.environ.get / os.path.dirname / isfile / isdir / getmtime / abspath / sys.platform + print(file=sys.stderr|stdout) + nested os.path.X chained-call args. Lock pipeline.py at 1196 so future regressions can't undo this work, and add ON-mode ratchets (totals + per-module) so ON-mode codegen wins are protected too."
+    },
+    {
+      "date": "2026-04-28-cpy-to-pcc-path-args",
+      "delta": "ON multi 3683→3637 (-46), ON per-module sum 9906→9868 (-38), pipeline.py 1173→1119 (-54), layer1.py 5976→5992 (+16).",
+      "reason": "Add a scoped CPython→pcc object bridge for native os.path/os.access path arguments so CPython-backed path values no longer force os.path.join and related helpers back through py_cpy_* dispatch."
+    },
+    {
+      "date": "2026-04-28-list-literal-bridge",
+      "delta": "ON multi 3637→3601 (-36), ON per-module sum 9868→9798 (-70), OFF total drops too — layer1.py OFF 23467→21474 (-1993), runtime_abi.py 6253→5535 (-718), class_gen 1349→1234 (-115), pipeline 1173→1110 (-63), marshal 358→328 (-30).",
+      "reason": "Extend the cpy→pcc bridge from os.path arg sites to list literal element sites. When a list literal contains any CPython value, the previous code routed the entire list construction through _emit_cpython_list_ops (CPython-managed). With py_cpy_to_pcc_obj available (added by codex), each cpy element is bridged individually and the list stays pcc-native, breaking the chain-of-cpython amplifier at literal sites. cpy splat-extend stays on the cpython path because eagerly bridging the iterable would copy out elements that the splat-extend semantics doesn't promise."
+    },
+    {
+      "date": "2026-04-28-tuple-dict-literal-bridge",
+      "delta": "OFF multi 27853→20416 (-7437), ON multi 3601→3454 (-147), ON per-module sum 9798→8397 (-1401). Largest OFF per-module drops: runtime_abi.py 5535→1152 (-4383), layer1.py 21474→20164 (-1310), type_infer.py 863→658 (-205), pipeline.py 1110→922 (-188).",
+      "reason": "Extend the cpy→pcc bridge from list literal element sites to tuple literal element sites and dict literal value sites, and add native py_tuple_concat so tuple + tuple-shaped Dyn no longer goes through CPython tuple.__add__. CPython-backed dict keys still use the CPython dict path so recursive marshalling does not change key identity/hash semantics; CPython splat iterables still use the legacy CPython list/tuple ops path."
+    },
+    {
+      "date": "2026-04-28-membership-set-dict-methods",
+      "delta": "OFF multi 20416→19763 (-653), ON multi 3454→2695 (-759), ON per-module sum 8397→7592 (-805). Largest ON drops: layer1.py 5077→4284 (-793), pipeline.py 922→910 (-12).",
+      "reason": "Make membership dispatch decide from the emitted container value rather than pre-classifying source expressions, so CPython-backed needles can bridge into native list/tuple/dict contains while CPython containers still use __contains__. Preserve homogeneous tuple iteration element types. Add native dispatch for set.update(iterable) through the existing set spread lowering, and dict.pop(key, default) through py_dict_get/py_dict_del; single-argument dict.pop remains on the CPython path to preserve missing-key exception semantics."
+    },
+    {
+      "date": "2026-04-28-class-schema-and-byte-constants",
+      "delta": "OFF multi 19763→19743 (-20), ON multi 2695→2648 (-47), ON per-module sum actual 7592→7571 (-21). Locked descending per-module entries: layer1.py ON 4284→4247 (-37), class_gen.py ON 519→509 (-10), type_infer.py ON 658→652 (-6); OFF layer1.py 19467→19453 (-14), class_gen.py 1157→1151 (-6), type_infer.py 658→652 (-6).",
+      "reason": "Add schema-bearing ClassType prepopulation for local and exported classes so pcc-Python annotations can express inheritance and fields instead of collapsing to DynType. Keep unresolved external class shells permissive so per-module self-compile still behaves like the old DynType path. Offset the new type-layer plumbing by removing CPython bytearray() from LLVM constant construction, replacing several reversed() uses in layer1 with pcc-native loops, and avoiding type(got).__name__ in the libpython-off type_infer stack. Conservative baseline update locks only the net total drops and per-module decreases; small structural increases in py_lift.py/pipeline.py remain governed by the existing ratchet instead of becoming new baselines."
+    },
+    {
+      "date": "2026-04-28-cross-module-class-dispatch",
+      "delta": "OFF multi 19743→18597 (-1146), ON multi 2648→1493 (-1155). ON per-module sum was not recaptured because the new external-class registration helper adds 15 layer1.py fallback calls in independent per-module mode; the existing per-module ratchet still covers that cost instead of locking it in.",
+      "reason": "Resolve unique exported ClassType annotations across modules, type method self as the enclosing class, and add positive-branch isinstance(name, ClassType) narrowing through simple 'and' conditions. Class-typed receivers can now register one matching external class and dispatch methods natively instead of routing through py_cpy_getattr/py_cpy_call. This is the flow-aware dispatch side of Insight 3: narrowing only pays off once the narrowed class value reaches a native method sink."
+    },
+    {
+      "date": "2026-04-28-str-split-maxsplit",
+      "delta": "OFF multi 18597→18469 (-128), ON multi 1493→1319 (-174), ON per-module sum 7571/7586→7360 (-211 from the pre-fix actual). Locked descending per-module entries: layer1.py ON 4247→4138, pipeline.py ON 910→820; layer1.py OFF 19453→19386, pipeline.py OFF 910→820. runtime_abi.py OFF rises 1152→1160 from the new ABI declaration and remains governed by the existing ratchet rather than being recaptured upward.",
+      "reason": "Add native py_str_split_maxsplit(s, sep, maxsplit) in the C runtime and pcc-Python runtime port, and dispatch str.split(sep, maxsplit) directly from codegen. This removes CPython split/getitem chains from module-name and option parsing code such as split('.', 1), split('=', 1), and split(None, 1), while preserving Python's maxsplit semantics for explicit separators and whitespace splitting."
+    },
+    {
+      "date": "2026-04-28-cpy-str-receiver-bridge",
+      "delta": "OFF multi 18469→18439 (-30), ON multi 1319→1269 (-50), ON per-module sum 7360→7310 (-50). Locked descending per-module entry: pipeline.py OFF/ON 820→770. layer1.py and py_lift.py per-module counts rise under the existing ratchet because the shared bridge logic lives there, so their old lower baselines remain in force.",
+      "reason": "When a CPython-returned value feeds an already-native str method such as lower(), strip(), split(), or endswith(), bridge the receiver through py_cpy_to_pcc_obj and keep the rest of the string method chain on py_str_* helpers. This cuts chain-of-CPython amplification for subprocess/platform/listdir string results without adding another restricted source rewrite."
+    },
+    {
+      "date": "2026-04-28-native-file-open",
+      "delta": "OFF multi 18439→18283 (-156), ON multi 1269→1039 (-230), ON per-module sum 7310→7091 (-219). Locked descending per-module entries: pipeline.py OFF/ON 770→559, layer1.py ON 4138→4130. layer1.py OFF and runtime_abi.py OFF rise under the existing ratchet because the native file-object code and ABI declarations live there, so their old lower baselines remain in force.",
+      "reason": "Add a native text-file runtime object and lower open(path, mode?, encoding=...) plus with-open read()/write()/close() through py_file_open/read_all/write/close. This removes the open/read/write/__enter__/__exit__ CPython chain from the pipeline's source/IR file reads and writes while keeping the standard with open(...) Python idiom."
+    },
+    {
+      "date": "2026-04-28-bridge-aware-ratchet",
+      "delta": "ON multi 1039→505 (-534), split as 18 bridge calls and 487 non-bridge py_cpy_* calls. ON per-module sum 7071→6462 (-609). Locked descending per-module entries: layer1.py 4130→3680, pipeline.py 559→508, class_gen.py 509→406, marshal.py 27→25, runtime_abi.py 3→0. OFF pipeline.py also drops 559→508; OFF aggregate remains governed by the prior lower total ratchet.",
+      "reason": "Recognize owner/alias IRBuilder receivers, replace remaining dataclass reflection in layer1.py with direct dataclass metadata access, treat pcc.llvm_capi.compat as an ON-only scaffold, add native value-position zip() and next(genexpr, default), and bridge CPython scalar equality into native py_obj_eq. Add bridge-aware ON ratchets so temporary py_cpy_to_pcc_* bridge calls cannot mask regressions in the original CPython fallback surface."
+    },
+    {
+      "date": "2026-04-28-utf8-ord-and-static-internals",
+      "delta": "ON multi 505→411 (-94), with bridge calls unchanged at 18 and non-bridge py_cpy_* calls 487→393 (-94). ON per-module sum 6462→6382 (-80). Locked descending per-module entries: layer1.py 3680→3615 and pipeline.py 508→493.",
+      "reason": "Add native py_str_ord in both runtime tiers and lower ord(str) through it, so Unicode ord() no longer reads only the first UTF-8 byte. Replace internal str.encode() byte construction in codegen/class globals with a pcc-native UTF-8 encoder, remove regex use from IR libpython detection, avoid reverse/reversed/delattr dynamic calls in hot compiler internals, and make the builtin-name table static instead of importing builtins and calling dir()."
+    },
+    {
+      "date": "2026-04-28-native-platform-machine",
+      "delta": "ON multi 411→400 (-11), bridge calls 18→16 (-2), non-bridge py_cpy_* calls 393→384 (-9). ON per-module sum 6382→6371 (-11). Locked descending per-module entry: pipeline.py 493→482.",
+      "reason": "Treat platform as a native builtin module for import analysis and lower platform.machine() to py_platform_machine_str in the C-only substrate shared by both runtime archives. This removes the CPython platform.machine call and the follow-on cpy→pcc string bridge while preserving the normal platform.machine().lower()/split() source idiom."
+    },
+    {
+      "date": "2026-04-28-native-subprocess-check-output",
+      "delta": "ON multi 400→383 (-17), bridge calls 16→13 (-3), non-bridge py_cpy_* calls 384→370 (-14). ON per-module sum 6371→6362 (-9). Locked descending per-module entry: pipeline.py 482→465; layer1.py rises 3615→3623 from the new native dispatch helper and remains governed by the existing lower ratchet.",
+      "reason": "Add py_subprocess_check_output in a C-only process substrate object that survives the pcc-Python runtime archive replacement, and lower subprocess.check_output(argv, text=True|universal_newlines=True) natively. The bootstrap pipeline's command-output probes now return pcc strings directly, so downstream strip()/split() chains no longer need CPython call sites or cpy→pcc string bridges. Unsupported bytes/encoding forms stay on the CPython fallback path."
+    },
+    {
+      "date": "2026-04-28-native-tempfile-tempdir",
+      "delta": "ON multi 383→337 (-46), bridge calls 13→10 (-3), non-bridge py_cpy_* calls 370→327 (-43). ON per-module sum 6362→6322 (-40). Locked descending per-module entry: pipeline.py 465→419; layer1.py rises 3623→3629 from the new with-lowering helper and remains governed by the existing lower ratchet.",
+      "reason": "Lower with tempfile.TemporaryDirectory(prefix=...) as tmp through py_tempdir_new/py_tempdir_cleanup instead of CPython TemporaryDirectory plus __enter__/__exit__. The helpers live in the same C-only process substrate as native check_output so the pcc-Python runtime archive keeps the symbols after replacing py_process.o."
+    },
+    {
+      "date": "2026-04-28-native-subprocess-run-stmt",
+      "delta": "ON multi 337→322 (-15), bridge calls unchanged at 10, non-bridge py_cpy_* calls 327→312 (-15). ON per-module sum 6322→6315 (-7). Locked descending per-module entry: pipeline.py 419→404; layer1.py rises 3629→3637 from the statement-only native run lowering and remains governed by the existing lower ratchet.",
+      "reason": "Lower expression-statement subprocess.run(argv, check=True[, capture_output=..., text=...]) through py_subprocess_run. This shape covers the pipeline's make/clang side-effect calls where the CompletedProcess value is ignored. Nonzero exit status raises RuntimeError through the pcc exception path; capture_output=True redirects child output away from stdout/stderr."
+    },
+    {
+      "date": "2026-04-28-native-process-stdlib-followup",
+      "delta": "OFF multi 18283→17135 (-1148) and ON multi 322→286 (-36), with ON bridge calls 10→9 (-1) and ON non-bridge py_cpy_* calls 312→277 (-35). ON per-module actual sum 6315→6279 (-36). Locked descending per-module entries: pipeline.py OFF/ON 508/404→368 and runtime_abi.py OFF 1152→0; layer1.py remains governed by its existing lower ratchet.",
+      "reason": "Add native shutil.which(name), shlex.split(text), sys.executable, and bool-expression capture_output support for statement-only subprocess.run. This removes the CPython shutil/shlex/process-call edges from _resolve_pcc_binary, _append_libpython_link_flags, and _ensure_runtime, and lets os.path.dirname(sys.executable) stay on the native os.path path instead of bridging back from CPython. Treat pcc.llvm_capi.compat as a scaffold import for runtime_abi.py in both modes, since that module only needs IR type constructors; this offsets new ABI table entries by deleting the old OFF-mode compat CPython import surface instead of raising the ratchet."
+    },
+    {
+      "date": "2026-04-29-on-zero",
+      "delta": "ON multi 286→0 (-286), bridge calls 9→0, non-bridge py_cpy_* calls 277→0. OFF multi 17135→16987 (-148). Tight closure shape is now 15 files because pcc.py_frontend.codegen package init falls out of the closure after import refactors.",
+      "reason": "Remove the last ON-mode libpython edges by replacing codegen-time float(str) parsing with a pcc-friendly decimal parser, rewriting comprehension lowering from nested CPython callbacks to explicit method recursion, and moving _link_with_self_backend's pcc.backend import/call sequence behind a host-tool subprocess boundary. The compiled stage1 closure no longer contains py_cpy_* calls in multi-file ON mode; the next Issue 1 gate is link-without-libpython."
+    }
+  ]
+}

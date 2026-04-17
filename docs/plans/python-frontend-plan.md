@@ -1,6 +1,6 @@
 # pcc Python Frontend — Implementation Plan
 
-## Status 2026-04-21 — M1 + M3 path α parser-side both reached
+## Status 2026-04-23 — M1 closed, bootstrap verify runnable on supported dev host
 
 **P6C Strategy C progress:**
 
@@ -12,17 +12,23 @@
   - α1 frozen LR tables + driver (63/63 parity)
   - α2 native lexer (63/63 token-stream parity)
   - α3 default flip + real-project + csmith (200/200 zero diff)
-- ⏳ P6C.6 three-stage bootstrap verify — blocked on #139 llvm_capi wire
+- ⏳ P6C.6 three-stage bootstrap verify — runnable on supported macOS arm64 dev host; pure Strategy C closure still blocked on dependency removal / packaging cleanup
 
-**Audit**: `scripts/audit_selfhost.py` reports **0 blockers**.
+**Audit**: `env -u LC_ALL uv run python scripts/audit_selfhost.py` reports
+**0 blockers** (2026-04-23).
 **Parity**: native Python parser 105/105 byte-identical vs CPython-ast
 on phase1+2+3+6c corpus.
+**Bootstrap**: `env -u LC_ALL ./scripts/bootstrap.sh` now completes stage 1 /
+stage 2 / stage 3 on the supported macOS arm64 development host, and
+`pcc2` / `pcc3` are byte-identical after stripping Mach-O code-signature
+metadata from comparison copies.
 **Oracle harness**: `tests/test_c_parser_oracle.py` — 63/63 C snippet
 snapshots in place for future C parser differential testing.
 
 **Scope caveat**: M1 closure = "pcc's Python source passes self-host
 audit, native Python parser is default." It is NOT Strategy C done.
-pcc binary still links libpython (for llvmlite + PLY). See #142
+The current bootstrap run may still link `libpython`, and evidence is
+still centered on the supported macOS arm64 development host. See #142
 "P6C M2+M3 tracker" for remaining epics.
 
 **Feature-flag policy (explicit user constraint)**:
@@ -43,6 +49,9 @@ See also:
 
 - [`docs/plans/python-frontend-interfaces.md`](docs/plans/python-frontend-interfaces.md)
   - frozen interface contracts for parallel work
+- [`docs/plans/python-native-stdlib-plan.md`](docs/plans/python-native-stdlib-plan.md)
+  - post-bootstrap plan for routing selected stdlib imports through
+    pcc-native modules instead of `libpython`
 
 ## What this plan covers
 
@@ -1031,6 +1040,44 @@ handle cleanly.
 
 The three-stage bootstrap and verification.
 
+**Current verified state (2026-04-23):**
+
+- `env -u LC_ALL ./scripts/bootstrap.sh` completes stage 1 / stage 2 /
+  stage 3 on the supported macOS arm64 development host.
+- Direct `cmp pcc2 pcc3` still differs on Mach-O code-signature metadata,
+  but signature-stripped comparison copies are byte-identical.
+- The compiled bootstrap binary's `--help` path now exits cleanly with
+  empty stderr; the earlier embedded-CPython shutdown noise is gone.
+- The default `python -m pcc` / `uv run pcc` entry path now routes
+  through the internal `pcc.cli_core` parser rather than importing the
+  `click`-decorated CPython CLI path.
+- `click` is no longer a runtime package dependency for `python-cc`;
+  it remains only on the dev/test compatibility surface around
+  `pcc.pcc.main`.
+- The bootstrap script no longer needs repo-scoped `PYTHONPATH` or
+  explicit embed-link env injection; compiled `pcc1` / `pcc2` now
+  resolve the matching `python3.13-config` from the embedded
+  interpreter's own `sysconfig` view.
+- This is still not full Strategy C closure: the current run may link
+  `libpython`, and broader host coverage / dependency removal remain open.
+- The Python CLI/API now exposes an explicit `libpython` policy switch
+  (`--python-libpython=auto|on|off` / `PCC_PYTHON_LIBPYTHON`): keep
+  `auto` as the transitional default, but treat `off` as the eventual
+  pure self-host gate. Any remaining fallback should fail loudly under
+  `off`, not silently re-link `libpython`.
+
+**Post-bootstrap cleanup track (do not forget after the gate is green):**
+
+- Keep the current bootstrap-safe CLI path stable first.
+- Then restore the general Python semantics currently avoided by
+  bootstrap-safe workarounds, rather than treating those workarounds as
+  permanent design:
+  - CPython-backed string slicing / `=` option-value extraction
+  - truthiness / equality on CPython-origin strings
+  - stable `sys.exit(expr)` / imported `exit(...)` lowering
+- Once those generic semantics are solid, retire the corresponding
+  CLI-specific workarounds in `pcc.cli_core` / `pcc.__main__`.
+
 **Deliverables:**
 
 - `scripts/bootstrap.sh`:
@@ -1051,7 +1098,7 @@ The three-stage bootstrap and verification.
 
 | # | Test | Pass |
 |---|---|---|
-| 1 | `cmp pcc2 pcc3` | byte-identical (or structurally identical if nondeterministic build metadata is stripped) |
+| 1 | `cmp pcc2 pcc3` | byte-identical, or byte-identical after stripping nondeterministic build metadata such as Mach-O code signatures |
 | 2 | `pcc2 hello.c -o hello` | same output as reference pcc |
 | 3 | All of pcc's tests, run via `pcc2`-compiled test runner | identical pass/fail set vs reference |
 | 4 | `ldd pcc2` | libc + libLLVM only; **no libpython**, no CPython extensions |

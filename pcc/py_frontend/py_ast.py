@@ -323,6 +323,7 @@ class Arg:
     annotation: Optional[Type]
     default: Optional[Expr]
     kind: str  # "pos", "kw_only", "pos_only", "*args", "**kwargs"
+    has_default: bool = False
 
 
 @dataclass(frozen=True)

@@ -14,6 +14,16 @@
 #define PY_FLAG_IMMORTAL    0x1
 #define PY_FLAG_GC_TRACKED  0x2
 
+/* ---- Type-specific deallocators (extern so py_obj.py can dispatch) -- */
+void py_dealloc_int(PyObject *o);
+void py_dealloc_float(PyObject *o);
+void py_dealloc_str(PyObject *o);
+void py_dealloc_list(PyObject *o);
+void py_dealloc_tuple(PyObject *o);
+void py_dealloc_dict(PyObject *o);
+void py_dealloc_set(PyObject *o);
+void py_dealloc_generic(PyObject *o);
+
 /* ---- Tagged-int helpers ------------------------------------------------ */
 /* Encoding: low bit = 1 means value; shift right arithmetic to recover the
  * int63 payload. Low bit = 0 means a real PyObject* pointer. Since malloc
@@ -87,6 +97,11 @@ typedef struct {
     int64_t hash;       /* cached FNV-1a hash, -1 if not yet computed */
     char    data[];     /* UTF-8 bytes followed by NUL terminator */
 } PyStrObject;
+
+PyObject *py_str_new(const char *data, int64_t byte_len);
+int64_t py_str_byte_len(PyObject *s);
+const char *py_str_utf8(PyObject *s);
+PyObject *py_obj_str(PyObject *o);
 
 typedef struct {
     PyObjectHeader h;
@@ -279,12 +294,18 @@ PyObject *py_instance_getattr(PyInstanceObject *inst, const char *name);
 
 /* Attribute assignment. Returns 0 on success, -1 on failure (e.g. unknown
  * field and no method slot to accept). */
-int py_instance_setattr(PyInstanceObject *inst, const char *name, PyObject *value);
+int64_t py_instance_setattr(PyInstanceObject *inst, const char *name, PyObject *value);
+
+/* Shallow-copy a native instance and override named fields. Used by the
+ * dataclasses.replace fast path on pcc-native class instances. */
+PyObject *py_dataclass_replace(PyObject *obj, int64_t n_overrides,
+                               const char **names, PyObject **values);
+PyObject *py_dataclass_replace_from_dict(PyObject *obj, PyObject *overrides);
 
 /* isinstance(obj, cls) — walks obj's class's MRO looking for cls.
  * Returns 1 if obj is an instance of cls or any subclass, 0 otherwise.
  * Non-instance objects get 0. */
-int py_isinstance(PyObject *obj, PyClassObject *cls);
+int64_t py_isinstance(PyObject *obj, PyClassObject *cls);
 
 /* super() lookup: find the first method named `name` in `start_cls`'s
  * MRO strictly AFTER `from_cls`. This is the standard super() semantic —
@@ -356,7 +377,7 @@ int py_property_set_fdel(PyObject *prop, PyObject *func);
 /* ---- Iteration + extended generic ops (Phase 3) ----------------------- */
 PyObject *py_obj_iter(PyObject *o);
 PyObject *py_obj_next(PyObject *it);
-int       py_obj_contains(PyObject *container, PyObject *item);
+int64_t   py_obj_contains(PyObject *container, PyObject *item);
 
 /* Numeric / comparison dunders. Each first tries the native fast path
  * for built-in types, then falls through to ``__op__`` on LHS and
@@ -371,10 +392,11 @@ PyObject *py_obj_pow(PyObject *a, PyObject *b);
 PyObject *py_obj_neg(PyObject *a);
 PyObject *py_obj_pos(PyObject *a);
 PyObject *py_obj_invert(PyObject *a);
-int py_obj_lt(PyObject *a, PyObject *b);
-int py_obj_le(PyObject *a, PyObject *b);
-int py_obj_gt(PyObject *a, PyObject *b);
-int py_obj_ge(PyObject *a, PyObject *b);
+int64_t py_obj_eq(PyObject *a, PyObject *b);
+int64_t py_obj_lt(PyObject *a, PyObject *b);
+int64_t py_obj_le(PyObject *a, PyObject *b);
+int64_t py_obj_gt(PyObject *a, PyObject *b);
+int64_t py_obj_ge(PyObject *a, PyObject *b);
 
 /* ---- Exceptions (Phase 3) --------------------------------------------- */
 
@@ -454,7 +476,7 @@ enum {
 /* Lazily allocate and cache the builtin exception class for `tag`.
  * Returns a borrowed reference — the runtime holds a permanent ref on
  * every builtin class so callers need not incref. */
-PyClassObject *py_exc_builtin_class(int32_t tag);
+PyClassObject *py_exc_builtin_class(int64_t tag);
 
 /* Allocate a PyExceptionObject wired to `cls` with `msg` as message
  * (may be NULL). Returns a new owned reference; installs header
@@ -464,10 +486,9 @@ PyExceptionObject *py_exc_alloc(PyClassObject *cls, const char *msg);
 /* Deallocation hook (called from py_decref via py_dealloc_exc). */
 void py_dealloc_exc(PyObject *o);
 
-/* Itanium C++ ABI typeinfo sentinel used by landingpads. The address of
- * this object is what `__cxa_throw` registers as the exception's type
- * and what landingpads match on. Defined in py_exc.c. */
-extern const void *const py_exception_typeinfo;
+/* Exception model is now return-code based (see py_exc.c header
+ * comment). No Itanium C++ ABI symbols are exported from py_exc.c
+ * anymore. */
 
 /* ---- Helpers ----------------------------------------------------------- */
 
@@ -533,6 +554,10 @@ char *py_bigint_to_cstr(const PyIntObject *b);
 /* Parse a (possibly signed) decimal string. Returns a new bignum or NULL on
  * parse / allocation failure. */
 PyIntObject *py_bigint_from_cstr(const char *s);
+
+/* Dynamic dunder helpers implemented in py_dunder.c. */
+PyObject *py_int_to_str_obj(PyObject *o);
+PyObject *py_user_str_dispatch(PyObject *o);
 
 /* Bitwise ops (treat operands as two's-complement of infinite width). */
 PyIntObject *py_bigint_and(const PyIntObject *a, const PyIntObject *b);

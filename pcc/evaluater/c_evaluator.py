@@ -15,8 +15,14 @@ import tempfile
 import platform
 from concurrent.futures import ProcessPoolExecutor
 from itertools import repeat
-from ..backend import BackendUnavailable, backend_signature, resolve_backend
-from ..backend.self_backend import emit_aarch64_darwin_asm
+from ..backend import (
+    BackendUnavailable,
+    backend_request_allows_unimplemented,
+    backend_signature,
+    resolve_backend,
+)
+from ..backend.self_backend_dispatch import emit_self_asm, self_backend_target_identity
+from ..backend.self_backend_parse import parse_self_backend_target_triple
 from ..codegen.c_codegen import LLVMCodeGenerator, postprocess_ir_text
 from ..parse.c_parser import CParser
 from ..preprocessor import preprocess
@@ -371,7 +377,7 @@ def _compiler_cache_tracked_files():
         os.path.join(base_dir, "lex", "c_lexer.py"),
         os.path.join(base_dir, "preprocessor.py"),
     ]
-    for dirname in ("passes", "ssa"):
+    for dirname in ("passes", "ssa", "llvm_capi", "backend"):
         package_dir = os.path.join(base_dir, dirname)
         try:
             for root, dirs, files in os.walk(package_dir):
@@ -577,9 +583,10 @@ def _store_compiled_artifact(cache_dir, cache_key, artifact):
 
 
 def get_c_type_from_ir(ir_type):
-    if isinstance(ir_type, ir.VoidType):
+    kind = type(ir_type).__name__
+    if kind == "VoidType":
         return None
-    elif isinstance(ir_type, ir.IntType):
+    elif kind == "IntType":
         if ir_type.width == 8:
             return c_int8
         elif ir_type.width == 16:
@@ -587,10 +594,14 @@ def get_c_type_from_ir(ir_type):
         elif ir_type.width == 32:
             return c_int32
         return c_int64
-    elif isinstance(ir_type, ir.DoubleType):
+    elif kind == "FloatType":
+        return c_float
+    elif kind == "DoubleType":
         return c_double
-    elif isinstance(ir_type, ir.PointerType):
+    elif kind == "PointerType":
         point_type = get_c_type_from_ir(ir_type.pointee)
+        if point_type is None:
+            return c_void_p
         return POINTER(point_type)
     else:
         return c_int64
@@ -629,15 +640,16 @@ def get_c_type_from_serialized_ir(ir_type_desc):
 def _serialize_ir_type(ir_type):
     if ir_type is None:
         return None
-    if isinstance(ir_type, ir.VoidType):
+    kind = type(ir_type).__name__
+    if kind == "VoidType":
         return ("void",)
-    if isinstance(ir_type, ir.IntType):
+    if kind == "IntType":
         return ("int", ir_type.width)
-    if isinstance(ir_type, ir.FloatType):
+    if kind == "FloatType":
         return ("float",)
-    if isinstance(ir_type, ir.DoubleType):
+    if kind == "DoubleType":
         return ("double",)
-    if isinstance(ir_type, ir.PointerType):
+    if kind == "PointerType":
         return ("ptr", _serialize_ir_type(ir_type.pointee))
     return ("int", 64)
 
@@ -972,7 +984,12 @@ def _rewrite_embed_directives(source):
 
 
 def _rewrite_missing_clang_test_headers(source):
+    replaced = False
     def repl(match):
+        nonlocal replaced
+        if replaced:
+            return ""
+        replaced = True
         return _CLANG_TEST_SIMULATOR_HEADER_STUB
 
     return _CLANG_TEST_SIMULATOR_INCLUDE.sub(repl, source)
@@ -1265,6 +1282,10 @@ class CEvaluator(object):
         llvm.initialize_all_targets()
         llvm.initialize_all_asmprinters()
 
+        allow_unimplemented_backend = (
+            allow_unimplemented_backend
+            or backend_request_allows_unimplemented(backend)
+        )
         self.backend_config = resolve_backend(
             backend,
             allow_unimplemented=allow_unimplemented_backend,
@@ -1878,6 +1899,7 @@ class CEvaluator(object):
         if self.backend == "self":
             return self._run_compiled_translation_units_self_backend(
                 compiled_units,
+                optimize=optimize,
                 base_dir=base_dir,
                 prog_args=prog_args,
                 link_args=link_args,
@@ -1956,6 +1978,7 @@ class CEvaluator(object):
                 emit_obj=emit_obj,
                 emit_asm=emit_asm,
                 emit_llvm=emit_llvm,
+                optimize=optimize,
             )
             return
 
@@ -1994,9 +2017,15 @@ class CEvaluator(object):
         emit_obj=None,
         emit_asm=None,
         emit_llvm=None,
+        optimize=True,
     ):
-        ir_texts = [ir_text for _unit_name, ir_text, _unit_return_type, _external_defs in compiled_units]
-        asm_text = self._self_backend_asm_text(compiled_units)
+        prepared_units = (
+            self._prepare_self_backend_units(compiled_units, optimize=optimize)
+            if self._normalize_opt_level(optimize) > 0
+            else compiled_units
+        )
+        ir_texts = [ir_text for _unit_name, ir_text, _unit_return_type, _external_defs in prepared_units]
+        asm_text = self._self_backend_asm_text(prepared_units)
 
         if emit_llvm:
             with open(emit_llvm, "w") as f:
@@ -2028,24 +2057,40 @@ class CEvaluator(object):
                     "backend 'self' currently supports --emit-asm, --emit-obj, and optional --emit-llvm"
                 )
 
+    def _prepare_self_backend_units(self, compiled_units, *, optimize=True):
+        target_machine = self.target.create_target_machine()
+        prepared_units = []
+        for unit_name, ir_text, unit_return_type, external_defs in compiled_units:
+            llvmmod = self._prepare_llvm_module(
+                unit_name,
+                ir_text,
+                target_machine,
+                optimize=optimize,
+            )
+            prepared_units.append((unit_name, str(llvmmod), unit_return_type, external_defs))
+        return prepared_units
+
     def _self_backend_asm_text(self, compiled_units):
         asm_modules = []
+        needs_subsections_via_symbols = False
         for _unit_name, ir_text, _unit_return_type, _external_defs in compiled_units:
-            asm_lines = emit_aarch64_darwin_asm(ir_text).splitlines()
-            if asm_lines and asm_lines[0] == ".section __TEXT,__text,regular,pure_instructions":
-                asm_lines = asm_lines[1:]
+            target_id = self_backend_target_identity(parse_self_backend_target_triple(ir_text))
+            asm_lines = emit_self_asm(ir_text).splitlines()
             if asm_lines and asm_lines[-1] == ".subsections_via_symbols":
                 asm_lines = asm_lines[:-1]
+            if target_id == "self-aarch64-darwin-v0":
+                needs_subsections_via_symbols = True
             asm_modules.append("\n".join(asm_lines).strip())
-        asm_text = ".section __TEXT,__text,regular,pure_instructions\n"
-        asm_text += "\n\n".join(fragment for fragment in asm_modules if fragment)
-        asm_text += "\n.subsections_via_symbols\n"
+        asm_text = "\n\n".join(fragment for fragment in asm_modules if fragment)
+        if needs_subsections_via_symbols:
+            asm_text += "\n.subsections_via_symbols\n"
         return asm_text
 
     def _run_compiled_translation_units_self_backend(
         self,
         compiled_units,
         *,
+        optimize=True,
         base_dir=None,
         prog_args=None,
         link_args=None,
@@ -2054,7 +2099,12 @@ class CEvaluator(object):
         text=False,
     ):
         cc = self._system_cc()
-        asm_text = self._self_backend_asm_text(compiled_units)
+        prepared_units = (
+            self._prepare_self_backend_units(compiled_units, optimize=optimize)
+            if self._normalize_opt_level(optimize) > 0
+            else compiled_units
+        )
+        asm_text = self._self_backend_asm_text(prepared_units)
         tmpdir = tempfile.mkdtemp(prefix="pcc_self_run_")
         try:
             asm_path = os.path.join(tmpdir, "self_backend.s")
@@ -2247,6 +2297,69 @@ class CEvaluator(object):
                 "-DUSHRT_MAX=65535",
                 "-DCHAR_MAX=127",
                 "-DUCHAR_MAX=255",
+                # stdint.h fixed-width limits (LP64 model, int64_t = long).
+                "-DINT8_MIN=(-128)",
+                "-DINT8_MAX=127",
+                "-DUINT8_MAX=255",
+                "-DINT16_MIN=(-32768)",
+                "-DINT16_MAX=32767",
+                "-DUINT16_MAX=65535",
+                "-DINT32_MIN=(-2147483647-1)",
+                "-DINT32_MAX=2147483647",
+                "-DUINT32_MAX=4294967295U",
+                "-DINT64_MIN=(-9223372036854775807L-1)",
+                "-DINT64_MAX=9223372036854775807L",
+                "-DUINT64_MAX=18446744073709551615UL",
+                "-DINTPTR_MIN=(-9223372036854775807L-1)",
+                "-DINTPTR_MAX=9223372036854775807L",
+                "-DUINTPTR_MAX=18446744073709551615UL",
+                "-DPTRDIFF_MIN=(-9223372036854775807L-1)",
+                "-DPTRDIFF_MAX=9223372036854775807L",
+                "-DSIZE_MAX=18446744073709551615UL",
+                "-DINTMAX_MIN=(-9223372036854775807LL-1)",
+                "-DINTMAX_MAX=9223372036854775807LL",
+                "-DUINTMAX_MAX=18446744073709551615ULL",
+                "-DWCHAR_MIN=(-2147483647-1)",
+                "-DWCHAR_MAX=2147483647",
+                "-DSIG_ATOMIC_MIN=(-2147483647-1)",
+                "-DSIG_ATOMIC_MAX=2147483647",
+                # inttypes.h format macros (int64_t = long in our LP64 model).
+                '-DPRId8="d"',
+                '-DPRIi8="i"',
+                '-DPRIu8="u"',
+                '-DPRIo8="o"',
+                '-DPRIx8="x"',
+                '-DPRIX8="X"',
+                '-DPRId16="d"',
+                '-DPRIi16="i"',
+                '-DPRIu16="u"',
+                '-DPRIo16="o"',
+                '-DPRIx16="x"',
+                '-DPRIX16="X"',
+                '-DPRId32="d"',
+                '-DPRIi32="i"',
+                '-DPRIu32="u"',
+                '-DPRIo32="o"',
+                '-DPRIx32="x"',
+                '-DPRIX32="X"',
+                '-DPRId64="ld"',
+                '-DPRIi64="li"',
+                '-DPRIu64="lu"',
+                '-DPRIo64="lo"',
+                '-DPRIx64="lx"',
+                '-DPRIX64="lX"',
+                '-DPRIdPTR="ld"',
+                '-DPRIiPTR="li"',
+                '-DPRIuPTR="lu"',
+                '-DPRIoPTR="lo"',
+                '-DPRIxPTR="lx"',
+                '-DPRIXPTR="lX"',
+                '-DPRIdMAX="lld"',
+                '-DPRIiMAX="lli"',
+                '-DPRIuMAX="llu"',
+                '-DPRIoMAX="llo"',
+                '-DPRIxMAX="llx"',
+                '-DPRIXMAX="llX"',
                 "-DSIG_DFL=0",
                 "-DSIG_IGN=1",
                 "-DSIGINT=2",

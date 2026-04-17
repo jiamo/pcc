@@ -93,10 +93,7 @@ resultlimit = 40               # Size limit of results when running in debug mod
 pickle_protocol = 0            # Protocol to use when writing pickle files
 
 # String type-checking compatibility
-if sys.version_info[0] < 3:
-    string_types = basestring
-else:
-    string_types = str
+string_types = str
 
 MAXINT = sys.maxsize
 
@@ -1342,7 +1339,7 @@ class Production(object):
         p = LRItem(self, n)
         # Precompute the list of productions immediately following.
         try:
-            p.lr_after = Prodnames[p.prod[n+1]]
+            p.lr_after = self.Prodnames[p.prod[n+1]]
         except (IndexError, KeyError):
             p.lr_after = []
         try:
@@ -1596,6 +1593,7 @@ class Grammar(object):
 
         # Create a production and add it to the list of productions
         p = Production(pnumber, prodname, syms, prodprec, func, file, line)
+        p.Prodnames = self.Prodnames
         self.Productions.append(p)
         self.Prodmap[map] = p
 
@@ -1618,6 +1616,7 @@ class Grammar(object):
         if start not in self.Nonterminals:
             raise GrammarError('start symbol %s undefined' % start)
         self.Productions[0] = Production(0, "S'", [start])
+        self.Productions[0].Prodnames = self.Prodnames
         self.Nonterminals[start].append(0)
         self.Start = start
 
@@ -1972,7 +1971,9 @@ class LRTable(object):
 
         self.lr_productions = []
         for p in parsetab._lr_productions:
-            self.lr_productions.append(MiniProduction(*p))
+            self.lr_productions.append(
+                MiniProduction(p[0], p[1], p[2], p[3], p[4], p[5])
+            )
 
         self.lr_method = parsetab._lr_method
         return parsetab._lr_signature
@@ -1999,7 +2000,9 @@ class LRTable(object):
 
         self.lr_productions = []
         for p in productions:
-            self.lr_productions.append(MiniProduction(*p))
+            self.lr_productions.append(
+                MiniProduction(p[0], p[1], p[2], p[3], p[4], p[5])
+            )
 
         in_f.close()
         return signature

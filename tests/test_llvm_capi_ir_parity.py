@@ -106,6 +106,23 @@ def _check_parity(build_ll, build_pcc):
 # ---------------------------------------------------------------------------
 
 
+def test_scaffold_function_type_dynamic_false_is_not_vararg():
+    i64 = pcc_ir.IntType(64)
+    void = pcc_ir.VoidType()
+
+    fty_false = pcc_ir.FunctionType___init___dyn(void, [i64], False)
+    fty_none = pcc_ir.FunctionType___init___dyn(void, [i64], None)
+    fty_true = pcc_ir.FunctionType___init___dyn(void, [i64], True)
+    fty_fixed_arity_false = pcc_ir.FunctionType___init__1_dyn_va(
+        void, i64, False,
+    )
+
+    assert str(fty_false) == "void (i64)"
+    assert str(fty_none) == "void (i64)"
+    assert str(fty_fixed_arity_false) == "void (i64)"
+    assert str(fty_true) == "void (i64, ...)"
+
+
 def test_simple_add():
     def ll_build():
         m = llvmlite_ir.Module("t")

@@ -149,8 +149,8 @@ Gate: `pcc pcc.py -o pcc1` runs to completion and produces an executable.
 
 ### #138.5 — Three-stage verify (1 week)
 
-- `scripts/bootstrap.sh` 自动化三阶段
-- `cmp pcc2 pcc3` 字节相同 gate
+- `scripts/bootstrap.sh` automates the three stages
+- `cmp pcc2 pcc3` byte-identical gate
 
 Gate: Strategy C acceptance achieved.
 
@@ -247,33 +247,32 @@ Remaining for a full swap:
 These aren't strictly packaging; they're follow-ups for the
 ``#138.x-long-tail`` bucket.
 
-## #138.5 (three-stage bootstrap) — blocked on multi-file compile
+## #138.5 (three-stage bootstrap) — bootstrap script landed; pure closure still open
 
-``scripts/bootstrap.sh`` stage 1 (CPython hosted ``python -m pcc``)
-hits the cross-module import wall::
+This section is now historically outdated as a hard blocker report.
+The multi-file/bootstrap work it called out has since landed enough to
+move the state forward materially:
 
-    pcc/__main__.py:
-        from .pcc import main
-        main()
+- `scripts/bootstrap.sh` now completes stage 1 / stage 2 / stage 3 on
+  the supported macOS arm64 development host
+- the bootstrap path now resolves the `pcc/__main__.py -> pcc.cli_core.cli_main`
+  entry shape, leaving `click` on the compatibility wrapper only
+- package runtime metadata no longer depends on `click`; the remaining
+  compatibility wrapper is dev/test-facing only
+- `pcc2` and `pcc3` are byte-identical after stripping Mach-O
+  code-signature metadata from comparison copies
 
-pcc today compiles a single ``.py`` file per invocation; the
-``from .pcc import main`` statement routes through
-``py_cpy_import`` and the subsequent bare ``main()`` call hits
-``Layer 1 unknown function 'main'`` because the user-symbol
-registry is per-compilation-unit.
+The remaining blockers are no longer "can't cross the module-import
+wall at all". They are the narrower closure items for pure Strategy C:
 
-Bootstrap therefore needs either:
-
-1. **Multi-file compile mode** — feed ``pcc/*.py`` to a single
-   invocation and link their emitted object files together.
-   Fundamentally new feature, probably ~1-2 weeks.
-2. **Separate compilation + linker step** — emit a ``.o`` per
-   module and teach the linker to resolve cross-module user
-   symbols. Same scope.
-
-Neither is achievable without #138.4 being done first (bootstrap
-entry still pulls click via pcc.py), so #138.5 stays blocked on
-#138.4 and the multi-file epic.
+1. **Dependency removal / packaging cleanup**
+   - some bootstrap paths may still link `libpython`
+2. **Environment-robust verification**
+   - current evidence is on the supported macOS arm64 development host;
+     broader host coverage is still part of the remaining P6C.6 work
+3. **Post-bootstrap smoke / broader regression**
+   - stage 1/2/3 completion is no longer the main missing piece; the
+     next step is broadening verification on top of that working path
 
 ## #138.3 (type inference relaxation) — closed with above work
 

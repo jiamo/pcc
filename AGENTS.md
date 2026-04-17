@@ -4,7 +4,14 @@ This file is for humans and AI agents working in this repository.
 
 ## Project Summary
 
-`pcc` is a C compiler implemented in Python on top of `pycparser`, `llvmlite`, and a lightweight fake-libc layer. Most fixes in this repository are not parser bugs; they are semantic bugs that only show up when expressions are combined, lowered to LLVM IR, and then exercised by real programs.
+`pcc` is primarily a C compiler implemented in Python on top of
+`pycparser`, LLVM (`llvmlite` and now `pcc/llvm_capi`), and a
+lightweight fake-libc layer. The C path is still the most mature part of
+the repository, but the repo now also contains an experimental Python
+frontend (`pcc/py_frontend/` + `pcc/py_runtime/`) and an active
+self-host/bootstrap track. Most fixes in this repository are not parser
+bugs; they are semantic bugs that only show up when expressions are
+combined, lowered to LLVM IR, and then exercised by real programs.
 
 The fastest way to get useful results is:
 
@@ -40,6 +47,7 @@ uv run pcc hello.c
 - While debugging one failure, prefer `-n0` so xdist does not hide ordering or temp-file problems.
 - Use ripgrep (`rg`), or your agent's built-in code search tools (e.g. Grep/Glob in Claude Code) for source discovery.
 - Do not leave temporary `.c` files inside real project directories. Directory-based source collection can accidentally compile them.
+- **Always cap probe / experimental binaries with a hard timeout.** When you compile a one-shot `/tmp/<name>` probe and run it (especially a self-host stage binary that might infinite-loop), wrap the run with `timeout 30s ./tmp_probe` or equivalent. Found 2026-04-26: 4 zombie `pq_probe_stage_*_self` processes from a codex session pegged 100% CPU each for 33 hours (~120 CPU-hours wasted) — they were started without a timeout and the agent moved on without verifying termination. Before ending a session, always `ps aux | grep <your-probe-name>` and `kill` any leftover children. Probe binaries that hang are *expected* during compiler bring-up; the leak is not.
 
 
 ## Repository Map
@@ -52,12 +60,64 @@ uv run pcc hello.c
   Preprocessing, parsing, IR generation, LLVM parsing, optimization, and execution.
 - `pcc/codegen/c_codegen.py`
   Main semantic lowering logic. Most tricky C correctness bugs land here.
+- `pcc/py_frontend/`
+  Experimental Python frontend. Type inference, Python lowering, and most
+  self-host blockers live here.
+- `pcc/py_runtime/`
+  Native runtime support for the Python frontend.
+- `pcc/llvm_capi/`
+  In-repo LLVM builder/binding replacement path. Useful both for
+  self-host work and for isolating `llvmlite` vs native LLVM-C behavior.
 - `utils/fake_libc_include/`
   Fake libc headers. Bugs here usually look like host ABI or declaration mismatches.
 - `tests/`
   Fast regression coverage. Add small tests here for every semantic fix.
+- `tests/py_corpus/`
+  End-to-end Python frontend corpus. Use this when validating Python-path
+  behavior beyond a minimized unit test.
+- `scripts/pcc_multi.py`
+  Experimental multi-file Python entrypoint used by the bootstrap track.
 - `projects/lua-5.5.0/`
   Real-program stress target. Very effective for catching interactions missed by unit tests.
+
+
+## Python Frontend / Bootstrap Notes
+
+The Python frontend is a separate subsystem from the mature C path. Do
+not assume a C-side debugging rule automatically covers Python lowering,
+runtime fallback, or bootstrap behavior.
+
+- Single-file Python entry:
+  `env -u LC_ALL uv run pcc foo.py`
+- Multi-file/bootstrap entry:
+  `env -u LC_ALL uv run python scripts/pcc_multi.py --entry pkg.main --out out_bin pkg/main.py ...`
+- `pcc/llvm_capi/` is the active in-repo LLVM replacement path; `llvmlite`
+  is still available as a fallback/comparison path for regression
+  isolation.
+- Current verified Issue 1 metric: the stage1 tight multi-file closure
+  in `--ir-scaffold=on` has zero `py_cpy_*` call instructions, guarded
+  by `tests/fallback_baseline.json`. This is necessary but not sufficient
+  for closing Issue 1.
+- The remaining Issue 1 close criterion is a real link gate: build the
+  stage1 bootstrap binary with libpython disabled and verify there are
+  no unresolved `Py*` / `py_cpy_*` symbols. Do not describe the current
+  path as pure self-host until that link-without-libpython property has
+  been re-verified in the current tree.
+- Some bootstrap host queries intentionally use host-tool subprocess
+  boundaries (`PCC_HOST_PYTHON` or `python3`) instead of in-process
+  libpython calls. In particular, `_link_with_self_backend` must not
+  reintroduce compiled-stage imports/calls of `pcc.backend.*`; doing so
+  brings `py_cpy_*` back into the stage1 closure. The long-term target
+  is to compile those backend modules natively, not to grow in-process
+  CPython fallback again.
+- When touching Python frontend or bootstrap-shared code, run the narrow
+  dedicated gates first:
+
+```bash
+env -u LC_ALL uv run pytest tests/test_py_multi_file_compile.py tests/test_py_multi_file_bootstrap_shim.py -q -n0
+env -u LC_ALL uv run pytest tests/test_llvm_capi_ir_parity.py tests/test_llvm_capi_end_to_end.py -q -n0
+env -u LC_ALL uv run pytest tests/test_fallback_baseline.py tests/test_ir_py_fallback_baseline.py -q -n0
+```
 
 
 ## Source Collection Modes
@@ -110,6 +170,47 @@ When the bug appears in a real program:
 3. Compare behavior, not assumptions
 
 This separates "the program is odd" from "the compiler lowered it incorrectly".
+
+
+### 2a. Use `llvmlite` as an oracle for `llvm_capi` parity
+
+If the failure looks like a codegen / IR-builder regression in
+`pcc/llvm_capi/`, do not guess blindly. Re-run the same minimized repro with
+the `llvmlite` backend and use that as the oracle.
+
+The switch is:
+
+```bash
+PCC_USE_LLVMLITE_C=1 env -u LC_ALL uv run pytest 'tests/test_clang_compat.py::test_unsigned_int_to_float_conversion_uses_unsigned_semantics' -q -n0
+```
+
+Use this workflow:
+
+1. shrink the failure to the smallest C repro or single pytest node
+2. run it under the default `llvm_capi` path
+3. run the exact same repro with `PCC_USE_LLVMLITE_C=1`
+4. compare compile result, runtime result, and when needed the emitted IR
+5. patch only the smallest semantic gap in `pcc/llvm_capi` or codegen
+6. add one focused regression test before moving on
+
+This is especially effective for:
+
+- missing `IRBuilder` ops such as `uitofp`, `fptoui`, `fpext`, or `fneg`
+- constant `gep` / `bitcast` expression lowering
+- typed-pointer semantics hidden by opaque `ptr`
+- function-type / function-pointer decay mismatches
+
+Do **not** assume `llvmlite` is the oracle for everything. It is a good oracle
+for backend parity bugs, but not for:
+
+- system preprocessor behavior
+- fake-libc or header rewrite policy
+- compile-only diagnostics policy
+- parser acceptance / rejection mismatches
+
+If both backends fail the same minimized repro, the bug is probably above the
+backend layer and you should move back to parser, preprocessor, headers, or
+semantic lowering.
 
 
 ### 3. Shrink the reproducer in stages
@@ -350,10 +451,13 @@ Before you stop, confirm all of the following:
 
 ## LLVM Version Mismatch
 
-`llvmlite` bundles its own LLVM version, which may be newer than the system `clang`.
+`llvmlite` bundles its own LLVM version, which may be newer than the
+system `clang`. The repository also has an in-repo LLVM-C replacement
+path under `pcc/llvm_capi`, so treat "LLVM behavior" and "llvmlite
+behavior" as related but not identical questions when debugging.
 
 - Older repository paths wrote LLVM IR text to disk and then asked the system compiler to compile that IR. In that setup, LLVM O2 could emit attributes the system `clang` did not understand, such as `nuw`, `nneg`, `range()`, `initializes()`, and `dead_on_unwind`.
-- The current system-link path does **not** rely on the system compiler parsing LLVM IR text. `run_translation_units_with_system_cc()` optimizes each module with llvmlite's LLVM and emits native object files directly, then links those objects with `cc`.
+- The current system-link path does **not** rely on the system compiler parsing LLVM IR text. `run_translation_units_with_system_cc()` optimizes each module with repository-managed LLVM and emits native object files directly, then links those objects with `cc`.
 - The remaining limitation is not "no optimization". It is "no cross-translation-unit optimization" in the separate-TU path. Each TU gets optimized on its own before linking, but there is no LTO-style whole-program pass over the linked module set.
 - If you ever reintroduce a text-IR handoff to the system compiler, keep the attribute-stripping warning in mind and centralize those rewrites in `postprocess_ir_text()`.
 

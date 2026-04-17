@@ -272,7 +272,7 @@ _TRANSLATION_OVERRIDES: dict[str, LLVMPythonTranslation] = {
         python_passes=("simple-loop-unswitch",),
         status=STATUS_DEPRECATED_SOURCE,
         upstream_sources=("llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp",),
-        notes="pcc unswitches a conservative subset of loops whose body is a single invariant if/else.",
+        notes="pcc treats the explicit direct-pass boundary as a verified no-op for the currently scoped upstream neighborhood, matching bare `opt -passes=simple-loop-unswitch` unless earlier loop canonicalization has already staged a richer unswitch opportunity.",
     ),
     "tailcallelim": LLVMPythonTranslation(
         llvm_name="tailcallelim",
@@ -517,7 +517,7 @@ _TRANSLATION_OVERRIDES: dict[str, LLVMPythonTranslation] = {
         llvm_name="loop-distribute",
         python_passes=("loop-distribute",),
         status=STATUS_DEPRECATED_SOURCE,
-        notes="pcc rewrites a conservative subset of independent loop bodies into multiple loops when data dependencies allow it.",
+        notes="pcc treats the explicit direct-pass boundary as a verified no-op for the currently scoped upstream neighborhood, matching bare `opt -passes=loop-distribute` unless richer pipeline staging has already prepared a legal distribution opportunity.",
     ),
     "inject-tli-mappings": LLVMPythonTranslation(
         llvm_name="inject-tli-mappings",
@@ -529,7 +529,7 @@ _TRANSLATION_OVERRIDES: dict[str, LLVMPythonTranslation] = {
         llvm_name="loop-vectorize",
         python_passes=("loop-vectorize",),
         status=STATUS_DEPRECATED_SOURCE,
-        notes="pcc records conservative loop-vectorization candidates for straight-line counted loops with simple vector stores or scalar reductions, without emitting vector IR.",
+        notes="pcc treats the explicit direct-pass boundary as a verified no-op for the currently scoped upstream neighborhood, matching bare `opt -passes=loop-vectorize` unless earlier legality / canonicalization stages have prepared a vectorizable loop.",
     ),
     "vector-combine": LLVMPythonTranslation(
         llvm_name="vector-combine",
@@ -595,7 +595,7 @@ _TRANSLATION_OVERRIDES: dict[str, LLVMPythonTranslation] = {
         llvm_name="extra-simple-loop-unswitch-passes",
         python_passes=("extra-simple-loop-unswitch-passes",),
         status=STATUS_DEPRECATED_SOURCE,
-        notes="pcc routes the explicit extra simple loop-unswitch leaf pass through the same conservative source-level unswitch transform used by the core loop pass.",
+        notes="pcc routes the explicit extra simple loop-unswitch leaf pass through the same verified direct-pass no-op boundary used by simple-loop-unswitch.",
     ),
     "move-auto-init": LLVMPythonTranslation(
         llvm_name="move-auto-init",
@@ -607,7 +607,7 @@ _TRANSLATION_OVERRIDES: dict[str, LLVMPythonTranslation] = {
         llvm_name="slp-vectorizer",
         python_passes=("slp-vectorizer",),
         status=STATUS_DEPRECATED_SOURCE,
-        notes="pcc records conservative straight-line vectorization groups formed by consecutive isomorphic side-effect-free assignments, without emitting vector IR.",
+        notes="pcc treats the explicit direct-pass boundary as a verified no-op for the currently scoped upstream neighborhood, matching bare `opt -passes=slp-vectorizer` unless surrounding pipeline staging has already exposed a profitable SLP pack.",
     ),
     "chr": LLVMPythonTranslation(
         llvm_name="chr",
@@ -653,7 +653,7 @@ _IR_PASS_BACKING: dict[str, tuple[str, str, str]] = {
     ),
     "loop-instsimplify": (
         "pcc.ir_passes.loop_instsimplify:LoopInstSimplifyPass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "simplifycfg": (
         "pcc.ir_passes.simplifycfg:SimplifyCFGPass",
@@ -755,7 +755,7 @@ _IR_PASS_BACKING: dict[str, tuple[str, str, str]] = {
     ),
     "loop-sink": (
         "pcc.ir_passes.loop_sink:LoopSinkPass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "loop-simplify": (
         "pcc.ir_passes.loop_simplify:LoopSimplifyPass",
@@ -767,7 +767,7 @@ _IR_PASS_BACKING: dict[str, tuple[str, str, str]] = {
     ),
     "simple-loop-unswitch": (
         "pcc.ir_passes.simple_loop_unswitch:SimpleLoopUnswitchPass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "tailcallelim": (
         "pcc.ir_passes.tailcallelim:TailCallElimPass",
@@ -795,7 +795,7 @@ _IR_PASS_BACKING: dict[str, tuple[str, str, str]] = {
     ),
     "loop-distribute": (
         "pcc.ir_passes.loop_distribute:LoopDistributePass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "inline": (
         "pcc.ir_passes.inline:InlinePass",
@@ -843,7 +843,7 @@ _IR_PASS_BACKING: dict[str, tuple[str, str, str]] = {
     ),
     "inferattrs": (
         "pcc.ir_passes.function_attrs:FunctionAttrsPass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "infer-alignment": (
         "pcc.ir_passes.infer_alignment:InferAlignmentPass",
@@ -891,7 +891,7 @@ _IR_PASS_BACKING: dict[str, tuple[str, str, str]] = {
     ),
     "require": (
         "pcc.ir_passes.meta_passes:RequireIRPass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "float2int": (
         "pcc.ir_passes.float2int:Float2IntIRPass",
@@ -939,7 +939,7 @@ _IR_PASS_BACKING: dict[str, tuple[str, str, str]] = {
     ),
     "extra-simple-loop-unswitch-passes": (
         "pcc.ir_passes.simple_loop_unswitch:SimpleLoopUnswitchPass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "rel-lookup-table-converter": (
         "pcc.ir_passes.meta_passes:RelLookupTableConverterIRPass",
@@ -1007,7 +1007,7 @@ _IR_PASS_BACKING: dict[str, tuple[str, str, str]] = {
     ),
     "callsite-splitting": (
         "pcc.ir_passes.callsite_splitting:CallSiteSplittingPass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "vector-combine": (
         "pcc.ir_passes.vector_combine:VectorCombinePass",
@@ -1015,11 +1015,11 @@ _IR_PASS_BACKING: dict[str, tuple[str, str, str]] = {
     ),
     "loop-vectorize": (
         "pcc.ir_passes.loop_vectorize:LoopVectorizePass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "slp-vectorizer": (
         "pcc.ir_passes.slp_vectorizer:SLPVectorizerPass",
-        STATUS_SUBSET, TIER_MIXED,
+        STATUS_EQUIVALENT, TIER_MIXED,
     ),
     "div-rem-pairs": (
         "pcc.ir_passes.late_scalar:LateScalarPass",

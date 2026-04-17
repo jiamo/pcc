@@ -611,12 +611,70 @@ def test_postgres_runtime_with_system_link_depends_on_repo_local_zlib_project():
 
 
 @pytest.mark.integration
+def test_postgres_runtime_with_self_backend_system_link_depends_on_repo_local_zlib_project():
+    _ensure_postgres_support_archives()
+
+    units, base_dir = _postgres_project_units()
+
+    result = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).run_translation_units_with_system_cc(
+        units,
+        optimize=True,
+        base_dir=base_dir,
+        jobs=translation_unit_jobs(),
+        include_dirs=translation_unit_include_dirs(units),
+        cpp_args=_postgres_project_cpp_args(),
+        link_args=_postgres_link_args(include_native_zlib=False),
+        timeout=180,
+    )
+
+    assert (
+        result.returncode == 0
+    ), (
+        "postgres self-backend system-link runtime with repo-local zlib "
+        f"project failed:\n{result.stdout}\n{result.stderr}"
+    )
+    assert "libpq version 170004" in result.stdout
+    assert "conninfo: host=1 port=1 dbname=1" in result.stdout
+    assert "OK" in result.stdout
+
+
+@pytest.mark.integration
 def test_postgres_cli_system_link_depends_on():
     _ensure_postgres_support_archives()
 
     result = CliRunner().invoke(
         pcc_cli_main,
         [
+            "--system-link",
+            "--jobs",
+            "2",
+            "--depends-on",
+            f"{POSTGRES_LIBPQ_DIR}={POSTGRES_MAKE_GOAL}",
+            f"--link-arg={ZLIB_LIB}",
+            f"--link-arg={POSTGRES_COMMON_ARCHIVE}",
+            f"--link-arg={POSTGRES_PORT_ARCHIVE}",
+            "--link-arg=-lm",
+            POSTGRES_TEST_MAIN,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "libpq version 170004" in result.output
+    assert "conninfo: host=1 port=1 dbname=1" in result.output
+    assert "OK" in result.output
+
+
+@pytest.mark.integration
+def test_postgres_cli_self_backend_system_link_depends_on():
+    _ensure_postgres_support_archives()
+
+    result = CliRunner().invoke(
+        pcc_cli_main,
+        [
+            "--backend=self",
             "--system-link",
             "--jobs",
             "2",
@@ -746,6 +804,118 @@ def test_postgres_runtime_query_against_native_server(tmp_path):
 
 
 @pytest.mark.integration
+def test_postgres_self_backend_runtime_query_against_native_server(tmp_path):
+    _ensure_postgres_support_archives()
+    _ensure_postgres_server_binaries()
+
+    query_units, base_dir = _postgres_query_units()
+    query_include_dirs = translation_unit_include_dirs(query_units)
+    query_cpp_args = _postgres_query_cpp_args()
+
+    runtime_root = tmp_path / "runtime"
+    data_dir = tmp_path / "data"
+    log_path = tmp_path / "postgres.log"
+
+    bin_dir, lib_dir = _prepare_postgres_runtime_tree(str(runtime_root))
+    env = _postgres_runtime_env_for(lib_dir)
+    port = _pick_unused_port()
+
+    initdb = subprocess.run(
+        [
+            os.path.join(bin_dir, "initdb"),
+            "-D",
+            str(data_dir),
+            "-U",
+            "postgres",
+            "-A",
+            "trust",
+            "--no-sync",
+            "--no-locale",
+            "-E",
+            "UTF8",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+    )
+    assert (
+        initdb.returncode == 0
+    ), f"postgres initdb failed:\n{initdb.stdout}\n{initdb.stderr}"
+
+    started = False
+    try:
+        start = subprocess.run(
+            [
+                os.path.join(bin_dir, "pg_ctl"),
+                "-D",
+                str(data_dir),
+                "-l",
+                str(log_path),
+                "-o",
+                f"-F -p {port}",
+                "-w",
+                "start",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+        assert (
+            start.returncode == 0
+        ), (
+            "postgres server start failed:\n"
+            f"{start.stdout}\n{start.stderr}\n"
+            f"{log_path.read_text() if log_path.exists() else ''}"
+        )
+        started = True
+
+        result = CEvaluator(
+            backend="self",
+            allow_unimplemented_backend=True,
+        ).run_translation_units_with_system_cc(
+            query_units,
+            optimize=True,
+            base_dir=base_dir,
+            jobs=translation_unit_jobs(),
+            include_dirs=query_include_dirs,
+            cpp_args=query_cpp_args,
+            link_args=_postgres_link_args(),
+            prog_args=[
+                f"host=127.0.0.1 port={port} dbname=postgres user=postgres"
+            ],
+            timeout=180,
+        )
+
+        assert (
+            result.returncode == 0
+        ), f"postgres self-backend query failed:\n{result.stdout}\n{result.stderr}"
+        assert "server_version_num=170004" in result.stdout
+        assert "alpha_score=17" in result.stdout
+        assert "sum=52" in result.stdout
+        assert "temp_rows=0" in result.stdout
+        assert "OK" in result.stdout
+    finally:
+        if started:
+            subprocess.run(
+                [
+                    os.path.join(bin_dir, "pg_ctl"),
+                    "-D",
+                    str(data_dir),
+                    "-m",
+                    "fast",
+                    "-w",
+                    "stop",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=env,
+            )
+
+
+@pytest.mark.integration
 def test_postgres_runtime_with_system_link_depends_on():
     _ensure_postgres_support_archives()
 
@@ -765,6 +935,34 @@ def test_postgres_runtime_with_system_link_depends_on():
     assert (
         result.returncode == 0
     ), f"postgres system-link runtime failed:\n{result.stdout}\n{result.stderr}"
+    assert "libpq version 170004" in result.stdout
+    assert "conninfo: host=1 port=1 dbname=1" in result.stdout
+    assert "OK" in result.stdout
+
+
+@pytest.mark.integration
+def test_postgres_runtime_with_self_backend_system_link_depends_on():
+    _ensure_postgres_support_archives()
+
+    units, base_dir = _postgres_units()
+
+    result = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).run_translation_units_with_system_cc(
+        units,
+        optimize=True,
+        base_dir=base_dir,
+        jobs=translation_unit_jobs(),
+        include_dirs=translation_unit_include_dirs(units),
+        cpp_args=_postgres_cpp_args(),
+        link_args=_postgres_link_args(),
+        timeout=180,
+    )
+
+    assert (
+        result.returncode == 0
+    ), f"postgres self-backend system-link runtime failed:\n{result.stdout}\n{result.stderr}"
     assert "libpq version 170004" in result.stdout
     assert "conninfo: host=1 port=1 dbname=1" in result.stdout
     assert "OK" in result.stdout

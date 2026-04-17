@@ -174,6 +174,21 @@ def pcre_compiled_units():
     return compiled_units
 
 
+@pytest.fixture(scope="module")
+def pcre_compiled_units_self():
+    units = _pcre_runtime_units()
+    compiled_units = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).compile_translation_units(
+        units,
+        base_dir=projects_dir,
+        jobs=translation_unit_jobs(),
+        cpp_args=PCRE_CPP_ARGS,
+    )
+    return compiled_units
+
+
 @pytest.mark.skipif(not os.path.isdir(pcre_dir), reason="pcre-8.45 not found")
 def test_pcre_native_runtime(native_pcre_bin):
     """Run test_pcre_main with natively compiled pcre (baseline)."""
@@ -200,6 +215,25 @@ def test_pcre_pcc_runtime_with_system_link(pcre_compiled_units):
     assert (
         result.returncode == 0
     ), f"pcc system-link pcre test failed:\n{result.stdout}\n{result.stderr}"
+    assert "53/53 tests passed" in result.stdout
+
+
+@pytest.mark.skipif(not os.path.isdir(pcre_dir), reason="pcre-8.45 not found")
+def test_pcre_self_backend_runtime_with_system_link(pcre_compiled_units_self):
+    result = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).run_compiled_translation_units_with_system_cc(
+        pcre_compiled_units_self,
+        optimize=True,
+        base_dir=projects_dir,
+        link_args=["-lm"],
+        timeout=180,
+    )
+
+    assert (
+        result.returncode == 0
+    ), f"pcc self-backend pcre system-link test failed:\n{result.stdout}\n{result.stderr}"
     assert "53/53 tests passed" in result.stdout
 
 

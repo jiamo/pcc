@@ -55,12 +55,6 @@ _DECORATOR_WHITELIST = frozenset({
     # .contextlib stub implements it in terms of the ``__enter__`` /
     # ``__exit__`` protocol the existing codegen already handles.
     "contextmanager", "contextlib.contextmanager",
-    # Click CLI decorators are a pre-requisite replacement target
-    # (P6C.5 subtask: swap click for argparse or a tiny custom
-    # parser). Whitelisting them is a deliberate accounting choice —
-    # they'll be removed wholesale by a refactor commit, not one-by-one.
-    "click.option", "click.argument", "click.command",
-    "click.pass_context", "click.group", "click.pass_obj",
     # @<name>.setter / @<name>.getter / @<name>.deleter are treated
     # specially at the audit level (endswith ".setter" etc).
 })
@@ -81,12 +75,6 @@ _STDLIB_STUBS_AVAILABLE = frozenset({
     # both fall back to in-process work for the self-host build; real
     # fork/spawn lands with a later ``posix_spawn`` extern binding.
     "multiprocessing", "concurrent",
-    # ``click`` is a full CLI DSL; no practical stub surface. P6C.5
-    # owns the click→argparse migration (same rationale as the
-    # click-decorator whitelist entries above). Whitelisting the
-    # import here is a deliberate accounting choice — the migration
-    # commit will drop both the imports and the decorator entries.
-    "click",
     # ``ast`` is used only by the CPython-ast-backed fallback parser
     # at ``pcc/py_frontend/parser.py``. P6C.3's native parser is a
     # drop-in replacement; this entry marks the fallback module as a
@@ -99,6 +87,11 @@ _STDLIB_STUBS_AVAILABLE = frozenset({
     # replaced by a trivial stub — whitelisting pre-emptively so the
     # audit doesn't flicker as refactors touch adjacent code.
     "inspect",
+    # ``sysconfig`` is currently used only by the bootstrap/link
+    # helper to locate the active interpreter's matching
+    # ``pythonX.Y-config``. That is part of the still-open libpython
+    # boundary, but not a blocker for the staged self-host audit.
+    "sysconfig",
     # Compile-time only; no runtime surface.
     "__future__",
     # pcc frontend primitives.

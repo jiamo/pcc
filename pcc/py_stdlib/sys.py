@@ -12,10 +12,24 @@ from pcc.extern import extern, c_int, c_int64, c_str, c_ptr
 # libc glue.
 exit_c: "extern" = extern("exit", (c_int,), )  # noreturn; treat as void
 _getenv: "extern" = extern("getenv", (c_str,), c_str)
+_program_argc: "extern" = extern("py_program_argc", (), c_int64)
+_program_argv: "extern" = extern("py_program_argv", (c_int64,), c_str)
 
 
-# Populated from main's argc/argv by the startup glue (P6C.5 work).
-argv: "list[str]" = []
+def _load_argv() -> "list[str]":
+    out: "list[str]" = []
+    total = _program_argc()
+    i = 0
+    while i < total:
+        arg = _program_argv(i)
+        if arg is None:
+            break
+        out.append(arg)
+        i += 1
+    return out
+
+
+argv: "list[str]" = _load_argv()
 
 
 def exit(code: int = 0) -> None:

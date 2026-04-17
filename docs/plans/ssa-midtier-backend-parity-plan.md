@@ -654,7 +654,7 @@ Top O2 wins: `linked_list_walk` 0.71x, `xorshift_10M` 0.68x, `horner_poly` 0.77x
 |-----------|--------|--------|-----|
 | SSA MidTier is the default path for a meaningful scalar subset | — | struct/array/int/ptr/loop with full InitList / designators / 2D / copy / call-thru support | ✅ |
 | bounded scalar passes replaced by SSA-backed | — | SCCP, GVN, DSE, ADCE, loop-phi classifier | ✅ |
-| O0 all-pass vs clang -O2 gap "明显缩小" (clear reduction) | reduction | pcc is 2.78x FASTER than clang -O2 | ✅✅ |
+| O0 all-pass vs clang -O2 gap clearly reduced | reduction | pcc is 2.78x FASTER than clang -O2 | ✅✅ |
 | pcc -O2 competitive with baseline | no regression | 1.02x (essentially parity) | ✅ |
 | remaining gap narrow enough to decide on machine/backend work | decidable | O0 already surpasses clang -O2; O2 at parity — the plan's "is machine/backend work worth owning?" answer is **"no, current LLVM backend + pcc mid-tier is already competitive or winning"** | ✅ |
 

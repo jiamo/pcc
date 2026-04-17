@@ -42,6 +42,22 @@ def zstd_compiled_units():
     return compiled_units, base_dir
 
 
+@pytest.fixture(scope="module")
+def zstd_compiled_units_self():
+    units, base_dir = _zstd_units()
+    compiled_units = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).compile_translation_units(
+        units,
+        base_dir=base_dir,
+        jobs=translation_unit_jobs(),
+        include_dirs=translation_unit_include_dirs(units),
+        cpp_args=_zstd_cpp_args(),
+    )
+    return compiled_units, base_dir
+
+
 @pytest.mark.skipif(not os.path.isdir(ZSTD_LIB_DIR), reason="zstd-1.5.6/lib not found")
 @pytest.mark.integration
 def test_zstd_runtime_with_mcjit_depends_on(zstd_compiled_units):
@@ -70,6 +86,28 @@ def test_zstd_runtime_with_system_link_depends_on(zstd_compiled_units):
     assert (
         result.returncode == 0
     ), f"zstd system-link runtime failed:\n{result.stdout}\n{result.stderr}"
+    assert "zstd version 1.5.6" in result.stdout
+    assert "roundtrip: hello, zstd!" in result.stdout
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not os.path.isdir(ZSTD_LIB_DIR), reason="zstd-1.5.6/lib not found")
+def test_zstd_runtime_with_self_backend_system_link_depends_on(zstd_compiled_units_self):
+    compiled_units, base_dir = zstd_compiled_units_self
+
+    result = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).run_compiled_translation_units_with_system_cc(
+        compiled_units,
+        optimize=True,
+        base_dir=base_dir,
+        timeout=180,
+    )
+
+    assert (
+        result.returncode == 0
+    ), f"zstd self backend system-link runtime failed:\n{result.stdout}\n{result.stderr}"
     assert "zstd version 1.5.6" in result.stdout
     assert "roundtrip: hello, zstd!" in result.stdout
     assert "OK" in result.stdout

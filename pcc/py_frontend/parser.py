@@ -20,7 +20,7 @@ from __future__ import annotations
 import ast as _py_ast
 from typing import Optional
 
-from pcc.py_frontend import py_ast as pa
+from . import py_ast as pa
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +537,9 @@ class _Lifter:
         values = [self.lift_expr(v) for v in node.values]
         # Right-fold so each BoolExpr node holds two children.
         result = values[-1]
-        for left in reversed(values[:-1]):
+        i = len(values) - 2
+        while i >= 0:
+            left = values[i]
             result = pa.BoolExpr(
                 span=span,
                 ty=_DYN,
@@ -545,6 +547,7 @@ class _Lifter:
                 left=left,
                 right=result,
             )
+            i -= 1
         return result
 
     def _expr_Compare(self, node: _py_ast.Compare) -> pa.Expr:
@@ -582,10 +585,13 @@ class _Lifter:
             prev = right
         # Right-fold into BoolExpr("and", ...).
         result: pa.Expr = comparisons[-1]
-        for c in reversed(comparisons[:-1]):
+        i = len(comparisons) - 2
+        while i >= 0:
+            c = comparisons[i]
             result = pa.BoolExpr(
                 span=span, ty=_DYN, op="and", left=c, right=result
             )
+            i -= 1
         return result
 
     def _expr_Call(self, node: _py_ast.Call) -> pa.Call:
@@ -910,6 +916,7 @@ class _Lifter:
                     else None,
                     default=default_expr,
                     kind="pos_only",
+                    has_default=idx_in_all >= default_offset,
                 )
             )
 
@@ -928,6 +935,7 @@ class _Lifter:
                     else None,
                     default=default_expr,
                     kind="pos",
+                    has_default=idx_in_all >= default_offset,
                 )
             )
 
@@ -941,6 +949,7 @@ class _Lifter:
                     else None,
                     default=None,
                     kind="*args",
+                    has_default=False,
                 )
             )
 
@@ -956,6 +965,7 @@ class _Lifter:
                     else None,
                     default=default_expr,
                     kind="kw_only",
+                    has_default=default_node is not None,
                 )
             )
 
@@ -969,6 +979,7 @@ class _Lifter:
                     else None,
                     default=None,
                     kind="**kwargs",
+                    has_default=False,
                 )
             )
 
@@ -1033,8 +1044,8 @@ class _Lifter:
 # ---------------------------------------------------------------------------
 
 _PRIMITIVE_TYPES: dict[str, pa.Type] = {
-    "int": pa.IntType(name="int"),
-    "float": pa.FloatType(name="float"),
+    "int": pa.IntType(name="int", width=64, signed=True),
+    "float": pa.FloatType(name="float", width=64),
     "bool": pa.BoolType(name="bool"),
     "str": pa.StrType(name="str"),
     "None": pa.NoneType(name="None"),

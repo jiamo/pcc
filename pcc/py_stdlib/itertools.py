@@ -74,9 +74,9 @@ def groupby(iterable, key=None):
     for item in iterable:
         k = key(item)
         if group and k != last_key:
-            yield last_key, iter(group)
+            yield (last_key, iter(group))
             group = []
         group.append(item)
         last_key = k
     if group:
-        yield last_key, iter(group)
+        yield (last_key, iter(group))

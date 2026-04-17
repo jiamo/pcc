@@ -88,6 +88,14 @@ def _normalize_backend_name(value: str | None) -> str:
     return candidate
 
 
+def backend_request_allows_unimplemented(requested: str | None = None) -> bool:
+    """Return True when a request explicitly opts into an experimental backend."""
+    raw = requested
+    if raw is None:
+        raw = os.environ.get(_ENV_BACKEND)
+    return _normalize_backend_name(raw) == "self"
+
+
 def resolve_backend(
     requested: str | None = None,
     *,

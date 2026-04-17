@@ -46,6 +46,7 @@ class FileScopeObjectState:
 @dataclass
 class FileScopeFunctionState:
     type_key: str
+    function_type: object
     linkage: str
     defined: bool
     symbol_name: str
@@ -514,10 +515,13 @@ _UNSIGNED_TYPE_NAMES = frozenset(
 )
 
 
-_PCC_VAARG_DECL_RE = re.compile(r'^declare .+@"__pcc_va_arg_\d+"\(.+\)\n?', re.M)
+_PCC_VAARG_DECL_RE = re.compile(
+    r'^declare .+@(?:"__pcc_va_arg_\d+"|__pcc_va_arg_\d+)\(.+\)\n?', re.M
+)
 _PCC_VAARG_CALL_RE = re.compile(
     r"^(?P<lhs>\s*%\S+)\s*=\s*call\s+"
-    r'(?P<rettype>.+?)\s+@"(?P<name>__pcc_va_arg_\d+)"\('
+    r"(?P<rettype>[^()\s]+)\s+(?:\([^)]*\)\s+)?"
+    r'@(?:"(?P<qname>__pcc_va_arg_\d+)"|(?P<name>__pcc_va_arg_\d+))\('
     r'(?P<argtype>.+?)\s+(?P<argval>%".+?"|%\S+)\)$',
     re.M,
 )
@@ -638,7 +642,7 @@ def _resolve_node_type(node_type):
         if isinstance(inner, c_ast.FuncDecl):
             ret_type = _resolve_node_type(inner.type)
             param_types = []
-            is_var_arg = False
+            is_var_arg = inner.args is None
             if inner.args:
                 for p in inner.args.params:
                     if isinstance(p, c_ast.EllipsisParam):
@@ -716,9 +720,9 @@ def _resolve_node_type(node_type):
                         )
                     if isinstance(ir_t, ir.PointerType):
                         sz = 8
-                    if self._is_floating_ir_type(ir_t):
-                        sz = self._ir_type_size(ir_t)
-                    al = self._ir_type_align(ir_t)
+                    if _is_floating_ir_type_static(ir_t):
+                        sz = _ir_type_size_static(ir_t)
+                    al = _ir_type_align_static(ir_t)
                     if sz > max_size:
                         max_size = sz
                     if al > max_align:
@@ -743,6 +747,59 @@ def _resolve_node_type(node_type):
     elif isinstance(node_type, c_ast.ArrayDecl):
         return voidptr_t  # array params decay to pointer
     return int64_t
+
+
+def _is_floating_ir_type_static(ir_type):
+    return isinstance(ir_type, (ir.FloatType, ir.DoubleType))
+
+
+def _ir_type_align_static(ir_type):
+    custom_align = getattr(ir_type, "custom_align", None)
+    if custom_align is not None:
+        return custom_align
+    if isinstance(ir_type, ir.VoidType):
+        return 1
+    if isinstance(ir_type, ir.IntType):
+        return min(ir_type.width // 8, 8)
+    if isinstance(ir_type, ir.FloatType):
+        return 4
+    if isinstance(ir_type, ir.DoubleType):
+        return 8
+    if isinstance(ir_type, ir.PointerType):
+        return 8
+    if isinstance(ir_type, ir.ArrayType):
+        return _ir_type_align_static(ir_type.element)
+    if _is_struct_ir_type(ir_type):
+        if not ir_type.elements:
+            return 1
+        return max(_ir_type_align_static(e) for e in ir_type.elements)
+    return 8
+
+
+def _ir_type_size_static(ir_type):
+    custom_size = getattr(ir_type, "custom_size", None)
+    if custom_size is not None:
+        return custom_size
+    if isinstance(ir_type, ir.IntType):
+        return ir_type.width // 8
+    if isinstance(ir_type, ir.FloatType):
+        return 4
+    if isinstance(ir_type, ir.DoubleType):
+        return 8
+    if isinstance(ir_type, ir.PointerType):
+        return 8
+    if isinstance(ir_type, ir.ArrayType):
+        return int(ir_type.count) * _ir_type_size_static(ir_type.element)
+    if _is_struct_ir_type(ir_type):
+        offset = 0
+        for elem in ir_type.elements:
+            align = _ir_type_align_static(elem)
+            offset = (offset + align - 1) & ~(align - 1)
+            offset += _ir_type_size_static(elem)
+        struct_align = _ir_type_align_static(ir_type)
+        offset = (offset + struct_align - 1) & ~(struct_align - 1)
+        return offset
+    return 8
 
 
 def _is_struct_ir_type(ir_type):
@@ -1781,11 +1838,12 @@ class LLVMCodeGenerator(object):
 
         # Emit the call
         is_void = isinstance(ftype.return_type, ir.VoidType)
+        call_target = self._direct_call_callee(callee_func, call_args)
         if is_void:
-            self.builder.call(callee_func, call_args)
+            self.builder.call(call_target, call_args)
             return None
 
-        result = self.builder.call(callee_func, call_args, name=inst.name)
+        result = self.builder.call(call_target, call_args, name=inst.name)
         # If the actual LLVM return type doesn't match the SSA metadata
         # type (e.g. builder defaulted to `int` for an undeclared
         # `strlen` but LLVM knows it returns `size_t`/i64), convert the
@@ -2048,6 +2106,14 @@ class LLVMCodeGenerator(object):
             )
         else:
             gv = existing
+            if definition_kind != "extern":
+                try:
+                    if self._is_file_scope_static(storage):
+                        gv.linkage = "internal"
+                    elif getattr(gv, "linkage", "") == "external":
+                        gv.linkage = ""
+                except Exception:
+                    pass
             self.define(name, (ir_type, gv))
 
         if state.definition_kind == "definition":
@@ -2086,14 +2152,30 @@ class LLVMCodeGenerator(object):
         if state is None:
             self._file_scope_function_states[name] = FileScopeFunctionState(
                 type_key=type_key,
+                function_type=function_type,
                 linkage=linkage,
                 defined=is_definition,
                 symbol_name=symbol_name,
             )
             return symbol_name
 
-        if state.type_key != type_key:
+        if (
+            is_definition
+            and self._is_no_prototype_function_ir_type(function_type)
+            and isinstance(state.function_type, ir.FunctionType)
+            and len(getattr(state.function_type, "args", ())) > 0
+        ):
             raise SemanticError(f"conflicting types for function '{name}'")
+
+        if not self._are_compatible_function_ir_types(
+            state.function_type, function_type
+        ):
+            raise SemanticError(f"conflicting types for function '{name}'")
+        merged_function_type = self._merge_function_ir_types(
+            state.function_type, function_type
+        )
+        state.function_type = merged_function_type
+        state.type_key = str(merged_function_type)
         if state.linkage != linkage:
             raise SemanticError(f"conflicting linkage for function '{name}'")
         if state.symbol_name != symbol_name:
@@ -2109,6 +2191,41 @@ class LLVMCodeGenerator(object):
         if len(lhs_args) != len(rhs_args):
             return False
         return all(str(lhs) == str(rhs) for lhs, rhs in zip(lhs_args, rhs_args))
+
+    @staticmethod
+    def _is_no_prototype_function_ir_type(function_type):
+        return (
+            isinstance(function_type, ir.FunctionType)
+            and bool(getattr(function_type, "var_arg", False))
+            and len(getattr(function_type, "args", ())) == 0
+        )
+
+    @classmethod
+    def _are_compatible_function_ir_types(cls, existing_type, new_type):
+        if str(existing_type.return_type) != str(new_type.return_type):
+            return False
+
+        existing_no_proto = cls._is_no_prototype_function_ir_type(existing_type)
+        new_no_proto = cls._is_no_prototype_function_ir_type(new_type)
+        if existing_no_proto and new_no_proto:
+            return True
+        if existing_no_proto or new_no_proto:
+            concrete = new_type if existing_no_proto else existing_type
+            return not bool(getattr(concrete, "var_arg", False))
+
+        if bool(getattr(existing_type, "var_arg", False)) != bool(
+            getattr(new_type, "var_arg", False)
+        ):
+            return False
+        return cls._function_arg_types_match(existing_type.args, new_type.args)
+
+    @classmethod
+    def _merge_function_ir_types(cls, existing_type, new_type):
+        if cls._is_no_prototype_function_ir_type(
+            existing_type
+        ) and not cls._is_no_prototype_function_ir_type(new_type):
+            return new_type
+        return existing_type
 
     def external_definitions(self):
         defs = []
@@ -2210,17 +2327,26 @@ class LLVMCodeGenerator(object):
     def _mark_unsigned(self, binding):
         """Mark a concrete IR binding as having unsigned type."""
         if binding is not None:
-            self._unsigned_bindings.add(id(binding))
+            try:
+                binding._pcc_unsigned_binding = True
+            except (AttributeError, TypeError):
+                self._unsigned_bindings.add(binding)
 
     def _mark_unsigned_pointee(self, binding):
         """Mark a pointer/array binding whose immediate pointee is unsigned."""
         if binding is not None:
-            self._unsigned_pointee_bindings.add(id(binding))
+            try:
+                binding._pcc_unsigned_pointee_binding = True
+            except (AttributeError, TypeError):
+                self._unsigned_pointee_bindings.add(binding)
 
     def _mark_unsigned_return(self, binding):
         """Mark a function or function-pointer binding with unsigned return."""
         if binding is not None:
-            self._unsigned_return_bindings.add(id(binding))
+            try:
+                binding._pcc_unsigned_return_binding = True
+            except (AttributeError, TypeError):
+                self._unsigned_return_bindings.add(binding)
 
     def _is_unsigned_val(self, val):
         """Check if a value should use unsigned operations."""
@@ -2228,13 +2354,22 @@ class LLVMCodeGenerator(object):
         return getattr(val, "_is_unsigned", False)
 
     def _is_unsigned_binding(self, binding):
-        return binding is not None and id(binding) in self._unsigned_bindings
+        return binding is not None and (
+            getattr(binding, "_pcc_unsigned_binding", False)
+            or binding in self._unsigned_bindings
+        )
 
     def _is_unsigned_pointee_binding(self, binding):
-        return binding is not None and id(binding) in self._unsigned_pointee_bindings
+        return binding is not None and (
+            getattr(binding, "_pcc_unsigned_pointee_binding", False)
+            or binding in self._unsigned_pointee_bindings
+        )
 
     def _is_unsigned_return_binding(self, binding):
-        return binding is not None and id(binding) in self._unsigned_return_bindings
+        return binding is not None and (
+            getattr(binding, "_pcc_unsigned_return_binding", False)
+            or binding in self._unsigned_return_bindings
+        )
 
     def _propagate_binding_tags(self, value, binding):
         """Copy signedness-related metadata from a binding to a produced value."""
@@ -2248,10 +2383,16 @@ class LLVMCodeGenerator(object):
 
     def _mark_vla_binding(self, binding):
         if binding is not None:
-            self._vla_bindings.add(id(binding))
+            try:
+                binding._pcc_vla_binding = True
+            except (AttributeError, TypeError):
+                self._vla_bindings.add(binding)
 
     def _is_vla_binding(self, binding):
-        return binding is not None and id(binding) in self._vla_bindings
+        return binding is not None and (
+            getattr(binding, "_pcc_vla_binding", False)
+            or binding in self._vla_bindings
+        )
 
     def _collect_function_label_names(self, node):
         labels = []
@@ -2555,19 +2696,70 @@ class LLVMCodeGenerator(object):
         """Create or reuse a global variable, avoiding DuplicatedNameError."""
         existing = self.module.globals.get(name)
         if existing:
+            if external:
+                try:
+                    existing.linkage = "external"
+                except Exception:
+                    pass
+                try:
+                    existing.initializer = None
+                except Exception:
+                    pass
             return existing
         try:
             gv = ir.GlobalVariable(self.module, ir_type, name)
-            if not external:
+            if external:
+                try:
+                    gv.linkage = "external"
+                except Exception:
+                    pass
+            else:
                 gv.initializer = ir.Constant(ir_type, None)
             return gv
         except Exception:
             gv = self.module.globals.get(name) or ir.GlobalVariable(
                 self.module, ir_type, self.module.get_unique_name(name)
             )
-            if not external and getattr(gv, "initializer", None) is None:
+            if external:
+                try:
+                    gv.linkage = "external"
+                except Exception:
+                    pass
+                try:
+                    gv.initializer = None
+                except Exception:
+                    pass
+            elif getattr(gv, "initializer", None) is None:
                 gv.initializer = ir.Constant(ir_type, None)
             return gv
+
+    def _bind_local_extern_object(self, name, ir_type):
+        """Bind a block-scope extern object name without mutating file-scope storage.
+
+        A local `extern int x;` inside a function should resolve to the visible
+        file-scope object `x`, not retroactively turn a defined global into an
+        undefined external declaration (gcc_torture scope-1.c).
+        """
+        state = self._file_scope_object_states.get(name)
+        if state is not None:
+            bind_type = self._merge_object_ir_types(state.ir_type, ir_type)
+            state.ir_type = bind_type
+            state.type_key = str(bind_type)
+            symbol_name = state.symbol_name
+            existing = self.module.globals.get(symbol_name)
+            if existing is None:
+                existing = self._safe_global_var(
+                    bind_type,
+                    symbol_name,
+                    external=(state.definition_kind == "extern"),
+                )
+            self.define(name, (bind_type, existing))
+            return
+
+        existing = self.module.globals.get(name)
+        if existing is None:
+            existing = self._safe_global_var(ir_type, name, external=True)
+        self.define(name, (ir_type, existing))
 
     # External C globals lazily declared on first use.
     _EXTERN_GLOBAL_VARS = {
@@ -2638,6 +2830,37 @@ class LLVMCodeGenerator(object):
             return future_type, future_type.return_type
         return ir.FunctionType(int32_t, [], var_arg=call_arg_count > 0), int32_t
 
+    def _direct_call_callee(self, callee_func, call_args):
+        """Materialize a concrete call ABI for old-style no-prototype calls.
+
+        On arm64 Darwin, calling a declared-but-unprototyped function through an
+        ``...``-only IR signature can misplace fixed arguments in registers. A
+        call like ``strlen(format)`` inside ``f(int, char*, ...)`` then leaves
+        the pointer in ``x1`` instead of the callee-expected ``x0`` and crashes
+        in ``strlen``. Bitcasting the callee to a concrete fixed-parameter
+        function type derived from the promoted call operands matches clang's
+        old-style call ABI lowering.
+        """
+        if (
+            not isinstance(callee_func, ir.Function)
+            or not call_args
+            or not self._is_no_prototype_function_ir_type(
+                getattr(callee_func, "function_type", None)
+            )
+        ):
+            return callee_func
+
+        call_type = ir.FunctionType(
+            callee_func.function_type.return_type,
+            [arg.type for arg in call_args],
+            var_arg=False,
+        )
+        return self.builder.bitcast(
+            callee_func,
+            call_type.as_pointer(),
+            name=f"{callee_func.name}.callabi",
+        )
+
     def _declare_implicit_function(self, name, call_arg_count=0):
         function_type, ret_ir = self._implicit_function_ir_type(
             name, call_arg_count=call_arg_count
@@ -2646,6 +2869,7 @@ class LLVMCodeGenerator(object):
         if state is None:
             self._file_scope_function_states[name] = FileScopeFunctionState(
                 type_key=str(function_type),
+                function_type=function_type,
                 linkage="external",
                 defined=False,
                 symbol_name=name,
@@ -2787,7 +3011,7 @@ class LLVMCodeGenerator(object):
         if array_list is not None:
             reversed_list = reversed(array_list)
             for dim in reversed_list:
-                ir_type = ir.ArrayType(ir_type, dim)
+                ir_type = self._checked_array_ir_type(ir_type, dim)
             ir_type.dim_array = array_list
 
         if point_level != 0:
@@ -3076,7 +3300,7 @@ class LLVMCodeGenerator(object):
         try:
             cond_val, _ = self.codegen(node.cond)
             if isinstance(cond_val, ir.Constant):
-                val = cond_val.constant
+                val = self._constant_raw_value(cond_val)
                 if isinstance(val, int) and val == 0:
                     msg = node.message
                     if hasattr(msg, 'value'):
@@ -3287,6 +3511,21 @@ class LLVMCodeGenerator(object):
                 self._tag_unsigned(result)
 
         elif node.op == "&":
+            if isinstance(node.expr, c_ast.StructRef) and self._is_offsetof_like_structref(
+                node.expr
+            ):
+                try:
+                    offset, field_type = self._eval_offsetof_structref(node.expr)
+                except CodegenError:
+                    pass
+                else:
+                    result = self.builder.inttoptr(
+                        ir.Constant(int64_t, offset),
+                        ir.PointerType(field_type),
+                        name="offsetofptr",
+                    )
+                    self._set_expr_ir_type(node, result.type)
+                    return result, None
             name_ir, name_ptr = self.codegen(node.expr)
             if name_ptr is None:
                 # Functions are already first-class pointers in LLVM IR.
@@ -3779,8 +4018,6 @@ class LLVMCodeGenerator(object):
         return c_ast.InitList(grouped_exprs, init_node.coord)
 
     def _designator_index_bounds(self, designator):
-        if isinstance(designator, c_ast.ID):
-            return None
         if isinstance(designator, c_ast.RangeDesignator):
             try:
                 start = int(self._eval_const_expr(designator.start))
@@ -4365,7 +4602,7 @@ class LLVMCodeGenerator(object):
         result = 0
         for i, byte_val in enumerate(values):
             shift_bits = 8 * (i if self._is_little_endian() else (byte_width - 1 - i))
-            raw = getattr(byte_val, "constant", 0)
+            raw = getattr(byte_val, "constant", getattr(byte_val, "value", 0))
             if not isinstance(raw, int):
                 raw = 0
             result |= (raw & 0xFF) << shift_bits
@@ -4383,7 +4620,7 @@ class LLVMCodeGenerator(object):
         width = len(byte_values)
         for i, byte_val in enumerate(byte_values):
             shift_bits = 8 * (i if self._is_little_endian() else (width - 1 - i))
-            raw = getattr(byte_val, "constant", 0)
+            raw = getattr(byte_val, "constant", getattr(byte_val, "value", 0))
             if not isinstance(raw, int):
                 raw = 0
             result |= (raw & 0xFF) << shift_bits
@@ -4943,9 +5180,19 @@ class LLVMCodeGenerator(object):
             elem_ir_type = int8_t
         arr_ir_type = elem_ir_type
         for dim in reversed(dims):
-            arr_ir_type = ir.ArrayType(arr_ir_type, dim)
+            arr_ir_type = self._checked_array_ir_type(arr_ir_type, dim)
         arr_ir_type.dim_array = dims
         return arr_ir_type
+
+    def _checked_array_ir_type(self, element_ir_type, dim):
+        """Build an array type while matching clang's oversized-object rejection."""
+        if dim < 0:
+            raise SemanticError("array size is negative")
+        element_size = self._ir_type_size(element_ir_type)
+        total_size = element_size * int(dim)
+        if total_size >= (1 << 61):
+            raise SemanticError(f"array is too large ({int(dim)} elements)")
+        return ir.ArrayType(element_ir_type, dim)
 
     def _resolve_param_type(self, param):
         """Resolve a function parameter type, handling typedefs and pointers."""
@@ -4958,6 +5205,10 @@ class LLVMCodeGenerator(object):
             if isinstance(elem_ir_type, ir.VoidType):
                 elem_ir_type = int8_t
             return ir.PointerType(elem_ir_type)
+        if isinstance(node_type, c_ast.TypeDecl) and isinstance(
+            node_type.type, c_ast.FuncDecl
+        ):
+            return self._build_func_ptr_type(node_type.type)
         t = self._resolve_ast_type(node_type)
         if isinstance(t, ir.ArrayType):
             return ir.PointerType(t.element)
@@ -4995,6 +5246,8 @@ class LLVMCodeGenerator(object):
         elif isinstance(node_type, c_ast.TypeDecl):
             if isinstance(node_type.type, c_ast.IdentifierType):
                 return self._get_ir_type(node_type.type.names)
+            elif isinstance(node_type.type, c_ast.FuncDecl):
+                return self._build_function_ir_type(node_type.type)[0]
             elif isinstance(node_type.type, c_ast.Struct):
                 return self.codegen_Struct(node_type.type)
             elif isinstance(node_type.type, c_ast.Union):
@@ -5062,7 +5315,7 @@ class LLVMCodeGenerator(object):
         """Build an IR function type from a FuncDecl AST node."""
         ret_ir, _ = self.codegen(func_decl_node)
         param_types = []
-        is_var_arg = False
+        is_var_arg = func_decl_node.args is None
         if func_decl_node.args:
             for param in func_decl_node.args.params:
                 if isinstance(param, c_ast.EllipsisParam):
@@ -5080,6 +5333,8 @@ class LLVMCodeGenerator(object):
         """Build the most specific callable type we can infer for a FuncDef."""
         ret_ir, _ = self.codegen(func_def_node.decl.type)
         param_infos, is_var_arg = self._funcdef_param_infos(func_def_node)
+        if getattr(func_def_node.decl.type, "args", None) is None:
+            is_var_arg = True
         arg_types = [param_type for _name, param_type, _decl in param_infos]
         if isinstance(ret_ir, ir.VoidType):
             ret_ir = ir.VoidType()
@@ -5128,6 +5383,13 @@ class LLVMCodeGenerator(object):
             return self.builder.load(ptr, name=name)
         except Exception:
             return ptr
+
+    @staticmethod
+    def _constant_raw_value(value):
+        raw_value = getattr(value, "value", None)
+        if raw_value is None:
+            raw_value = getattr(value, "constant", None)
+        return raw_value
 
     def _decay_array_value_to_pointer(self, value, name="arraydecay"):
         """Convert an array value (including string literals) to &value[0]."""
@@ -5184,7 +5446,7 @@ class LLVMCodeGenerator(object):
             if isinstance(target_type, ir.VoidType):
                 return val
             return self._zero_initializer(target_type)
-        if val.type == target_type:
+        if self._same_ir_type_semantics(val.type, target_type):
             return val
         if isinstance(val.type, ir.IntType) and self._is_floating_ir_type(target_type):
             return self._int_to_float(val, target_type)
@@ -5239,7 +5501,7 @@ class LLVMCodeGenerator(object):
             target_type, ir.PointerType
         ):
             ptr = self._decay_array_value_to_pointer(val)
-            if ptr.type == target_type:
+            if self._same_ir_type_semantics(ptr.type, target_type):
                 return ptr
             return self.builder.bitcast(ptr, target_type)
         return val
@@ -5252,6 +5514,22 @@ class LLVMCodeGenerator(object):
 
     def _is_aggregate_ir_type(self, ir_type):
         return _is_struct_ir_type(ir_type) or getattr(ir_type, "is_union", False)
+
+    def _same_ir_type_semantics(self, lhs, rhs):
+        if lhs is rhs:
+            return True
+        if type(lhs) is not type(rhs):
+            return False
+        if isinstance(lhs, ir.PointerType):
+            return (
+                getattr(lhs, "addrspace", 0) == getattr(rhs, "addrspace", 0)
+                and self._same_ir_type_semantics(lhs.pointee, rhs.pointee)
+            )
+        if isinstance(lhs, ir.ArrayType):
+            return lhs.count == rhs.count and self._same_ir_type_semantics(
+                lhs.element, rhs.element
+            )
+        return str(lhs) == str(rhs)
 
     def _validate_explicit_cast(self, source_type, target_type):
         if isinstance(target_type, ir.VoidType):
@@ -5386,7 +5664,7 @@ class LLVMCodeGenerator(object):
                     inner = _build_array_type(arr_node.type)
                 else:
                     inner = self._resolve_ast_type(arr_node.type)
-                return ir.ArrayType(inner, dim)
+                return self._checked_array_ir_type(inner, dim)
 
             return _build_array_type(decl.type)
         if isinstance(decl.type, c_ast.PtrDecl):
@@ -5692,7 +5970,9 @@ class LLVMCodeGenerator(object):
                 [ir.Constant(int64_t, byte_offset)],
                 name=f"{name}.offs",
             )
-        if byte_ptr.type != target_ptr_type:
+        byte_pointee = getattr(byte_ptr.type, "pointee", None)
+        target_pointee = getattr(target_ptr_type, "pointee", None)
+        if byte_pointee != target_pointee:
             return self.builder.bitcast(byte_ptr, target_ptr_type, name=name)
         return byte_ptr
 
@@ -5704,7 +5984,14 @@ class LLVMCodeGenerator(object):
 
     def _load_bitfield(self, ref):
         align = max(1, self._ir_type_align(ref.storage_ir_type))
-        raw = self.builder.load(ref.container_ptr, align=align)
+        container_ptr = ref.container_ptr
+        storage_ptr_ty = ref.storage_ir_type.as_pointer()
+        pointee = getattr(container_ptr.type, "pointee", None)
+        if pointee != ref.storage_ir_type:
+            container_ptr = self.builder.bitcast(
+                container_ptr, storage_ptr_ty, "bitfieldptr.base"
+            )
+        raw = self.builder.load(container_ptr, align=align)
         if ref.bit_offset:
             raw = self.builder.lshr(
                 raw, ir.Constant(ref.storage_ir_type, ref.bit_offset), "bitshift"
@@ -5739,12 +6026,32 @@ class LLVMCodeGenerator(object):
         if value is None:
             return
         align = max(1, self._ir_type_align(ref.storage_ir_type))
-        storage_value = self.builder.load(ref.container_ptr, align=align)
+        container_ptr = ref.container_ptr
+        storage_ptr_ty = ref.storage_ir_type.as_pointer()
+        pointee = getattr(container_ptr.type, "pointee", None)
+        if pointee != ref.storage_ir_type:
+            container_ptr = self.builder.bitcast(
+                container_ptr, storage_ptr_ty, "bitfieldptr.base"
+            )
+        storage_value = self.builder.load(container_ptr, align=align)
         if value.type != ref.semantic_ir_type:
             value = self._implicit_convert(value, ref.semantic_ir_type)
         value = self._convert_int_value(
             value, ref.storage_ir_type, result_unsigned=ref.is_unsigned
         )
+        if value.type != ref.storage_ir_type:
+            if isinstance(value.type, ir.IntType) and isinstance(
+                ref.storage_ir_type, ir.IntType
+            ):
+                if value.type.width > ref.storage_ir_type.width:
+                    value = self.builder.trunc(
+                        value, ref.storage_ir_type, "bitstore.cast"
+                    )
+                elif value.type.width < ref.storage_ir_type.width:
+                    ext = self.builder.zext if ref.is_unsigned else self.builder.sext
+                    value = ext(value, ref.storage_ir_type, "bitstore.cast")
+            else:
+                value = self._implicit_convert(value, ref.storage_ir_type)
         field_mask = self._bitfield_mask(ref.bit_width)
         field_mask_const = ir.Constant(ref.storage_ir_type, field_mask)
         if ref.bit_width < ref.storage_ir_type.width:
@@ -5764,7 +6071,7 @@ class LLVMCodeGenerator(object):
                 "bitstore.clear",
             )
             value = self.builder.or_(storage_value, value, "bitstore.merge")
-        self.builder.store(value, ref.container_ptr, align=align)
+        self.builder.store(value, container_ptr, align=align)
 
     def _refine_member_ir_type(self, aggregate_type, member_key, field_type):
         """Prefer semantic member types over storage types when available."""
@@ -5885,6 +6192,16 @@ class LLVMCodeGenerator(object):
             return 0, target_type
 
         raise CodegenError(f"Not an offsetof base: {type(node).__name__}")
+
+    def _is_offsetof_like_structref(self, node):
+        if isinstance(node, c_ast.StructRef):
+            return self._is_offsetof_like_structref(node.name)
+        if not isinstance(node, c_ast.Cast):
+            return False
+        try:
+            return int(self._eval_const_expr(node.expr)) == 0
+        except Exception:
+            return False
 
     def _infer_sizeof_operand_ir_type(self, node):
         """Infer the operand type for sizeof without emitting runtime IR."""
@@ -7007,7 +7324,9 @@ class LLVMCodeGenerator(object):
                         # Non-constant case: skip (LLVM requires constants)
                         continue
                     if case_val.type != cond_val.type:
-                        case_val = ir.Constant(cond_val.type, case_val.constant)
+                        case_val = ir.Constant(
+                            cond_val.type, self._constant_raw_value(case_val)
+                        )
                 switch_inst.add_case(case_val, label_blocks[id(item)])
 
             self._switch_contexts.append({"blocks": label_blocks})
@@ -7206,7 +7525,7 @@ class LLVMCodeGenerator(object):
             self._clear_unsigned(result)
             self._tag_value_from_decl_type(result, node.to_type.type)
             return result, None
-        if expr.type == dest_ir_type:
+        if self._same_ir_type_semantics(expr.type, dest_ir_type):
             if isinstance(dest_ir_type, ir.IntType):
                 if is_unsigned:
                     if self._is_unsigned_val(expr):
@@ -7471,15 +7790,17 @@ class LLVMCodeGenerator(object):
         )
 
         # Call and handle return type
+        call_target = self._direct_call_callee(callee_func, converted)
+
         try:
             is_void = isinstance(callee_func.return_value.type, ir.VoidType)
         except Exception:
             is_void = False
         try:
             if is_void:
-                self.builder.call(callee_func, converted)
+                self.builder.call(call_target, converted)
                 return ir.Constant(int64_t, 0), None
-            result = self.builder.call(callee_func, converted, "calltmp")
+            result = self.builder.call(call_target, converted, "calltmp")
         except (TypeError, IndexError):
             # Arg count/type mismatch — return dummy value
             return ir.Constant(int64_t, 0), None
@@ -8281,8 +8602,7 @@ class LLVMCodeGenerator(object):
         )
         if is_extern_local:
             ir_type = self._extern_decl_ir_type(node.name, node.type)
-            gv = self._safe_global_var(ir_type, node.name, external=True)
-            self.define(node.name, (ir_type, gv))
+            self._bind_local_extern_object(node.name, ir_type)
             return None, None
 
         # Static local objects: stored as internal globals with function-scoped names
@@ -8687,7 +9007,7 @@ class LLVMCodeGenerator(object):
                     dims = array_list + [dim]
                     arr_ir = elem_ir
                     for current_dim in reversed(dims):
-                        arr_ir = ir.ArrayType(arr_ir, current_dim)
+                        arr_ir = self._checked_array_ir_type(arr_ir, current_dim)
                     arr_ir.dim_array = dims
                     if not self.in_global:
                         var_addr = self._alloca_in_entry(arr_ir, node.name)
@@ -8709,7 +9029,7 @@ class LLVMCodeGenerator(object):
             if var_addr is None:
                 var_ir_type = elem_ir_type
                 for dim in reversed(array_list):
-                    var_ir_type = ir.ArrayType(var_ir_type, dim)
+                    var_ir_type = self._checked_array_ir_type(var_ir_type, dim)
                 var_ir_type.dim_array = array_list
                 if not self.in_global:
                     var_addr = self._alloca_in_entry(var_ir_type, node.name)
@@ -8819,7 +9139,7 @@ class LLVMCodeGenerator(object):
                             # NULL (i64 0) → null pointer of correct type
                             if (isinstance(init_val.type, ir.IntType)
                                     and isinstance(init_val, ir.Constant)
-                                    and init_val.constant == 0):
+                                    and self._constant_raw_value(init_val) == 0):
                                 init_val = ir.Constant(
                                     var_addr.value_type, None
                                 )
@@ -8828,7 +9148,7 @@ class LLVMCodeGenerator(object):
                             if (
                                 isinstance(init_val, ir.Constant)
                                 and isinstance(init_val.type, ir.IntType)
-                                and init_val.constant == 0
+                                and self._constant_raw_value(init_val) == 0
                             ):
                                 init_val = ir.Constant(func_ir_type, None)
                             elif init_val.type != func_ir_type:
@@ -8919,7 +9239,11 @@ class LLVMCodeGenerator(object):
             )
             gv = self._make_global_string_constant(func_name, name_hint="funcname")
             ptr = self._const_pointer_to_first_elem(gv, cstring)
-            node.ir_type = cstring
+            # `__func__` behaves like an implicitly-declared local array object,
+            # not a `char *`. Keep the expression's semantic type as the array
+            # so downstream array-ref lowering emits a byte load instead of
+            # decaying the whole expression into a pointer comparison.
+            node.ir_type = gv.type.pointee
             return ptr, gv
 
         valtype, var = self.lookup(node.name)
@@ -9191,12 +9515,43 @@ class LLVMCodeGenerator(object):
                         raise CodegenError(
                             "goto into block skips declaration with initializer is not supported"
                         )
-                    self.codegen(stmt)
+                    self._codegen_decl_before_forward_label(stmt)
                     continue
 
                 if isinstance(stmt, (c_ast.Typedef, c_ast.EmptyStatement)):
                     self.codegen(stmt)
                     continue
+
+    def _codegen_decl_before_forward_label(self, node):
+        if (
+            self.builder is None
+            or self.function is None
+            or self.builder.block is None
+            or not self.builder.block.is_terminated
+        ):
+            self.codegen(node)
+            return
+
+        saved_block = self.builder.block
+        entry_block = self.function.entry_basic_block
+        entry_builder = ir.IRBuilder(entry_block)
+        insert_before = None
+        for inst in entry_block.instructions:
+            if inst.opname not in ("phi", "alloca"):
+                insert_before = inst
+                break
+        if insert_before is not None:
+            entry_builder.position_before(insert_before)
+        else:
+            entry_builder.position_at_end(entry_block)
+
+        saved_builder = self.builder
+        self.builder = entry_builder
+        try:
+            self.codegen(node)
+        finally:
+            self.builder = saved_builder
+            self.builder.position_at_end(saved_block)
 
     def _codegen_compound_items(self, node, use_new_scope):
         scope = self.new_scope() if use_new_scope else nullcontext()
@@ -9241,6 +9596,8 @@ class LLVMCodeGenerator(object):
         self.func_return_types[funcname] = ir_type
 
         param_infos, is_var_arg = self._funcdef_param_infos(node)
+        if getattr(node.decl.type, "args", None) is None:
+            is_var_arg = True
         arg_types = [param_type for _name, param_type, _decl in param_infos]
 
         function_type = ir.FunctionType(ir_type, arg_types, var_arg=is_var_arg)
@@ -9618,7 +9975,9 @@ class LLVMCodeGenerator(object):
 
         typed_field_addr = field_addr
         target_ptr_type = ir.PointerType(semantic_field_type)
-        if field_addr.type != target_ptr_type:
+        field_pointee = getattr(field_addr.type, "pointee", None)
+        target_pointee = getattr(target_ptr_type, "pointee", None)
+        if field_pointee != target_pointee:
             try:
                 typed_field_addr = self.builder.bitcast(
                     field_addr, target_ptr_type
@@ -9754,7 +10113,9 @@ class LLVMCodeGenerator(object):
 
         typed_field_addr = field_addr
         target_ptr_type = ir.PointerType(semantic_field_type)
-        if field_addr.type != target_ptr_type:
+        field_pointee = getattr(field_addr.type, "pointee", None)
+        target_pointee = getattr(target_ptr_type, "pointee", None)
+        if field_pointee != target_pointee:
             try:
                 typed_field_addr = self.builder.bitcast(field_addr, target_ptr_type)
             except Exception:
@@ -10171,7 +10532,11 @@ class LLVMCodeGenerator(object):
                     return make_int(len(self._string_literal_data(node.expr)), 64, True)
                 ir_t = self._infer_sizeof_operand_ir_type(node.expr)
                 return make_int(self._ir_type_size(ir_t), 64, True)
-            if node.op == "&" and isinstance(node.expr, c_ast.StructRef):
+            if (
+                node.op == "&"
+                and isinstance(node.expr, c_ast.StructRef)
+                and self._is_offsetof_like_structref(node.expr)
+            ):
                 offset, _ = self._eval_offsetof_structref(node.expr)
                 return make_int(offset, 64, True)
             val = self._eval_const_expr(node.expr)
@@ -10362,8 +10727,9 @@ class LLVMCodeGenerator(object):
                 if isinstance(val, ir.values.Constant) and isinstance(
                     val.type, ir.IntType
                 ):
+                    raw_value = self._constant_raw_value(val)
                     return make_int(
-                        int(val.constant),
+                        int(raw_value),
                         val.type.width,
                         self._is_unsigned_val(val),
                     )
@@ -10381,6 +10747,20 @@ class LLVMCodeGenerator(object):
             raise CodegenError(f"Not a constant expression: {type(node).__name__}")
         elif isinstance(node, c_ast.Typename):
             return 0
+        elif isinstance(node, c_ast.ID):
+            try:
+                _, binding = self.lookup(node.name)
+            except Exception:
+                raise CodegenError(
+                    f"Not a constant expression: {type(node).__name__} {node.name!r}"
+                )
+            if isinstance(binding, ir.Constant):
+                width = getattr(binding.type, "width", 32)
+                is_unsigned = bool(getattr(binding.type, "is_unsigned", False))
+                return make_int(int(binding.value), width, is_unsigned)
+            raise CodegenError(
+                f"Not a constant expression: {type(node).__name__} {node.name!r}"
+            )
         raise CodegenError(f"Not a constant expression: {type(node).__name__}")
 
     def codegen_InitList(self, node):

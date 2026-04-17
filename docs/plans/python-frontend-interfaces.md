@@ -670,7 +670,7 @@ Harness compares pcc-produced binary's stdout+exit against
 - Change any signature in this contract.
 - Assume any un-documented function exists.
 - Touch another agent's files.
-- Run tests (per current sprint: "不测试").
+- Run tests (per current sprint: "skip tests").
 
 ---
 

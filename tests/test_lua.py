@@ -11,6 +11,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import fcntl
 import hashlib
@@ -19,6 +20,7 @@ import llvmlite.ir as ir
 import llvmlite.binding as llvm
 import pcc.evaluater.c_evaluator as c_evaluator
 from pcc.codegen.c_codegen import postprocess_ir_text
+from pcc.project import collect_translation_units, translation_unit_include_dirs
 
 this_dir = os.path.dirname(__file__)
 project_dir = os.path.dirname(this_dir)
@@ -62,6 +64,7 @@ _BACKGROUND_PID_LINE = re.compile(
     re.MULTILINE,
 )
 LUA_CPP_ARGS = ("-DLUA_USE_JUMPTABLE=0", "-DLUA_NOBUILTIN")
+SELF_BACKEND_SMOKE_TEST_FILES = ("math.lua", "calls.lua")
 
 
 def _test_cache_root():
@@ -399,6 +402,134 @@ def _compile_native_onelua():
         _release_artifact_lock(lockfile)
 
 
+def _compile_self_backend_onelua():
+    """Compile onelua.c via the self backend and link a runnable binary."""
+    onelua_path = os.path.join(lua_src_dir, "onelua.c")
+    self_backend_path = os.path.join(project_dir, "pcc", "backend", "self_backend.py")
+    if not os.path.isfile(onelua_path):
+        return "init", "onelua.c not found"
+
+    cache_key = _cache_key(
+        "lua-self-backend",
+        platform.system(),
+        LUA_CPP_ARGS,
+        _lua_preprocessor_prefix(),
+        c_evaluator._COMPILER_CACHE_FINGERPRINT,
+        file_paths=(onelua_path, self_backend_path),
+    )
+    cache_dir = os.path.join(_test_cache_root(), f"lua-self-backend-{cache_key}")
+    obj_path = os.path.join(cache_dir, "onelua_self.o")
+    bin_path = os.path.join(cache_dir, "lua_self")
+    lockfile = _artifact_lock(f"lua-self-backend-{cache_key}")
+    stage = "compile"
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    try:
+        if os.path.isfile(bin_path):
+            return "ok", bin_path
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        compile_cmd = [
+            sys.executable,
+            "-m",
+            "pcc",
+            "--backend=self",
+            "--emit-obj",
+            obj_path,
+            *[f"--cpp-arg={arg}" for arg in LUA_CPP_ARGS],
+            onelua_path,
+        ]
+        r = subprocess.run(
+            compile_cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+            cwd=project_dir,
+        )
+        if r.returncode != 0:
+            detail = r.stderr or r.stdout or "self backend compile failed"
+            return "compile", detail[:300]
+        stage = "link"
+
+        r = subprocess.run(
+            ["cc", obj_path, "-o", bin_path, "-lm", "-ldl"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if r.returncode != 0:
+            detail = r.stderr or r.stdout or "self backend link failed"
+            return "link", detail[:300]
+
+        return "ok", bin_path
+    except Exception as e:
+        return stage, f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        _release_artifact_lock(lockfile)
+
+
+def _compile_self_backend_lua_separate_tus():
+    """Compile Lua via make-derived separate translation units using the self backend."""
+    lua_dir = os.path.join(project_dir, "projects", "lua-5.5.0")
+    self_backend_path = os.path.join(project_dir, "pcc", "backend", "self_backend.py")
+    if not os.path.isdir(lua_dir):
+        return "init", "lua source dir not found"
+
+    cache_key = _cache_key(
+        "lua-self-backend-separate-tus",
+        platform.system(),
+        LUA_CPP_ARGS,
+        _lua_preprocessor_prefix(),
+        c_evaluator._COMPILER_CACHE_FINGERPRINT,
+        file_paths=(*_lua_make_tree_files(), self_backend_path),
+    )
+    cache_dir = os.path.join(_test_cache_root(), f"lua-self-backend-separate-tus-{cache_key}")
+    obj_path = os.path.join(cache_dir, "lua_sep_self.o")
+    bin_path = os.path.join(cache_dir, "lua_sep_self")
+    lockfile = _artifact_lock(f"lua-self-backend-separate-tus-{cache_key}")
+    stage = "collect"
+    try:
+        if os.path.isfile(bin_path):
+            return "ok", bin_path
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        units, base_dir = collect_translation_units(
+            lua_dir,
+            sources_from_make="lua",
+            cpp_args=LUA_CPP_ARGS,
+        )
+        stage = "compile"
+        ev = c_evaluator.CEvaluator(backend="self", allow_unimplemented_backend=True)
+        compiled_units = ev.compile_translation_units(
+            units,
+            base_dir=base_dir,
+            include_dirs=translation_unit_include_dirs(units),
+            cpp_args=LUA_CPP_ARGS,
+            frontend_opt_level=2,
+        )
+        ev.emit_compiled_units(compiled_units, emit_obj=obj_path, optimize=2)
+
+        stage = "link"
+        r = subprocess.run(
+            ["cc", obj_path, "-o", bin_path, "-lm", "-ldl"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if r.returncode != 0:
+            detail = r.stderr or r.stdout or "self backend link failed"
+            return "link", detail[:300]
+
+        return "ok", bin_path
+    except Exception as e:
+        return stage, f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        _release_artifact_lock(lockfile)
+
+
 def _compile_lua_test_libs(libs_dir):
     """Build the dynamic Lua test modules inside an isolated tests copy."""
     if not os.path.isdir(libs_dir):
@@ -601,6 +732,18 @@ def native_lua_bin():
 
 
 @pytest.fixture(scope="session")
+def self_lua_bin():
+    """Compile onelua.c via the self backend once per session."""
+    return _compile_self_backend_onelua()
+
+
+@pytest.fixture(scope="session")
+def self_lua_separate_tus_bin():
+    """Compile Lua via self backend using make-derived separate translation units."""
+    return _compile_self_backend_lua_separate_tus()
+
+
+@pytest.fixture(scope="session")
 def makefile_lua_bin():
     """Build Lua via Makefile once per session."""
     return _compile_makefile_lua()
@@ -685,6 +828,40 @@ def test_pcc_runtime_matches_native(
     ) == _normalize_runtime_stderr(native_r.stderr, native_bin)
 
 
+@pytest.mark.skipif(not os.path.isdir(lua_tests_dir), reason="testes/ not found")
+@pytest.mark.parametrize(
+    "test_file",
+    SELF_BACKEND_SMOKE_TEST_FILES,
+    ids=SELF_BACKEND_SMOKE_TEST_FILES,
+)
+def test_self_backend_runtime_matches_native_smoke(
+    test_file, self_lua_bin, native_lua_bin, lua_runtime_tests_dir
+):
+    """Smoke-test the self backend on the current real workload closure slice."""
+    self_stage, self_bin = self_lua_bin
+    if self_stage != "ok":
+        pytest.xfail(f"self backend stage '{self_stage}': {self_bin}")
+
+    native_stage, native_bin = native_lua_bin
+    if native_stage != "ok":
+        pytest.xfail(f"native stage '{native_stage}': {native_bin}")
+
+    tests_stage, tests_dir = lua_runtime_tests_dir
+    if tests_stage != "ok":
+        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+
+    self_r = _run_lua_script(self_bin, test_file, tests_dir)
+    native_r = _run_lua_script(native_bin, test_file, tests_dir)
+
+    assert self_r.returncode == native_r.returncode
+    assert _normalize_runtime_stdout(
+        self_r.stdout, self_bin
+    ) == _normalize_runtime_stdout(native_r.stdout, native_bin)
+    assert _normalize_runtime_stderr(
+        self_r.stderr, self_bin
+    ) == _normalize_runtime_stderr(native_r.stderr, native_bin)
+
+
 @pytest.mark.skipif(
     not os.path.isfile(os.path.join(lua_src_dir, "makefile")),
     reason="makefile not found",
@@ -731,3 +908,69 @@ def test_makefile_lua_all(makefile_lua_bin, lua_runtime_tests_dir):
         cwd=tests_dir,
     )
     assert r.returncode == 0, f"all.lua failed (rc={r.returncode}):\n{r.stderr[-500:]}"
+
+
+@pytest.mark.skipif(
+    not os.path.isfile(os.path.join(lua_tests_dir, "all.lua")),
+    reason="all.lua not found",
+)
+def test_self_backend_lua_all_smoke(self_lua_bin, native_lua_bin, lua_runtime_tests_dir):
+    """Run all.lua through the self backend's current curated Lua closure path."""
+    self_stage, self_bin = self_lua_bin
+    if self_stage != "ok":
+        pytest.xfail(f"self backend stage '{self_stage}': {self_bin}")
+
+    native_stage, native_bin = native_lua_bin
+    if native_stage != "ok":
+        pytest.xfail(f"native stage '{native_stage}': {native_bin}")
+
+    tests_stage, tests_dir = lua_runtime_tests_dir
+    if tests_stage != "ok":
+        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+
+    script_path = os.path.abspath(os.path.join(tests_dir, "all.lua"))
+    self_r = subprocess.run(
+        [self_bin, "-e", "_port=true", script_path],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=tests_dir,
+    )
+    native_r = subprocess.run(
+        [native_bin, "-e", "_port=true", script_path],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=tests_dir,
+    )
+
+    assert native_r.returncode == 0, f"native all.lua failed (rc={native_r.returncode}):\n{native_r.stderr[-500:]}"
+    assert self_r.returncode == 0, f"self all.lua failed (rc={self_r.returncode}):\n{self_r.stderr[-500:]}"
+    assert "final OK !!!" in self_r.stdout
+
+
+@pytest.mark.skipif(
+    not os.path.isfile(os.path.join(lua_tests_dir, "all.lua")),
+    reason="all.lua not found",
+)
+def test_self_backend_separate_tus_lua_all_smoke(self_lua_separate_tus_bin, lua_runtime_tests_dir):
+    """Run all.lua through the self backend's separate-TU Lua build path."""
+    self_stage, self_bin = self_lua_separate_tus_bin
+    if self_stage != "ok":
+        pytest.xfail(f"self separate-tus stage '{self_stage}': {self_bin}")
+
+    tests_stage, tests_dir = lua_runtime_tests_dir
+    if tests_stage != "ok":
+        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+
+    script_path = os.path.abspath(os.path.join(tests_dir, "all.lua"))
+    self_r = subprocess.run(
+        [self_bin, "-e", "_port=true", script_path],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=tests_dir,
+    )
+
+    assert self_r.returncode == 0, f"self separate-tus all.lua failed (rc={self_r.returncode}):\n{self_r.stderr[-500:]}"
+    assert "final OK !!!" in self_r.stdout

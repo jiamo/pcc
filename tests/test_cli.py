@@ -1,8 +1,11 @@
+import os
 import shutil
 import subprocess
+import sys
 
 from click.testing import CliRunner
 
+from pcc.cli_core import cli_main
 from pcc.passes import find_opt_binary
 from pcc.pcc import main
 
@@ -13,6 +16,145 @@ def test_help_shows_jobs_default_8():
     assert result.exit_code == 0
     assert "--jobs INTEGER RANGE" in result.output
     assert "[default: 8;" in result.output
+
+
+def test_python_m_help_does_not_import_click():
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    code = (
+        "import builtins, runpy, sys\n"
+        "orig_import = builtins.__import__\n"
+        "def blocked(name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "    if name == 'click' or name.startswith('click.'):\n"
+        "        raise ImportError('click blocked for __main__ path')\n"
+        "    return orig_import(name, globals, locals, fromlist, level)\n"
+        "builtins.__import__ = blocked\n"
+        "sys.argv = ['pcc', '--help']\n"
+        "runpy.run_module('pcc', run_name='__main__')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Usage: pcc [OPTIONS] PATH" in result.stdout
+    assert "click blocked" not in result.stderr
+
+
+def test_importing_pcc_wrapper_without_click_falls_back_to_plain_main():
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    code = (
+        "import builtins, importlib\n"
+        "orig_import = builtins.__import__\n"
+        "def blocked(name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "    if name == 'click' or name.startswith('click.'):\n"
+        "        raise ImportError('click blocked for pcc.pcc import')\n"
+        "    return orig_import(name, globals, locals, fromlist, level)\n"
+        "builtins.__import__ = blocked\n"
+        "mod = importlib.import_module('pcc.pcc')\n"
+        "print(callable(mod.main))\n"
+        "print(mod.main(['--help']))\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("True\nUsage: pcc [OPTIONS] PATH")
+    assert result.stdout.rstrip().endswith("0")
+    assert "click blocked" not in result.stderr
+
+
+def test_plain_cli_supports_python_path_before_output_flag(tmp_path):
+    script_path = tmp_path / "main.py"
+    exe_path = tmp_path / "main_bin"
+    script_path.write_text(
+        "def main() -> None:\n"
+        "    print(123)\n\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+
+    result = cli_main([str(script_path), "-o", str(exe_path)])
+
+    assert result == 0
+    assert exe_path.is_file()
+
+    run = subprocess.run(
+        [str(exe_path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "123\n"
+
+
+def test_plain_cli_python_libpython_off_supports_native_subset(tmp_path):
+    script_path = tmp_path / "main.py"
+    exe_path = tmp_path / "main_bin"
+    script_path.write_text(
+        "def main() -> None:\n"
+        "    print(123)\n\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+
+    result = cli_main(
+        ["--python-libpython=off", str(script_path), "-o", str(exe_path)]
+    )
+
+    assert result == 0
+    assert exe_path.is_file()
+
+    run = subprocess.run(
+        [str(exe_path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "123\n"
+
+
+def test_python_libpython_off_reports_friendly_error_for_fallback_script(tmp_path):
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    script_path = tmp_path / "needs_fallback.py"
+    exe_path = tmp_path / "needs_fallback_bin"
+    script_path.write_text(
+        "import tempfile\n"
+        "print(tempfile.gettempdir())\n"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pcc",
+            "--python-libpython=off",
+            str(script_path),
+            "-o",
+            str(exe_path),
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 1
+    assert "requires libpython fallback" in result.stderr
+    assert "--python-libpython=auto/on" in result.stderr
+    assert not exe_path.exists()
 
 
 def test_jobs_requires_separate_tus(tmp_path):
@@ -245,6 +387,16 @@ def test_backend_self_can_run_simple_program(tmp_path):
     )
 
     assert result.exit_code == 0
+
+
+def test_backend_self_env_can_run_simple_program(tmp_path, monkeypatch):
+    main_path = tmp_path / "main.c"
+    main_path.write_text("int main(void) { return 0; }\n")
+    monkeypatch.setenv("PCC_BACKEND", "self")
+
+    result = cli_main([str(main_path)])
+
+    assert result == 0
 
 
 def test_backend_self_emit_asm_starts_aarch64_mvp(tmp_path):

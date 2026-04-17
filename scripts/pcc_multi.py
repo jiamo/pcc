@@ -27,79 +27,264 @@ instead of an executable) and ``--verbose`` for pipeline timing.
 """
 from __future__ import annotations
 
-import argparse
 import sys
+
+from pcc.extern import extern, c_int
+
+_USAGE = (
+    "Usage:\n"
+    "  pcc_multi --entry MODULE --out PATH "
+    "[--backend llvm|self] [--emit-llvm] [-v|--verbose] SRC [SRC ...]\n"
+    "\n"
+    "Each SRC is either <path> or <path>=<module.name>.\n"
+)
+
+_exit_c: "extern" = extern("exit", (c_int,), )
+
+
+def _write_text(text: str, *, to_stderr: bool = False) -> None:
+    if to_stderr:
+        try:
+            import sys
+            sys.stderr.write(text)
+            return
+        except Exception:
+            pass
+    print(text, end="")
+
+
+def _exit_process(code: int) -> None:
+    try:
+        _exit_c(code)
+        return
+    except Exception:
+        raise SystemExit(code)
 
 
 def _parse_src_arg(spec: str):
     """Return ``(path, module_name_or_None)`` for one positional."""
-    if "=" in spec:
-        path, _, mod = spec.partition("=")
-        return path, mod
+    i = 0
+    while i < len(spec):
+        if spec[i] == "=":
+            return spec[:i], spec[i + 1:]
+        i += 1
     return spec, None
 
 
+def _infer_module_name(path: str) -> str:
+    start = 0
+    i = len(path) - 1
+    while i >= 0:
+        ch = path[i]
+        if ch == "/" or ch == "\\":
+            start = i + 1
+            break
+        i -= 1
+    base = path[start:]
+    if len(base) >= 3 and base[-3:] == ".py":
+        return base[:-3]
+    return base
+
+
+def _parse_cli(argv=None):
+    argv = _normalized_argv(argv)
+    entry = None
+    out = None
+    emit_llvm = False
+    verbose = False
+    backend = None
+    sources: "list[str]" = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            while i < len(argv):
+                sources.append(argv[i])
+                i += 1
+            break
+        if arg == "--help" or arg == "-h":
+            return None, 0, None
+        if arg == "--emit-llvm":
+            emit_llvm = True
+            i += 1
+            continue
+        if arg == "--verbose" or arg == "-v":
+            verbose = True
+            i += 1
+            continue
+        if arg == "--entry" or arg == "--out":
+            if i + 1 >= len(argv):
+                return None, 2, f"{arg} requires a value"
+            value = argv[i + 1]
+            if arg == "--entry":
+                entry = value
+            else:
+                out = value
+            i += 2
+            continue
+        if arg == "--backend":
+            if i + 1 >= len(argv):
+                return None, 2, "--backend requires a value"
+            backend = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--backend="):
+            backend = arg[len("--backend="):]
+            i += 1
+            continue
+        if len(arg) > 0 and arg[0] == "-":
+            return None, 2, f"unknown option: {arg}"
+        sources.append(arg)
+        i += 1
+
+    if entry is None:
+        return None, 2, "missing required option --entry"
+    if out is None:
+        return None, 2, "missing required option --out"
+    if len(sources) == 0:
+        return None, 2, "at least one source is required"
+    return (entry, out, emit_llvm, verbose, backend, sources), 0, None
+
+
+def _normalized_argv(argv=None):
+    out: "list[str]" = []
+    if argv is None:
+        i = 1
+        while i < len(sys.argv):
+            out.append((sys.argv[i] or "") + "")
+            i += 1
+        return out
+    i = 0
+    while i < len(argv):
+        out.append((argv[i] or "") + "")
+        i += 1
+    return out
+
+
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(
-        prog="pcc_multi",
-        description="Multi-file Python compile for the pcc bootstrap.",
-    )
-    ap.add_argument(
-        "--entry", required=True,
-        help="Dotted module name that provides the program entry "
-             "(its top-level body becomes @main).",
-    )
-    ap.add_argument(
-        "--out", required=True,
-        help="Output path: native executable, or .ll when "
-             "--emit-llvm is given.",
-    )
-    ap.add_argument(
-        "--emit-llvm", action="store_true",
-        help="Write combined LLVM IR instead of linking.",
-    )
-    ap.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="Print each pipeline step + timings to stderr.",
-    )
-    ap.add_argument(
-        "sources", nargs="+",
-        help="One or more '<path>' or '<path>=<module.name>' entries.",
-    )
-    args = ap.parse_args(argv)
+    argv = _normalized_argv(argv)
+    entry_module = None
+    out_path = None
+    emit_llvm = False
+    verbose = False
+    backend = None
+    source_specs: "list[str]" = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            while i < len(argv):
+                source_specs.append(argv[i])
+                i += 1
+            break
+        if arg == "--help" or arg == "-h":
+            _write_text(_USAGE)
+            return 0
+        if arg == "--emit-llvm":
+            emit_llvm = True
+            i += 1
+            continue
+        if arg == "--verbose" or arg == "-v":
+            verbose = True
+            i += 1
+            continue
+        if arg == "--entry" or arg == "--out":
+            if i + 1 >= len(argv):
+                _write_text(
+                    "pcc_multi: " + arg + " requires a value\n",
+                    to_stderr=True,
+                )
+                _write_text(_USAGE, to_stderr=True)
+                return 2
+            value = argv[i + 1]
+            if arg == "--entry":
+                entry_module = value
+            else:
+                out_path = value
+            i += 2
+            continue
+        if arg == "--backend":
+            if i + 1 >= len(argv):
+                _write_text(
+                    "pcc_multi: --backend requires a value\n",
+                    to_stderr=True,
+                )
+                _write_text(_USAGE, to_stderr=True)
+                return 2
+            backend = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--backend="):
+            backend = arg[len("--backend="):]
+            i += 1
+            continue
+        if len(arg) > 0 and arg[0] == "-":
+            _write_text(
+                "pcc_multi: unknown option: " + arg + "\n",
+                to_stderr=True,
+            )
+            _write_text(_USAGE, to_stderr=True)
+            return 2
+        source_specs.append(arg)
+        i += 1
+
+    if entry_module is None:
+        _write_text("pcc_multi: missing required option --entry\n", to_stderr=True)
+        _write_text(_USAGE, to_stderr=True)
+        return 2
+    if out_path is None:
+        _write_text("pcc_multi: missing required option --out\n", to_stderr=True)
+        _write_text(_USAGE, to_stderr=True)
+        return 2
+    if len(source_specs) == 0:
+        _write_text("pcc_multi: at least one source is required\n", to_stderr=True)
+        _write_text(_USAGE, to_stderr=True)
+        return 2
 
     src_paths = []
     module_names = []
-    for spec in args.sources:
+    for spec in source_specs:
         path, mod = _parse_src_arg(spec)
+        path = (path or "") + ""
         src_paths.append(path)
         if mod is None:
-            # Filename stem fallback — matches compile_python default.
-            import os
-            base = os.path.basename(path)
-            if base.endswith(".py"):
-                base = base[:-3]
-            module_names.append(base)
+            module_names.append(_infer_module_name(path))
         else:
-            module_names.append(mod)
+            module_names.append((mod or "") + "")
 
     from pcc.py_frontend.pipeline import (
-        compile_python_multi, PyPipelineError,
+        compile_python_multi,
+        PyPipelineError,
     )
     try:
-        compile_python_multi(
-            src_paths,
-            args.out,
-            verbose=args.verbose,
-            emit_llvm_only=args.emit_llvm,
-            entry_module=args.entry,
-            module_names=module_names,
-        )
+        if backend is None:
+            compile_python_multi(
+                src_paths,
+                out_path,
+                verbose=verbose,
+                emit_llvm_only=emit_llvm,
+                entry_module=entry_module,
+                module_names=module_names,
+            )
+        else:
+            compile_python_multi(
+                src_paths,
+                out_path,
+                verbose=verbose,
+                emit_llvm_only=emit_llvm,
+                entry_module=entry_module,
+                module_names=module_names,
+                backend=backend,
+            )
     except PyPipelineError as e:
-        print(f"pcc_multi: {e}", file=sys.stderr)
+        _write_text("pcc_multi: " + str(e) + "\n", to_stderr=True)
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    if code != 0:
+        _exit_process(code)

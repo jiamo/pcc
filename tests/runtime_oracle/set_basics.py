@@ -1,0 +1,11 @@
+s = {1, 2, 3}
+s.add(4)
+s.add(2)
+print(sorted(s))
+print(len(s))
+print(2 in s, 9 in s)
+s.discard(1)
+print(sorted(s))
+print(sorted({1, 2, 3} | {3, 4, 5}))
+print(sorted({1, 2, 3} & {2, 3, 4}))
+print(sorted({1, 2, 3} - {2}))

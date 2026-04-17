@@ -1,203 +1,202 @@
 # Dual Backend Plan: keep LLVM(llvmlite) + optional own backend
 
-> 目标（本次决议）：在**不影响现有路径**的前提下，开始支持“可选后端”能力，先上可切换的架构，再分阶段落地自己的 LLVM 后端（可运行，但默认仍走当前 llvmlite 路径）。
+> Goal (this round): without affecting existing paths, start supporting an "optional backend" capability — first the switchable architecture, then phase in our own LLVM backend (runnable, but the default still goes through the current llvmlite path).
 
 ---
 
-## 0. 现状锚点
+## 0. Current state
 
-- 已具备：LLVM IR 级 pass 翻译闭环已进入稳定阶段（all-pass 1:1 里程碑），`C` front-end/parser/main pipeline、integration、cache 等仍以 llvmlite 为主。
-- 风险：如果直接硬切到“自研后端”会影响 `tests` 稳定性。
-- 结论：要保持“主线不变”，只能按**双后端**、**默认关闭新后端**、**可选回退**来推进。
-
----
-
-## 1. 目标拆解（可选项）
-
-我们要支持两层可选：
-
-1. **编译管线提供者（IR 与执行链）**
-   - `llvm`：当前 `llvmlite` 路径（默认）
-   - `llvm_capi`：先跑起来的“替代管线”（文本/IR 到 LLVM-C API）
-
-2. **机器码后端（长期）**
-   - `builtin`: 继续依赖 LLVM 后端
-   - `self`：自研 Python 后端（未来，逐步推进）
-
-> 当前先只要求完成第 1 层的双后端可选，`self` 在第 3 阶段再接入。
+- In place: LLVM IR-level pass translation has reached a stable phase (the all-pass 1:1 milestone). The C front-end / parser / main pipeline / integration / cache still use llvmlite as the primary path.
+- Risk: directly hard-switching to "our own backend" would destabilise `tests`.
+- Conclusion: to keep "the mainline unchanged", we can only proceed via **dual backends**, **new backend off by default**, **optional fallback**.
 
 ---
 
-## 2. 设计原则
+## 1. Goal breakdown (options)
 
-- **默认行为不变**：现有测试、默认 CLI 行为都必须继续走当前稳定路径。
-- **按 token 估算任务，不按人时。**
-  - 这里的 `repo token` 指产出代码/测试/文档的净 token。
-  - `working token` 指执行 + 调试 + 回归迭代消耗的 token；通常明显高于 repo token。
-- **Feature gating**：所有新后端功能必须通过显式 flag 打开。
-- **可回退**：任何新后端都必须有“失败回退到 llvmlite”的策略，不让现网受阻。
-- **粒度小**：每个阶段改动只影响少量模块。
+We need two layers of choice:
+
+1. **Compile pipeline provider (IR + execution chain)**
+   - `llvm`: the current `llvmlite` path (default)
+   - `llvm_capi`: the alternative pipeline we get running first (text/IR through the LLVM-C API)
+
+2. **Machine code backend (long-term)**
+   - `builtin`: keep relying on the LLVM backend
+   - `self`: our own Python-implemented backend (future, phased)
+
+> For now we only require finishing layer 1 (dual backend selectable); `self` is wired up in stage 3.
 
 ---
 
-## 3. 任务包（按里程碑）
+## 2. Design principles
 
-### 阶段 A：基础能力（无行为改动）
+- **Default behaviour unchanged**: existing tests and the default CLI behaviour must keep going through the current stable path.
+- **Estimate tasks by tokens, not person-hours.**
+  - `repo token` here means the net tokens of code/tests/docs produced.
+  - `working token` means the tokens consumed during execution + debugging + regression iteration; usually significantly higher than repo token.
+- **Feature gating**: every new backend feature must be turned on by an explicit flag.
+- **Fallback-able**: every new backend must have a "fail back to llvmlite" strategy so production isn't blocked.
+- **Small granularity**: each phase touches only a few modules.
 
-**目的**：先把“可选后端”这件事变成配置，不改现有语义。
+---
 
-#### A1. 后端选择接口（低耦合）
-- 新建 `pcc/backend/` 目录，定义后端协议：`BackendKind`、`BackendConfig`、`BackendSession`。
-- 新增 `PCC_BACKEND` env + `--backend` CLI（值：`llvm`, `llvm_capi`, `self`）。
-- 当前默认值 = `llvm`。
-- 现有 `pcc/pcc.py`/`pcc/evaluater/c_evaluator.py` 只读取该配置。
-- **验收**：
-  - `env PCC_BACKEND=llvm` 与默认结果完全一致。
-  - `--backend=llvm` 不报新警告。
-- **token 估算**：
+## 3. Task buckets (by milestone)
+
+### Phase A: foundation (no behaviour change)
+
+**Goal**: make "optional backend" purely a configuration knob, with no semantic changes.
+
+#### A1. Backend selection interface (low coupling)
+- Create `pcc/backend/`, define the backend protocol: `BackendKind`, `BackendConfig`, `BackendSession`.
+- Add `PCC_BACKEND` env + `--backend` CLI (values: `llvm`, `llvm_capi`, `self`).
+- Current default = `llvm`.
+- Existing `pcc/pcc.py` / `pcc/evaluater/c_evaluator.py` only read this configuration.
+- **Acceptance**:
+  - `env PCC_BACKEND=llvm` is bit-identical to default.
+  - `--backend=llvm` raises no new warnings.
+- **Token estimate**:
   - `repo token`: `8k-25k`
   - `working token`: `120k-260k`
 
-#### A2. 编译缓存与签名打标（避免污染）
-- 在 `_compile_cache_key` / 本地缓存签名中加入：
+#### A2. Cache key + signature stamping (avoid pollution)
+- Add to `_compile_cache_key` / local cache signature:
   - `backend_kind`
-  - `backend_semver`（后端能力标识）
+  - `backend_semver` (backend capability marker)
   - `backend_config hash`
-- 让 `--backend` 模式变化时 cache 必定 miss。
-- **验收**：模式切换后不会误用旧 `*.so`/`*.json`。
-- **token 估算**：
+- Switching `--backend` modes guarantees a cache miss.
+- **Acceptance**: switching modes never reuses stale `*.so`/`*.json`.
+- **Token estimate**:
   - `repo token`: `4k-9k`
   - `working token`: `40k-120k`
 
-#### A3. 开关文档 + 自检测试
-- 新增文档章节：`docs/plans/` 内新增一页，写明默认/可选/禁用。
-- `tests`：新增 3-5 个轻量测试，仅验证 env/CLI 显式行为，不改原语义。
-  - 默认模式仍旧可运行小规模关键回归。
-  - 非默认后端在未实现时给出清晰报错。
-- **验收**：`pytest tests/test_backend_selector.py`（新）绿。
-- **token 估算**：
+#### A3. Switch documentation + self-test
+- Add a docs section: a new page under `docs/plans/` documenting default / optional / disabled.
+- `tests`: add 3–5 lightweight tests that verify the env/CLI behaviour explicitly without changing existing semantics.
+  - Default mode still runs the small key regression set.
+  - Non-default backends report a clear error when not yet implemented.
+- **Acceptance**: `pytest tests/test_backend_selector.py` (new) green.
+- **Token estimate**:
   - `repo token`: `6k-12k`
   - `working token`: `60k-140k`
 
 ---
 
-### 阶段 B：`llvm_capi` 可执行后端（替换 llvmlite runtime 入口）
+### Phase B: `llvm_capi` runnable backend (replace the llvmlite runtime entry)
 
-**目的**：在不改 codegen 主路径的情况下，先让自研后端可以**接管运行时管线**。
+**Goal**: without changing the codegen main path, let our own backend take over the runtime pipeline first.
 
-#### B1. 后端适配层（对象层 + 执行层）
-- 新增 `pcc/backend/llvm_capi_backend.py`，将 `evaluate` 中的：
+#### B1. Backend adapter layer (object layer + execution layer)
+- Add `pcc/backend/llvm_capi_backend.py` wrapping these `evaluate` calls behind one interface:
   - `llvm.parse_assembly`
   - `target_machine.emit_object`
   - `llvm.create_mcjit_compiler` / `ee.get_function_address`
-  封装为统一接口。
-- 引入 `BackendUnavailable` 明确区分“接口未声明”与“运行失败”。
-- **验收**：在 `PCC_BACKEND=llvm_capi` 下，未改代码路径下也可输出与 llvm 默认路径一致的行为边界（当 backend 实现完整）。
-- **token 估算**：
+- Introduce `BackendUnavailable` to clearly distinguish "interface not declared" from "execution failure".
+- **Acceptance**: under `PCC_BACKEND=llvm_capi`, with no code-path changes, the behaviour boundary matches the llvm default path (when the backend implementation is complete).
+- **Token estimate**:
   - `repo token`: `20k-45k`
   - `working token`: `250k-700k`
 
-#### B2. 扩展 `pcc/llvm_capi` 的声明面
-- 补齐最小所需声明（不必一次齐全）：
-  - 运行时初始化、context/module、builder、target machine、parse/verify、对象生命周期。
-- 先不追求完整性，允许 `NotImplemented` 兜底。
-- **验收**：`llvm_capi` 后端至少覆盖：`parse+verify+emit_object` 的单元路径。
-- **token 估算**：
+#### B2. Expand the surface of `pcc/llvm_capi`
+- Fill in the minimum required declarations (no need to be complete in one pass):
+  - runtime init, context/module, builder, target machine, parse/verify, object lifecycle.
+- Don't aim for completeness; allow `NotImplemented` as a fallback.
+- **Acceptance**: the `llvm_capi` backend covers at least the `parse + verify + emit_object` unit path.
+- **Token estimate**:
   - `repo token`: `6k-18k`
   - `working token`: `80k-220k`
 
-#### B3. 集成与回退机制
-- `PCC_BACKEND=llvm_capi` + 缺失符号时：自动回退 `llvm`（并打 warning + metrics）。
-- `self-host` 目标（若开启）允许默认后端强制切到 `llvm_capi`。
-- **验收**：
-  - 能看到 backend 选择日志（便于审计）。
-  - 回退不会污染主 cache。
-- **token 估算**：
+#### B3. Integration and fallback mechanism
+- `PCC_BACKEND=llvm_capi` + missing symbols → automatic fallback to `llvm` (with warning + metrics).
+- The `self-host` target (when enabled) may force the default backend to `llvm_capi`.
+- **Acceptance**:
+  - The backend selection is logged (auditable).
+  - Fallbacks don't pollute the main cache.
+- **Token estimate**:
   - `repo token`: `8k-16k`
   - `working token`: `80k-180k`
 
 ---
 
-### 阶段 C：自研机器后端（`self`）第一版（单目标，Asm-first）
+### Phase C: own machine backend (`self`) v1 (single target, asm-first)
 
-> 这一步是你说的“自己的 backend”真正开始。先做最小目标架构，不影响现有主线。
+> This is where "our own backend" really starts. Begin with the smallest target architecture without affecting the existing mainline.
 
-#### C1. Scope 锁定（MVP）
-- 先只支持单目标（建议 AArch64-darwin 或 x86_64-linux 两选一）。
-- 只处理以下指令范围：
-  - 整数/指针算术、比较、分支、call、基本栈分配、局部数组/结构读取写入（仅先前端能生成的子集）。
-- 先不做：SIMD、异常、DWARF、复杂重定位。
-- **验收**：self 后端可编译 `tests/test_cli` 的核心集子集并产出可运行二进制。
-- **token 估算**：
+#### C1. Scope lock (MVP)
+- Support a single target only (recommend either AArch64-darwin or x86_64-linux).
+- Only the following instruction range:
+  - integer / pointer arithmetic, comparisons, branches, call, basic stack allocation, local array / struct read+write (only the subset our front end currently emits).
+- Defer: SIMD, exceptions, DWARF, complex relocations.
+- **Acceptance**: the self backend can compile the core subset of `tests/test_cli` and produce a runnable binary.
+- **Token estimate**:
   - `repo token`: `90k-180k`
   - `working token`: `1.6M-4M`
 
-#### C2. 最小后端核（MIR/Lowering）
-- 从 LLVM IR 文本做轻量解析或直译到自有中间表示（推荐 MIR）。
-- 实现：
-  - 线性扫描式寄存器分配
-  - 简易 ABI 规则（调用约定/返回值/参数传递）
-  - Frame layout（栈桢大小、对齐、callee-save）
-  - 直接 `asm` 输出。
-- **验收**：对 `while/if/call/return` 的小程序，汇编可执行与行为对齐。 
-- **token 估算**：
+#### C2. Minimum backend core (MIR / lowering)
+- Lightweight parsing of LLVM IR text or direct lowering into our own intermediate form (recommend MIR).
+- Implement:
+  - linear-scan register allocation
+  - simple ABI rules (calling convention / return value / argument passing)
+  - frame layout (frame size, alignment, callee-save)
+  - direct `asm` emission.
+- **Acceptance**: small `while / if / call / return` programs compile and run with matching behaviour.
+- **Token estimate**:
   - `repo token`: `120k-260k`
   - `working token`: `2.8M-7M`
 
-#### C3. 后端选择与回退
-- 增加 `--backend=self` 与 `PCC_BACKEND=self`。
-- 未覆盖功能区域按 fallback/报错策略退回到 `llvm_capi`。
-- 在测试中加入“能力标签”：一部分测试走默认后端，一部分测试 `self` 下 skip（已明确）。
-- **验收**：
-  - `self` 可被显式打开。
-  - 没有 `self` 覆盖的功能不再静默误编译。
-- **token 估算**：
+#### C3. Backend selection + fallback
+- Add `--backend=self` and `PCC_BACKEND=self`.
+- Uncovered feature areas fall back / error out to `llvm_capi`.
+- Add "capability labels" to tests: some run on the default backend, some skip under `self` (and that skip is explicit).
+- **Acceptance**:
+  - `self` can be turned on explicitly.
+  - Features not yet covered by `self` no longer silently miscompile.
+- **Token estimate**:
   - `repo token`: `12k-24k`
   - `working token`: `130k-320k`
 
 ---
 
-## 4. 当前工作不受影响的保障清单
+## 4. Safeguard list — current work stays unaffected
 
-1. `PCC_BACKEND` 默认值 = `llvm`。
-2. 不动现有默认 pass pipeline 和 optimization 顺序。
-3. 所有现有 suite gate 仍用默认 backend 跑。
-4. 新后端功能必须是开关式：
-   - 未启用则不进入任何关键路径。
-5. 每个阶段都保留 `rollback`: 切回默认并保持同一 commit 通过。
-
----
-
-## 5. 与已有计划的关系（对齐）
-
-- 与 `all-pass-llvm-ir-1to1-master-plan` 的关系：
-  - 本计划不再重复 pass 翻译；它只是把“当前已翻译的 pass”接到可选后端接口里。
-- 与 `llvmcapi-wire-spike-report` 的关系：
-  - 这是该 spike 的工程化落地版，变成长期任务化。
-- 与 `self-backend-translation-plan` 的关系：
-  - 本计划负责把后端做成**可选能力**；
-  - `docs/plans/self-backend-translation-plan.md` 负责把“我们自己的机器后端”拆成独立 roadmap；
-  - 两者关系是：`β4/llvm_capi` 负责前半段解耦与共享 builder，`self backend` 在这个共享边界之上逐步落地。
-- 与 `python-frontend-plan` 的 Phase 6C：
-  - 这里是 Phase 6C 的必要底座：同一 artifact/back-end 管线的共享。
+1. `PCC_BACKEND` default = `llvm`.
+2. Don't touch the existing default pass pipeline / optimisation order.
+3. All existing suite gates still run on the default backend.
+4. New backend features must be switch-gated:
+   - When off, they don't enter any critical path.
+5. Every phase keeps a `rollback`: switching back to default keeps the same commit green.
 
 ---
 
-## 6. 接下来立即可执行任务（建议今天就开）
+## 5. Relationship with existing plans (alignment)
 
-- `Task 0`：建立 `docs/plans/dual-llvm-backend-compat-plan.md`（本计划）
-- `Task 1`：在 evaluator/pcc CLI 增加后端选择开关（`--backend`/`PCC_BACKEND`）
-- `Task 2`：增加 cache fingerprint 后端维度
-- `Task 3`：新增后端选择自检测试（2~3个）
-- `Task 4`：开始 `llvm_capi_backend` 抽象接口的 skeleton（不改旧行为）
-
-> 以上四项可以做到“边做边跑当前完整 suite”：默认路径不变，新增测试可控。
+- vs `all-pass-llvm-ir-1to1-master-plan`:
+  - This plan does not duplicate pass translation; it only wires the already-translated passes into the optional backend interface.
+- vs `llvmcapi-wire-spike-report`:
+  - This is the productionised, long-term task track of that spike.
+- vs `self-backend-translation-plan`:
+  - This plan turns the backend into an **optional capability**;
+  - `docs/plans/self-backend-translation-plan.md` carves "our own machine backend" into its own roadmap;
+  - The relation: `β4/llvm_capi` handles the early decoupling and shared builder; `self backend` lands incrementally on top of that shared boundary.
+- vs `python-frontend-plan` Phase 6C:
+  - This plan is the necessary substrate for Phase 6C: a shared artifact / backend pipeline.
 
 ---
 
-## 7. 里程碑判定
+## 6. Immediate executable tasks (suggested to start today)
 
-- **M0（本周）**：开关和缓存隔离完成，默认行为不变。
-- **M1（下阶段）**：`llvm_capi` 可替代 `llvmlite` 运行到 emit_object/基本加载。
-- **M2（后续）**：`self` 后端可以选择打开并在最小子集下运行。
-- **M3（长期）**：逐步扩展 `self` 覆盖率与目标族。
+- `Task 0`: create `docs/plans/dual-llvm-backend-compat-plan.md` (this plan)
+- `Task 1`: add backend selection switch to evaluator / pcc CLI (`--backend` / `PCC_BACKEND`)
+- `Task 2`: add a backend dimension to the cache fingerprint
+- `Task 3`: add backend-selection self-test (2~3 tests)
+- `Task 4`: start the `llvm_capi_backend` abstract interface skeleton (no behaviour change)
+
+> The four can be done "while running the current full suite alongside": the default path is unchanged, new tests are scoped.
+
+---
+
+## 7. Milestone gates
+
+- **M0 (this week)**: switch + cache isolation done, default behaviour unchanged.
+- **M1 (next phase)**: `llvm_capi` can replace `llvmlite` up to emit_object / basic loading.
+- **M2 (later)**: `self` backend can be selectively enabled and runs a minimal subset.
+- **M3 (long-term)**: gradually expand `self` coverage and target families.

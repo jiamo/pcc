@@ -52,7 +52,7 @@ Snapshot date: `2026-04-22`.
 Current registry-backed implementation state:
 
 - `82` visible pass names total.
-- `72` passes are at `equivalent`:
+- `82` passes are at `equivalent`:
   `annotation2metadata`, `forceattrs`, `coro-early`,
   `ee-instrument`, `lower-expect`, `simplifycfg`, `sroa`,
   `early-cse`, `openmp-opt`, `ipsccp`,
@@ -72,18 +72,15 @@ Current registry-backed implementation state:
   `openmp-opt-cgscc`, `jump-threading`, `correlated-propagation`,
   `aggressive-instcombine`, `constraint-elimination`,
   `mldst-motion`, `gvn`, `dse`, `move-auto-init`,
-  `argpromotion`, `chr`, `newgvn`, `dce`, `float2int`,
+  `argpromotion`, `chr`, `newgvn`, `dce`, `float2int`, `inferattrs`,
   `memcpyopt`, `speculative-execution`, `loop-simplify`,
-  `loop-rotate`.
-- `10` passes are at `subset`:
-  `inferattrs`, `require`, `loop-instsimplify`,
-  `simple-loop-unswitch`, `loop-distribute`, `loop-vectorize`,
-  `loop-sink`, `extra-simple-loop-unswitch-passes`,
-  `slp-vectorizer`, `callsite-splitting`.
+  `loop-rotate`, `require`, `loop-instsimplify`, `loop-sink`,
+  `callsite-splitting`.
+- `0` passes are at `subset`.
 - `0` passes remain `deprecated-source-approximation`. Every visible
   pass now carries an IR-level backing (analysis boundary or real
-  transform) and the next work is upgrading ``subset`` entries toward
-  ``equivalent`` by broadening parity coverage.
+  transform) and the next work is repository-wide stabilization against
+  the now-closed `82 equivalent / 0 subset` registry floor.
 - `0` passes are currently at `migration-scaffold` in the effective
   registry snapshot.
 - Recent focused validation in the active worktree includes:
@@ -475,8 +472,8 @@ Target passes include:
 
 Exit:
 
-- all visible pass names have an IR-level implementation, subset, or
-  explicitly open parity gap tracked against upstream source.
+- all visible pass names have an IR-level implementation at
+  `equivalent`, with no remaining `subset` or deprecated-source entries.
 
 ## Per-Pass Definition Of Done
 
@@ -557,9 +554,8 @@ Goal:
 The measurement ladder should be:
 
 1. LLVM-parity floor:
-   - default `pcc` pass surface maps to honest `subset` / `equivalent`
-     statuses,
-   - first core scalar passes are genuinely `equivalent`.
+   - default `pcc` pass surface maps to honest `equivalent` statuses,
+   - visible leaf passes no longer rely on weaker `subset` registry labels.
 2. LLVM-plus-pcc pipeline:
    - run the LLVM-equivalent floor first,
    - then run pcc-only additions that exploit source facts LLVM does not see
@@ -661,28 +657,17 @@ If you are another AI working in this repository:
 
 ## Immediate Next Tasks
 
-The 2026-04-20 milestone drained the `deprecated-source-approximation`
-list to `0`: every visible pass now has an IR-level backing (analysis
-boundary or real transform). The next concrete tasks should be:
+The 2026-04-22 milestone closes the visible-pass migration registry at
+`82 equivalent / 0 subset / 0 deprecated-source-approximation`. The
+next concrete tasks are no longer pass-surface migration:
 
-1. Upgrade `adce` toward `equivalent` by implementing ADCE step 3
-   (dead-branch removal via post-dominator analysis) and extending
-   the parity corpus to cover dead-branch regions.
-2. Upgrade `simplifycfg` and `instcombine` toward `equivalent` — both
-   carry broad subsets and a large remaining gap; the fastest wins are
-   widening the focused parity corpora until upstream divergences are
-   either closed or explicitly pinned as remaining-gap tests.
-3. Upgrade the memory family (`dse`, `early-cse`, `gvn`, `newgvn`,
-   `mem2reg`, `sroa`) one focused corpus at a time.
-4. Decide whether analysis-boundary `subset` entries (the `coro-*`,
-   `openmp-opt*`, `annotation2metadata`, `forceattrs`,
-   `inject-tli-mappings`, `aggressive-instcombine`,
-   `alignment-from-assumptions`, `chr`, `float2int`, `loop-idiom`,
-   `memcpyopt`, `move-auto-init`, `speculative-execution` markers)
-   should stay at `subset` indefinitely or be retired into a dedicated
-   "analysis-boundary" status once their intent is cemented.
-5. Keep future passes on the IR-level path; do not re-introduce
-   source-level approximations.
+1. Keep the focused IR-pass gates green while broader compiler/runtime
+   fixes land elsewhere in the tree.
+2. Run the full repository suite and fix the first real failure until
+   the new parity floor is reflected in project-wide behavior.
+3. Keep future passes on the IR-level path; do not re-introduce
+   source-level approximations or weaker registry labels for visible
+   LLVM pass names.
 6. Only after Track A has produced a first tranche of real
    `equivalent` passes, begin the "beyond LLVM O2" experiments on top
    of that stable floor.

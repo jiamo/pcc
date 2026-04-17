@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "Frozen baseline for pcc/llvm_capi/ir.py compiled in ON mode.",
+    "Captured 2026-04-28 (after removing unused 'import math').",
+    "",
+    "This file is the ratchet for Phase 9: getting ir.py to 0 py_cpy_*",
+    "in ON mode (the gate to closing Issue 1 — bootstrap binary",
+    "without libpython linkage).",
+    "",
+    "RULE: any commit may DECREASE these numbers (re-capture baseline).",
+    "      no commit may INCREASE them (ratchet failure).",
+    "",
+    "Path A's IRBuilder/runtime[]/ir.X dispatch is unrelated to this",
+    "file's reduction — Path A makes USERS of ir.py emit static calls;",
+    "ir.py's INTERNAL implementation has separate dynamic-Python idioms",
+    "that need their own type-tracking + refactoring work.",
+    "",
+    "Counts are CALL instructions only (not declarations)."
+  ],
+  "_total": 68,
+  "py_cpy_call1": 10,
+  "py_cpy_call_noargs": 3,
+  "py_cpy_decref": 19,
+  "py_cpy_ensure_init": 1,
+  "py_cpy_from_f64": 3,
+  "py_cpy_from_pcc_obj": 11,
+  "py_cpy_from_pccstr": 2,
+  "py_cpy_getattr": 13,
+  "py_cpy_import": 3,
+  "py_cpy_main_exitcode": 1,
+  "py_cpy_truthy": 2,
+  "_recapture_2026-04-28-late": "75 -> 68 (-7) after the os.path / sys.platform / print(file=) dispatch wave. ir.py itself doesn't use those idioms directly; the savings come indirectly via reduced shared-import boilerplate and chain-broken dispatches in the ir.py self-compile path."
+}

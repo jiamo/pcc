@@ -17,13 +17,70 @@ from dataclasses import dataclass
 
 from .py_lex import (
     Lexer, Token,
-    TK_DEDENT, TK_EOF, TK_INDENT, TK_KEYWORD, TK_NAME, TK_NEWLINE,
-    TK_NUMBER, TK_OP, TK_STRING,
 )
+
+
+# Keep these token-kind strings local to avoid pulling sibling-module
+# constant imports through the multi-file CPython fallback path.
+TK_NEWLINE = "NEWLINE"
+TK_INDENT = "INDENT"
+TK_DEDENT = "DEDENT"
+TK_NAME = "NAME"
+TK_NUMBER = "NUMBER"
+TK_STRING = "STRING"
+TK_OP = "OP"
+TK_KEYWORD = "KEYWORD"
+TK_EOF = "EOF"
 
 
 class ParseError(Exception):
     pass
+
+
+def _join_strings(parts: list[str], sep: str) -> str:
+    if not parts:
+        return ""
+    out = parts[0]
+    i = 1
+    while i < len(parts):
+        out += sep + parts[i]
+        i += 1
+    return out
+
+
+def _pow10f(exp: int) -> float:
+    out = 1.0
+    i = 0
+    while i < exp:
+        out = out * 10.0
+        i += 1
+    return out
+
+
+def _parse_float_literal(text: str) -> float:
+    exp = 0
+    mantissa = text
+    lower = text.lower()
+    e_idx = lower.find("e")
+    if e_idx >= 0:
+        mantissa = text[:e_idx]
+        exp = int(text[e_idx + 1:], 10)
+    dot_idx = mantissa.find(".")
+    frac_len = 0
+    digits = mantissa
+    if dot_idx >= 0:
+        frac_len = len(mantissa) - dot_idx - 1
+        digits = mantissa[:dot_idx] + mantissa[dot_idx + 1:]
+    if not digits:
+        digits = "0"
+    value = float(int(digits, 10))
+    if frac_len > 0:
+        value = value / _pow10f(frac_len)
+    if exp > 0:
+        value = value * _pow10f(exp)
+    elif exp < 0:
+        value = value / _pow10f(-exp)
+    return value
 
 
 @dataclass
@@ -52,11 +109,12 @@ class _Expr:
 class _Num:
     value: "int | float"
     line: int
+    is_int: bool
 
 
 @dataclass
 class _Str:
-    value: str
+    parts: tuple[tuple[str, bool], ...]
     line: int
 
 
@@ -323,8 +381,15 @@ class _Assert:
 
 
 @dataclass
+class _FStringText:
+    text: str
+    is_raw: bool
+    line: int
+
+
+@dataclass
 class _FString:
-    parts: list   # mix of str literals and embedded expr nodes
+    parts: list   # mix of _FStringText and embedded expr nodes
     line: int
 
 
@@ -337,7 +402,8 @@ class Parser:
 
     def __init__(self, src: str, filename: str = "<input>") -> None:
         self.filename = filename
-        self.tokens: list[Token] = list(Lexer(src, filename))
+        lexer = Lexer(src, filename)
+        self.tokens: list[Token] = Lexer.tokenize(lexer)
         self.pos = 0
 
     # --------------------------------------------------- token helpers
@@ -375,8 +441,8 @@ class Parser:
             got = self._peek()
             exp = text or kind
             raise ParseError(
-                f"{self.filename}:{got.line}:{got.col}: "
-                f"expected {exp!r}, got {got.kind} {got.text!r}"
+                self.filename + ": expected " + exp
+                + ", got " + got.kind + " " + got.text
             )
         return t
 
@@ -457,12 +523,15 @@ class Parser:
 
     def _parse_global_or_nonlocal(self, which: str):
         kw = self._advance()
-        names = [self._expect(TK_NAME).text]
+        first = self._expect(TK_NAME)
+        names = [first.text]
         while self._accept(TK_OP, ","):
-            names.append(self._expect(TK_NAME).text)
+            tok = self._expect(TK_NAME)
+            names.append(tok.text)
         self._expect(TK_NEWLINE)
-        cls = _Global if which == "global" else _Nonlocal
-        return cls(names=names, line=kw.line)
+        if which == "global":
+            return _Global(names=names, line=kw.line)
+        return _Nonlocal(names=names, line=kw.line)
 
     def _parse_with(self) -> _With:
         kw = self._expect(TK_KEYWORD, "with")
@@ -477,7 +546,8 @@ class Parser:
         ctx = self._parse_expr()
         as_name = None
         if self._accept(TK_KEYWORD, "as"):
-            as_name = self._expect(TK_NAME).text
+            tok = self._expect(TK_NAME)
+            as_name = tok.text
         return (ctx, as_name)
 
     def _parse_assert(self) -> _Assert:
@@ -555,7 +625,8 @@ class Parser:
             "+=", "-=", "*=", "/=", "//=", "%=", "**=",
             "&=", "|=", "^=", "<<=", ">>=",
         ):
-            op = self._advance().text
+            op_tok = self._advance()
+            op = op_tok.text
             value = self._parse_expr()
             self._expect(TK_NEWLINE)
             return _AugAssign(target=lhs, op=op, value=value, line=t.line)
@@ -643,7 +714,8 @@ class Parser:
             p = self._peek()
             if p.kind == TK_OP and p.text == ".":
                 self._advance()
-                attr = self._expect(TK_NAME).text
+                attr_tok = self._expect(TK_NAME)
+                attr = attr_tok.text
                 node = _Attr(obj=node, name=attr, line=p.line)
             elif p.kind == TK_OP and p.text == "[":
                 self._advance()
@@ -694,7 +766,8 @@ class Parser:
         mod = self._parse_dotted_name()
         as_name = None
         if self._accept(TK_KEYWORD, "as"):
-            as_name = self._expect(TK_NAME).text
+            tok = self._expect(TK_NAME)
+            as_name = tok.text
         return (mod, as_name)
 
     def _parse_import_name_item(self) -> tuple:
@@ -702,17 +775,21 @@ class Parser:
         if self._peek().kind == TK_OP and self._peek().text == "*":
             self._advance()
             return ("*", None)
-        name = self._expect(TK_NAME).text
+        name_tok = self._expect(TK_NAME)
+        name = name_tok.text
         as_name = None
         if self._accept(TK_KEYWORD, "as"):
-            as_name = self._expect(TK_NAME).text
+            as_tok = self._expect(TK_NAME)
+            as_name = as_tok.text
         return (name, as_name)
 
     def _parse_dotted_name(self) -> str:
-        parts = [self._expect(TK_NAME).text]
+        first = self._expect(TK_NAME)
+        parts = [first.text]
         while self._accept(TK_OP, "."):
-            parts.append(self._expect(TK_NAME).text)
-        return ".".join(parts)
+            tok = self._expect(TK_NAME)
+            parts.append(tok.text)
+        return _join_strings(parts, ".")
 
     def _parse_raise(self) -> _Raise:
         kw = self._expect(TK_KEYWORD, "raise")
@@ -739,7 +816,8 @@ class Parser:
             if self._peek().kind != TK_OP or self._peek().text != ":":
                 exc_type = self._parse_expr()
                 if self._accept(TK_KEYWORD, "as"):
-                    as_name = self._expect(TK_NAME).text
+                    as_tok = self._expect(TK_NAME)
+                    as_name = as_tok.text
             self._expect(TK_OP, ":")
             handlers.append((exc_type, as_name, self._parse_block()))
         if self._peek().kind == TK_KEYWORD and self._peek().text == "else":
@@ -772,7 +850,8 @@ class Parser:
 
     def _parse_classdef(self, decorators: tuple) -> _ClassDef:
         kw = self._expect(TK_KEYWORD, "class")
-        name = self._expect(TK_NAME).text
+        name_tok = self._expect(TK_NAME)
+        name = name_tok.text
         bases: list = []
         if self._accept(TK_OP, "("):
             if self._peek().text != ")":
@@ -789,7 +868,8 @@ class Parser:
 
     def _parse_funcdef(self) -> _FuncDef:
         kw = self._expect(TK_KEYWORD, "def")
-        name = self._expect(TK_NAME).text
+        name_tok = self._expect(TK_NAME)
+        name = name_tok.text
         self._expect(TK_OP, "(")
         # Each element is a tuple (kind, name) where kind ∈
         # {"pos", "*args", "**kwargs"}. We drop type / default info at
@@ -824,14 +904,16 @@ class Parser:
             self._advance()
             if self._peek().kind == TK_OP and self._peek().text in (",", ":"):
                 return ("kwonly-sep", "", None, None)
-            pname = self._expect(TK_NAME).text
+            pname_tok = self._expect(TK_NAME)
+            pname = pname_tok.text
             ann = None
             if not in_lambda and self._accept(TK_OP, ":"):
                 ann = self._parse_type_expr()
             return ("*args", pname, ann, None)
         if t.kind == TK_OP and t.text == "**":
             self._advance()
-            pname = self._expect(TK_NAME).text
+            pname_tok = self._expect(TK_NAME)
+            pname = pname_tok.text
             ann = None
             if not in_lambda and self._accept(TK_OP, ":"):
                 ann = self._parse_type_expr()
@@ -839,7 +921,8 @@ class Parser:
         if t.kind == TK_OP and t.text == "/":
             self._advance()
             return ("pos-only-sep", "", None, None)
-        pname = self._expect(TK_NAME).text
+        pname_tok = self._expect(TK_NAME)
+        pname = pname_tok.text
         ann = None
         default = None
         if not in_lambda and self._accept(TK_OP, ":"):
@@ -894,8 +977,7 @@ class Parser:
                 node = _Attr(obj=node, name=attr_tok.text, line=attr_tok.line)
         elif t.kind == TK_STRING:
             self._advance()
-            body = self._string_body(t.text)
-            node = _Str(value=body, line=t.line)
+            node = _Str(parts=(self._string_piece(t.text),), line=t.line)
         elif t.kind == TK_OP and t.text == "*":
             self._advance()
             inner = self._parse_type_atom()
@@ -1116,7 +1198,8 @@ class Parser:
             if t.kind == TK_OP and t.text in (
                 "<", ">", "<=", ">=", "==", "!=",
             ):
-                op = self._advance().text
+                op_tok = self._advance()
+                op = op_tok.text
             elif t.kind == TK_KEYWORD and t.text == "is":
                 self._advance()
                 if self._accept(TK_KEYWORD, "not"):
@@ -1167,7 +1250,8 @@ class Parser:
     def _parse_shift(self):
         lhs = self._parse_add()
         while self._peek().kind == TK_OP and self._peek().text in ("<<", ">>"):
-            op = self._advance().text
+            op_tok = self._advance()
+            op = op_tok.text
             rhs = self._parse_add()
             lhs = _BinOp(op=op, lhs=lhs, rhs=rhs, line=self._peek().line)
         return lhs
@@ -1175,7 +1259,8 @@ class Parser:
     def _parse_add(self):
         lhs = self._parse_mul()
         while self._peek().kind == TK_OP and self._peek().text in ("+", "-"):
-            op = self._advance().text
+            op_tok = self._advance()
+            op = op_tok.text
             rhs = self._parse_mul()
             lhs = _BinOp(op=op, lhs=lhs, rhs=rhs, line=self._peek().line)
         return lhs
@@ -1185,7 +1270,8 @@ class Parser:
         while self._peek().kind == TK_OP and self._peek().text in (
             "*", "/", "//", "%", "@",
         ):
-            op = self._advance().text
+            op_tok = self._advance()
+            op = op_tok.text
             rhs = self._parse_unary()
             lhs = _BinOp(op=op, lhs=lhs, rhs=rhs, line=self._peek().line)
         return lhs
@@ -1207,21 +1293,186 @@ class Parser:
         return lhs
 
     @staticmethod
-    def _string_body(raw: str) -> str:
+    def _string_prefix(raw: str) -> str:
+        i = 0
+        while i < len(raw) and raw[i] not in ("'", '"'):
+            i += 1
+        return raw[:i]
+
+    @classmethod
+    def _string_body(cls, raw: str) -> str:
         """Strip quotes and the optional prefix (``b``/``f``/``r``/``u``
         and 2-char combinations) from a STRING token's raw text.
 
         Returns the string body *with escapes unprocessed* — the
         lowering stage owns escape handling because it needs to know
         whether the prefix said ``r`` (raw, no processing) or not."""
-        i = 0
-        while i < len(raw) and raw[i] not in ("'", '"'):
-            i += 1
-        prefix = raw[:i]
-        rest = raw[i:]
+        rest = raw[len(cls._string_prefix(raw)):]
         if rest[:3] in ('"""', "'''"):
             return rest[3:-3]
         return rest[1:-1]
+
+    @classmethod
+    def _string_piece(cls, raw: str) -> tuple[str, bool]:
+        prefix = cls._string_prefix(raw).lower()
+        return (cls._string_body(raw), "r" in prefix)
+
+    @classmethod
+    def _string_is_f(cls, raw: str) -> bool:
+        return "f" in cls._string_prefix(raw).lower()
+
+    @staticmethod
+    def _split_fstring_expr(text: str) -> str:
+        depth = 0
+        quote = ""
+        triple = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == "\\":
+                    i += 2
+                    continue
+                if triple:
+                    if (
+                        ch == quote
+                        and i + 2 < len(text)
+                        and text[i + 1] == quote
+                        and text[i + 2] == quote
+                    ):
+                        quote = ""
+                        triple = False
+                        i += 3
+                        continue
+                elif ch == quote:
+                    quote = ""
+                    i += 1
+                    continue
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                triple = (
+                    i + 2 < len(text)
+                    and text[i + 1] == ch
+                    and text[i + 2] == ch
+                )
+                i += 3 if triple else 1
+                continue
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                if depth > 0:
+                    depth -= 1
+            elif depth == 0 and ch in ("!", ":"):
+                return text[:i].strip()
+            i += 1
+        return text.strip()
+
+    def _parse_fstring_expr(self, text: str, line: int):
+        expr_text = self._split_fstring_expr(text)
+        if not expr_text:
+            raise ParseError(
+                self.filename + ":" + str(line) + ": empty f-string expression"
+            )
+        parser = Parser(expr_text, self.filename)
+        expr = parser._parse_expr()
+        while parser._peek().kind == TK_NEWLINE:
+            parser._advance()
+        if parser._peek().kind != TK_EOF:
+            t = parser._peek()
+            raise ParseError(
+                self.filename + ":" + str(line)
+                + ": trailing f-string expression input near "
+                + repr(t.text)
+            )
+        return expr
+
+    def _parse_fstring_parts(self, raw: str, line: int) -> list:
+        body = self._string_body(raw)
+        is_raw = "r" in self._string_prefix(raw).lower()
+        out = []
+        literal = []
+        i = 0
+        while i < len(body):
+            ch = body[i]
+            if ch == "{" and i + 1 < len(body) and body[i + 1] == "{":
+                literal.append("{")
+                i += 2
+                continue
+            if ch == "}" and i + 1 < len(body) and body[i + 1] == "}":
+                literal.append("}")
+                i += 2
+                continue
+            if ch == "{":
+                if literal:
+                    out.append(_FStringText("".join(literal), is_raw, line))
+                    literal = []
+                start = i + 1
+                depth = 0
+                quote = ""
+                triple = False
+                i = start
+                while i < len(body):
+                    c = body[i]
+                    if quote:
+                        if c == "\\":
+                            i += 2
+                            continue
+                        if triple:
+                            if (
+                                c == quote
+                                and i + 2 < len(body)
+                                and body[i + 1] == quote
+                                and body[i + 2] == quote
+                            ):
+                                quote = ""
+                                triple = False
+                                i += 3
+                                continue
+                        elif c == quote:
+                            quote = ""
+                            i += 1
+                            continue
+                        i += 1
+                        continue
+                    if c in ("'", '"'):
+                        quote = c
+                        triple = (
+                            i + 2 < len(body)
+                            and body[i + 1] == c
+                            and body[i + 2] == c
+                        )
+                        i += 3 if triple else 1
+                        continue
+                    if c in "([{":
+                        depth += 1
+                    elif c in ")]}":
+                        if c == "}" and depth == 0:
+                            out.append(
+                                self._parse_fstring_expr(body[start:i], line)
+                            )
+                            i += 1
+                            break
+                        if depth > 0:
+                            depth -= 1
+                    i += 1
+                else:
+                    raise ParseError(
+                        self.filename + ":" + str(line)
+                        + ": unterminated f-string expression"
+                    )
+                continue
+            if ch == "}":
+                raise ParseError(
+                    self.filename + ":" + str(line)
+                    + ": single '}' in f-string"
+                )
+            literal.append(ch)
+            i += 1
+        if literal:
+            out.append(_FStringText("".join(literal), is_raw, line))
+        return out
 
     def _parse_subscript(self):
         """``expr``, ``a:b``, ``a:b:c`` or tuple of subscripts."""
@@ -1332,7 +1583,8 @@ class Parser:
                 node = _Subscript(obj=node, idx=idx, line=t.line)
             elif t.kind == TK_OP and t.text == ".":
                 self._advance()
-                attr = self._expect(TK_NAME).text
+                attr_tok = self._expect(TK_NAME)
+                attr = attr_tok.text
                 node = _Attr(obj=node, name=attr, line=t.line)
             else:
                 break
@@ -1344,16 +1596,25 @@ class Parser:
             self._advance()
             clean = t.text.replace("_", "")
             if "." in clean or "e" in clean.lower():
-                return _Num(float(clean), t.line)
-            return _Num(int(clean, 0), t.line)
+                return _Num(_parse_float_literal(clean), t.line, False)
+            return _Num(int(clean, 0), t.line, True)
         if t.kind == TK_STRING:
             self._advance()
-            body = self._string_body(t.text)
+            strings = [t]
             # Implicit concatenation: ``"foo" "bar"`` / ``"foo" r"bar"``.
             while self._peek().kind == TK_STRING:
                 nxt = self._advance()
-                body += self._string_body(nxt.text)
-            return _Str(body, t.line)
+                strings.append(nxt)
+            if any(self._string_is_f(tok.text) for tok in strings):
+                fparts = []
+                for tok in strings:
+                    if self._string_is_f(tok.text):
+                        fparts.extend(self._parse_fstring_parts(tok.text, tok.line))
+                    else:
+                        body, is_raw = self._string_piece(tok.text)
+                        fparts.append(_FStringText(body, is_raw, tok.line))
+                return _FString(fparts, t.line)
+            return _Str(tuple(self._string_piece(tok.text) for tok in strings), t.line)
         if t.kind == TK_KEYWORD:
             if t.text == "True":
                 self._advance()
@@ -1539,4 +1800,5 @@ class Parser:
 
 
 def parse(src: str, filename: str = "<input>") -> _Module:
-    return Parser(src, filename).parse_module()
+    parser = Parser(src, filename)
+    return Parser.parse_module(parser)

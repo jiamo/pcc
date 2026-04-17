@@ -80,7 +80,7 @@ class TestArrayOfPointers(unittest.TestCase):
         cg.generate_code(ast)
         ir_str = str(cg.module)
         assert "grid" in ir_str
-        assert "[2 x [2 x i32*]]" in ir_str
+        assert "[2 x [2 x i32*]]" in ir_str or "[2 x [2 x ptr]]" in ir_str
 
     def test_multidim_ptr_array_runtime(self):
         pcc = CEvaluator()

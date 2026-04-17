@@ -36,6 +36,7 @@ from dataclasses import replace
 from typing import Optional
 
 from . import py_ast
+from .export_meta import decode_type
 from .py_ast import (
     Arg,
     Assign,
@@ -48,6 +49,7 @@ from .py_ast import (
     Break,
     Call,
     ClassDef,
+    ClassType,
     Compare,
     Continue,
     Delete,
@@ -95,18 +97,45 @@ from .py_ast import (
     With,
 )
 from .types import (
-    TYPE_BOOL,
-    TYPE_DYN,
-    TYPE_FLOAT,
-    TYPE_INT,
-    TYPE_NONE,
-    TYPE_STR,
     PyFrontendError,
     common_type,
     is_numeric,
     parse_annotation,
     type_eq,
 )
+
+
+TYPE_INT: IntType = IntType(name="int", width=64, signed=True)
+TYPE_FLOAT: FloatType = FloatType(name="float", width=64)
+TYPE_BOOL: BoolType = BoolType(name="bool")
+TYPE_NONE: NoneType = NoneType(name="None")
+TYPE_STR: StrType = StrType(name="str")
+TYPE_DYN: DynType = DynType(name="dyn")
+
+
+def _make_list_type(elem: Type) -> ListType:
+    return ListType("list", elem)
+
+
+def _make_dict_type(key: Type, value: Type) -> DictType:
+    return DictType("dict", key, value)
+
+
+def _make_tuple_type(name: str, elems: tuple[Type, ...]) -> TupleType:
+    return TupleType(name, elems)
+
+
+def _make_func_type(params: tuple[Type, ...], ret: Type) -> FuncType:
+    return FuncType("callable", params, ret)
+
+
+def _make_class_type(
+    name: str,
+    module: str,
+    fields: tuple[tuple[str, Type], ...],
+    bases: tuple[ClassType, ...],
+) -> ClassType:
+    return ClassType(name, module, fields, bases)
 
 
 # ---------------------------------------------------------------------------
@@ -131,10 +160,63 @@ _BUILTIN_TYPES: dict[str, Type] = {
     "float": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_FLOAT),
     "str": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_STR),
     "bool": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_BOOL),
+    "set": FuncType(
+        name="callable", params=(TYPE_DYN,), ret=DynType(name="set"),
+    ),
+    "frozenset": FuncType(
+        name="callable", params=(TYPE_DYN,), ret=DynType(name="set"),
+    ),
+    "chr": FuncType(name="callable", params=(TYPE_INT,), ret=TYPE_STR),
     "abs": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
     "min": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
     "max": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
     "sum": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
+}
+
+_UNSAFE_INTRINSIC_RETURN_TYPES: dict[str, Type] = {
+    "malloc": TYPE_DYN,
+    "cstr": TYPE_DYN,
+    "global_addr": TYPE_DYN,
+    "global_load_ptr": TYPE_DYN,
+    "global_store_ptr": TYPE_NONE,
+    "define_global_i8": TYPE_NONE,
+    "define_global_i32": TYPE_NONE,
+    "define_global_header": TYPE_NONE,
+    "define_global_ptr_null": TYPE_NONE,
+    "define_global_ptr_to_global": TYPE_NONE,
+    "define_global_cstr": TYPE_NONE,
+    "define_global_ptr_array": TYPE_NONE,
+    "define_global_null_ptr_array": TYPE_NONE,
+    "define_global_i32_array": TYPE_NONE,
+    "calloc": TYPE_DYN,
+    "realloc": TYPE_DYN,
+    "free": TYPE_NONE,
+    "ptr_add": TYPE_DYN,
+    "null": TYPE_DYN,
+    "ptr_eq": TYPE_BOOL,
+    "ptr_is_null": TYPE_BOOL,
+    "is_tagged_int": TYPE_BOOL,
+    "tag_int": TYPE_DYN,
+    "untag_int": TYPE_INT,
+    "load_i64": TYPE_INT,
+    "load_i32": TYPE_INT,
+    "load_i8": TYPE_INT,
+    "load_ptr": TYPE_DYN,
+    "load_f64": TYPE_FLOAT,
+    "store_i64": TYPE_NONE,
+    "store_i32": TYPE_NONE,
+    "store_i8": TYPE_NONE,
+    "store_ptr": TYPE_NONE,
+    "store_f64": TYPE_NONE,
+    "memset": TYPE_DYN,
+    "memcpy": TYPE_DYN,
+    "memmove": TYPE_DYN,
+    "write": TYPE_INT,
+    "strlen": TYPE_INT,
+    "getenv": TYPE_DYN,
+    "setenv": TYPE_INT,
+    "unsetenv": TYPE_INT,
+    "access": TYPE_INT,
 }
 
 
@@ -200,8 +282,21 @@ class _InferCtx:
         # flow into this module's scope at inference time rather than
         # collapsing to DynType.
         self.external_exports = external_exports or {}
+        # ``from dataclasses import replace as ...`` is common across
+        # the frontend passes. Track the local aliases explicitly so
+        # call-result inference can preserve the first argument's type
+        # instead of collapsing the whole expression to DynType.
+        self.dataclasses_replace_aliases: set[str] = set()
+        self.class_types: dict[str, ClassType] = {}
 
     # -- helpers -----------------------------------------------------------
+
+    def register_class_type(self, local_name: str, ty: ClassType) -> None:
+        """Register a schema-bearing class type under local and stable names."""
+        self.class_types[local_name] = ty
+        self.class_types[ty.name] = ty
+        if ty.module:
+            self.class_types[f"{ty.module}.{ty.name}"] = ty
 
     def resolve_annotation(self, ann: object) -> Type:
         """Normalise an ``annotation`` field into a ``Type``.
@@ -213,11 +308,71 @@ class _InferCtx:
         if ann is None:
             return TYPE_DYN
         if isinstance(ann, Type):
-            return ann
+            return self.resolve_type_refs(ann)
         if isinstance(ann, Expr):
-            return parse_annotation(ann)
+            return self.resolve_type_refs(parse_annotation(ann))
         # Unknown annotation payload — be defensive, don't crash.
         return TYPE_DYN
+
+    def resolve_type_refs(self, ty: Type) -> Type:
+        """Resolve ``ClassType`` refs inside annotations.
+
+        Both parsers can preserve an unknown annotation name as
+        ``ClassType(name, fields=())`` before inference has seen the
+        corresponding class body. Once the module class table exists,
+        replace those shells with the schema-bearing class type and
+        recurse through container annotations.
+        """
+        if isinstance(ty, ClassType):
+            if (
+                not ty.module
+                and not ty.fields
+                and not ty.bases
+            ):
+                if ty.name == "list":
+                    return _make_list_type(TYPE_DYN)
+                if ty.name == "dict":
+                    return _make_dict_type(TYPE_DYN, TYPE_DYN)
+                if ty.name == "tuple":
+                    return _make_tuple_type("tuple_variadic", (TYPE_DYN,))
+            if ty.module:
+                found = self.class_types.get(f"{ty.module}.{ty.name}")
+                if found is not None:
+                    return found
+            found = self.class_types.get(ty.name)
+            if found is not None:
+                return found
+            fields = tuple(
+                (name, self.resolve_type_refs(field_ty))
+                for name, field_ty in ty.fields
+            )
+            bases = tuple(self.resolve_type_refs(base) for base in ty.bases)
+            if fields == ty.fields and bases == ty.bases:
+                return ty
+            return _make_class_type(ty.name, ty.module, fields, bases)
+        if isinstance(ty, ListType):
+            elem = self.resolve_type_refs(ty.elem)
+            if elem == ty.elem:
+                return ty
+            return _make_list_type(elem)
+        if isinstance(ty, DictType):
+            key = self.resolve_type_refs(ty.key)
+            value = self.resolve_type_refs(ty.value)
+            if key == ty.key and value == ty.value:
+                return ty
+            return _make_dict_type(key, value)
+        if isinstance(ty, TupleType):
+            elems = tuple(self.resolve_type_refs(e) for e in ty.elems)
+            if elems == ty.elems:
+                return ty
+            return _make_tuple_type(ty.name, elems)
+        if isinstance(ty, FuncType):
+            params = tuple(self.resolve_type_refs(p) for p in ty.params)
+            ret = self.resolve_type_refs(ty.ret)
+            if params == ty.params and ret == ty.ret:
+                return ty
+            return _make_func_type(params, ret)
+        return ty
 
     def lookup_name(self, scope: _Scope, ident: str) -> Type:
         """Resolve a bare name, falling through to builtins."""
@@ -360,6 +515,14 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
         # int, ``min``/``max``/``abs`` return the operand type family.
         if isinstance(callee, Name):
             bname = callee.ident
+            if (
+                bname in ctx.dataclasses_replace_aliases
+                and len(new_args) == 1
+            ):
+                return replace(
+                    expr, func=callee, args=new_args, kwargs=new_kwargs,
+                    ty=new_args[0].ty,
+                )
             if bname == "sum":
                 return replace(
                     expr, func=callee, args=new_args, kwargs=new_kwargs,
@@ -381,6 +544,11 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                     ty=TYPE_FLOAT,
                 )
             if bname == "str":
+                return replace(
+                    expr, func=callee, args=new_args, kwargs=new_kwargs,
+                    ty=TYPE_STR,
+                )
+            if bname == "chr":
                 return replace(
                     expr, func=callee, args=new_args, kwargs=new_kwargs,
                     ty=TYPE_STR,
@@ -454,6 +622,13 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
     # Attribute / subscript / slice (Phase 1: opaque → dyn) --------------
     if isinstance(expr, Attr):
         obj = _infer_expr(ctx, scope, expr.obj)
+        # Bucket 1: when the receiver is a known class type with
+        # field declarations, look up the field's declared type.
+        # Walks the MRO (bases) so inherited fields resolve too.
+        if isinstance(obj.ty, ClassType):
+            field_ty = _lookup_class_field(obj.ty, expr.name)
+            if field_ty is not None:
+                return replace(expr, obj=obj, ty=field_ty)
         return replace(expr, obj=obj, ty=TYPE_DYN)
 
     if isinstance(expr, Subscript):
@@ -561,6 +736,9 @@ def _binop_result(op: str, a: Type, b: Type, span: SourceSpan) -> Type:
     if op == "+":
         if isinstance(a, StrType) and isinstance(b, StrType):
             return TYPE_STR
+    if op == "%":
+        if isinstance(a, StrType):
+            return TYPE_STR
     if op == "*":
         # str * int or int * str → str
         if isinstance(a, StrType) and isinstance(b, (IntType, BoolType)):
@@ -571,14 +749,14 @@ def _binop_result(op: str, a: Type, b: Type, span: SourceSpan) -> Type:
     # Reject obvious mismatches early with a friendly error.
     if op in ("+", "-", "*", "/", "//", "%", "**"):
         if isinstance(a, StrType) and is_numeric(b):
-            if op != "*":
+            if op not in ("*", "%"):
                 raise PyFrontendError(
                     span=span,
                     message=f"unsupported operand type(s) for {op}: 'str' and numeric",
                     hint="use str() or explicit conversion",
                 )
         if isinstance(b, StrType) and is_numeric(a):
-            if op != "*":
+            if op not in ("*", "%"):
                 raise PyFrontendError(
                     span=span,
                     message=f"unsupported operand type(s) for {op}: numeric and 'str'",
@@ -621,6 +799,8 @@ def _call_result_type(ctx: _InferCtx, callee: Expr) -> Type:
         # builtins or a user definition captured via a local binding).
     if isinstance(callee.ty, FuncType):
         return callee.ty.ret
+    if isinstance(callee.ty, ClassType):
+        return callee.ty
     return TYPE_DYN
 
 
@@ -658,7 +838,8 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
 
     if isinstance(stmt, If):
         cond = _infer_expr(ctx, scope, stmt.cond)
-        body = tuple(_infer_stmt(ctx, scope, s) for s in stmt.body)
+        body_scope = _narrow_scope_for_cond(ctx, scope, cond)
+        body = tuple(_infer_stmt(ctx, body_scope, s) for s in stmt.body)
         else_body = tuple(_infer_stmt(ctx, scope, s) for s in stmt.else_body)
         return replace(stmt, cond=cond, body=body, else_body=else_body)
 
@@ -744,6 +925,12 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
             ):
                 new_body.append(s)
                 continue
+            if isinstance(s, FuncDef):
+                self_ty = ctx.class_types.get(stmt.name)
+                new_body.append(
+                    _infer_funcdef(ctx, class_scope, s, self_ty=self_ty)
+                )
+                continue
             new_body.append(_infer_stmt(ctx, class_scope, s))
         return replace(stmt, body=tuple(new_body))
 
@@ -753,38 +940,36 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
     # function / class type so downstream call-site and attribute
     # inference picks the concrete type rather than DynType.
     if isinstance(stmt, ImportFrom):
+        resolved = _resolve_relative_module(
+            stmt.module,
+            stmt.level,
+            ctx.module.name,
+            stmt.span.file,
+        )
+        if resolved == "dataclasses":
+            for attr_name, as_name in stmt.names:
+                if attr_name != "replace":
+                    continue
+                local_name = as_name or attr_name
+                ft = FuncType(
+                    name="callable", params=(TYPE_DYN,), ret=TYPE_DYN,
+                )
+                ctx.dataclasses_replace_aliases.add(local_name)
+                scope.update(local_name, ft)
+                ctx.func_types[local_name] = ft
+        if resolved == "pcc.unsafe":
+            for attr_name, as_name in stmt.names:
+                ret_ty = _UNSAFE_INTRINSIC_RETURN_TYPES.get(attr_name)
+                if ret_ty is None:
+                    continue
+                local_name = as_name or attr_name
+                ft = FuncType(
+                    name="callable", params=(TYPE_DYN,), ret=ret_ty,
+                )
+                scope.update(local_name, ft)
+                ctx.func_types[local_name] = ft
         if ctx.external_exports:
-            resolved = _resolve_relative_module(
-                stmt.module, stmt.level, ctx.module.name,
-            )
-            module_exports = ctx.external_exports.get(resolved)
-            if module_exports is not None:
-                for attr_name, as_name in stmt.names:
-                    local_name = as_name or attr_name
-                    info = module_exports.get(attr_name)
-                    if info is None:
-                        continue
-                    if info["kind"] == "function":
-                        param_tys = tuple(
-                            _annotation_to_type(t)
-                            for t in info["param_types"]
-                        )
-                        ret_ty = info["return_ty"] or TYPE_NONE
-                        ft = FuncType(
-                            name="callable", params=param_tys,
-                            ret=_annotation_to_type(ret_ty),
-                        )
-                        scope.update(local_name, ft)
-                        ctx.func_types[local_name] = ft
-                    elif info["kind"] == "class":
-                        # A bare class-name reference should resolve
-                        # to the class's constructor type. pcc's
-                        # ClassType serves as both the value type and
-                        # the callable-marker; record it in scope.
-                        from .py_ast import ClassType
-                        scope.update(local_name, ClassType(
-                            name=info["class_name"], module=resolved,
-                        ))
+            _bind_external_import_exports(ctx, scope, resolved, stmt.names)
         return stmt
     if isinstance(stmt, (Import, Global, Nonlocal, Pass, Break, Continue)):
         return stmt
@@ -821,6 +1006,258 @@ def _element_type_of(ty: Type) -> Type:
     if isinstance(ty, StrType):
         return TYPE_STR
     return TYPE_DYN
+
+
+def _single_class_type_from_isinstance_arg(
+    ctx: _InferCtx, expr: Expr,
+) -> Optional[ClassType]:
+    """Resolve ``isinstance``'s second argument when it is one class.
+
+    Tuple forms describe a union. The frontend has no union type yet, so
+    we deliberately leave those unnarrowed instead of guessing.
+    """
+    if isinstance(expr, Name):
+        ty = ctx.resolve_type_refs(expr.ty)
+        if isinstance(ty, ClassType):
+            return ty
+        found = ctx.class_types.get(expr.ident)
+        if found is not None:
+            return found
+    return None
+
+
+def _narrow_scope_for_cond(ctx: _InferCtx, scope: _Scope, cond: Expr) -> _Scope:
+    if isinstance(cond, BoolExpr) and cond.op == "and":
+        narrowed_left = _narrow_scope_for_cond(ctx, scope, cond.left)
+        return _narrow_scope_for_cond(ctx, narrowed_left, cond.right)
+    return _narrow_scope_for_isinstance(ctx, scope, cond)
+
+
+def _narrow_scope_for_isinstance(
+    ctx: _InferCtx, scope: _Scope, cond: Expr,
+) -> _Scope:
+    if not (
+        isinstance(cond, Call)
+        and isinstance(cond.func, Name)
+        and cond.func.ident == "isinstance"
+        and len(cond.args) == 2
+        and not cond.kwargs
+        and isinstance(cond.args[0], Name)
+    ):
+        return scope
+    candidate = _single_class_type_from_isinstance_arg(ctx, cond.args[1])
+    if candidate is None:
+        return scope
+    var_name = cond.args[0].ident
+    current = scope.lookup(var_name)
+    if current is None:
+        return scope
+    if not (
+        isinstance(current, DynType)
+        or (
+            isinstance(current, ClassType)
+            and _class_type_assignable(current, candidate)
+        )
+    ):
+        return scope
+    narrowed = _Scope(parent=scope)
+    narrowed.update(var_name, candidate)
+    return narrowed
+
+
+def _iter_class_mro(cls_ty: ClassType):
+    """Yield ``cls_ty`` and its bases breadth-first, guarding cycles."""
+    seen: set[tuple[str, str]] = set()
+    queue: list[ClassType] = [cls_ty]
+    while queue:
+        cur = queue.pop(0)
+        key = (cur.module, cur.name)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield cur
+        queue.extend(cur.bases)
+
+
+def _lookup_class_field(cls_ty: ClassType, field_name: str) -> Optional[Type]:
+    for cur in _iter_class_mro(cls_ty):
+        for fname, fty in cur.fields:
+            if fname == field_name:
+                return fty
+    return None
+
+
+def _class_bases_from_def(ctx: _InferCtx, stmt: ClassDef) -> tuple[ClassType, ...]:
+    bases: list[ClassType] = []
+    for base_expr in stmt.bases:
+        if not isinstance(base_expr, Name):
+            continue
+        if base_expr.ident == "object":
+            continue
+        base_ty = ctx.class_types.get(base_expr.ident)
+        if isinstance(base_ty, ClassType):
+            bases.append(base_ty)
+        else:
+            bases.append(
+                _make_class_type(
+                    base_expr.ident, ctx.module.name or "", (), (),
+                )
+            )
+    return tuple(bases)
+
+
+def _append_field(
+    fields: list[tuple[str, Type]], name: str, field_ty: Type,
+) -> None:
+    for i, (existing, _old_ty) in enumerate(fields):
+        if existing == name:
+            fields[i] = (name, field_ty)
+            return
+    fields.append((name, field_ty))
+
+
+def _class_fields_from_def(ctx: _InferCtx, stmt: ClassDef) -> tuple[tuple[str, Type], ...]:
+    fields: list[tuple[str, Type]] = []
+    for body_stmt in stmt.body:
+        if isinstance(body_stmt, Assign):
+            if body_stmt.annotation is None:
+                continue
+            field_ty = ctx.resolve_annotation(body_stmt.annotation)
+            for target in body_stmt.targets:
+                if isinstance(target, Name):
+                    _append_field(fields, target.ident, field_ty)
+        elif isinstance(body_stmt, FuncDef) and body_stmt.name == "__init__":
+            arg_types = {
+                arg.name: ctx.resolve_annotation(arg.annotation)
+                for arg in body_stmt.args
+                if arg.name not in ("", "self", "cls")
+            }
+            for init_stmt in body_stmt.body:
+                if not isinstance(init_stmt, Assign):
+                    continue
+                explicit_ty: Optional[Type] = None
+                if init_stmt.annotation is not None:
+                    explicit_ty = ctx.resolve_annotation(init_stmt.annotation)
+                for target in init_stmt.targets:
+                    if (
+                        not isinstance(target, Attr)
+                        or not isinstance(target.obj, Name)
+                        or target.obj.ident != "self"
+                    ):
+                        continue
+                    field_ty = explicit_ty
+                    if field_ty is None and isinstance(init_stmt.value, Name):
+                        field_ty = arg_types.get(init_stmt.value.ident)
+                    if field_ty is None:
+                        continue
+                    _append_field(fields, target.name, field_ty)
+    return tuple(fields)
+
+
+def _class_type_from_export(
+    ctx: _InferCtx,
+    module_name: str,
+    info: dict,
+    module_exports: dict,
+    memo: dict[tuple[str, str], ClassType],
+) -> ClassType:
+    class_name = info["class_name"]
+    key = (module_name, class_name)
+    cached = memo.get(key)
+    if cached is not None:
+        return cached
+
+    placeholder = _make_class_type(class_name, module_name, (), ())
+    memo[key] = placeholder
+
+    bases: list[ClassType] = []
+    for base_name in info.get("base_names", ()):
+        base_info = module_exports.get(base_name)
+        if isinstance(base_info, dict) and base_info.get("kind") == "class":
+            bases.append(
+                _class_type_from_export(
+                    ctx, module_name, base_info, module_exports, memo,
+                )
+            )
+        else:
+            bases.append(
+                _make_class_type(base_name, module_name, (), ())
+            )
+
+    fields = tuple(
+        (
+            fname,
+            ctx.resolve_type_refs(_annotation_to_type(decode_type(field_ty))),
+        )
+        for fname, field_ty in info.get("field_types", ())
+    )
+    cls_ty = _make_class_type(
+        class_name, module_name, fields, tuple(bases),
+    )
+    memo[key] = cls_ty
+    ctx.register_class_type(class_name, cls_ty)
+    return cls_ty
+
+
+def _bind_external_import_exports(
+    ctx: _InferCtx,
+    scope: _Scope,
+    resolved_module: str,
+    names: tuple[tuple[str, Optional[str]], ...],
+) -> None:
+    module_exports = ctx.external_exports.get(resolved_module)
+    if module_exports is None:
+        return
+
+    memo: dict[tuple[str, str], ClassType] = {}
+    for info in module_exports.values():
+        if isinstance(info, dict) and info.get("kind") == "class":
+            _class_type_from_export(
+                ctx, resolved_module, info, module_exports, memo,
+            )
+
+    for attr_name, as_name in names:
+        local_name = as_name or attr_name
+        info = module_exports.get(attr_name)
+        if info is None:
+            continue
+        if info["kind"] == "function":
+            param_tys = tuple(
+                ctx.resolve_type_refs(_annotation_to_type(decode_type(t)))
+                for t in info["param_types"]
+            )
+            ret_ty = ctx.resolve_type_refs(
+                _annotation_to_type(decode_type(info["return_ty"]))
+            )
+            ft = _make_func_type(param_tys, ret_ty)
+            scope.update(local_name, ft)
+            ctx.func_types[local_name] = ft
+        elif info["kind"] == "class":
+            cls_ty = _class_type_from_export(
+                ctx, resolved_module, info, module_exports, memo,
+            )
+            scope.update(local_name, cls_ty)
+            ctx.register_class_type(local_name, cls_ty)
+
+
+def _preload_unique_external_classes(ctx: _InferCtx) -> None:
+    by_name: dict[str, list[tuple[str, dict, dict]]] = {}
+    for module_name, module_exports in ctx.external_exports.items():
+        for info in module_exports.values():
+            if not isinstance(info, dict) or info.get("kind") != "class":
+                continue
+            by_name.setdefault(info["class_name"], []).append(
+                (module_name, info, module_exports)
+            )
+    memo: dict[tuple[str, str], ClassType] = {}
+    for class_name, entries in by_name.items():
+        if len(entries) != 1:
+            continue
+        module_name, info, module_exports = entries[0]
+        cls_ty = _class_type_from_export(
+            ctx, module_name, info, module_exports, memo,
+        )
+        ctx.register_class_type(class_name, cls_ty)
 
 
 # ---------------------------------------------------------------------------
@@ -867,6 +1304,14 @@ def _check_assign_compatible(ann: Type, rhs: Type, span: SourceSpan) -> None:
     # Allow bool→int.
     if isinstance(ann, IntType) and isinstance(rhs, BoolType):
         return
+    # Allow None to any object-ish annotation (``Optional[list]`` /
+    # ``Optional[dict]`` / ``Optional[MyClass]`` parses as the inner
+    # type; None-at-init is a standard idiom).
+    from .py_ast import NoneType as _NoneType
+    if isinstance(rhs, _NoneType) and not isinstance(
+        ann, (IntType, FloatType, BoolType)
+    ):
+        return
     # Container element subsumption with DynType.
     if _is_assignable(ann, rhs):
         return
@@ -882,12 +1327,25 @@ def _check_assign_compatible(ann: Type, rhs: Type, span: SourceSpan) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _infer_funcdef(ctx: _InferCtx, scope: _Scope, fn: FuncDef) -> FuncDef:
+def _infer_funcdef(
+    ctx: _InferCtx,
+    scope: _Scope,
+    fn: FuncDef,
+    *,
+    self_ty: Optional[ClassType] = None,
+) -> FuncDef:
     # Resolve argument annotations up-front.
     new_args: list[Arg] = []
     param_scope = _Scope(parent=scope)
-    for a in fn.args:
+    for index, a in enumerate(fn.args):
         ty = ctx.resolve_annotation(a.annotation)
+        if (
+            self_ty is not None
+            and index == 0
+            and a.name in ("self", "cls")
+            and a.annotation is None
+        ):
+            ty = self_ty
         new_args.append(
             replace(
                 a,
@@ -997,6 +1455,17 @@ def _is_assignable(declared: Type, got: Type) -> bool:
         return True
     if type_eq(declared, got):
         return True
+    if isinstance(got, NoneType) and not isinstance(
+        declared, (IntType, FloatType, BoolType)
+    ):
+        return True
+    if isinstance(declared, ClassType):
+        if _runtime_type_object_assignable(declared, got):
+            return True
+        if _builtin_container_class_assignable(declared, got):
+            return True
+        if isinstance(got, ClassType):
+            return _class_type_assignable(declared, got)
     if isinstance(declared, TupleType) and isinstance(got, TupleType):
         # ``tuple[T, ...]`` — variadic declared tuple matches any
         # tuple whose every element is assignable to ``T``.
@@ -1011,10 +1480,12 @@ def _is_assignable(declared: Type, got: Type) -> bool:
             return all(_is_assignable(d, got_elem) for d in declared.elems)
         if len(declared.elems) != len(got.elems):
             return False
-        return all(
-            _is_assignable(d, g)
-            for d, g in zip(declared.elems, got.elems)
-        )
+        i = 0
+        while i < len(declared.elems):
+            if not _is_assignable(declared.elems[i], got.elems[i]):
+                return False
+            i += 1
+        return True
     if isinstance(declared, ListType) and isinstance(got, ListType):
         return _is_assignable(declared.elem, got.elem)
     if isinstance(declared, DictType) and isinstance(got, DictType):
@@ -1022,6 +1493,76 @@ def _is_assignable(declared: Type, got: Type) -> bool:
             _is_assignable(declared.key, got.key)
             and _is_assignable(declared.value, got.value)
         )
+    return False
+
+
+def _runtime_type_object_assignable(declared: ClassType, got: Type) -> bool:
+    """Compatibility for pcc's meta-level Type objects.
+
+    The frontend type lattice uses ``IntType`` / ``NoneType`` instances
+    both to describe runtime Python values and as the objects returned by
+    helpers such as ``parse_annotation() -> Type``. When annotations like
+    ``Type`` / ``NoneType`` are preserved as ``ClassType`` refs, those
+    existing meta values must remain assignable.
+    """
+    if declared.name == "Type" and isinstance(got, Type):
+        return True
+    if declared.name == "IntType" and isinstance(got, IntType):
+        return True
+    if declared.name == "FloatType" and isinstance(got, FloatType):
+        return True
+    if declared.name == "BoolType" and isinstance(got, BoolType):
+        return True
+    if declared.name == "NoneType" and isinstance(got, NoneType):
+        return True
+    if declared.name == "StrType" and isinstance(got, StrType):
+        return True
+    if declared.name == "ListType" and isinstance(got, ListType):
+        return True
+    if declared.name == "DictType" and isinstance(got, DictType):
+        return True
+    if declared.name == "TupleType" and isinstance(got, TupleType):
+        return True
+    if declared.name == "FuncType" and isinstance(got, FuncType):
+        return True
+    if declared.name == "ClassType" and isinstance(got, ClassType):
+        return True
+    if declared.name == "DynType" and isinstance(got, DynType):
+        return True
+    return False
+
+
+def _builtin_container_class_assignable(declared: ClassType, got: Type) -> bool:
+    if declared.name == "list" and isinstance(got, ListType):
+        return True
+    if declared.name == "dict" and isinstance(got, DictType):
+        return True
+    if declared.name == "tuple" and isinstance(got, TupleType):
+        return True
+    return False
+
+
+def _class_type_is_unresolved_shell(ty: ClassType) -> bool:
+    return not ty.module and not ty.fields and not ty.bases
+
+
+def _class_type_assignable(declared: ClassType, got: ClassType) -> bool:
+    if declared.name == got.name and (
+        declared.module == got.module or not declared.module or not got.module
+    ):
+        return True
+    # An annotation imported from a module whose schema is not available
+    # (the per-module self-compile probe runs without external_exports)
+    # must behave like the old DynType path. Preserve strict subclass
+    # checks only once at least one side carries real schema/module data.
+    if (
+        _class_type_is_unresolved_shell(declared)
+        or _class_type_is_unresolved_shell(got)
+    ):
+        return True
+    for base in got.bases:
+        if _class_type_assignable(declared, base):
+            return True
     return False
 
 
@@ -1077,27 +1618,53 @@ def _check_returns(body: tuple[Stmt, ...], ret_ty: Type) -> None:
 
 
 def _prepopulate_module_scope(ctx: _InferCtx, module: Module) -> None:
-    """Seed the module scope with function signatures before body inference.
+    """Seed module scope with imports, class schemas, and function signatures.
 
     This lets forward references and mutual recursion work: every ``def``
-    at module scope is registered with its annotated (or ``dyn``)
-    signature first, then bodies are typed in a second pass.
+    at module scope is registered with its annotated (or ``dyn``) signature
+    first, and every local class name is registered as a schema-bearing
+    ``ClassType`` before function bodies resolve annotations.
     """
+    if ctx.external_exports:
+        _preload_unique_external_classes(ctx)
+
+    for stmt in module.body:
+        if not isinstance(stmt, ImportFrom) or not ctx.external_exports:
+            continue
+        resolved = _resolve_relative_module(
+            stmt.module,
+            stmt.level,
+            ctx.module.name,
+            stmt.span.file,
+        )
+        _bind_external_import_exports(ctx, ctx.globals, resolved, stmt.names)
+
+    for stmt in module.body:
+        if isinstance(stmt, ClassDef):
+            cls_ty = _make_class_type(stmt.name, module.name or "", (), ())
+            ctx.register_class_type(stmt.name, cls_ty)
+            ctx.globals.symbols[stmt.name] = cls_ty
+
+    for stmt in module.body:
+        if isinstance(stmt, ClassDef):
+            bases = _class_bases_from_def(ctx, stmt)
+            fields = _class_fields_from_def(ctx, stmt)
+            cls_ty = _make_class_type(stmt.name, module.name or "", fields, bases)
+            ctx.register_class_type(stmt.name, cls_ty)
+            ctx.globals.symbols[stmt.name] = cls_ty
+
     for stmt in module.body:
         if isinstance(stmt, FuncDef):
             params = tuple(ctx.resolve_annotation(a.annotation) for a in stmt.args)
             ret = ctx.resolve_annotation(stmt.return_ty)
-            ft = FuncType(name="callable", params=params, ret=ret)
+            ft = _make_func_type(params, ret)
             ctx.func_types[stmt.name] = ft
-            ctx.globals.define(stmt.name, ft)
-        elif isinstance(stmt, ClassDef):
-            # Record the class as a dyn-shaped value binding.  Phase 3
-            # will refine with a real ClassType.
-            ctx.globals.define(stmt.name, TYPE_DYN)
+            ctx.globals.symbols[stmt.name] = ft
 
 
 def _resolve_relative_module(
     module: Optional[str], level: int, current: Optional[str],
+    current_file: Optional[str] = None,
 ) -> str:
     """Mirror of ``layer1._resolve_relative_import``. Needed at
     inference time so cross-module exports lookup uses the
@@ -1107,9 +1674,16 @@ def _resolve_relative_module(
         return module or ""
     cur = current or ""
     parts = cur.split(".") if cur else []
-    if level > len(parts):
+    current_file = (current_file or "").replace("\\", "/")
+    is_package_init = (
+        current_file == "__init__.py"
+        or current_file.endswith("/__init__.py")
+    )
+    package_parts = parts if is_package_init else parts[:-1]
+    up = level - 1
+    if up > len(package_parts):
         return module or ""
-    base_parts = parts[: len(parts) - level]
+    base_parts = package_parts[: len(package_parts) - up]
     if module:
         return ".".join(base_parts + [module])
     return ".".join(base_parts)
