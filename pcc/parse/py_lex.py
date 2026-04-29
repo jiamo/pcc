@@ -43,6 +43,65 @@ _OPS_MULTI = (
 _OPS_SINGLE = "+-*/%@&|^~<>=()[]{},:.;"
 
 
+def _is_digit_code(c: int) -> bool:
+    return c >= 48 and c <= 57
+
+
+def _is_alpha_code(c: int) -> bool:
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+
+
+def _is_alnum_code(c: int) -> bool:
+    return _is_alpha_code(c) or _is_digit_code(c)
+
+
+def _lower_code(c: int) -> int:
+    if c >= 65 and c <= 90:
+        return c + 32
+    return c
+
+
+def _is_prefix_code(c: int) -> bool:
+    lc = _lower_code(c)
+    return lc == 98 or lc == 102 or lc == 114 or lc == 117
+
+
+def _is_quote_code(c: int) -> bool:
+    return c == 34 or c == 39
+
+
+def _is_single_op_code(c: int) -> bool:
+    return (
+        c == 37 or c == 38 or c == 40 or c == 41 or c == 42
+        or c == 43 or c == 44 or c == 45 or c == 46 or c == 47
+        or c == 58 or c == 59 or c == 60 or c == 61 or c == 62
+        or c == 64 or c == 91 or c == 93 or c == 94 or c == 123
+        or c == 124 or c == 125 or c == 126
+    )
+
+
+def _is_open_paren_code(c: int) -> bool:
+    return c == 40 or c == 91 or c == 123
+
+
+def _is_close_paren_code(c: int) -> bool:
+    return c == 41 or c == 93 or c == 125
+
+
+def _pcc_str_byte_len(s: str) -> int:
+    return len(s)
+
+
+def _pcc_str_byte_at(s: str, pos: int) -> int:
+    if pos < len(s):
+        return ord(s[pos])
+    return -1
+
+
+def _pcc_str_byte_slice(s: str, lo: int, hi: int) -> str:
+    return s[lo:hi]
+
+
 @dataclass(frozen=True)
 class Token:
     kind: str
@@ -70,6 +129,7 @@ class Lexer:
 
     def __init__(self, src: str, filename: str = "<input>") -> None:
         self.src = src
+        self._src_len = _pcc_str_byte_len(src)
         self.filename = filename
         self.pos = 0
         self.line = 1
@@ -84,51 +144,51 @@ class Lexer:
         """Run the lexer to completion, returning all tokens."""
         out: list[Token] = []
         indent_stack: list[int] = self._indent_stack
-        while self.pos < len(self.src):
+        while self.pos < self._src_len:
             if self._at_line_start and self._paren_depth == 0:
                 self._emit_indent(out)
                 self._at_line_start = False
-                if self.pos >= len(self.src):
+                if self.pos >= self._src_len:
                     break
-            ch = self.src[self.pos]
-            if ch == "\n":
+            ch = self._peek_code(0)
+            if ch == 10:
                 self._emit_newline(out)
                 continue
-            if ch in " \t":
+            if ch == 32 or ch == 9:
                 self.pos += 1
                 self.col += 1
                 continue
-            if ch == "#":
-                while self.pos < len(self.src) and self.src[self.pos] != "\n":
+            if ch == 35:
+                while self.pos < self._src_len and self._peek_code(0) != 10:
                     self.pos += 1
                 continue
-            if ch == "\\" and self._peek(1) == "\n":
+            if ch == 92 and self._peek_code(1) == 10:
                 self.pos += 2
                 self.line += 1
                 self.col = 1
                 continue
             if (
-                ch.lower() in "bfru"
-                and self._peek(1) in ('"', "'")
+                _is_prefix_code(ch)
+                and _is_quote_code(self._peek_code(1))
             ):
                 out.append(self._read_string())
                 continue
             if (
-                ch.lower() in "bfru"
-                and self._peek(1).lower() in "bfru"
-                and self._peek(2) in ('"', "'")
+                _is_prefix_code(ch)
+                and _is_prefix_code(self._peek_code(1))
+                and _is_quote_code(self._peek_code(2))
             ):
                 out.append(self._read_string())
                 continue
-            if ch.isalpha() or ch == "_":
+            if _is_alpha_code(ch) or ch == 95:
                 out.append(self._read_name())
                 continue
-            if ch.isdigit() or (
-                ch == "." and self._peek(1).isdigit()
+            if _is_digit_code(ch) or (
+                ch == 46 and _is_digit_code(self._peek_code(1))
             ):
                 out.append(self._read_number())
                 continue
-            if ch in ('"', "'"):
+            if _is_quote_code(ch):
                 out.append(self._read_string())
                 continue
             out.append(self._read_op())
@@ -142,18 +202,31 @@ class Lexer:
 
     # ------------------------------------------------------ helpers
 
+    def _code_at(self, pos: int) -> int:
+        if pos < self._src_len:
+            return _pcc_str_byte_at(self.src, pos)
+        return -1
+
+    def _slice(self, lo: int, hi: int) -> str:
+        return _pcc_str_byte_slice(self.src, lo, hi)
+
+    def _peek_code(self, off: int) -> int:
+        return self._code_at(self.pos + off)
+
     def _peek(self, off: int) -> str:
         p = self.pos + off
-        return self.src[p] if p < len(self.src) else ""
+        return self._slice(p, p + 1) if p < self._src_len else ""
 
     def _emit_indent(self, out: list[Token]) -> None:
         indent_stack: list[int] = self._indent_stack
         depth = 0
         p = self.pos
-        while p < len(self.src) and self.src[p] in " \t":
-            depth += 1 if self.src[p] == " " else 8
+        pc = self._code_at(p)
+        while p < self._src_len and (pc == 32 or pc == 9):
+            depth += 1 if pc == 32 else 8
             p += 1
-        if p >= len(self.src) or self.src[p] in ("\n", "#"):
+            pc = self._code_at(p)
+        if p >= self._src_len or pc == 10 or pc == 35:
             self.pos = p
             self.col = depth + 1
             return
@@ -183,12 +256,15 @@ class Lexer:
         start = self.pos
         start_col = self.col
         while (
-            self.pos < len(self.src)
-            and (self.src[self.pos].isalnum() or self.src[self.pos] == "_")
+            self.pos < self._src_len
+            and (
+                _is_alnum_code(self._peek_code(0))
+                or self._peek_code(0) == 95
+            )
         ):
             self.pos += 1
             self.col += 1
-        text = self.src[start:self.pos]
+        text = self._slice(start, self.pos)
         kind = TK_KEYWORD if text in KEYWORDS else TK_NAME
         return Token(kind, text, self.line, start_col)
 
@@ -197,47 +273,62 @@ class Lexer:
         start_col = self.col
         # Hex / octal / binary: ``0x…`` / ``0o…`` / ``0b…`` (PEP 3127).
         if (
-            self.src[self.pos] == "0"
-            and self.pos + 1 < len(self.src)
-            and self.src[self.pos + 1] in "xXoObB"
+            self._peek_code(0) == 48
+            and self.pos + 1 < self._src_len
+            and (
+                _lower_code(self._code_at(self.pos + 1)) == 98
+                or _lower_code(self._code_at(self.pos + 1)) == 111
+                or _lower_code(self._code_at(self.pos + 1)) == 120
+            )
         ):
-            base = self.src[self.pos + 1].lower()
+            base = _lower_code(self._code_at(self.pos + 1))
             self.pos += 2
             self.col += 2
-            if base == "x":
-                valid = "0123456789abcdefABCDEF_"
-            elif base == "o":
-                valid = "01234567_"
-            else:
-                valid = "01_"
-            while self.pos < len(self.src) and self.src[self.pos] in valid:
+            while self.pos < self._src_len:
+                c = self._peek_code(0)
+                valid = False
+                if c == 95:
+                    valid = True
+                elif base == 120:
+                    valid = (
+                        _is_digit_code(c)
+                        or (c >= 65 and c <= 70)
+                        or (c >= 97 and c <= 102)
+                    )
+                elif base == 111:
+                    valid = c >= 48 and c <= 55
+                else:
+                    valid = c == 48 or c == 49
+                if not valid:
+                    break
                 self.pos += 1
                 self.col += 1
             return Token(
-                TK_NUMBER, self.src[start:self.pos], self.line, start_col,
+                TK_NUMBER, self._slice(start, self.pos), self.line, start_col,
             )
         has_dot = False
         has_exp = False
-        while self.pos < len(self.src):
-            ch = self.src[self.pos]
-            if ch.isdigit():
+        while self.pos < self._src_len:
+            ch = self._peek_code(0)
+            if _is_digit_code(ch):
                 self.pos += 1
                 self.col += 1
-            elif ch == "." and not has_dot and not has_exp:
+            elif ch == 46 and not has_dot and not has_exp:
                 has_dot = True
                 self.pos += 1
                 self.col += 1
-            elif ch in ("e", "E") and not has_exp:
+            elif (ch == 101 or ch == 69) and not has_exp:
                 has_exp = True
                 self.pos += 1
                 self.col += 1
-                if self.pos < len(self.src) and self.src[self.pos] in "+-":
+                nxt = self._peek_code(0)
+                if self.pos < self._src_len and (nxt == 43 or nxt == 45):
                     self.pos += 1
                     self.col += 1
-            elif ch in ("_",):
+            elif ch == 95:
                 self.pos += 1
                 self.col += 1
-            elif ch in ("j", "J"):
+            elif ch == 106 or ch == 74:
                 # Imaginary literal suffix — we accept the char so the
                 # tokenizer doesn't choke, the frontend doesn't use them.
                 self.pos += 1
@@ -245,7 +336,7 @@ class Lexer:
                 break
             else:
                 break
-        return Token(TK_NUMBER, self.src[start:self.pos], self.line, start_col)
+        return Token(TK_NUMBER, self._slice(start, self.pos), self.line, start_col)
 
     def _read_string(self) -> Token:
         start = self.pos
@@ -253,31 +344,34 @@ class Lexer:
         # Consume the optional prefix chars (``b``, ``r``, ``f``, ``u``
         # and their 2-char combinations).
         while (
-            self.pos < len(self.src)
-            and self.src[self.pos].lower() in "bfru"
-            and self._peek(0) not in ('"', "'")
+            self.pos < self._src_len
+            and _is_prefix_code(self._peek_code(0))
+            and not _is_quote_code(self._peek_code(0))
         ):
             self.pos += 1
             self.col += 1
-        quote = self.src[self.pos]
+        quote_code = self._peek_code(0)
         # Handle triple-quoted.
-        triple = self._peek(1) == quote and self._peek(2) == quote
+        triple = (
+            self._peek_code(1) == quote_code
+            and self._peek_code(2) == quote_code
+        )
         if triple:
             self.pos += 3
             self.col += 3
-            while self.pos < len(self.src):
+            while self.pos < self._src_len:
                 if (
-                    self.src[self.pos] == quote
-                    and self._peek(1) == quote
-                    and self._peek(2) == quote
+                    self._peek_code(0) == quote_code
+                    and self._peek_code(1) == quote_code
+                    and self._peek_code(2) == quote_code
                 ):
                     self.pos += 3
                     self.col += 3
                     return Token(
-                        TK_STRING, self.src[start:self.pos],
+                        TK_STRING, self._slice(start, self.pos),
                         self.line, start_col,
                     )
-                if self.src[self.pos] == "\n":
+                if self._peek_code(0) == 10:
                     self.line += 1
                     self.col = 1
                 else:
@@ -289,20 +383,20 @@ class Lexer:
         # Single-line.
         self.pos += 1
         self.col += 1
-        while self.pos < len(self.src):
-            ch = self.src[self.pos]
-            if ch == "\\":
+        while self.pos < self._src_len:
+            ch = self._peek_code(0)
+            if ch == 92:
                 self.pos += 2
                 self.col += 2
                 continue
-            if ch == quote:
+            if ch == quote_code:
                 self.pos += 1
                 self.col += 1
                 return Token(
-                    TK_STRING, self.src[start:self.pos],
+                    TK_STRING, self._slice(start, self.pos),
                     self.line, start_col,
                 )
-            if ch == "\n":
+            if ch == 10:
                 raise LexError(
                     f"{self.filename}:{self.line}: unterminated string"
                 )
@@ -317,19 +411,21 @@ class Lexer:
         # Try 3-, 2-, then 1-char operators.
         for op in _OPS_MULTI:
             op_len = len(op)
-            if src[pos:pos + op_len] == op:
+            if self._slice(pos, pos + op_len) == op:
                 self.pos = pos + op_len
                 self.col += op_len
                 return Token(TK_OP, op, self.line, start_col)
-        ch = self.src[self.pos]
-        if ch in _OPS_SINGLE:
-            if ch in "([{":
+        ch_code = self._peek_code(0)
+        if _is_single_op_code(ch_code):
+            ch = self._slice(self.pos, self.pos + 1)
+            if _is_open_paren_code(ch_code):
                 self._paren_depth += 1
-            elif ch in ")]}":
+            elif _is_close_paren_code(ch_code):
                 self._paren_depth = max(0, self._paren_depth - 1)
             self.pos += 1
             self.col += 1
             return Token(TK_OP, ch, self.line, start_col)
+        ch = self._slice(self.pos, self.pos + 1)
         raise LexError(
             f"{self.filename}:{self.line}:{self.col}: stray character {ch!r}"
         )

@@ -49,10 +49,11 @@ def _join_strings(parts: list[str], sep: str) -> str:
 
 
 def _pow10f(exp: int) -> float:
-    out = 1.0
+    out = float(int("1", 10))
+    ten = float(int("10", 10))
     i = 0
     while i < exp:
-        out = out * 10.0
+        out = out * ten
         i += 1
     return out
 
@@ -107,7 +108,7 @@ class _Expr:
 
 @dataclass
 class _Num:
-    value: "int | float"
+    text: str
     line: int
     is_int: bool
 
@@ -1193,8 +1194,11 @@ class Parser:
 
     def _parse_compare(self):
         lhs = self._parse_bitor()
+        comparisons = []
+        prev = lhs
         while True:
             t = self._peek()
+            line = t.line
             if t.kind == TK_OP and t.text in (
                 "<", ">", "<=", ">=", "==", "!=",
             ):
@@ -1220,8 +1224,13 @@ class Parser:
             else:
                 break
             rhs = self._parse_bitor()
-            lhs = _Compare(op=op, lhs=lhs, rhs=rhs, line=self._peek().line)
-        return lhs
+            comparisons.append(_Compare(op=op, lhs=prev, rhs=rhs, line=line))
+            prev = rhs
+        if not comparisons:
+            return lhs
+        if len(comparisons) == 1:
+            return comparisons[0]
+        return _BoolOp(op="and", values=comparisons, line=comparisons[0].line)
 
     def _parse_bitor(self):
         lhs = self._parse_bitxor()
@@ -1596,8 +1605,8 @@ class Parser:
             self._advance()
             clean = t.text.replace("_", "")
             if "." in clean or "e" in clean.lower():
-                return _Num(_parse_float_literal(clean), t.line, False)
-            return _Num(int(clean, 0), t.line, True)
+                return _Num(clean, t.line, False)
+            return _Num(clean, t.line, True)
         if t.kind == TK_STRING:
             self._advance()
             strings = [t]

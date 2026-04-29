@@ -117,3 +117,22 @@ def test_float_inf_emits_native_constant():
     assert has_inf_const, (
         f"expected an +inf constant in body, got:\n{body}"
     )
+
+
+def test_float_literals_keep_decimal_value_in_ir():
+    program = textwrap.dedent(
+        """
+        def zero() -> float:
+            return 0.0
+
+        def one_half() -> float:
+            return 1.5
+        """
+    )
+    ir_text = _compile_to_ll(program, "nb_float_literal_values")
+    zero_body = _fn_body(ir_text, "zero")
+    half_body = _fn_body(ir_text, "one_half")
+    assert zero_body is not None
+    assert half_body is not None
+    assert "0x0000000000000000" in zero_body
+    assert "0x3FF8000000000000" in half_body

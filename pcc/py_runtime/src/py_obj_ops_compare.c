@@ -168,6 +168,18 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
         return 1;
     }
 
+    if (ta == PY_TYPE_SET && tb == PY_TYPE_SET) {
+        PySetObject *sa = (PySetObject *)a;
+        PySetObject *sb = (PySetObject *)b;
+        if (sa->size != sb->size) return 0;
+        for (int64_t i = 0; i < sa->capacity; i++) {
+            PyObject *key = sa->entries[i].key;
+            if (key == NULL || key == py_set_dummy) continue;
+            if (!py_set_contains(b, key)) return 0;
+        }
+        return 1;
+    }
+
     if (ta == PY_TYPE_NONE || tb == PY_TYPE_NONE) return 0;
 
     return 0;

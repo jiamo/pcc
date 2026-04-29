@@ -138,6 +138,11 @@ class ClassInfo:
         # call-site lookups (e.g. ``_find_method_def``) see synthetic
         # methods, not just what the user wrote.
         self.expanded_cd: "ClassDef | None" = None
+        # Cross-module extern classes synthesize FuncDef stubs from export
+        # metadata so kwargs/default resolution can use normal method
+        # lowering. Keep this as a declared pcc field; dynamic post-init
+        # attributes are not reliable in the native object layout.
+        self.extern_method_defs: dict[str, FuncDef] = {}
 
 
 class ClassLowering:

@@ -1824,6 +1824,8 @@ def compile_python_multi(
     # This way each module's inference (pre-pass 2) sees the
     # cross-module export table built from the raw annotations.
     for src, mod_name in zip(src_paths, module_names):
+        if verbose:
+            _log(verbose, "exports " + mod_name)
         with open(src, "r", encoding="utf-8") as f:
             source = f.read()
         from ..parse.py_lift import parse_and_lift as _parse_and_lift
@@ -1856,7 +1858,12 @@ def compile_python_multi(
                     for inherited in class_field_defs.get(base_expr.ident, ()):
                         if inherited["name"] not in field_names:
                             field_names.append(inherited["name"])
-                        field_defs.append(dict(inherited))
+                        # The inherited field descriptor is immutable for this
+                        # pre-pass. Reuse it directly instead of relying on
+                        # ``dict(existing_dict)`` during bootstrap; pcc1's
+                        # native path must not corrupt dataclass field names
+                        # before synthetic __init__ metadata is exported.
+                        field_defs.append(inherited)
                 methods = []
                 for body_stmt in s.body:
                     if isinstance(body_stmt, _py_ast.Assign):

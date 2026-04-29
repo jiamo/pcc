@@ -1,7 +1,7 @@
 import os
 import sys
 
-from .py_frontend import pipeline as _py_pipeline
+from .py_frontend.pipeline import compile_python as _compile_python
 
 
 _DEFAULT_EMIT_LL = "__PCC_DEFAULT_LL__"
@@ -280,7 +280,7 @@ def bootstrap_cli_main(argv=None) -> int:
             ll_out = output_path if output_path else path[:-3] + ".ll"
         else:
             ll_out = output_path if output_path else emit_llvm
-        _py_pipeline.compile_python(
+        _compile_python(
             path,
             ll_out,
             verbose=verbose,
@@ -291,7 +291,7 @@ def bootstrap_cli_main(argv=None) -> int:
             recursive_stdlib=False,
         )
     else:
-        _py_pipeline.compile_python(
+        _compile_python(
             path,
             output_path,
             verbose=verbose,

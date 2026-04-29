@@ -54,6 +54,22 @@ def test_ord_uses_native_utf8_codepoint_helper():
     assert "@py_str_utf8" not in body, body
 
 
+def test_ord_of_str_subscript_uses_indexed_helper():
+    program = textwrap.dedent(
+        """
+        def f(s: str, i: int) -> int:
+            return ord(s[i])
+        """
+    )
+
+    ir_text = _compile_to_ll(program, "native_ord_index_ir", mode="on")
+    body = _function_body(ir_text, "f")
+
+    assert body is not None
+    assert "@py_str_ord_at_i64" in body, body
+    assert "@py_str_index" not in body, body
+
+
 def test_native_ord_runtime_matches_python_for_multibyte(tmp_path):
     from pcc.py_frontend.pipeline import compile_python
 

@@ -34,6 +34,42 @@ class LiftError(Exception):
     """Raised when a parser node has no py_ast equivalent yet."""
 
 
+def _pow10f_lift(exp: int) -> float:
+    out = float(int("1", 10))
+    ten = float(int("10", 10))
+    i = 0
+    while i < exp:
+        out = out * ten
+        i += 1
+    return out
+
+
+def _parse_float_literal_lift(text: str) -> float:
+    exp = 0
+    mantissa = text
+    lower = text.lower()
+    e_idx = lower.find("e")
+    if e_idx >= 0:
+        mantissa = text[:e_idx]
+        exp = int(text[e_idx + 1:], 10)
+    dot_idx = mantissa.find(".")
+    frac_len = 0
+    digits = mantissa
+    if dot_idx >= 0:
+        frac_len = len(mantissa) - dot_idx - 1
+        digits = mantissa[:dot_idx] + mantissa[dot_idx + 1:]
+    if not digits:
+        digits = "0"
+    value = float(int(digits, 10))
+    if frac_len > 0:
+        value = value / _pow10f_lift(frac_len)
+    if exp > 0:
+        value = value * _pow10f_lift(exp)
+    elif exp < 0:
+        value = value / _pow10f_lift(-exp)
+    return value
+
+
 def lift_module(mod: pp._Module, filename: str, module_name: str) -> pa.Module:
     L = _Lifter(filename)
     body = tuple(L.lift_stmt(s) for s in mod.body)
@@ -355,12 +391,12 @@ class _Lifter:
             return pa.IntLit(
                 span=span,
                 ty=pa.IntType(name="int", width=64, signed=True),
-                value=e.value,
+                value=int(e.text, 0),
             )
         return pa.FloatLit(
             span=span,
             ty=pa.FloatType(name="float", width=64),
-            value=e.value,
+            value=_parse_float_literal_lift(e.text),
         )
 
     def _e_Str(self, e: pp._Str) -> pa.StrLit:
@@ -686,6 +722,8 @@ def _lift_type(node) -> pa.Type:
                         key=_lift_type(inner.elems[0]),
                         value=_lift_type(inner.elems[1]),
                     )
+            if base.ident in ("set", "frozenset"):
+                return pa.DynType(name="set")
         return _DYN
     if isinstance(node, pp._BinOp) and node.op == "|":
         # PEP 604 union — pcc has no Union type, fall back to Dyn.

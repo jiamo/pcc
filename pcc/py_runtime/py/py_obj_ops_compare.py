@@ -288,6 +288,23 @@ def py_obj_eq(a, b) -> int:
                 i = i + 1
             return 1
 
+    if ta == 8:                       # SET
+        if tb == 8:
+            if load_i64(a, 16) != load_i64(b, 16):
+                return 0
+            entries = load_ptr(a, 40)
+            capacity: int = load_i64(a, 24)
+            dummy = global_load_ptr("py_set_dummy")
+            i: int = 0
+            while i < capacity:
+                key = load_ptr(entries, i * 16 + 8)
+                if ptr_is_null(key) == 0:
+                    if ptr_eq(key, dummy) == 0:
+                        if py_set_contains(b, key) == 0:
+                            return 0
+                i = i + 1
+            return 1
+
     if ta == 0:
         return 0
     if tb == 0:

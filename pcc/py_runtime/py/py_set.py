@@ -26,6 +26,8 @@ from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
     free,
     global_load_ptr,
+    is_tagged_int,
+    load_i32,
     load_i64,
     load_ptr,
     malloc,
@@ -191,6 +193,28 @@ def py_set_add(s, item) -> None:
         fl: int = load_i64(s, 32)
         store_i64(s, 32, fl + 1)
     _maybe_grow(s)
+
+
+@c_abi_export("py_set_update")
+def py_set_update(dst, src) -> None:
+    if ptr_is_null(dst) != 0:
+        return
+    if ptr_is_null(src) != 0:
+        return
+    if is_tagged_int(src) != 0:
+        return
+    if load_i32(src, 8) != 8:          # PY_TYPE_SET
+        return
+    entries = load_ptr(src, 40)
+    capacity: int = load_i64(src, 24)
+    dummy = global_load_ptr("py_set_dummy")
+    i: int = 0
+    while i < capacity:
+        key = load_ptr(entries, i * 16 + 8)
+        if ptr_is_null(key) == 0:
+            if ptr_eq(key, dummy) == 0:
+                py_set_add(dst, key)
+        i = i + 1
 
 
 @c_abi_export("py_set_contains")

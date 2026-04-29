@@ -203,7 +203,7 @@ def marshal_to_object(
             widened = builder.sext(value, _I64, name="m.dyn.sext64")
             return builder.call(runtime["py_int_from_i64"], [widened],
                                   name="m.dyn.int_box")
-        if value.type is ir.DoubleType():
+        if value.type is _DOUBLE or isinstance(value.type, ir.DoubleType):
             return builder.call(runtime["py_float_from_f64"], [value],
                                   name="m.dyn.flt_box")
         raise NotImplementedError(
@@ -304,7 +304,8 @@ def _stash_overflow_slot(builder: ir.IRBuilder) -> ir.Value:
             break
 
     saved_block = builder._block
-    saved_anchor = builder._anchor
+    saved_pos = getattr(builder, "_pos", None)
+    saved_anchor = None if saved_pos is not None else builder._anchor
 
     if insert_before is not None:
         builder.position_before(insert_before)
@@ -314,10 +315,25 @@ def _stash_overflow_slot(builder: ir.IRBuilder) -> ir.Value:
 
     if saved_block is not None:
         builder._block = saved_block
-        # If we inserted into the same block, the new alloca shifted
-        # subsequent indices by 1 — account for that so future inserts
-        # land where the caller expected.
-        if saved_block is entry and insert_before is not None:
+        # Prefer the concrete pcc.llvm_capi insertion cursor. The
+        # self-hosted compiler does not reliably execute Python
+        # ``property`` descriptors, so depending on IRBuilder._anchor
+        # can restore the cursor to the alloca insertion point and
+        # emit later instructions before their operands.
+        if saved_pos is not None:
+            end_marker = getattr(builder, "_END", None)
+            if (
+                saved_block is entry
+                and insert_before is not None
+                and saved_pos != end_marker
+            ):
+                builder._pos = saved_pos + 1
+            else:
+                builder._pos = saved_pos
+        elif saved_block is entry and insert_before is not None:
+            # If we inserted into the same block, the new alloca shifted
+            # subsequent indices by 1 — account for that so future inserts
+            # land where the caller expected.
             builder._anchor = saved_anchor + 1
         else:
             builder._anchor = saved_anchor

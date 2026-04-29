@@ -79,6 +79,9 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_str_byte_len": (_I64, [_PYOBJ], False),
     "py_str_utf8": (_CSTR, [_PYOBJ], False),
     "py_str_ord": (_I64, [_PYOBJ], False),
+    "py_str_ord_at_i64": (_I64, [_PYOBJ, _I64], False),
+    "py_str_byte_at_i64": (_I64, [_PYOBJ, _I64], False),
+    "py_str_byte_slice_i64": (_PYOBJ, [_PYOBJ, _I64, _I64], False),
     "py_str_concat": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_str_repeat": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_str_slice": (_PYOBJ, [_PYOBJ, _PYOBJ, _PYOBJ, _PYOBJ], False),
@@ -145,6 +148,7 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     # ---- Set -------------------------------------------------------
     "py_set_new": (_PYOBJ, [], False),
     "py_set_add": (_VOID, [_PYOBJ, _PYOBJ], False),
+    "py_set_update": (_VOID, [_PYOBJ, _PYOBJ], False),
     "py_set_contains": (_I64, [_PYOBJ, _PYOBJ], False),
     "py_set_remove": (_I64, [_PYOBJ, _PYOBJ], False),
     "py_set_len": (_I64, [_PYOBJ], False),

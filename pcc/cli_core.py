@@ -1166,3 +1166,18 @@ def cli_main_sys_argv_exit() -> None:
         from sys import exit as _exit
 
         _exit(code)
+
+
+def cli_main_strict_sys_argv_exit() -> None:
+    """Entry point for the ``pcc-static`` console script.
+
+    Same as ``pcc`` but with the no-libpython flag combination
+    (``--python-libpython=off`` + ``--ir-scaffold=on``) wired in as
+    the default. An explicitly-passed ``--python-libpython`` /
+    ``--ir-scaffold`` CLI flag, or a pre-set ``PCC_PYTHON_LIBPYTHON``
+    / ``PCC_IR_SCAFFOLD`` env var, still takes precedence.
+    """
+    import os
+    os.environ.setdefault("PCC_PYTHON_LIBPYTHON", "off")
+    os.environ.setdefault("PCC_IR_SCAFFOLD", "on")
+    cli_main_sys_argv_exit()

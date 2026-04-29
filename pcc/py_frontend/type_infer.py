@@ -125,6 +125,34 @@ def _make_tuple_type(name: str, elems: tuple[Type, ...]) -> TupleType:
     return TupleType(name, elems)
 
 
+def _tuple_elem_type(ty: TupleType) -> Type:
+    if ty.elems:
+        acc = ty.elems[0]
+        for elem in ty.elems[1:]:
+            acc = common_type(acc, elem)
+        return acc
+    return TYPE_DYN
+
+
+def _tuple_from_iterable_type(ty: Type) -> TupleType:
+    if isinstance(ty, TupleType):
+        return ty
+    if isinstance(ty, ListType):
+        return TupleType(name="tuple_variadic", elems=(ty.elem,))
+    if isinstance(ty, StrType):
+        return TupleType(name="tuple_variadic", elems=(TYPE_STR,))
+    return TupleType(name="tuple_variadic", elems=(TYPE_DYN,))
+
+
+def _tuple_concat_type(a: TupleType, b: TupleType) -> TupleType:
+    if not a.elems and not b.elems:
+        return TupleType(name="tuple", elems=())
+    return TupleType(
+        name="tuple_variadic",
+        elems=(common_type(_tuple_elem_type(a), _tuple_elem_type(b)),),
+    )
+
+
 def _make_func_type(params: tuple[Type, ...], ret: Type) -> FuncType:
     return FuncType("callable", params, ret)
 
@@ -232,27 +260,45 @@ class _Scope:
     globals → builtins (builtins live as a fallback in ``_lookup``).
     """
 
-    __slots__ = ("symbols", "parent")
+    __slots__ = ("names", "types", "parent")
 
     def __init__(self, parent: Optional["_Scope"] = None) -> None:
-        self.symbols: dict[str, Type] = {}
+        self.names: list[str] = []
+        self.types: list[Type] = []
         self.parent: Optional[_Scope] = parent
 
+    def _find_local(self, name: str) -> int:
+        i = 0
+        while i < len(self.names):
+            if self.names[i] == name:
+                return i
+            i = i + 1
+        return -1
+
     def define(self, name: str, ty: Type) -> None:
-        self.symbols[name] = ty
+        idx = self._find_local(name)
+        if idx >= 0:
+            self.types[idx] = ty
+            return
+        self.names.append(name)
+        self.types.append(ty)
 
     def update(self, name: str, ty: Type) -> None:
         """Update or insert; used for assignment re-typing."""
-        self.symbols[name] = ty
+        self.define(name, ty)
 
     def lookup_local(self, name: str) -> Optional[Type]:
-        return self.symbols.get(name)
+        idx = self._find_local(name)
+        if idx >= 0:
+            return self.types[idx]
+        return None
 
     def lookup(self, name: str) -> Optional[Type]:
         scope: Optional[_Scope] = self
         while scope is not None:
-            if name in scope.symbols:
-                return scope.symbols[name]
+            found = scope.lookup_local(name)
+            if found is not None:
+                return found
             scope = scope.parent
         return None
 
@@ -487,10 +533,13 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                     ty=ListType(name="list", elem=elt_ty),
                 )
             if sentinel in ("_set_comp", "__setcomp__"):
-                elt = new_args[0] if new_args else None
-                elt_ty = elt.ty if elt is not None else TYPE_DYN
-                # No SetType in py_ast; leave as dyn but tagged list-of-elem
-                # would be wrong. Fall through to generic path.
+                # py_ast has no first-class SetType yet. Preserve the
+                # container kind with DynType(name="set") so codegen does
+                # not route set operators through integer bitwise lowering.
+                return replace(
+                    expr, func=callee, args=new_args, kwargs=new_kwargs,
+                    ty=DynType(name="set"),
+                )
             if sentinel in ("_dict_comp", "__dictcomp__"):
                 # Native: first arg is TupleExpr(k, v). CPython-AST:
                 # first two args are key/val exprs.
@@ -547,6 +596,15 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                 return replace(
                     expr, func=callee, args=new_args, kwargs=new_kwargs,
                     ty=TYPE_STR,
+                )
+            if bname == "tuple":
+                if not new_args:
+                    ty = TupleType(name="tuple", elems=())
+                else:
+                    ty = _tuple_from_iterable_type(new_args[0].ty)
+                return replace(
+                    expr, func=callee, args=new_args, kwargs=new_kwargs,
+                    ty=ty,
                 )
             if bname == "chr":
                 return replace(
@@ -642,12 +700,14 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                 ty = obj.ty
             elif isinstance(obj.ty, StrType):
                 ty = TYPE_STR
-            elif isinstance(obj.ty, TupleType) and obj.ty.elems:
-                first = obj.ty.elems[0]
-                if all(type_eq(first, e) for e in obj.ty.elems):
-                    ty = TupleType(name="tuple_variadic", elems=(first,))
+            elif isinstance(obj.ty, TupleType):
+                if obj.ty.elems:
+                    ty = TupleType(
+                        name="tuple_variadic",
+                        elems=(_tuple_elem_type(obj.ty),),
+                    )
                 else:
-                    ty = TYPE_DYN
+                    ty = TupleType(name="tuple", elems=())
             else:
                 ty = TYPE_DYN
             return replace(expr, obj=obj, idx=idx, ty=ty)
@@ -736,6 +796,10 @@ def _binop_result(op: str, a: Type, b: Type, span: SourceSpan) -> Type:
     if op == "+":
         if isinstance(a, StrType) and isinstance(b, StrType):
             return TYPE_STR
+        if isinstance(a, TupleType) and isinstance(b, TupleType):
+            return _tuple_concat_type(a, b)
+        if isinstance(a, ListType) and isinstance(b, ListType):
+            return ListType(name="list", elem=common_type(a.elem, b.elem))
     if op == "%":
         if isinstance(a, StrType):
             return TYPE_STR
@@ -769,6 +833,14 @@ def _binop_result(op: str, a: Type, b: Type, span: SourceSpan) -> Type:
 
     # Bitwise / shift on int-like operands stays int.
     if op in ("&", "|", "^", "<<", ">>"):
+        if (
+            op == "|"
+            and isinstance(a, DynType)
+            and isinstance(b, DynType)
+            and a.name in ("set", "frozenset")
+            and b.name in ("set", "frozenset")
+        ):
+            return DynType(name="set")
         if isinstance(a, (IntType, BoolType)) and isinstance(b, (IntType, BoolType)):
             # Bool <<>> anything else returns int (Python promotes).
             return TYPE_INT
@@ -1008,15 +1080,29 @@ def _element_type_of(ty: Type) -> Type:
     return TYPE_DYN
 
 
-def _single_class_type_from_isinstance_arg(
+def _type_from_isinstance_arg(
     ctx: _InferCtx, expr: Expr,
-) -> Optional[ClassType]:
-    """Resolve ``isinstance``'s second argument when it is one class.
+) -> Optional[Type]:
+    """Resolve ``isinstance``'s second argument when it is one type.
 
     Tuple forms describe a union. The frontend has no union type yet, so
     we deliberately leave those unnarrowed instead of guessing.
     """
     if isinstance(expr, Name):
+        if expr.ident == "tuple":
+            return TupleType(name="tuple_variadic", elems=(TYPE_DYN,))
+        if expr.ident == "list":
+            return ListType(name="list", elem=TYPE_DYN)
+        if expr.ident == "dict":
+            return DictType(name="dict", key=TYPE_DYN, value=TYPE_DYN)
+        if expr.ident == "str":
+            return TYPE_STR
+        if expr.ident == "int":
+            return TYPE_INT
+        if expr.ident == "bool":
+            return TYPE_BOOL
+        if expr.ident == "float":
+            return TYPE_FLOAT
         ty = ctx.resolve_type_refs(expr.ty)
         if isinstance(ty, ClassType):
             return ty
@@ -1045,19 +1131,21 @@ def _narrow_scope_for_isinstance(
         and isinstance(cond.args[0], Name)
     ):
         return scope
-    candidate = _single_class_type_from_isinstance_arg(ctx, cond.args[1])
+    candidate = _type_from_isinstance_arg(ctx, cond.args[1])
     if candidate is None:
         return scope
     var_name = cond.args[0].ident
     current = scope.lookup(var_name)
     if current is None:
         return scope
+    if isinstance(current, DynType):
+        narrowed = _Scope(parent=scope)
+        narrowed.update(var_name, candidate)
+        return narrowed
     if not (
-        isinstance(current, DynType)
-        or (
-            isinstance(current, ClassType)
-            and _class_type_assignable(current, candidate)
-        )
+        isinstance(current, ClassType)
+        and isinstance(candidate, ClassType)
+        and _class_type_assignable(current, candidate)
     ):
         return scope
     narrowed = _Scope(parent=scope)
@@ -1643,7 +1731,7 @@ def _prepopulate_module_scope(ctx: _InferCtx, module: Module) -> None:
         if isinstance(stmt, ClassDef):
             cls_ty = _make_class_type(stmt.name, module.name or "", (), ())
             ctx.register_class_type(stmt.name, cls_ty)
-            ctx.globals.symbols[stmt.name] = cls_ty
+            ctx.globals.define(stmt.name, cls_ty)
 
     for stmt in module.body:
         if isinstance(stmt, ClassDef):
@@ -1651,7 +1739,7 @@ def _prepopulate_module_scope(ctx: _InferCtx, module: Module) -> None:
             fields = _class_fields_from_def(ctx, stmt)
             cls_ty = _make_class_type(stmt.name, module.name or "", fields, bases)
             ctx.register_class_type(stmt.name, cls_ty)
-            ctx.globals.symbols[stmt.name] = cls_ty
+            ctx.globals.define(stmt.name, cls_ty)
 
     for stmt in module.body:
         if isinstance(stmt, FuncDef):
@@ -1659,7 +1747,7 @@ def _prepopulate_module_scope(ctx: _InferCtx, module: Module) -> None:
             ret = ctx.resolve_annotation(stmt.return_ty)
             ft = _make_func_type(params, ret)
             ctx.func_types[stmt.name] = ft
-            ctx.globals.symbols[stmt.name] = ft
+            ctx.globals.define(stmt.name, ft)
 
 
 def _resolve_relative_module(

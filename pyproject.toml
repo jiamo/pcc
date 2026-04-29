@@ -1,6 +1,6 @@
 [project]
 name = "python-cc"
-version = "0.1.1"
+version = "0.1.2"
 description = "Pcc is a c compiler built on python and llvm."
 readme = "README.md"
 license = "MIT"
@@ -12,6 +12,11 @@ dependencies = [
 
 [project.scripts]
 pcc = "pcc.cli_core:cli_main"
+# Same compiler as `pcc`, but defaults to --python-libpython=off
+# --ir-scaffold=on so produced binaries do not link libpython.
+# Explicit --python-libpython / --ir-scaffold on the command line
+# (or PCC_PYTHON_LIBPYTHON / PCC_IR_SCAFFOLD env vars) still win.
+pcc-static = "pcc.cli_core:cli_main_strict_sys_argv_exit"
 
 [project.urls]
 Homepage = "https://github.com/jiamo/pcc"

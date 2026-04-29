@@ -51,7 +51,10 @@ def encode_type(ty: Type | None):
         )
     if isinstance(ty, DynType):
         return ("dyn",)
-    raise TypeError(f"unsupported export type descriptor: {ty!r}")
+    # Export metadata is an ABI hint for cross-module declarations.
+    # Complex annotations that the lightweight exporter cannot encode
+    # should degrade to dyn instead of blocking bootstrap.
+    return ("dyn",)
 
 
 def decode_type(desc):

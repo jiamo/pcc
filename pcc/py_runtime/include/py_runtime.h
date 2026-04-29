@@ -82,6 +82,9 @@ int64_t   py_str_len(PyObject *s);             /* in codepoints */
 int64_t   py_str_byte_len(PyObject *s);        /* in UTF-8 bytes */
 const char *py_str_utf8(PyObject *s);          /* borrowed, NUL-terminated */
 int64_t   py_str_ord(PyObject *s);             /* first codepoint, -1 on empty/invalid */
+int64_t   py_str_ord_at_i64(PyObject *s, int64_t i); /* codepoint at index, -1 invalid */
+int64_t   py_str_byte_at_i64(PyObject *s, int64_t i); /* raw UTF-8 byte, -1 invalid */
+PyObject *py_str_byte_slice_i64(PyObject *s, int64_t lo, int64_t hi);
 PyObject *py_str_concat(PyObject *a, PyObject *b);
 PyObject *py_str_repeat(PyObject *s, PyObject *n);
 PyObject *py_str_slice(PyObject *s, PyObject *lo, PyObject *hi, PyObject *step);
@@ -142,6 +145,7 @@ PyObject *py_tuple_slice(PyObject *t, PyObject *lo, PyObject *hi, PyObject *step
 /* ---- Set --------------------------------------------------------------- */
 PyObject *py_set_new(void);
 void      py_set_add(PyObject *s, PyObject *item);
+void      py_set_update(PyObject *dst, PyObject *src);
 /* Returns 1 if item is in the set, 0 otherwise. Returns int64_t so the
  * pcc-Python port (py_set.py) emits under pcc's default `int` lowering
  * without a type mismatch. */

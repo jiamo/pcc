@@ -71,11 +71,13 @@ from ..py_ast import (
     DynType,
     Expr,
     ExprStmt,
+    ExceptHandler,
     FloatLit,
     FloatType,
     For,
     FuncDef,
     FuncType,
+    Global,
     If,
     IfExpr,
     IntLit,
@@ -85,6 +87,7 @@ from ..py_ast import (
     ListType,
     Module,
     Name,
+    Nonlocal,
     NoneLit,
     NoneType,
     Delete,
@@ -299,17 +302,132 @@ def _ascii_decimal_digit(ch: str) -> int:
 
 
 def _dataclass_field_value(obj, field_name: str, default=None):
-    state = getattr(obj, "__dict__", None)
-    if isinstance(state, dict):
-        return state.get(field_name, default)
-    return default
+    return getattr(obj, field_name, default)
 
 
 def _dataclass_field_names(obj):
     fields = getattr(obj, "__dataclass_fields__", None)
-    if fields is None:
-        return ()
-    return fields.keys()
+    if fields is not None:
+        return fields.keys()
+    if isinstance(obj, SourceSpan):
+        return ("file", "line", "col", "end_line", "end_col")
+    if isinstance(obj, IntType) or isinstance(obj, FloatType):
+        return ("name", "width")
+    if isinstance(obj, BoolType):
+        return ("name",)
+    if isinstance(obj, NoneType):
+        return ("name",)
+    if isinstance(obj, StrType):
+        return ("name",)
+    if isinstance(obj, ListType):
+        return ("name", "elem")
+    if isinstance(obj, DictType):
+        return ("name", "key", "value")
+    if isinstance(obj, TupleType):
+        return ("name", "elems")
+    if isinstance(obj, FuncType):
+        return ("name", "params", "ret")
+    if isinstance(obj, ClassType):
+        return ("name", "module", "fields", "bases")
+    if isinstance(obj, DynType):
+        return ("name",)
+    if isinstance(obj, Type):
+        return ("name",)
+    if isinstance(obj, Expr):
+        if isinstance(obj, NoneLit):
+            return ("span", "ty")
+        if (
+            isinstance(obj, IntLit)
+            or isinstance(obj, FloatLit)
+            or isinstance(obj, BoolLit)
+            or isinstance(obj, StrLit)
+        ):
+            return ("span", "ty", "value")
+        if isinstance(obj, Name):
+            return ("span", "ty", "ident")
+        if isinstance(obj, BinOp):
+            return ("span", "ty", "op", "lhs", "rhs")
+        if isinstance(obj, UnaryOp):
+            return ("span", "ty", "op", "operand")
+        if isinstance(obj, Compare):
+            return ("span", "ty", "op", "lhs", "rhs")
+        if isinstance(obj, BoolExpr):
+            return ("span", "ty", "op", "left", "right")
+        if isinstance(obj, Call):
+            return ("span", "ty", "func", "args", "kwargs")
+        if isinstance(obj, Attr):
+            return ("span", "ty", "obj", "name")
+        if isinstance(obj, Subscript):
+            return ("span", "ty", "obj", "idx")
+        if isinstance(obj, Slice):
+            return ("span", "ty", "lo", "hi", "step")
+        if isinstance(obj, ListExpr):
+            return ("span", "ty", "elems")
+        if isinstance(obj, DictExpr):
+            return ("span", "ty", "pairs")
+        if isinstance(obj, TupleExpr):
+            return ("span", "ty", "elems")
+        if isinstance(obj, IfExpr):
+            return ("span", "ty", "cond", "then_e", "else_e")
+        if isinstance(obj, Lambda):
+            return ("span", "ty", "params", "body")
+    if isinstance(obj, Stmt):
+        if isinstance(obj, Assign):
+            return ("span", "targets", "value", "annotation")
+        if isinstance(obj, AugAssign):
+            return ("span", "target", "op", "value")
+        if isinstance(obj, ExprStmt):
+            return ("span", "expr")
+        if isinstance(obj, If):
+            return ("span", "cond", "body", "else_body")
+        if isinstance(obj, While):
+            return ("span", "cond", "body", "else_body")
+        if isinstance(obj, For):
+            return ("span", "target", "iter", "body", "else_body")
+        if isinstance(obj, Return):
+            return ("span", "value")
+        if (
+            isinstance(obj, Pass)
+            or isinstance(obj, Break)
+            or isinstance(obj, Continue)
+        ):
+            return ("span",)
+        if isinstance(obj, Raise):
+            return ("span", "exc", "cause")
+        if isinstance(obj, Try):
+            return ("span", "body", "handlers", "else_body", "finally_body")
+        if isinstance(obj, With):
+            return ("span", "items", "body")
+        if isinstance(obj, Import):
+            return ("span", "names")
+        if isinstance(obj, ImportFrom):
+            return ("span", "module", "names", "level")
+        if isinstance(obj, Global):
+            return ("span", "names")
+        if isinstance(obj, Nonlocal):
+            return ("span", "names")
+        if isinstance(obj, Delete):
+            return ("span", "targets")
+        if isinstance(obj, FuncDef):
+            return (
+                "span", "name", "args", "return_ty", "body",
+                "decorators", "is_method", "is_async",
+            )
+        if isinstance(obj, ClassDef):
+            return (
+                "span", "name", "bases", "keywords", "body", "decorators",
+            )
+    if isinstance(obj, Arg):
+        return ("name", "annotation", "default", "kind", "has_default")
+    if isinstance(obj, ExceptHandler):
+        return ("exc_type", "name", "body", "span")
+    if isinstance(obj, Module):
+        return ("name", "body", "docstring")
+    return ()
+
+
+def _as_native_float(value) -> float:
+    return value
 
 
 # Well-known Python stdlib callables that fall through to the
@@ -694,11 +812,15 @@ class L1CodeGen:
         # Map from user function name -> ir.Function (filled during
         # the declaration pass before we emit bodies).
         self.functions: dict[str, ir.Function] = {}
+        self._c_abi_export_symbols: set[str] = set()
+        self._fn_err_exit_blocks: dict[str, ir.Block] = {}
 
         # Per-function state, reset when entering a new FuncDef:
         self.builder: Optional[ir.IRBuilder] = None
         self.current_function: Optional[ir.Function] = None
         self.current_func_def: Optional[FuncDef] = None
+        self.current_class = None
+        self.current_method_kind = None
         self._current_global_names: set[str] = set()
         # ident -> (alloca ptr, ir.Type, pcc_py Type)
         self.env: dict[str, tuple[ir.AllocaInstr, ir.Type, Type]] = {}
@@ -741,6 +863,8 @@ class L1CodeGen:
         self._native_module_aliases: dict[str, str] = {}
         self._native_builtin_module_aliases: dict[str, str] = {}
         self._native_builtin_value_aliases: dict[str, str] = {}
+        self._native_file_values: set = set()
+        self._native_file_env_flags: dict[str, bool] = {}
         self._cross_module_func_defs: dict[str, FuncDef] = {}
 
     # ---------------------------------------------------------------- API
@@ -757,6 +881,8 @@ class L1CodeGen:
             self.runtime = declare_runtime(self.module)
             self._printf = self._declare_printf()
             self.functions = {}
+            self._c_abi_export_symbols = set()
+            self._fn_err_exit_blocks = {}
             self._fmt_int = None
             self._fmt_float = None
             self._fmt_bool_true = None
@@ -769,7 +895,11 @@ class L1CodeGen:
             self._native_module_aliases = {}
             self._native_builtin_module_aliases = {}
             self._native_builtin_value_aliases = {}
+            self._native_file_values = set()
+            self._native_file_env_flags = {}
             self._cross_module_func_defs = {}
+            self.current_class = None
+            self.current_method_kind = None
 
         self.class_lowering = ClassLowering(self)
 
@@ -865,7 +995,32 @@ class L1CodeGen:
                         self._resolve_relative_import(stmt)
                         if native_table is not None else None
                     )
-                    if (
+                    handled_as_native_submodule = False
+                    if native_table is not None:
+                        remaining_names = []
+                        for attr_name, as_name in stmt.names:
+                            full_submodule = self._native_import_from_submodule(
+                                resolved, attr_name,
+                            )
+                            if full_submodule is None:
+                                full_submodule = (
+                                    self._resolve_relative_import_submodule(
+                                        stmt, resolved, attr_name,
+                                    )
+                                )
+                            if (
+                                full_submodule is not None
+                                and full_submodule in native_table
+                            ):
+                                self._register_native_module_alias(
+                                    as_name or attr_name, full_submodule,
+                                )
+                                continue
+                            remaining_names.append((attr_name, as_name))
+                        handled_as_native_submodule = not remaining_names
+                    if handled_as_native_submodule:
+                        pass
+                    elif (
                         native_table is not None
                         and self._has_native_import_from_targets(
                             stmt, resolved,
@@ -999,15 +1154,15 @@ class L1CodeGen:
                         self._cpy_module_global(local_name)
                     )
                 return
-            for slot in getattr(s, "__dataclass_fields__", {}).keys():
+            for slot in _dataclass_field_names(s):
                 if slot in ("span",):
                     continue
                 v = _dataclass_field_value(s, slot, None)
                 if isinstance(v, tuple):
                     for it in v:
-                        if hasattr(it, "__dataclass_fields__"):
+                        if _dataclass_field_names(it):
                             walk(it)
-                elif v is not None and hasattr(v, "__dataclass_fields__"):
+                elif v is not None and _dataclass_field_names(v):
                     walk(v)
         walk(stmt)
 
@@ -1651,6 +1806,73 @@ class L1CodeGen:
         self._hoisted_capture_params = {}
         self._hoisted_class_capture_params = {}
 
+        def clone_funcdef(fd, name, args, return_ty, body):
+            return _FuncDef(
+                fd.span,
+                name,
+                args,
+                return_ty,
+                body,
+                fd.decorators,
+                fd.is_method,
+                fd.is_async,
+            )
+
+        def name_in(items, name):
+            for item in items:
+                if item == name:
+                    return True
+            return False
+
+        def append_name_once(items, name):
+            if not name_in(items, name):
+                items.append(name)
+
+        def extend_names_once(items, names):
+            for name in names:
+                append_name_once(items, name)
+
+        def copy_names(names):
+            out = []
+            extend_names_once(out, names)
+            return out
+
+        def copy_name_map(src):
+            out = {}
+            for key, value in src.items():
+                out[key] = value
+            return out
+
+        def update_name_map(dst, src):
+            for key, value in src.items():
+                dst[key] = value
+
+        def is_discard_capture_name(name):
+            return (
+                name == "_"
+                or name == "*"
+                or name == "**"
+                or name.startswith("__nested_")
+            )
+
+        def filter_capture_names(names):
+            out = []
+            for name in names:
+                if not is_discard_capture_name(name):
+                    out.append(name)
+            return tuple(out)
+
+        def filter_self_capture_names(names, original_name, hoisted_name):
+            out = []
+            for name in names:
+                if (
+                    name != original_name
+                    and name != hoisted_name
+                    and not is_discard_capture_name(name)
+                ):
+                    out.append(name)
+            return tuple(out)
+
         def body_reads_self(stmts):
             """Return True if any Name(ident='self') appears read in
             ``stmts`` (not just as a write target). Used to skip
@@ -1663,7 +1885,7 @@ class L1CodeGen:
                 if isinstance(x, _Name) and x.ident == "self":
                     found[0] = True
                     return
-                for slot in getattr(x, "__dataclass_fields__", {}).keys():
+                for slot in _dataclass_field_names(x):
                     v = _dataclass_field_value(x, slot, None)
                     if isinstance(v, tuple):
                         for it in v:
@@ -1705,7 +1927,7 @@ class L1CodeGen:
                     for _, v in x.kwargs:
                         walk(v, in_lambda=in_lambda)
                     return
-                for slot in getattr(x, "__dataclass_fields__", {}).keys():
+                for slot in _dataclass_field_names(x):
                     v = _dataclass_field_value(x, slot, None)
                     if isinstance(v, tuple):
                         for it in v:
@@ -1744,7 +1966,7 @@ class L1CodeGen:
                     if x.target.ident not in local:
                         found[0] = True
                         return
-                for slot in getattr(x, "__dataclass_fields__", {}).keys():
+                for slot in _dataclass_field_names(x):
                     v = _dataclass_field_value(x, slot, None)
                     if isinstance(v, tuple):
                         for it in v:
@@ -1762,25 +1984,25 @@ class L1CodeGen:
             scope and the hoisted inner both rewrite ``X`` references
             as ``X[0]`` subscripts, with a shared list allocation
             in outer scope."""
-            free = set(compute_free_names(fd, excluded))
+            free = compute_free_names(fd, excluded)
             if not free:
-                return set()
-            mutated: set = set()
+                return ()
+            mutated = []
 
             def walk(x):
                 if isinstance(x, _Assign):
                     for t in x.targets:
-                        if isinstance(t, _Name) and t.ident in free:
-                            mutated.add(t.ident)
+                        if isinstance(t, _Name) and name_in(free, t.ident):
+                            append_name_once(mutated, t.ident)
                     for slot in ("value",):
                         walk(_dataclass_field_value(x, slot))
                     return
                 if isinstance(x, _AugAssign):
-                    if isinstance(x.target, _Name) and x.target.ident in free:
-                        mutated.add(x.target.ident)
+                    if isinstance(x.target, _Name) and name_in(free, x.target.ident):
+                        append_name_once(mutated, x.target.ident)
                     walk(x.value)
                     return
-                for slot in getattr(x, "__dataclass_fields__", {}).keys():
+                for slot in _dataclass_field_names(x):
                     v = _dataclass_field_value(x, slot, None)
                     if isinstance(v, tuple):
                         for it in v:
@@ -1789,7 +2011,7 @@ class L1CodeGen:
                         walk(v)
             for s in fd.body:
                 walk(s)
-            return mutated
+            return tuple(mutated)
 
         def box_expr(expr, boxed):
             """Rewrite every ``Name(X)`` read in ``expr`` to
@@ -1822,11 +2044,11 @@ class L1CodeGen:
                         kwargs=tuple((k, go(v)) for (k, v) in e.kwargs),
                     )
                 # Generic dataclass-fields recursion.
-                fields = getattr(e, "__dataclass_fields__", None)
-                if fields is None:
+                fields = _dataclass_field_names(e)
+                if not fields:
                     return e
                 new_fields = {}
-                for slot in fields.keys():
+                for slot in fields:
                     v = _dataclass_field_value(e, slot, None)
                     if slot == "span":
                         continue
@@ -1834,7 +2056,7 @@ class L1CodeGen:
                         items = tuple(go(it) for it in v)
                         new_fields[slot] = items
                     else:
-                        new_fields[slot] = go(v) if hasattr(v, "__dataclass_fields__") else v
+                        new_fields[slot] = go(v) if _dataclass_field_names(v) else v
                 # Only call _replace when we actually changed something
                 # and the field names match the dataclass.
                 return _replace(e, **new_fields) if new_fields else e
@@ -1935,7 +2157,10 @@ class L1CodeGen:
                 # Nested FuncDef body — rewrite recursively (its free
                 # reads of the boxed var also need to become X[0]).
                 if isinstance(st, _FuncDef):
-                    out.append(_replace(st, body=box_stmts(st.body, boxed)))
+                    out.append(clone_funcdef(
+                        st, st.name, st.args, st.return_ty,
+                        box_stmts(st.body, boxed),
+                    ))
                     continue
                 out.append(st)
             return tuple(out)
@@ -1944,24 +2169,30 @@ class L1CodeGen:
             """Walk a function body and return a set of names that
             any nested FuncDef mutates as a free var. Used to decide
             which outer locals to box."""
-            boxed: set = set()
+            boxed = []
             for st in body:
                 if isinstance(st, _FuncDef):
-                    boxed.update(mutable_captures_in_fd(st, set()))
+                    extend_names_once(boxed, mutable_captures_in_fd(st, ()))
                     # Recurse into deeply nested defs.
-                    boxed.update(collect_all_mutable_captures(st.body))
+                    extend_names_once(boxed, collect_all_mutable_captures(st.body))
                     continue
-                for slot in getattr(st, "__dataclass_fields__", {}).keys():
+                for slot in _dataclass_field_names(st):
                     v = _dataclass_field_value(st, slot, None)
                     if isinstance(v, tuple):
                         for it in v:
-                            if hasattr(it, "__dataclass_fields__"):
+                            if _dataclass_field_names(it):
                                 if isinstance(it, _FuncDef):
-                                    boxed.update(mutable_captures_in_fd(it, set()))
-                                    boxed.update(collect_all_mutable_captures(it.body))
+                                    extend_names_once(
+                                        boxed,
+                                        mutable_captures_in_fd(it, ()),
+                                    )
+                                    extend_names_once(
+                                        boxed,
+                                        collect_all_mutable_captures(it.body),
+                                    )
                                 else:
                                     pass
-            return boxed
+            return tuple(boxed)
 
         def box_outer_body(body):
             """Top-level entry: if any nested def in ``body`` mutates
@@ -2001,11 +2232,12 @@ class L1CodeGen:
             Callers that only want a bool can use
             ``bool(compute_free_names(...))``. Closure conversion
             uses the actual name set to append synthetic params."""
-            param_names = {
-                a.name for a in fd.args if a.name != ""
-            }
-            assigned_names: set = set()
-            module_names: set[str] = set()
+            param_names = []
+            for a in fd.args:
+                if a.name != "":
+                    append_name_once(param_names, a.name)
+            assigned_names = []
+            module_names = []
             from ..py_ast import (
                 Assign as _AssignStmt,
                 Import as _ImportStmtTop,
@@ -2015,38 +2247,38 @@ class L1CodeGen:
 
             def add_module_target_names(t):
                 if isinstance(t, _Name):
-                    module_names.add(t.ident)
+                    append_name_once(module_names, t.ident)
                 elif isinstance(t, _TupleExprTop):
                     for e in t.elems:
                         add_module_target_names(e)
 
             for s in self.ast_module.body:
                 if isinstance(s, (_FuncDef, _ClassDef)):
-                    module_names.add(s.name)
+                    append_name_once(module_names, s.name)
                 elif isinstance(s, _ImportStmtTop):
                     for mod_name, as_name in s.names:
                         bound = as_name or mod_name.split(".", 1)[0]
                         if bound:
-                            module_names.add(bound)
+                            append_name_once(module_names, bound)
                 elif isinstance(s, _ImportFromStmtTop):
                     for imported_name, as_name in s.names:
                         if imported_name == "*":
                             continue
-                        module_names.add(as_name or imported_name)
+                        append_name_once(module_names, as_name or imported_name)
                 elif isinstance(s, _AssignStmt):
                     for target in s.targets:
                         add_module_target_names(target)
-            module_names |= set(excluded)
+            extend_names_once(module_names, excluded)
             if own_name is not None:
-                module_names.add(own_name)
+                append_name_once(module_names, own_name)
             # ``fd.name`` is in scope for recursive self-calls.
-            module_names.add(fd.name)
+            append_name_once(module_names, fd.name)
 
             from ..py_ast import TupleExpr as _TupleExpr
 
             def add_target_names(t):
                 if isinstance(t, _Name):
-                    assigned_names.add(t.ident)
+                    append_name_once(assigned_names, t.ident)
                 elif isinstance(t, _TupleExpr):
                     for e in t.elems:
                         add_target_names(e)
@@ -2056,7 +2288,7 @@ class L1CodeGen:
             # even an ``X = v`` assignment to such a name writes to
             # the outer binding, not a local. Track them and exclude
             # from ``assigned_names``.
-            nonlocal_names: set = set()
+            nonlocal_names = []
             from ..py_ast import (
                 Global as _GL,
                 Import as _ImportStmt,
@@ -2067,7 +2299,7 @@ class L1CodeGen:
             def collect_nonlocal_global(stmts):
                 for s in stmts:
                     if isinstance(s, (_NL, _GL)):
-                        nonlocal_names.update(s.names)
+                        extend_names_once(nonlocal_names, s.names)
                     elif isinstance(s, _If):
                         collect_nonlocal_global(s.body)
                         collect_nonlocal_global(s.else_body)
@@ -2087,7 +2319,7 @@ class L1CodeGen:
                 for s in stmts:
                     if isinstance(s, _Assign):
                         for t in s.targets:
-                            if isinstance(t, _Name) and t.ident in nonlocal_names:
+                            if isinstance(t, _Name) and name_in(nonlocal_names, t.ident):
                                 continue
                             add_target_names(t)
                     elif isinstance(s, _AugAssign):
@@ -2119,12 +2351,14 @@ class L1CodeGen:
                         for mod_name, asname in s.names:
                             bound = asname or mod_name.split(".", 1)[0]
                             if bound:
-                                assigned_names.add(bound)
+                                append_name_once(assigned_names, bound)
                     elif isinstance(s, _ImportFromStmt):
                         for imported_name, asname in s.names:
                             if imported_name == "*":
                                 continue
-                            assigned_names.add(asname or imported_name)
+                            append_name_once(
+                                assigned_names, asname or imported_name,
+                            )
                     elif isinstance(s, (_FuncDef, _ClassDef)):
                         # A nested ``def`` / ``class`` binds its name
                         # in the enclosing scope. Uses of that name in
@@ -2132,7 +2366,7 @@ class L1CodeGen:
                         # captures from an even-further-outer scope.
                         # Don't recurse into its body — that has its
                         # own local scope.
-                        assigned_names.add(s.name)
+                        append_name_once(assigned_names, s.name)
             collect_assigned(fd.body)
 
             # Parser sentinel names the codegen special-cases at Call
@@ -2157,17 +2391,19 @@ class L1CodeGen:
                 "_",
                 "*", "**",
             }
-            local_scope = (
-                param_names | assigned_names | module_names | sentinel_ns
-            )
+            local_scope = []
+            extend_names_once(local_scope, param_names)
+            extend_names_once(local_scope, assigned_names)
+            extend_names_once(local_scope, module_names)
+            extend_names_once(local_scope, sentinel_ns)
             builtins_ns = _PY_BUILTINS_NS
-            free: set = set()
+            free = []
 
             def _collect_target_names(t, acc):
                 if isinstance(t, _Name):
-                    acc.add(t.ident)
+                    append_name_once(acc, t.ident)
                     return
-                for slot in getattr(t, "__dataclass_fields__", {}).keys():
+                for slot in _dataclass_field_names(t):
                     v = _dataclass_field_value(t, slot, None)
                     if isinstance(v, tuple):
                         for it in v:
@@ -2175,7 +2411,7 @@ class L1CodeGen:
 
             def walk(x, bound=None):
                 if bound is None:
-                    bound = frozenset()
+                    bound = ()
                 if isinstance(x, (_FuncDef, _ClassDef)):
                     # Nested defs/classes introduce their own local
                     # scope. Their bodies must not contribute free vars
@@ -2191,11 +2427,11 @@ class L1CodeGen:
                     return
                 if isinstance(x, _Name):
                     if (
-                        x.ident not in local_scope
-                        and x.ident not in builtins_ns
-                        and x.ident not in bound
+                        not name_in(local_scope, x.ident)
+                        and not name_in(builtins_ns, x.ident)
+                        and not name_in(bound, x.ident)
                     ):
-                        free.add(x.ident)
+                        append_name_once(free, x.ident)
                     return
                 if isinstance(x, _Call) and isinstance(x.func, _Name):
                     fname = x.func.ident
@@ -2204,25 +2440,119 @@ class L1CodeGen:
                         "__listcomp__", "__setcomp__", "__genexpr__",
                     ) and x.args:
                         # _list_comp(elt, _gen_clause(target, iter, ifs), ...)
-                        walk(x.args[0], bound | _gather_comp_targets(x.args))
-                        for gen in x.args[1:]:
-                            walk(gen, bound)
+                        comp_bound = copy_names(bound)
+                        for gen_arg in x.args[1:]:
+                            if (
+                                isinstance(gen_arg, _Call)
+                                and isinstance(gen_arg.func, _Name)
+                                and gen_arg.func.ident == "_gen_clause"
+                                and gen_arg.args
+                            ):
+                                _collect_target_names(gen_arg.args[0], comp_bound)
+                            elif isinstance(gen_arg, _TupleExpr):
+                                for clause in gen_arg.elems:
+                                    if (
+                                        isinstance(clause, _TupleExpr)
+                                        and clause.elems
+                                    ):
+                                        _collect_target_names(
+                                            clause.elems[0], comp_bound,
+                                        )
+                        walk(x.args[0], comp_bound)
+                        running_bound = copy_names(bound)
+                        for gen_arg in x.args[1:]:
+                            if (
+                                isinstance(gen_arg, _Call)
+                                and isinstance(gen_arg.func, _Name)
+                                and gen_arg.func.ident == "_gen_clause"
+                                and len(gen_arg.args) == 3
+                            ):
+                                target, iter_expr, ifs_expr = gen_arg.args
+                                walk(iter_expr, running_bound)
+                                _collect_target_names(target, running_bound)
+                                walk(ifs_expr, running_bound)
+                            elif isinstance(gen_arg, _TupleExpr):
+                                for clause in gen_arg.elems:
+                                    if (
+                                        isinstance(clause, _TupleExpr)
+                                        and len(clause.elems) >= 3
+                                    ):
+                                        target = clause.elems[0]
+                                        iter_expr = clause.elems[1]
+                                        ifs_expr = clause.elems[2]
+                                        walk(iter_expr, running_bound)
+                                        _collect_target_names(
+                                            target, running_bound,
+                                        )
+                                        walk(ifs_expr, running_bound)
+                                    else:
+                                        walk(clause, running_bound)
+                            else:
+                                walk(gen_arg, running_bound)
                         return
                     if fname in ("_dict_comp", "__dictcomp__") and x.args:
                         # _dict_comp(TupleExpr(k, v), _gen_clause(...), ...)
-                        walk(x.args[0], bound | _gather_comp_targets(x.args))
-                        for gen in x.args[1:]:
-                            walk(gen, bound)
+                        comp_bound = copy_names(bound)
+                        for gen_arg in x.args[1:]:
+                            if (
+                                isinstance(gen_arg, _Call)
+                                and isinstance(gen_arg.func, _Name)
+                                and gen_arg.func.ident == "_gen_clause"
+                                and gen_arg.args
+                            ):
+                                _collect_target_names(gen_arg.args[0], comp_bound)
+                            elif isinstance(gen_arg, _TupleExpr):
+                                for clause in gen_arg.elems:
+                                    if (
+                                        isinstance(clause, _TupleExpr)
+                                        and clause.elems
+                                    ):
+                                        _collect_target_names(
+                                            clause.elems[0], comp_bound,
+                                        )
+                        walk(x.args[0], comp_bound)
+                        if fname == "__dictcomp__" and len(x.args) > 1:
+                            walk(x.args[1], comp_bound)
+                        running_bound = copy_names(bound)
+                        for gen_arg in x.args[1:]:
+                            if (
+                                isinstance(gen_arg, _Call)
+                                and isinstance(gen_arg.func, _Name)
+                                and gen_arg.func.ident == "_gen_clause"
+                                and len(gen_arg.args) == 3
+                            ):
+                                target, iter_expr, ifs_expr = gen_arg.args
+                                walk(iter_expr, running_bound)
+                                _collect_target_names(target, running_bound)
+                                walk(ifs_expr, running_bound)
+                            elif isinstance(gen_arg, _TupleExpr):
+                                for clause in gen_arg.elems:
+                                    if (
+                                        isinstance(clause, _TupleExpr)
+                                        and len(clause.elems) >= 3
+                                    ):
+                                        target = clause.elems[0]
+                                        iter_expr = clause.elems[1]
+                                        ifs_expr = clause.elems[2]
+                                        walk(iter_expr, running_bound)
+                                        _collect_target_names(
+                                            target, running_bound,
+                                        )
+                                        walk(ifs_expr, running_bound)
+                                    else:
+                                        walk(clause, running_bound)
+                            else:
+                                walk(gen_arg, running_bound)
                         return
                     if fname == "_gen_clause" and x.args:
                         # _gen_clause(target, iter, (ifs,))
                         target = x.args[0]
-                        new_bound = set(bound)
+                        new_bound = copy_names(bound)
                         _collect_target_names(target, new_bound)
                         for a in x.args[1:]:
-                            walk(a, bound | new_bound)
+                            walk(a, new_bound)
                         return
-                for slot in getattr(x, "__dataclass_fields__", {}).keys():
+                for slot in _dataclass_field_names(x):
                     v = _dataclass_field_value(x, slot, None)
                     if isinstance(v, tuple):
                         for it in v:
@@ -2230,23 +2560,9 @@ class L1CodeGen:
                     else:
                         walk(v, bound)
 
-            def _gather_comp_targets(args):
-                """Extract target names bound by the comprehension's
-                ``_gen_clause`` sub-expressions so the element / kv
-                walk treats them as in-scope."""
-                bound = set()
-                for a in args[1:]:
-                    if (
-                        isinstance(a, _Call)
-                        and isinstance(a.func, _Name)
-                        and a.func.ident == "_gen_clause"
-                        and a.args
-                    ):
-                        _collect_target_names(a.args[0], bound)
-                return bound
             for s in fd.body:
                 walk(s)
-            return tuple(sorted(free))
+            return filter_capture_names(tuple(sorted(free)))
 
         def body_reads_free_names(fd, excluded):
             return bool(compute_free_names(fd, excluded))
@@ -2259,11 +2575,11 @@ class L1CodeGen:
                 TupleExpr as _TupleExpr,
             )
 
-            bindings: set[str] = set()
+            bindings = []
 
             def add_target_names(t):
                 if isinstance(t, _Name):
-                    bindings.add(t.ident)
+                    append_name_once(bindings, t.ident)
                 elif isinstance(t, _TupleExpr):
                     for e in t.elems:
                         add_target_names(e)
@@ -2294,23 +2610,25 @@ class L1CodeGen:
                         walk(s.finally_body)
                         for h in s.handlers:
                             if h.name:
-                                bindings.add(h.name)
+                                append_name_once(bindings, h.name)
                             walk(h.body)
                     elif isinstance(s, _ImportStmt):
                         for mod_name, asname in s.names:
                             bound = asname or mod_name.split(".", 1)[0]
                             if bound:
-                                bindings.add(bound)
+                                append_name_once(bindings, bound)
                     elif isinstance(s, _ImportFromStmt):
                         for imported_name, asname in s.names:
                             if imported_name == "*":
                                 continue
-                            bindings.add(asname or imported_name)
+                            append_name_once(
+                                bindings, asname or imported_name,
+                            )
                     elif isinstance(s, (_FuncDef, _ClassDef)):
-                        bindings.add(s.name)
+                        append_name_once(bindings, s.name)
 
             walk(stmts)
-            return bindings
+            return tuple(bindings)
 
         def rewrite_body(stmts, rename_map, scope_names):
             """Return a new body tuple with nested defs stripped out
@@ -2319,7 +2637,7 @@ class L1CodeGen:
             # hoisted so mutual-recursive siblings don't capture each
             # other as free vars. Each will get its real hoisted name
             # inserted when the main loop reaches it.
-            prescan_map = dict(rename_map)
+            prescan_map = copy_name_map(rename_map)
             for st in stmts:
                 if isinstance(st, _FuncDef) and st.name not in prescan_map:
                     # Placeholder value — actual hoisted name assigned
@@ -2327,17 +2645,39 @@ class L1CodeGen:
                     # map is what ``compute_free_names``' excluded
                     # argument needs.
                     prescan_map[st.name] = (f"__nested_{st.name}", ())
-            sibling_names = {
-                st.name for st in stmts if isinstance(st, _FuncDef)
-            }
+            sibling_names = []
+            for st in stmts:
+                if isinstance(st, _FuncDef):
+                    append_name_once(sibling_names, st.name)
+
+            def filter_sibling_capture_names(names):
+                out = []
+                for name in names:
+                    if not name_in(sibling_names, name):
+                        out.append(name)
+                return tuple(out)
+
+            def filter_renamed_capture_names(names):
+                out = []
+                for name in names:
+                    discard = False
+                    for key, mapped in rename_map.items():
+                        mapped_name = mapped[0] if isinstance(mapped, tuple) else mapped
+                        if name == key or name == mapped_name:
+                            discard = True
+                            break
+                    if not discard:
+                        out.append(name)
+                return tuple(out)
 
             def locally_bound_names(fd):
                 """Names that are already available inside ``fd`` without
                 capturing them from the enclosing scope."""
-                bound = {
-                    a.name for a in fd.args if a.name != ""
-                }
-                bound.update(collect_scope_bindings(fd.body))
+                bound = []
+                for a in fd.args:
+                    if a.name != "":
+                        append_name_once(bound, a.name)
+                extend_names_once(bound, collect_scope_bindings(fd.body))
                 return bound
 
             def called_sibling_names(fd):
@@ -2345,7 +2685,7 @@ class L1CodeGen:
                 ``fd``. Their own captures must be threaded through the
                 caller once the call site is rewritten to the hoisted
                 form with synthetic capture kwargs."""
-                out = set()
+                out = []
                 local_bound = locally_bound_names(fd)
 
                 def walk(x):
@@ -2360,10 +2700,10 @@ class L1CodeGen:
                     if (
                         isinstance(x, _Call)
                         and isinstance(x.func, _Name)
-                        and x.func.ident in sibling_names
-                        and x.func.ident not in local_bound
+                        and name_in(sibling_names, x.func.ident)
+                        and not name_in(local_bound, x.func.ident)
                     ):
-                        out.add(x.func.ident)
+                        append_name_once(out, x.func.ident)
                     for slot in _dataclass_field_names(x):
                         walk(_dataclass_field_value(x, slot, None))
 
@@ -2414,38 +2754,55 @@ class L1CodeGen:
             for k, v in prescan_map.items():
                 excluded_prescan.add(k)
                 excluded_prescan.add(v[0] if isinstance(v, tuple) else v)
-            lexical_free_names: dict[str, set[str]] = {}
-            local_bound_names: dict[str, set[str]] = {}
-            sibling_call_deps: dict[str, set[str]] = {}
-            effective_free_names: dict[str, set[str]] = {}
+
+            def sibling_funcdef(name):
+                for sibling_stmt in stmts:
+                    if (
+                        isinstance(sibling_stmt, _FuncDef)
+                        and sibling_stmt.name == name
+                    ):
+                        return sibling_stmt
+                return None
+
+            def sibling_effective_free_names(fd, seen_names):
+                out = []
+                extend_names_once(out, compute_free_names(fd, excluded_prescan))
+                local_bound = locally_bound_names(fd)
+                for dep in called_sibling_names(fd):
+                    if name_in(seen_names, dep):
+                        continue
+                    dep_fd = sibling_funcdef(dep)
+                    if dep_fd is None:
+                        continue
+                    dep_free = sibling_effective_free_names(
+                        dep_fd, tuple(seen_names) + (dep,),
+                    )
+                    for fv in dep_free:
+                        if (
+                            name_in(scope_names, fv)
+                            and not name_in(local_bound, fv)
+                        ):
+                            append_name_once(out, fv)
+                return tuple(sorted(out))
+
+            effective_free_names: dict[str, tuple] = {}
             for st in stmts:
                 if not isinstance(st, _FuncDef):
                     continue
-                lexical = set(compute_free_names(st, excluded_prescan))
-                lexical_free_names[st.name] = lexical
-                local_bound_names[st.name] = locally_bound_names(st)
-                sibling_call_deps[st.name] = called_sibling_names(st)
-                effective_free_names[st.name] = set(lexical)
-            changed = True
-            while changed:
-                changed = False
-                for name, deps in sibling_call_deps.items():
-                    merged = set(lexical_free_names[name])
-                    for dep in deps:
-                        merged.update(
-                            fv for fv in effective_free_names.get(dep, ())
-                            if fv in scope_names
-                            and fv not in local_bound_names.get(name, ())
-                        )
-                    if merged != effective_free_names[name]:
-                        effective_free_names[name] = merged
-                        changed = True
+                effective_free_names[st.name] = sibling_effective_free_names(
+                    st, (st.name,),
+                )
             for name in sibling_names:
                 mapped = prescan_map.get(name)
                 if isinstance(mapped, tuple):
+                    capture_names = filter_capture_names(
+                        effective_free_names.get(name, ()),
+                    )
+                    capture_names = filter_sibling_capture_names(capture_names)
+                    capture_names = filter_renamed_capture_names(capture_names)
                     prescan_map[name] = (
                         mapped[0],
-                        tuple(sorted(effective_free_names.get(name, ()))),
+                        tuple(sorted(capture_names)),
                     )
             new_stmts = []
             for st in stmts:
@@ -2514,6 +2871,7 @@ class L1CodeGen:
                                     body_stmt, excluded_prescan,
                                 )
                                 if fv in scope_names
+                                and not is_discard_capture_name(fv)
                             )
                             if recv_name is not None and method_free:
                                 cap_names = set(method_free)
@@ -2676,8 +3034,11 @@ class L1CodeGen:
                     local_bound = locally_bound_names(st)
                     free_names = tuple(sorted(effective_free_names.get(
                         st.name,
-                        set(compute_free_names(st, excluded)),
+                        compute_free_names(st, excluded),
                     )))
+                    free_names = filter_capture_names(free_names)
+                    free_names = filter_sibling_capture_names(free_names)
+                    free_names = filter_renamed_capture_names(free_names)
                     # Pick the hoisted symbol early so self-referential
                     # free-var detection works.
                     hoist_name = f"__nested_{st.name}"
@@ -2690,6 +3051,9 @@ class L1CodeGen:
                     while final_name in existing:
                         suffix += 1
                         final_name = f"{hoist_name}_{suffix}"
+                    free_names = filter_self_capture_names(
+                        free_names, st.name, final_name,
+                    )
                     while True:
                         # Closure conversion: prepend the free vars as
                         # extra trailing arguments with DynType annotation.
@@ -2727,24 +3091,31 @@ class L1CodeGen:
                         # ``rewrite_expr`` rewrites the self-call's
                         # ``Call(Name(<inner_name>), args)`` to include
                         # the free vars as trailing positional args.
-                        inner_map = dict(prescan_map)
-                        inner_map.update(rename_map)
+                        inner_map = copy_name_map(prescan_map)
+                        update_name_map(inner_map, rename_map)
                         inner_map[st.name] = (final_name, free_names)
-                        inner_scope = set(scope_names)
-                        inner_scope.update(
-                            a.name for a in st.args if a.name != ""
+                        inner_scope = copy_names(scope_names)
+                        for a in st.args:
+                            if a.name != "":
+                                append_name_once(inner_scope, a.name)
+                        extend_names_once(
+                            inner_scope, collect_scope_bindings(st.body),
                         )
-                        inner_scope.update(collect_scope_bindings(st.body))
                         inner_body = rewrite_body(
                             st.body, inner_map, inner_scope,
                         )
                         forwarded = {
                             fv
                             for fv in compute_free_names(
-                                _replace(st, body=inner_body), excluded,
+                                clone_funcdef(
+                                    st, st.name, st.args, st.return_ty,
+                                    inner_body,
+                                ),
+                                excluded,
                             )
-                            if fv in scope_names
-                            and fv not in local_bound
+                            if name_in(scope_names, fv)
+                            and not name_in(local_bound, fv)
+                            and not is_discard_capture_name(fv)
                         }
                         forwarded.update(
                             forwarded_value_capture_names(
@@ -2752,6 +3123,11 @@ class L1CodeGen:
                             )
                         )
                         widened = tuple(sorted(set(free_names) | forwarded))
+                        widened = filter_self_capture_names(
+                            widened, st.name, final_name,
+                        )
+                        widened = filter_sibling_capture_names(widened)
+                        widened = filter_renamed_capture_names(widened)
                         if widened == free_names:
                             break
                         free_names = widened
@@ -2768,10 +3144,8 @@ class L1CodeGen:
                         # rewrite has already swapped the ident.
                         self._hoist_wrap_caps[final_name] = cap_entry
                     self._hoisted_capture_params[final_name] = tuple(free_names)
-                    hoisted_fd = _replace(
-                        st, name=final_name,
-                        args=new_args,
-                        body=inner_body,
+                    hoisted_fd = clone_funcdef(
+                        st, final_name, new_args, st.return_ty, inner_body,
                     )
                     hoisted.append(hoisted_fd)
                     rename_map[st.name] = (final_name, free_names)
@@ -2998,7 +3372,7 @@ class L1CodeGen:
                 ):
                     found[0] = True
                     return
-                for slot in getattr(x, "__dataclass_fields__", {}).keys():
+                for slot in _dataclass_field_names(x):
                     v = _dataclass_field_value(x, slot, None)
                     if isinstance(v, tuple):
                         for it in v:
@@ -3122,7 +3496,7 @@ class L1CodeGen:
             )
             new_body = new_body + (ret,)
             new_ret_ty = ListType(name="list", elem=DynType(name="dyn"))
-            return _replace(fd, body=new_body, return_ty=new_ret_ty)
+            return clone_funcdef(fd, fd.name, fd.args, new_ret_ty, new_body)
 
         new_top_body = []
         for stmt in self.ast_module.body:
@@ -3133,12 +3507,15 @@ class L1CodeGen:
                 # safely closure-convert-by-value — the list reference
                 # is shared between outer and inner.
                 boxed_body = box_outer_body(stmt.body)
-                scope_names = {
-                    a.name for a in stmt.args if a.name != ""
-                }
-                scope_names.update(collect_scope_bindings(boxed_body))
+                scope_names = []
+                for a in stmt.args:
+                    if a.name != "":
+                        append_name_once(scope_names, a.name)
+                extend_names_once(scope_names, collect_scope_bindings(boxed_body))
                 new_body = rewrite_body(boxed_body, {}, scope_names)
-                new_top_body.append(_replace(stmt, body=new_body))
+                new_top_body.append(clone_funcdef(
+                    stmt, stmt.name, stmt.args, stmt.return_ty, new_body,
+                ))
             elif isinstance(stmt, _ClassDef):
                 # Rewrite each method's body.
                 new_methods = []
@@ -3146,14 +3523,19 @@ class L1CodeGen:
                     if isinstance(m, _FuncDef):
                         m = transform_generator_body(m)
                         boxed_body = box_outer_body(m.body)
-                        scope_names = {
-                            a.name for a in m.args if a.name != ""
-                        }
-                        scope_names.update(collect_scope_bindings(boxed_body))
+                        scope_names = []
+                        for a in m.args:
+                            if a.name != "":
+                                append_name_once(scope_names, a.name)
+                        extend_names_once(
+                            scope_names, collect_scope_bindings(boxed_body),
+                        )
                         new_body = rewrite_body(
                             boxed_body, {}, scope_names,
                         )
-                        new_methods.append(_replace(m, body=new_body))
+                        new_methods.append(clone_funcdef(
+                            m, m.name, m.args, m.return_ty, new_body,
+                        ))
                     else:
                         new_methods.append(m)
                 new_top_body.append(_replace(stmt, body=tuple(new_methods)))
@@ -3180,6 +3562,12 @@ class L1CodeGen:
         sanitized = mod_name.replace(".", "_").replace("-", "_")
         return f"user_{sanitized}_{name}"
 
+    def _func_decorators(self, fd: FuncDef) -> tuple:
+        decorators = fd.decorators
+        if not isinstance(decorators, tuple):
+            return ()
+        return decorators
+
     def _declare_user_function(self, fd: FuncDef) -> None:
         if fd.is_async:
             raise NotImplementedError(
@@ -3187,9 +3575,10 @@ class L1CodeGen:
                 f"{fd.name!r}"
             )
         c_abi_sym: str | None = None
-        if fd.decorators:
+        decorators = self._func_decorators(fd)
+        if decorators:
             unrecognised = []
-            for d in fd.decorators:
+            for d in decorators:
                 sym = self._decorator_c_abi_export_symbol(d)
                 if sym is not None:
                     c_abi_sym = sym
@@ -3199,7 +3588,7 @@ class L1CodeGen:
             if unrecognised:
                 raise NotImplementedError(
                     "Layer 1 does not handle decorators; received "
-                    f"{len(fd.decorators)} on {fd.name!r} "
+                    f"{len(decorators)} on {fd.name!r} "
                     f"(first unrecognised: "
                     f"{self._decorator_repr(unrecognised[0])})"
                 )
@@ -3245,7 +3634,7 @@ class L1CodeGen:
         # spurious check would misinterpret that as "the helper
         # raised".
         if c_abi_sym is not None:
-            fn._pcc_c_abi_export = True
+            self._c_abi_export_symbols.add(sym)
         runtime_args = [a for a in fd.args if a.name != ""]
         for ir_arg, ast_arg in zip(fn.args, runtime_args):
             ir_arg.name = ast_arg.name
@@ -3255,7 +3644,7 @@ class L1CodeGen:
         fn = self.functions[fd.name]
         box_int_abi = not any(
             self._decorator_c_abi_export_symbol(d) is not None
-            for d in fd.decorators
+            for d in self._func_decorators(fd)
         ) and self._should_box_python_ints()
         saved_box_int_locals = self._box_int_locals
         saved_exact_int_flags = self._exact_int_env_flags
@@ -3688,15 +4077,16 @@ class L1CodeGen:
         else:
             self.env_list_elem_class_hint.pop(target.ident, None)
 
+        target_ty = stmt.annotation if stmt.annotation is not None else target.ty
         boxed_int_target = (
-            isinstance(target.ty, IntType)
+            isinstance(target_ty, IntType)
             and self._int_exprs_are_boxed()
         )
         exact_int_value = None
         if boxed_int_target and isinstance(stmt.value.ty, (IntType, BoolType)):
             exact_int_value = self._emit_exact_int_operand_object(stmt.value)
         elif (
-            isinstance(target.ty, IntType)
+            isinstance(target_ty, IntType)
             and self._int_expr_needs_exact_object_boundary(stmt.value)
         ):
             exact_int_value = self._maybe_emit_exact_int_object(stmt.value)
@@ -3758,7 +4148,6 @@ class L1CodeGen:
         slot = self.env.get(target.ident)
         if slot is None:
             # First assignment — allocate.
-            target_ty = stmt.annotation if stmt.annotation is not None else target.ty
             if not (self._is_scalar(target_ty) or self._is_object(target_ty)):
                 raise NotImplementedError(
                     f"Layer 1/2 cannot allocate variable "
@@ -3766,7 +4155,7 @@ class L1CodeGen:
                 )
             ir_ty = (
                 _CSTR if (boxed_int_target or exact_int_value is not None)
-                else self._map_type(target_ty)
+                else self._storage_ir_type(target_ty)
             )
             alloca = self._alloca_in_entry(ir_ty, name=f"{target.ident}.addr")
             self.env[target.ident] = (alloca, ir_ty, target_ty)
@@ -3973,7 +4362,7 @@ class L1CodeGen:
                     f"Layer 1 tuple-unpack target {target.ident!r} has "
                     f"unsupported type {type(target_ty).__name__}"
                 )
-            ir_ty = self._map_type(target_ty)
+            ir_ty = self._storage_ir_type(target_ty)
             alloca = self._alloca_in_entry(ir_ty, name=f"{target.ident}.addr")
             self.env[target.ident] = (alloca, ir_ty, target_ty)
             slot = self.env[target.ident]
@@ -4312,8 +4701,11 @@ class L1CodeGen:
             # py_print_many. ``file=<fp>`` / ``flush=<bool>`` pull in
             # the libpython fallback — load CPython's builtin print
             # and dispatch through it with the full kwarg set.
-            kw_names = {k for k, _ in call.kwargs}
-            if kw_names <= {"sep", "end"}:
+            only_sep_end = True
+            for k, _ in call.kwargs:
+                if k != "sep" and k != "end":
+                    only_sep_end = False
+            if only_sep_end:
                 self._emit_print_many(call)
                 return
             # ``print(..., file=sys.stderr|sys.stdout[, sep=, end=])``
@@ -5993,11 +6385,12 @@ class L1CodeGen:
         module_name, info = export
         if info.get("kind") != "class":
             return None
+        class_name = attr_name
         expected_global = (
             ".class."
             + module_name.replace(".", "_").replace("-", "_")
             + "."
-            + info["class_name"]
+            + class_name
         )
         existing = self.class_lowering.classes.get(attr_name)
         if (
@@ -6007,11 +6400,62 @@ class L1CodeGen:
             return None
         return self.class_lowering.declare_extern_class(
             owning_module=module_name,
-            class_name=info["class_name"],
+            class_name=class_name,
             field_names=info["field_names"],
             methods=info["methods"],
             local_name=attr_name,
         )
+
+    def _emit_no_init_field_instance(
+        self, class_name: str, args: tuple, kwargs: tuple,
+    ) -> ir.Value | None:
+        info = self.class_lowering.classes.get(class_name)
+        if info is None:
+            return None
+        field_names = tuple(getattr(info, "field_names", ()))
+        if not field_names:
+            return None
+        if len(args) > len(field_names):
+            raise NotImplementedError(
+                f"class {class_name!r} has no __init__ for extra "
+                "positional arguments"
+            )
+
+        inst = self.class_lowering.emit_instantiate(class_name, (), self)
+        seen = set()
+
+        for i, arg_expr in enumerate(args):
+            field_name = field_names[i]
+            seen.add(field_name)
+            raw_v = self._emit_expr(arg_expr)
+            v_obj = marshal.marshal_to_object(
+                self.builder, self.module, self.runtime, raw_v, arg_expr.ty,
+            )
+            self.builder.call(
+                self.runtime["py_obj_setattr"],
+                [inst, self._attr_name_ptr(field_name), v_obj],
+            )
+
+        for kw_name, kw_expr in kwargs:
+            if kw_name in seen:
+                raise NotImplementedError(
+                    f"class {class_name!r} got multiple values for "
+                    f"field {kw_name!r}"
+                )
+            if kw_name not in field_names:
+                raise NotImplementedError(
+                    f"class {class_name!r} has no field {kw_name!r}"
+                )
+            seen.add(kw_name)
+            raw_v = self._emit_expr(kw_expr)
+            v_obj = marshal.marshal_to_object(
+                self.builder, self.module, self.runtime, raw_v, kw_expr.ty,
+            )
+            self.builder.call(
+                self.runtime["py_obj_setattr"],
+                [inst, self._attr_name_ptr(kw_name), v_obj],
+            )
+        return inst
 
     def _declare_extern_user_function(
         self,
@@ -6099,12 +6543,18 @@ class L1CodeGen:
             return None
         init_fd = self.class_lowering._find_method_def(attr.name, "__init__")
         resolved_args = expr.args
-        if expr.kwargs:
-            if init_fd is None:
+        if init_fd is None:
+            inst = self._emit_no_init_field_instance(
+                attr.name, expr.args, expr.kwargs,
+            )
+            if inst is not None:
+                return inst
+            if expr.kwargs:
                 raise NotImplementedError(
                     f"class {attr.name!r} with kwargs needs __init__ "
                     "to resolve parameter names"
                 )
+        elif expr.kwargs:
             resolved_args = tuple(self._resolve_call_kwargs(
                 expr.args, expr.kwargs, init_fd.args, skip_self=True,
             ))
@@ -6292,6 +6742,24 @@ class L1CodeGen:
         import_module = stmt.module or ""
         if native_table is not None:
             import_module = self._resolve_relative_import(stmt)
+            remaining_names: list[tuple[str, Optional[str]]] = []
+            for attr_name, as_name in stmt_names:
+                full_submodule = self._native_import_from_submodule(
+                    import_module, attr_name,
+                )
+                if full_submodule is None:
+                    full_submodule = self._resolve_relative_import_submodule(
+                        stmt, import_module, attr_name,
+                    )
+                if full_submodule is not None and full_submodule in native_table:
+                    self._register_native_module_alias(
+                        as_name or attr_name, full_submodule,
+                    )
+                    continue
+                remaining_names.append((attr_name, as_name))
+            if not remaining_names:
+                return
+            stmt_names = remaining_names
             if self._has_native_import_from_targets(
                 stmt, import_module,
             ):
@@ -8405,13 +8873,18 @@ class L1CodeGen:
         # Requires an active IRBuilder; _emit_for is called during
         # body lowering so the builder is positioned on the enclosing
         # block.
-        ir_ty = self._map_type(int_ty)
+        ir_ty = self._storage_ir_type(int_ty)
         alloca = self._alloca_in_entry(ir_ty, name=f"{cnt_name}.addr")
         if start_expr is None:
-            self.builder.store(ir.Constant(ir_ty, 0), alloca)
+            start_val = ir.Constant(_I64, 0)
         else:
             start_val = self._emit_expr_as_i64(start_expr)
-            self.builder.store(start_val, alloca)
+        if isinstance(ir_ty, ir.PointerType):
+            start_val = self.builder.call(
+                self.runtime["py_int_from_i64"], [start_val],
+                name=self._fresh("enum.start.box"),
+            )
+        self.builder.store(start_val, alloca)
         self.env[cnt_name] = (alloca, ir_ty, int_ty)
 
         return _replace(stmt, target=new_target, iter=inner_iter, body=new_body)
@@ -9038,7 +9511,7 @@ class L1CodeGen:
                 return self._emit_int_literal_object(int(expr.value))
             return ir.Constant(_I64, int(expr.value))
         if isinstance(expr, FloatLit):
-            return ir.Constant(_DOUBLE, float(expr.value))
+            return ir.Constant(_DOUBLE, _as_native_float(expr.value))
         if isinstance(expr, BoolLit):
             return ir.Constant(_I1, 1 if expr.value else 0)
         if isinstance(expr, NoneLit):
@@ -9348,14 +9821,14 @@ class L1CodeGen:
                 for it in e:
                     collect_free_vars(it, bound, acc)
                 return
-            for slot in getattr(e, "__dataclass_fields__", {}).keys():
+            for slot in _dataclass_field_names(e):
                 if slot in ("span", "ty"):
                     continue
                 v = _dataclass_field_value(e, slot, None)
                 if isinstance(v, tuple):
                     for it in v:
                         collect_free_vars(it, bound, acc)
-                elif v is not None and hasattr(v, "__dataclass_fields__"):
+                elif v is not None and _dataclass_field_names(v):
                     collect_free_vars(v, bound, acc)
 
         free_vars: set = set()
@@ -11044,7 +11517,7 @@ class L1CodeGen:
         if isinstance(obj_ty, ListType):
             helper = "py_list_slice"
         elif isinstance(obj_ty, TupleType):
-            helper = "py_list_slice"  # py_tuple_slice doesn't exist; treat as list
+            helper = "py_tuple_slice"
         elif isinstance(obj_ty, StrType):
             helper = "py_str_slice"
         elif isinstance(obj_ty, DynType):
@@ -11940,6 +12413,13 @@ class L1CodeGen:
                 self.runtime["py_tuple_concat"], [lhs, rhs],
                 name=self._fresh("tup.concat"),
             )
+
+        if (
+            op == "|"
+            and self._is_native_set_dyn(lhs_ty)
+            and self._is_native_set_dyn(rhs_ty)
+        ):
+            return self._emit_set_union_values(lhs, rhs)
 
         if (
             self._int_exprs_are_boxed()
@@ -13191,10 +13671,56 @@ class L1CodeGen:
         if name == "ord" and len(expr.args) == 1:
             # ``ord(s)`` where s is a one-char str. Return the first
             # Unicode codepoint, matching CPython for valid pcc strings.
-            s_val = self._emit_as_object(expr.args[0])
+            ord_arg = expr.args[0]
+            if (
+                isinstance(ord_arg, Subscript)
+                and not isinstance(ord_arg.idx, Slice)
+                and isinstance(ord_arg.obj.ty, StrType)
+            ):
+                s_val = self._emit_expr(ord_arg.obj)
+                idx_val = self._emit_expr_as_i64(ord_arg.idx)
+                return self.builder.call(
+                    self.runtime["py_str_ord_at_i64"], [s_val, idx_val],
+                    name=self._fresh("ord.at"),
+                )
+            s_val = self._emit_as_object(ord_arg)
             return self.builder.call(
                 self.runtime["py_str_ord"], [s_val],
                 name=self._fresh("ord"),
+            )
+        if (
+            self.ast_module.name == "pcc.parse.py_lex"
+            and name == "_pcc_str_byte_len"
+            and len(expr.args) == 1
+        ):
+            s_val = self._emit_expr(expr.args[0])
+            return self.builder.call(
+                self.runtime["py_str_byte_len"], [s_val],
+                name=self._fresh("str.byte_len"),
+            )
+        if (
+            self.ast_module.name == "pcc.parse.py_lex"
+            and name == "_pcc_str_byte_at"
+            and len(expr.args) == 2
+        ):
+            s_val = self._emit_expr(expr.args[0])
+            idx_val = self._emit_expr_as_i64(expr.args[1])
+            return self.builder.call(
+                self.runtime["py_str_byte_at_i64"], [s_val, idx_val],
+                name=self._fresh("str.byte_at"),
+            )
+        if (
+            self.ast_module.name == "pcc.parse.py_lex"
+            and name == "_pcc_str_byte_slice"
+            and len(expr.args) == 3
+        ):
+            s_val = self._emit_expr(expr.args[0])
+            lo_val = self._emit_expr_as_i64(expr.args[1])
+            hi_val = self._emit_expr_as_i64(expr.args[2])
+            return self.builder.call(
+                self.runtime["py_str_byte_slice_i64"],
+                [s_val, lo_val, hi_val],
+                name=self._fresh("str.byte_slice"),
             )
         if name == "getattr" and 2 <= len(expr.args) <= 3:
             return self._emit_getattr_builtin(expr)
@@ -13251,6 +13777,11 @@ class L1CodeGen:
                         mro_info.name, "__init__",
                     )
             if init_fd is None:
+                inst = self._emit_no_init_field_instance(
+                    class_name, expr.args, expr.kwargs,
+                )
+                if inst is not None:
+                    return attach_hoisted_class_captures(inst)
                 if expr.kwargs:
                     from ..py_ast import (
                         Assign as _AssignAst,
@@ -13294,7 +13825,7 @@ class L1CodeGen:
                                 self.runtime["py_obj_setattr"],
                                 [inst, self._attr_name_ptr(kw_name), v_obj],
                             )
-                            return inst
+                        return inst
                     raise NotImplementedError(
                         f"class {class_name!r} with kwargs needs __init__ "
                         "to resolve parameter names"
@@ -13478,6 +14009,8 @@ class L1CodeGen:
             return self._expr_looks_cpython(expr.obj)
         if isinstance(expr, Call):
             if isinstance(expr.func, Name):
+                if expr.func.ident == "getattr" and expr.args:
+                    return self._expr_looks_cpython(expr.args[0])
                 if expr.func.ident in _CPY_BUILTIN_FALLBACK:
                     return True
                 return self._expr_looks_cpython(expr.func)
@@ -13537,6 +14070,8 @@ class L1CodeGen:
         if self._expr_looks_cpython(expr):
             return True
         if isinstance(expr, Call) and isinstance(expr.func, Name):
+            if expr.func.ident == "getattr" and expr.args:
+                return self._expr_looks_cpython(expr.args[0])
             actual = call_arg_map.get(expr.func.ident)
             if actual is not None:
                 return self._callable_expr_returns_cpython(actual)
@@ -13545,7 +14080,7 @@ class L1CodeGen:
     def _user_func_returns_cpython(
         self,
         ast_fd,
-        formals: tuple = (),
+        formals = (),
         actual_args: Optional[list[Expr]] = None,
     ) -> bool:
         """Return True when ``ast_fd`` obviously returns a CPython value.
@@ -13603,7 +14138,7 @@ class L1CodeGen:
         plus the caller's own check, matching the cc-C runtime.
         """
         cur_fn = self.current_function
-        if cur_fn is not None and getattr(cur_fn, "_pcc_c_abi_export", False):
+        if cur_fn is not None and cur_fn.name in self._c_abi_export_symbols:
             return
         err_target = getattr(self, "_try_err_block", None)
         if err_target is None:
@@ -13635,7 +14170,8 @@ class L1CodeGen:
         types, undef void for void returns).
         """
         fn = self.current_function
-        existing = getattr(fn, "_pcc_err_exit_block", None)
+        fn_name = fn.name
+        existing = self._fn_err_exit_blocks.get(fn_name)
         if existing is not None:
             return existing
         err_bb = fn.append_basic_block(name="err.exit")
@@ -13666,7 +14202,7 @@ class L1CodeGen:
             # obviously if it ever triggers (shouldn't happen for pcc's
             # current emitted types).
             self.builder.unreachable()
-        fn._pcc_err_exit_block = err_bb
+        self._fn_err_exit_blocks[fn_name] = err_bb
         self.builder.position_at_end(save_block)
         return err_bb
 
@@ -15185,6 +15721,10 @@ class L1CodeGen:
                     kwargs=expr.kwargs,
                 )
 
+        native_external = self._maybe_emit_class_lowering_extern_method(expr)
+        if native_external is not None:
+            return native_external
+
         # Case 3: ``other_obj.method(...)`` — first try the class hint
         # recorded at assignment time, walking up the MRO of that
         # class for the first definition of the method. Fall back to
@@ -15263,10 +15803,6 @@ class L1CodeGen:
                         info, attr.name, expr.args,
                         kwargs=expr.kwargs,
                     )
-
-        native_external = self._maybe_emit_class_lowering_extern_method(expr)
-        if native_external is not None:
-            return native_external
 
         # Last-resort CPython fallback: when the receiver is a DynType
         # value (typical for foreign / imported-module classes whose
@@ -18193,6 +18729,12 @@ class L1CodeGen:
                 )
             return new_set
         arg_ty = arg.ty
+        if isinstance(arg_ty, DynType) and arg_ty.name == "set":
+            src_val = self._emit_expr(arg)
+            self.builder.call(
+                self.runtime["py_set_update"], [new_set, src_val],
+            )
+            return new_set
         if isinstance(arg_ty, (ListType, TupleType, DictType, DynType, StrType)):
             src_val = self._emit_expr(arg)
             src_obj = marshal.marshal_to_object(
@@ -18240,6 +18782,17 @@ class L1CodeGen:
             self.builder.position_at_end(end_bb)
             return new_set
         return None
+
+    def _emit_set_union_values(
+        self, lhs: ir.Value, rhs: ir.Value,
+    ) -> ir.Value:
+        new_set = self.builder.call(
+            self.runtime["py_set_new"], [],
+            name=self._fresh("set.union"),
+        )
+        self.builder.call(self.runtime["py_set_update"], [new_set, lhs])
+        self.builder.call(self.runtime["py_set_update"], [new_set, rhs])
+        return new_set
 
     def _spread_into_set(self, dst_set: ir.Value, src_expr: "Expr") -> None:
         """Iterate ``src_expr`` and ``py_set_add`` each element to
@@ -18339,17 +18892,39 @@ class L1CodeGen:
                 boxed, IntType(name="int"),
             )
         if isinstance(arg_ty, DynType):
-            # Dyn arg: treat as string if ``py_str_utf8`` returns a
-            # non-NULL buffer, else fall through to ``py_int_to_i64``
-            # for values that are already numeric PyObject*.
             obj = self._emit_expr(arg)
-            # Box non-pointer payloads (i1 from a short-circuit ``or``
-            # over two str candidates, etc.) so py_str_utf8 gets the
-            # pointer operand it expects.
             if not isinstance(obj.type, ir.PointerType):
                 obj = marshal.marshal_to_object(
                     self.builder, self.module, self.runtime, obj, arg_ty,
                 )
+            fn = self.current_function
+            if fn is None:
+                return None
+            tag = self.builder.call(
+                self.runtime["py_obj_type_tag"], [obj],
+                name=self._fresh("int.dyn.tag"),
+            )
+            str_bb = fn.append_basic_block(name=self._fresh("int.dyn.str"))
+            non_str_bb = fn.append_basic_block(
+                name=self._fresh("int.dyn.non_str"),
+            )
+            float_bb = fn.append_basic_block(
+                name=self._fresh("int.dyn.float"),
+            )
+            non_float_bb = fn.append_basic_block(
+                name=self._fresh("int.dyn.non_float"),
+            )
+            bool_bb = fn.append_basic_block(name=self._fresh("int.dyn.bool"))
+            int_bb = fn.append_basic_block(name=self._fresh("int.dyn.int"))
+            join_bb = fn.append_basic_block(name=self._fresh("int.dyn.join"))
+
+            is_str = self.builder.icmp_signed(
+                "==", tag, ir.Constant(_I64, 4),
+                name=self._fresh("int.dyn.is_str"),
+            )
+            self.builder.cbranch(is_str, str_bb, non_str_bb)
+
+            self.builder.position_at_end(str_bb)
             cstr = self.builder.call(
                 self.runtime["py_str_utf8"], [obj],
                 name=self._fresh("int.dyn.cstr"),
@@ -18358,10 +18933,62 @@ class L1CodeGen:
                 self.runtime["py_int_from_cstr"], [cstr, base_val],
                 name=self._fresh("int.dyn.parse"),
             )
-            return marshal.marshal_from_object(
+            str_val = marshal.marshal_from_object(
                 self.builder, self.module, self.runtime,
                 boxed, IntType(name="int"),
             )
+            str_exit = self.builder._block
+            self.builder.branch(join_bb)
+
+            self.builder.position_at_end(non_str_bb)
+            is_float = self.builder.icmp_signed(
+                "==", tag, ir.Constant(_I64, 3),
+                name=self._fresh("int.dyn.is_float"),
+            )
+            self.builder.cbranch(is_float, float_bb, non_float_bb)
+
+            self.builder.position_at_end(float_bb)
+            f64 = self.builder.call(
+                self.runtime["py_float_to_f64"], [obj],
+                name=self._fresh("int.dyn.f64"),
+            )
+            float_val = self.builder.fptosi(
+                f64, _I64, name=self._fresh("int.dyn.from_float"),
+            )
+            float_exit = self.builder._block
+            self.builder.branch(join_bb)
+
+            self.builder.position_at_end(non_float_bb)
+            is_bool = self.builder.icmp_signed(
+                "==", tag, ir.Constant(_I64, 1),
+                name=self._fresh("int.dyn.is_bool"),
+            )
+            self.builder.cbranch(is_bool, bool_bb, int_bb)
+
+            self.builder.position_at_end(bool_bb)
+            bool_val = self.builder.call(
+                self.runtime["py_obj_truthy"], [obj],
+                name=self._fresh("int.dyn.from_bool"),
+            )
+            bool_exit = self.builder._block
+            self.builder.branch(join_bb)
+
+            self.builder.position_at_end(int_bb)
+            int_val = self.builder.call(
+                self.runtime["py_int_to_i64"],
+                [obj, ir.Constant(_I32.as_pointer(), None)],
+                name=self._fresh("int.dyn.from_int"),
+            )
+            int_exit = self.builder._block
+            self.builder.branch(join_bb)
+
+            self.builder.position_at_end(join_bb)
+            phi = self.builder.phi(_I64, name=self._fresh("int.dyn"))
+            phi.add_incoming(str_val, str_exit)
+            phi.add_incoming(float_val, float_exit)
+            phi.add_incoming(bool_val, bool_exit)
+            phi.add_incoming(int_val, int_exit)
+            return phi
         return None
 
     def _maybe_emit_sum_literal(self, expr: Call) -> Optional[ir.Value]:
@@ -18784,8 +19411,16 @@ class L1CodeGen:
         through to NotImplementedError."""
         a_expr, b_expr = expr.args
         a_ty, b_ty = a_expr.ty, b_expr.ty
-        numeric = (IntType, FloatType, BoolType, DynType)
-        if not (isinstance(a_ty, numeric) and isinstance(b_ty, numeric)):
+
+        def is_numeric_type(ty):
+            return (
+                isinstance(ty, IntType)
+                or isinstance(ty, FloatType)
+                or isinstance(ty, BoolType)
+                or isinstance(ty, DynType)
+            )
+
+        if not (is_numeric_type(a_ty) and is_numeric_type(b_ty)):
             raise NotImplementedError(
                 f"Layer 1 {name}() with non-numeric args "
                 f"({a_ty!r}, {b_ty!r}) needs runtime support"
@@ -19097,36 +19732,52 @@ class L1CodeGen:
         default raises L1CodegenError, as do duplicate binds, unknown
         keywords, and surplus positionals.
         """
-        formals = list(formal_args)
-        if skip_self and formals:
+        formals: list = []
+        src_i = 0
+        while src_i < len(formal_args):
+            formal = formal_args[src_i]
             # Bound instance/class method calls already provide the
             # receiver separately. Strip the first formal regardless of
             # its source-level name (`self`, `cls`, `self_or_op`, ...).
-            formals = formals[1:]
-        # Filter out the bare ``*`` separator — a kw_only marker with
-        # an empty name has no runtime param. ``*args`` / ``**kwargs``
-        # with real names are separate kinds (rejected upstream in
-        # _emit_user_function / _declare_user_function).
-        formals = [f for f in formals if f.name != ""]
+            if skip_self and src_i == 0:
+                src_i += 1
+                continue
+            # Filter out the bare ``*`` separator — a kw_only marker
+            # with an empty name has no runtime param. ``*args`` /
+            # ``**kwargs`` with real names are separate kinds.
+            if formal.name != "":
+                formals.append(formal)
+            src_i += 1
         n_formal = len(formals)
-        resolved: list = [None] * n_formal
-        var_pos_idx = next(
-            (i for i, f in enumerate(formals) if f.kind == "*args"), None,
-        )
-        var_kw_idx = next(
-            (i for i, f in enumerate(formals) if f.kind == "**kwargs"), None,
-        )
-        pos_formal_indices = [
-            i for i, f in enumerate(formals)
-            if f.kind in ("pos", "pos_only")
-        ]
+        resolved: list = []
+        i = 0
+        while i < n_formal:
+            resolved.append(None)
+            i += 1
+        var_pos_idx = -1
+        var_kw_idx = -1
+        pos_formal_indices: list = []
+        i = 0
+        while i < n_formal:
+            f = formals[i]
+            if f.kind == "*args":
+                var_pos_idx = i
+            elif f.kind == "**kwargs":
+                var_kw_idx = i
+            elif f.kind == "pos" or f.kind == "pos_only":
+                pos_formal_indices.append(i)
+            i += 1
         extra_pos: list[Expr] = []
-        for i, e in enumerate(positional):
+        i = 0
+        while i < len(positional):
+            e = positional[i]
             if i < len(pos_formal_indices):
                 resolved[pos_formal_indices[i]] = e
+                i += 1
                 continue
-            if var_pos_idx is not None:
+            if var_pos_idx >= 0:
                 extra_pos.append(e)
+                i += 1
                 continue
             raise L1CodegenError(
                 f"too many positional args: got {len(positional)}, "
@@ -19150,7 +19801,7 @@ class L1CodeGen:
             )
 
         synth_span = _synthetic_span()
-        if var_pos_idx is not None:
+        if var_pos_idx >= 0:
             resolved[var_pos_idx] = TupleExpr(
                 span=synth_span,
                 ty=TupleType(
@@ -19159,24 +19810,30 @@ class L1CodeGen:
                 elems=tuple(extra_pos),
             )
 
-        name_to_idx = {
-            f.name: i
-            for i, f in enumerate(formals)
-            if f.kind not in ("*args", "**kwargs")
-        }
+        name_to_idx = {}
+        i = 0
+        while i < n_formal:
+            f = formals[i]
+            if f.kind != "*args" and f.kind != "**kwargs":
+                name_to_idx[f.name] = i
+            i += 1
         extra_kwargs: list[tuple[str, Expr]] = []
         for kw_name, kw_expr in kwargs_pairs:
             idx = name_to_idx.get(kw_name)
             if idx is None:
-                if var_kw_idx is not None:
+                if var_kw_idx >= 0:
                     extra_kwargs.append((kw_name, kw_expr))
                     continue
+                formal_names = ",".join(f.name for f in formals)
                 raise L1CodegenError(
-                    f"unexpected keyword argument {kw_name!r}"
+                    f"unexpected keyword argument {kw_name!r}; "
+                    f"formals=({formal_names})"
                 )
             if formals[idx].kind == "pos_only":
+                formal_names = ",".join(f.name for f in formals)
                 raise L1CodegenError(
-                    f"unexpected keyword argument {kw_name!r}"
+                    f"unexpected keyword argument {kw_name!r}; "
+                    f"formals=({formal_names})"
                 )
             if resolved[idx] is not None:
                 raise L1CodegenError(
@@ -19184,15 +19841,10 @@ class L1CodeGen:
                 )
             resolved[idx] = kw_expr
 
-        if var_kw_idx is not None:
-            resolved[var_kw_idx] = DictExpr(
-                span=synth_span,
-                ty=DictType(
-                    name="dict",
-                    key=StrType(name="str"),
-                    value=DynType(name="dyn"),
-                ),
-                pairs=tuple(
+        if var_kw_idx >= 0:
+            kw_pairs: list = []
+            for kw_name, kw_expr in extra_kwargs:
+                kw_pairs.append(
                     (
                         StrLit(
                             span=kw_expr.span,
@@ -19201,11 +19853,20 @@ class L1CodeGen:
                         ),
                         kw_expr,
                     )
-                    for kw_name, kw_expr in extra_kwargs
+                )
+            resolved[var_kw_idx] = DictExpr(
+                span=synth_span,
+                ty=DictType(
+                    name="dict",
+                    key=StrType(name="str"),
+                    value=DynType(name="dyn"),
                 ),
+                pairs=tuple(kw_pairs),
             )
 
-        for i, formal in enumerate(formals):
+        i = 0
+        while i < n_formal:
+            formal = formals[i]
             if resolved[i] is None:
                 if formal.kind == "*args":
                     resolved[i] = TupleExpr(
@@ -19227,9 +19888,13 @@ class L1CodeGen:
                     continue
                 if not getattr(formal, "has_default", False):
                     raise L1CodegenError(
-                        f"missing required argument {formal.name!r}"
+                        f"missing required argument {formal.name!r} "
+                        f"(positional={len(positional)}, "
+                        f"kwargs={len(kwargs_pairs)}, "
+                        f"formals={len(formals)})"
                     )
                 resolved[i] = formal.default
+            i += 1
         return resolved
 
     # -- Coercions / helpers ------------------------------------------

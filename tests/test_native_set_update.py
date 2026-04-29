@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -56,3 +57,62 @@ def test_set_update_uses_native_spread(mode):
     assert "@py_set_add" in body, body
     assert "cpy.fn.update" not in body, body
     assert "cpy.call1.update" not in body, body
+
+
+@pytest.mark.parametrize("mode", ["off", "on"])
+def test_set_ior_uses_native_union(mode):
+    program = textwrap.dedent(
+        """
+        def f(left_items: list[str], right_items: list[str]) -> object:
+            left = set(left_items)
+            right = set(right_items)
+            left |= right
+            return left
+        """
+    )
+    ir = _compile_to_ll(program, f"set_ior_{mode}", mode=mode)
+    body = _function_body(ir, "f")
+    assert body is not None
+    assert "@py_set_update" in body, body
+    assert "@py_int_to_i64" not in body, body
+
+
+@pytest.mark.parametrize("mode", ["off", "on"])
+def test_annotated_set_ior_stays_set_union(mode):
+    program = textwrap.dedent(
+        """
+        def f(excluded: set[str]) -> object:
+            module_names: set[str] = set()
+            module_names |= set(excluded)
+            return module_names
+        """
+    )
+    ir = _compile_to_ll(program, f"set_ior_annotated_{mode}", mode=mode)
+    body = _function_body(ir, "f")
+    assert body is not None
+    assert "@py_set_update" in body, body
+    assert "@py_int_to_i64" not in body, body
+
+
+def test_set_equality_runtime(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "set_eq.py"
+    exe = tmp_path / "set_eq"
+    src.write_text(
+        textwrap.dedent(
+            """
+            print(set(["a", "b"]) == set(["b", "a"]))
+            print(set(["a"]) == set(["a", "b"]))
+            """
+        )
+    )
+    compile_python(str(src), str(exe), ir_scaffold_mode="on")
+    run = subprocess.run(
+        [str(exe)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert run.stdout.splitlines() == ["True", "False"]

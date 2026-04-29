@@ -799,11 +799,11 @@ class Function:
         # stay clean.
         self._name_counter = len(self.args)
         self._block_counter = 0
-        # Track all named locals that have been emitted so far —
-        # collisions get a ``.N`` suffix appended. Matches llvmlite's
-        # auto-deduplication; without it, code like
-        # ``builder.call(..., name="m.int_unbox")`` in a loop would
-        # emit conflicting SSA names.
+        # Track explicit names used by blocks and the small number of
+        # callers that require llvmlite-style stable deduplication. SSA
+        # instruction names are allocated from ``_name_counter`` instead;
+        # pcc-Python's dict is too expensive for per-instruction use in
+        # self-hosted codegen.
         self._name_registry: dict[str, int] = {}
         self.linkage = ""
         self.attributes = FunctionAttributes()
@@ -1209,25 +1209,15 @@ class IRBuilder:
         fn = self._fn
         if fn is None:
             raise ValueError("IRBuilder has no current function")
+        fn._name_counter += 1
         if name == "":
-            fn._name_counter += 1
             return f".{fn._name_counter}"
-        n = fn._name_registry.get(name, 0)
-        fn._name_registry[name] = n + 1
-        if n == 0:
-            return name
-        candidate = f"{name}.{n}"
-        while candidate in fn._name_registry:
-            n += 1
-            candidate = f"{name}.{n}"
-        fn._name_registry[candidate] = 1
-        return candidate
+        return f"{name}.{fn._name_counter}"
 
     def _next(self, name: str, ty: Type) -> Value:
         """Produce a new local SSA value with ``name`` (or a fresh temp
-        if empty). Uniqueifies against the function's name registry
-        so repeated ``name="x"`` calls get ``%x``, ``%x.1``, ``%x.2``
-        — same as llvmlite."""
+        if empty). Named temporaries use a function-wide serial suffix,
+        trading llvmlite text parity for O(1) self-hosted codegen."""
         return Value(ty, f"%{self._next_name(name)}")
 
     # ------------- return / branch / terminator -------------
@@ -1924,7 +1914,7 @@ def Module___init___named(name):
     return Module(name=name)
 
 
-def Module___init__():
+def scaffold_Module___init__():
     return Module(name="")
 
 

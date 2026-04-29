@@ -169,6 +169,18 @@ void py_set_add(PyObject *set, PyObject *item) {
     (void)py_set_maybe_grow(s);
 }
 
+void py_set_update(PyObject *dst, PyObject *src) {
+    if (dst == NULL || src == NULL) return;
+    if (PY_IS_TAGGED_INT(src)) return;
+    if (py_header(src)->type_tag != PY_TYPE_SET) return;
+    PySetObject *s = (PySetObject *)src;
+    for (int64_t i = 0; i < s->capacity; i++) {
+        PyObject *k = s->entries[i].key;
+        if (k == NULL || k == py_set_dummy) continue;
+        py_set_add(dst, k);
+    }
+}
+
 int64_t py_set_contains(PyObject *set, PyObject *item) {
     if (set == NULL || item == NULL) return 0;
     PySetObject *s = (PySetObject *)set;

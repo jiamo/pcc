@@ -54,6 +54,13 @@ static int64_t str_cp_len(PyStrObject *s) {
 
 static int64_t utf8_byte_offset_for_codepoint(PyStrObject *s, int64_t cp_idx) {
     if (cp_idx <= 0) return 0;
+    /* Fast path for ASCII-only strings after str_cp_len() has cached
+     * that codepoint count equals byte length. The native Python
+     * parser/lexer indexes source text by position; rescanning from
+     * byte 0 for every s[i] makes large modules quadratic. */
+    if (s->cp_len == s->byte_len) {
+        return cp_idx >= s->byte_len ? s->byte_len : cp_idx;
+    }
     int64_t seen = 0;
     for (int64_t i = 0; i < s->byte_len; i++) {
         unsigned char b = (unsigned char)s->data[i];
@@ -124,19 +131,19 @@ int64_t py_str_len(PyObject *s) {
     return ss->cp_len;
 }
 
-int64_t py_str_ord(PyObject *s) {
-    if (s == NULL) return -1;
-    PyStrObject *ss = (PyStrObject *)s;
-    if (ss->byte_len <= 0) return -1;
-    const unsigned char *p = (const unsigned char *)ss->data;
+static int64_t utf8_ord_at_byte(PyStrObject *ss, int64_t bo) {
+    if (ss == NULL) return -1;
+    if (bo < 0 || bo >= ss->byte_len) return -1;
+    const unsigned char *p = (const unsigned char *)(ss->data + bo);
+    int64_t remaining = ss->byte_len - bo;
     unsigned char b0 = p[0];
     if (b0 < 0x80) return (int64_t)b0;
     if ((b0 & 0xE0) == 0xC0) {
-        if (ss->byte_len < 2) return -1;
+        if (remaining < 2) return -1;
         return (int64_t)(((b0 & 0x1F) << 6) | (p[1] & 0x3F));
     }
     if ((b0 & 0xF0) == 0xE0) {
-        if (ss->byte_len < 3) return -1;
+        if (remaining < 3) return -1;
         return (int64_t)(
             ((b0 & 0x0F) << 12)
             | ((p[1] & 0x3F) << 6)
@@ -144,7 +151,7 @@ int64_t py_str_ord(PyObject *s) {
         );
     }
     if ((b0 & 0xF8) == 0xF0) {
-        if (ss->byte_len < 4) return -1;
+        if (remaining < 4) return -1;
         return (int64_t)(
             ((b0 & 0x07) << 18)
             | ((p[1] & 0x3F) << 12)
@@ -153,6 +160,47 @@ int64_t py_str_ord(PyObject *s) {
         );
     }
     return -1;
+}
+
+int64_t py_str_ord(PyObject *s) {
+    if (s == NULL) return -1;
+    PyStrObject *ss = (PyStrObject *)s;
+    return utf8_ord_at_byte(ss, 0);
+}
+
+int64_t py_str_ord_at_i64(PyObject *s, int64_t idx) {
+    if (s == NULL) return -1;
+    PyStrObject *ss = (PyStrObject *)s;
+    int64_t cp_len = str_cp_len(ss);
+    int64_t real = normalise_index(idx, cp_len);
+    if (real < 0) return -1;
+    if (ss->cp_len == ss->byte_len) {
+        return (int64_t)((unsigned char)ss->data[real]);
+    }
+    int64_t bo = utf8_byte_offset_for_codepoint(ss, real);
+    return utf8_ord_at_byte(ss, bo);
+}
+
+int64_t py_str_byte_at_i64(PyObject *s, int64_t idx) {
+    if (s == NULL) return -1;
+    PyStrObject *ss = (PyStrObject *)s;
+    if (idx < 0 || idx >= ss->byte_len) return -1;
+    return (int64_t)((unsigned char)ss->data[idx]);
+}
+
+PyObject *py_str_byte_slice_i64(PyObject *s, int64_t lo, int64_t hi) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    if (lo < 0) lo = 0;
+    if (hi < lo) hi = lo;
+    if (lo > ss->byte_len) lo = ss->byte_len;
+    if (hi > ss->byte_len) hi = ss->byte_len;
+    PyObject *out = str_from_range(ss->data + lo, hi - lo);
+    if (out != NULL) {
+        PyStrObject *os = (PyStrObject *)out;
+        if (ss->cp_len == ss->byte_len) os->cp_len = os->byte_len;
+    }
+    return out;
 }
 
 PyObject *py_chr_from_i64(int64_t codepoint) {

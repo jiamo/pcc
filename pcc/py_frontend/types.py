@@ -177,6 +177,9 @@ def parse_annotation(expr: Expr) -> Type:
                 )
             return DictType(name="dict", key=TYPE_DYN, value=TYPE_DYN)
 
+        if head in ("set", "Set", "frozenset", "FrozenSet"):
+            return DynType(name="set")
+
         if head == "tuple" or head == "Tuple":
             return TupleType(
                 name="tuple",

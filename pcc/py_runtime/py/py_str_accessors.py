@@ -131,6 +131,14 @@ def _utf8_byte_offset_for_codepoint(s, cp_idx: int) -> int:
     if cp_idx <= 0:
         return 0
     byte_len: int = load_i64(s, 16)
+    # Once _str_cp_len has proved an ASCII-only string, codepoint
+    # offsets are byte offsets. The parser/lexer index source text by
+    # position; without this fast path each s[i] rescans from byte 0.
+    cached_cp_len: int = load_i64(s, 24)
+    if cached_cp_len == byte_len:
+        if cp_idx >= byte_len:
+            return byte_len
+        return cp_idx
     data = ptr_add(s, 40)
     seen: int = 0
     i: int = 0
@@ -242,19 +250,26 @@ def py_str_len(s) -> int:
 def py_str_ord(s) -> int:
     if ptr_is_null(s) != 0:
         return -1
+    return _utf8_ord_at_byte(s, 0)
+
+
+def _utf8_ord_at_byte(s, byte_off: int) -> int:
     byte_len: int = load_i64(s, 16)
-    if byte_len <= 0:
+    if byte_off < 0:
         return -1
-    data = ptr_add(s, 40)
+    if byte_off >= byte_len:
+        return -1
+    remaining: int = byte_len - byte_off
+    data = ptr_add(ptr_add(s, 40), byte_off)
     b0: int = load_i8(data, 0) & 255
     if b0 < 128:
         return b0
     if (b0 & 224) == 192:
-        if byte_len < 2:
+        if remaining < 2:
             return -1
         return ((b0 & 31) << 6) | (load_i8(data, 1) & 63)
     if (b0 & 240) == 224:
-        if byte_len < 3:
+        if remaining < 3:
             return -1
         return (
             ((b0 & 15) << 12)
@@ -262,7 +277,7 @@ def py_str_ord(s) -> int:
             | (load_i8(data, 2) & 63)
         )
     if (b0 & 248) == 240:
-        if byte_len < 4:
+        if remaining < 4:
             return -1
         return (
             ((b0 & 7) << 18)
@@ -271,6 +286,52 @@ def py_str_ord(s) -> int:
             | (load_i8(data, 3) & 63)
         )
     return -1
+
+
+@c_abi_export("py_str_ord_at_i64")
+def py_str_ord_at_i64(s, idx: int) -> int:
+    if ptr_is_null(s) != 0:
+        return -1
+    cp_len: int = _str_cp_len(s)
+    real: int = _normalise_index(idx, cp_len)
+    if real < 0:
+        return -1
+    if load_i64(s, 24) == load_i64(s, 16):
+        return load_i8(ptr_add(s, 40), real) & 255
+    bo: int = _utf8_byte_offset_for_codepoint(s, real)
+    return _utf8_ord_at_byte(s, bo)
+
+
+@c_abi_export("py_str_byte_at_i64")
+def py_str_byte_at_i64(s, idx: int) -> int:
+    if ptr_is_null(s) != 0:
+        return -1
+    byte_len: int = load_i64(s, 16)
+    if idx < 0:
+        return -1
+    if idx >= byte_len:
+        return -1
+    return load_i8(ptr_add(s, 40), idx) & 255
+
+
+@c_abi_export("py_str_byte_slice_i64")
+def py_str_byte_slice_i64(s, lo: int, hi: int):
+    if ptr_is_null(s) != 0:
+        return null()
+    byte_len: int = load_i64(s, 16)
+    if lo < 0:
+        lo = 0
+    if hi < lo:
+        hi = lo
+    if lo > byte_len:
+        lo = byte_len
+    if hi > byte_len:
+        hi = byte_len
+    out = _str_from_range(ptr_add(ptr_add(s, 40), lo), hi - lo)
+    if ptr_is_null(out) == 0:
+        if load_i64(s, 24) == byte_len:
+            store_i64(out, 24, load_i64(out, 16))
+    return out
 
 
 @c_abi_export("py_chr_from_i64")

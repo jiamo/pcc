@@ -154,6 +154,7 @@ pcc/py_runtime/build_libpython/
 pcc/py_runtime/libpy_runtime_libpython.a
 $exe
 .tmp_00031_dbg2.c
+tmp_probe_*.py
 pcc/py_runtime/libpy_runtime_pcc.a
 pcc/py_runtime/libpy_runtime_pcc_py.a
 pcc/py_runtime/build_pcc/
