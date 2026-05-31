@@ -369,6 +369,41 @@ env -u LC_ALL uv run python scripts/pcc_multi.py --entry pkg.main \
 - These JSON files are the source of truth. `docs/issues/open-bootstrap-issues.md`
   is a historical tracker that may lag.
 
+### Bootstrap regression discipline
+
+When a gate that has been green for a long time regresses, treat that as
+evidence that the current work is suspect until proven otherwise. Do not answer
+with a local patch story before doing the causality audit.
+
+Required sequence for bootstrap / pcc1 / no-libpython regressions:
+
+1. Identify the first failing boundary in mode-labeled terms
+   (`pcc0 -> pcc1` fallback, `pcc1 -> pcc2` runtime crash,
+   `pcc2/pcc3` byte drift, no-host link failure, etc.).
+2. List the recent touched subsystems that could plausibly own that boundary
+   before changing more code. For codegen/runtime changes, assume your recent
+   change is a prime suspect until IR/source/debugger evidence rules it out.
+3. Separate stacked failures. If fixing the first boundary exposes a second
+   crash, write them as two failures with two evidence chains; do not collapse
+   them into one guessed root cause.
+4. Do not weaken runtime or GC semantics to localize a bootstrap failure. In
+   particular, do not disable GC tracking, barriers, owned-local cleanup,
+   finalizers, or libpython rejection just to make a stage pass. Such changes
+   are semantic changes, not diagnostics.
+5. For ownership failures, verify the callee/caller reference contract before
+   touching cleanup. Function calls return owned references; returning a
+   borrowed local, parameter, module global, field, or singleton must retain in
+   the callee rather than making the caller stop releasing owned results.
+6. Host-side tests are not bootstrap proof. A Python-frontend/codegen/runtime
+   fix that affects `pcc/py_frontend/codegen/`, `pcc/py_frontend/type_infer.py`,
+   `pcc/py_runtime/`, or bootstrap entrypoints must include a focused
+   regression and a pcc1/bootstrap gate appropriate to the touched path before
+   it is described as fixed.
+7. Debug instrumentation must be clearly tagged, recorded in the investigation,
+   and removed or promoted to a deliberate tested feature before finishing. Do
+   not leave temporary runtime probes that change archive staleness, link
+   shape, or stage behavior.
+
 ### Dedicated gates for Python-frontend / bootstrap edits
 
 ```bash

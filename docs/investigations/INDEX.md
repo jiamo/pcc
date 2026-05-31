@@ -56,6 +56,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - While validating a Python codegen edit, the full pytest bootstrap gate was
 - [bootstrap-types-rsplit-libpython-fallback.md](bootstrap-types-rsplit-libpython-fallback.md) — **types dotted-name rsplit reintroduced libpython fallback**
   - Fix the bootstrap. The current bootstrap/fallback gates regressed: the tight stage1 closure
+- [bootstrap-user-function-low-ir-fallback-2026-06-01.md](bootstrap-user-function-low-ir-fallback-2026-06-01.md) — **LowIR fallback and borrowed return ownership broke full bootstrap**
+  - resolved locally 2026-06-01. The first failing boundary was a strict
 
 ## gc
 

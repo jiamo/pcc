@@ -599,3 +599,19 @@ def test_on_mode_isinstance_helper_contextual_fallback_zero(
         "pcc.py_frontend.codegen.isinstance_lowering"
     )
     assert actual == 0
+
+
+def test_on_mode_user_function_low_ir_helpers_contextual_fallback_zero(
+    closure_compile_on,
+):
+    """Regression for LowIR helper return types in stage1 codegen.
+
+    ``user_function_lowering`` builds LowIR values recursively.  If those
+    helpers lose the ``LowValue`` result type, reads such as ``operand.ty``
+    become dynamic attribute comparisons and reintroduce ``py_cpy_*`` calls
+    into pcc1's strict no-libpython closure.
+    """
+    actual = closure_compile_on["contextual_per_module"].get(
+        "pcc.py_frontend.codegen.user_function_lowering"
+    )
+    assert actual == 0

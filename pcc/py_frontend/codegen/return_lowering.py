@@ -50,6 +50,54 @@ class ReturnLoweringMixin:
         self._emitting_finally = prev
         self._return_log("finally end")
 
+    def _return_value_needs_retain(self, value: ir.Value, stmt: Return) -> bool:
+        """Return true when a PyObject* return value is borrowed locally.
+
+        User/native pcc function calls use the normal Python/C-API ownership
+        convention: the caller receives an owned reference.  Constructors,
+        container literals, subscripts, and owned locals already satisfy that
+        contract.  Parameters, module globals, and non-owned locals are borrowed
+        in the callee, so returning them must promote the borrow to an owned
+        result before caller-side cleanup may release it.
+        """
+        if stmt.value is None:
+            return False
+        if not isinstance(value.type, ir.PointerType):
+            return False
+        if value in getattr(self, "_cpy_values", ()):
+            return False
+        expr = stmt.value
+        if self._expr_returns_unsafe_raw_pointer(expr):
+            return False
+        if isinstance(expr, Name):
+            if expr.ident in getattr(self, "_owned_local_names", set()):
+                return False
+            if expr.ident in getattr(self, "_current_param_names", set()):
+                return True
+            if expr.ident in getattr(self, "_module_globals", {}):
+                return True
+            if expr.ident in self.env:
+                return True
+        if self._expr_returns_owned_object(expr):
+            return False
+        if (
+            getattr(self, "_module_has_c_abi_export", False)
+            and getattr(self, "_module_uses_raw_int_scaffold", False)
+        ):
+            return False
+        expr_ty = getattr(expr, "ty", None)
+        ret_decl_ty = getattr(self.current_func_def, "return_ty", None)
+        return self._is_object(expr_ty) or self._is_object(ret_decl_ty)
+
+    def _retain_borrowed_return_value(
+        self,
+        value: ir.Value,
+        stmt: Return,
+    ) -> ir.Value:
+        if not self._return_value_needs_retain(value, stmt):
+            return value
+        return self._gc_retain(value, name=self._fresh("ret.retain"))
+
     def _emit_return(self, stmt: Return) -> None:
         self._return_log("begin")
         fn = self.current_function
@@ -117,6 +165,7 @@ class ReturnLoweringMixin:
         ):
             self._return_log("exact int object")
             value = self._emit_exact_int_operand_object(stmt.value)
+            value = self._retain_borrowed_return_value(value, stmt)
             self._emit_pending_finally_blocks()
             if self._builder_block_is_terminated():
                 self._return_log("exact int terminated")
@@ -170,6 +219,7 @@ class ReturnLoweringMixin:
                     value,
                     stmt.value.ty,
                 )
+        value = self._retain_borrowed_return_value(value, stmt)
         self._return_log("value finally")
         self._emit_pending_finally_blocks()
         if self._builder_block_is_terminated():

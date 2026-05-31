@@ -164,6 +164,10 @@ def _low_ir_coerce_value(
     return None
 
 
+def _low_value_ty(value: pcc_low_ir.LowValue) -> int:
+    return value.ty
+
+
 def _low_ir_expr_to_value(
     expr: Expr,
     builder: pcc_low_ir.LowBuilder,
@@ -187,10 +191,10 @@ def _low_ir_expr_to_value(
         if expr.op == "-":
             target_ty = (
                 _LOW_F64
-                if operand.ty == _LOW_F64
+                if _low_value_ty(operand) == _LOW_F64
                 else pcc_low_ir.LOW_I64
             )
-            if operand.ty != target_ty:
+            if _low_value_ty(operand) != target_ty:
                 operand = _low_ir_coerce_value(operand, target_ty)
                 if operand is None:
                     return None
@@ -203,13 +207,13 @@ def _low_ir_expr_to_value(
                 operand,
             )
         if expr.op == "+":
-            if operand.ty == _LOW_F64:
+            if _low_value_ty(operand) == _LOW_F64:
                 return operand
-            if operand.ty == pcc_low_ir.LOW_I64:
+            if _low_value_ty(operand) == pcc_low_ir.LOW_I64:
                 return operand
             return _low_ir_coerce_value(operand, pcc_low_ir.LOW_I64)
         if expr.op == "not":
-            if operand.ty != pcc_low_ir.LOW_I1:
+            if _low_value_ty(operand) != pcc_low_ir.LOW_I1:
                 operand = _low_ir_coerce_value(operand, pcc_low_ir.LOW_I1)
                 if operand is None:
                     return None
@@ -227,11 +231,11 @@ def _low_ir_expr_to_value(
             return None
         result_ty = _low_ir_type_for_expr(expr)
         if result_ty == _LOW_F64:
-            if lhs.ty != _LOW_F64:
+            if _low_value_ty(lhs) != _LOW_F64:
                 lhs = _low_ir_coerce_value(lhs, _LOW_F64)
                 if lhs is None:
                     return None
-            if rhs.ty != _LOW_F64:
+            if _low_value_ty(rhs) != _LOW_F64:
                 rhs = _low_ir_coerce_value(rhs, _LOW_F64)
                 if rhs is None:
                     return None
@@ -240,11 +244,11 @@ def _low_ir_expr_to_value(
                     return None  # ``x / 0.0`` must raise; bail to guarded path
                 return pcc_low_ir.LowBinOp(_LOW_F64, expr.op, lhs, rhs)
             return None
-        if lhs.ty != pcc_low_ir.LOW_I64:
+        if _low_value_ty(lhs) != pcc_low_ir.LOW_I64:
             lhs = _low_ir_coerce_value(lhs, pcc_low_ir.LOW_I64)
             if lhs is None:
                 return None
-        if rhs.ty != pcc_low_ir.LOW_I64:
+        if _low_value_ty(rhs) != pcc_low_ir.LOW_I64:
             rhs = _low_ir_coerce_value(rhs, pcc_low_ir.LOW_I64)
             if rhs is None:
                 return None
@@ -259,11 +263,11 @@ def _low_ir_expr_to_value(
         rhs = _low_ir_expr_to_value(expr.rhs, builder, direct_symbols)
         if lhs is None or rhs is None:
             return None
-        if lhs.ty != pcc_low_ir.LOW_I64:
+        if _low_value_ty(lhs) != pcc_low_ir.LOW_I64:
             lhs = _low_ir_coerce_value(lhs, pcc_low_ir.LOW_I64)
             if lhs is None:
                 return None
-        if rhs.ty != pcc_low_ir.LOW_I64:
+        if _low_value_ty(rhs) != pcc_low_ir.LOW_I64:
             rhs = _low_ir_coerce_value(rhs, pcc_low_ir.LOW_I64)
             if rhs is None:
                 return None
@@ -277,15 +281,15 @@ def _low_ir_expr_to_value(
         target_ty = _low_ir_type_for_expr(expr)
         if target_ty is None:
             return None
-        if cond.ty != pcc_low_ir.LOW_I1:
+        if _low_value_ty(cond) != pcc_low_ir.LOW_I1:
             cond = _low_ir_coerce_value(cond, pcc_low_ir.LOW_I1)
             if cond is None:
                 return None
-        if then_value.ty != target_ty:
+        if _low_value_ty(then_value) != target_ty:
             then_value = _low_ir_coerce_value(then_value, target_ty)
             if then_value is None:
                 return None
-        if else_value.ty != target_ty:
+        if _low_value_ty(else_value) != target_ty:
             else_value = _low_ir_coerce_value(else_value, target_ty)
             if else_value is None:
                 return None
@@ -299,7 +303,7 @@ def _low_ir_expr_to_value(
             value = _low_ir_expr_to_value(arg, builder, direct_symbols)
             if value is None:
                 return None
-            if value.ty != pcc_low_ir.LOW_I64:
+            if _low_value_ty(value) != pcc_low_ir.LOW_I64:
                 value = _low_ir_coerce_value(value, pcc_low_ir.LOW_I64)
                 if value is None:
                     return None
@@ -461,7 +465,7 @@ def _low_ir_lower_stmt_block(
                 target_ty = _low_ir_type_for_expr(target)
                 if target_ty is None:
                     return False
-                if value.ty == target_ty:
+                if _low_value_ty(value) == target_ty:
                     _low_builder_store(builder, target.ident, value)
                 else:
                     coerced = _low_ir_coerce_value(value, target_ty)
@@ -483,7 +487,7 @@ def _low_ir_lower_stmt_block(
             if value is None:
                 return False
             target_ty = return_ty
-            if value.ty == target_ty:
+            if _low_value_ty(value) == target_ty:
                 _low_builder_ret(builder, value)
             else:
                 coerced = _low_ir_coerce_value(value, target_ty)
@@ -500,7 +504,7 @@ def _low_ir_lower_stmt_block(
             cond = _low_ir_expr_to_value(stmt.cond, builder, direct_symbols)
             if cond is None:
                 return False
-            if cond.ty != pcc_low_ir.LOW_I1:
+            if _low_value_ty(cond) != pcc_low_ir.LOW_I1:
                 cond = _low_ir_coerce_value(cond, pcc_low_ir.LOW_I1)
                 if cond is None:
                     return False
@@ -529,7 +533,7 @@ def _low_ir_lower_stmt_block(
             cond = _low_ir_expr_to_value(stmt.cond, builder, direct_symbols)
             if cond is None:
                 return False
-            if cond.ty != pcc_low_ir.LOW_I1:
+            if _low_value_ty(cond) != pcc_low_ir.LOW_I1:
                 cond = _low_ir_coerce_value(cond, pcc_low_ir.LOW_I1)
                 if cond is None:
                     return False
