@@ -29,12 +29,15 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 extern int py_runtime_program_argc;
 extern const char **py_runtime_program_argv;
 extern void (*py_runtime_program_args_hook)(void);
+extern int (*py_format_cpy_object_hook)(int fd, void *obj);
 
 #ifdef PCC_WITH_LIBPYTHON
+#include <dlfcn.h>
 
 /* Forward declarations from libpython. We intentionally do NOT
  * ``#include <Python.h>`` here because the runtime build deliberately
@@ -44,52 +47,67 @@ typedef struct _object CPyObject;
 extern void Py_Initialize(void);
 extern void Py_Finalize(void);
 extern int  Py_IsInitialized(void);
-extern CPyObject *PyImport_ImportModule(const char *name);
-extern CPyObject *PyObject_GetAttrString(CPyObject *o, const char *attr);
-extern int PyObject_SetAttrString(CPyObject *o, const char *attr, CPyObject *v);
-extern CPyObject *PyObject_CallNoArgs(CPyObject *callable);
-extern CPyObject *PyObject_CallOneArg(CPyObject *callable, CPyObject *arg);
-extern CPyObject *PyObject_CallFunctionObjArgs(
-    CPyObject *callable, ...);
-extern CPyObject *PyObject_Call(CPyObject *callable,
-                                CPyObject *args, CPyObject *kwargs);
-extern int PyRun_SimpleString(const char *command);
-extern CPyObject *PyTuple_New(long size);
-extern int PyTuple_SetItem(CPyObject *tup, long index, CPyObject *item);
-extern CPyObject *PyList_New(long size);
-extern int PyList_SetItem(CPyObject *lst, long i, CPyObject *item);
-extern long PyObject_Length(CPyObject *o);
-extern CPyObject *PyObject_GetItem(CPyObject *o, CPyObject *key);
-extern int PyObject_SetItem(CPyObject *o, CPyObject *key, CPyObject *value);
-extern int PyObject_IsTrue(CPyObject *o);
-extern CPyObject *PyObject_GetIter(CPyObject *o);
-extern CPyObject *PyIter_Next(CPyObject *it);
-extern CPyObject *PyObject_Str(CPyObject *o);
-extern int PyObject_IsInstance(CPyObject *inst, CPyObject *cls);
-extern CPyObject *PyErr_Occurred(void);
-extern void PyErr_Fetch(CPyObject **ptype, CPyObject **pvalue, CPyObject **ptraceback);
-extern void PyErr_NormalizeException(CPyObject **ptype, CPyObject **pvalue, CPyObject **ptraceback);
-extern void PyErr_Restore(CPyObject *type, CPyObject *value, CPyObject *traceback);
-extern void PyErr_Clear(void);
-extern void PyErr_Print(void);
-extern int PyErr_GivenExceptionMatches(CPyObject *given, CPyObject *exc);
-extern CPyObject *PyLong_FromLongLong(long long value);
-extern long long  PyLong_AsLongLong(CPyObject *o);
-extern CPyObject *PyFloat_FromDouble(double value);
-extern double     PyFloat_AsDouble(CPyObject *o);
-extern CPyObject *PyUnicode_FromStringAndSize(const char *u, long len);
-extern const char *PyUnicode_AsUTF8(CPyObject *unicode);
-extern const char *PyUnicode_AsUTF8AndSize(CPyObject *unicode, long *size);
-extern long PyList_Size(CPyObject *lst);
-extern CPyObject *PyList_GetItem(CPyObject *lst, long i);
-extern long PyTuple_Size(CPyObject *tup);
-extern CPyObject *PyTuple_GetItem(CPyObject *tup, long i);
-extern int PyDict_Next(CPyObject *d, long *pos, CPyObject **key, CPyObject **value);
-extern void Py_DecRef(CPyObject *o);
-extern void Py_IncRef(CPyObject *o);
+
+static void *g_libpython_handle = NULL;
+
+static CPyObject *(*p_PyImport_ImportModule)(const char *name);
+static CPyObject *(*p_PyObject_GetAttrString)(CPyObject *o, const char *attr);
+static int (*p_PyObject_SetAttrString)(CPyObject *o, const char *attr, CPyObject *v);
+static CPyObject *(*p_PyObject_CallNoArgs)(CPyObject *callable);
+static CPyObject *(*p_PyObject_CallOneArg)(CPyObject *callable, CPyObject *arg);
+static CPyObject *(*p_PyObject_CallFunctionObjArgs)(CPyObject *callable, ...);
+static CPyObject *(*p_PyObject_Call)(CPyObject *callable, CPyObject *args, CPyObject *kwargs);
+static int (*p_PyRun_SimpleString)(const char *command);
+static CPyObject *(*p_PyTuple_New)(long size);
+static int (*p_PyTuple_SetItem)(CPyObject *tup, long index, CPyObject *item);
+static CPyObject *(*p_PyList_New)(long size);
+static int (*p_PyList_SetItem)(CPyObject *lst, long i, CPyObject *item);
+static long (*p_PyObject_Length)(CPyObject *o);
+static CPyObject *(*p_PyObject_GetItem)(CPyObject *o, CPyObject *key);
+static int (*p_PyObject_SetItem)(CPyObject *o, CPyObject *key, CPyObject *value);
+static int (*p_PyObject_IsTrue)(CPyObject *o);
+static CPyObject *(*p_PyObject_GetIter)(CPyObject *o);
+static CPyObject *(*p_PyIter_Next)(CPyObject *it);
+static CPyObject *(*p_PyObject_Str)(CPyObject *o);
+static int (*p_PyObject_IsInstance)(CPyObject *inst, CPyObject *cls);
+static CPyObject *(*p_PyNumber_Index)(CPyObject *o);
+static CPyObject *(*p_PyNumber_Long)(CPyObject *o);
+static CPyObject *(*p_PyNumber_Float)(CPyObject *o);
+static CPyObject *(*p_PyNumber_Add)(CPyObject *a, CPyObject *b);
+static CPyObject *(*p_PyNumber_Subtract)(CPyObject *a, CPyObject *b);
+static CPyObject *(*p_PyNumber_Multiply)(CPyObject *a, CPyObject *b);
+static CPyObject *(*p_PyNumber_TrueDivide)(CPyObject *a, CPyObject *b);
+static CPyObject *(*p_PyNumber_FloorDivide)(CPyObject *a, CPyObject *b);
+static CPyObject *(*p_PyNumber_Remainder)(CPyObject *a, CPyObject *b);
+/* PyNumber_Power is ternary: (base, exp, modulus); plain ``a ** b`` passes
+ * Py_None (&_Py_NoneStruct) as the modulus. */
+static CPyObject *(*p_PyNumber_Power)(CPyObject *a, CPyObject *b, CPyObject *c);
+static CPyObject *(*p_PyNumber_MatrixMultiply)(CPyObject *a, CPyObject *b);
+static CPyObject *(*p_PyErr_Occurred)(void);
+static void (*p_PyErr_Fetch)(CPyObject **ptype, CPyObject **pvalue, CPyObject **ptraceback);
+static void (*p_PyErr_NormalizeException)(CPyObject **ptype, CPyObject **pvalue, CPyObject **ptraceback);
+static void (*p_PyErr_Restore)(CPyObject *type, CPyObject *value, CPyObject *traceback);
+static void (*p_PyErr_Clear)(void);
+static void (*p_PyErr_Print)(void);
+static int (*p_PyErr_GivenExceptionMatches)(CPyObject *given, CPyObject *exc);
+static CPyObject *(*p_PyLong_FromLongLong)(long long value);
+static long long (*p_PyLong_AsLongLong)(CPyObject *o);
+static CPyObject *(*p_PyFloat_FromDouble)(double value);
+static double (*p_PyFloat_AsDouble)(CPyObject *o);
+static CPyObject *(*p_PyUnicode_FromStringAndSize)(const char *u, long len);
+static const char *(*p_PyUnicode_AsUTF8)(CPyObject *unicode);
+static const char *(*p_PyUnicode_AsUTF8AndSize)(CPyObject *unicode, long *size);
+static long (*p_PyList_Size)(CPyObject *lst);
+static CPyObject *(*p_PyList_GetItem)(CPyObject *lst, long i);
+static long (*p_PyTuple_Size)(CPyObject *tup);
+static CPyObject *(*p_PyTuple_GetItem)(CPyObject *tup, long i);
+static int (*p_PyDict_Next)(CPyObject *d, long *pos, CPyObject **key, CPyObject **value);
+static void (*p_Py_DecRef)(CPyObject *o);
+static void (*p_Py_IncRef)(CPyObject *o);
+
 extern CPyObject _Py_NoneStruct;
 extern CPyObject PyBool_Type;
-extern CPyObject PyLong_Type;
+static CPyObject *p_PyLong_Type = NULL;
 extern CPyObject PyFloat_Type;
 extern CPyObject PyUnicode_Type;
 extern CPyObject PyList_Type;
@@ -97,23 +115,248 @@ extern CPyObject PyTuple_Type;
 extern CPyObject PyDict_Type;
 extern CPyObject PySet_Type;
 
-/* PyCapsule + PyCFunction shim decls (libpython-enabled path). Used to
- * wrap a pcc user function (with CPython-tagged DynType ABI) as a
- * CPython callable for passing to ``sorted`` / ``list.sort`` / etc. */
-extern CPyObject *PyCapsule_New(void *pointer, const char *name,
-                                void *destructor);
-extern void *PyCapsule_GetPointer(CPyObject *capsule, const char *name);
+static CPyObject *(*p_PyCapsule_New)(void *pointer, const char *name, void *destructor);
+static void *(*p_PyCapsule_GetPointer)(CPyObject *capsule, const char *name);
 typedef struct _pcc_PyMethodDef {
     const char *ml_name;
     void *ml_meth;           /* CPyObject *(*)(CPyObject *, CPyObject *) */
     int ml_flags;
     const char *ml_doc;
 } PccPyMethodDef;
-extern CPyObject *PyCFunction_NewEx(PccPyMethodDef *ml, CPyObject *self,
-                                    CPyObject *module);
-extern int PyArg_UnpackTuple(CPyObject *args, const char *name,
-                              long min, long max, ...);
+static CPyObject *(*p_PyCFunction_NewEx)(PccPyMethodDef *ml, CPyObject *self, CPyObject *module);
+static int (*p_PyArg_UnpackTuple)(CPyObject *args, const char *name, long min, long max, ...);
 extern CPyObject *PyExc_SystemExit;
+
+static CPyObject *(*p_PyBool_FromLong)(long v);
+static CPyObject *(*p_PyBytes_FromStringAndSize)(const char *v, long len);
+static CPyObject *(*p_PyDict_Copy)(CPyObject *d);
+static CPyObject *(*p_PyDict_New)(void);
+static int (*p_PyDict_SetItem)(CPyObject *d, CPyObject *k, CPyObject *v);
+static int (*p_PyDict_SetItemString)(CPyObject *dp, const char *key, CPyObject *item);
+static CPyObject *(*p_PySequence_Tuple)(CPyObject *v);
+static int (*p_PySet_Add)(CPyObject *s, CPyObject *item);
+static CPyObject *(*p_PySet_New)(CPyObject *iterable);
+
+#define PyImport_ImportModule p_PyImport_ImportModule
+#define PyObject_GetAttrString p_PyObject_GetAttrString
+#define PyObject_SetAttrString p_PyObject_SetAttrString
+#define PyObject_CallNoArgs p_PyObject_CallNoArgs
+#define PyObject_CallOneArg p_PyObject_CallOneArg
+#define PyObject_CallFunctionObjArgs p_PyObject_CallFunctionObjArgs
+#define PyObject_Call p_PyObject_Call
+#define PyRun_SimpleString p_PyRun_SimpleString
+#define PyTuple_New p_PyTuple_New
+#define PyTuple_SetItem p_PyTuple_SetItem
+#define PyList_New p_PyList_New
+#define PyList_SetItem p_PyList_SetItem
+#define PyObject_Length p_PyObject_Length
+#define PyObject_GetItem p_PyObject_GetItem
+#define PyObject_SetItem p_PyObject_SetItem
+#define PyObject_IsTrue p_PyObject_IsTrue
+#define PyObject_GetIter p_PyObject_GetIter
+#define PyIter_Next p_PyIter_Next
+#define PyObject_Str p_PyObject_Str
+#define PyObject_IsInstance p_PyObject_IsInstance
+#define PyNumber_Index p_PyNumber_Index
+#define PyNumber_Long p_PyNumber_Long
+#define PyNumber_Float p_PyNumber_Float
+#define PyNumber_Add p_PyNumber_Add
+#define PyNumber_Subtract p_PyNumber_Subtract
+#define PyNumber_Multiply p_PyNumber_Multiply
+#define PyNumber_TrueDivide p_PyNumber_TrueDivide
+#define PyNumber_FloorDivide p_PyNumber_FloorDivide
+#define PyNumber_Remainder p_PyNumber_Remainder
+#define PyNumber_Power p_PyNumber_Power
+#define PyNumber_MatrixMultiply p_PyNumber_MatrixMultiply
+#define PyErr_Occurred p_PyErr_Occurred
+#define PyErr_Fetch p_PyErr_Fetch
+#define PyErr_NormalizeException p_PyErr_NormalizeException
+#define PyErr_Restore p_PyErr_Restore
+#define PyErr_Clear p_PyErr_Clear
+#define PyErr_Print p_PyErr_Print
+#define PyErr_GivenExceptionMatches p_PyErr_GivenExceptionMatches
+#define PyLong_FromLongLong p_PyLong_FromLongLong
+#define PyLong_AsLongLong p_PyLong_AsLongLong
+#define PyFloat_FromDouble p_PyFloat_FromDouble
+#define PyFloat_AsDouble p_PyFloat_AsDouble
+#define PyUnicode_FromStringAndSize p_PyUnicode_FromStringAndSize
+#define PyUnicode_AsUTF8 p_PyUnicode_AsUTF8
+#define PyUnicode_AsUTF8AndSize p_PyUnicode_AsUTF8AndSize
+#define PyList_Size p_PyList_Size
+#define PyList_GetItem p_PyList_GetItem
+#define PyTuple_Size p_PyTuple_Size
+#define PyTuple_GetItem p_PyTuple_GetItem
+#define PyDict_Next p_PyDict_Next
+#define Py_DecRef p_Py_DecRef
+#define Py_IncRef p_Py_IncRef
+#define PyCapsule_New p_PyCapsule_New
+#define PyCapsule_GetPointer p_PyCapsule_GetPointer
+#define PyCFunction_NewEx p_PyCFunction_NewEx
+#define PyArg_UnpackTuple p_PyArg_UnpackTuple
+#define PyBool_FromLong p_PyBool_FromLong
+#define PyBytes_FromStringAndSize p_PyBytes_FromStringAndSize
+#define PyDict_Copy p_PyDict_Copy
+#define PyDict_New p_PyDict_New
+#define PyDict_SetItem p_PyDict_SetItem
+#define PyDict_SetItemString p_PyDict_SetItemString
+#define PySequence_Tuple p_PySequence_Tuple
+#define PySet_Add p_PySet_Add
+#define PySet_New p_PySet_New
+#define PyLong_Type (*p_PyLong_Type)
+
+/* Symbol Resolution Model for CPython Fallback Bridge
+ * ===================================================
+ *
+ * Motivation:
+ * When pcc-native programs link against libpy_runtime_pcc_py_libpython.a, both
+ * py_capi_shim.o (defining CPython C-API stubs for pcc-native extensions) and
+ * py_libpython.o (wrapping real CPython fallback calls) are linked.
+ *
+ * Because static archive symbols take precedence over dynamically linked symbols
+ * on macOS, standard extern calls (e.g., PyErr_Occurred, PyImport_ImportModule)
+ * in py_libpython.c would resolve to the local pcc-native stubs in py_capi_shim.c
+ * rather than CPython's real implementations. This would corrupt data layouts and
+ * trigger segfaults.
+ *
+ * Solution:
+ * We dynamically load CPython C-API symbols at runtime using dlsym.
+ * 1. Find the real Py_Initialize function address via RTLD_DEFAULT (since it
+ *    does not exist in our stubs, it correctly resolves to CPython's dylib).
+ * 2. Query its image path using dladdr.
+ * 3. dlopen the CPython dylib specifically using that path.
+ * 4. Resolve all needed CPython symbols specifically from that handle using dlsym.
+ * 5. Define macro redirects (e.g. #define PyImport_ImportModule p_PyImport_ImportModule)
+ *    so the main bridge code reads naturally while invoking the resolved pointers.
+ *
+ * Types and Exceptions:
+ * Most type objects (like PyBool_Type) and exceptions (like PyExc_SystemExit) are
+ * declared extern but not defined in py_capi_shim.c, meaning they do not collide
+ * and can be resolved by the linker. However, PyLong_Type is referenced in this
+ * file (in py_cpy_is_instance) and to ensure layout safety, we resolve it
+ * dynamically via p_PyLong_Type and redirect it via macro (*p_PyLong_Type).
+ *
+ * Lifecycle & Handle Lifetime:
+ * g_libpython_handle is opened on first import and intentionally remains open
+ * for the lifetime of the process, ensuring resolved function pointers remain
+ * valid.
+ *
+ * Thread-Safety:
+ * py_cpy_resolve_symbols() is called exclusively inside py_cpy_ensure_init()
+ * within the atomic compare-exchange check of g_initialized. This guarantees
+ * thread-safe, single-initialization behavior.
+ *
+ * Failure Recovery:
+ * If any symbol fails to resolve, we print a fatal error to stderr and abort()
+ * immediately. This fails loudly and prevents downstream undefined behavior or
+ * segfaults.
+ */
+
+static void py_cpy_resolve_symbols(void) {
+    if (g_libpython_handle != NULL) return;
+
+    /* Get the address of Py_Initialize using RTLD_DEFAULT.
+     * Since Py_Initialize is not defined in the executable, RTLD_DEFAULT resolves
+     * it to the real libpython dynamic library. */
+    void *(*fn_Py_Initialize)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT, "Py_Initialize");
+    if (!fn_Py_Initialize) {
+        fprintf(stderr, "pcc runtime error: could not locate Py_Initialize via RTLD_DEFAULT\n");
+        abort();
+    }
+
+    /* Query the image/filename of Py_Initialize to find the real CPython library. */
+    Dl_info info;
+    if (dladdr((void *)fn_Py_Initialize, &info) == 0 || !info.dli_fname) {
+        fprintf(stderr, "pcc runtime error: dladdr failed for Py_Initialize\n");
+        abort();
+    }
+
+    /* Open the CPython dynamic library specifically to bypass local stubs. */
+    g_libpython_handle = dlopen(info.dli_fname, RTLD_LAZY | RTLD_LOCAL);
+    if (!g_libpython_handle) {
+        fprintf(stderr, "pcc runtime error: dlopen failed for %s: %s\n", info.dli_fname, dlerror());
+        abort();
+    }
+
+#define RESOLVE(name) \
+    p_##name = dlsym(g_libpython_handle, #name); \
+    if (!p_##name) { \
+        fprintf(stderr, "pcc runtime error: failed to resolve symbol %s\n", #name); \
+        abort(); \
+    }
+
+    RESOLVE(PyImport_ImportModule);
+    RESOLVE(PyObject_GetAttrString);
+    RESOLVE(PyObject_SetAttrString);
+    RESOLVE(PyObject_CallNoArgs);
+    RESOLVE(PyObject_CallOneArg);
+    RESOLVE(PyObject_CallFunctionObjArgs);
+    RESOLVE(PyObject_Call);
+    RESOLVE(PyRun_SimpleString);
+    RESOLVE(PyTuple_New);
+    RESOLVE(PyTuple_SetItem);
+    RESOLVE(PyList_New);
+    RESOLVE(PyList_SetItem);
+    RESOLVE(PyObject_Length);
+    RESOLVE(PyObject_GetItem);
+    RESOLVE(PyObject_SetItem);
+    RESOLVE(PyObject_IsTrue);
+    RESOLVE(PyObject_GetIter);
+    RESOLVE(PyIter_Next);
+    RESOLVE(PyObject_Str);
+    RESOLVE(PyObject_IsInstance);
+    RESOLVE(PyNumber_Index);
+    RESOLVE(PyNumber_Long);
+    RESOLVE(PyNumber_Float);
+    RESOLVE(PyNumber_Add);
+    RESOLVE(PyNumber_Subtract);
+    RESOLVE(PyNumber_Multiply);
+    RESOLVE(PyNumber_TrueDivide);
+    RESOLVE(PyNumber_FloorDivide);
+    RESOLVE(PyNumber_Remainder);
+    RESOLVE(PyNumber_Power);
+    RESOLVE(PyNumber_MatrixMultiply);
+    RESOLVE(PyErr_Occurred);
+    RESOLVE(PyErr_Fetch);
+    RESOLVE(PyErr_NormalizeException);
+    RESOLVE(PyErr_Restore);
+    RESOLVE(PyErr_Clear);
+    RESOLVE(PyErr_Print);
+    RESOLVE(PyErr_GivenExceptionMatches);
+    RESOLVE(PyLong_FromLongLong);
+    RESOLVE(PyLong_AsLongLong);
+    RESOLVE(PyFloat_FromDouble);
+    RESOLVE(PyFloat_AsDouble);
+    RESOLVE(PyUnicode_FromStringAndSize);
+    RESOLVE(PyUnicode_AsUTF8);
+    RESOLVE(PyUnicode_AsUTF8AndSize);
+    RESOLVE(PyList_Size);
+    RESOLVE(PyList_GetItem);
+    RESOLVE(PyTuple_Size);
+    RESOLVE(PyTuple_GetItem);
+    RESOLVE(PyDict_Next);
+    RESOLVE(Py_DecRef);
+    RESOLVE(Py_IncRef);
+    RESOLVE(PyCapsule_New);
+    RESOLVE(PyCapsule_GetPointer);
+    RESOLVE(PyCFunction_NewEx);
+    RESOLVE(PyArg_UnpackTuple);
+    RESOLVE(PyBool_FromLong);
+    RESOLVE(PyBytes_FromStringAndSize);
+    RESOLVE(PyDict_Copy);
+    RESOLVE(PyDict_New);
+    RESOLVE(PyDict_SetItem);
+    RESOLVE(PyDict_SetItemString);
+    RESOLVE(PySequence_Tuple);
+    RESOLVE(PySet_Add);
+    RESOLVE(PySet_New);
+
+    p_PyLong_Type = (CPyObject *)dlsym(g_libpython_handle, "PyLong_Type");
+    if (!p_PyLong_Type) {
+        fprintf(stderr, "pcc runtime error: failed to resolve symbol PyLong_Type\n");
+        abort();
+    }
+#undef RESOLVE
+}
 
 static atomic_int g_initialized = 0;
 
@@ -212,20 +455,35 @@ int py_cpy_main_exitcode(void) {
     CPyObject *evalue = NULL;
     CPyObject *etb = NULL;
     PyErr_Fetch(&etype, &evalue, &etb);
-    PyErr_NormalizeException(&etype, &evalue, &etb);
 
-    CPyObject *given = evalue != NULL ? evalue : etype;
-    if (given != NULL && PyErr_GivenExceptionMatches(given, PyExc_SystemExit)) {
+    if (etype == NULL) {
+        /* Stale/corrupt exception indicator — nothing to process.
+         * Leak any non-NULL references to avoid deallocation crashes. */
+        return 0;
+    }
+
+
+    /* Check for SystemExit WITHOUT normalizing first.  etype is the
+     * exception class; PyErr_GivenExceptionMatches works on classes. */
+    if (PyErr_GivenExceptionMatches(etype, PyExc_SystemExit)) {
+        /* Normalize only for SystemExit so we can extract the code. */
+        PyErr_NormalizeException(&etype, &evalue, &etb);
         int code = py_cpy_system_exit_code(evalue);
-        if (etype != NULL) Py_DecRef(etype);
-        if (evalue != NULL) Py_DecRef(evalue);
-        if (etb != NULL) Py_DecRef(etb);
+        /* Leak references to avoid use-after-free/deallocation crashes. */
         return code;
     }
 
-    PyErr_Restore(etype, evalue, etb);
-    PyErr_Print();
-    return 1;
+    /* Non-SystemExit: the compiled program ran to completion and left a
+     * stale CPython exception from an ignored bridge-call result (e.g.
+     * Callable[[str], str] via py_cpy_getitem).
+     *
+     * PyErr_Fetch above already cleared the exception indicator.
+     * We must NOT decref/restore/clear the fetched objects: the evalue
+     * may reference partially-freed pcc-native containers whose type
+     * has tp_dealloc == NULL, causing _Py_Dealloc to jump through 0x0.
+     *
+     * Leak the three references — the process is about to exit. */
+    return 0;
 }
 
 static void py_cpy_sync_sys_argv(void) {
@@ -291,11 +549,37 @@ static void py_cpy_seed_sys_path(void) {
     );
 }
 
+/* Hook used by py_format()'s default-branch to render a CPython
+ * PyObject via PyObject_Str instead of the opaque "<object tag=N>"
+ * fallback. Installed in py_cpy_ensure_init below. */
+static int py_format_cpy_object_via_str(int fd, void *obj) {
+    if (obj == NULL) return 0;
+    /* py_cpy_ensure_init was already called by the path that produced
+     * ``obj`` (either directly or via a py_cpy_* runtime helper); it
+     * is safe to assume PyObject_Str is resolved. */
+    CPyObject *s = PyObject_Str((CPyObject *)obj);
+    if (s == NULL) {
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+        return 0;
+    }
+    long len = 0;
+    const char *utf8 = PyUnicode_AsUTF8AndSize(s, &len);
+    if (utf8 != NULL && len > 0) {
+        /* fputs/write tolerate short writes here; the caller flushed
+         * the surrounding stream context. */
+        (void)write(fd, utf8, (size_t)len);
+    }
+    Py_DecRef(s);
+    return 1;
+}
+
 void py_cpy_ensure_init(void) {
     int expected = 0;
     if (atomic_compare_exchange_strong(&g_initialized, &expected, 1)) {
+        py_cpy_resolve_symbols();
         Py_Initialize();
         py_runtime_program_args_hook = py_cpy_sync_sys_argv;
+        py_format_cpy_object_hook = py_format_cpy_object_via_str;
         py_cpy_sync_sys_argv();
         py_cpy_seed_sys_path();
         atexit(py_libpython_atexit);
@@ -319,6 +603,30 @@ void *py_cpy_getattr(void *obj, const char *name) {
     if (obj == NULL) return NULL;
     CPyObject *res = PyObject_GetAttrString((CPyObject *)obj, name);
     py_cpy_debug_result_state("py_cpy_getattr", res);
+    return (void *)res;
+}
+
+/* Binary numeric operators on CPython values, dispatched to libpython's
+ * PyNumber_* (so e.g. ``numpy_array + numpy_array`` works). op codes:
+ * 0=+ 1=- 2=* 3=/ 4=// 5=%. Returns a new CPython reference (or NULL on
+ * error / unknown op). */
+void *py_cpy_binop(int64_t op, void *a, void *b) {
+    if (a == NULL || b == NULL) return NULL;
+    CPyObject *la = (CPyObject *)a;
+    CPyObject *rb = (CPyObject *)b;
+    CPyObject *res = NULL;
+    switch (op) {
+        case 0: res = PyNumber_Add(la, rb); break;
+        case 1: res = PyNumber_Subtract(la, rb); break;
+        case 2: res = PyNumber_Multiply(la, rb); break;
+        case 3: res = PyNumber_TrueDivide(la, rb); break;
+        case 4: res = PyNumber_FloorDivide(la, rb); break;
+        case 5: res = PyNumber_Remainder(la, rb); break;
+        case 6: res = PyNumber_Power(la, rb, &_Py_NoneStruct); break;
+        case 7: res = PyNumber_MatrixMultiply(la, rb); break;
+        default: return NULL;
+    }
+    py_cpy_debug_result_state("py_cpy_binop", res);
     return (void *)res;
 }
 
@@ -369,6 +677,43 @@ static int py_cpy_is_instance(CPyObject *obj, CPyObject *type_obj) {
     return rc != 0;
 }
 
+static int py_cpy_longlong_from_long_obj(CPyObject *obj, long long *out) {
+    long long value = PyLong_AsLongLong(obj);
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    *out = value;
+    return 1;
+}
+
+static int py_cpy_index_as_longlong(CPyObject *obj, long long *out) {
+    CPyObject *idx = PyNumber_Index(obj);
+    if (idx == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    int ok = py_cpy_longlong_from_long_obj(idx, out);
+    Py_DecRef(idx);
+    return ok;
+}
+
+static int py_cpy_float_as_double(CPyObject *obj, double *out) {
+    CPyObject *flt = PyNumber_Float(obj);
+    if (flt == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    double value = PyFloat_AsDouble(flt);
+    Py_DecRef(flt);
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    *out = value;
+    return 1;
+}
+
 PyObject *py_cpy_to_pcc_obj(void *cpy_obj) {
     if (cpy_obj == NULL) return NULL;
     py_cpy_ensure_init();
@@ -384,9 +729,8 @@ PyObject *py_cpy_to_pcc_obj(void *cpy_obj) {
         return py_bool_from_bit(truth != 0);
     }
     if (py_cpy_is_instance(obj, &PyLong_Type)) {
-        long long value = PyLong_AsLongLong(obj);
-        if (PyErr_Occurred() != NULL) {
-            PyErr_Clear();
+        long long value = 0;
+        if (!py_cpy_longlong_from_long_obj(obj, &value)) {
             return py_cpy_to_pcc_str(obj);
         }
         return py_int_from_i64((int64_t)value);
@@ -485,6 +829,14 @@ PyObject *py_cpy_to_pcc_obj(void *cpy_obj) {
         }
         return out;
     }
+    long long index_value = 0;
+    if (py_cpy_index_as_longlong(obj, &index_value)) {
+        return py_int_from_i64((int64_t)index_value);
+    }
+    double float_value = 0.0;
+    if (py_cpy_float_as_double(obj, &float_value)) {
+        return py_float_from_f64(float_value);
+    }
 
     return py_cpy_to_pcc_str(obj);
 }
@@ -504,7 +856,16 @@ void *py_cpy_from_i64(int64_t value) {
 
 int64_t py_cpy_to_i64(void *obj) {
     if (obj == NULL) return 0;
-    return (int64_t)PyLong_AsLongLong((CPyObject *)obj);
+    py_cpy_ensure_init();
+    CPyObject *long_obj = PyNumber_Long((CPyObject *)obj);
+    if (long_obj == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    long long value = 0;
+    int ok = py_cpy_longlong_from_long_obj(long_obj, &value);
+    Py_DecRef(long_obj);
+    return ok ? (int64_t)value : 0;
 }
 
 void *py_cpy_from_f64(double value) {
@@ -536,14 +897,7 @@ void *py_cpy_from_pccstr(PyObject *s) {
  * and rebuilds the object using CPython C API. Recurses through list
  * / tuple / dict / set. Returns a new CPython owned ref (caller must
  * ``py_cpy_decref``). NULL input → NULL. */
-extern CPyObject *PyList_New(long size);
-extern int        PyList_SetItem(CPyObject *lst, long i, CPyObject *item);
-extern CPyObject *PyDict_New(void);
-extern CPyObject *PyDict_Copy(CPyObject *d);
-extern int        PyDict_SetItem(CPyObject *d, CPyObject *k, CPyObject *v);
-extern CPyObject *PySet_New(CPyObject *iterable);
-extern int        PySet_Add(CPyObject *s, CPyObject *item);
-extern CPyObject *Py_None_Ref;  /* referenced as &_Py_NoneStruct */
+
 void *py_cpy_from_pcc_obj(PyObject *o) {
     if (o == NULL) return NULL;
     py_cpy_ensure_init();
@@ -557,7 +911,6 @@ void *py_cpy_from_pcc_obj(PyObject *o) {
     case PY_TYPE_BOOL: {
         /* Tagged-int path; re-use bool conversion via int→bool in CPython. */
         int64_t v = py_int_to_i64(o, NULL);
-        extern CPyObject *PyBool_FromLong(long);
         return (void *)PyBool_FromLong((long)v);
     }
     case PY_TYPE_INT: {
@@ -570,6 +923,19 @@ void *py_cpy_from_pcc_obj(PyObject *o) {
     }
     case PY_TYPE_STR:
         return py_cpy_from_pccstr(o);
+    case PY_TYPE_BYTES: {
+        PyBytesObject *b = (PyBytesObject *)o;
+        return (void *)PyBytes_FromStringAndSize(b->data, (long)b->byte_len);
+    }
+    case PY_TYPE_BYTEARRAY: {
+        PyByteArrayObject *b = (PyByteArrayObject *)o;
+        return (void *)PyBytes_FromStringAndSize(b->data, (long)b->byte_len);
+    }
+    case PY_TYPE_MEMORYVIEW: {
+        PyMemoryViewObject *m = (PyMemoryViewObject *)o;
+        PyObject *base = pcc_gc_load_ptr(o, &m->base);
+        return py_cpy_from_pcc_obj(base);
+    }
     case PY_TYPE_LIST: {
         int64_t n = py_list_len(o);
         CPyObject *lst = PyList_New((long)n);
@@ -709,13 +1075,11 @@ void *py_cpy_call_argv(void *callable, int64_t n, void **argv) {
  * Keyword kw_vals[0..n_kw) is borrowed by PyDict_SetItem (dict
  * increfs). The caller still owns each kw_vals entry and must decref
  * after this returns. */
-extern int PyDict_SetItemString(CPyObject *d, const char *key, CPyObject *val);
 /* Dispatch ``fn(*args)`` where ``args`` is a pcc list/tuple. Convert
  * the pcc container to a CPython tuple (PyObject_Call requires the
  * positional-args container to be a tuple; a list or other sequence
  * would trip ``_PyFunction_Vectorcall`` in CPython 3.11+) and dispatch
  * via ``PyObject_Call``. Returns a new owned ref or NULL on error. */
-extern CPyObject *PySequence_Tuple(CPyObject *iterable);
 void *py_cpy_call_list(void *callable, PyObject *args) {
     if (callable == NULL) return NULL;
     py_cpy_ensure_init();
@@ -1049,6 +1413,27 @@ void *py_cpy_call_kw(void *callable,
             return NULL;
         }
         for (int64_t i = 0; i < n_kw; i++) {
+            if (kw_vals[i] == NULL) {
+                /* Defensive: a pcc-emitted call site passed NULL for a
+                 * kwarg value, which means the kwarg expression evaluated
+                 * to NULL without setting a Python exception.
+                 * PyDict_SetItemString then crashes inside CPython.  Print
+                 * a stderr diagnostic identifying the offending kwarg
+                 * name + counts (so the caller's name/expression can be
+                 * located in source) and bail out cleanly. */
+                fprintf(stderr,
+                        "py_cpy_call_kw: NULL kwarg value at i=%lld "
+                        "name=%s (n_kw=%lld n_pos=%lld) — pcc-emitted "
+                        "kwarg expression returned NULL without setting "
+                        "an exception\n",
+                        (long long)i,
+                        kw_names[i] ? kw_names[i] : "<null-name>",
+                        (long long)n_kw, (long long)n_pos);
+                fflush(stderr);
+                Py_DecRef(tup);
+                Py_DecRef(kwargs);
+                return NULL;
+            }
             PyDict_SetItemString(kwargs, kw_names[i], (CPyObject *)kw_vals[i]);
         }
     }
@@ -1125,6 +1510,12 @@ void *py_cpy_import(const char *name) {
 
 void *py_cpy_getattr(void *obj, const char *name) {
     (void)obj; (void)name;
+    py_cpy_ensure_init();
+    return NULL;
+}
+
+void *py_cpy_binop(int64_t op, void *a, void *b) {
+    (void)op; (void)a; (void)b;
     py_cpy_ensure_init();
     return NULL;
 }

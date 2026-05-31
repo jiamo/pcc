@@ -40,6 +40,11 @@ class FloatType(Type):  # name = "float"
 
 
 @dataclass(frozen=True)
+class ComplexType(Type):  # name = "complex"
+    pass
+
+
+@dataclass(frozen=True)
 class BoolType(Type):   pass   # name = "bool"
 
 
@@ -49,6 +54,18 @@ class NoneType(Type):   pass   # name = "None"
 
 @dataclass(frozen=True)
 class StrType(Type):    pass   # name = "str"
+
+
+@dataclass(frozen=True)
+class BytesType(Type):  pass   # name = "bytes"
+
+
+@dataclass(frozen=True)
+class ByteArrayType(Type):  pass   # name = "bytearray"
+
+
+@dataclass(frozen=True)
+class MemoryViewType(Type): pass   # name = "memoryview"
 
 
 @dataclass(frozen=True)
@@ -78,6 +95,21 @@ class ClassType(Type):
     module: str
     fields: tuple[tuple[str, Type], ...] = ()
     bases: tuple["ClassType", ...] = ()
+    # ``@property`` declarations: name → declared return type. Kept
+    # separate from ``fields`` so callers cannot pass a property name
+    # to a positional constructor, and from method tables so
+    # ``c.prop()`` doesn't accidentally type-check. See
+    # docs/investigations/pcc-py-type-infer-property-return-type.md.
+    properties: tuple[tuple[str, Type], ...] = ()
+    valueclass: bool = False
+
+
+@dataclass(frozen=True)
+class ValueClassType(ClassType):
+    """Opt-in identity-free class type for the Valhalla value model."""
+
+    flattened: bool = True
+    nullable_fields: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,6 +133,12 @@ class FloatLit(Expr):    value: float
 
 
 @dataclass(frozen=True)
+class ComplexLit(Expr):
+    real: float
+    imag: float
+
+
+@dataclass(frozen=True)
 class BoolLit(Expr):     value: bool
 
 
@@ -110,6 +148,10 @@ class NoneLit(Expr):     pass
 
 @dataclass(frozen=True)
 class StrLit(Expr):      value: str
+
+
+@dataclass(frozen=True)
+class BytesLit(Expr):    value: bytes
 
 
 @dataclass(frozen=True)
@@ -241,6 +283,7 @@ class For(Stmt):
     iter: Expr
     body: tuple[Stmt, ...]
     else_body: tuple[Stmt, ...] = ()
+    is_async: bool = False
 
 
 @dataclass(frozen=True)
@@ -286,6 +329,7 @@ class ExceptHandler:
 class With(Stmt):
     items: tuple[tuple[Expr, Optional[Expr]], ...]  # (ctx, as_var?)
     body: tuple[Stmt, ...]
+    is_async: bool = False
 
 
 @dataclass(frozen=True)

@@ -194,15 +194,10 @@ def build(
 def _link_exe(ev, compiled_units, out_dir, link_args, opt_level):
     """Link compiled units into an executable."""
     cc = ev._system_cc()
-    tm = ev.target.create_target_machine()
     obj_paths = []
-
-    for name, ir_text, _, _ in compiled_units:
-        llvmmod = ev._prepare_llvm_module(name, ir_text, tm, optimize=opt_level)
-        obj_path = os.path.join(out_dir, f"{name.replace('.', '_')}.o")
-        with open(obj_path, "wb") as f:
-            f.write(tm.emit_object(llvmmod))
-        obj_paths.append(obj_path)
+    obj_path = os.path.join(out_dir, "output.o")
+    ev.emit_compiled_units(compiled_units, emit_obj=obj_path, optimize=opt_level)
+    obj_paths.append(obj_path)
 
     bin_path = os.path.join(out_dir, "a.out")
     cmd = [cc] + obj_paths + ["-o", bin_path] + ev._platform_link_flags() + link_args
@@ -215,15 +210,10 @@ def _link_exe(ev, compiled_units, out_dir, link_args, opt_level):
 def _link_shared(ev, compiled_units, out_dir, link_args, opt_level):
     """Link compiled units into a shared library."""
     cc = ev._system_cc()
-    tm = ev.target.create_target_machine()
     obj_paths = []
-
-    for name, ir_text, _, _ in compiled_units:
-        llvmmod = ev._prepare_llvm_module(name, ir_text, tm, optimize=opt_level)
-        obj_path = os.path.join(out_dir, f"{name.replace('.', '_')}.o")
-        with open(obj_path, "wb") as f:
-            f.write(tm.emit_object(llvmmod))
-        obj_paths.append(obj_path)
+    obj_path = os.path.join(out_dir, "output.o")
+    ev.emit_compiled_units(compiled_units, emit_obj=obj_path, optimize=opt_level)
+    obj_paths.append(obj_path)
 
     if platform.system() == "Darwin":
         suffix = ".dylib"

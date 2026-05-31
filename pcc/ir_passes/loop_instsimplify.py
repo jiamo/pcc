@@ -36,7 +36,11 @@ from .ir_mutator import Instruction, MutableModule
 from .loop_info import compute_loop_info
 from .loop_simplifycfg import _insert_simple_exit_lcssa
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
-from .simplifycfg import _split_functions
+from .simplifycfg import (
+    _function_chunk_module,
+    _module_context_for_function,
+    _split_functions,
+)
 
 
 class LoopInstSimplifyPass(ModulePass):
@@ -67,7 +71,8 @@ def loop_instsimplify_text(ir_text: str) -> tuple[str, bool]:
         if not is_function:
             out.append(chunk)
             continue
-        new_chunk, local = _rewrite_loop_function(chunk)
+        context = _module_context_for_function(ir_text, chunk)
+        new_chunk, local = _rewrite_loop_function(chunk, context)
         if local:
             new_chunk, lcssa_changed = _insert_simple_exit_lcssa(new_chunk)
             local = local or lcssa_changed
@@ -78,8 +83,13 @@ def loop_instsimplify_text(ir_text: str) -> tuple[str, bool]:
     return "".join(out), True
 
 
-def _rewrite_loop_function(fn_text: str) -> tuple[str, bool]:
-    binding_mod = llvm.parse_assembly(fn_text)
+def _rewrite_loop_function(
+    fn_text: str,
+    module_context: str = "",
+) -> tuple[str, bool]:
+    binding_mod = llvm.parse_assembly(
+        _function_chunk_module(module_context, fn_text)
+    )
     binding_mod.verify()
     fn = next((f for f in binding_mod.functions if not f.is_declaration), None)
     if fn is None:

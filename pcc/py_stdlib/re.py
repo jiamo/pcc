@@ -33,19 +33,24 @@ class Pattern:
         self.flags = flags
 
     def match(self, s: str) -> Match | None:
-        raise NotImplementedError("re.match: PCRE2 backend not yet wired")
+        host_re = __import__("re")
+        return host_re.match(self.pattern, s, self.flags)
 
     def search(self, s: str) -> Match | None:
-        raise NotImplementedError("re.search: PCRE2 backend not yet wired")
+        host_re = __import__("re")
+        return host_re.search(self.pattern, s, self.flags)
 
     def findall(self, s: str) -> list[str]:
-        raise NotImplementedError("re.findall: PCRE2 backend not yet wired")
+        host_re = __import__("re")
+        return host_re.findall(self.pattern, s, self.flags)
 
     def sub(self, repl: str, s: str) -> str:
-        raise NotImplementedError("re.sub: PCRE2 backend not yet wired")
+        host_re = __import__("re")
+        return host_re.sub(self.pattern, repl, s, flags=self.flags)
 
     def split(self, s: str, maxsplit: int = 0) -> list[str]:
-        raise NotImplementedError("re.split: PCRE2 backend not yet wired")
+        host_re = __import__("re")
+        return host_re.split(self.pattern, s, maxsplit=maxsplit, flags=self.flags)
 
 
 IGNORECASE = 2
@@ -66,6 +71,11 @@ def match(pattern: str, s: str, flags: int = 0) -> Match | None:
 
 def search(pattern: str, s: str, flags: int = 0) -> Match | None:
     return Pattern(pattern, flags).search(s)
+
+
+def fullmatch(pattern: str, s: str, flags: int = 0):
+    host_re = __import__("re")
+    return host_re.fullmatch(pattern, s, flags)
 
 
 def findall(pattern: str, s: str, flags: int = 0) -> list[str]:

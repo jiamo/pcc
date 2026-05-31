@@ -53,7 +53,9 @@ def emit_memory_instruction(
                     and func.alloca_slots[ptr_name].allocated_type.describe() == value_type.describe()
                 ):
                     dest_slot = SlotInfo(func.alloca_slots[ptr_name].offset, value_type)
-                    return copy_large_aggregate_value_to_slot(func, value, value_type, dest_slot)
+                    return copy_large_aggregate_value_to_slot(
+                        func, value, value_type, dest_slot, module_symbols=module_symbols
+                    )
                 lines = materialize_pointer(func, ptr_name, 9, module_symbols)
                 lines.extend(
                     store_large_aggregate_literal_to_address(

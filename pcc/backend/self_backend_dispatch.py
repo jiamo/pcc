@@ -7,6 +7,7 @@ from .self_backend_targets import (
     SelfAsmEmitter,
     resolve_self_backend_target,
 )
+from .self_backend_target_passes import run_self_target_pass_pipeline
 
 
 def resolve_self_asm_emitter(
@@ -24,5 +25,6 @@ def self_backend_target_identity(triple: str) -> str:
 def emit_self_asm(ir_text: str, triple: str | None = None) -> str:
     if triple is None:
         triple = parse_self_backend_target_triple(ir_text)
-    _target_id, emitter = resolve_self_asm_emitter(triple)
-    return emitter(ir_text)
+    target_id, emitter = resolve_self_asm_emitter(triple)
+    asm_text = emitter(ir_text)
+    return run_self_target_pass_pipeline(asm_text, target_id)

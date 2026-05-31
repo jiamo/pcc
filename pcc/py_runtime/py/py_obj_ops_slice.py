@@ -1,0 +1,43 @@
+"""Slice dispatch split out from py_obj_ops_dispatch.
+
+Keep ``py_obj_slice`` in its own archive member so generic getitem/len/truthy
+dispatch does not force list/tuple/str/bytes slicing helpers into ordinary
+executables.
+"""
+
+from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
+from pcc.unsafe import is_tagged_int, load_i32, null, ptr_is_null
+
+
+py_list_slice = extern("py_list_slice", (c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
+py_tuple_slice = extern("py_tuple_slice", (c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
+py_str_slice = extern("py_str_slice", (c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
+py_bytes_slice = extern("py_bytes_slice", (c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
+pcc_runtime_log_event_code = extern(
+    "pcc_runtime_log_event_code",
+    (c_int32, c_int32, c_int64, c_int64, c_ptr),
+    c_void,
+)
+
+
+def _type_of(o) -> int:
+    if is_tagged_int(o) != 0:
+        return 2
+    return load_i32(o, 8)
+
+
+@c_abi_export("py_obj_slice")
+def py_obj_slice(o, lo, hi, step):
+    if ptr_is_null(o) != 0:
+        return null()
+    tag: int = _type_of(o)
+    pcc_runtime_log_event_code(7, 2, tag, 0, o)
+    if tag == 5:
+        return py_list_slice(o, lo, hi, step)
+    if tag == 7:
+        return py_tuple_slice(o, lo, hi, step)
+    if tag == 4:
+        return py_str_slice(o, lo, hi, step)
+    if tag == 17 or tag == 18 or tag == 19:
+        return py_bytes_slice(o, lo, hi, step)
+    return null()

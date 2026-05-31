@@ -2,18 +2,29 @@ from __future__ import annotations
 
 from .py_ast import (
     BoolType,
+    ByteArrayType,
+    BytesType,
     ClassType,
+    ComplexType,
     DictType,
     DynType,
     FloatType,
     FuncType,
     IntType,
     ListType,
+    MemoryViewType,
     NoneType,
     StrType,
     TupleType,
     Type,
+    ValueClassType,
 )
+
+
+def _is_value_class_type(ty) -> bool:
+    return isinstance(ty, ValueClassType) or (
+        isinstance(ty, ClassType) and bool(getattr(ty, "valueclass", False))
+    )
 
 
 def encode_type(ty: Type | None):
@@ -23,12 +34,20 @@ def encode_type(ty: Type | None):
         return ("int", ty.width, ty.signed)
     if isinstance(ty, FloatType):
         return ("float", ty.width)
+    if isinstance(ty, ComplexType):
+        return ("complex",)
     if isinstance(ty, BoolType):
         return ("bool",)
     if isinstance(ty, NoneType):
         return ("none",)
     if isinstance(ty, StrType):
         return ("str",)
+    if isinstance(ty, BytesType):
+        return ("bytes",)
+    if isinstance(ty, ByteArrayType):
+        return ("bytearray",)
+    if isinstance(ty, MemoryViewType):
+        return ("memoryview",)
     if isinstance(ty, ListType):
         return ("list", encode_type(ty.elem))
     if isinstance(ty, DictType):
@@ -40,6 +59,17 @@ def encode_type(ty: Type | None):
             "func",
             tuple(encode_type(t) for t in ty.params),
             encode_type(ty.ret),
+        )
+    if _is_value_class_type(ty):
+        return (
+            "valueclass",
+            ty.name,
+            ty.module,
+            tuple((name, encode_type(field_ty)) for name, field_ty in ty.fields),
+            tuple(encode_type(base) for base in ty.bases),
+            tuple((name, encode_type(prop_ty)) for name, prop_ty in ty.properties),
+            bool(getattr(ty, "flattened", True)),
+            bool(getattr(ty, "nullable_fields", False)),
         )
     if isinstance(ty, ClassType):
         return (
@@ -57,22 +87,52 @@ def encode_type(ty: Type | None):
     return ("dyn",)
 
 
+_DECODE_TYPE_MISSING = object()
+_DECODE_TYPE_CACHE = {}
+
+
 def decode_type(desc):
     if desc is None or isinstance(desc, Type):
         return desc
     if not isinstance(desc, tuple) or len(desc) == 0:
         raise TypeError(f"invalid export type descriptor: {desc!r}")
+    try:
+        cached = _DECODE_TYPE_CACHE.get(desc, _DECODE_TYPE_MISSING)
+    except TypeError:
+        return _decode_type_uncached(desc)
+    if cached is not _DECODE_TYPE_MISSING:
+        return cached
+    decoded = _decode_type_uncached(desc)
+    try:
+        _DECODE_TYPE_CACHE[desc] = decoded
+    except TypeError:
+        pass
+    return decoded
+
+
+def _decode_type_uncached(desc):
     tag = desc[0]
     if tag == "int":
-        return IntType(name="int", width=desc[1], signed=desc[2])
+        width = desc[1] if len(desc) > 1 else 64
+        signed = desc[2] if len(desc) > 2 else True
+        return IntType(name="int", width=width, signed=signed)
     if tag == "float":
-        return FloatType(name="float", width=desc[1])
+        width = desc[1] if len(desc) > 1 else 64
+        return FloatType(name="float", width=width)
+    if tag == "complex":
+        return ComplexType("complex")
     if tag == "bool":
-        return BoolType(name="bool")
+        return BoolType("bool")
     if tag == "none":
-        return NoneType(name="None")
+        return NoneType("None")
     if tag == "str":
-        return StrType(name="str")
+        return StrType("str")
+    if tag == "bytes":
+        return BytesType("bytes")
+    if tag == "bytearray":
+        return ByteArrayType("bytearray")
+    if tag == "memoryview":
+        return MemoryViewType("memoryview")
     if tag == "list":
         return ListType(name="list", elem=decode_type(desc[1]))
     if tag == "dict":
@@ -99,6 +159,24 @@ def decode_type(desc):
             fields=tuple((name, decode_type(field_ty)) for name, field_ty in desc[3]),
             bases=tuple(decode_type(base) for base in desc[4]),
         )
+    if tag == "valueclass":
+        props = ()
+        flattened = True
+        nullable_fields = False
+        if len(desc) > 5:
+            props = tuple((name, decode_type(prop_ty)) for name, prop_ty in desc[5])
+        if len(desc) > 6:
+            flattened = bool(desc[6])
+        if len(desc) > 7:
+            nullable_fields = bool(desc[7])
+        return ClassType(
+            name=desc[1],
+            module=desc[2],
+            fields=tuple((name, decode_type(field_ty)) for name, field_ty in desc[3]),
+            bases=tuple(decode_type(base) for base in desc[4]),
+            properties=props,
+            valueclass=True,
+        )
     if tag == "dyn":
-        return DynType(name="dyn")
+        return DynType("dyn")
     raise TypeError(f"unknown export type descriptor tag: {tag!r}")

@@ -44,11 +44,39 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdint.h>
 
 #define PY_DICT_INITIAL_CAPACITY  8   /* must be power of 2 */
 
 /* ---- Forward decls ---------------------------------------------------- */
 static int  py_dict_rehash(PyDictObject *d, int64_t new_capacity);
+
+static int py_dict_pointer_can_have_header(PyObject *obj) {
+    uintptr_t bits = (uintptr_t)obj;
+    if (obj == NULL) return 0;
+    if (PY_IS_TAGGED_INT(obj)) return 0;
+    if (bits < 0x1000u) return 0;
+    if ((bits & 0x7u) != 0u) return 0;
+#if UINTPTR_MAX > 0xffffffffu
+    if ((bits >> 48) != 0u) return 0;
+#endif
+    return 1;
+}
+
+static int py_object_is_dict(PyObject *obj) {
+    if (!py_dict_pointer_can_have_header(obj)) return 0;
+    return py_header(obj)->type_tag == PY_TYPE_DICT;
+}
+
+static PyObject *py_dict_entry_key(PyDictObject *d, DictEntry *e) {
+    if (e->key == NULL) return NULL;
+    return pcc_gc_load_ptr((PyObject *)d, &e->key);
+}
+
+static PyObject *py_dict_entry_value(PyDictObject *d, DictEntry *e) {
+    if (e->value == NULL) return NULL;
+    return pcc_gc_load_ptr((PyObject *)d, &e->value);
+}
 
 /* ---- Allocation ------------------------------------------------------- */
 
@@ -67,24 +95,29 @@ static int py_dict_alloc_tables(PyDictObject *d, int64_t capacity) {
     d->capacity     = capacity;
     d->size         = 0;
     d->entries_used = 0;
+    (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+        (PyObject *)d,
+        d->entries,
+        capacity * (int64_t)sizeof(DictEntry)
+    );
     return 0;
 }
 
 PyObject *py_dict_new(void) {
-    PyDictObject *d = (PyDictObject *)malloc(sizeof(PyDictObject));
+    PyDictObject *d = (PyDictObject *)pcc_gc_alloc(
+        (int64_t)sizeof(PyDictObject), PY_TYPE_DICT, 0
+    );
     if (d == NULL) return NULL;
-    d->h.refcount = 1;
-    d->h.type_tag = PY_TYPE_DICT;
-    d->h.flags    = 0;
     d->indices      = NULL;
     d->entries      = NULL;
     d->capacity     = 0;
     d->size         = 0;
     d->entries_used = 0;
     if (py_dict_alloc_tables(d, PY_DICT_INITIAL_CAPACITY) != 0) {
-        free(d);
+        py_decref((PyObject *)d);
         return NULL;
     }
+    py_gc_track((PyObject *)d);
     return (PyObject *)d;
 }
 
@@ -103,12 +136,24 @@ PyObject *py_dict_new(void) {
  */
 static void py_dict_lookup(PyDictObject *d, int64_t hash, PyObject *key,
                            int64_t *out_slot, int64_t *out_entry_idx) {
+    if (!py_object_is_dict((PyObject *)d)) {
+        *out_slot = 0;
+        *out_entry_idx = -1;
+        return;
+    }
+    if (d->capacity <= 0 || d->indices == NULL || d->entries == NULL) {
+        *out_slot = 0;
+        *out_entry_idx = -1;
+        return;
+    }
     int64_t mask = d->capacity - 1;
     uint64_t perturb = (uint64_t)hash;
     int64_t j = (int64_t)((uint64_t)hash & (uint64_t)mask);
     int64_t first_tombstone = -1;
+    int64_t probes = 0;
+    int64_t limit = d->capacity * 2;
 
-    for (;;) {
+    while (probes < limit) {
         int64_t ix = d->indices[j];
         if (ix == PY_DICT_EMPTY) {
             /* Key not present; insertion target is the earliest tombstone
@@ -122,8 +167,9 @@ static void py_dict_lookup(PyDictObject *d, int64_t hash, PyObject *key,
         } else {
             /* Live entry: compare hash cheap-first, then py_obj_eq. */
             DictEntry *e = &d->entries[ix];
-            if (e->key != NULL && e->hash == hash &&
-                (e->key == key || py_obj_eq(e->key, key))) {
+            PyObject *entry_key = py_dict_entry_key(d, e);
+            if (entry_key != NULL && e->hash == hash &&
+                (entry_key == key || py_obj_eq(entry_key, key))) {
                 *out_slot = j;
                 *out_entry_idx = ix;
                 return;
@@ -132,7 +178,14 @@ static void py_dict_lookup(PyDictObject *d, int64_t hash, PyObject *key,
         /* Advance probe. */
         perturb >>= 5;
         j = (int64_t)(((uint64_t)j * 5u + perturb + 1u) & (uint64_t)mask);
+        probes++;
     }
+
+    /* A healthy table always reaches an EMPTY slot before this. Treat a
+     * bounded-out probe as a miss instead of letting a corrupt probe cycle
+     * hang the self-hosted compiler indefinitely. */
+    *out_slot = (first_tombstone >= 0) ? first_tombstone : 0;
+    *out_entry_idx = -1;
 }
 
 /* Insert a (hash, key, value) into indices[] + entries[]. Assumes there
@@ -146,11 +199,11 @@ static void py_dict_insert_fresh(PyDictObject *d, int64_t hash,
     (void)ix;
     int64_t ei = d->entries_used++;
     DictEntry *e = &d->entries[ei];
-    py_incref(key);
-    py_incref(value);
     e->hash  = hash;
-    e->key   = key;
-    e->value = value;
+    e->key   = NULL;
+    e->value = NULL;
+    pcc_gc_store_ptr((PyObject *)d, &e->key, key);
+    pcc_gc_store_ptr((PyObject *)d, &e->value, value);
     d->indices[slot] = ei;
     d->size++;
 }
@@ -181,22 +234,29 @@ static int py_dict_rehash(PyDictObject *d, int64_t new_capacity) {
     d->capacity     = new_capacity;
     d->size         = 0;
     d->entries_used = 0;
+    (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+        (PyObject *)d,
+        d->entries,
+        new_capacity * (int64_t)sizeof(DictEntry)
+    );
     free(old_indices);
 
     for (int64_t i = 0; i < old_entries_used; i++) {
         DictEntry *e = &old_entries[i];
-        if (e->key == NULL) continue;  /* skip dead entries */
+        PyObject *entry_key = py_dict_entry_key(d, e);
+        if (entry_key == NULL) continue;  /* skip dead entries */
+        PyObject *entry_value = py_dict_entry_value(d, e);
         /* Insert without incref'ing again — we're moving refs over. We
          * can't reuse insert_fresh which would double-count. Inline the
          * move: find slot via lookup, copy entry, bump counters. */
         int64_t slot, ix;
-        py_dict_lookup(d, e->hash, e->key, &slot, &ix);
+        py_dict_lookup(d, e->hash, entry_key, &slot, &ix);
         (void)ix;  /* guaranteed -1 during rehash */
         int64_t ei = d->entries_used++;
         DictEntry *ne = &d->entries[ei];
         ne->hash  = e->hash;
-        ne->key   = e->key;
-        ne->value = e->value;
+        ne->key   = entry_key;
+        ne->value = entry_value;
         d->indices[slot] = ei;
         d->size++;
     }
@@ -226,7 +286,7 @@ static int py_dict_maybe_grow(PyDictObject *d) {
 /* ---- Public API ------------------------------------------------------- */
 
 void py_dict_set(PyObject *dict, PyObject *key, PyObject *value) {
-    if (dict == NULL || key == NULL) return;
+    if (!py_object_is_dict(dict) || key == NULL) return;
     PyDictObject *d = (PyDictObject *)dict;
 
     int64_t hash = py_obj_hash(key);
@@ -236,9 +296,7 @@ void py_dict_set(PyObject *dict, PyObject *key, PyObject *value) {
         /* Update existing. Replace value; key stays (Python semantics:
          * dict[k] = v keeps the original key object). */
         DictEntry *e = &d->entries[ix];
-        py_incref(value);
-        py_decref(e->value);
-        e->value = value;
+        pcc_gc_store_ptr(dict, &e->value, value);
         return;
     }
     /* Fresh insert. */
@@ -249,14 +307,15 @@ void py_dict_set(PyObject *dict, PyObject *key, PyObject *value) {
 }
 
 PyObject *py_dict_get(PyObject *dict, PyObject *key) {
-    if (dict == NULL || key == NULL) return NULL;
+    if (!py_object_is_dict(dict) || key == NULL) return NULL;
     PyDictObject *d = (PyDictObject *)dict;
 
     int64_t hash = py_obj_hash(key);
     int64_t slot, ix;
     py_dict_lookup(d, hash, key, &slot, &ix);
     if (ix < 0) return NULL;
-    PyObject *v = d->entries[ix].value;
+    PyObject *v = pcc_gc_load_ptr(dict, &d->entries[ix].value);
+    if (v == NULL) return NULL;
     py_incref(v);
     return v;
 }
@@ -268,8 +327,60 @@ PyObject *py_dict_get_default(PyObject *dict, PyObject *key, PyObject *def) {
     return def;
 }
 
+/* d[key] subscript: like py_dict_get but raises KeyError (carrying the key,
+ * like CPython) when the key is absent, so a surrounding try/except can catch
+ * it. py_dict_get stays non-raising for dict.get()/setdefault()/etc. */
+PyObject *py_dict_getitem(PyObject *dict, PyObject *key) {
+    PyObject *v = py_dict_get(dict, key);
+    if (v == NULL) {
+        PyObject *exc = py_exc_new_with_value(PY_EXC_KEYERROR, key);
+        py_raise(exc);
+        if (exc) py_decref(exc);
+        return NULL;
+    }
+    return v;
+}
+
+/* dict.fromkeys(iterable, value): new dict with each element of iterable as a
+ * key mapped to value (caller passes None when omitted). Iterator protocol;
+ * clears a terminal StopIteration like the sorted() iterator path. */
+PyObject *py_dict_fromkeys(PyObject *iterable, PyObject *value) {
+    PyObject *d = py_dict_new();
+    if (d == NULL) return NULL;
+    PyObject *it = py_obj_iter(iterable);
+    if (it != NULL) {
+        for (;;) {
+            PyObject *k = py_obj_next(it);
+            if (k == NULL) {
+                if (py_err_occurred()) {
+                    PyObject *cur = py_current_exception();
+                    PyObject *stop = py_exc_builtin_class(PY_EXC_STOPITERATION);
+                    if (py_exc_matches(cur, stop)) py_clear_exception();
+                }
+                break;
+            }
+            py_dict_set(d, k, value);
+            py_decref(k);
+        }
+        py_decref(it);
+    }
+    return d;
+}
+
+PyObject *py_dict_pop(PyObject *dict, PyObject *key) {
+    PyObject *v = py_dict_get(dict, key);
+    if (v == NULL) {
+        PyObject *exc = py_exc_new_with_value(PY_EXC_KEYERROR, key);
+        py_raise(exc);
+        if (exc) py_decref(exc);
+        return NULL;
+    }
+    (void)py_dict_del(dict, key);
+    return v;
+}
+
 int64_t py_dict_contains(PyObject *dict, PyObject *key) {
-    if (dict == NULL || key == NULL) return 0;
+    if (!py_object_is_dict(dict) || key == NULL) return 0;
     PyDictObject *d = (PyDictObject *)dict;
     int64_t hash = py_obj_hash(key);
     int64_t slot, ix;
@@ -278,7 +389,7 @@ int64_t py_dict_contains(PyObject *dict, PyObject *key) {
 }
 
 int64_t py_dict_del(PyObject *dict, PyObject *key) {
-    if (dict == NULL || key == NULL) return -1;
+    if (!py_object_is_dict(dict) || key == NULL) return -1;
     PyDictObject *d = (PyDictObject *)dict;
     int64_t hash = py_obj_hash(key);
     int64_t slot, ix;
@@ -286,8 +397,8 @@ int64_t py_dict_del(PyObject *dict, PyObject *key) {
     if (ix < 0) return -1;
 
     DictEntry *e = &d->entries[ix];
-    py_decref(e->key);
-    py_decref(e->value);
+    py_decref(py_dict_entry_key(d, e));
+    py_decref(py_dict_entry_value(d, e));
     e->key   = NULL;
     e->value = NULL;
     /* Leave e->hash intact; it's just a cached int and aids debugging. */
@@ -296,55 +407,91 @@ int64_t py_dict_del(PyObject *dict, PyObject *key) {
     return 0;
 }
 
+void py_dict_clear(PyObject *dict) {
+    if (!py_object_is_dict(dict)) return;
+    PyDictObject *d = (PyDictObject *)dict;
+    for (int64_t i = 0; i < d->entries_used; i++) {
+        DictEntry *e = &d->entries[i];
+        PyObject *key = py_dict_entry_key(d, e);
+        if (key == NULL) continue;
+        py_decref(key);
+        py_decref(py_dict_entry_value(d, e));
+        e->hash = 0;
+        e->key = NULL;
+        e->value = NULL;
+    }
+    for (int64_t i = 0; i < d->capacity; i++) {
+        d->indices[i] = PY_DICT_EMPTY;
+    }
+    d->size = 0;
+    d->entries_used = 0;
+}
+
 int64_t py_dict_len(PyObject *dict) {
-    if (dict == NULL) return 0;
+    if (!py_object_is_dict(dict)) return 0;
     return ((PyDictObject *)dict)->size;
 }
 
 PyObject *py_dict_keys(PyObject *dict) {
-    if (dict == NULL) return NULL;
+    if (!py_object_is_dict(dict)) return NULL;
     PyDictObject *d = (PyDictObject *)dict;
     PyObject *out = py_list_new(d->size > 0 ? d->size : 4);
     if (out == NULL) return NULL;
     for (int64_t i = 0; i < d->entries_used; i++) {
         DictEntry *e = &d->entries[i];
-        if (e->key == NULL) continue;
-        py_list_append(out, e->key);
+        PyObject *key = py_dict_entry_key(d, e);
+        if (key == NULL) continue;
+        py_list_append(out, key);
     }
     return out;
 }
 
 PyObject *py_dict_values(PyObject *dict) {
-    if (dict == NULL) return NULL;
+    if (!py_object_is_dict(dict)) return NULL;
     PyDictObject *d = (PyDictObject *)dict;
     PyObject *out = py_list_new(d->size > 0 ? d->size : 4);
     if (out == NULL) return NULL;
     for (int64_t i = 0; i < d->entries_used; i++) {
         DictEntry *e = &d->entries[i];
-        if (e->key == NULL) continue;
-        py_list_append(out, e->value);
+        PyObject *key = py_dict_entry_key(d, e);
+        if (key == NULL) continue;
+        py_list_append(out, py_dict_entry_value(d, e));
     }
     return out;
 }
 
 PyObject *py_dict_items(PyObject *dict) {
-    if (dict == NULL) return NULL;
+    if (!py_object_is_dict(dict)) return NULL;
     PyDictObject *d = (PyDictObject *)dict;
     PyObject *out = py_list_new(d->size > 0 ? d->size : 4);
     if (out == NULL) return NULL;
     for (int64_t i = 0; i < d->entries_used; i++) {
         DictEntry *e = &d->entries[i];
-        if (e->key == NULL) continue;
+        PyObject *key = py_dict_entry_key(d, e);
+        if (key == NULL) continue;
+        PyObject *value = py_dict_entry_value(d, e);
         /* Build a 2-tuple (key, value) for each live entry. */
         PyObject *pair = py_tuple_new(2);
         if (pair == NULL) {
             py_decref(out);
             return NULL;
         }
-        py_tuple_set_item(pair, 0, e->key);
-        py_tuple_set_item(pair, 1, e->value);
+        py_tuple_set_item(pair, 0, key);
+        py_tuple_set_item(pair, 1, value);
         py_list_append(out, pair);
         py_decref(pair);  /* list took its own ref */
     }
     return out;
+}
+
+void py_dict_update(PyObject *dst, PyObject *src) {
+    if (!py_object_is_dict(dst) || !py_object_is_dict(src)) return;
+    PyDictObject *s = (PyDictObject *)src;
+    int64_t used = s->entries_used;
+    for (int64_t i = 0; i < used; i++) {
+        DictEntry *e = &s->entries[i];
+        PyObject *key = py_dict_entry_key(s, e);
+        if (key == NULL) continue;
+        py_dict_set(dst, key, py_dict_entry_value(s, e));
+    }
 }

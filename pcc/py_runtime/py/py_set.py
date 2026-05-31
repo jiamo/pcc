@@ -26,6 +26,7 @@ from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
     free,
     global_load_ptr,
+    ptr_add,
     is_tagged_int,
     load_i32,
     load_i64,
@@ -44,12 +45,26 @@ py_incref            = extern("py_incref",            (c_ptr,),                 
 py_decref            = extern("py_decref",            (c_ptr,),                     c_void)
 py_obj_hash          = extern("py_obj_hash",          (c_ptr,),                     c_int64)
 py_obj_eq            = extern("py_obj_eq",            (c_ptr, c_ptr),               c_int32)
+py_gc_track          = extern("py_gc_track",          (c_ptr,),                     c_void)
+pcc_gc_store_ptr     = extern("pcc_gc_store_ptr",     (c_ptr, c_ptr, c_ptr),        c_void)
+pcc_gc_load_ptr      = extern("pcc_gc_load_ptr",      (c_ptr, c_ptr),               c_ptr)
+pcc_gc_alloc         = extern("pcc_gc_alloc",         (c_int64, c_int32, c_int32),  c_ptr)
+py_list_new          = extern("py_list_new",          (c_int64,),                   c_ptr)
+py_list_append       = extern("py_list_append",       (c_ptr, c_ptr),               c_void)
 
 
 # INITIAL_CAPACITY is intentionally NOT a module-level constant —
 # pcc-Python initializes module-level integers in the auto-generated
 # main(), which the Makefile strips for library .o builds. Inline 8
 # at the call site instead.
+
+
+def _ptr_is_set(o) -> bool:
+    if ptr_is_null(o) != 0:
+        return False
+    if is_tagged_int(o) != 0:
+        return False
+    return load_i32(o, 8) == 8
 
 
 def _alloc_entries(capacity: int):
@@ -62,18 +77,31 @@ def _alloc_entries(capacity: int):
     return entries
 
 
-def _lookup_slot(entries, capacity: int, hash_val: int, key) -> int:
+def _entry_key(s, entries, slot_off: int):
+    k = load_ptr(entries, slot_off + 8)
+    if ptr_is_null(k) != 0:
+        return k
+    if ptr_eq(k, global_load_ptr("py_set_dummy")) != 0:
+        return k
+    return pcc_gc_load_ptr(s, ptr_add(entries, slot_off + 8))
+
+
+def _lookup_slot(s, entries, capacity: int, hash_val: int, key) -> int:
     # Returns slot index (>=0) if key is found, or -(slot+1) for the
     # insert target if not found (negative encoding).
     mask: int = capacity - 1
-    perturb: int = hash_val
+    # C uses uint64_t perturb. pcc-Python integers are signed i64 today, so
+    # right-shifting a negative hash would be arithmetic and could keep
+    # perturb negative forever, trapping the probe sequence in a small cycle.
+    perturb: int = hash_val & 9223372036854775807
     j: int = hash_val & mask
     first_tombstone: int = -1
     dummy = global_load_ptr("py_set_dummy")
+    probes: int = 0
 
     while True:
         slot_off: int = j * 16
-        k = load_ptr(entries, slot_off + 8)
+        k = _entry_key(s, entries, slot_off)
         if ptr_is_null(k) != 0:
             if first_tombstone >= 0:
                 return -(first_tombstone + 1)
@@ -90,6 +118,11 @@ def _lookup_slot(entries, capacity: int, hash_val: int, key) -> int:
                     return j
         perturb = perturb >> 5
         j = (j * 5 + perturb + 1) & mask
+        probes = probes + 1
+        if probes > capacity:
+            if first_tombstone >= 0:
+                return -(first_tombstone + 1)
+            return -(j + 1)
 
 
 def _rehash(s, new_capacity: int) -> int:
@@ -109,11 +142,11 @@ def _rehash(s, new_capacity: int) -> int:
     i: int = 0
     while i < old_capacity:
         slot_off: int = i * 16
-        k = load_ptr(old_entries, slot_off + 8)
+        k = _entry_key(s, old_entries, slot_off)
         if ptr_is_null(k) == 0:
             if ptr_eq(k, dummy) == 0:
                 h: int = load_i64(old_entries, slot_off)
-                dest = _lookup_slot(new_entries, new_capacity, h, k)
+                dest = _lookup_slot(s, new_entries, new_capacity, h, k)
                 if dest < 0:
                     dest = -(dest + 1)
                 dest_off: int = dest * 16
@@ -144,12 +177,9 @@ def _maybe_grow(s) -> int:
 
 @c_abi_export("py_set_new")
 def py_set_new():
-    s = malloc(48)          # sizeof(PySetObject)
+    s = pcc_gc_alloc(48, 8, 0)  # sizeof(PySetObject), PY_TYPE_SET
     if ptr_is_null(s) != 0:
         return null()
-    store_i64(s, 0, 1)     # refcount
-    store_i32(s, 8, 8)     # type_tag = PY_TYPE_SET
-    store_i32(s, 12, 0)    # flags
     store_i64(s, 16, 0)    # size
     store_i64(s, 24, 0)    # capacity
     store_i64(s, 32, 0)    # fill
@@ -157,10 +187,11 @@ def py_set_new():
     # Alloc initial entries table (capacity = 8, must be power of 2).
     entries = _alloc_entries(8)
     if ptr_is_null(entries) != 0:
-        free(s)
+        py_decref(s)
         return null()
     store_ptr(s, 40, entries)
     store_i64(s, 24, 8)
+    py_gc_track(s)
     return s
 
 
@@ -173,7 +204,7 @@ def py_set_add(s, item) -> None:
     entries = load_ptr(s, 40)
     capacity: int = load_i64(s, 24)
     h: int = py_obj_hash(item)
-    slot: int = _lookup_slot(entries, capacity, h, item)
+    slot: int = _lookup_slot(s, entries, capacity, h, item)
     if slot >= 0:
         return                      # already present
     slot = -(slot + 1)
@@ -183,9 +214,9 @@ def py_set_add(s, item) -> None:
     if ptr_is_null(prev_key) == 0:
         if ptr_eq(prev_key, global_load_ptr("py_set_dummy")) != 0:
             was_tombstone = 1
-    py_incref(item)
     store_i64(entries, slot_off, h)
-    store_ptr(entries, slot_off + 8, item)
+    store_ptr(entries, slot_off + 8, null())
+    pcc_gc_store_ptr(s, ptr_add(entries, slot_off + 8), item)
     # size++
     sz: int = load_i64(s, 16)
     store_i64(s, 16, sz + 1)
@@ -210,11 +241,149 @@ def py_set_update(dst, src) -> None:
     dummy = global_load_ptr("py_set_dummy")
     i: int = 0
     while i < capacity:
-        key = load_ptr(entries, i * 16 + 8)
+        key = _entry_key(src, entries, i * 16)
         if ptr_is_null(key) == 0:
             if ptr_eq(key, dummy) == 0:
                 py_set_add(dst, key)
         i = i + 1
+
+
+@c_abi_export("py_set_intersection")
+def py_set_intersection(a, b):
+    out = py_set_new()
+    if ptr_is_null(out) != 0:
+        return null()
+    if not _ptr_is_set(a):
+        return out
+    if not _ptr_is_set(b):
+        return out
+    entries = load_ptr(a, 40)
+    capacity: int = load_i64(a, 24)
+    dummy = global_load_ptr("py_set_dummy")
+    i: int = 0
+    while i < capacity:
+        key = _entry_key(a, entries, i * 16)
+        if ptr_is_null(key) == 0:
+            if ptr_eq(key, dummy) == 0:
+                if py_set_contains(b, key) != 0:
+                    py_set_add(out, key)
+        i = i + 1
+    return out
+
+
+@c_abi_export("py_set_difference")
+def py_set_difference(a, b):
+    out = py_set_new()
+    if ptr_is_null(out) != 0:
+        return null()
+    if not _ptr_is_set(a):
+        return out
+    b_is_set: bool = _ptr_is_set(b)
+    entries = load_ptr(a, 40)
+    capacity: int = load_i64(a, 24)
+    dummy = global_load_ptr("py_set_dummy")
+    i: int = 0
+    while i < capacity:
+        key = _entry_key(a, entries, i * 16)
+        if ptr_is_null(key) == 0:
+            if ptr_eq(key, dummy) == 0:
+                if not b_is_set:
+                    py_set_add(out, key)
+                elif py_set_contains(b, key) == 0:
+                    py_set_add(out, key)
+        i = i + 1
+    return out
+
+
+@c_abi_export("py_set_symmetric_difference")
+def py_set_symmetric_difference(a, b):
+    # a ^ b = (a - b) | (b - a); mirrors py_set.c::py_set_symmetric_difference.
+    out = py_set_new()
+    if ptr_is_null(out) != 0:
+        return null()
+    a_is_set: bool = _ptr_is_set(a)
+    b_is_set: bool = _ptr_is_set(b)
+    dummy = global_load_ptr("py_set_dummy")
+    if a_is_set:
+        entries_a = load_ptr(a, 40)
+        capacity_a: int = load_i64(a, 24)
+        i: int = 0
+        while i < capacity_a:
+            key = _entry_key(a, entries_a, i * 16)
+            if ptr_is_null(key) == 0:
+                if ptr_eq(key, dummy) == 0:
+                    if not b_is_set:
+                        py_set_add(out, key)
+                    elif py_set_contains(b, key) == 0:
+                        py_set_add(out, key)
+            i = i + 1
+    if b_is_set:
+        entries_b = load_ptr(b, 40)
+        capacity_b: int = load_i64(b, 24)
+        j: int = 0
+        while j < capacity_b:
+            key2 = _entry_key(b, entries_b, j * 16)
+            if ptr_is_null(key2) == 0:
+                if ptr_eq(key2, dummy) == 0:
+                    if not a_is_set:
+                        py_set_add(out, key2)
+                    elif py_set_contains(a, key2) == 0:
+                        py_set_add(out, key2)
+            j = j + 1
+    return out
+
+
+@c_abi_export("py_set_issubset")
+def py_set_issubset(a, b) -> int:
+    if not _ptr_is_set(a):
+        return 0
+    if not _ptr_is_set(b):
+        return 0
+    size_a: int = load_i64(a, 16)
+    size_b: int = load_i64(b, 16)
+    if size_a > size_b:
+        return 0
+    entries = load_ptr(a, 40)
+    capacity: int = load_i64(a, 24)
+    dummy = global_load_ptr("py_set_dummy")
+    i: int = 0
+    while i < capacity:
+        key = _entry_key(a, entries, i * 16)
+        if ptr_is_null(key) == 0:
+            if ptr_eq(key, dummy) == 0:
+                if py_set_contains(b, key) == 0:
+                    return 0
+        i = i + 1
+    return 1
+
+
+@c_abi_export("py_set_issuperset")
+def py_set_issuperset(a, b) -> int:
+    return py_set_issubset(b, a)
+
+
+@c_abi_export("py_set_items")
+def py_set_items(s):
+    if not _ptr_is_set(s):
+        return null()
+    size: int = load_i64(s, 16)
+    cap_hint: int = size
+    if cap_hint <= 0:
+        cap_hint = 4
+    out = py_list_new(cap_hint)
+    if ptr_is_null(out) != 0:
+        return null()
+    entries = load_ptr(s, 40)
+    capacity: int = load_i64(s, 24)
+    dummy = global_load_ptr("py_set_dummy")
+    i: int = 0
+    while i < capacity:
+        key = _entry_key(s, entries, i * 16)
+        if ptr_is_null(key) == 0:
+            if ptr_eq(key, dummy) == 0:
+                py_list_append(out, key)
+        i = i + 1
+    return out
 
 
 @c_abi_export("py_set_contains")
@@ -226,7 +395,7 @@ def py_set_contains(s, item) -> int:
     entries = load_ptr(s, 40)
     capacity: int = load_i64(s, 24)
     h: int = py_obj_hash(item)
-    slot: int = _lookup_slot(entries, capacity, h, item)
+    slot: int = _lookup_slot(s, entries, capacity, h, item)
     if slot >= 0:
         return 1
     return 0
@@ -241,11 +410,11 @@ def py_set_remove(s, item) -> int:
     entries = load_ptr(s, 40)
     capacity: int = load_i64(s, 24)
     h: int = py_obj_hash(item)
-    slot: int = _lookup_slot(entries, capacity, h, item)
+    slot: int = _lookup_slot(s, entries, capacity, h, item)
     if slot < 0:
         return -1
     slot_off: int = slot * 16
-    k = load_ptr(entries, slot_off + 8)
+    k = _entry_key(s, entries, slot_off)
     py_decref(k)
     store_ptr(entries, slot_off + 8, global_load_ptr("py_set_dummy"))
     sz: int = load_i64(s, 16)

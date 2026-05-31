@@ -11,8 +11,10 @@ PyStrObject layout (from py_internal.h):
     offset 32   hash             (i64, -1 if not yet computed)
     offset 40   data[]           (UTF-8 bytes + NUL, flexible array)
 """
-from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void
+
+from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
+    cstr,
     free,
     global_load_ptr,
     is_tagged_int,
@@ -27,15 +29,35 @@ from pcc.unsafe import (
     ptr_eq,
     ptr_is_null,
     store_i8,
-    store_i32,
     store_i64,
 )
 
-py_str_new         = extern("py_str_new",         (c_ptr, c_int64),  c_ptr)
-py_int_value_i64   = extern("py_int_value_i64",   (c_ptr,),          c_int64)
-py_list_new        = extern("py_list_new",        (c_int64,),        c_ptr)
-py_list_append     = extern("py_list_append",     (c_ptr, c_ptr),    c_void)
-py_decref          = extern("py_decref",          (c_ptr,),          c_void)
+py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
+py_raise = extern("py_raise", (c_ptr,), c_void)
+py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
+py_bytes_new = extern("py_bytes_new", (c_ptr, c_int64), c_ptr)
+py_int_value_i64 = extern("py_int_value_i64", (c_ptr,), c_int64)
+py_list_new = extern("py_list_new", (c_int64,), c_ptr)
+py_list_append = extern("py_list_append", (c_ptr, c_ptr), c_void)
+py_tuple_len = extern("py_tuple_len", (c_ptr,), c_int64)
+py_tuple_get = extern("py_tuple_get", (c_ptr, c_int64), c_ptr)
+py_tuple_new = extern("py_tuple_new", (c_int64,), c_ptr)
+py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
+py_incref = extern("py_incref", (c_ptr,), c_void)
+py_decref = extern("py_decref", (c_ptr,), c_void)
+py_mem_alloc = extern("py_mem_alloc", (c_int64,), c_ptr)
+py_mem_free = extern("py_mem_free", (c_ptr,), c_void)
+py_dict_get = extern("py_dict_get", (c_ptr, c_ptr), c_ptr)
+py_int_from_i64 = extern("py_int_from_i64", (c_int64,), c_ptr)
+py_dict_new = extern("py_dict_new", (), c_ptr)
+py_dict_set = extern("py_dict_set", (c_ptr, c_ptr, c_ptr), c_void)
+pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+pcc_debug_bad_str_concat = extern(
+    "pcc_debug_bad_str_concat",
+    (c_ptr, c_ptr, c_int64, c_int64),
+    c_void,
+)
 
 
 def _str_alloc(byte_len: int):
@@ -43,31 +65,30 @@ def _str_alloc(byte_len: int):
     # byte_len + NUL. PyStrObject = 40 bytes.
     if byte_len < 0:
         return null()
-    s = malloc(40 + byte_len + 1)
+    if byte_len > 9223372036854775807 - 41:
+        return null()
+    s = pcc_gc_alloc(40 + byte_len + 1, 4, 0)
     if ptr_is_null(s) != 0:
         return null()
-    store_i64(s, 0, 1)               # refcount
-    store_i32(s, 8, 4)               # PY_TYPE_STR
-    store_i32(s, 12, 0)              # flags
-    store_i64(s, 16, byte_len)       # byte_len
-    store_i64(s, 24, -1)             # cp_len
-    store_i64(s, 32, -1)             # hash
-    store_i8(s, 40 + byte_len, 0)    # NUL terminator
+    store_i64(s, 16, byte_len)  # byte_len
+    store_i64(s, 24, -1)  # cp_len
+    store_i64(s, 32, -1)  # hash
+    store_i8(s, 40 + byte_len, 0)  # NUL terminator
     return s
 
 
 def _is_ascii_ws(c: int) -> int:
-    if c == 32:        # ' '
+    if c == 32:  # ' '
         return 1
-    if c == 9:         # '\t'
+    if c == 9:  # '\t'
         return 1
-    if c == 10:        # '\n'
+    if c == 10:  # '\n'
         return 1
-    if c == 13:        # '\r'
+    if c == 13:  # '\r'
         return 1
-    if c == 11:        # '\v'
+    if c == 11:  # '\v'
         return 1
-    if c == 12:        # '\f'
+    if c == 12:  # '\f'
         return 1
     return 0
 
@@ -108,6 +129,43 @@ def _byte_find(hay, hay_len: int, need, need_len: int) -> int:
                 return i
         i = i + 1
     return -1
+
+
+def _byte_rfind(hay, hay_len: int, need, need_len: int) -> int:
+    if need_len == 0:
+        return hay_len
+    if need_len > hay_len:
+        return -1
+    last: int = hay_len - need_len
+    i: int = last
+    while i >= 0:
+        first_hay: int = load_i8(hay, i) & 0xFF
+        first_need: int = load_i8(need, 0) & 0xFF
+        if first_hay == first_need:
+            if _bytes_eq(ptr_add(hay, i), need, need_len) != 0:
+                return i
+        i = i - 1
+    return -1
+
+
+def _stringlike_data(o):
+    if ptr_is_null(o) != 0:
+        return null()
+    tag: int = load_i32(o, 8)
+    if tag == 4:
+        return ptr_add(o, 40)
+    if tag == 17 or tag == 18:
+        return ptr_add(o, 24)
+    return null()
+
+
+def _stringlike_len(o) -> int:
+    if ptr_is_null(o) != 0:
+        return 0
+    tag: int = load_i32(o, 8)
+    if tag == 4 or tag == 17 or tag == 18:
+        return load_i64(o, 16)
+    return 0
 
 
 def _byte_offset_to_cp_offset(s, byte_off: int) -> int:
@@ -272,9 +330,7 @@ def _utf8_ord_at_byte(s, byte_off: int) -> int:
         if remaining < 3:
             return -1
         return (
-            ((b0 & 15) << 12)
-            | ((load_i8(data, 1) & 63) << 6)
-            | (load_i8(data, 2) & 63)
+            ((b0 & 15) << 12) | ((load_i8(data, 1) & 63) << 6) | (load_i8(data, 2) & 63)
         )
     if (b0 & 248) == 240:
         if remaining < 4:
@@ -312,6 +368,78 @@ def py_str_byte_at_i64(s, idx: int) -> int:
     if idx >= byte_len:
         return -1
     return load_i8(ptr_add(s, 40), idx) & 255
+
+
+@c_abi_export("py_str_utf8_encode")
+def py_str_utf8_encode(s):
+    if ptr_is_null(s) != 0:
+        return py_bytes_new(null(), 0)
+    byte_len: int = load_i64(s, 16)
+    if byte_len <= 0:
+        return py_bytes_new(null(), 0)
+    return py_bytes_new(ptr_add(s, 40), byte_len)
+
+
+@c_abi_export("py_str_latin1_encode")
+def py_str_latin1_encode(s):
+    if ptr_is_null(s) != 0:
+        return py_bytes_new(null(), 0)
+    byte_len: int = load_i64(s, 16)
+    if byte_len <= 0:
+        return py_bytes_new(null(), 0)
+    buf = malloc(byte_len)
+    if ptr_is_null(buf):
+        return null()
+    raw = ptr_add(s, 40)
+    i: int = 0
+    out: int = 0
+    while i < byte_len:
+        b0: int = load_i8(raw, i)
+        if b0 < 0:
+            b0 = b0 + 256
+        cp: int = 0
+        step: int = 1
+        if b0 < 128:
+            cp = b0
+        elif (b0 & 224) == 192 and i + 1 < byte_len:
+            b1: int = load_i8(raw, i + 1)
+            if b1 < 0:
+                b1 = b1 + 256
+            cp = ((b0 & 31) << 6) | (b1 & 63)
+            step = 2
+        elif (b0 & 240) == 224 and i + 2 < byte_len:
+            b1 = load_i8(raw, i + 1)
+            b2: int = load_i8(raw, i + 2)
+            if b1 < 0:
+                b1 = b1 + 256
+            if b2 < 0:
+                b2 = b2 + 256
+            cp = ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63)
+            step = 3
+        elif (b0 & 248) == 240 and i + 3 < byte_len:
+            b1 = load_i8(raw, i + 1)
+            b2 = load_i8(raw, i + 2)
+            b3: int = load_i8(raw, i + 3)
+            if b1 < 0:
+                b1 = b1 + 256
+            if b2 < 0:
+                b2 = b2 + 256
+            if b3 < 0:
+                b3 = b3 + 256
+            cp = ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63)
+            step = 4
+        else:
+            free(buf)
+            return null()
+        if cp > 255:
+            free(buf)
+            return null()
+        store_i8(buf, out, cp)
+        out = out + 1
+        i = i + step
+    result = py_bytes_new(buf, out)
+    free(buf)
+    return result
 
 
 @c_abi_export("py_str_byte_slice_i64")
@@ -399,9 +527,7 @@ def py_str_contains(s, sub) -> int:
         return 0
     sn: int = load_i64(s, 16)
     pn: int = load_i64(sub, 16)
-    bo: int = _byte_find(
-        ptr_add(s, 40), sn, ptr_add(sub, 40), pn
-    )
+    bo: int = _byte_find(ptr_add(s, 40), sn, ptr_add(sub, 40), pn)
     if bo < 0:
         return 0
     return 1
@@ -415,9 +541,21 @@ def py_str_find(s, sub) -> int:
         return -1
     sn: int = load_i64(s, 16)
     pn: int = load_i64(sub, 16)
-    bo: int = _byte_find(
-        ptr_add(s, 40), sn, ptr_add(sub, 40), pn
-    )
+    bo: int = _byte_find(ptr_add(s, 40), sn, ptr_add(sub, 40), pn)
+    if bo < 0:
+        return -1
+    return _byte_offset_to_cp_offset(s, bo)
+
+
+@c_abi_export("py_str_rfind")
+def py_str_rfind(s, sub) -> int:
+    if ptr_is_null(s) != 0:
+        return -1
+    if ptr_is_null(sub) != 0:
+        return -1
+    sn: int = load_i64(s, 16)
+    pn: int = load_i64(sub, 16)
+    bo: int = _byte_rfind(ptr_add(s, 40), sn, ptr_add(sub, 40), pn)
     if bo < 0:
         return -1
     return _byte_offset_to_cp_offset(s, bo)
@@ -429,14 +567,27 @@ def py_str_startswith(s, prefix) -> int:
         return 0
     if ptr_is_null(prefix) != 0:
         return 0
-    ls: int = load_i64(s, 16)
-    lp: int = load_i64(prefix, 16)
+    if load_i32(prefix, 8) == 7:
+        n: int = py_tuple_len(prefix)
+        i: int = 0
+        while i < n:
+            item = py_tuple_get(prefix, i)
+            ok: int = py_str_startswith(s, item)
+            py_decref(item)
+            if ok != 0:
+                return 1
+            i = i + 1
+        return 0
+    ds = _stringlike_data(s)
+    dp = _stringlike_data(prefix)
+    if ptr_is_null(ds) != 0 or ptr_is_null(dp) != 0:
+        return 0
+    ls: int = _stringlike_len(s)
+    lp: int = _stringlike_len(prefix)
     if lp > ls:
         return 0
     if lp == 0:
         return 1
-    ds = ptr_add(s, 40)
-    dp = ptr_add(prefix, 40)
     return _bytes_eq(ds, dp, lp)
 
 
@@ -446,14 +597,28 @@ def py_str_endswith(s, suffix) -> int:
         return 0
     if ptr_is_null(suffix) != 0:
         return 0
-    ls: int = load_i64(s, 16)
-    lf: int = load_i64(suffix, 16)
+    if load_i32(suffix, 8) == 7:
+        n: int = py_tuple_len(suffix)
+        i: int = 0
+        while i < n:
+            item = py_tuple_get(suffix, i)
+            ok: int = py_str_endswith(s, item)
+            py_decref(item)
+            if ok != 0:
+                return 1
+            i = i + 1
+        return 0
+    ds0 = _stringlike_data(s)
+    df = _stringlike_data(suffix)
+    if ptr_is_null(ds0) != 0 or ptr_is_null(df) != 0:
+        return 0
+    ls: int = _stringlike_len(s)
+    lf: int = _stringlike_len(suffix)
     if lf > ls:
         return 0
     if lf == 0:
         return 1
-    ds = ptr_add(s, 40 + (ls - lf))
-    df = ptr_add(suffix, 40)
+    ds = ptr_add(ds0, ls - lf)
     return _bytes_eq(ds, df, lf)
 
 
@@ -468,9 +633,9 @@ def py_str_isdigit(s) -> int:
     i: int = 0
     while i < n:
         c: int = load_i8(data, i) & 0xFF
-        if c < 48:               # '0'
+        if c < 48:  # '0'
             return 0
-        if c > 57:               # '9'
+        if c > 57:  # '9'
             return 0
         i = i + 1
     return 1
@@ -488,12 +653,12 @@ def py_str_isalpha(s) -> int:
     while i < n:
         c: int = load_i8(data, i) & 0xFF
         ok: int = 0
-        if c >= 97:              # 'a'
-            if c <= 122:         # 'z'
+        if c >= 97:  # 'a'
+            if c <= 122:  # 'z'
                 ok = 1
         if ok == 0:
-            if c >= 65:          # 'A'
-                if c <= 90:      # 'Z'
+            if c >= 65:  # 'A'
+                if c <= 90:  # 'Z'
                     ok = 1
         if ok == 0:
             return 0
@@ -544,21 +709,81 @@ def py_str_isalnum(s) -> int:
     while i < n:
         c: int = load_i8(data, i) & 0xFF
         ok: int = 0
-        if c >= 48:              # '0'
-            if c <= 57:          # '9'
+        if c >= 48:  # '0'
+            if c <= 57:  # '9'
                 ok = 1
         if ok == 0:
-            if c >= 97:          # 'a'
-                if c <= 122:     # 'z'
+            if c >= 97:  # 'a'
+                if c <= 122:  # 'z'
                     ok = 1
         if ok == 0:
-            if c >= 65:          # 'A'
-                if c <= 90:      # 'Z'
+            if c >= 65:  # 'A'
+                if c <= 90:  # 'Z'
                     ok = 1
         if ok == 0:
             return 0
         i = i + 1
     return 1
+
+
+@c_abi_export("py_str_isupper")
+def py_str_isupper(s) -> int:
+    # True iff there is at least one cased (ASCII letter) char and no lowercase
+    # one (CPython ignores non-cased chars). Mirrors py_str_isupper in
+    # py_str_accessors.c.
+    if ptr_is_null(s) != 0:
+        return 0
+    n: int = load_i64(s, 16)
+    data = ptr_add(s, 40)
+    has_upper: int = 0
+    i: int = 0
+    while i < n:
+        c: int = load_i8(data, i) & 0xFF
+        if c >= 97 and c <= 122:    # a-z -> not isupper
+            return 0
+        if c >= 65 and c <= 90:     # A-Z
+            has_upper = 1
+        i = i + 1
+    return has_upper
+
+
+@c_abi_export("py_str_islower")
+def py_str_islower(s) -> int:
+    if ptr_is_null(s) != 0:
+        return 0
+    n: int = load_i64(s, 16)
+    data = ptr_add(s, 40)
+    has_lower: int = 0
+    i: int = 0
+    while i < n:
+        c: int = load_i8(data, i) & 0xFF
+        if c >= 65 and c <= 90:     # A-Z -> not islower
+            return 0
+        if c >= 97 and c <= 122:    # a-z
+            has_lower = 1
+        i = i + 1
+    return has_lower
+
+
+@c_abi_export("py_str_index_of")
+def py_str_index_of(s, sub) -> int:
+    # str.index(sub): like find() but raises ValueError when sub is absent.
+    # Named *_of to avoid the existing py_str_index (s[i] subscript helper).
+    idx: int = py_str_find(s, sub)
+    if idx < 0:
+        py_raise(py_exc_new(2, cstr("substring not found")))   # PY_EXC_VALUEERROR
+        return -1
+    return idx
+
+
+@c_abi_export("py_str_rindex_of")
+def py_str_rindex_of(s, sub) -> int:
+    # str.rindex(sub): like rfind() but raises ValueError when sub is absent.
+    idx: int = py_str_rfind(s, sub)
+    if idx < 0:
+        py_raise(py_exc_new(2, cstr("substring not found")))   # PY_EXC_VALUEERROR
+        return -1
+    return idx
 
 
 @c_abi_export("py_str_strip")
@@ -712,9 +937,9 @@ def py_str_upper(s):
     i: int = 0
     while i < n:
         c: int = load_i8(src, i) & 0xFF
-        if c >= 97:                  # 'a'
-            if c <= 122:             # 'z'
-                c = c - 32           # 'a'-'A' = 32
+        if c >= 97:  # 'a'
+            if c <= 122:  # 'z'
+                c = c - 32  # 'a'-'A' = 32
         store_i8(dst, i, c)
         i = i + 1
     cp: int = load_i64(s, 24)
@@ -735,14 +960,115 @@ def py_str_lower(s):
     i: int = 0
     while i < n:
         c: int = load_i8(src, i) & 0xFF
-        if c >= 65:                  # 'A'
-            if c <= 90:              # 'Z'
-                c = c + 32           # 'a'-'A' = 32
+        if c >= 65:  # 'A'
+            if c <= 90:  # 'Z'
+                c = c + 32  # 'a'-'A' = 32
         store_i8(dst, i, c)
         i = i + 1
     cp: int = load_i64(s, 24)
     store_i64(out, 24, cp)
     return out
+
+
+@c_abi_export("py_str_capitalize")
+def py_str_capitalize(s):
+    if ptr_is_null(s) != 0:
+        return null()
+    n: int = load_i64(s, 16)
+    out = _str_alloc(n)
+    if ptr_is_null(out) != 0:
+        return null()
+    src = ptr_add(s, 40)
+    dst = ptr_add(out, 40)
+    i: int = 0
+    while i < n:
+        c: int = load_i8(src, i) & 0xFF
+        if i == 0:
+            if c >= 97:  # 'a'
+                if c <= 122:  # 'z'
+                    c = c - 32
+        else:
+            if c >= 65:  # 'A'
+                if c <= 90:  # 'Z'
+                    c = c + 32
+        store_i8(dst, i, c)
+        i = i + 1
+    cp: int = load_i64(s, 24)
+    store_i64(out, 24, cp)
+    return out
+
+
+@c_abi_export("py_str_swapcase")
+def py_str_swapcase(s):
+    # ASCII swapcase, mirrors py_str_accessors.c::py_str_swapcase.
+    if ptr_is_null(s) != 0:
+        return null()
+    n: int = load_i64(s, 16)
+    out = _str_alloc(n)
+    if ptr_is_null(out) != 0:
+        return null()
+    src = ptr_add(s, 40)
+    dst = ptr_add(out, 40)
+    i: int = 0
+    while i < n:
+        c: int = load_i8(src, i) & 0xFF
+        if c >= 97:
+            if c <= 122:
+                c = c - 32      # a-z -> upper
+        else:
+            if c >= 65:
+                if c <= 90:
+                    c = c + 32  # A-Z -> lower
+        store_i8(dst, i, c)
+        i = i + 1
+    cp: int = load_i64(s, 24)
+    store_i64(out, 24, cp)
+    return out
+
+
+@c_abi_export("py_str_title")
+def py_str_title(s):
+    # ASCII titlecase, mirrors py_str_accessors.c::py_str_title.
+    if ptr_is_null(s) != 0:
+        return null()
+    n: int = load_i64(s, 16)
+    out = _str_alloc(n)
+    if ptr_is_null(out) != 0:
+        return null()
+    src = ptr_add(s, 40)
+    dst = ptr_add(out, 40)
+    prev_alpha: int = 0
+    i: int = 0
+    while i < n:
+        c: int = load_i8(src, i) & 0xFF
+        is_alpha: int = 0
+        if c >= 97:
+            if c <= 122:
+                is_alpha = 1
+        if c >= 65:
+            if c <= 90:
+                is_alpha = 1
+        if is_alpha != 0:
+            if prev_alpha == 0:
+                if c >= 97:
+                    if c <= 122:
+                        c = c - 32  # word start -> upper
+            else:
+                if c >= 65:
+                    if c <= 90:
+                        c = c + 32  # inside word -> lower
+        store_i8(dst, i, c)
+        prev_alpha = is_alpha
+        i = i + 1
+    cp: int = load_i64(s, 24)
+    store_i64(out, 24, cp)
+    return out
+
+
+@c_abi_export("py_str_casefold")
+def py_str_casefold(s):
+    # ASCII casefold == lower (mirrors py_str_accessors.c::py_str_casefold).
+    return py_str_lower(s)
 
 
 @c_abi_export("py_str_concat")
@@ -751,8 +1077,25 @@ def py_str_concat(a, b):
         return null()
     if ptr_is_null(b) != 0:
         return null()
+    tag_a: int = _type_of(a)
+    tag_b: int = _type_of(b)
+    if tag_a != 4:
+        pcc_debug_bad_str_concat(a, b, tag_a, tag_b)
+        return null()
+    if tag_b != 4:
+        pcc_debug_bad_str_concat(a, b, tag_a, tag_b)
+        return null()
     la: int = load_i64(a, 16)
     lb: int = load_i64(b, 16)
+    if la < 0:
+        pcc_debug_bad_str_concat(a, b, tag_a, tag_b)
+        return null()
+    if lb < 0:
+        pcc_debug_bad_str_concat(a, b, tag_a, tag_b)
+        return null()
+    if la > 9223372036854775807 - lb:
+        pcc_debug_bad_str_concat(a, b, tag_a, tag_b)
+        return null()
     total: int = la + lb
     out = _str_alloc(total)
     if ptr_is_null(out) != 0:
@@ -798,129 +1141,6 @@ def py_str_repeat(s, n):
     return out
 
 
-@c_abi_export("py_str_slice")
-def py_str_slice(s, lo, hi, step):
-    if ptr_is_null(s) != 0:
-        return null()
-    cp_len: int = _str_cp_len(s)
-    step_v: int = 1
-    if _is_none_or_null(step) == 0:
-        step_v = _int_or_default(step, 1)
-    if step_v == 0:
-        return null()
-
-    if step_v > 0:
-        lo_v: int = 0
-        hi_v: int = cp_len
-        if _is_none_or_null(lo) == 0:
-            lo_v = _int_or_default(lo, 0)
-        if _is_none_or_null(hi) == 0:
-            hi_v = _int_or_default(hi, cp_len)
-        lo_v = _clamp_slice_index(lo_v, cp_len)
-        hi_v = _clamp_slice_index(hi_v, cp_len)
-        if lo_v >= hi_v:
-            return py_str_new(null(), 0)
-
-        if step_v == 1:
-            bo_lo: int = _utf8_byte_offset_for_codepoint(s, lo_v)
-            bo_hi: int = _utf8_byte_offset_for_codepoint(s, hi_v)
-            return _str_from_range(ptr_add(ptr_add(s, 40), bo_lo), bo_hi - bo_lo)
-
-        bo_lo2: int = _utf8_byte_offset_for_codepoint(s, lo_v)
-        bo_hi2: int = _utf8_byte_offset_for_codepoint(s, hi_v)
-        cap: int = bo_hi2 - bo_lo2
-        out = _str_alloc(cap)
-        if ptr_is_null(out) != 0:
-            return null()
-        src = ptr_add(s, 40)
-        dst = ptr_add(out, 40)
-        out_bytes: int = 0
-        out_cps: int = 0
-        cp_index: int = lo_v
-        bpos: int = bo_lo2
-        next_target: int = lo_v
-        while bpos < bo_hi2:
-            w: int = _utf8_codepoint_byte_len(s, bpos)
-            if cp_index == next_target:
-                memmove(ptr_add(dst, out_bytes), ptr_add(src, bpos), w)
-                out_bytes = out_bytes + w
-                out_cps = out_cps + 1
-                next_target = next_target + step_v
-            bpos = bpos + w
-            cp_index = cp_index + 1
-        store_i64(out, 16, out_bytes)
-        store_i8(dst, out_bytes, 0)
-        store_i64(out, 24, out_cps)
-        return out
-
-    default_lo: int = cp_len - 1
-    default_hi: int = -1
-    lo_v2: int = default_lo
-    hi_v2: int = default_hi
-    if _is_none_or_null(lo) == 0:
-        lo_v2 = _int_or_default(lo, default_lo)
-    if _is_none_or_null(hi) == 0:
-        hi_v2 = _int_or_default(hi, default_hi)
-
-    if lo_v2 < 0:
-        lo_v2 = lo_v2 + cp_len
-    if lo_v2 >= cp_len:
-        lo_v2 = cp_len - 1
-    if lo_v2 < 0:
-        return py_str_new(null(), 0)
-
-    if _is_none_or_null(hi) == 0:
-        if hi_v2 < 0:
-            hi_v2 = hi_v2 + cp_len
-        if hi_v2 < -1:
-            hi_v2 = -1
-        if hi_v2 > cp_len:
-            hi_v2 = cp_len
-
-    if lo_v2 <= hi_v2:
-        return py_str_new(null(), 0)
-
-    span: int = lo_v2 - hi_v2
-    pos_step: int = -step_v
-    out_n: int = (span + pos_step - 1) // pos_step
-    cp_off = malloc((cp_len + 1) * 8)
-    if ptr_is_null(cp_off) != 0:
-        return null()
-
-    src2 = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
-    cp: int = 0
-    i: int = 0
-    while i < byte_len:
-        b: int = load_i8(src2, i) & 0xFF
-        if (b & 0xC0) != 0x80:
-            store_i64(cp_off, cp * 8, i)
-            cp = cp + 1
-        i = i + 1
-    store_i64(cp_off, cp_len * 8, byte_len)
-
-    out2 = _str_alloc(byte_len)
-    if ptr_is_null(out2) != 0:
-        free(cp_off)
-        return null()
-    dst2 = ptr_add(out2, 40)
-    out_bytes2: int = 0
-    k: int = 0
-    while k < out_n:
-        cp_idx: int = lo_v2 + step_v * k
-        start: int = load_i64(cp_off, cp_idx * 8)
-        end: int = load_i64(cp_off, (cp_idx + 1) * 8)
-        width: int = end - start
-        memmove(ptr_add(dst2, out_bytes2), ptr_add(src2, start), width)
-        out_bytes2 = out_bytes2 + width
-        k = k + 1
-    store_i64(out2, 16, out_bytes2)
-    store_i8(dst2, out_bytes2, 0)
-    store_i64(out2, 24, out_n)
-    free(cp_off)
-    return out2
-
-
 @c_abi_export("py_str_index")
 def py_str_index(s, idx_obj):
     if ptr_is_null(s) != 0:
@@ -954,15 +1174,15 @@ def py_str_count(s, sub) -> int:
     i: int = 0
     while i + pn <= sn:
         # Compare pn bytes at sdata+i vs pdata.
-        match: int = 1
+        ok: int = 1
         k: int = 0
-        while k < pn and match == 1:
+        while k < pn and ok == 1:
             ba: int = load_i8(sdata, i + k) & 0xFF
             bb: int = load_i8(pdata, k) & 0xFF
             if ba != bb:
-                match = 0
+                ok = 0
             k = k + 1
-        if match == 1:
+        if ok == 1:
             count = count + 1
             i = i + pn
         else:
@@ -1070,6 +1290,491 @@ def _str_split_whitespace(s):
     return out
 
 
+def _fill_byte_count(pad: int, fillobj) -> int:
+    # Total bytes for `pad` fill codepoints (fill default ' ' is 1 byte).
+    if ptr_is_null(fillobj) != 0:
+        return pad
+    return pad * load_i64(fillobj, 16)
+
+
+def _fill_pad(buf, pos: int, pad: int, fillobj) -> int:
+    # Write `pad` fill codepoints into buf starting at pos; return new pos.
+    if ptr_is_null(fillobj) != 0:
+        p: int = 0
+        while p < pad:
+            store_i8(buf, pos, 32)              # ' '
+            pos = pos + 1
+            p = p + 1
+        return pos
+    fill_bytes: int = load_i64(fillobj, 16)
+    fill_data = ptr_add(fillobj, 40)
+    q: int = 0
+    while q < pad:
+        b: int = 0
+        while b < fill_bytes:
+            store_i8(buf, pos, load_i8(fill_data, b))
+            pos = pos + 1
+            b = b + 1
+        q = q + 1
+    return pos
+
+
+@c_abi_export("py_str_rjust")
+def py_str_rjust(s, width: int, fillobj):
+    n = py_str_len(s)
+    if width <= n:
+        py_incref(s)
+        return s
+    pad: int = width - n
+    s_bytes: int = load_i64(s, 16)
+    s_data = ptr_add(s, 40)
+    pad_bytes: int = _fill_byte_count(pad, fillobj)
+    buf = py_mem_alloc(s_bytes + pad_bytes + 1)
+    if ptr_is_null(buf) != 0:
+        return null()
+    pos: int = _fill_pad(buf, 0, pad, fillobj)
+    k: int = 0
+    while k < s_bytes:
+        store_i8(buf, pos + k, load_i8(s_data, k))
+        k = k + 1
+    store_i8(buf, pos + s_bytes, 0)
+    out = py_str_new(buf, pos + s_bytes)
+    py_mem_free(buf)
+    return out
+
+
+@c_abi_export("py_str_ljust")
+def py_str_ljust(s, width: int, fillobj):
+    n = py_str_len(s)
+    if width <= n:
+        py_incref(s)
+        return s
+    pad: int = width - n
+    s_bytes: int = load_i64(s, 16)
+    s_data = ptr_add(s, 40)
+    pad_bytes: int = _fill_byte_count(pad, fillobj)
+    buf = py_mem_alloc(s_bytes + pad_bytes + 1)
+    if ptr_is_null(buf) != 0:
+        return null()
+    k: int = 0
+    while k < s_bytes:
+        store_i8(buf, k, load_i8(s_data, k))
+        k = k + 1
+    pos: int = _fill_pad(buf, s_bytes, pad, fillobj)
+    store_i8(buf, pos, 0)
+    out = py_str_new(buf, pos)
+    py_mem_free(buf)
+    return out
+
+
+def _re_escape_is_special(c: int) -> int:
+    # CPython 3.7+ re.escape set: ()[]{}?*+-|^$\.&~# plus whitespace.
+    if c == 40 or c == 41 or c == 91 or c == 93 or c == 123 or c == 125:
+        return 1
+    if c == 63 or c == 42 or c == 43 or c == 45 or c == 124 or c == 94:
+        return 1
+    if c == 36 or c == 92 or c == 46 or c == 38 or c == 126 or c == 35:
+        return 1
+    if c == 32 or c == 9 or c == 10 or c == 13 or c == 11 or c == 12:
+        return 1
+    return 0
+
+
+@c_abi_export("py_re_escape")
+def py_re_escape(s):
+    if ptr_is_null(s) != 0:
+        return null()
+    data = ptr_add(s, 40)
+    byte_len: int = load_i64(s, 16)
+    buf = py_mem_alloc(byte_len * 2 + 1)
+    if ptr_is_null(buf) != 0:
+        return null()
+    pos: int = 0
+    i: int = 0
+    while i < byte_len:
+        c: int = load_i8(data, i) & 0xFF
+        if _re_escape_is_special(c) != 0:
+            store_i8(buf, pos, 92)              # backslash
+            pos = pos + 1
+        store_i8(buf, pos, c)
+        pos = pos + 1
+        i = i + 1
+    store_i8(buf, pos, 0)
+    out = py_str_new(buf, pos)
+    py_mem_free(buf)
+    return out
+
+
+@c_abi_export("py_str_rsplit_maxsplit")
+def py_str_rsplit_maxsplit(s, sep, maxsplit: int):
+    # Right split with a maxsplit limit (sep is a non-empty str; the lowering
+    # only dispatches the sep-given form).  rsplit without a limit == split.
+    if ptr_is_null(s) != 0:
+        return null()
+    if maxsplit < 0:
+        return py_str_split(s, sep)
+    data = ptr_add(s, 40)
+    byte_len: int = load_i64(s, 16)
+    sep_data = ptr_add(sep, 40)
+    sep_len: int = load_i64(sep, 16)
+    if sep_len == 0:
+        return py_list_new(0)
+    if maxsplit == 0:
+        out0 = py_list_new(1)
+        if ptr_is_null(out0) != 0:
+            return null()
+        if _list_append_str_range(out0, data, 0, byte_len) != 0:
+            return null()
+        return out0
+    # Scan from the right; store the kept separator byte positions in
+    # ascending slots so the result builds left-to-right (no reversal).
+    positions = py_mem_alloc(maxsplit * 8)
+    if ptr_is_null(positions) != 0:
+        return null()
+    count: int = 0
+    i: int = byte_len - sep_len
+    while i >= 0 and count < maxsplit:
+        if _bytes_eq(ptr_add(data, i), sep_data, sep_len) != 0:
+            store_i64(positions, (maxsplit - 1 - count) * 8, i)
+            count = count + 1
+            i = i - sep_len
+        else:
+            i = i - 1
+    out = py_list_new(count + 1)
+    if ptr_is_null(out) != 0:
+        py_mem_free(positions)
+        return null()
+    prev: int = 0
+    j: int = maxsplit - count
+    while j < maxsplit:
+        p: int = load_i64(positions, j * 8)
+        if _list_append_str_range(out, data, prev, p - prev) != 0:
+            py_mem_free(positions)
+            return null()
+        prev = p + sep_len
+        j = j + 1
+    py_mem_free(positions)
+    if _list_append_str_range(out, data, prev, byte_len - prev) != 0:
+        return null()
+    return out
+
+
+@c_abi_export("py_str_center")
+def py_str_center(s, width: int, fillobj):
+    n = py_str_len(s)
+    if width <= n:
+        py_incref(s)
+        return s
+    marg: int = width - n
+    left: int = marg // 2 + (marg & width & 1)      # CPython center split
+    right: int = marg - left
+    s_bytes: int = load_i64(s, 16)
+    s_data = ptr_add(s, 40)
+    pad_l: int = _fill_byte_count(left, fillobj)
+    pad_r: int = _fill_byte_count(right, fillobj)
+    buf = py_mem_alloc(s_bytes + pad_l + pad_r + 1)
+    if ptr_is_null(buf) != 0:
+        return null()
+    pos: int = _fill_pad(buf, 0, left, fillobj)
+    k: int = 0
+    while k < s_bytes:
+        store_i8(buf, pos + k, load_i8(s_data, k))
+        k = k + 1
+    pos = pos + s_bytes
+    pos = _fill_pad(buf, pos, right, fillobj)
+    store_i8(buf, pos, 0)
+    out = py_str_new(buf, pos)
+    py_mem_free(buf)
+    return out
+
+
+@c_abi_export("py_str_zfill")
+def py_str_zfill(s, width: int):
+    n = py_str_len(s)
+    if width <= n:
+        py_incref(s)
+        return s
+    pad: int = width - n
+    s_bytes: int = load_i64(s, 16)
+    s_data = ptr_add(s, 40)
+    sign: int = 0
+    if s_bytes > 0:
+        c0: int = load_i8(s_data, 0) & 0xFF
+        if c0 == 43 or c0 == 45:                    # leading '+' or '-'
+            sign = 1
+    buf = py_mem_alloc(s_bytes + pad + 1)
+    if ptr_is_null(buf) != 0:
+        return null()
+    pos: int = 0
+    if sign != 0:
+        store_i8(buf, 0, load_i8(s_data, 0))
+        pos = 1
+    z: int = 0
+    while z < pad:
+        store_i8(buf, pos, 48)                      # '0'
+        pos = pos + 1
+        z = z + 1
+    k: int = sign
+    while k < s_bytes:
+        store_i8(buf, pos, load_i8(s_data, k))
+        pos = pos + 1
+        k = k + 1
+    store_i8(buf, pos, 0)
+    out = py_str_new(buf, pos)
+    py_mem_free(buf)
+    return out
+
+
+@c_abi_export("py_str_expandtabs")
+def py_str_expandtabs(s, tabsize: int):
+    # str.expandtabs(tabsize): '\t' -> spaces up to the next tabsize column
+    # boundary; '\n'/'\r' reset the column. Mirrors py_str_expandtabs in
+    # py_str_accessors.c (ASCII/byte-oriented column tracking).
+    if ptr_is_null(s) != 0:
+        return null()
+    s_bytes: int = load_i64(s, 16)
+    s_data = ptr_add(s, 40)
+    mult: int = 1
+    if tabsize > 1:
+        mult = tabsize
+    buf = py_mem_alloc(s_bytes * mult + 1)
+    if ptr_is_null(buf) != 0:
+        return null()
+    pos: int = 0
+    col: int = 0
+    i: int = 0
+    while i < s_bytes:
+        c: int = load_i8(s_data, i) & 0xFF
+        if c == 9:                          # '\t'
+            if tabsize > 0:
+                spaces: int = tabsize - (col % tabsize)
+                k: int = 0
+                while k < spaces:
+                    store_i8(buf, pos, 32)  # ' '
+                    pos = pos + 1
+                    k = k + 1
+                col = col + spaces
+        elif c == 10 or c == 13:            # '\n' or '\r'
+            store_i8(buf, pos, c)
+            pos = pos + 1
+            col = 0
+        else:
+            store_i8(buf, pos, c)
+            pos = pos + 1
+            col = col + 1
+        i = i + 1
+    store_i8(buf, pos, 0)
+    out = py_str_new(buf, pos)
+    py_mem_free(buf)
+    return out
+
+
+@c_abi_export("py_str_translate")
+def py_str_translate(s, table):
+    # str.translate(table): map each byte through table (dict {ord:ord|str|None}).
+    # Absent->keep, None->delete, int->that byte, str->its bytes. Two-pass (size
+    # then fill). Mirrors py_str_translate in py_str_accessors.c (byte/ASCII).
+    if ptr_is_null(s) != 0:
+        return null()
+    byte_len: int = load_i64(s, 16)
+    data = ptr_add(s, 40)
+    none = global_load_ptr("py_None")
+    out_len: int = 0
+    i: int = 0
+    while i < byte_len:
+        c: int = load_i8(data, i) & 0xFF
+        key = py_int_from_i64(c)
+        val = py_dict_get(table, key)
+        py_decref(key)
+        if ptr_is_null(val) != 0:
+            out_len = out_len + 1
+        elif ptr_eq(val, none) != 0:
+            py_decref(val)
+        elif _type_of(val) == 4:                # PY_TYPE_STR
+            out_len = out_len + load_i64(val, 16)
+            py_decref(val)
+        else:
+            out_len = out_len + 1
+            py_decref(val)
+        i = i + 1
+    buf = py_mem_alloc(out_len + 1)
+    if ptr_is_null(buf) != 0:
+        return null()
+    pos: int = 0
+    i = 0
+    while i < byte_len:
+        c2: int = load_i8(data, i) & 0xFF
+        key2 = py_int_from_i64(c2)
+        val2 = py_dict_get(table, key2)
+        py_decref(key2)
+        if ptr_is_null(val2) != 0:
+            store_i8(buf, pos, c2)
+            pos = pos + 1
+        elif ptr_eq(val2, none) != 0:
+            py_decref(val2)
+        elif _type_of(val2) == 4:               # PY_TYPE_STR
+            vlen: int = load_i64(val2, 16)
+            vdata = ptr_add(val2, 40)
+            j: int = 0
+            while j < vlen:
+                store_i8(buf, pos, load_i8(vdata, j))
+                pos = pos + 1
+                j = j + 1
+            py_decref(val2)
+        else:
+            nc: int = py_int_value_i64(val2)
+            store_i8(buf, pos, nc & 0xFF)
+            pos = pos + 1
+            py_decref(val2)
+        i = i + 1
+    store_i8(buf, pos, 0)
+    out = py_str_new(buf, pos)
+    py_mem_free(buf)
+    return out
+
+
+@c_abi_export("py_str_maketrans")
+def py_str_maketrans(x, y):
+    # str.maketrans(x, y) -> {ord(x[i]): ord(y[i])} for the 2-arg form (equal
+    # length). Mirrors py_str_maketrans in py_str_accessors.c. py_dict_set
+    # increfs key+value, so the fresh ints are decref'd after.
+    xlen: int = load_i64(x, 16)
+    ylen: int = load_i64(y, 16)
+    if xlen != ylen:
+        py_raise(py_exc_new(2, cstr(
+            "the first two maketrans arguments must have equal length")))
+        return null()
+    xdata = ptr_add(x, 40)
+    ydata = ptr_add(y, 40)
+    d = py_dict_new()
+    if ptr_is_null(d) != 0:
+        return null()
+    i: int = 0
+    while i < xlen:
+        k = py_int_from_i64(load_i8(xdata, i) & 0xFF)
+        v = py_int_from_i64(load_i8(ydata, i) & 0xFF)
+        py_dict_set(d, k, v)
+        py_decref(k)
+        py_decref(v)
+        i = i + 1
+    return d
+
+
+@c_abi_export("py_str_removeprefix")
+def py_str_removeprefix(s, prefix):
+    if ptr_is_null(s) != 0:
+        return null()
+    data = ptr_add(s, 40)
+    byte_len: int = load_i64(s, 16)
+    p_data = ptr_add(prefix, 40)
+    p_len: int = load_i64(prefix, 16)
+    if p_len > 0 and p_len <= byte_len and _bytes_eq(data, p_data, p_len) != 0:
+        return _str_from_range(ptr_add(data, p_len), byte_len - p_len)
+    py_incref(s)
+    return s
+
+
+@c_abi_export("py_str_removesuffix")
+def py_str_removesuffix(s, suffix):
+    if ptr_is_null(s) != 0:
+        return null()
+    data = ptr_add(s, 40)
+    byte_len: int = load_i64(s, 16)
+    suf_data = ptr_add(suffix, 40)
+    suf_len: int = load_i64(suffix, 16)
+    if suf_len > 0 and suf_len <= byte_len and _bytes_eq(
+        ptr_add(data, byte_len - suf_len), suf_data, suf_len
+    ) != 0:
+        return _str_from_range(data, byte_len - suf_len)
+    py_incref(s)
+    return s
+
+
+@c_abi_export("py_str_partition")
+def py_str_partition(s, sep):
+    # (before, sep, after) on first occurrence; (s, "", "") if not found.
+    # Byte-level: sep boundaries fall on codepoint boundaries for valid UTF-8.
+    if ptr_is_null(s) != 0:
+        return null()
+    data = ptr_add(s, 40)
+    byte_len: int = load_i64(s, 16)
+    sep_data = ptr_add(sep, 40)
+    sep_len: int = load_i64(sep, 16)
+    found: int = -1
+    if sep_len > 0:
+        i: int = 0
+        while i + sep_len <= byte_len and found < 0:
+            if _bytes_eq(ptr_add(data, i), sep_data, sep_len) != 0:
+                found = i
+            else:
+                i = i + 1
+    t = py_tuple_new(3)
+    if ptr_is_null(t) != 0:
+        return null()
+    if found < 0:
+        py_tuple_set_item(t, 0, s)              # set_item increfs; s is borrowed
+        e1 = _str_from_range(data, 0)
+        py_tuple_set_item(t, 1, e1)
+        py_decref(e1)
+        e2 = _str_from_range(data, 0)
+        py_tuple_set_item(t, 2, e2)
+        py_decref(e2)
+    else:
+        before = _str_from_range(data, found)
+        py_tuple_set_item(t, 0, before)
+        py_decref(before)
+        mid = _str_from_range(ptr_add(data, found), sep_len)
+        py_tuple_set_item(t, 1, mid)
+        py_decref(mid)
+        after = _str_from_range(ptr_add(data, found + sep_len), byte_len - found - sep_len)
+        py_tuple_set_item(t, 2, after)
+        py_decref(after)
+    return t
+
+
+@c_abi_export("py_str_rpartition")
+def py_str_rpartition(s, sep):
+    # (before, sep, after) on the LAST occurrence; ("", "", s) if not found
+    # (rpartition puts the original at the END, unlike partition). Mirrors
+    # py_str_rpartition in py_str_accessors.c. No break: loop while found < 0.
+    if ptr_is_null(s) != 0:
+        return null()
+    data = ptr_add(s, 40)
+    byte_len: int = load_i64(s, 16)
+    sep_data = ptr_add(sep, 40)
+    sep_len: int = load_i64(sep, 16)
+    found: int = -1
+    if sep_len > 0 and sep_len <= byte_len:
+        i: int = byte_len - sep_len
+        while i >= 0 and found < 0:
+            if _bytes_eq(ptr_add(data, i), sep_data, sep_len) != 0:
+                found = i
+            else:
+                i = i - 1
+    t = py_tuple_new(3)
+    if ptr_is_null(t) != 0:
+        return null()
+    if found < 0:
+        e0 = _str_from_range(data, 0)
+        py_tuple_set_item(t, 0, e0)
+        py_decref(e0)
+        e1 = _str_from_range(data, 0)
+        py_tuple_set_item(t, 1, e1)
+        py_decref(e1)
+        py_tuple_set_item(t, 2, s)              # original at the END
+    else:
+        before = _str_from_range(data, found)
+        py_tuple_set_item(t, 0, before)
+        py_decref(before)
+        mid = _str_from_range(ptr_add(data, found), sep_len)
+        py_tuple_set_item(t, 1, mid)
+        py_decref(mid)
+        after = _str_from_range(ptr_add(data, found + sep_len), byte_len - found - sep_len)
+        py_tuple_set_item(t, 2, after)
+        py_decref(after)
+    return t
+
+
 @c_abi_export("py_str_split")
 def py_str_split(s, sep):
     if ptr_is_null(s) != 0:
@@ -1092,12 +1797,12 @@ def py_str_split(s, sep):
     i: int = 0
     sep_first: int = load_i8(sep_data, 0) & 0xFF
     while i + sep_len <= byte_len:
-        match: int = 0
+        ok: int = 0
         first: int = load_i8(data, i) & 0xFF
         if first == sep_first:
             if _bytes_eq(ptr_add(data, i), sep_data, sep_len) != 0:
-                match = 1
-        if match != 0:
+                ok = 1
+        if ok != 0:
             if _list_append_str_range(out, data, start, i - start) != 0:
                 return null()
             i = i + sep_len
@@ -1163,12 +1868,12 @@ def py_str_split_maxsplit(s, sep, maxsplit: int):
     splits: int = 0
     sep_first: int = load_i8(sep_data, 0) & 0xFF
     while i + sep_len <= byte_len and splits < maxsplit:
-        match: int = 0
+        ok: int = 0
         first: int = load_i8(data, i) & 0xFF
         if first == sep_first:
             if _bytes_eq(ptr_add(data, i), sep_data, sep_len) != 0:
-                match = 1
-        if match != 0:
+                ok = 1
+        if ok != 0:
             if _list_append_str_range(out, data, start, i - start) != 0:
                 return null()
             i = i + sep_len
@@ -1193,38 +1898,48 @@ def py_str_join(sep, lst):
         return py_str_new(null(), 0)
 
     sep_len: int = load_i64(sep, 16)
+    if sep_len < 0:
+        return null()
     items = load_ptr(lst, 32)
     total: int = 0
     i: int = 0
     while i < length:
-        e = load_ptr(items, i * 8)
+        e = pcc_gc_load_ptr(lst, ptr_add(items, i * 8))
         if ptr_is_null(e) != 0:
             return null()
-        if _type_of(e) != 4:
+        tag: int = _type_of(e)
+        if tag != 4:
             return null()
         if i > 0:
+            if total > 9223372036854775807 - sep_len:
+                return null()
             total = total + sep_len
-        total = total + load_i64(e, 16)
+        elem_len: int = load_i64(e, 16)
+        if elem_len < 0:
+            return null()
+        if total > 9223372036854775807 - elem_len:
+            return null()
+        total = total + elem_len
         i = i + 1
 
     out = _str_alloc(total)
     if ptr_is_null(out) != 0:
         return null()
-    dst = ptr_add(out, 40)
+
+    out_data = ptr_add(out, 40)
     sep_data = ptr_add(sep, 40)
     off: int = 0
-    j: int = 0
-    while j < length:
-        e = load_ptr(items, j * 8)
-        if j > 0:
-            if sep_len > 0:
-                memmove(ptr_add(dst, off), sep_data, sep_len)
-                off = off + sep_len
-        elem_len: int = load_i64(e, 16)
+    i = 0
+    while i < length:
+        e = pcc_gc_load_ptr(lst, ptr_add(items, i * 8))
+        if i > 0 and sep_len > 0:
+            memmove(ptr_add(out_data, off), sep_data, sep_len)
+            off = off + sep_len
+        elem_len = load_i64(e, 16)
         if elem_len > 0:
-            memmove(ptr_add(dst, off), ptr_add(e, 40), elem_len)
+            memmove(ptr_add(out_data, off), ptr_add(e, 40), elem_len)
             off = off + elem_len
-        j = j + 1
+        i = i + 1
     return out
 
 
@@ -1252,12 +1967,12 @@ def _py_str_replace_impl(s, old, new_value, maxreplace: int):
     i: int = 0
     old_first: int = load_i8(old_data, 0) & 0xFF
     while i + old_len <= s_len:
-        match: int = 0
+        ok: int = 0
         first: int = load_i8(data, i) & 0xFF
         if first == old_first:
             if _bytes_eq(ptr_add(data, i), old_data, old_len) != 0:
-                match = 1
-        if match != 0:
+                ok = 1
+        if ok != 0:
             matches = matches + 1
             if maxreplace > 0:
                 if matches >= maxreplace:

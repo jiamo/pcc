@@ -89,6 +89,21 @@ PyObject *py_int_neg(PyObject *a) {
 }
 
 PyObject *py_int_floordiv(PyObject *a, PyObject *b) {
+    if (is_tagged_both(a, b)) {
+        int64_t av = py_untag_int(a);
+        int64_t bv = py_untag_int(b);
+        if (bv == 0) return NULL;
+        /* C trunc-divides; Python wants floor. Adjust if signs differ
+         * and remainder is non-zero. ``av`` and ``bv`` are in
+         * [PY_TAGGED_INT_MIN, PY_TAGGED_INT_MAX], so neither the divide
+         * nor the q-1 adjust can overflow i64. */
+        int64_t q = av / bv;
+        int64_t r = av - q * bv;
+        if (r != 0 && ((r ^ bv) < 0)) {
+            q -= 1;
+        }
+        return py_int_from_i64(q);
+    }
     PyIntObject *ba = promote_any(a);
     PyIntObject *bb = promote_any(b);
     if (!ba || !bb) { free(ba); free(bb); return NULL; }
@@ -101,6 +116,18 @@ PyObject *py_int_floordiv(PyObject *a, PyObject *b) {
 }
 
 PyObject *py_int_mod(PyObject *a, PyObject *b) {
+    if (is_tagged_both(a, b)) {
+        int64_t av = py_untag_int(a);
+        int64_t bv = py_untag_int(b);
+        if (bv == 0) return NULL;
+        /* C %-truncates toward 0; Python mod has same sign as divisor.
+         * Adjust if signs of remainder and divisor differ. */
+        int64_t r = av % bv;
+        if (r != 0 && ((r ^ bv) < 0)) {
+            r += bv;
+        }
+        return py_int_from_i64(r);
+    }
     PyIntObject *ba = promote_any(a);
     PyIntObject *bb = promote_any(b);
     if (!ba || !bb) { free(ba); free(bb); return NULL; }
@@ -218,7 +245,11 @@ PyObject *py_int_shl(PyObject *a, PyObject *b) {
     /* Shift count must be non-negative. */
     int overflow = 0;
     int64_t n = py_int_to_i64(b, &overflow);
-    if (overflow || n < 0) return NULL;
+    if (overflow) return NULL;
+    if (n < 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR, "negative shift count"));
+        return NULL;
+    }
     if (n == 0) {
         /* Return a new reference to a. Tagged ints are inherently immortal
          * (no refcount), so the same tagged pointer is safe to return. */
@@ -244,7 +275,11 @@ PyObject *py_int_shl(PyObject *a, PyObject *b) {
 PyObject *py_int_shr(PyObject *a, PyObject *b) {
     int overflow = 0;
     int64_t n = py_int_to_i64(b, &overflow);
-    if (overflow || n < 0) return NULL;
+    if (overflow) return NULL;
+    if (n < 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR, "negative shift count"));
+        return NULL;
+    }
     if (n == 0) {
         if (PY_IS_TAGGED_INT(a)) return a;
         py_incref(a);

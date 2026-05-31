@@ -5,12 +5,12 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.project import TranslationUnit
 from tests.worker_process import run_worker_process
-
 
 DEFAULT_TIMEOUT = 10
 XDIST_TIMEOUT = 20
@@ -92,6 +92,7 @@ def read_expected_output(case_path: Path) -> str:
     return ""
 
 
+@lru_cache(maxsize=None)
 def run_native(
     case_path: Path,
     repo_root: Path,
@@ -123,6 +124,7 @@ def run_native(
         )
 
 
+@lru_cache(maxsize=None)
 def run_pcc(
     case_path: Path,
     repo_root: Path,

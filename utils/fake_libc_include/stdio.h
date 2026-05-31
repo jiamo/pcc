@@ -4,6 +4,19 @@
 #include "_fake_defines.h"
 #include "_fake_typedefs.h"
 
+#ifdef __APPLE__
+extern FILE *__stdinp;
+extern FILE *__stdoutp;
+extern FILE *__stderrp;
+#define stdin __stdinp
+#define stdout __stdoutp
+#define stderr __stderrp
+#else
+extern FILE *stdin;
+extern FILE *stdout;
+extern FILE *stderr;
+#endif
+
 int getc_unlocked(FILE *stream);
 void flockfile(FILE *stream);
 void funlockfile(FILE *stream);

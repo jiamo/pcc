@@ -1,9 +1,9 @@
 {
   "_comment": [
     "Frozen bootstrap-gate baseline (Issue 1 progress tracker).",
-    "Captured 2026-04-28 from build/bootstrap-{llvm,self}/.",
-    "Path A's success criterion: links_libpython transitions to false",
-    "for every backend×stage. byte_identical_pcc2_pcc3 (after Mach-O",
+    "Captured 2026-05-01 from strict no-libpython bootstrap probes.",
+    "Issue 1's success criterion is now the current state: no stage",
+    "links libpython. byte_identical_pcc2_pcc3 (after Mach-O",
     "signature normalization) must remain true throughout.",
     "Test: tests/test_bootstrap_gate_baseline.py (skipped unless",
     "binaries already exist; never triggers a heavy bootstrap build).",
@@ -13,14 +13,14 @@
   ],
   "current_state": {
     "llvm": {
-      "stage1": {"size_bytes": 176504, "links_libpython": true},
-      "stage2": {"size_bytes": 176504, "links_libpython": true},
-      "stage3": {"size_bytes": 176504, "links_libpython": true}
+      "stage1": {"size_bytes": 2485688, "links_libpython": false},
+      "stage2": {"size_bytes": 2534536, "links_libpython": false},
+      "stage3": {"size_bytes": 2534536, "links_libpython": false}
     },
     "self": {
-      "stage1": {"size_bytes": 194008, "links_libpython": true},
-      "stage2": {"size_bytes": 194008, "links_libpython": true},
-      "stage3": {"size_bytes": 194008, "links_libpython": true}
+      "stage1": {"size_bytes": 4442648, "links_libpython": false},
+      "stage2": {"size_bytes": 4524200, "links_libpython": false},
+      "stage3": {"size_bytes": 4524200, "links_libpython": false}
     }
   },
   "byte_identical_pcc2_pcc3": {
@@ -29,9 +29,9 @@
     "self": true
   },
   "path_a_target": {
-    "_comment": "When Path A is complete, every binary must satisfy:",
+    "_comment": "Issue 1 close criterion for every bootstrap binary:",
     "links_libpython_must_be": false,
     "byte_identical_pcc2_pcc3_must_remain": true,
-    "issue_1_closed_when": "every backend×stage links_libpython == false"
+    "issue_1_closed_when": "satisfied on macOS arm64 as of 2026-05-01"
   }
 }

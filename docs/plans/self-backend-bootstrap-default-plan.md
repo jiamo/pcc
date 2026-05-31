@@ -4,7 +4,7 @@ Related plans:
 
 - `docs/plans/self-backend-translation-plan.md`
 - `docs/plans/python-frontend-plan.md`
-- `docs/plans/p6c6-bootstrap-spike-report.md`
+- `docs/plans/archive/p6c6-bootstrap-spike-report.md`
 - `docs/plans/llvmcapi-beta4-backlog.md`
 
 ## Purpose

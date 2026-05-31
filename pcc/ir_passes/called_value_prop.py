@@ -125,17 +125,6 @@ def called_value_prop_text(ir_text: str) -> tuple[str, bool]:
     md_for_fn: dict[str, str] = {}
     new_md_defs: list[str] = []
 
-    def md_ref_for(fn: str) -> str:
-        nonlocal next_md
-        ref = md_for_fn.get(fn)
-        if ref is not None:
-            return ref
-        ref = f"!{next_md}"
-        next_md += 1
-        md_for_fn[fn] = ref
-        new_md_defs.append(f"{ref} = !{{ptr @{fn}}}\n")
-        return ref
-
     # Rewrite indirect calls by attaching !callees metadata.
     lines = ir_text.splitlines(keepends=True)
     changed = False
@@ -148,7 +137,13 @@ def called_value_prop_text(ir_text: str) -> tuple[str, bool]:
             continue
         if "!callees" in line:
             continue
-        md_ref = md_ref_for(load_results[fp])
+        callee_fn = load_results[fp]
+        md_ref = md_for_fn.get(callee_fn)
+        if md_ref is None:
+            md_ref = f"!{next_md}"
+            next_md += 1
+            md_for_fn[callee_fn] = md_ref
+            new_md_defs.append(f"{md_ref} = !{{ptr @{callee_fn}}}\n")
         newline = "\n" if line.endswith("\n") else ""
         core = line[:-1] if newline else line
         new_line = f"{core}, !callees {md_ref}{newline}"

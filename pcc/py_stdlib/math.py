@@ -32,6 +32,7 @@ pi:  float = 3.141592653589793
 e:   float = 2.718281828459045
 tau: float = 6.283185307179586
 inf: float = float("inf")
+nan: float = float("nan")
 
 
 def sqrt(x: float) -> float:
@@ -84,3 +85,48 @@ def fabs(x: float) -> float:
 
 def fmod(x: float, y: float) -> float:
     return fmod_c(x, y)
+
+
+def isnan(x: float) -> bool:
+    return x != x
+
+
+def isinf(x: float) -> bool:
+    return x == inf or x == -inf
+
+
+def isfinite(x: float) -> bool:
+    return not isnan(x) and not isinf(x)
+
+
+def trunc(x: float) -> int:
+    return int(x)
+
+
+def copysign(x: float, y: float) -> float:
+    ax = x if x >= 0.0 else -x
+    if y < 0.0 or (y == 0.0 and str(y).startswith("-")):
+        return -ax
+    return ax
+
+
+def prod(values, start=1):
+    out = start
+    for value in values:
+        out *= value
+    return out
+
+
+def factorial(n: int) -> int:
+    if n < 0:
+        raise ValueError("factorial() not defined for negative values")
+    out = 1
+    i = 2
+    while i <= n:
+        out *= i
+        i += 1
+    return out
+
+
+def radians(x: float) -> float:
+    return x * pi / 180.0

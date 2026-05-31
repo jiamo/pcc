@@ -21,26 +21,26 @@ class Gate:
 GATES: dict[str, Gate] = {
     "self-unit": Gate(
         name="self-unit",
-        pytest_args=("tests/test_self_backend.py", "-q", "-n0"),
+        pytest_args=("tests/c/test_self_backend.py", "-q", "-n0"),
         timeout_seconds=300,
         description="focused self backend unit/IR/emitter coverage",
     ),
     "c-testsuite": Gate(
         name="c-testsuite",
-        pytest_args=("tests/test_c_testsuite_self.py", "-q", "-n0"),
+        pytest_args=("tests/c/test_c_testsuite_self.py", "-q", "-n0"),
         timeout_seconds=1200,
         description="full c-testsuite self/native and self/LLVM broad gate",
     ),
     "gcc-torture": Gate(
         name="gcc-torture",
-        pytest_args=("tests/test_gcc_torture_self.py", "-q", "-n0"),
+        pytest_args=("tests/c/test_gcc_torture_self.py", "-q", "-n0"),
         timeout_seconds=3600,
         description="full gcc-torture self/native and self/LLVM formal gate",
     ),
     "zlib": Gate(
         name="zlib",
         pytest_args=(
-            "tests/test_zlib.py::test_zlib_runtime_with_self_backend_system_link_depends_on",
+            "tests/c/test_zlib.py::test_zlib_runtime_with_self_backend_system_link_depends_on",
             "-q",
             "-n0",
         ),
@@ -50,7 +50,7 @@ GATES: dict[str, Gate] = {
     "lz4": Gate(
         name="lz4",
         pytest_args=(
-            "tests/test_lz4.py::test_lz4_runtime_with_self_backend_system_link_depends_on",
+            "tests/c/test_lz4.py::test_lz4_runtime_with_self_backend_system_link_depends_on",
             "-q",
             "-n0",
         ),
@@ -60,7 +60,7 @@ GATES: dict[str, Gate] = {
     "zstd": Gate(
         name="zstd",
         pytest_args=(
-            "tests/test_zstd.py::test_zstd_runtime_with_self_backend_system_link_depends_on",
+            "tests/integration/test_zstd.py::test_zstd_runtime_with_self_backend_system_link_depends_on",
             "-q",
             "-n0",
         ),
@@ -70,7 +70,7 @@ GATES: dict[str, Gate] = {
     "pcre": Gate(
         name="pcre",
         pytest_args=(
-            "tests/test_pcre.py::test_pcre_self_backend_runtime_with_system_link",
+            "tests/integration/test_pcre.py::test_pcre_self_backend_runtime_with_system_link",
             "-q",
             "-n0",
         ),
@@ -80,7 +80,7 @@ GATES: dict[str, Gate] = {
     "openssl": Gate(
         name="openssl",
         pytest_args=(
-            "tests/test_openssl.py::test_openssl_runtime_with_self_backend_system_link_depends_on",
+            "tests/c/test_openssl.py::test_openssl_runtime_with_self_backend_system_link_depends_on",
             "-q",
             "-n0",
         ),
@@ -90,7 +90,7 @@ GATES: dict[str, Gate] = {
     "readline": Gate(
         name="readline",
         pytest_args=(
-            "tests/test_readline.py::test_readline_runtime_with_self_backend_system_link_depends_on",
+            "tests/integration/test_readline.py::test_readline_runtime_with_self_backend_system_link_depends_on",
             "-q",
             "-n0",
         ),
@@ -102,7 +102,7 @@ GATES: dict[str, Gate] = {
         pytest_args=(
             "-m",
             "integration",
-            "tests/test_postgres.py::test_postgres_runtime_with_self_backend_system_link_depends_on_repo_local_zlib_project",
+            "tests/integration/test_postgres.py::test_postgres_runtime_with_self_backend_system_link_depends_on_repo_local_zlib_project",
             "-q",
             "-n0",
         ),
@@ -114,7 +114,7 @@ GATES: dict[str, Gate] = {
         pytest_args=(
             "-m",
             "integration",
-            "tests/test_postgres.py::test_postgres_cli_self_backend_system_link_depends_on",
+            "tests/integration/test_postgres.py::test_postgres_cli_self_backend_system_link_depends_on",
             "-q",
             "-n0",
         ),

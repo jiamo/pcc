@@ -3,9 +3,8 @@
 Only py_str_new remains here; the rest of the string runtime lives in
 py_str_accessors.py.
 """
-from pcc.extern import c_abi_export
+from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr
 from pcc.unsafe import (
-    malloc,
     memmove,
     null,
     ptr_add,
@@ -15,16 +14,17 @@ from pcc.unsafe import (
     store_i64,
 )
 
+pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+
 
 def _str_alloc(byte_len: int):
     if byte_len < 0:
         return null()
-    s = malloc(40 + byte_len + 1)
+    s = pcc_gc_alloc(40 + byte_len + 1, 4, 0)
     if ptr_is_null(s) != 0:
         return null()
     store_i64(s, 0, 1)               # refcount
     store_i32(s, 8, 4)               # PY_TYPE_STR
-    store_i32(s, 12, 0)              # flags
     store_i64(s, 16, byte_len)       # byte_len
     store_i64(s, 24, -1)             # cp_len
     store_i64(s, 32, -1)             # hash

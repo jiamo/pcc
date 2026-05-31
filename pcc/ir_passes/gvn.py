@@ -158,6 +158,30 @@ def _canonical_ptr_name(ptr: str, aliases: dict[str, str]) -> str:
     return current
 
 
+def _resolve_replacement(
+    name: str,
+    replacements: dict[str, str],
+) -> str:
+    rep = replacements[name]
+    seen = {name}
+    while rep.startswith("%"):
+        next_name = rep[1:]
+        if next_name in seen or next_name not in replacements:
+            break
+        seen.add(next_name)
+        rep = replacements[next_name]
+    return rep
+
+
+def _collapse_replacement_chains(
+    replacements: dict[str, str],
+) -> dict[str, str]:
+    return {
+        name: _resolve_replacement(name, replacements)
+        for name in replacements
+    }
+
+
 def _member_dominates(
     candidate: tuple[str, int, str],
     target: tuple[str, int, str],
@@ -335,6 +359,7 @@ def _rewrite_function(
 
     kept = [ln for i, ln in enumerate(lines) if i not in dead_lines]
     text = "".join(kept)
+    replacements = _collapse_replacement_chains(replacements)
     for _ in range(8):
         nt = text
         for name, rep in replacements.items():

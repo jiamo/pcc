@@ -31,10 +31,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import re
 from pathlib import Path
 
 
 CORPUS_ROOT = Path(__file__).resolve().parent
+OVERRIDE_TARGET_TRIPLE_WARNING = re.compile(
+    r"warning: overriding the module target triple with "
+)
 
 
 def load_expected(test_dir: Path) -> tuple[bytes, int] | None:
@@ -61,14 +65,42 @@ def load_expected(test_dir: Path) -> tuple[bytes, int] | None:
 
 def compile_one(src: Path, out: Path, verbose: bool) -> tuple[bool, float]:
     t0 = time.monotonic()
+    cmd = [sys.executable, "-m", "pcc", str(src), "-o", str(out)]
     try:
-        subprocess.run(
-            ["python", "-m", "pcc", str(src), "-o", str(out)],
-            check=True,
-            capture_output=not verbose,
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
         )
-    except subprocess.CalledProcessError:
+    except OSError as exc:
+        raise SystemExit(f"{' '.join(cmd)}: {exc}") from exc
+    output = ""
+    if completed.stdout:
+        output += completed.stdout
+    if completed.stderr:
+        output += completed.stderr
+    if verbose and output:
+        filtered = [
+            line
+            for line in output.splitlines()
+            if not OVERRIDE_TARGET_TRIPLE_WARNING.search(line)
+        ]
+        if filtered:
+            print("\n".join(filtered))
+
+    if completed.returncode != 0:
+        # Keep all non-filtered compiler output visible even when not verbose.
+        if not verbose and output:
+            filtered = [
+                line
+                for line in output.splitlines()
+                if not OVERRIDE_TARGET_TRIPLE_WARNING.search(line)
+            ]
+            if filtered:
+                print("\n".join(filtered))
         return False, time.monotonic() - t0
+
     return True, time.monotonic() - t0
 
 

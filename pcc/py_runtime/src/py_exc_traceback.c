@@ -37,11 +37,14 @@ void py_exc_append_frame(PyObject *exc,
 
 
 static void print_exc_heading(PyExceptionObject *e) {
-    const char *cls_name = (e->exc_class && e->exc_class->name)
-        ? e->exc_class->name : "Exception";
-    if (e->message != NULL && e->message != py_None &&
-        py_type_of(e->message) == PY_TYPE_STR) {
-        const char *msg = py_str_utf8(e->message);
+    PyObject *exc_class_obj = pcc_gc_load_ptr((PyObject *)e, (PyObject **)&e->exc_class);
+    PyClassObject *exc_class = (PyClassObject *)exc_class_obj;
+    PyObject *message = pcc_gc_load_ptr((PyObject *)e, &e->message);
+    const char *cls_name = (exc_class && exc_class->name)
+        ? exc_class->name : "Exception";
+    if (message != NULL && message != py_None &&
+        py_type_of(message) == PY_TYPE_STR) {
+        const char *msg = py_str_utf8(message);
         fprintf(stderr, "%s: %s\n", cls_name, msg ? msg : "");
     } else {
         fprintf(stderr, "%s\n", cls_name);
@@ -68,13 +71,15 @@ void py_exc_print_unhandled(PyObject *exc) {
     PyExceptionObject *e = (PyExceptionObject *)exc;
 
     /* Emit chained causes oldest-first, CPython-style. */
-    if (e->cause != NULL && py_type_of(e->cause) == PY_TYPE_EXC) {
-        py_exc_print_unhandled(e->cause);
+    PyObject *cause = pcc_gc_load_ptr(exc, &e->cause);
+    PyObject *context = pcc_gc_load_ptr(exc, &e->context);
+    if (cause != NULL && py_type_of(cause) == PY_TYPE_EXC) {
+        py_exc_print_unhandled(cause);
         fprintf(stderr,
                 "\nThe above exception was the direct cause of the "
                 "following exception:\n\n");
-    } else if (e->context != NULL && py_type_of(e->context) == PY_TYPE_EXC) {
-        py_exc_print_unhandled(e->context);
+    } else if (context != NULL && py_type_of(context) == PY_TYPE_EXC) {
+        py_exc_print_unhandled(context);
         fprintf(stderr,
                 "\nDuring handling of the above exception, another "
                 "exception occurred:\n\n");

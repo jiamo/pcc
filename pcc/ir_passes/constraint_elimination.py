@@ -28,7 +28,7 @@ import re
 
 import llvmlite.binding as llvm
 
-from .dominator_tree import compute_dominator_tree
+from .dominator_tree import CFG, compute_dominator_tree
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
 
 
@@ -112,6 +112,7 @@ def _collect_scope_facts(fn):
 
     # Per block: scan terminator for conditional-branch facts.
     dom = compute_dominator_tree(fn)
+    cfg = CFG.of_function(fn)
     per_block: dict[str, list[tuple[str, str, int]]] = {
         b: [] for b in dom.all_blocks()
     }
@@ -135,6 +136,9 @@ def _collect_scope_facts(fn):
             (m.group("t"), pred),
             (m.group("f"), _negate_pred(pred)),
         ):
+            target_preds = tuple(cfg.predecessors.get(target, ()))
+            if len(target_preds) != 1 or target_preds[0] != block.name:
+                continue
             for b in dom.all_blocks():
                 if dom.dominates(target, b):
                     per_block[b].append((var, fact_pred, const))

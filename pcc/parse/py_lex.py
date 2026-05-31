@@ -12,6 +12,7 @@ they simplify decisions.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 # Token kinds. Keep in sync with parser expectations.
 TK_NEWLINE  = "NEWLINE"
@@ -88,6 +89,56 @@ def _is_close_paren_code(c: int) -> bool:
     return c == 41 or c == 93 or c == 125
 
 
+def _single_op_text(c: int) -> str:
+    if c == 37:
+        return "%"
+    if c == 38:
+        return "&"
+    if c == 40:
+        return "("
+    if c == 41:
+        return ")"
+    if c == 42:
+        return "*"
+    if c == 43:
+        return "+"
+    if c == 44:
+        return ","
+    if c == 45:
+        return "-"
+    if c == 46:
+        return "."
+    if c == 47:
+        return "/"
+    if c == 58:
+        return ":"
+    if c == 59:
+        return ";"
+    if c == 60:
+        return "<"
+    if c == 61:
+        return "="
+    if c == 62:
+        return ">"
+    if c == 64:
+        return "@"
+    if c == 91:
+        return "["
+    if c == 93:
+        return "]"
+    if c == 94:
+        return "^"
+    if c == 123:
+        return "{"
+    if c == 124:
+        return "|"
+    if c == 125:
+        return "}"
+    if c == 126:
+        return "~"
+    return ""
+
+
 def _pcc_str_byte_len(s: str) -> int:
     return len(s)
 
@@ -130,6 +181,9 @@ class Lexer:
     def __init__(self, src: str, filename: str = "<input>") -> None:
         self.src = src
         self._src_len = _pcc_str_byte_len(src)
+        self._debug_bootstrap = bool(
+            os.environ.get("PCC_DEBUG_BOOTSTRAP", "").strip()
+        )
         self.filename = filename
         self.pos = 0
         self.line = 1
@@ -208,6 +262,36 @@ class Lexer:
         return -1
 
     def _slice(self, lo: int, hi: int) -> str:
+        # Temporary bootstrap-time guard: catch pathological slice bounds
+        # before they reach C runtime helpers, which can otherwise turn into
+        # heap-corruption crashes that are hard to diagnose.
+        if self._debug_bootstrap:
+            try:
+                src_len = self._src_len
+            except Exception as e:
+                raise RuntimeError(f"lexer._slice source-length probe failed: {e}")
+            if lo < 0 or hi < 0 or lo > hi or lo > src_len or hi > src_len:
+                raise RuntimeError(
+                    f"lexer._slice bounds out of range: lo={lo} hi={hi} src_len={src_len}"
+                )
+
+        src_len = self._src_len
+        # Clamp to Python-like byte-slice bounds in non-debug mode so
+        # malformed offsets cannot propagate into runtime string helpers.
+        if lo < 0:
+            lo = src_len + lo
+        if hi < 0:
+            hi = src_len + hi
+        if lo < 0:
+            lo = 0
+        if hi < 0:
+            hi = 0
+        if lo > src_len:
+            lo = src_len
+        if hi > src_len:
+            hi = src_len
+        if hi < lo:
+            hi = lo
         return _pcc_str_byte_slice(self.src, lo, hi)
 
     def _peek_code(self, off: int) -> int:
@@ -360,6 +444,18 @@ class Lexer:
             self.pos += 3
             self.col += 3
             while self.pos < self._src_len:
+                ch = self._peek_code(0)
+                if ch == 92:
+                    self.pos += 1
+                    self.col += 1
+                    if self.pos < self._src_len:
+                        if self._peek_code(0) == 10:
+                            self.line += 1
+                            self.col = 1
+                        else:
+                            self.col += 1
+                        self.pos += 1
+                    continue
                 if (
                     self._peek_code(0) == quote_code
                     and self._peek_code(1) == quote_code
@@ -371,7 +467,7 @@ class Lexer:
                         TK_STRING, self._slice(start, self.pos),
                         self.line, start_col,
                     )
-                if self._peek_code(0) == 10:
+                if ch == 10:
                     self.line += 1
                     self.col = 1
                 else:
@@ -406,18 +502,93 @@ class Lexer:
 
     def _read_op(self) -> Token:
         start_col = self.col
-        src: str = self.src
         pos: int = self.pos
-        # Try 3-, 2-, then 1-char operators.
-        for op in _OPS_MULTI:
-            op_len = len(op)
-            if self._slice(pos, pos + op_len) == op:
-                self.pos = pos + op_len
-                self.col += op_len
-                return Token(TK_OP, op, self.line, start_col)
-        ch_code = self._peek_code(0)
+        c0 = self._code_at(pos)
+        c1 = self._code_at(pos + 1)
+        c2 = self._code_at(pos + 2)
+        op = ""
+        op_len = 0
+
+        # Fixed longest-first matching for the hot self-host lexer path.
+        # Avoid per-candidate slicing or dict lookup; both are amplified by
+        # bootstrap sources with hundreds of thousands of tokens.
+        if c0 == 42 and c1 == 42 and c2 == 61:
+            op = "**="
+            op_len = 3
+        elif c0 == 47 and c1 == 47 and c2 == 61:
+            op = "//="
+            op_len = 3
+        elif c0 == 62 and c1 == 62 and c2 == 61:
+            op = ">>="
+            op_len = 3
+        elif c0 == 60 and c1 == 60 and c2 == 61:
+            op = "<<="
+            op_len = 3
+        elif c0 == 46 and c1 == 46 and c2 == 46:
+            op = "..."
+            op_len = 3
+        elif c0 == 45 and c1 == 62:
+            op = "->"
+            op_len = 2
+        elif c0 == 42 and c1 == 42:
+            op = "**"
+            op_len = 2
+        elif c0 == 47 and c1 == 47:
+            op = "//"
+            op_len = 2
+        elif c0 == 60 and c1 == 60:
+            op = "<<"
+            op_len = 2
+        elif c0 == 62 and c1 == 62:
+            op = ">>"
+            op_len = 2
+        elif c0 == 60 and c1 == 61:
+            op = "<="
+            op_len = 2
+        elif c0 == 62 and c1 == 61:
+            op = ">="
+            op_len = 2
+        elif c0 == 61 and c1 == 61:
+            op = "=="
+            op_len = 2
+        elif c0 == 33 and c1 == 61:
+            op = "!="
+            op_len = 2
+        elif c0 == 43 and c1 == 61:
+            op = "+="
+            op_len = 2
+        elif c0 == 45 and c1 == 61:
+            op = "-="
+            op_len = 2
+        elif c0 == 42 and c1 == 61:
+            op = "*="
+            op_len = 2
+        elif c0 == 47 and c1 == 61:
+            op = "/="
+            op_len = 2
+        elif c0 == 37 and c1 == 61:
+            op = "%="
+            op_len = 2
+        elif c0 == 38 and c1 == 61:
+            op = "&="
+            op_len = 2
+        elif c0 == 124 and c1 == 61:
+            op = "|="
+            op_len = 2
+        elif c0 == 94 and c1 == 61:
+            op = "^="
+            op_len = 2
+        elif c0 == 58 and c1 == 61:
+            op = ":="
+            op_len = 2
+        if op_len != 0:
+            self.pos = pos + op_len
+            self.col += op_len
+            return Token(TK_OP, op, self.line, start_col)
+
+        ch_code = c0
         if _is_single_op_code(ch_code):
-            ch = self._slice(self.pos, self.pos + 1)
+            ch = _single_op_text(ch_code)
             if _is_open_paren_code(ch_code):
                 self._paren_depth += 1
             elif _is_close_paren_code(ch_code):
@@ -425,7 +596,9 @@ class Lexer:
             self.pos += 1
             self.col += 1
             return Token(TK_OP, ch, self.line, start_col)
-        ch = self._slice(self.pos, self.pos + 1)
+        ch = _single_op_text(ch_code)
+        if not ch:
+            ch = self._slice(self.pos, self.pos + 1)
         raise LexError(
             f"{self.filename}:{self.line}:{self.col}: stray character {ch!r}"
         )

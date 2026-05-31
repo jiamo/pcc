@@ -35,6 +35,10 @@ from .dce import dce_module_text
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
 
 
+_DEFINE_HEADER_RE = re.compile(
+    r"^\s*define\b(?P<body>.*?@(?P<name>[\w\.\$]+)\([^)]*\)[^{]*)\{",
+    re.DOTALL,
+)
 _BLOCK_LABEL_RE = re.compile(r"^\s*(?P<label>[\w\.\-]+):")
 _COND_BR_RE = re.compile(
     r"^br\s+i1\s+(?P<cond>[^,]+)\s*,\s*label\s+%(?P<true>[\w\.]+)\s*,\s*label\s+%(?P<false>[\w\.]+)\s*$"
@@ -100,6 +104,78 @@ def _split_functions(ir_text: str) -> list[tuple[bool, str]]:
     if current:
         chunks.append((in_function, "".join(current)))
     return chunks
+
+
+def _module_context_without_functions(ir_text: str) -> str:
+    """Return module-level IR needed to parse one function chunk.
+
+    Several loop-local passes operate on one function body at a time, but
+    LLVM still needs the module declarations, target header, attribute
+    groups, and metadata used by that function.  Python frontend IR calls
+    many runtime helpers, so parsing a bare ``define`` chunk reports
+    undefined ``@py_*`` symbols even though the complete module is valid.
+    """
+    return "".join(
+        chunk for is_function, chunk in _split_functions(ir_text)
+        if not is_function
+    )
+
+
+def _function_chunk_module(context: str, fn_text: str) -> str:
+    """Wrap one function chunk in its module-level parse context."""
+    if not context:
+        return fn_text
+    if context.endswith("\n") or fn_text.startswith("\n"):
+        return context + fn_text
+    return context + "\n" + fn_text
+
+
+def _function_name_from_chunk(fn_text: str) -> str | None:
+    match = _DEFINE_HEADER_RE.search(fn_text)
+    if match is None:
+        return None
+    return match.group("name")
+
+
+def _function_declaration_from_chunk(fn_text: str) -> str | None:
+    match = _DEFINE_HEADER_RE.search(fn_text)
+    if match is None:
+        return None
+    body = match.group("body").rstrip()
+    # Sibling definitions are reintroduced as declarations when a
+    # function-local cleanup reparses one function in isolation. LLVM
+    # allows ``define internal ...`` but not ``declare internal ...``:
+    # declarations have external linkage by default. Drop definition-only
+    # linkage tokens while preserving calling conventions / return attrs.
+    body = re.sub(
+        r"^(\s*)"
+        r"(private|internal|linkonce(?:_odr)?|weak(?:_odr)?|"
+        r"available_externally|appending|common|extern_weak|external)"
+        r"\b\s*",
+        r"\1",
+        body,
+        count=1,
+    )
+    return "declare" + body + "\n"
+
+
+def _module_context_for_function(ir_text: str, fn_text: str) -> str:
+    """Return parse context plus declarations for sibling definitions."""
+    skip_name = _function_name_from_chunk(fn_text)
+    context = [_module_context_without_functions(ir_text)]
+    declarations: list[str] = []
+    for is_function, chunk in _split_functions(ir_text):
+        if not is_function:
+            continue
+        name = _function_name_from_chunk(chunk)
+        if name is None or name == skip_name:
+            continue
+        declaration = _function_declaration_from_chunk(chunk)
+        if declaration is not None:
+            declarations.append(declaration)
+    if declarations:
+        context.append("".join(declarations))
+    return "".join(context)
 
 
 def _parse_blocks(fn_text: str) -> tuple[str, list[_Block], str]:
@@ -571,9 +647,14 @@ def _unique_block_label(prefix: str, blocks: list[_Block]) -> str:
     return name
 
 
-def _cleanup_function_locally(fn_text: str) -> str:
-    cleaned, _ = dce_module_text(fn_text)
-    return cleaned
+def _cleanup_function_locally(fn_text: str, module_context: str = "") -> str:
+    cleaned, _ = dce_module_text(
+        _function_chunk_module(module_context, fn_text)
+    )
+    for is_function, chunk in _split_functions(cleaned):
+        if is_function:
+            return chunk
+    return fn_text
 
 
 def _is_trivial_unreachable(block: _Block | None) -> bool:
@@ -1512,6 +1593,7 @@ def simplify_cfg_text(ir_text: str) -> tuple[str, bool]:
         if not is_function:
             out.append(chunk)
             continue
+        context = _module_context_for_function(ir_text, chunk)
         header, blocks, footer = _parse_blocks(chunk)
         if not blocks:
             out.append(chunk)
@@ -1533,7 +1615,7 @@ def simplify_cfg_text(ir_text: str) -> tuple[str, bool]:
             fn_changed = True
         current = _join_function(header, blocks, footer)
         if fn_changed:
-            current = _cleanup_function_locally(current)
+            current = _cleanup_function_locally(current, context)
         out.append(current)
         changed = changed or fn_changed
     if not changed:

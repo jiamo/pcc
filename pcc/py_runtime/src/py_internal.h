@@ -13,6 +13,60 @@
 /* ---- Flags ------------------------------------------------------------- */
 #define PY_FLAG_IMMORTAL    0x1
 #define PY_FLAG_GC_TRACKED  0x2
+#define PY_FLAG_FINALIZED   0x4
+#define PY_FLAG_GC_WHITE    0x8
+#define PY_FLAG_GC_GRAY     0x10
+#define PY_FLAG_GC_BLACK    0x20
+#define PY_FLAG_GC_PINNED   0x40
+#define PY_FLAG_GC_YOUNG    0x80
+#define PY_FLAG_GC_OLD      0x100
+#define PY_FLAG_GC_REMEMBERED 0x200
+#define PY_FLAG_GC_SWEEP_CANDIDATE 0x400
+#define PY_FLAG_GC_RELOCATION_CANDIDATE 0x800
+#define PY_FLAG_GC_MINOR_ARENA 0x1000
+#define PY_FLAG_GC_RELOCATION_TARGET 0x2000
+#define PY_FLAG_GC_FRESH_ALLOC 0x4000
+#define PY_FLAG_GC_LARGE_DEFERRED 0x8000
+#define PY_FLAG_GC_ZPAGE_ALLOC 0x10000
+#define PY_FLAG_GC_COLOR_MASK \
+    (PY_FLAG_GC_WHITE | PY_FLAG_GC_GRAY | PY_FLAG_GC_BLACK)
+
+static inline int32_t py_header_flags_load(PyObjectHeader *h) {
+    return __atomic_load_n(&h->flags, __ATOMIC_ACQUIRE);
+}
+
+static inline void py_header_flags_store(PyObjectHeader *h, int32_t flags) {
+    __atomic_store_n(&h->flags, flags, __ATOMIC_RELEASE);
+}
+
+static inline void py_header_flags_or(PyObjectHeader *h, int32_t flags) {
+    (void)__atomic_or_fetch(&h->flags, flags, __ATOMIC_ACQ_REL);
+}
+
+static inline void py_header_flags_and(PyObjectHeader *h, int32_t flags) {
+    (void)__atomic_and_fetch(&h->flags, flags, __ATOMIC_ACQ_REL);
+}
+
+static inline int32_t py_header_flags_update(
+    PyObjectHeader *h,
+    int32_t clear_mask,
+    int32_t set_mask
+) {
+    int32_t old_flags = py_header_flags_load(h);
+    for (;;) {
+        int32_t new_flags = (old_flags & ~clear_mask) | set_mask;
+        if (__atomic_compare_exchange_n(
+                &h->flags,
+                &old_flags,
+                new_flags,
+                0,
+                __ATOMIC_ACQ_REL,
+                __ATOMIC_ACQUIRE
+            )) {
+            return new_flags;
+        }
+    }
+}
 
 /* ---- Type-specific deallocators (extern so py_obj.py can dispatch) -- */
 void py_dealloc_int(PyObject *o);
@@ -22,7 +76,114 @@ void py_dealloc_list(PyObject *o);
 void py_dealloc_tuple(PyObject *o);
 void py_dealloc_dict(PyObject *o);
 void py_dealloc_set(PyObject *o);
+void py_dealloc_func(PyObject *o);
+void py_dealloc_iter(PyObject *o);
+void py_dealloc_gen(PyObject *o);
+void py_dealloc_coroutine(PyObject *o);
+void py_dealloc_continuation(PyObject *o);
+void py_dealloc_task(PyObject *o);
+void py_dealloc_memoryview(PyObject *o);
+void py_dealloc_weakref(PyObject *o);
+void py_dealloc_file(PyObject *o);
+void py_dealloc_thread_lock(PyObject *o);
+void py_dealloc_thread_rlock(PyObject *o);
+void py_dealloc_thread_event(PyObject *o);
+void py_dealloc_thread_condition(PyObject *o);
+void py_dealloc_thread_semaphore(PyObject *o);
+void py_dealloc_thread_thread(PyObject *o);
+void py_dealloc_virtual_thread(PyObject *o);
 void py_dealloc_generic(PyObject *o);
+
+/* ---- GC backend selector/telemetry internals ------------------------- */
+void pcc_gc_note_alloc(int64_t bytes);
+void *pcc_gc_try_minor_alloc(int64_t bytes);
+void *pcc_gc_backend4_try_zpage_alloc(int64_t bytes, int32_t flags);
+void pcc_gc_note_object_allocated(PyObject *o);
+void pcc_gc_note_object_allocated_sized(PyObject *o, int64_t size);
+void pcc_gc_note_object_freeing(PyObject *o);
+void pcc_gc_free_object_memory(PyObject *o);
+void pcc_gc_note_load(void);
+PyObject *pcc_gc_note_relocation_read(PyObject *o);
+void pcc_gc_note_store(void);
+void pcc_gc_root_slot_lock(void);
+void pcc_gc_root_slot_unlock(void);
+void pcc_gc_note_safepoint(void);
+void pcc_gc_note_pin(int32_t delta);
+void pcc_gc_note_write_barrier(PyObject *owner, PyObject *value);
+void pcc_gc_note_slot_write_barrier(
+    PyObject *owner,
+    PyObject **slot,
+    PyObject *value
+);
+void pcc_gc_thread_unregister_buffers(void);
+int64_t pcc_gc_has_tracing_sweep(void);
+int64_t pcc_gc_collect_tracing(void);
+void pcc_gc_begin_explicit_tracing_collect(void);
+void pcc_gc_end_explicit_tracing_collect(void);
+int32_t pcc_gc_explicit_collect_is_active(void);
+typedef void (*PccGcRootVisitor)(PyObject *root, void *ctx);
+void pcc_gc_visit_runtime_roots(PccGcRootVisitor visit, void *ctx);
+void pcc_gc_note_frame_enter(const void *frame_map, PyObject **slots);
+void pcc_gc_note_frame_leave(PyObject **slots);
+
+/* ---- Threading/refcount substrate internals --------------------------- */
+typedef void *(*PccThreadMain)(void *arg);
+typedef struct PccThreadHandle PccThreadHandle;
+typedef struct PccMutex PccMutex;
+typedef struct PccCond PccCond;
+
+/* Runtime log sink used by C GC/allocation hot paths. The implementation is
+ * guarded by PCC_LOG at runtime, so calls are cheap when disabled. */
+int  pcc_runtime_log_enabled(const char *category);
+void pcc_runtime_log_event(const char *category, const char *event,
+                           int64_t value0, int64_t value1, const void *ptr);
+/* Integer-coded variant used by pcc-Python runtime ports that cannot cheaply
+ * materialize borrowed C string literals in every hot path. */
+void pcc_runtime_log_event_code(int32_t category, int32_t event, int64_t value0, int64_t value1, const void *ptr);
+
+int64_t pcc_refcount_incref(int64_t *slot);
+int64_t pcc_refcount_decref(int64_t *slot);
+int64_t pcc_refcount_load(int64_t *slot);
+void    pcc_refcount_forget(int64_t *slot);
+
+int64_t pcc_thread_start(
+    PccThreadHandle **out,
+    PccThreadMain entry,
+    void *arg
+);
+int64_t pcc_thread_join(PccThreadHandle *thread, void **result);
+void    pcc_thread_detach(PccThreadHandle *thread);
+
+PccMutex *pcc_mutex_new(void);
+void      pcc_mutex_free(PccMutex *mutex);
+int64_t   pcc_mutex_lock(PccMutex *mutex);
+int64_t   pcc_mutex_unlock(PccMutex *mutex);
+
+PccCond  *pcc_cond_new(void);
+void      pcc_cond_free(PccCond *cond);
+int64_t   pcc_cond_wait(PccCond *cond, PccMutex *mutex);
+int64_t   pcc_cond_timedwait_ms(PccCond *cond, PccMutex *mutex, int64_t timeout_ms);
+int64_t   pcc_cond_signal(PccCond *cond);
+int64_t   pcc_cond_broadcast(PccCond *cond);
+
+/* ---- GC tracker nodes for the refcount+cycle collector ---------------- */
+typedef struct PyGcNode {
+    PyObject *obj;
+    int64_t gc_refs;
+    int32_t reachable;
+    struct PyGcNode *prev;
+    struct PyGcNode *next;
+} PyGcNode;
+
+PyGcNode *py_gc_index_find(PyObject *obj);
+int64_t py_gc_index_insert(PyObject *obj, PyGcNode *node);
+PyGcNode *py_gc_index_remove(PyObject *obj);
+void *pcc_gc_object_index_find(PyObject *obj);
+int64_t pcc_gc_object_index_insert(PyObject *obj, void *node);
+void *pcc_gc_object_index_remove(PyObject *obj);
+void pcc_gc_object_index_clear(void);
+int64_t pcc_gc_object_is_known(PyObject *obj);
+int64_t pcc_gc_object_is_known_no_lock(PyObject *obj);
 
 /* ---- Tagged-int helpers ------------------------------------------------ */
 /* Encoding: low bit = 1 means value; shift right arithmetic to recover the
@@ -81,6 +242,29 @@ typedef struct {
     double value;
 } PyFloatObject;
 
+typedef struct {
+    PyObjectHeader h;
+    double real;
+    double imag;
+} PyComplexObject;
+
+typedef struct {
+    PyObjectHeader h;
+    int64_t byte_len;
+    char data[];
+} PyBytesObject;
+
+typedef struct {
+    PyObjectHeader h;
+    int64_t byte_len;
+    char data[];
+} PyByteArrayObject;
+
+typedef struct {
+    PyObjectHeader h;
+    PyObject *base;
+} PyMemoryViewObject;
+
 /* PyStrObject: UTF-8 encoded string.
  *
  * Phase 2 layout uses a flexible-array-member tail for the UTF-8 payload,
@@ -101,7 +285,11 @@ typedef struct {
 PyObject *py_str_new(const char *data, int64_t byte_len);
 int64_t py_str_byte_len(PyObject *s);
 const char *py_str_utf8(PyObject *s);
+PyObject *py_obj_repr(PyObject *o);
+PyObject *py_obj_ascii(PyObject *o);
 PyObject *py_obj_str(PyObject *o);
+PyObject *py_format_obj_to_str(PyObject *o, int use_repr);
+PyObject *py_float_to_str_obj(PyObject *o);
 
 typedef struct {
     PyObjectHeader h;
@@ -230,6 +418,9 @@ typedef struct PyClassObject {
     const char             **field_names;
     int32_t                  instance_size;
     int32_t                  type_tag_alloc;
+    PyObject               *del_method;
+    PyObject               *attrs;      /* owned dict for class-level variables */
+    struct PyClassObject   *metaclass;  /* borrowed class object for type attrs */
 } PyClassObject;
 
 /* Instance object: header + pointer to class + flexible field slot array.
@@ -243,6 +434,69 @@ typedef struct PyInstanceObject {
     PyClassObject          *cls;
     PyObject               *fields[];
 } PyInstanceObject;
+
+/* ValueBox objects are runtime object boxes for valueclass payloads at
+ * object/object-boundary crossings. The layout matches PyInstanceObject so
+ * that slots, GC tracing, and class dispatch can reuse instance behavior.
+ */
+typedef PyInstanceObject PyValueBoxObject;
+
+/* ---- Native function object -------------------------------------------- */
+
+typedef PyObject *(*PyNativeFuncEntry)(PyObject *captures, PyObject *args);
+
+typedef struct {
+    PyObjectHeader h;
+    PyNativeFuncEntry entry;
+    PyObject *captures;
+    const char *name;
+    PyObject *self_obj;
+} PyFuncObject;
+
+typedef struct PyWeakRefObject {
+    PyObjectHeader h;
+    PyObject *target;      /* borrowed weak target; NULL after invalidation */
+    PyObject *callback;    /* owned, may be NULL */
+    struct PyWeakRefObject *prev;
+    struct PyWeakRefObject *next;
+} PyWeakRefObject;
+
+/* ---- Native generator object ------------------------------------------- */
+
+typedef PyObject *(*PyNativeGenResume)(PyObject *gen, PyObject *frame);
+
+typedef struct {
+    PyObjectHeader h;
+    PyNativeGenResume resume;
+    PyObject *frame;
+    int64_t state;
+    int64_t done;
+    PyObject *send_value;
+} PyGenObject;
+
+typedef struct {
+    PyObjectHeader h;
+    PyObject *coro;
+    PyObject *result;
+    PyObject *waiter;
+    int64_t done;
+} PyTaskObject;
+
+struct PyContinuationStackChunk {
+    int32_t root_map_slot_count;
+    int32_t reserved;
+    int64_t slot_count;
+    PyObject **slots;
+};
+
+typedef struct {
+    PyObjectHeader h;
+    PyObject *continuation;
+    PyObject *result;
+    int64_t state;
+    int64_t queued;
+    int64_t pinned;
+} PyVirtualThreadObject;
 
 /* ---- Class / Instance API (py_class.c) -------------------------------- */
 
@@ -264,15 +518,29 @@ typedef struct PyInstanceObject {
 PyClassObject *py_class_new(const char *name,
                             PyClassObject **bases, int32_t n_bases,
                             const char **field_names, int32_t n_fields);
+PyObject *py_class_new_from_objects(PyObject *name,
+                                    PyObject *bases,
+                                    PyObject *ns);
+void py_class_mark_slots_only(PyClassObject *cls);
 
 /* Install a method on the class. `func` is borrowed (caller retains
  * ownership). Methods added after py_class_new are visible to subsequent
  * lookups but not to earlier instances — normal Python behavior. */
 void py_class_add_method(PyClassObject *cls, const char *name, PyObject *func);
+void py_class_set_metaclass(PyClassObject *cls, PyClassObject *metaclass);
 
 /* Walk the class's MRO and return the first method with the given name,
  * or NULL if none is found. Borrowed reference. */
 PyObject *py_class_lookup(PyClassObject *cls, const char *name);
+
+PyObject *py_class_attrs_dict(PyClassObject *cls, int64_t create);
+PyObject *py_class_getattr(PyClassObject *cls, const char *name);
+int64_t py_class_setattr(PyClassObject *cls, const char *name, PyObject *value);
+int64_t py_class_setattr_raw(PyClassObject *cls, const char *name, PyObject *value);
+int64_t py_class_apply_namespace_dict(PyClassObject *cls, PyObject *ns);
+int64_t py_class_delattr(PyClassObject *cls, const char *name);
+void py_class_attrs_dispose(PyClassObject *cls);
+int64_t py_class_attrs_retarget(PyClassObject *from, PyClassObject *to);
 
 /* Allocate an instance of `cls`. All field slots start at NULL. Returns a
  * new reference. Calls py_class_new implicit logic — no __init__ is
@@ -287,14 +555,20 @@ PyObject *py_instance_new(PyClassObject *cls);
 PyObject *py_instance_get_field(PyInstanceObject *inst, int32_t idx);
 void      py_instance_set_field(PyInstanceObject *inst, int32_t idx, PyObject *value);
 
+PyObject *py_valuebox_new(PyClassObject *cls);
+PyObject *py_valuebox_get_field(PyValueBoxObject *box, int32_t idx);
+void      py_valuebox_set_field(PyValueBoxObject *box, int32_t idx, PyObject *value);
+
 /* Generic attribute dispatch for PY_TYPE_INSTANCE / PY_TYPE_USER tags.
  * Tries `inst->cls->field_names` first, then MRO method lookup. Returns
  * a borrowed reference (caller may py_incref if keeping). */
 PyObject *py_instance_getattr(PyInstanceObject *inst, const char *name);
+PyObject *py_instance_getattr_default(PyInstanceObject *inst, const char *name);
 
 /* Attribute assignment. Returns 0 on success, -1 on failure (e.g. unknown
  * field and no method slot to accept). */
 int64_t py_instance_setattr(PyInstanceObject *inst, const char *name, PyObject *value);
+int64_t py_instance_delattr(PyInstanceObject *inst, const char *name);
 
 /* Shallow-copy a native instance and override named fields. Used by the
  * dataclasses.replace fast path on pcc-native class instances. */
@@ -341,6 +615,7 @@ void py_instance_dealloc(PyObject *o);
 #define PY_TYPE_PROPERTY      (PY_TYPE_USER + 1)
 #define PY_TYPE_CLASSMETHOD   (PY_TYPE_USER + 2)
 #define PY_TYPE_STATICMETHOD  (PY_TYPE_USER + 3)
+#define PY_TYPE_USER_CLASS_START (PY_TYPE_USER + 4)
 
 typedef struct {
     PyObjectHeader h;       /* type_tag = PY_TYPE_PROPERTY */
@@ -359,10 +634,17 @@ typedef struct {
     PyObject *func;
 } PyStaticMethodObject;
 
+typedef struct {
+    PyObjectHeader h;       /* type_tag = PY_TYPE_ITER */
+    PyObject *seq;          /* list / tuple / str / materialised dict keys */
+    int64_t index;          /* next index to return */
+} PyIterObject;
+
 /* Constructors (implemented in py_descr.c). All return new references. */
 PyObject *py_property_new(PyObject *fget, PyObject *fset, PyObject *fdel);
 PyObject *py_classmethod_new(PyObject *func);
 PyObject *py_staticmethod_new(PyObject *func);
+PyObject *py_instance_bind_method(PyObject *method, PyObject *self, const char *name);
 
 /* In-place setter/deleter replacement — used by the @name.setter /
  * @name.deleter decorator form where a second `def` with the same
@@ -448,31 +730,6 @@ typedef struct PyExceptionObject {
     int32_t             cap_frames;
 } PyExceptionObject;
 
-/* Built-in exception tags. The frontend passes one of these to
- * py_exc_new; the runtime maps each to the lazily-bootstrapped class
- * returned by py_exc_builtin_class. Keep these in sync with
- * PY_EXC_BUILTIN_NAMES in py_exc.c. */
-enum {
-    PY_EXC_BASE              = 0,   /* BaseException */
-    PY_EXC_EXCEPTION         = 1,   /* Exception */
-    PY_EXC_VALUEERROR        = 2,
-    PY_EXC_TYPEERROR         = 3,
-    PY_EXC_KEYERROR          = 4,
-    PY_EXC_INDEXERROR        = 5,
-    PY_EXC_ATTRIBUTEERROR    = 6,
-    PY_EXC_RUNTIMEERROR      = 7,
-    PY_EXC_STOPITERATION     = 8,
-    PY_EXC_ZERODIVISIONERROR = 9,
-    PY_EXC_NAMEERROR         = 10,
-    PY_EXC_NOTIMPLEMENTEDERROR = 11,
-    PY_EXC_ARITHMETICERROR   = 12,
-    PY_EXC_LOOKUPERROR       = 13,
-    PY_EXC_OSERROR           = 14,
-    PY_EXC_OVERFLOWERROR     = 15,
-    PY_EXC_ASSERTIONERROR    = 16,
-    PY_EXC_N_BUILTIN         = 17
-};
-
 /* Lazily allocate and cache the builtin exception class for `tag`.
  * Returns a borrowed reference — the runtime holds a permanent ref on
  * every builtin class so callers need not incref. */
@@ -498,6 +755,7 @@ void py_dealloc_exc(PyObject *o);
  * encounter a large bignum should use py_int_to_i64 (public ABI) with the
  * overflow out-param instead. */
 int64_t py_int_value_i64(PyObject *o);
+int64_t py_int_bit_length(PyObject *o);
 
 /* Access typed fields. */
 static inline PyObjectHeader *py_header(PyObject *o) {
@@ -558,6 +816,19 @@ PyIntObject *py_bigint_from_cstr(const char *s);
 /* Dynamic dunder helpers implemented in py_dunder.c. */
 PyObject *py_int_to_str_obj(PyObject *o);
 PyObject *py_user_str_dispatch(PyObject *o);
+PyObject *py_user_repr_dispatch(PyObject *o);
+void py_user_del_dispatch(PyObject *o);
+int64_t py_user_hash_dispatch(PyObject *o, int64_t *handled);
+PyObject *py_user_iter_dispatch(PyObject *o);
+PyObject *py_user_next_dispatch(PyObject *o);
+PyObject *py_user_matmul_dispatch(PyObject *a, PyObject *b);
+int64_t py_user_len_dispatch(PyObject *o, int64_t *handled);
+int64_t py_user_bool_dispatch(PyObject *o, int64_t *handled);
+int64_t py_obj_index_i64(PyObject *o);
+int64_t py_user_contains_dispatch(PyObject *o, PyObject *item, int64_t *handled);
+PyObject *py_user_getitem_dispatch(PyObject *o, PyObject *key);
+int64_t py_user_setitem_dispatch(PyObject *o, PyObject *key, PyObject *value, int64_t *handled);
+int64_t py_user_delitem_dispatch(PyObject *o, PyObject *key, int64_t *handled);
 
 /* Bitwise ops (treat operands as two's-complement of infinite width). */
 PyIntObject *py_bigint_and(const PyIntObject *a, const PyIntObject *b);
@@ -577,5 +848,16 @@ PyIntObject *py_bigint_pow(const PyIntObject *base, const PyIntObject *exp);
  * divide-by-zero or alloc failure. */
 int py_bigint_divmod(const PyIntObject *a, const PyIntObject *b,
                      PyIntObject **q_out, PyIntObject **r_out);
+
+/* Multi-phase C-extension init (py_capi_shim.c): a PyInit_* that returns
+ * PyModuleDef_Init(&def) yields a module DEF, not a ready module. The loader
+ * detects it (pcc_capi_is_moduledef) and runs the Py_mod_exec slots to build the
+ * real module (pcc_capi_module_exec). numpy's _multiarray_umath needs this. */
+int pcc_capi_is_moduledef(PyObject *o);
+PyObject *pcc_capi_module_exec(PyObject *def_as_obj);
+void pcc_capi_visit_extension_module_state_roots(
+    PccGcRootVisitor visit,
+    void *ctx
+);
 
 #endif /* PY_INTERNAL_H */

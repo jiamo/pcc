@@ -4,11 +4,16 @@ String-to-int parsing for int(str) / int(str, base). The arithmetic core
 stays in py_int.c for now; this module only parses an int64 payload and
 delegates canonical tagged-vs-heap construction to py_int_from_i64.
 """
-from pcc.extern import extern, c_abi_export, c_ptr, c_int64
-from pcc.unsafe import load_i8, null, ptr_is_null
+from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void
+from pcc.unsafe import cstr, load_i8, null, ptr_is_null
 
 
 py_int_from_i64 = extern("py_int_from_i64", (c_int64,),       c_ptr)
+py_int_mul      = extern("py_int_mul",      (c_ptr, c_ptr),   c_ptr)
+py_int_add      = extern("py_int_add",      (c_ptr, c_ptr),   c_ptr)
+py_decref       = extern("py_decref",       (c_ptr,),         c_void)
+py_raise        = extern("py_raise",        (c_ptr,),         c_void)
+py_exc_new      = extern("py_exc_new",      (c_int64, c_ptr), c_ptr)
 
 
 def _byte_at(s, i: int) -> int:
@@ -49,6 +54,48 @@ def _has_prefix(s, i: int, lo: int, hi: int) -> int:
     if c == hi:
         return 1
     return 0
+
+
+def _parse_bigint(s, start: int, base: int, negative: int):
+    # Bigint fallback for decimals/values that exceed int64. Accumulates with
+    # the general int ops (py_int_mul / py_int_add), which handle bignum.
+    # ``start`` is the first digit position (after sign/prefix).
+    base_obj = py_int_from_i64(base)
+    acc = py_int_from_i64(0)
+    i: int = start
+    done: int = 0
+    while done == 0:
+        ch: int = _byte_at(s, i)
+        if ch == 0:
+            done = 1
+        else:
+            d: int = _digit_value(ch)
+            if d < 0:
+                done = 1
+            elif d >= base:
+                done = 1
+            else:
+                prod = py_int_mul(acc, base_obj)
+                py_decref(acc)
+                dobj = py_int_from_i64(d)
+                acc = py_int_add(prod, dobj)
+                py_decref(prod)
+                py_decref(dobj)
+                i = i + 1
+    py_decref(base_obj)
+    # Trailing: optional whitespace then NUL, matching the int64 path.
+    while _is_space(_byte_at(s, i)) != 0:
+        i = i + 1
+    if _byte_at(s, i) != 0:
+        py_decref(acc)
+        return null()
+    if negative != 0:
+        neg_one = py_int_from_i64(-1)
+        res = py_int_mul(acc, neg_one)
+        py_decref(acc)
+        py_decref(neg_one)
+        return res
+    return acc
 
 
 @c_abi_export("py_int_from_cstr")
@@ -109,6 +156,7 @@ def py_int_from_cstr(s, base: int):
         else:
             neg_rem = neg_rem + 1
 
+    digits_start: int = i
     value: int = 0
     saw_digit: int = 0
     min_exact: int = 0
@@ -130,10 +178,10 @@ def py_int_from_cstr(s, base: int):
                     div_limit = neg_div
                     rem_limit = neg_rem
                 if value > div_limit:
-                    return null()
+                    return _parse_bigint(s, digits_start, base, negative)
                 if value == div_limit:
                     if d > rem_limit:
-                        return null()
+                        return _parse_bigint(s, digits_start, base, negative)
                     if negative != 0:
                         if value > max_div:
                             min_exact = 1
@@ -162,3 +210,16 @@ def py_int_from_cstr(s, base: int):
             return py_int_from_i64(min_i64)
         return py_int_from_i64(0 - value)
     return py_int_from_i64(value)
+
+
+@c_abi_export("py_int_from_cstr_or_raise")
+def py_int_from_cstr_or_raise(s, base: int):
+    # int(str) builtin: parse like py_int_from_cstr but raise ValueError on
+    # invalid input instead of returning NULL (which the frontend would unbox to
+    # 0 -> int('xyz') silently became 0). Mirrors py_int_from_cstr_or_raise in
+    # py_int_parse.c; py_int_from_cstr stays NULL-returning for other callers.
+    v = py_int_from_cstr(s, base)
+    if ptr_is_null(v) == 0:
+        return v
+    py_raise(py_exc_new(2, cstr("invalid literal for int()")))  # PY_EXC_VALUEERROR
+    return null()

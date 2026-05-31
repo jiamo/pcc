@@ -106,6 +106,28 @@ int64_t py_int_value_i64(PyObject *o) {
     return b->sign < 0 ? INT64_MIN : INT64_MAX;
 }
 
+/* int.bit_length(): number of bits to represent abs(value), 0 for 0. Exact for
+ * bignums: (ndigits-1)*32 + bits in the top base-2^32 digit. */
+int64_t py_int_bit_length(PyObject *o) {
+    if (o == NULL) return 0;
+    if (PY_IS_TAGGED_INT(o)) {
+        int64_t v = py_untag_int(o);
+        uint64_t a = (v < 0) ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
+        int64_t bits = 0;
+        while (a > 0) { bits++; a >>= 1; }
+        return bits;
+    }
+    if (py_header(o)->type_tag == PY_TYPE_INT) {
+        const PyIntObject *b = (const PyIntObject *)o;
+        if (b->ndigits <= 0) return 0;
+        uint32_t top = b->digits[b->ndigits - 1];
+        int64_t top_bits = 0;
+        while (top > 0) { top_bits++; top >>= 1; }
+        return (int64_t)(b->ndigits - 1) * 32 + top_bits;
+    }
+    return 0;
+}
+
 PyObject *py_int_from_i64(int64_t v) {
     if (v >= PY_TAGGED_INT_MIN && v <= PY_TAGGED_INT_MAX) {
         return py_tag_int(v);

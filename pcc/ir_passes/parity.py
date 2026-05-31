@@ -174,6 +174,25 @@ def _strip_llvm_boilerplate(text: str) -> str:
     return text
 
 
+def _replace_numeric_names_in_line(
+    line: str,
+    mapping: dict[str, str],
+    counter: int,
+) -> tuple[str, int]:
+    out: list[str] = []
+    pos = 0
+    for match in _NUM_NAME_RE.finditer(line):
+        key = match.group(1)
+        if key not in mapping:
+            mapping[key] = f"n{counter}"
+            counter += 1
+        out.append(line[pos : match.start()])
+        out.append(f"%{mapping[key]}")
+        pos = match.end()
+    out.append(line[pos:])
+    return "".join(out), counter
+
+
 def _normalize_numeric_names(text: str) -> str:
     """Rewrite ``%<digits>`` names densely per function.
 
@@ -189,16 +208,8 @@ def _normalize_numeric_names(text: str) -> str:
         if line.startswith("define "):
             mapping.clear()
             counter = 0
-
-        def repl(match: re.Match[str]) -> str:
-            nonlocal counter
-            key = match.group(1)
-            if key not in mapping:
-                mapping[key] = f"n{counter}"
-                counter += 1
-            return f"%{mapping[key]}"
-
-        out.append(_NUM_NAME_RE.sub(repl, line))
+        replaced, counter = _replace_numeric_names_in_line(line, mapping, counter)
+        out.append(replaced)
     return "".join(out)
 
 

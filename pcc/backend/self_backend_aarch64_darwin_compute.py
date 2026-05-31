@@ -45,11 +45,22 @@ from .self_backend_parse import (
 
 
 def _vector_lane_stride(vector_type):
-    if not vector_type.is_array or vector_type.elem is None or not (vector_type.elem.is_int or vector_type.elem.is_fp):
+    if not vector_type.is_array or vector_type.elem is None:
         raise BackendUnavailable(
-            f"self backend vector lowering currently expects integer/fp vector lanes, got {vector_type.describe()}"
+            f"self backend vector lowering currently expects array vector lanes, got {vector_type.describe()}"
         )
-    return vector_type.elem, vector_type.elem.slot_size
+    lane_type = vector_type.elem
+    # Pointer-lane vectors are not arithmetic vectors for the self backend, but
+    # they are valid aggregate values in LLVM IR.  Lua/NumPy-shaped C lowering
+    # uses forms such as [2 x void*] for table/function dispatch data.  Treat
+    # each lane as an 8-byte scalar for extract/insert/shuffle/select and
+    # slot/memory copying.  Arithmetic/reduction intrinsics are still guarded by
+    # their individual callers and remain int/fp-only.
+    if not (lane_type.is_int or lane_type.is_fp or lane_type.is_ptr):
+        raise BackendUnavailable(
+            f"self backend vector lowering currently expects integer/fp/ptr vector lanes, got {vector_type.describe()}"
+        )
+    return lane_type, lane_type.slot_size
 
 
 def _emit_vector_storage_address(
@@ -194,11 +205,20 @@ def _emit_insertelement(
     if vector_value in {"poison", "zeroinitializer"}:
         lines = zero_slot(dest_slot)
     else:
-        lines = copy_large_aggregate_value_to_slot(func, vector_value, vector_type, dest_slot)
+        lines = copy_large_aggregate_value_to_slot(
+            func, vector_value, vector_type, dest_slot, module_symbols=module_symbols
+        )
+    # Materialize the new element BEFORE computing the dest address.
+    # ``materialize_value`` may pick ``x15`` as a scratch GPR via
+    # ``pick_scratch_gpr`` (e.g. when reading an SSA slot whose offset
+    # exceeds 255 in a large frame like lua_newstate's). If we set
+    # ``x15`` to the dest address first, that scratch use clobbers it
+    # and the lane store ends up writing back into the *source* slot,
+    # silently dropping the inserted element.
+    lines.extend(materialize_value(func, elem_value, elem_type, 9, module_symbols))
     lines.extend(emit_slot_base_address(dest_slot, "x15"))
     if lane_index:
         lines.extend(emit_add_offset("x15", "x15", lane_index * lane_stride))
-    lines.extend(materialize_value(func, elem_value, elem_type, 9, module_symbols))
     lines.extend(store_value_to_address("x15", elem_type, 9))
     return lines
 
@@ -570,7 +590,9 @@ def _emit_insertvalue(
             )
         )
     else:
-        lines = copy_large_aggregate_value_to_slot(func, aggregate_value, aggregate_type, dest_slot)
+        lines = copy_large_aggregate_value_to_slot(
+            func, aggregate_value, aggregate_type, dest_slot, module_symbols=module_symbols
+        )
     if elem_type.is_array or elem_type.is_struct:
         lines.extend(emit_slot_base_address(dest_slot, "x15"))
         if offset:

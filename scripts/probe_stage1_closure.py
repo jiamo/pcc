@@ -18,7 +18,7 @@ import traceback
 
 
 def _set_env_defaults() -> None:
-    os.environ.setdefault("PCC_PYTHON_LIBPYTHON", "auto")
+    os.environ.setdefault("PCC_PYTHON_LIBPYTHON", "off")
 
 
 def _try_per_module_lower(srcs: list[str], mods: list[str]):

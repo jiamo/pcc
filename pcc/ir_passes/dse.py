@@ -1,4 +1,4 @@
-"""Dead Store Elimination (DSE) — IR-level, block-local subset.
+"""Dead Store Elimination (DSE) — IR-level, conservative local subset.
 
 Upstream reference:
 
@@ -10,25 +10,27 @@ Upstream reference:
   bits analysis, cross-block stores via dominator walks, and a
   number of noalias-library-call hints.
 
-Staged subset implemented here (block-local; labelled ``subset``):
+Staged subset implemented here (labelled ``subset``):
 
 - within a single basic block, scan forward; record the latest
   store to each pointer,
 - whenever we see a new store to the same pointer with no
   intervening load/call that may read it, the previous store is dead
   and removed,
-- when a block ends in ``ret`` / ``unreachable``, drop trailing stores
-  to non-escaping local ``alloca`` slots that are never read again,
+- trailing stores to local stack slots (``alloca`` and exact no-op
+  aliases) are removed at function exits,
+- pending local stack-slot stores may cross one unconditional edge
+  only when the successor has that block as its single predecessor,
 - any instruction that might-alias (load/call) flushes the pending
-  stores,
+  stores; calls are treated as full barriers,
 - ``volatile store`` acts as a barrier and is never removed.
 
-Cross-block DSE (which requires MemorySSAWalker) is deferred; our
-MemorySSA staging only models per-block clobber chains, plus one
-additional narrow case: pending stores are carried across an
-unconditional jump into a single-predecessor successor block, so a
-later overwriting store in that linear successor can kill the earlier
-store.
+General cross-block DSE still requires a real MemorySSA/escape model.
+The Python self-host pipeline constructs many short-lived container/AST
+objects; the previous optimistic subset misclassified some of those
+stores as dead and compiled empty lists. Keep non-local pointers and
+multi-predecessor control flow deliberately conservative until the alias
+model is strong enough to prove those cases.
 """
 
 from __future__ import annotations
@@ -41,23 +43,25 @@ from .alias_analysis import AliasAnalysis, AliasResult
 from .dce import dce_module_text as run_local_dce
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
 
-
 _STORE_RE = re.compile(
     r"^(?P<indent>\s*)store(?P<volatile>\s+volatile)?\b.*?,\s*ptr\s+[%@](?P<ptr>[\w\.]+)"
 )
-_LOAD_RE = re.compile(
-    r"^\s*%[\w\.]+\s*=\s*load\b.*?,\s*ptr\s+[%@](?P<ptr>[\w\.]+)"
-)
-_ALLOCA_RE = re.compile(r"^\s*%(?P<ptr>[\w\.]+)\s*=\s*alloca\b")
-_LABEL_RE = re.compile(r"^(?P<label>[\w\.]+):\s*$")
-_BR_RE = re.compile(r"^\s*br\s+label\s+%(?P<label>[\w\.]+)\s*$")
+_LOAD_RE = re.compile(r"^\s*%[\w\.]+\s*=\s*load\b.*?,\s*ptr\s+[%@](?P<ptr>[\w\.]+)")
+_LABEL_RE = re.compile(r"^(?P<label>[\w\.]+):(?:\s*;.*)?\s*$")
 _BITCAST_ALIAS_RE = re.compile(
     r"^\s*%(?P<dst>[\w\.]+)\s*=\s*bitcast\s+ptr\s+[%@](?P<src>[\w\.]+)\s+to\s+ptr\b"
 )
 _ZERO_GEP_ALIAS_RE = re.compile(
     r"^\s*%(?P<dst>[\w\.]+)\s*=\s*getelementptr(?:\s+inbounds)?\s+[^,]+,\s+ptr\s+[%@](?P<src>[\w\.]+)\s*,\s*i\d+\s+0\s*$"
 )
-_SSA_TOKEN_RE = re.compile(r"%([\w\.]+)\b")
+_ALLOCA_RE = re.compile(r"^\s*%(?P<ptr>[\w\.]+)\s*=\s*alloca\b")
+_UNCOND_BR_RE = re.compile(r"^\s*br\s+label\s+%(?P<label>[\w\.]+)\s*$")
+_COND_BR_RE = re.compile(
+    r"^\s*br\s+i1\s+[^,]+,\s*label\s+%(?P<t>[\w\.]+),\s*label\s+%(?P<f>[\w\.]+)\s*$"
+)
+
+
+BlockKey = tuple[int, str]
 
 
 class DSEPass(ModulePass):
@@ -82,21 +86,17 @@ class DSEPass(ModulePass):
         return PreservedAnalyses.none()
 
 
-def dse_module_text(
-    ir_text: str, aa: AliasAnalysis
-) -> tuple[str, bool]:
+def dse_module_text(ir_text: str, aa: AliasAnalysis) -> tuple[str, bool]:
     """Drop redundant intra-block stores."""
     lines = ir_text.splitlines(keepends=True)
-    # Find basic block boundaries by the `label:` prefix or `define`.
     dead_lines: set[int] = set()
     pending: dict[str, int] = {}  # pointer name → line index of last store
     in_fn = False
-    fn_start = 0
-    local_allocas: set[str] = set()
-    escaping_allocas: set[str] = set()
-    preds_by_fn: dict[int, dict[str, int]] = {}
-    carry_edges_by_fn: dict[int, dict[str, str]] = {}
+    fn_id = -1
+    current_block: BlockKey | None = None
     exact_aliases: dict[str, str] = {}
+    successors, predecessors = _scan_cfg(lines)
+    local_allocas = _scan_local_allocas(lines)
 
     def canonical_ptr(ptr: str) -> str:
         current = ptr
@@ -123,8 +123,6 @@ def dse_module_text(
         to_clear = []
         for ptr in pending:
             if ptr_read is None:
-                if ptr in local_allocas and ptr not in escaping_allocas:
-                    continue
                 to_clear.append(ptr)
                 continue
             if aa.alias_names(ptr, ptr_read) != AliasResult.NoAlias:
@@ -132,161 +130,54 @@ def dse_module_text(
         for p in to_clear:
             pending.pop(p, None)
 
-    def collect_local_allocas(fn_lines: list[str]) -> tuple[set[str], set[str]]:
-        allocas: set[str] = set()
-        aliases_to_alloca: dict[str, str] = {}
-
-        def alias_base(name: str) -> str:
-            current = name
-            seen: set[str] = set()
-            while current in aliases_to_alloca and current not in seen:
-                seen.add(current)
-                nxt = aliases_to_alloca[current]
-                if nxt == current:
-                    break
-                current = nxt
-            return current
-
-        for line in fn_lines:
-            match = _ALLOCA_RE.match(line.strip())
-            if match is not None:
-                allocas.add(match.group("ptr"))
-                aliases_to_alloca[match.group("ptr")] = match.group("ptr")
-                continue
-            alias = exact_alias_source(line.strip())
-            if alias is None:
-                continue
-            dst, src = alias
-            base = aliases_to_alloca.get(src)
-            if base is not None:
-                aliases_to_alloca[dst] = base
-        escaping: set[str] = set()
-        for raw_line in fn_lines:
-            line = raw_line.strip()
-            if not line:
-                continue
-            if _ALLOCA_RE.match(line):
-                continue
-            if exact_alias_source(line) is not None:
-                continue
-            names = _SSA_TOKEN_RE.findall(line)
-            if not names:
-                continue
-            store_match = _STORE_RE.match(line)
-            load_match = _LOAD_RE.match(line)
-            for name in names:
-                base = aliases_to_alloca.get(name)
-                if base is None:
-                    continue
-                if store_match is not None and alias_base(store_match.group("ptr")) == base:
-                    continue
-                if load_match is not None and alias_base(load_match.group("ptr")) == base:
-                    continue
-                escaping.add(base)
-        return allocas, escaping
-
-    def collect_cfg_hints(fn_lines: list[str]) -> tuple[dict[str, int], dict[str, str]]:
-        labels: list[str] = []
-        preds: dict[str, int] = {}
-        carry_from_pred: dict[str, str] = {}
-        current_label: str | None = None
-        current_insts: list[str] = []
-
-        def finish_block() -> None:
-            nonlocal current_label, current_insts
-            if current_label is None:
-                return
-            preds.setdefault(current_label, 0)
-            if current_insts:
-                term = current_insts[-1]
-                m = _BR_RE.match(term)
-                if m is not None:
-                    dst = m.group("label")
-                    preds[dst] = preds.get(dst, 0) + 1
-                    carry_from_pred[dst] = current_label
-                elif term.startswith("br "):
-                    for dst in re.findall(r"label\s+%([\w\.]+)", term):
-                        preds[dst] = preds.get(dst, 0) + 1
-                else:
-                    for dst in re.findall(r"label\s+%([\w\.]+)", term):
-                        preds[dst] = preds.get(dst, 0) + 1
-            current_label = None
-            current_insts = []
-
-        for raw in fn_lines:
-            stripped = raw.strip()
-            m = _LABEL_RE.match(stripped)
-            if m is not None:
-                finish_block()
-                current_label = m.group("label")
-                labels.append(current_label)
-                preds.setdefault(current_label, 0)
-                continue
-            if current_label is None:
-                continue
-            if stripped:
-                current_insts.append(stripped)
-        finish_block()
-        if labels:
-            preds[labels[0]] = preds.get(labels[0], 0)
-        single_pred_carry = {
-            label: pred
-            for label, pred in carry_from_pred.items()
-            if preds.get(label, 0) == 1
-        }
-        return preds, single_pred_carry
-
     def flush_dead_locals_at_block_end():
         for ptr, line_idx in list(pending.items()):
-            if ptr in local_allocas and ptr not in escaping_allocas:
+            if is_local_alloca(ptr):
                 dead_lines.add(line_idx)
+        pending.clear()
+
+    def is_local_alloca(ptr: str) -> bool:
+        return canonical_ptr(ptr) in local_allocas.get(fn_id, set())
+
+    def keep_only_dead_local_candidates() -> None:
+        for ptr in list(pending.keys()):
+            if not is_local_alloca(ptr):
                 pending.pop(ptr, None)
+
+    def can_carry_to_successor(
+        pred: BlockKey | None,
+        succ: BlockKey,
+    ) -> bool:
+        if pred is None:
+            return False
+        return successors.get(pred) == [succ] and predecessors.get(succ) == {pred}
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("define "):
             in_fn = True
-            fn_start = idx
+            fn_id += 1
+            current_block = None
             pending.clear()
             exact_aliases.clear()
-            end_idx = idx + 1
-            while end_idx < len(lines):
-                if lines[end_idx].strip() == "}":
-                    break
-                end_idx += 1
-            local_allocas, escaping_allocas = collect_local_allocas(
-                lines[idx + 1 : end_idx]
-            )
-            preds, carry_edges = collect_cfg_hints(lines[idx + 1 : end_idx])
-            preds_by_fn[fn_start] = preds
-            carry_edges_by_fn[fn_start] = carry_edges
             continue
         if stripped == "}":
             in_fn = False
+            current_block = None
             pending.clear()
             exact_aliases.clear()
-            local_allocas = set()
-            escaping_allocas = set()
             continue
         if not in_fn:
             continue
         # New basic block — anything beginning with `<label>:` line-alone.
         label_match = _LABEL_RE.match(stripped)
         if label_match is not None:
-            carry_edges = carry_edges_by_fn.get(fn_start, {})
-            label = label_match.group("label")
-            prev_label = None
-            # Find the label of the previous block by scanning back to the
-            # nearest preceding label line within the function body.
-            back = idx - 1
-            while back > fn_start:
-                prev_match = _LABEL_RE.match(lines[back].strip())
-                if prev_match is not None:
-                    prev_label = prev_match.group("label")
-                    break
-                back -= 1
-            if carry_edges.get(label) != prev_label:
+            next_block = (fn_id, label_match.group("label"))
+            if can_carry_to_successor(current_block, next_block):
+                keep_only_dead_local_candidates()
+            else:
                 pending.clear()
+            current_block = next_block
             continue
 
         alias = exact_alias_source(stripped)
@@ -327,7 +218,11 @@ def dse_module_text(
         if stripped.startswith("ret ") or stripped == "unreachable":
             flush_dead_locals_at_block_end()
             continue
-        if stripped.startswith("atomicrmw") or stripped.startswith("fence") or stripped.startswith("cmpxchg"):
+        if (
+            stripped.startswith("atomicrmw")
+            or stripped.startswith("fence")
+            or stripped.startswith("cmpxchg")
+        ):
             flush_on_may_read(None)
             continue
 
@@ -338,3 +233,75 @@ def dse_module_text(
     new_text = "".join(new_lines)
     new_text, _ = run_local_dce(new_text)
     return new_text, True
+
+
+def _scan_local_allocas(lines: list[str]) -> dict[int, set[str]]:
+    local_allocas: dict[int, set[str]] = {}
+    in_fn = False
+    fn_id = -1
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("define "):
+            in_fn = True
+            fn_id += 1
+            local_allocas.setdefault(fn_id, set())
+            continue
+        if stripped == "}":
+            in_fn = False
+            continue
+        if not in_fn:
+            continue
+        match = _ALLOCA_RE.match(stripped)
+        if match is not None:
+            local_allocas.setdefault(fn_id, set()).add(match.group("ptr"))
+    return local_allocas
+
+
+def _scan_cfg(
+    lines: list[str],
+) -> tuple[dict[BlockKey, list[BlockKey]], dict[BlockKey, set[BlockKey]]]:
+    successors: dict[BlockKey, list[BlockKey]] = {}
+    predecessors: dict[BlockKey, set[BlockKey]] = {}
+    in_fn = False
+    fn_id = -1
+    current_block: BlockKey | None = None
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("define "):
+            in_fn = True
+            fn_id += 1
+            current_block = None
+            continue
+        if stripped == "}":
+            in_fn = False
+            current_block = None
+            continue
+        if not in_fn:
+            continue
+
+        label_match = _LABEL_RE.match(stripped)
+        if label_match is not None:
+            current_block = (fn_id, label_match.group("label"))
+            successors.setdefault(current_block, [])
+            predecessors.setdefault(current_block, set())
+            continue
+        if current_block is None:
+            continue
+
+        targets: list[BlockKey] = []
+        uncond = _UNCOND_BR_RE.match(stripped)
+        if uncond is not None:
+            targets.append((fn_id, uncond.group("label")))
+        else:
+            cond = _COND_BR_RE.match(stripped)
+            if cond is not None:
+                targets.append((fn_id, cond.group("t")))
+                targets.append((fn_id, cond.group("f")))
+        if not targets:
+            continue
+        successors[current_block] = targets
+        for target in targets:
+            predecessors.setdefault(target, set()).add(current_block)
+
+    return successors, predecessors

@@ -1,6 +1,11 @@
+fred.txt
+pcc/py_runtime/libpy_runtime.a.target
 .DS_Store
 *.out
 *.s
+!projects/postgresql-17.4/src/backend/port/tas/dummy.s
+# Top-level LLVM IR debug dumps (subdir .ll fixtures stay tracked)
+/*.ll
 # Byte-compiled / optimized / DLL files
 .pytest_cache/
 parser.out
@@ -160,3 +165,43 @@ pcc/py_runtime/libpy_runtime_pcc_py.a
 pcc/py_runtime/build_pcc/
 pcc/py_runtime/build_py/
 pcc/py_runtime/libpy_runtime_pcc_py_libpython.a
+pcc/py_runtime/libpy_runtime_pcc_py.a.target
+output/
+pcc1
+pcc2
+pcc3
+build_tmp.ll
+pcc1_opt
+pcc1_preset
+*.ll
+tiny_test_bin
+reports/
+!docs/reports/
+docs/reports/*
+!docs/reports/disassemble-corpus.md
+!docs/reports/pytorch-claim-policy.md
+platform.info
+pcc1_auto
+pcc2_src
+pcc/py_runtime/libpy_runtime_pcc_py_libpython.a.target
+.antigravitycli/
+
+# Local-only active docs (top-level indexes + plans in progress)
+docs/current-goal-state.md
+docs/tasksV2.md
+docs/pcc_multi_year_roadmap.md
+docs/plans/python.md
+docs/plans/pytorch.md
+docs/plans/disassemble.md
+docs/plans/python-valhalla-value-model-plan.md
+docs/plans/python-compat-specialization-strategy.md
+docs/plans/numpy_plan.md
+docs/plans/numpy_ecosystem_plan.md
+docs/plans/numpy-capi-provider-design.md
+pcc/py_runtime/libpy_runtime_libpython.a.target
+codex-goal-prompt.md
+todo.md
+pcc/py_runtime/build_asan/
+pcc/py_runtime/libpy_runtime_asan.a
+.understand-anything/
+pcc/py_runtime/libpy_runtime_pcc.a.target

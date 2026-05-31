@@ -28,8 +28,13 @@ not rebuilding all of CPython.
 | `time` | stub | binds libc via extern (time, monotonic, sleep) |
 | `string` | skeleton | ascii_lowercase/uppercase/digits constants |
 | `base64` | skeleton | b64encode, b64decode |
-| `urllib.parse` | skeleton | quote, unquote, urlparse |
-| `typing` | noop | List/Dict/Optional/Union as generic markers |
+| `urllib.parse` | skeleton | package-style native dotted import; quote, unquote, urlparse subset |
+| `typing` | noop+ | Generic/Protocol/TypeVar/NewType/Annotated markers, get_origin/get_args |
+| `types` | skeleton | SimpleNamespace, ModuleType, MappingProxyType, marker type aliases |
+| `abc` | skeleton+ | ABCMeta, abstract decorators, register/cache token |
+| `enum` | skeleton+ | Enum/IntEnum, auto, unique, iteration/value lookup |
+| `inspect` | skeleton | signature, predicates, getmembers/getdoc/unwrap |
+| `weakref` | skeleton | ref/proxy/WeakValueDictionary/WeakKeyDictionary/WeakSet/finalize |
 | `dataclasses` | skeleton | @dataclass decorator |
 | `builtins` | skeleton | int/str/bytes/bool/list/dict/... constructors |
 

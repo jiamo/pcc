@@ -11,9 +11,12 @@ Type tags (inlined per the module-init gotcha):
     PY_TYPE_NONE  = 0   PY_TYPE_BOOL  = 1   PY_TYPE_INT   = 2
     PY_TYPE_FLOAT = 3   PY_TYPE_STR   = 4   PY_TYPE_LIST  = 5
     PY_TYPE_DICT  = 6   PY_TYPE_TUPLE = 7   PY_TYPE_SET   = 8
+    PY_TYPE_BYTES = 17  PY_TYPE_BYTEARRAY = 18  PY_TYPE_MEMORYVIEW = 19
 
 Object layouts:
     PyStrObject:  byte_len@16 (i64), cp_len@24, hash@32 (i64, -1=unset), data@40
+    PyBytesObject/PyByteArrayObject: byte_len@16 (i64), data@24
+    PyMemoryViewObject: base@16 (ptr)
     PyListObject: length@16   (i64),  capacity@24, items@32 (ptr)
     PyTupleObject: len@16     (i64),  items[]@24  (flex)
 
@@ -21,7 +24,7 @@ FNV-1a constants (verified to work in pcc-Python signed-i64):
     offset basis: 0xcbf29ce484222325 = -3750763034362895579 (signed)
     prime:        0x100000001b3      =  1099511628211
 """
-from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
+from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void, c_double
 from pcc.unsafe import (
     global_load_ptr,
     is_tagged_int,
@@ -39,6 +42,7 @@ from pcc.unsafe import (
 py_int_value_i64     = extern("py_int_value_i64",     (c_ptr,),                    c_int64)
 py_int_from_i64      = extern("py_int_from_i64",      (c_int64,),                  c_ptr)
 py_int_cmp           = extern("py_int_cmp",           (c_ptr, c_ptr),              c_int32)
+py_float_to_f64      = extern("py_float_to_f64",      (c_ptr,),                    c_double)
 
 py_str_eq            = extern("py_str_eq",            (c_ptr, c_ptr),              c_int32)
 py_str_contains      = extern("py_str_contains",      (c_ptr, c_ptr),              c_int32)
@@ -50,16 +54,30 @@ py_list_get          = extern("py_list_get",          (c_ptr, c_int64),         
 py_list_set          = extern("py_list_set",          (c_ptr, c_int64, c_ptr),     c_void)
 py_list_len          = extern("py_list_len",          (c_ptr,),                    c_int64)
 py_list_contains     = extern("py_list_contains",     (c_ptr, c_ptr),              c_int64)
+py_dict_keys         = extern("py_dict_keys",         (c_ptr,),                    c_ptr)
 
 py_tuple_get         = extern("py_tuple_get",         (c_ptr, c_int64),            c_ptr)
 py_tuple_len         = extern("py_tuple_len",         (c_ptr,),                    c_int64)
 
 py_dict_contains     = extern("py_dict_contains",     (c_ptr, c_ptr),              c_int64)
+py_dict_get          = extern("py_dict_get",          (c_ptr, c_ptr),              c_ptr)
 py_set_contains      = extern("py_set_contains",      (c_ptr, c_ptr),              c_int64)
 
 py_obj_len           = extern("py_obj_len",           (c_ptr,),                    c_int64)
+py_err_occurred      = extern("py_err_occurred",      (),                          c_int64)
+py_clear_exception   = extern("py_clear_exception",   (),                          c_void)
+py_obj_iter          = extern("py_obj_iter",          (c_ptr,),                    c_ptr)
+py_obj_next          = extern("py_obj_next",          (c_ptr,),                    c_ptr)
+py_current_exception = extern("py_current_exception", (),                          c_ptr)
+py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,),                  c_ptr)
+py_exc_matches       = extern("py_exc_matches",       (c_ptr, c_ptr),              c_int64)
 py_obj_getitem       = extern("py_obj_getitem",       (c_ptr, c_ptr),              c_ptr)
 
+py_user_hash_dispatch = extern("py_user_hash_dispatch", (c_ptr, c_ptr),            c_int64)
+py_user_contains_dispatch = extern("py_user_contains_dispatch", (c_ptr, c_ptr, c_ptr), c_int64)
+py_user_eq_dispatch = extern("py_user_eq_dispatch", (c_ptr, c_ptr),               c_int64)
+
+pcc_gc_load_ptr      = extern("pcc_gc_load_ptr",      (c_ptr, c_ptr),              c_ptr)
 py_decref            = extern("py_decref",            (c_ptr,),                    c_void)
 
 
@@ -75,6 +93,60 @@ def _is_bool(o) -> int:
     if ptr_eq(o, global_load_ptr("py_False")) != 0:
         return 1
     return 0
+
+
+def _cstr_eq(a, b) -> int:
+    # Byte-by-byte NUL-terminated compare, inlined to avoid pulling
+    # the substrate strcmp helper into an active runtime module
+    # (the substrate-helper boundary is enforced by
+    # test_runtime_substrate_spike.py).
+    if ptr_eq(a, b) != 0:
+        return 1
+    if ptr_is_null(a) != 0:
+        return 0
+    if ptr_is_null(b) != 0:
+        return 0
+    i: int = 0
+    while True:
+        ca: int = load_i8(a, i) & 255
+        cb: int = load_i8(b, i) & 255
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _valuebox_classes_eq(a, b) -> int:
+    if ptr_eq(a, b) != 0:
+        if ptr_is_null(a) == 0:
+            return 1
+        return 0
+    if ptr_is_null(a) != 0:
+        return 0
+    if ptr_is_null(b) != 0:
+        return 0
+    if _cstr_eq(load_ptr(a, 16), load_ptr(b, 16)) == 0:
+        return 0
+    n_fields: int = load_i32(a, 72)
+    if n_fields != load_i32(b, 72):
+        return 0
+    if n_fields < 0:
+        return 0
+    field_names_a = load_ptr(a, 80)
+    field_names_b = load_ptr(b, 80)
+    i: int = 0
+    while i < n_fields:
+        fa = null()
+        fb = null()
+        if ptr_is_null(field_names_a) == 0:
+            fa = load_ptr(field_names_a, i * 8)
+        if ptr_is_null(field_names_b) == 0:
+            fb = load_ptr(field_names_b, i * 8)
+        if _cstr_eq(fa, fb) == 0:
+            return 0
+        i = i + 1
+    return 1
 
 
 def _is_int_like_tag(tag: int) -> int:
@@ -95,6 +167,77 @@ def _int_or_bool_as_i64(o) -> int:
     if _is_bool(o) != 0:
         return _bool_as_i64(o)
     return py_int_value_i64(o)
+
+
+def _is_bytes_like_tag(tag: int) -> int:
+    if tag == 17:
+        return 1
+    if tag == 18:
+        return 1
+    if tag == 19:
+        return 1
+    return 0
+
+
+def _bytes_len(o) -> int:
+    if _type_of(o) == 19:
+        base = pcc_gc_load_ptr(o, ptr_add(o, 16))
+        return _bytes_len(base)
+    return load_i64(o, 16)
+
+
+def _bytes_data_ptr(o):
+    if _type_of(o) == 19:
+        base = pcc_gc_load_ptr(o, ptr_add(o, 16))
+        return _bytes_data_ptr(base)
+    return ptr_add(o, 24)
+
+
+def _dict_key(d, entries, off: int):
+    k = load_ptr(entries, off + 8)
+    if ptr_is_null(k) != 0:
+        return k
+    return pcc_gc_load_ptr(d, ptr_add(entries, off + 8))
+
+
+def _dict_value(d, entries, off: int):
+    v = load_ptr(entries, off + 16)
+    if ptr_is_null(v) != 0:
+        return v
+    return pcc_gc_load_ptr(d, ptr_add(entries, off + 16))
+
+
+def _set_key(s, entries, off: int):
+    k = load_ptr(entries, off + 8)
+    if ptr_is_null(k) != 0:
+        return k
+    if ptr_eq(k, global_load_ptr("py_set_dummy")) != 0:
+        return k
+    return pcc_gc_load_ptr(s, ptr_add(entries, off + 8))
+
+
+def _bytes_cmp(a, b) -> int:
+    la: int = _bytes_len(a)
+    lb: int = _bytes_len(b)
+    n: int = la
+    if lb < n:
+        n = lb
+    da = _bytes_data_ptr(a)
+    db = _bytes_data_ptr(b)
+    i: int = 0
+    while i < n:
+        ba: int = load_i8(da, i) & 0xFF
+        bb: int = load_i8(db, i) & 0xFF
+        if ba < bb:
+            return -1
+        if ba > bb:
+            return 1
+        i = i + 1
+    if la < lb:
+        return -1
+    if la > lb:
+        return 1
+    return 0
 
 
 # ---- FNV-1a ---------------------------------------------------------
@@ -144,6 +287,25 @@ def _cmp_threeway(a, b) -> int:
                 return 1
             return 0
 
+    # Numeric with at least one float (pure int/int handled above): compare as
+    # doubles. Without this, float vs int / float vs float fell through to the
+    # final ``return 0`` (treated as equal), so boxed-float comparisons via
+    # py_obj_lt/gt were wrong.
+    a_num: int = a_is_int
+    if ta == 3:
+        a_num = 1
+    b_num: int = b_is_int
+    if tb == 3:
+        b_num = 1
+    if a_num != 0 and b_num != 0:
+        fa: float = py_float_to_f64(a)
+        fb: float = py_float_to_f64(b)
+        if fa < fb:
+            return -1
+        if fa > fb:
+            return 1
+        return 0
+
     if ta == 4:                       # STR
         if tb == 4:
             # Use byte-by-byte cmp via load_i8 over min(len_a, len_b).
@@ -168,6 +330,10 @@ def _cmp_threeway(a, b) -> int:
             if la > lb:
                 return 1
             return 0
+
+    if _is_bytes_like_tag(ta) != 0:
+        if _is_bytes_like_tag(tb) != 0:
+            return _bytes_cmp(a, b)
 
     if ta == 7:                       # TUPLE
         if tb == 7:
@@ -255,6 +421,12 @@ def py_obj_eq(a, b) -> int:
                 return 1
             return 0
 
+    if _is_bytes_like_tag(ta) != 0:
+        if _is_bytes_like_tag(tb) != 0:
+            if _bytes_cmp(a, b) == 0:
+                return 1
+            return 0
+
     if ta == 7:                       # TUPLE
         if tb == 7:
             la: int = py_tuple_len(a)
@@ -288,6 +460,30 @@ def py_obj_eq(a, b) -> int:
                 i = i + 1
             return 1
 
+    if ta == 6:                       # DICT
+        if tb == 6:
+            da_size: int = load_i64(a, 16)
+            db_size: int = load_i64(b, 16)
+            if da_size != db_size:
+                return 0
+            entries = load_ptr(a, 40)
+            used: int = load_i64(a, 48)
+            i: int = 0
+            while i < used:
+                off: int = i * 24
+                key = _dict_key(a, entries, off)
+                if ptr_is_null(key) == 0:
+                    val = _dict_value(a, entries, off)
+                    other = py_dict_get(b, key)
+                    if ptr_is_null(other) != 0:
+                        return 0
+                    eq: int = py_obj_eq(val, other)
+                    py_decref(other)
+                    if eq == 0:
+                        return 0
+                i = i + 1
+            return 1
+
     if ta == 8:                       # SET
         if tb == 8:
             if load_i64(a, 16) != load_i64(b, 16):
@@ -297,11 +493,36 @@ def py_obj_eq(a, b) -> int:
             dummy = global_load_ptr("py_set_dummy")
             i: int = 0
             while i < capacity:
-                key = load_ptr(entries, i * 16 + 8)
+                key = _set_key(a, entries, i * 16)
                 if ptr_is_null(key) == 0:
                     if ptr_eq(key, dummy) == 0:
                         if py_set_contains(b, key) == 0:
                             return 0
+                i = i + 1
+            return 1
+
+    if ta == 200:                     # VALUEBOX
+        if tb == 200:
+            cls_a = pcc_gc_load_ptr(a, ptr_add(a, 16))
+            cls_b = pcc_gc_load_ptr(b, ptr_add(b, 16))
+            if _valuebox_classes_eq(cls_a, cls_b) == 0:
+                return 0
+            n_fields: int = load_i32(cls_a, 72)
+            if n_fields < 0:
+                return 0
+            fields_a = ptr_add(a, 24)
+            fields_b = ptr_add(b, 24)
+            i: int = 0
+            while i < n_fields:
+                va = pcc_gc_load_ptr(a, ptr_add(fields_a, i * 8))
+                vb = pcc_gc_load_ptr(b, ptr_add(fields_b, i * 8))
+                if ptr_eq(va, vb) == 0:
+                    if ptr_is_null(va) != 0:
+                        return 0
+                    if ptr_is_null(vb) != 0:
+                        return 0
+                    if py_obj_eq(va, vb) == 0:
+                        return 0
                 i = i + 1
             return 1
 
@@ -331,6 +552,26 @@ def py_obj_hash(o) -> int:
         if ptr_eq(o, global_load_ptr("py_True")) != 0:
             return 1
         return 0
+    if tag == 200:                    # VALUEBOX
+        cls = pcc_gc_load_ptr(o, ptr_add(o, 16))
+        if ptr_is_null(cls) != 0:
+            return 0
+        n_fields: int = load_i32(cls, 72)
+        if n_fields < 0:
+            return 0
+        h: int = n_fields
+        fields = ptr_add(o, 24)
+        i: int = 0
+        while i < n_fields:
+            v = pcc_gc_load_ptr(o, ptr_add(fields, i * 8))
+            field_hash: int = 0
+            if ptr_is_null(v) == 0:
+                field_hash = py_obj_hash(v)
+            h = (h * 31 + (field_hash % 1000003)) % 1000000007
+            i = i + 1
+        if h == -1:
+            return -2
+        return h
     if tag == 2:                      # INT
         v: int = py_int_value_i64(o)
         if v == -1:
@@ -350,6 +591,10 @@ def py_obj_hash(o) -> int:
         h: int = _fnv1a(data_ptr, bl)
         store_i64(o, 32, h)
         return h
+    if tag == 17:                     # BYTES
+        bl: int = load_i64(o, 16)
+        data_ptr = ptr_add(o, 24)
+        return _fnv1a(data_ptr, bl)
     if tag == 7:                      # TUPLE
         n: int = py_tuple_len(o)
         h: int = 0
@@ -361,6 +606,8 @@ def py_obj_hash(o) -> int:
         if h == -1:
             return -2
         return h
+    if tag == 11 or tag >= 100:       # INSTANCE / PY_TYPE_USER
+        return py_user_hash_dispatch(o, null())
     return 0
 
 
@@ -401,6 +648,12 @@ def py_obj_sorted(x):
     if ptr_is_null(x) != 0:
         return null()
     n: int = py_obj_len(x)
+    # py_obj_len is a sizing hint only; a custom iterator (no __len__) raises
+    # from it, and a pending exception would abort the iterator loop below
+    # (yielding []). Clear it — the iterator branch handles length-less srcs.
+    if py_err_occurred() != 0:
+        py_clear_exception()
+        n = 0
     out = py_list_new(n)
     if ptr_is_null(out) != 0:
         return null()
@@ -410,19 +663,48 @@ def py_obj_sorted(x):
         dummy = global_load_ptr("py_set_dummy")
         i: int = 0
         while i < capacity:
-            key = load_ptr(entries, i * 16 + 8)
+            key = _set_key(x, entries, i * 16)
             if ptr_is_null(key) == 0:
                 if ptr_eq(key, dummy) == 0:
                     py_list_append(out, key)
             i = i + 1
+    elif _type_of(x) == 6:
+        # dict -> sort its keys. py_obj_getitem(dict, int) would look up the
+        # int as a KEY (returns NULL -> [<null>,...]); use py_dict_keys instead.
+        # (The C py_obj_sorted uses the iterator protocol for all non-indexables;
+        # the port handles the common dict case here — generator/range in
+        # default mode still fall to the indexable else-path, a follow-on.)
+        keys = py_dict_keys(x)
+        if ptr_is_null(keys) == 0:
+            nk: int = py_list_len(keys)
+            ki: int = 0
+            while ki < nk:
+                el = py_list_get(keys, ki)
+                py_list_append(out, el)
+                py_decref(el)
+                ki = ki + 1
+            py_decref(keys)
     else:
-        i: int = 0
-        while i < n:
-            idx_box = py_int_from_i64(i)
-            el = py_obj_getitem(x, idx_box)
-            py_list_append(out, el)
-            py_decref(idx_box)
-            i = i + 1
+        # General length-less iterable (custom __iter__/__next__ class,
+        # generator, range): use the iterator protocol — matching the C
+        # py_obj_sorted. The old index-based py_obj_len + py_obj_getitem
+        # path yielded [] for anything without __len__/__getitem__.
+        it = py_obj_iter(x)
+        if ptr_is_null(it) == 0:
+            it_done: int = 0
+            while it_done == 0:
+                el = py_obj_next(it)
+                if ptr_is_null(el) != 0:
+                    if py_err_occurred() != 0:
+                        cur = py_current_exception()
+                        stop = py_exc_builtin_class(8)
+                        if py_exc_matches(cur, stop) != 0:
+                            py_clear_exception()
+                    it_done = 1
+                else:
+                    py_list_append(out, el)
+                    py_decref(el)
+            py_decref(it)
     m: int = py_list_len(out)
     j: int = 1
     while j < m:
@@ -480,4 +762,6 @@ def py_obj_contains(container, item) -> int:
         if py_str_contains(container, item) != 0:
             return 1
         return 0
+    if tag == 11 or tag >= 100:
+        return py_user_contains_dispatch(container, item, null())
     return 0

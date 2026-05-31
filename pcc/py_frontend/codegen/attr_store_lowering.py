@@ -1,0 +1,304 @@
+"""Attribute-store lowering helpers for L1CodeGen."""
+from __future__ import annotations
+
+from pcc.llvm_capi.compat import ir
+
+from ..py_ast import Attr, Expr, IntType, Name, Type
+from . import marshal
+
+
+class AttrStoreLoweringMixin:
+    def _emit_attr_store_value(
+        self,
+        target: Attr,
+        value: ir.Value,
+        value_ty: Type,
+    ) -> None:
+        if isinstance(target.obj, Name):
+            if (
+                hasattr(self, "class_lowering")
+                and target.obj.ident in self.class_lowering.classes
+            ):
+                info = self.class_lowering.classes[target.obj.ident]
+                metaclass_descr = self._metaclass_data_descriptor_info(
+                    info,
+                    target.name,
+                )
+                if metaclass_descr is not None:
+                    value_obj = marshal.marshal_to_object(
+                        self.builder,
+                        self.module,
+                        self.runtime,
+                        value,
+                        value_ty,
+                    )
+                    if self._emit_metaclass_data_descriptor_set(
+                        info,
+                        target.name,
+                        value_obj,
+                    ):
+                        return
+                if self.class_lowering.emit_class_attr_store(
+                    info,
+                    target.name,
+                    value,
+                    value_ty,
+                ):
+                    if not hasattr(self, "_class_attr_runtime_state"):
+                        self._class_attr_runtime_state = {}
+                    if getattr(self, "_class_attr_mutation_in_loop_depth", 0):
+                        state = "unknown"
+                    else:
+                        state = "live"
+                    self._class_attr_runtime_state[(info.name, target.name)] = state
+                    return
+            if (
+                self.current_class is not None
+                and target.obj.ident == "cls"
+                and self.current_method_kind == "classmethod"
+            ):
+                cls_obj = self._emit_expr(target.obj)
+                value_obj = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    value,
+                    value_ty,
+                )
+                status = self.builder.call(
+                    self.runtime["py_obj_setattr"],
+                    [cls_obj, self._attr_name_ptr(target.name), value_obj],
+                    name=self._fresh(f"cls.setattr.{target.name}.rc"),
+                )
+                self._emit_attribute_error_if_status_failed(
+                    status,
+                    target.name,
+                    target.span,
+                )
+                return
+            builtin_module = self._native_builtin_module_for_name(target.obj.ident)
+            if builtin_module is not None:
+                value_obj = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    value,
+                    value_ty,
+                )
+                gv = self._native_module_attr_global(builtin_module, target.name)
+                old_value = self.builder.load(
+                    gv,
+                    name=self._fresh(f"modattr.{target.name}.old"),
+                )
+                self.builder.call(self.runtime["pcc_gc_unpin"], [old_value])
+                self.builder.call(self.runtime["pcc_gc_pin"], [value_obj])
+                self.builder.call(
+                    self.runtime["pcc_gc_store_root"],
+                    [
+                        self._as_gc_ptr(
+                            gv,
+                            name=self._fresh(f"modattr.{target.name}.slot"),
+                        ),
+                        value_obj,
+                    ],
+                )
+                return
+            native_module = getattr(
+                self,
+                "_native_module_aliases",
+                {},
+            ).get(target.obj.ident)
+            if native_module is not None:
+                value_obj = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    value,
+                    value_ty,
+                )
+                gv = self._native_module_attr_global(native_module, target.name)
+                old_value = self.builder.load(
+                    gv,
+                    name=self._fresh(f"modattr.{target.name}.old"),
+                )
+                self.builder.call(self.runtime["pcc_gc_unpin"], [old_value])
+                self.builder.call(self.runtime["pcc_gc_pin"], [value_obj])
+                self.builder.call(
+                    self.runtime["pcc_gc_store_root"],
+                    [
+                        self._as_gc_ptr(
+                            gv,
+                            name=self._fresh(f"modattr.{target.name}.slot"),
+                        ),
+                        value_obj,
+                    ],
+                )
+                return
+        # Property setter fast path.
+        if isinstance(target.obj, Name):
+            hint = self.env_class_hint.get(target.obj.ident)
+            if hint is not None:
+                hint_info = self.class_lowering.classes.get(hint)
+                in_init = (
+                    self.current_func_def is not None
+                    and self.current_func_def.name == "__init__"
+                    and self.current_class is hint_info
+                )
+                if (
+                    hint_info is not None
+                    and getattr(hint_info, "dataclass_frozen", False)
+                    and target.name in hint_info.field_names
+                    and not in_init
+                ):
+                    self._emit_builtin_exception_and_branch(
+                        "AttributeError",
+                        "cannot assign to field",
+                        target.span,
+                    )
+                    return
+                info = self._resolve_property_setter_mro(hint, target.name)
+                if info is not None:
+                    setter_fn = info.property_setters[target.name]
+                    obj_val = self._emit_expr(target.obj)
+                    if len(setter_fn.args) >= 2:
+                        param_ty = setter_fn.args[1].type
+                        if isinstance(param_ty, ir.IntType) and param_ty.width == 64:
+                            value = self._coerce(value, value_ty, IntType(name="int"))
+                        elif isinstance(param_ty, ir.PointerType):
+                            value = marshal.marshal_to_object(
+                                self.builder,
+                                self.module,
+                                self.runtime,
+                                value,
+                                value_ty,
+                            )
+                    self._call_user(setter_fn, [obj_val, value], "")
+                    return
+                if self._resolve_property_mro(hint, target.name) is not None:
+                    self._emit_builtin_exception_and_branch(
+                        "AttributeError",
+                        "can't set attribute",
+                        target.span,
+                    )
+                    return
+                data_descr = self._class_attr_descriptor_class(
+                    hint,
+                    target.name,
+                )
+                if data_descr is not None:
+                    _owner_info, desc_info = data_descr
+                    if "__set__" in desc_info.methods:
+                        obj_val = self._emit_expr(target.obj)
+                        value_obj = marshal.marshal_to_object(
+                            self.builder,
+                            self.module,
+                            self.runtime,
+                            value,
+                            value_ty,
+                        )
+                        if self._emit_data_descriptor_set(
+                            hint,
+                            target.name,
+                            obj_val,
+                            value_obj,
+                        ):
+                            return
+
+        current_class = self.current_class
+        if (
+            current_class is not None
+            and isinstance(target.obj, Name)
+            and target.obj.ident == "self"
+        ):
+            receiver_class_name = self._self_receiver_class_name()
+            receiver_info = None
+            if receiver_class_name is not None:
+                receiver_info = self.class_lowering.classes.get(receiver_class_name)
+            if receiver_info is None:
+                receiver_info = current_class
+            in_init = (
+                self.current_func_def is not None
+                and self.current_func_def.name == "__init__"
+            )
+            if (
+                getattr(receiver_info, "dataclass_frozen", False)
+                and target.name in receiver_info.field_names
+                and not in_init
+            ):
+                self._emit_builtin_exception_and_branch(
+                    "AttributeError",
+                    "cannot assign to field",
+                    target.span,
+                )
+                return
+            self_val = self.builder.load(self.env["self"][0], name=self._fresh("self"))
+            value = marshal.marshal_to_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                value,
+                value_ty,
+            )
+            status = self.class_lowering.emit_self_attr_store(
+                receiver_info, target.name, self_val, value
+            )
+            if status is not None:
+                self._emit_attribute_error_if_status_failed(
+                    status,
+                    target.name,
+                    target.span,
+                )
+            return
+        obj = self._emit_expr(target.obj)
+        name_ptr = self._attr_name_ptr(target.name)
+        if obj in getattr(self, "_cpy_values", ()) or (
+            isinstance(target.obj, Name)
+            and getattr(self, "_cpy_env_flags", {}).get(
+                target.obj.ident,
+                False,
+            )
+        ):
+            cpy_value, owned = self._marshal_to_cpython(value, value_ty)
+            self.builder.call(
+                self.runtime["py_cpy_setattr"], [obj, name_ptr, cpy_value]
+            )
+            if owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [cpy_value])
+            return
+        value = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            value,
+            value_ty,
+        )
+        status = self.builder.call(
+            self.runtime["py_obj_setattr"],
+            [obj, name_ptr, value],
+            name=self._fresh(f"setattr.{target.name}.rc"),
+        )
+        self._emit_attribute_error_if_status_failed(
+            status,
+            target.name,
+            target.span,
+        )
+
+    def _emit_attr_store(self, target: Attr, value_expr: Expr) -> None:
+        prefer_native_callable = (
+            isinstance(target.obj, Name)
+            and hasattr(self, "class_lowering")
+            and target.obj.ident in self.class_lowering.classes
+            and isinstance(value_expr, Name)
+            and value_expr.ident in self.functions
+        )
+        if prefer_native_callable:
+            old_prefer_native = self._prefer_native_callable_values
+            self._prefer_native_callable_values = True
+            try:
+                value = self._emit_expr(value_expr)
+            finally:
+                self._prefer_native_callable_values = old_prefer_native
+        else:
+            value = self._emit_expr(value_expr)
+        self._emit_attr_store_value(target, value, value_expr.ty)
+        self._gc_release_if_owned(value, value_expr)

@@ -182,7 +182,7 @@ def assign_stack_slots(
             for value in instruction_used_values(instr):
                 maybe_free_local_value(value, index)
         term_pos = len(block.instructions)
-        for value in list(active_local_values):
+        for value in sorted(active_local_values):
             maybe_free_local_value(value, term_pos)
 
     func.frame_size = _align_to(offset, 16)

@@ -104,6 +104,17 @@ def _configure_bindings(lib: ctypes.CDLL) -> None:
     lib.LLVMDisposeMessage.argtypes = [ctypes.c_void_p]
     lib.LLVMDisposeMessage.restype = None
 
+    # Error.h
+    try:
+        lib.LLVMGetErrorMessage.argtypes = [ctypes.c_void_p]
+        lib.LLVMGetErrorMessage.restype = ctypes.c_void_p
+        lib.LLVMDisposeErrorMessage.argtypes = [ctypes.c_void_p]
+        lib.LLVMDisposeErrorMessage.restype = None
+        lib.LLVMConsumeError.argtypes = [ctypes.c_void_p]
+        lib.LLVMConsumeError.restype = None
+    except AttributeError:
+        pass
+
     # Memory buffer + parser
     lib.LLVMCreateMemoryBufferWithMemoryRangeCopy.argtypes = [
         ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
@@ -187,6 +198,32 @@ def _configure_bindings(lib: ctypes.CDLL) -> None:
     lib.LLVMGetBufferStart.restype = ctypes.c_char_p
     lib.LLVMGetBufferSize.argtypes = [ctypes.c_void_p]
     lib.LLVMGetBufferSize.restype = ctypes.c_size_t
+
+    # New pass manager, llvm-c/Transforms/PassBuilder.h.
+    try:
+        lib.LLVMRunPasses.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        lib.LLVMRunPasses.restype = ctypes.c_void_p
+        lib.LLVMCreatePassBuilderOptions.argtypes = []
+        lib.LLVMCreatePassBuilderOptions.restype = ctypes.c_void_p
+        lib.LLVMDisposePassBuilderOptions.argtypes = [ctypes.c_void_p]
+        lib.LLVMDisposePassBuilderOptions.restype = None
+        lib.LLVMPassBuilderOptionsSetVerifyEach.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        lib.LLVMPassBuilderOptionsSetVerifyEach.restype = None
+        lib.LLVMPassBuilderOptionsSetDebugLogging.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        lib.LLVMPassBuilderOptionsSetDebugLogging.restype = None
+    except AttributeError:
+        pass
 
     # MCJIT / execution engine
     lib.LLVMLinkInMCJIT.argtypes = []
@@ -272,6 +309,19 @@ def _consume_msg(ptr: int) -> str:
         return ""
     s = ctypes.c_char_p(ptr).value or b""
     _lib().LLVMDisposeMessage(ptr)
+    return s.decode("utf-8", errors="replace")
+
+
+def _consume_error(ptr: int) -> str:
+    """Copy an LLVMErrorRef message, consuming the error."""
+    if not ptr:
+        return ""
+    lib = _lib()
+    raw = lib.LLVMGetErrorMessage(ptr)
+    if not raw:
+        return ""
+    s = ctypes.c_char_p(raw).value or b""
+    lib.LLVMDisposeErrorMessage(raw)
     return s.decode("utf-8", errors="replace")
 
 
@@ -408,6 +458,74 @@ def parse_assembly(ir_text: str) -> ModuleRef:
         msg = _consume_msg(err_out.value or 0)
         raise RuntimeError(f"parse_assembly: {msg}")
     return ModuleRef(mod_out.value)
+
+
+def run_passes(
+    mod: ModuleRef,
+    passes: str,
+    target_machine: "TargetMachine | None" = None,
+    *,
+    verify_each: bool = True,
+    debug_logging: bool = False,
+) -> None:
+    """Run an LLVM new-PM pass pipeline in memory on ``mod``.
+
+    ``passes`` uses the same syntax as ``opt -passes=...`` and
+    ``LLVMRunPasses``: individual pass names, nested pipelines, or
+    profiles such as ``default<O2>``.
+    """
+    lib = _lib()
+    try:
+        run = lib.LLVMRunPasses
+    except AttributeError as exc:
+        raise RuntimeError(
+            "LLVMRunPasses is not available in this libLLVM build"
+        ) from exc
+
+    if target_machine is None:
+        initialize_native_target()
+        initialize_native_asmprinter()
+        target_machine = Target.from_default_triple().create_target_machine()
+
+    opts = lib.LLVMCreatePassBuilderOptions()
+    if not opts:
+        raise RuntimeError("LLVMCreatePassBuilderOptions returned NULL")
+    try:
+        lib.LLVMPassBuilderOptionsSetVerifyEach(opts, int(bool(verify_each)))
+        lib.LLVMPassBuilderOptionsSetDebugLogging(opts, int(bool(debug_logging)))
+        err = run(
+            mod._handle,
+            str(passes).encode("utf-8"),
+            target_machine._handle,
+            opts,
+        )
+        if err:
+            msg = _consume_error(err)
+            raise RuntimeError(f"LLVMRunPasses failed: {msg}")
+    finally:
+        lib.LLVMDisposePassBuilderOptions(opts)
+    mod.verify()
+
+
+def run_passes_on_ir(
+    ir_text: str,
+    passes: str,
+    target_machine: "TargetMachine | None" = None,
+    *,
+    verify_each: bool = True,
+    debug_logging: bool = False,
+) -> str:
+    """Parse IR text, run an in-memory LLVM pipeline, and serialize once."""
+    mod = parse_assembly(ir_text)
+    mod.verify()
+    run_passes(
+        mod,
+        passes,
+        target_machine,
+        verify_each=verify_each,
+        debug_logging=debug_logging,
+    )
+    return str(mod)
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +720,7 @@ def create_mcjit_compiler(
 
 __all__ = [
     "parse_assembly", "ModuleRef", "FunctionRef",
+    "run_passes", "run_passes_on_ir",
     "Target", "TargetMachine", "ExecutionEngine",
     "create_mcjit_compiler",
     "initialize_native_target", "initialize_native_asmprinter",

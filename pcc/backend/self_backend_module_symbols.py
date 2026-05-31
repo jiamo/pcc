@@ -20,13 +20,25 @@ def prepare_module_symbols(
     globals_: list[GlobalDef],
     functions: list[ParsedFunction],
 ) -> PreparedModuleSymbols:
-    internal_prefix = "__pccmod_" + hashlib.sha1(ir_text.encode("utf-8")).hexdigest()[:10] + "_"
     defined_symbols = frozenset(
         {global_.name for global_ in globals_} | {func.name for func in functions}
     )
     internal_symbols = frozenset(
         {global_.name for global_ in globals_ if global_.is_internal}
         | {func.name for func in functions if not func.is_global}
+    )
+    public_symbols = sorted(
+        {global_.name for global_ in globals_ if not global_.is_internal}
+        | {func.name for func in functions if func.is_global}
+    )
+    if public_symbols:
+        prefix_seed = "\n".join(public_symbols)
+    else:
+        prefix_seed = "\n".join(sorted(defined_symbols))
+    internal_prefix = (
+        "__pccmod_"
+        + hashlib.sha1(prefix_seed.encode("utf-8")).hexdigest()[:10]
+        + "_"
     )
     return PreparedModuleSymbols(
         internal_prefix=internal_prefix,

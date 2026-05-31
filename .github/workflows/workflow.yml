@@ -22,8 +22,11 @@ jobs:
       - name: Install build dependencies
         run: pip install build
 
-      - name: Build package
-        run: python -m build
+      - name: Build sdist
+        # sdist-only: hatch_build.py self-compiles a native `pcc` on
+        # every user's `pip install`, so no platform wheels are
+        # published. See pyproject.toml + hatch_build.py.
+        run: python -m build --sdist
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

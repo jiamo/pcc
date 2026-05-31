@@ -22,15 +22,19 @@ PyExceptionObject layout (offset 16 -> exc_class).
 
 Constants: PY_TYPE_CLASS = 10, PY_TYPE_EXC = 12.
 """
-from pcc.extern import c_abi_export
+from pcc.extern import c_abi_export, c_ptr, extern
 from pcc.unsafe import (
     is_tagged_int,
     load_i32,
     load_ptr,
     null,
+    ptr_add,
     ptr_eq,
     ptr_is_null,
 )
+
+pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+pcc_gc_note_relocation_read = extern("pcc_gc_note_relocation_read", (c_ptr,), c_ptr)
 
 
 def _type_of(obj) -> int:
@@ -46,11 +50,18 @@ def _to_class(obj):
         return null()
     if is_tagged_int(obj):
         return null()
+    obj = pcc_gc_note_relocation_read(obj)
     tag: int = load_i32(obj, 8)
     if tag == 10:                         # PY_TYPE_CLASS
         return obj
     if tag == 12:                         # PY_TYPE_EXC
-        return load_ptr(obj, 16)   # ->exc_class
+        return pcc_gc_load_ptr(obj, ptr_add(obj, 16))   # ->exc_class
+    if tag == 11 or tag >= 100:           # PY_TYPE_INSTANCE / user classes
+        # A raised user exception subclass is a PyInstanceObject; its ``cls``
+        # is at offset 16 (right after the 16-byte header), same slot as
+        # PyExceptionObject->exc_class. Project to it so the MRO walk matches
+        # ``except MyError`` / ``except Exception``.
+        return pcc_gc_load_ptr(obj, ptr_add(obj, 16))   # ->cls
     return null()
 
 
@@ -70,7 +81,7 @@ def py_exc_matches(exc, type_) -> int:
     n_mro: int = load_i32(ecls, 40)
     i: int = 0
     while i < n_mro:
-        entry = load_ptr(mro, i * 8)
+        entry = pcc_gc_load_ptr(ecls, ptr_add(mro, i * 8))
         if ptr_eq(entry, tcls):
             return 1
         i = i + 1

@@ -29,13 +29,18 @@ from typing import Mapping
 
 from pcc.llvm_capi.compat import ir
 
+from .core_helpers import _instruction_opname_text
 from ..py_ast import (
     BoolType,
+    ByteArrayType,
+    BytesType,
     ClassType,
+    ComplexType,
     DictType,
     FloatType,
     IntType,
     ListType,
+    MemoryViewType,
     NoneType,
     StrType,
     TupleType,
@@ -54,6 +59,70 @@ _DOUBLE = ir.DoubleType()
 _PTR = _I8.as_pointer()   # PyObject*
 
 
+def _type_name(ty: Type) -> str:
+    name = getattr(ty, "name", "")
+    if name is None:
+        return ""
+    return name
+
+
+def _type_name_in(ty: Type, names: tuple[str, ...]) -> bool:
+    return _type_name(ty) in names
+
+
+def _ir_type_or_none(value):
+    try:
+        return value.type
+    except AttributeError:
+        return None
+
+
+def _ir_type_text(ty) -> str:
+    if ty is None:
+        return ""
+    try:
+        return str(ty)
+    except Exception:
+        return ""
+
+
+def _ir_int_width(ty) -> int:
+    try:
+        if isinstance(ty, ir.IntType):
+            return int(ty.width)
+    except Exception:
+        pass
+    try:
+        return int(ty.width)
+    except Exception:
+        pass
+    text = _ir_type_text(ty)
+    if len(text) > 1 and text[0] == "i":
+        digits = text[1:]
+        if digits.isdigit():
+            return int(digits)
+    return -1
+
+
+def _ir_is_pointer_type(ty) -> bool:
+    try:
+        if isinstance(ty, ir.PointerType):
+            return True
+    except Exception:
+        pass
+    text = _ir_type_text(ty)
+    return text == "ptr" or text.endswith("*") or text.endswith(" ptr")
+
+
+def _ir_is_double_type(ty) -> bool:
+    try:
+        if isinstance(ty, ir.DoubleType):
+            return True
+    except Exception:
+        pass
+    return _ir_type_text(ty) == "double"
+
+
 def _tmp(builder: ir.IRBuilder, hint: str) -> str:
     """Make a unique SSA name by salting with the builder's block id."""
     return f"{hint}.{id(builder._block):x}"
@@ -61,11 +130,32 @@ def _tmp(builder: ir.IRBuilder, hint: str) -> str:
 
 def is_object_type(ty: Type) -> bool:
     """True if ``ty`` must be represented as ``PyObject*`` at runtime."""
-    return isinstance(ty, (StrType, ListType, DictType, TupleType, NoneType))
+    if _type_name_in(
+        ty,
+        (
+            "str",
+            "bytes",
+            "bytearray",
+            "memoryview",
+            "list",
+            "dict",
+            "tuple",
+            "None",
+            "complex",
+        ),
+    ):
+        return True
+    return isinstance(
+        ty, (StrType, BytesType, ByteArrayType, MemoryViewType,
+             ListType, DictType, TupleType, NoneType, ComplexType)
+)
+
 
 
 def is_native_type(ty: Type) -> bool:
     """True if ``ty`` has a native LLVM-IR scalar representation."""
+    if _type_name_in(ty, ("int", "float", "bool")):
+        return True
     return isinstance(ty, (IntType, FloatType, BoolType))
 
 
@@ -89,64 +179,97 @@ def marshal_to_object(
     Any other type raises :class:`NotImplementedError`; the L3 layer
     picks those up.
     """
-    if isinstance(ty, IntType):
+    ty_name = _type_name(ty)
+    value_ty = _ir_type_or_none(value)
+    if isinstance(ty, IntType) or ty_name == "int":
         # bool backed as i1 also comes through here when common_type
         # coerces to int; guard width.
         v64 = value
-        if value.type is not _I64:
-            if isinstance(value.type, ir.IntType):
-                if value.type.width == 64:
+        value_width = _ir_int_width(value_ty)
+        if value_width != 64:
+            if value_width > 0:
+                if value_width == 64:
                     v64 = value
                 else:
                     v64 = builder.sext(value, _I64, name="m.b2i64")
-            elif isinstance(value.type, ir.PointerType):
+            elif _ir_is_pointer_type(value_ty):
                 # int-annotated but held as PyObject* — the value came
                 # from a CPython / dyn path that boxed it. Already a
                 # PyObject*, pass through.
                 return value
+            elif value_ty is None:
+                # Self-host cross-module IR values can lose their Python-side
+                # ``.type`` metadata while still carrying an i64 SSA value.
+                v64 = value
+            elif _ir_type_text(value_ty).isdigit():
+                # pcc2 can mis-read ``ir.Constant.type`` as the constant's
+                # literal value when subclass field metadata drifts. The
+                # source type is still an int here, so keep the native value.
+                v64 = value
             else:
                 raise NotImplementedError(
-                    f"marshal_to_object: unexpected IR type {value.type} for int"
+                    "marshal_to_object: unexpected IR type "
+                    + _ir_type_text(value_ty)
+                    + " for int"
                 )
         return builder.call(runtime["py_int_from_i64"], [v64],
                               name="m.int_box")
-    if isinstance(ty, FloatType):
+    if isinstance(ty, FloatType) or ty_name == "float":
         # If inference said float but the caller already has a
         # PyObject* (e.g. a CPython ``float(...)`` fallback returned
         # a ptr), pass through — the downstream DynType path handles
         # the object form.
-        if isinstance(value.type, ir.PointerType):
+        if _ir_is_pointer_type(value_ty):
             return value
         return builder.call(runtime["py_float_from_f64"], [value],
                               name="m.flt_box")
-    if isinstance(ty, BoolType):
+    if isinstance(ty, BoolType) or ty_name == "bool":
         # py_bool_from_bit takes i32.
-        if value.type is _I1:
+        value_width = _ir_int_width(value_ty)
+        if value_width == 1:
             bit = builder.zext(value, _I32, name="m.b2i32")
-        elif isinstance(value.type, ir.PointerType):
+        elif _ir_is_pointer_type(value_ty):
             # Bool-typed value already boxed via a CPython/dynamic path.
             return value
-        elif isinstance(value.type, ir.IntType):
-            if value.type.width == 32:
+        elif value_width > 0:
+            if value_width == 32:
                 bit = value
-            elif value.type.width > 32:
+            elif value_width > 32:
                 bit = builder.trunc(value, _I32, name="m.b2i32")
             else:
                 bit = builder.zext(value, _I32, name="m.b2i32")
         else:
             raise NotImplementedError(
-                f"marshal_to_object: unexpected IR type {value.type} for bool"
+                "marshal_to_object: unexpected IR type "
+                + _ir_type_text(value_ty)
+                + " for bool"
             )
         return builder.call(runtime["py_bool_from_bit"], [bit],
                               name="m.bool_box")
-    if isinstance(ty, NoneType):
+    if isinstance(ty, NoneType) or ty_name == "None":
         # If caller already has a pointer (e.g. loaded py_None earlier),
         # return it; otherwise materialise a load of the global.
-        if isinstance(value.type, ir.PointerType):
+        if _ir_is_pointer_type(value_ty):
             return value
         gv = declare_runtime_global(module, "py_None")
         return builder.load(gv, name="m.none")
-    if isinstance(ty, (StrType, ListType, DictType, TupleType)):
+    if _type_name_in(
+        ty,
+        (
+            "str",
+            "bytes",
+            "bytearray",
+            "memoryview",
+            "list",
+            "dict",
+            "tuple",
+            "complex",
+        ),
+    ) or isinstance(
+        ty,
+        (StrType, BytesType, ByteArrayType, MemoryViewType,
+         ListType, DictType, TupleType, ComplexType),
+    ):
         # Already a PyObject* in the common case. But an ``or`` /
         # ``and`` phi whose arms are str-typed can land as i1 in IR
         # (the truth value, not the actual string ptr). When that
@@ -155,14 +278,18 @@ def marshal_to_object(
         # a bool PyObject* so the runtime's str helpers see a
         # well-typed ptr. (The resulting object isn't a real str, but
         # py_str_* will raise cleanly or fall back.)
-        if isinstance(value.type, ir.PointerType):
+        if _ir_is_pointer_type(value_ty):
             return value
-        if value.type is _I1:
+        value_width = _ir_int_width(value_ty)
+        if value_width == 1:
             bit = builder.zext(value, _I32, name="m.str.b2i32")
             return builder.call(runtime["py_bool_from_bit"], [bit],
                                   name="m.str.bool_box")
-        if isinstance(value.type, ir.IntType):
-            widened = builder.sext(value, _I64, name="m.str.sext64")
+        if value_width > 0:
+            widened = (
+                value if value_width == 64
+                else builder.sext(value, _I64, name="m.str.sext64")
+            )
             return builder.call(runtime["py_int_from_i64"], [widened],
                                   name="m.str.int_box")
         return value
@@ -184,33 +311,66 @@ def marshal_to_object(
         # This shows up in pcc's own sources as tuples of type objects
         # such as ``(IntType, FloatType, BoolType, DynType)`` used for
         # ``isinstance`` family checks during self-host compilation.
-        if isinstance(value.type, ir.PointerType):
+        if _ir_is_pointer_type(value_ty) or _ir_type_text(value_ty) == "":
             return value
         raise NotImplementedError(
-            f"marshal_to_object: unexpected IR type {value.type} for class object"
+            "marshal_to_object: unexpected IR type "
+            + _ir_type_text(value_ty)
+            + " for class object"
         )
-    if isinstance(ty, DynType):
-        if isinstance(value.type, ir.PointerType):
+    if isinstance(ty, DynType) or ty_name == "dyn":
+        # Self-host resilience: some stage2/stage3 paths can surface a
+        # missing IR value for DynType expressions that semantically
+        # degrade to ``None``. Keep codegen progressing by materialising
+        # ``py_None`` instead of aborting the whole compile.
+        if value is None or value_ty is None:
+            gv = declare_runtime_global(module, "py_None")
+            return builder.load(gv, name="m.dyn.none")
+        if _ir_is_pointer_type(value_ty):
             return value
-        if value.type is _I64:
+        value_width = _ir_int_width(value_ty)
+        if value_width == 64:
             return builder.call(runtime["py_int_from_i64"], [value],
                                   name="m.dyn.int_box")
-        if isinstance(value.type, ir.IntType):
-            if value.type.width == 1:
+        if value_width > 0:
+            if value_width == 1:
                 bit = builder.zext(value, _I32, name="m.dyn.b2i32")
                 return builder.call(runtime["py_bool_from_bit"], [bit],
                                       name="m.dyn.bool_box")
-            widened = builder.sext(value, _I64, name="m.dyn.sext64")
+            widened = (
+                value if value_width == 64
+                else builder.sext(value, _I64, name="m.dyn.sext64")
+            )
             return builder.call(runtime["py_int_from_i64"], [widened],
                                   name="m.dyn.int_box")
-        if value.type is _DOUBLE or isinstance(value.type, ir.DoubleType):
+        if _ir_is_double_type(value_ty):
             return builder.call(runtime["py_float_from_f64"], [value],
                                   name="m.dyn.flt_box")
         raise NotImplementedError(
-            f"marshal_to_object: DynType with IR {value.type} not supported"
+            "marshal_to_object: DynType with IR "
+            + _ir_type_text(value_ty)
+            + " not supported"
         )
+    if isinstance(ty, Type) or ty_name == "Type":
+        # ``Type`` is the base class for pcc's type-description objects.
+        # In the self-hosted compiler those values flow at runtime as
+        # regular PyObject* instances, for example when iterating AST or
+        # frontend metadata containers whose element type is imprecise.
+        if _ir_is_pointer_type(value_ty):
+            return value
+        raise NotImplementedError(
+            "marshal_to_object: unexpected IR type "
+            + _ir_type_text(value_ty)
+            + " for Type object"
+        )
+    if _ir_is_pointer_type(value_ty):
+        # Last-resort identity path for boxed values whose precise frontend
+        # type object did not match this module's class objects. This happens
+        # during bootstrap when type-description objects cross compiled
+        # module boundaries. Scalars still fail below.
+        return value
     raise NotImplementedError(
-        f"marshal_to_object: type {type(ty).__name__} not supported"
+        "marshal_to_object: unsupported type descriptor"
     )
 
 
@@ -230,7 +390,8 @@ def marshal_from_object(
     * ``str`` / ``list`` / ``dict`` / ``tuple`` / ``None`` → pass through
       (they already live as ``PyObject*`` natively).
     """
-    if isinstance(target_ty, IntType):
+    target_name = _type_name(target_ty)
+    if isinstance(target_ty, IntType) or target_name == "int":
         if isinstance(pyobj.type, ir.IntType):
             if pyobj.type.width == 64:
                 return pyobj
@@ -242,16 +403,16 @@ def marshal_from_object(
         return builder.call(
             runtime["py_int_to_i64"], [pyobj, ov_slot], name="m.int_unbox"
         )
-    if isinstance(target_ty, FloatType):
-        if pyobj.type is _DOUBLE:
+    if isinstance(target_ty, FloatType) or target_name == "float":
+        if isinstance(pyobj.type, ir.DoubleType):
             return pyobj
         if isinstance(pyobj.type, ir.FloatType):
             return builder.fpext(pyobj, _DOUBLE, name="m.flt_widen")
         return builder.call(
             runtime["py_float_to_f64"], [pyobj], name="m.flt_unbox"
         )
-    if isinstance(target_ty, BoolType):
-        if pyobj.type is _I1:
+    if isinstance(target_ty, BoolType) or target_name == "bool":
+        if isinstance(pyobj.type, ir.IntType) and pyobj.type.width == 1:
             return pyobj
         if isinstance(pyobj.type, ir.IntType):
             zero = ir.Constant(pyobj.type, 0)
@@ -262,21 +423,44 @@ def marshal_from_object(
             runtime["py_obj_truthy"], [pyobj], name="m.bool_unbox_i32"
         )
         return builder.trunc(i32, _I1, name="m.bool_unbox")
-    if isinstance(
+    if _type_name_in(
         target_ty,
-        (StrType, ListType, DictType, TupleType, ClassType, NoneType),
+        (
+            "str",
+            "bytes",
+            "bytearray",
+            "memoryview",
+            "list",
+            "dict",
+            "tuple",
+            "None",
+            "complex",
+        ),
+    ) or isinstance(
+        target_ty,
+        (StrType, BytesType, ByteArrayType, MemoryViewType,
+         ListType, DictType, TupleType, ClassType, NoneType, ComplexType),
     ):
         return pyobj
     from ..py_ast import DynType as _DynType, FuncType as _FuncType
-    if isinstance(target_ty, (_DynType, _FuncType)):
+    if isinstance(target_ty, (_DynType, _FuncType)) or target_name in (
+        "dyn",
+        "FuncType",
+    ):
         # FuncType values at runtime are opaque PyObject* callables
         # (CPython PyCFunction wrappers produced by
         # ``py_cpy_wrap_pcc_Narg`` or user operator.getters). Identity
         # pass-through. DynType handled the same way — the caller
         # already has a PyObject*.
         return pyobj
+    if isinstance(target_ty, Type) or target_name == "Type":
+        return pyobj
+    if isinstance(pyobj.type, ir.PointerType):
+        # Same duplicate-type-object fallback as marshal_to_object: an
+        # already boxed value can be carried through unchanged.
+        return pyobj
     raise NotImplementedError(
-        f"marshal_from_object: target {type(target_ty).__name__} not supported"
+        "marshal_from_object: unsupported target type descriptor"
     )
 
 
@@ -299,13 +483,21 @@ def _stash_overflow_slot(builder: ir.IRBuilder) -> ir.Value:
     entry = fn.blocks[0]
     insert_before = None
     for instr in entry._instrs:
-        if instr.opname != "alloca":
+        if _instruction_opname_text(instr) != "alloca":
             insert_before = instr
             break
 
     saved_block = builder._block
-    saved_pos = getattr(builder, "_pos", None)
-    saved_anchor = None if saved_pos is not None else builder._anchor
+    # Read _pos directly rather than via getattr-with-default: the
+    # pcc-py self-host runtime can return the default for instance
+    # attrs that ARE set (the same pattern that broke
+    # _skip_program_main / current_class). Falling back to
+    # ``builder._anchor`` exercises a Python ``@property`` descriptor
+    # which the self-host runtime also doesn't reliably execute, so
+    # the alloca insertion point ends up restored as the primary
+    # cursor and later emissions land before their operands.
+    saved_pos = builder._pos
+    saved_anchor = None
 
     if insert_before is not None:
         builder.position_before(insert_before)

@@ -108,6 +108,20 @@ def emit_phi_assignments(
     if not assignments:
         return []
 
+    dest_names = {phi.dest for phi, _match, _offset in assignments}
+    can_store_directly = all(
+        not phi.type.is_array
+        and not phi.type.is_struct
+        and match.value not in dest_names
+        for phi, match, _offset in assignments
+    )
+    if can_store_directly:
+        lines: list[str] = []
+        for phi, match, _offset in assignments:
+            lines.extend(materialize_value(func, match.value, phi.type, 9, module_symbols))
+            lines.extend(store_value_regs_to_slot(func.value_slots[phi.dest], 9))
+        return lines
+
     total_temp = _align_to(temp_offset, 16)
     lines: list[str] = []
     if total_temp:

@@ -1,6 +1,7 @@
 """pcc-Python replacement for most public py_int_* operation dispatch."""
 from pcc.extern import extern, c_abi_export, c_double, c_int64, c_ptr, c_void
 from pcc.unsafe import (
+    cstr,
     free,
     is_tagged_int,
     load_i32,
@@ -31,6 +32,8 @@ py_bigint_or = extern("py_bigint_or", (c_ptr, c_ptr), c_ptr)
 py_bigint_xor = extern("py_bigint_xor", (c_ptr, c_ptr), c_ptr)
 py_bigint_shl = extern("py_bigint_shl", (c_ptr, c_int64), c_ptr)
 py_bigint_shr = extern("py_bigint_shr", (c_ptr, c_int64), c_ptr)
+py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
+py_raise = extern("py_raise", (c_ptr,), c_void)
 pow_c = extern("pow", (c_double, c_double), c_double)
 
 
@@ -186,6 +189,14 @@ def py_int_neg(a):
 
 @c_abi_export("py_int_floordiv")
 def py_int_floordiv(a, b):
+    if _both_tagged(a, b):
+        av: int = untag_int(a)
+        bv: int = untag_int(b)
+        if bv == 0:
+            return null()
+        # Tagged-int fast path. ``av`` and ``bv`` are in [-2^62, 2^62-1]
+        # so ``av // bv`` cannot overflow i64.
+        return py_int_from_i64(av // bv)
     ba = py_bigint_from_any(a)
     bb = py_bigint_from_any(b)
     if ptr_is_null(ba) or ptr_is_null(bb):
@@ -217,6 +228,16 @@ def py_int_floordiv(a, b):
 
 @c_abi_export("py_int_mod")
 def py_int_mod(a, b):
+    if _both_tagged(a, b):
+        av: int = untag_int(a)
+        bv: int = untag_int(b)
+        if bv == 0:
+            return null()
+        # Tagged-int fast path. ``a % b`` in pcc-Python under
+        # ``pcc.unsafe`` lowers to a Python-semantics modulo (srem +
+        # sign correction in codegen), so we get Python mod sign
+        # convention directly.
+        return py_int_from_i64(av % bv)
     ba = py_bigint_from_any(a)
     bb = py_bigint_from_any(b)
     if ptr_is_null(ba) or ptr_is_null(bb):
@@ -304,6 +325,7 @@ def py_int_shl(a, b):
         return null()
     n: int = _int_i64_value(b)
     if n < 0:
+        py_raise(py_exc_new(2, cstr("negative shift count")))
         return null()
     if n == 0:
         if is_tagged_int(a):
@@ -330,6 +352,7 @@ def py_int_shr(a, b):
         return null()
     n: int = _int_i64_value(b)
     if n < 0:
+        py_raise(py_exc_new(2, cstr("negative shift count")))
         return null()
     if n == 0:
         if is_tagged_int(a):

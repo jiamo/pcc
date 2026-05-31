@@ -92,6 +92,36 @@ def _bigint_tagged_fit_value(b) -> int:
     return 0 - (high * 4294967296 + low)
 
 
+@c_abi_export("py_int_bit_length")
+def py_int_bit_length(n) -> int:
+    # int.bit_length(): bits to represent abs(value), 0 for 0. Exact for bignums:
+    # (ndigits-1)*32 + bits in the top base-2^32 digit. Mirrors py_int_bit_length
+    # in py_int_core.c. tagged-int path only sees i63-range values (negatable).
+    if ptr_is_null(n) != 0:
+        return 0
+    if is_tagged_int(n) != 0:
+        a: int = untag_int(n)
+        if a < 0:
+            a = 0 - a
+        bits: int = 0
+        while a > 0:
+            bits = bits + 1
+            a = a >> 1
+        return bits
+    tag: int = load_i32(n, 8)
+    if tag == 2:                            # PY_TYPE_INT bignum
+        ndigits: int = load_i32(n, 20)
+        if ndigits <= 0:
+            return 0
+        top: int = _load_u32(n, 24 + (ndigits - 1) * 4)
+        top_bits: int = 0
+        while top > 0:
+            top_bits = top_bits + 1
+            top = top >> 1
+        return (ndigits - 1) * 32 + top_bits
+    return 0
+
+
 def _bigint_fits_tagged(b) -> bool:
     sign: int = load_i32(b, 16)
     if sign == 0:

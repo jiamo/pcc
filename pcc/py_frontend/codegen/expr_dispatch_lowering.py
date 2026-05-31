@@ -1,0 +1,400 @@
+"""Expression dispatch lowering for L1CodeGen."""
+from __future__ import annotations
+
+from pcc.llvm_capi.compat import ir
+
+from ..py_ast import (
+    Attr,
+    BinOp,
+    BoolExpr,
+    BoolLit,
+    BoolType,
+    BytesLit,
+    Call,
+    ClassType,
+    Compare,
+    ComplexLit,
+    DictExpr,
+    Expr,
+    FloatLit,
+    FloatType,
+    IfExpr,
+    IntType,
+    IntLit,
+    Lambda,
+    ListExpr,
+    Name,
+    NoneLit,
+    Slice,
+    StrLit,
+    Subscript,
+    TupleExpr,
+    UnaryOp,
+)
+from .layer1_support import _as_native_float
+from .runtime_abi import declare_runtime_global
+
+
+_I1 = ir.IntType(1)
+_I64 = ir.IntType(64)
+_DOUBLE = ir.DoubleType()
+
+
+def _is_class_type_for_expr_dispatch(ty) -> bool:
+    if isinstance(ty, ClassType):
+        return True
+    return type(ty).__name__ in ("ClassType", "ValueClassType")
+
+
+def _expr_dispatch_kind_name(expr: Expr) -> str:
+    try:
+        return type(expr).__name__
+    except Exception:
+        return ""
+
+
+def _expr_has_attr(expr: Expr, name: str) -> bool:
+    return hasattr(expr, name)
+
+
+def _expr_type_name(expr: Expr) -> str:
+    try:
+        return expr.ty.name
+    except AttributeError:
+        return ""
+
+
+def _expr_is_name(expr: Expr, kind: str) -> bool:
+    return isinstance(expr, Name) or (kind == "Name") or _expr_has_attr(expr, "ident")
+
+
+def _expr_is_list(expr: Expr, kind: str) -> bool:
+    if isinstance(expr, ListExpr) or kind == "ListExpr":
+        return True
+    return _expr_has_attr(expr, "elems") and _expr_type_name(expr) == "list"
+
+
+def _expr_is_tuple(expr: Expr, kind: str) -> bool:
+    if isinstance(expr, TupleExpr) or kind == "TupleExpr":
+        return True
+    ty_name = _expr_type_name(expr)
+    return _expr_has_attr(expr, "elems") and (
+        ty_name == "tuple" or ty_name == "tuple_variadic"
+    )
+
+
+def _expr_is_dict(expr: Expr, kind: str) -> bool:
+    return isinstance(expr, DictExpr) or kind == "DictExpr" or _expr_has_attr(
+        expr, "pairs"
+    )
+
+
+def _expr_is_call(expr: Expr, kind: str) -> bool:
+    return (
+        isinstance(expr, Call)
+        or kind == "Call"
+        or (
+            _expr_has_attr(expr, "func")
+            and _expr_has_attr(expr, "args")
+            and _expr_has_attr(expr, "kwargs")
+        )
+    )
+
+
+def _expr_is_attr(expr: Expr, kind: str) -> bool:
+    return isinstance(expr, Attr) or kind == "Attr" or (
+        _expr_has_attr(expr, "obj") and _expr_has_attr(expr, "name")
+    )
+
+
+def _expr_is_subscript(expr: Expr, kind: str) -> bool:
+    return isinstance(expr, Subscript) or kind == "Subscript" or (
+        _expr_has_attr(expr, "obj") and _expr_has_attr(expr, "idx")
+    )
+
+
+def _expr_is_slice(expr: Expr, kind: str) -> bool:
+    return isinstance(expr, Slice) or kind == "Slice" or (
+        _expr_has_attr(expr, "lo")
+        and _expr_has_attr(expr, "hi")
+        and _expr_has_attr(expr, "step")
+    )
+
+
+def _expr_is_binop(expr: Expr, kind: str) -> bool:
+    if isinstance(expr, BinOp) or kind == "BinOp":
+        return True
+    if not (
+        _expr_has_attr(expr, "lhs")
+        and _expr_has_attr(expr, "rhs")
+        and _expr_has_attr(expr, "op")
+    ):
+        return False
+    try:
+        return expr.op not in (
+            "==",
+            "!=",
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "is",
+            "is not",
+            "in",
+            "not in",
+        )
+    except AttributeError:
+        return False
+
+
+def _expr_is_compare(expr: Expr, kind: str) -> bool:
+    if isinstance(expr, Compare) or kind == "Compare":
+        return True
+    if not (
+        _expr_has_attr(expr, "lhs")
+        and _expr_has_attr(expr, "rhs")
+        and _expr_has_attr(expr, "op")
+    ):
+        return False
+    try:
+        return expr.op in (
+            "==",
+            "!=",
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "is",
+            "is not",
+            "in",
+            "not in",
+        )
+    except AttributeError:
+        return False
+
+
+def _expr_is_bool(expr: Expr, kind: str) -> bool:
+    return isinstance(expr, BoolExpr) or kind == "BoolExpr" or (
+        _expr_has_attr(expr, "left")
+        and _expr_has_attr(expr, "right")
+        and _expr_has_attr(expr, "op")
+    )
+
+
+def _expr_is_unary(expr: Expr, kind: str) -> bool:
+    return isinstance(expr, UnaryOp) or kind == "UnaryOp" or (
+        _expr_has_attr(expr, "operand") and _expr_has_attr(expr, "op")
+    )
+
+
+def _expr_is_if(expr: Expr, kind: str) -> bool:
+    return isinstance(expr, IfExpr) or kind == "IfExpr" or (
+        _expr_has_attr(expr, "cond")
+        and _expr_has_attr(expr, "then_e")
+        and _expr_has_attr(expr, "else_e")
+    )
+
+
+def _expr_is_lambda(expr: Expr, kind: str) -> bool:
+    return isinstance(expr, Lambda) or kind == "Lambda" or (
+        _expr_has_attr(expr, "params") and _expr_has_attr(expr, "body")
+    )
+
+
+class ExprDispatchLoweringMixin:
+    def _emit_dynamic_binary_dunder_call(
+        self,
+        lhs_expr: Expr,
+        dunder_name: str,
+        rhs_expr: Expr,
+    ) -> ir.Value:
+        recv_obj = self._emit_as_object(lhs_expr)
+        rhs_obj = self._emit_as_object(rhs_expr)
+        result = self.builder.call(
+            self.runtime["py_obj_call_method1"],
+            [recv_obj, self._attr_name_ptr(dunder_name), rhs_obj],
+            name=self._fresh(f"dyn.dunder.{dunder_name}.call"),
+        )
+        self._emit_attribute_error_if_null(
+            result,
+            dunder_name,
+            getattr(lhs_expr, "span", None),
+        )
+        return result
+
+    def _emit_expr_impl(self, expr: Expr) -> ir.Value:
+        if isinstance(expr, IntLit):
+            if self._int_exprs_are_boxed():
+                return self._emit_int_literal_object(int(expr.value))
+            return ir.Constant(_I64, int(expr.value))
+        if isinstance(expr, FloatLit):
+            return ir.Constant(_DOUBLE, _as_native_float(expr.value))
+        if isinstance(expr, ComplexLit):
+            return self.builder.call(
+                self.runtime["py_complex_new"],
+                [
+                    ir.Constant(_DOUBLE, _as_native_float(expr.real)),
+                    ir.Constant(_DOUBLE, _as_native_float(expr.imag)),
+                ],
+                name=self._fresh("complex.lit"),
+            )
+        if isinstance(expr, BoolLit):
+            return ir.Constant(_I1, 1 if bool(expr.value) else 0)
+        if isinstance(expr, NoneLit):
+            return self._emit_none_literal()
+        if isinstance(expr, StrLit):
+            return self._emit_str_literal(expr.value)
+        if isinstance(expr, BytesLit):
+            return self._emit_bytes_literal(expr.value)
+        expr_kind = _expr_dispatch_kind_name(expr)
+        if _expr_is_list(expr, expr_kind):
+            return self._emit_list_literal(expr)
+        if _expr_is_dict(expr, expr_kind):
+            return self._emit_dict_literal(expr)
+        if _expr_is_tuple(expr, expr_kind):
+            return self._emit_tuple_literal(expr)
+        if _expr_is_slice(expr, expr_kind):
+            return self._emit_slice_object_expr(expr)
+        if _expr_is_name(expr, expr_kind):
+            return self._emit_name(expr)
+        if _expr_is_subscript(expr, expr_kind):
+            return self._emit_subscript_load(expr)
+        if _expr_is_attr(expr, expr_kind):
+            return self._emit_attr(expr)
+        if _expr_is_binop(expr, expr_kind):
+            # Class-based arithmetic dunder fast path: ``a + b`` on a
+            # hinted class with ``__add__`` dispatches there before
+            # falling back to numeric coercion. Mirrors the compare
+            # path in ``_emit_compare``.
+            arith_dunder = {
+                "+": "__add__",
+                "-": "__sub__",
+                "*": "__mul__",
+                "/": "__truediv__",
+                "//": "__floordiv__",
+                "%": "__mod__",
+                "**": "__pow__",
+            }.get(expr.op)
+            if arith_dunder is not None:
+                dunder = self._try_dispatch_dunder_unary(
+                    expr.lhs, arith_dunder, (expr.rhs,)
+                )
+                if dunder is not None:
+                    reflected_dunder = {
+                        "+": "__radd__",
+                        "-": "__rsub__",
+                        "*": "__rmul__",
+                        "/": "__rtruediv__",
+                        "//": "__rfloordiv__",
+                        "%": "__rmod__",
+                        "**": "__rpow__",
+                    }.get(expr.op)
+                    if reflected_dunder is not None and isinstance(
+                        dunder.type, ir.PointerType
+                    ):
+                        parent_fn = self.current_function
+                        notimpl_gv = declare_runtime_global(
+                            self.module, "py_NotImplemented"
+                        )
+                        notimpl = self.builder.load(
+                            notimpl_gv, name=self._fresh("notimplemented")
+                        )
+                        is_notimpl = self.builder.icmp_unsigned(
+                            "==",
+                            dunder,
+                            notimpl,
+                            name=self._fresh("notimplemented.cmp"),
+                        )
+                        reflected_block = parent_fn.append_basic_block(
+                            name=self._fresh("binop.reflected")
+                        )
+                        done_block = parent_fn.append_basic_block(
+                            name=self._fresh("binop.done")
+                        )
+                        direct_block = self.builder.block
+                        self.builder.cbranch(
+                            is_notimpl, reflected_block, done_block
+                        )
+                        self.builder.position_at_end(reflected_block)
+                        reflected = self._try_dispatch_dunder_unary(
+                            expr.rhs, reflected_dunder, (expr.lhs,)
+                        )
+                        if reflected is None or reflected.type != dunder.type:
+                            reflected = dunder
+                        self.builder.branch(done_block)
+                        reflected_incoming = self.builder.block
+                        self.builder.position_at_end(done_block)
+                        phi = self.builder.phi(
+                            dunder.type, name=self._fresh("binop.dunder")
+                        )
+                        phi.add_incoming(dunder, direct_block)
+                        phi.add_incoming(reflected, reflected_incoming)
+                        return phi
+                    return dunder
+                if _is_class_type_for_expr_dispatch(expr.lhs.ty):
+                    return self._emit_dynamic_binary_dunder_call(
+                        expr.lhs,
+                        arith_dunder,
+                        expr.rhs,
+                    )
+                reflected_dunder = {
+                    "+": "__radd__",
+                    "-": "__rsub__",
+                    "*": "__rmul__",
+                    "/": "__rtruediv__",
+                    "//": "__rfloordiv__",
+                    "%": "__rmod__",
+                    "**": "__rpow__",
+                }.get(expr.op)
+                if reflected_dunder is not None and _is_class_type_for_expr_dispatch(
+                    expr.rhs.ty
+                ):
+                    return self._emit_dynamic_binary_dunder_call(
+                        expr.rhs,
+                        reflected_dunder,
+                        expr.lhs,
+                    )
+                # ``/`` on a DynType operand (e.g. ``obj.attr / n``) is handled
+                # generically by py_obj_truediv in _emit_binop_value below: a
+                # DynType may box a number at runtime, so it must not route to
+                # the __truediv__ dunder (a tagged int has no such attribute).
+            lhs = self._emit_expr(expr.lhs)
+            rhs = self._emit_expr(expr.rhs)
+            result = self._emit_binop_value(
+                expr.op, lhs, expr.lhs.ty, rhs, expr.rhs.ty, result_ty=expr.ty
+            )
+            self._gc_release_if_owned(lhs, expr.lhs)
+            self._gc_release_if_owned(rhs, expr.rhs)
+            return result
+        if _expr_is_unary(expr, expr_kind):
+            return self._emit_unary(expr)
+        if _expr_is_compare(expr, expr_kind):
+            return self._emit_compare(expr)
+        if _expr_is_bool(expr, expr_kind):
+            return self._emit_boolexpr(expr)
+        if _expr_is_call(expr, expr_kind):
+            return self._emit_call(expr)
+        if _expr_is_if(expr, expr_kind):
+            return self._emit_if_expr(expr)
+        # Simple lambda -> CPython ``operator`` callable. Covers the
+        # common ``sorted(xs, key=lambda x: x.attr)`` and
+        # ``sorted(xs, key=lambda x: x[i])`` idioms that dominate
+        # pcc's own source (method / subscript getters used as sort
+        # keys).
+        if _expr_is_lambda(expr, expr_kind):
+            simple = self._maybe_emit_simple_lambda(expr)
+            if simple is not None:
+                return simple
+            native = self._maybe_emit_native_lambda_func(expr)
+            if native is not None:
+                return native
+            # Fall back to the general lambda-wrap path: hoist the
+            # lambda body into a dedicated pcc FuncDef and wrap the
+            # function pointer as a CPython PyCFunction via
+            # ``py_cpy_wrap_pcc_1arg``.
+            wrapped = self._maybe_emit_lambda_wrap(expr)
+            if wrapped is not None:
+                return wrapped
+        raise NotImplementedError(
+            f"Layer 1 does not handle expression {type(expr).__name__}"
+        )

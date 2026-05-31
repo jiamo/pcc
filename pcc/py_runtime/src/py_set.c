@@ -38,6 +38,13 @@
 
 /* ---- Forward decls ----------------------------------------------------- */
 static int py_set_rehash(PySetObject *s, int64_t new_capacity);
+int64_t py_set_contains(PyObject *set, PyObject *item);
+
+static PyObject *py_set_entry_key(PySetObject *s, SetEntry *e) {
+    PyObject *raw = e->key;
+    if (raw == NULL || raw == py_set_dummy) return raw;
+    return pcc_gc_load_ptr((PyObject *)s, &e->key);
+}
 
 /* ---- Allocation -------------------------------------------------------- */
 
@@ -52,23 +59,28 @@ static int py_set_alloc_entries(PySetObject *s, int64_t capacity) {
     s->capacity = capacity;
     s->size     = 0;
     s->fill     = 0;
+    (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+        (PyObject *)s,
+        s->entries,
+        capacity * (int64_t)sizeof(SetEntry)
+    );
     return 0;
 }
 
 PyObject *py_set_new(void) {
-    PySetObject *s = (PySetObject *)malloc(sizeof(PySetObject));
+    PySetObject *s = (PySetObject *)pcc_gc_alloc(
+        (int64_t)sizeof(PySetObject), PY_TYPE_SET, 0
+    );
     if (s == NULL) return NULL;
-    s->h.refcount = 1;
-    s->h.type_tag = PY_TYPE_SET;
-    s->h.flags    = 0;
     s->entries    = NULL;
     s->capacity   = 0;
     s->size       = 0;
     s->fill       = 0;
     if (py_set_alloc_entries(s, PY_SET_INITIAL_CAPACITY) != 0) {
-        free(s);
+        py_decref((PyObject *)s);
         return NULL;
     }
+    py_gc_track((PyObject *)s);
     return (PyObject *)s;
 }
 
@@ -89,14 +101,15 @@ static void py_set_lookup(PySetObject *s, int64_t hash, PyObject *key,
 
     for (;;) {
         SetEntry *e = &s->entries[j];
-        if (e->key == NULL) {
+        PyObject *entry_key = py_set_entry_key(s, e);
+        if (entry_key == NULL) {
             *out_slot = (first_tombstone >= 0) ? first_tombstone : j;
             *out_found = 0;
             return;
         }
-        if (e->key == py_set_dummy) {
+        if (entry_key == py_set_dummy) {
             if (first_tombstone < 0) first_tombstone = j;
-        } else if (e->hash == hash && (e->key == key || py_obj_eq(e->key, key))) {
+        } else if (e->hash == hash && (entry_key == key || py_obj_eq(entry_key, key))) {
             *out_slot = j;
             *out_found = 1;
             return;
@@ -120,7 +133,7 @@ static int py_set_rehash(PySetObject *s, int64_t new_capacity) {
     }
 
     for (int64_t i = 0; i < old_capacity; i++) {
-        PyObject *k = old_entries[i].key;
+        PyObject *k = py_set_entry_key(s, &old_entries[i]);
         if (k == NULL || k == py_set_dummy) continue;
         int64_t slot;
         int found;
@@ -160,9 +173,9 @@ void py_set_add(PyObject *set, PyObject *item) {
 
     SetEntry *e = &s->entries[slot];
     int was_tombstone = (e->key == py_set_dummy);
-    py_incref(item);
     e->hash = hash;
-    e->key  = item;
+    e->key = NULL;
+    pcc_gc_store_ptr(set, &e->key, item);
     s->size++;
     if (!was_tombstone) s->fill++;
 
@@ -175,10 +188,112 @@ void py_set_update(PyObject *dst, PyObject *src) {
     if (py_header(src)->type_tag != PY_TYPE_SET) return;
     PySetObject *s = (PySetObject *)src;
     for (int64_t i = 0; i < s->capacity; i++) {
-        PyObject *k = s->entries[i].key;
+        PyObject *k = py_set_entry_key(s, &s->entries[i]);
         if (k == NULL || k == py_set_dummy) continue;
         py_set_add(dst, k);
     }
+}
+
+PyObject *py_set_intersection(PyObject *a, PyObject *b) {
+    PyObject *out = py_set_new();
+    if (out == NULL) return NULL;
+    if (a == NULL || b == NULL) return out;
+    if (PY_IS_TAGGED_INT(a) || PY_IS_TAGGED_INT(b)) return out;
+    if (py_header(a)->type_tag != PY_TYPE_SET) return out;
+    if (py_header(b)->type_tag != PY_TYPE_SET) return out;
+    PySetObject *sa = (PySetObject *)a;
+    for (int64_t i = 0; i < sa->capacity; i++) {
+        PyObject *k = py_set_entry_key(sa, &sa->entries[i]);
+        if (k == NULL || k == py_set_dummy) continue;
+        if (py_set_contains(b, k)) py_set_add(out, k);
+    }
+    return out;
+}
+
+PyObject *py_set_difference(PyObject *a, PyObject *b) {
+    PyObject *out = py_set_new();
+    if (out == NULL) return NULL;
+    if (a == NULL) return out;
+    if (PY_IS_TAGGED_INT(a)) return out;
+    if (py_header(a)->type_tag != PY_TYPE_SET) return out;
+    PySetObject *sa = (PySetObject *)a;
+    int b_is_set = (
+        b != NULL
+        && !PY_IS_TAGGED_INT(b)
+        && py_header(b)->type_tag == PY_TYPE_SET
+    );
+    for (int64_t i = 0; i < sa->capacity; i++) {
+        PyObject *k = py_set_entry_key(sa, &sa->entries[i]);
+        if (k == NULL || k == py_set_dummy) continue;
+        if (!b_is_set || !py_set_contains(b, k)) py_set_add(out, k);
+    }
+    return out;
+}
+
+/* a ^ b: elements in exactly one of a, b ((a - b) | (b - a)). */
+PyObject *py_set_symmetric_difference(PyObject *a, PyObject *b) {
+    PyObject *out = py_set_new();
+    if (out == NULL) return NULL;
+    int a_is_set = (
+        a != NULL && !PY_IS_TAGGED_INT(a)
+        && py_header(a)->type_tag == PY_TYPE_SET
+    );
+    int b_is_set = (
+        b != NULL && !PY_IS_TAGGED_INT(b)
+        && py_header(b)->type_tag == PY_TYPE_SET
+    );
+    if (a_is_set) {
+        PySetObject *sa = (PySetObject *)a;
+        for (int64_t i = 0; i < sa->capacity; i++) {
+            PyObject *k = py_set_entry_key(sa, &sa->entries[i]);
+            if (k == NULL || k == py_set_dummy) continue;
+            if (!b_is_set || !py_set_contains(b, k)) py_set_add(out, k);
+        }
+    }
+    if (b_is_set) {
+        PySetObject *sb = (PySetObject *)b;
+        for (int64_t i = 0; i < sb->capacity; i++) {
+            PyObject *k = py_set_entry_key(sb, &sb->entries[i]);
+            if (k == NULL || k == py_set_dummy) continue;
+            if (!a_is_set || !py_set_contains(a, k)) py_set_add(out, k);
+        }
+    }
+    return out;
+}
+
+int64_t py_set_issubset(PyObject *a, PyObject *b) {
+    if (a == NULL || b == NULL) return 0;
+    if (PY_IS_TAGGED_INT(a) || PY_IS_TAGGED_INT(b)) return 0;
+    if (py_header(a)->type_tag != PY_TYPE_SET) return 0;
+    if (py_header(b)->type_tag != PY_TYPE_SET) return 0;
+    PySetObject *sa = (PySetObject *)a;
+    PySetObject *sb = (PySetObject *)b;
+    if (sa->size > sb->size) return 0;
+    for (int64_t i = 0; i < sa->capacity; i++) {
+        PyObject *k = py_set_entry_key(sa, &sa->entries[i]);
+        if (k == NULL || k == py_set_dummy) continue;
+        if (!py_set_contains(b, k)) return 0;
+    }
+    return 1;
+}
+
+int64_t py_set_issuperset(PyObject *a, PyObject *b) {
+    return py_set_issubset(b, a);
+}
+
+PyObject *py_set_items(PyObject *set) {
+    if (set == NULL) return NULL;
+    if (PY_IS_TAGGED_INT(set)) return NULL;
+    if (py_header(set)->type_tag != PY_TYPE_SET) return NULL;
+    PySetObject *s = (PySetObject *)set;
+    PyObject *out = py_list_new(s->size > 0 ? s->size : 4);
+    if (out == NULL) return NULL;
+    for (int64_t i = 0; i < s->capacity; i++) {
+        PyObject *k = py_set_entry_key(s, &s->entries[i]);
+        if (k == NULL || k == py_set_dummy) continue;
+        py_list_append(out, k);
+    }
+    return out;
 }
 
 int64_t py_set_contains(PyObject *set, PyObject *item) {
@@ -200,7 +315,8 @@ int64_t py_set_remove(PyObject *set, PyObject *item) {
     py_set_lookup(s, hash, item, &slot, &found);
     if (!found) return -1;
     SetEntry *e = &s->entries[slot];
-    py_decref(e->key);
+    PyObject *k = py_set_entry_key(s, e);
+    py_decref(k);
     e->key = py_set_dummy;   /* tombstone; fill unchanged */
     s->size--;
     return 0;

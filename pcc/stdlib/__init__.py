@@ -8,6 +8,13 @@ pcc can't compile (C accelerators, decorators we don't yet support,
 etc.) — so user code can still ``import struct`` etc. without
 falling back to libpython.
 
+The public spelling is always the CPython spelling: ``import os``,
+``import gc``, ``import struct``. ``pcc/stdlib/<name>.py`` is an
+implementation location selected by pcc's resolver, not a user-facing
+``std.<name>`` namespace. A pcc-specific namespace would make programs
+less Python-compatible and should be reserved for non-stdlib extension
+APIs only.
+
 Adding a port:
 1. Create ``pcc/stdlib/<name>.py`` containing a pcc-compilable
    implementation that exposes the same public API as the CPython
@@ -16,6 +23,5 @@ Adding a port:
    silently.
 
 Current ports:
-- (none yet — this is the registry directory; see Issue 11.C.2 for
-  the first port, ``struct``, which unblocks Phase 9.2)
+- ``struct`` and helper modules used by it.
 """

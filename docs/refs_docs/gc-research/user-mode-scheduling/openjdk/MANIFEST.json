@@ -1,0 +1,253 @@
+{
+  "upstream": "https://github.com/openjdk/jdk",
+  "commit": "b9778ccb475891efd6347f7645b9a53c011f70fd",
+  "fetched_on": "2026-05-15",
+  "selection": "OpenJDK mainline Loom / virtual-thread reference pack: Java virtual-thread API/runtime, continuation API, carrier/blocking/poller integration, and HotSpot continuation freeze/thaw implementation.",
+  "files": [
+    {
+      "path": "BaseVirtualThread.java",
+      "upstream_path": "src/java.base/share/classes/java/lang/BaseVirtualThread.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/java/lang/BaseVirtualThread.java",
+      "sha256": "5988fd05e87f2c7d8efb35c121a2ad0e2e0f0b68a518674470a5849b394f4c9a",
+      "bytes": 2443
+    },
+    {
+      "path": "Thread.java",
+      "upstream_path": "src/java.base/share/classes/java/lang/Thread.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/java/lang/Thread.java",
+      "sha256": "47803bc7aaea8d53d1ed3cc701334b73915a6caea5e1e956d7b199efec85274b",
+      "bytes": 102410
+    },
+    {
+      "path": "ThreadBuilders.java",
+      "upstream_path": "src/java.base/share/classes/java/lang/ThreadBuilders.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/java/lang/ThreadBuilders.java",
+      "sha256": "e313229178615b0b61401d32886a1cb6d64e1bedf0f9e4c76629bddd365fa99e",
+      "bytes": 14877
+    },
+    {
+      "path": "VirtualThread.java",
+      "upstream_path": "src/java.base/share/classes/java/lang/VirtualThread.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/java/lang/VirtualThread.java",
+      "sha256": "6ec3a59f66542c6fa6129bdb58715ca28f049c969ed5204acc371a78206a541d",
+      "bytes": 52736
+    },
+    {
+      "path": "VirtualThreadEndEvent.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/event/VirtualThreadEndEvent.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/event/VirtualThreadEndEvent.java",
+      "sha256": "1cc9a7e5d25e34b07ca10895f4116f30258ba62a2f47d86ba0e10eb6be56ff76",
+      "bytes": 1647
+    },
+    {
+      "path": "VirtualThreadStartEvent.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/event/VirtualThreadStartEvent.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/event/VirtualThreadStartEvent.java",
+      "sha256": "791701972285dd7385b8f4447fea9be7271e9a2cd7669c22aaa92c268f42bd9d",
+      "bytes": 1655
+    },
+    {
+      "path": "VirtualThreadSubmitFailedEvent.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/event/VirtualThreadSubmitFailedEvent.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/event/VirtualThreadSubmitFailedEvent.java",
+      "sha256": "1cc92ca37ee725102d6d05208d935e206942a2d3ecf2f10c943eee4d030c056c",
+      "bytes": 1461
+    },
+    {
+      "path": "Blocker.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/misc/Blocker.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/misc/Blocker.java",
+      "sha256": "fd73a440df3b8ebe7176d8af9450cdcb86c8730892be2d5b9fdcfd835b2f81d5",
+      "bytes": 3329
+    },
+    {
+      "path": "CarrierThread.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/misc/CarrierThread.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/misc/CarrierThread.java",
+      "sha256": "efb9c631c95de2614798f387c1af3114bef06932c6bc2582074f9334daa01f89",
+      "bytes": 5395
+    },
+    {
+      "path": "CarrierThreadLocal.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/misc/CarrierThreadLocal.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/misc/CarrierThreadLocal.java",
+      "sha256": "d1510d65432ba0e2eca15308c1e09d8142ce65f63cf35d9648e99b60e108aa1b",
+      "bytes": 1856
+    },
+    {
+      "path": "ThreadFlock.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/misc/ThreadFlock.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/misc/ThreadFlock.java",
+      "sha256": "b889b88ba31c8b5b8f69c5ae1cd85a2525f0b9a2f975c306f362e2c85c8c61a9",
+      "bytes": 21559
+    },
+    {
+      "path": "Continuation.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/vm/Continuation.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/vm/Continuation.java",
+      "sha256": "cafd991ddd7f144376950442bc097e25f7d154b7e8fc9dccc4a2df21f9907c95",
+      "bytes": 17318
+    },
+    {
+      "path": "ContinuationScope.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/vm/ContinuationScope.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/vm/ContinuationScope.java",
+      "sha256": "a181a622fa8025654344e5c59db991aa75465f783f8d46c4c907ad03ecd36062",
+      "bytes": 2125
+    },
+    {
+      "path": "ContinuationSupport.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/vm/ContinuationSupport.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/vm/ContinuationSupport.java",
+      "sha256": "258be453e43eedcc9c9ab7fa44bac6725c7dd1a3a54e07316121329df8c4f972",
+      "bytes": 2392
+    },
+    {
+      "path": "SharedThreadContainer.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/vm/SharedThreadContainer.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/vm/SharedThreadContainer.java",
+      "sha256": "edc971c37ba45b8facb7ae026d3ec07246461f81b4ba7bb61947669212c97b50",
+      "bytes": 5737
+    },
+    {
+      "path": "StackChunk.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/vm/StackChunk.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/vm/StackChunk.java",
+      "sha256": "49b301bcc44f8523343738cf1ddc43f66555adb448b01b37a1a4e5b0c73dbb88",
+      "bytes": 1642
+    },
+    {
+      "path": "ThreadContainer.java",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/vm/ThreadContainer.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/jdk/internal/vm/ThreadContainer.java",
+      "sha256": "d80db4a55afff422dd374c83a8a82d4841677e0bfcd840785aef150385b0da90",
+      "bytes": 4472
+    },
+    {
+      "path": "LockSupport.java",
+      "upstream_path": "src/java.base/share/classes/java/util/concurrent/locks/LockSupport.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/java/util/concurrent/locks/LockSupport.java",
+      "sha256": "5f5a2e25dcedc37534a663555b1fae7aabfe96930d5cb1e1c791c0e7635b8b91",
+      "bytes": 17962
+    },
+    {
+      "path": "NioSocketImpl.java",
+      "upstream_path": "src/java.base/share/classes/sun/nio/ch/NioSocketImpl.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/sun/nio/ch/NioSocketImpl.java",
+      "sha256": "63e75e96e3a57da8eaaab4fc43f23ecedfb4bcedd4deb867bc443183c9d62f92",
+      "bytes": 46018
+    },
+    {
+      "path": "Poller.java",
+      "upstream_path": "src/java.base/share/classes/sun/nio/ch/Poller.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/sun/nio/ch/Poller.java",
+      "sha256": "74ca3bf87e2e6e5d89d00a6d43034123376ab3d34c1f0f3ea6ed970f3feef0e9",
+      "bytes": 27759
+    },
+    {
+      "path": "PollerProvider.java",
+      "upstream_path": "src/java.base/share/classes/sun/nio/ch/PollerProvider.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/sun/nio/ch/PollerProvider.java",
+      "sha256": "5789db83dd175fc657e48936b0fd463ace924674c11fd9ed81fdfb50414d0e7a",
+      "bytes": 2932
+    },
+    {
+      "path": "SocketChannelImpl.java",
+      "upstream_path": "src/java.base/share/classes/sun/nio/ch/SocketChannelImpl.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/java.base/share/classes/sun/nio/ch/SocketChannelImpl.java",
+      "sha256": "402d21cb4d6e46b2a74b7fd49d085cdf7e89d0bb6c0248a7f173ca818560c8c8",
+      "bytes": 55040
+    },
+    {
+      "path": "continuation.cpp",
+      "upstream_path": "src/hotspot/share/runtime/continuation.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuation.cpp",
+      "sha256": "b3c54e344457cfc21f46d7914eb02dca6804d73e81249cb5c0a06cd8d1f740d3",
+      "bytes": 18840
+    },
+    {
+      "path": "continuation.hpp",
+      "upstream_path": "src/hotspot/share/runtime/continuation.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuation.hpp",
+      "sha256": "d8fc5c08ebd02541986ace4a8dc33412996e70755f46811850af2404613eb724",
+      "bytes": 4901
+    },
+    {
+      "path": "continuationEntry.cpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationEntry.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationEntry.cpp",
+      "sha256": "a9021bdc0d6310e17f68e41f306b3e6341c194c0da3a39146b4608a5fc2891d2",
+      "bytes": 6396
+    },
+    {
+      "path": "continuationEntry.hpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationEntry.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationEntry.hpp",
+      "sha256": "81ce43a42bc381f769a75c286c081beaafbf89b70715918b6a8e84002ac5d50a",
+      "bytes": 5301
+    },
+    {
+      "path": "continuationEntry.inline.hpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationEntry.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationEntry.inline.hpp",
+      "sha256": "21188b9117fd219709ed36b0d583e1ea4df013e0740e5b13f3a589ccbab7c68b",
+      "bytes": 2795
+    },
+    {
+      "path": "continuationFreezeThaw.cpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationFreezeThaw.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationFreezeThaw.cpp",
+      "sha256": "b682cee3a55a6cbb0b12c58a2f066da09cb825b03228f469008eebb8bf9c72c8",
+      "bytes": 137085
+    },
+    {
+      "path": "continuationHelper.hpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationHelper.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationHelper.hpp",
+      "sha256": "cf857086a50095441ebb8bf8a762cdd9db8ec5eb04d9f9ac3fc16aaf7889d875",
+      "bytes": 5548
+    },
+    {
+      "path": "continuationHelper.inline.hpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationHelper.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationHelper.inline.hpp",
+      "sha256": "bf0f29033661d14f5853006ef0062c4c405ef4effd8cac814d90584dad025acc",
+      "bytes": 7831
+    },
+    {
+      "path": "continuationJavaClasses.cpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationJavaClasses.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationJavaClasses.cpp",
+      "sha256": "fbeb79d3a5c024ad10bcc1456ed492088583f72e3e3e0496b05afc469fc5f93c",
+      "bytes": 4797
+    },
+    {
+      "path": "continuationJavaClasses.hpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationJavaClasses.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationJavaClasses.hpp",
+      "sha256": "c28a2cc006077ea512f706cfa095307cad1558fc2028c5ea1e275825aef1f207",
+      "bytes": 5907
+    },
+    {
+      "path": "continuationJavaClasses.inline.hpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationJavaClasses.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationJavaClasses.inline.hpp",
+      "sha256": "58c2b46f474a89e75a675f7613376f21146ec1e676545adece1709c9f3ad2261",
+      "bytes": 7736
+    },
+    {
+      "path": "continuationWrapper.cpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationWrapper.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationWrapper.cpp",
+      "sha256": "d225b7746eb2044a70f56c47430bf6a1f566c648b33a122cdf83212b8d041f0f",
+      "bytes": 3264
+    },
+    {
+      "path": "continuationWrapper.inline.hpp",
+      "upstream_path": "src/hotspot/share/runtime/continuationWrapper.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/b9778ccb475891efd6347f7645b9a53c011f70fd/src/hotspot/share/runtime/continuationWrapper.inline.hpp",
+      "sha256": "cc7cf40f924e589bce3c84fa15e2e3a377994bfeaecc64e0f1770b46d301eb35",
+      "bytes": 6765
+    }
+  ]
+}

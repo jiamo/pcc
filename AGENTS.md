@@ -2,28 +2,198 @@
 
 This file is for humans and AI agents working in this repository.
 
+## Read Next
+
+Startup route for active goal work:
+
+1. Read this file first for repository rules and safety constraints.
+2. Read `codex-goal-prompt.md` for the current goal contract and work protocol.
+3. Read `docs/current-goal-state.md` for the current audit state and the
+   investigation/doc routing that should be read next.
+4. Use `docs/investigations/INDEX.md` to find relevant prior investigations
+   before opening or continuing a non-trivial bug.
+5. **Task-conditional, required — not optional reference.** The moment the task
+   becomes *debugging a failure*, read and follow
+   [`docs/debugging-playbook.md`](docs/debugging-playbook.md) before guessing.
+   The moment you *open or continue an investigation*, read and follow
+   [`docs/investigation-workflow.md`](docs/investigation-workflow.md) first.
+   These two were split out of this file to stay under the context budget;
+   the split lowered their resident-in-context cost, **not** their authority.
+
+## Project Intent (north star — read before changing direction)
+
+> This section is the top-level design contract. It exists to keep autonomous
+> work aligned: when a change would trade away one of the obligations below for
+> a local win — a faster benchmark, a greener gate, a smaller diff, a passing
+> bootstrap by rewrite — **stop and surface the tradeoff instead of taking it
+> silently.** This section is the *why*; `codex-goal-prompt.md` is the *how*
+> (tracks, gates, claim hygiene, prohibitions). If you find yourself weakening
+> Python semantics, mislabeling a mode, or special-casing a package to make
+> progress, you are off the north star — re-read this section.
+
+**Thesis.** pcc exists to give Python a native, auditable, self-hostable,
+no-libpython execution path. The goal is **not** merely to make selected Python
+programs faster — it is to make Python execution *ownable*: compiled,
+inspectable, self-hostable, package-aware, runtime-extensible, and honest about
+every fallback boundary. pcc treats performance as a **consequence of proven
+semantics, never a license to weaken Python behavior.**
+
+**What separates pcc from a Python accelerator.** Five things. Without them pcc
+is just another speedup tool; with them it is a system rebuilding Python
+*execution ownership*. Do not let any of these decay into decoration:
+
+```text
+1. pcc1 -> pcc2 -> pcc3 self-hosted fixed point
+2. five-GC comparative runtime (refcount/cycle, incremental, concurrent,
+   generational, relocating) — a research program, not one collector
+3. opt-in value model — identity-free immutable payloads for hot paths, with no
+   theft of ordinary-class semantics (Java's Project Valhalla is a conceptual
+   reference only, not pcc's brand or design constraint)
+4. self-backend as a first-class execution root (LLVM is oracle, not owner)
+5. long-running runtime efficiency (pause / RSS / throughput / fragmentation
+   over time, not single-shot compile+run speed)
+```
+
+**The fixed point is more than a byte compare.** It is evidence that pcc's
+Python semantics, runtime, codegen, object model, backend, and diagnostics are
+coherent enough to reproduce themselves:
+
+```text
+pcc0/host -> pcc1     pcc can produce a compiler
+pcc1      -> pcc2     the produced compiler can reproduce the compiler
+pcc2      -> pcc3     stable pcc2/pcc3 == a self-hosted fixed point
+```
+
+**Seven obligations.** Each is operationalized by a track + gates in
+`codex-goal-prompt.md`; the one-line form here is the guardrail, and the
+parenthetical is where it is actually enforced:
+
+```text
+1. Compatibility must be mode-labeled. A claim must say which mode produced it:
+     host pcc != pcc1   |   cpython-compat != pcc-native
+     libpython != no-libpython   |   LLVM-backed != self-backed
+     stage1 != pcc1->pcc2->pcc3 fixed point
+   (codex-goal-prompt §0.10 claim hygiene, §9.2 mode boundaries)
+
+2. Performance must be proven. C-like claims require IR-shape evidence + runtime
+   benchmark + a slow path that preserves Python semantics when assumptions fail.
+   pcc does not claim arbitrary dynamic Python becomes C-speed — only the parts
+   whose semantics are stable enough to lower natively. (C-track, §16)
+
+3. Ecosystem support must be generic. NumPy / PyTorch / pandas / Arrow / SciPy
+   are integration targets, never compiler special cases. No `if package ==
+   "numpy"`; fix the reusable mechanism (install/import/ABI/buffer/capsule/
+   build-surface) and regress the generic feature. (B-track, §9.1, §14)
+
+4. Self-backend must become a first-class execution root, not a forever-LLVM
+   dependency. No silent fallback to LLVM after --backend=self. (S-track, §10)
+
+5. The pcc1/pcc2/pcc3 fixed point is a contract. Differences are *classified*
+   (semantic / IR-text / class-layout / object-model / backend nondeterminism /
+   link metadata / perf-only / diagnostic), not patched around. pcc2/pcc3
+   stability is a core correctness signal. (§0.10, §19.2)
+
+6. Runtime design is part of the research goal. The five GC backends are a
+   comparative program; none may win by weakening finalizers, weakrefs,
+   resurrection, suspended coroutine frames, scheduler queues, C-extension
+   refs, or value payloads. Measure efficiency as a long-running property.
+   (G-track/§12, T-track/§13)
+
+7. The value model is the performance bridge, not a syntax gimmick. Ordinary
+   classes keep identity (id / is / weakref / __dict__ / mutation / subclass /
+   finalizer / dynamic attrs). Value classes are opt-in, identity-free payloads
+   with explicit boxing/unboxing, identity-escape diagnostics, GC tracing of
+   pointer-bearing payloads, and self-backend aggregate/scalar ABI. (The concept
+   is the obligation; "Valhalla" is only the reference it was distilled from.)
+   What pcc borrows from Valhalla is the PROJECTION model (semantic type vs
+   physical representation; value/object projection; boxing bridge; optimization
+   never changes semantics) — NOT Java's fixed-width `int` wrap. This applies to
+   `int` itself: `int` is a Python arbitrary-precision SEMANTIC type with a value
+   projection (tagged small-int lane) and an object projection (boxed bignum);
+   value-lane overflow must deopt/promote, never wrap. Raw machine integers are
+   the EXPLICIT `pcc.i64`/`pcc.u64` type (where wrap/trap/checked/saturating is
+   written in the type), or a proven-in-range internal optimization — never the
+   silent default meaning of `int`. (value model / V-track, §11)
+```
+
+**One mission, not two.** Industrial failures are research data (import failure
+-> C-API/ABI gap; Linux deploy failure -> self-backend target gap; long-running
+service regression -> GC/runtime benchmark; perf miss -> value-model gap), and
+research artifacts are industrial trust (fixed-point bootstrap -> reproducibility;
+five-GC matrix -> runtime credibility; valueclass benchmarks -> performance
+proof; package ABI reports -> ecosystem trust). The industrial thesis ("adopt
+pcc where native artifacts, no-libpython deploy, package-aware diagnostics, and
+hot-path specialization beat CPython") and the academic thesis ("a
+Python-authored compiler self-hosts into a no-libpython fixed point while
+exposing a disciplined runtime laboratory") reinforce each other. **Every claim
+must say exactly what it proves and what it does not prove.**
+
+**Runtime layering: shrink the C runtime to a kernel; do not eliminate it.**
+pcc does not aim to eliminate all low-level native runtime code. The long-term
+goal is to minimize the C-level runtime into a small ABI kernel — allocation,
+object headers, atomics/refcount barriers, platform syscalls, threading
+primitives, dynamic loading, C-extension entrypoints, safepoints/stack maps,
+and GC primitives — while Python *semantics* migrate into pcc-Python and are
+compiled by pcc itself. The C kernel remains as the machine boundary; **it must
+not become a second, hand-maintained C version of the Python semantic runtime
+running in parallel with the pcc-Python one.** Distinguish four layers (do not
+say "C runtime" loosely — it conflates them):
+
+```text
+C-level kernel        KEEP (minimize): platform/ABI, alloc, atomics, threads,
+                      dlopen, syscalls, safepoints, GC slot/root primitives.
+                      Knows no high-level Python semantics (no list/dict/dunder/
+                      valueclass/import policy; no `if package == "numpy"`).
+C semantic runtime    SHRINK: hand-written C list/dict/str/dunder/exception
+                      semantics -> migrate to pcc-Python.
+pcc-Python runtime    GROW: the migration target; Python semantics authored in
+                      pcc-Python, self-hostable, testable, compiled by pcc.
+C-API shim            KEEP but spec/generate: the ABI surface extensions see;
+                      != CPython/libpython.
+```
+
+This does not contradict no-libpython: no-libpython means not depending on the
+CPython runtime, NOT that the final binary contains zero C-level runtime. It
+ties directly to the **5-GC Production Equality Rule** (codex-goal-prompt.md,
+G-track): all five GC backends, the C kernel, and the pcc-Python mirror must
+consume ONE slot-based trace/update contract (`py_obj_visit_slots` /
+`py_obj_update_slot` / root + frame + native-handle registration) so there is
+never a second parallel set of object-graph rules to drift. The C kernel and
+the pcc-Python semantic runtime are connected by a stable, spec'd runtime ABI
+(Layer 1) precisely to prevent that drift.
+
 ## Project Summary
 
-`pcc` is primarily a C compiler implemented in Python on top of
-`pycparser`, LLVM (`llvmlite` and now `pcc/llvm_capi`), and a
-lightweight fake-libc layer. The C path is still the most mature part of
-the repository, but the repo now also contains an experimental Python
-frontend (`pcc/py_frontend/` + `pcc/py_runtime/`) and an active
-self-host/bootstrap track. Most fixes in this repository are not parser
-bugs; they are semantic bugs that only show up when expressions are
-combined, lowered to LLVM IR, and then exercised by real programs.
+`pcc` is two compilers and one runtime in one repo:
 
-The fastest way to get useful results is:
+1. A **C frontend** built on `pycparser`, LLVM (`llvmlite` and `pcc/llvm_capi`),
+   and a fake-libc layer. This is the most mature path; it runs real
+   third-party projects (Lua, SQLite, PostgreSQL `libpq`, zlib, lz4, zstd,
+   PCRE, OpenSSL, readline, nginx).
+2. An experimental **typed-Python frontend** (`pcc/py_frontend/` +
+   `pcc/py_runtime/`) used for the self-host / bootstrap track.
+3. A **runtime** (`pcc/py_runtime/src/*.c` and pcc-Python ports under
+   `pcc/py_runtime/py/`) with five pluggable GC backends.
 
-1. Reproduce with a tiny C program when possible.
-2. Compare against a native compiler built from the same source.
+Most fixes in this repository are not parser bugs; they are **semantic** bugs
+that only show up when expressions are combined, lowered to LLVM IR, and then
+exercised by real programs. The C-side and Python-side both follow this
+pattern.
+
+The fastest way to get useful results:
+
+1. Reproduce with a tiny program when possible.
+2. Compare against a known-good reference (native compiler for C; CPython for
+   Python; `llvmlite` for `llvm_capi` parity).
 3. Add one small regression test and one realistic integration confirmation.
 4. Do not consider a real-project bug "fixed" until the minimized regression
    exists in `tests/` and passes without the project harness.
 
 The fastest way to create expensive regressions is the opposite:
 
-1. touch `c_codegen.py` or parser code with a broad speculative change
+1. touch `c_codegen.py`, any `pcc/py_frontend/codegen/*_lowering.py` mixin, or
+   any `pcc/py_frontend/codegen/native_*.py` file with a broad speculative
+   change
 2. skip the smallest reproducer
 3. delay regression checks until after several edits have stacked up
 
@@ -32,312 +202,270 @@ Do not do that here.
 
 ## Environment Rules
 
-- Use `uv run ...` for Python entrypoints. Do not rely on bare `python`; local `pyenv` state may not match the repository.
-- **Codex-specific**: Codex sets `LC_ALL=C` which can break Python locale handling. Unset it with `env -u LC_ALL` before running commands. See https://github.com/openai/codex/issues/14723. Not needed for Claude Code or other agents.
+- Use `uv run ...` for Python entrypoints. Do not rely on bare `python`; local
+  `pyenv` state may not match the repository.
+- Use `env -u LC_ALL` in command examples. It is required for Codex because
+  Codex may set `LC_ALL=C`, which can break Python locale handling; it is
+  harmless for other users. See https://github.com/openai/codex/issues/14723.
 
-```bash
-# Codex only:
-env -u LC_ALL uv run pytest -q
-env -u LC_ALL uv run pcc hello.c
-# Claude Code / others:
-uv run pytest -q
-uv run pcc hello.c
-```
+  ```bash
+  env -u LC_ALL uv run pytest -q
+  env -u LC_ALL uv run pcc hello.c
+  ```
 
-- While debugging one failure, prefer `-n0` so xdist does not hide ordering or temp-file problems.
-- Use ripgrep (`rg`), or your agent's built-in code search tools (e.g. Grep/Glob in Claude Code) for source discovery.
-- Do not leave temporary `.c` files inside real project directories. Directory-based source collection can accidentally compile them.
-- **Always cap probe / experimental binaries with a hard timeout.** When you compile a one-shot `/tmp/<name>` probe and run it (especially a self-host stage binary that might infinite-loop), wrap the run with `timeout 30s ./tmp_probe` or equivalent. Found 2026-04-26: 4 zombie `pq_probe_stage_*_self` processes from a codex session pegged 100% CPU each for 33 hours (~120 CPU-hours wasted) — they were started without a timeout and the agent moved on without verifying termination. Before ending a session, always `ps aux | grep <your-probe-name>` and `kill` any leftover children. Probe binaries that hang are *expected* during compiler bring-up; the leak is not.
+- While debugging one failure, prefer `-n0` so xdist does not hide ordering or
+  temp-file problems.
+- Use ripgrep (`rg`) or your agent's built-in code search for source discovery.
+- Do not leave temporary `.c`/`.py` files inside real project directories.
+  Directory-based source collection can accidentally compile them.
+- **Never drop scratch files in the repo root.** When you need a throwaway
+  artifact, in order of preference: (1) write a real test under `tests/` —
+  that captures the case as a regression and survives; (2) use an existing
+  fixed build/cache directory (e.g. the per-test artifact dir under
+  `~/.cache/pcc/test-artifacts/`, or `cache_dir` in the function you're
+  working on); (3) only if neither fits, use `/tmp/`. The top-level
+  directory is never the right place — it pollutes `git status`,
+  pre-commit hooks pick it up, and other agents see the noise.
+- **Every Bash invocation must have an explicit timeout. No exceptions.**
+  This applies to **all** runs — `uv run pytest`, `uv run pcc`,
+  `scripts/bootstrap.sh`, `/tmp/<name>` probes, LLDB sessions, anything
+  that forks a child process. The default is a small timeout you expect
+  the command to finish well under; **only widen it when you can name a
+  specific reason** the run will legitimately take longer (e.g. "full
+  pytest suite is 6–8 min → use 600s", "stage1 self-host bootstrap is
+  ~4–5 min → use 360s"). "I'll just let it run" is not a reason.
+  Without a timeout, a hung collection / codegen infinite loop / runaway
+  probe silently burns the foreground turn and can leave zombie children
+  pegging CPU for hours (this has happened — ~120 CPU-hours lost once).
+  Before ending a session, `ps aux | grep <your-probe-name>` and `kill`
+  any leftover children. Prefer the Bash tool's `timeout` field; fall
+  back to a `timeout <Ns>` prefix when shelling out from a script.
+- **Never `git revert`, `git checkout -- <path>`, `git restore`, `git reset
+  --hard`, `git clean -f`, `git stash`, branch switches that discard local
+  edits, or any `--force`/`--hard` flag that drops uncommitted state — unless
+  the user explicitly asks for it.** Multiple agents and humans share this
+  working directory; a unilateral rewind silently deletes another agent's
+  in-flight work that has not yet been committed. If you believe a previous
+  change is wrong, leave it in place and discuss with the user, or stage a
+  *new* commit that supersedes it.
+- **Do not perform file-overwrite operations via git (including revert/restore
+  checkout/reset --hard/clean/stash or equivalent) unless explicitly requested
+  by the user.** This applies to all working-tree files touched in this
+  repository.
+- **Do not `git commit` unless the user asks.** During investigation you may
+  *describe* a sequence ("commit investigation file → run experiment → revert
+  → record outcome → commit again"), but you may not run the commits without
+  explicit user approval. The Investigation Workflow's "save before each
+  experiment" idiom is a prescription for the user to follow, not for the
+  agent to execute autonomously.
+- **Do not delete documents, plans, investigations, tests, or project
+  directories unless the user explicitly names the files/directories to
+  remove.** Treat `rm`, scripted deletion, and bulk cleanup of docs as
+  destructive operations, even when git could recover them.
 
 
 ## Repository Map
 
-- `pcc/pcc.py`
-  Command-line entrypoint.
-- `pcc/project.py`
-  Directory collection, `--sources-from-make`, and translation-unit selection.
-- `pcc/evaluater/c_evaluator.py`
-  Preprocessing, parsing, IR generation, LLVM parsing, optimization, and execution.
-- `pcc/codegen/c_codegen.py`
-  Main semantic lowering logic. Most tricky C correctness bugs land here.
-- `pcc/py_frontend/`
-  Experimental Python frontend. Type inference, Python lowering, and most
-  self-host blockers live here.
-- `pcc/py_runtime/`
-  Native runtime support for the Python frontend.
-- `pcc/llvm_capi/`
-  In-repo LLVM builder/binding replacement path. Useful both for
-  self-host work and for isolating `llvmlite` vs native LLVM-C behavior.
-- `utils/fake_libc_include/`
-  Fake libc headers. Bugs here usually look like host ABI or declaration mismatches.
-- `tests/`
-  Fast regression coverage. Add small tests here for every semantic fix.
-- `tests/py_corpus/`
-  End-to-end Python frontend corpus. Use this when validating Python-path
-  behavior beyond a minimized unit test.
-- `scripts/pcc_multi.py`
-  Experimental multi-file Python entrypoint used by the bootstrap track.
-- `projects/lua-5.5.0/`
-  Real-program stress target. Very effective for catching interactions missed by unit tests.
+| Path | Role |
+|---|---|
+| `pcc/pcc.py`, `pcc/cli_core.py` | CLI entrypoints |
+| `pcc/cli_bootstrap.py` | Bootstrap-stage CLI used by `pcc1`/`pcc2`/`pcc3` |
+| `pcc/api.py` | `build(...)` / `module(...)` Python API for C |
+| `pcc/project.py` | Directory collection, `--sources-from-make`, TU selection |
+| `pcc/evaluater/c_evaluator.py` | C preprocess/parse/IR/optimize/execute |
+| `pcc/codegen/c_codegen.py` | Main C semantic lowering (~most C bugs land here) |
+| `pcc/parse/c_parser.py` | C parser (PLY-based; bump cache version on grammar/lexer changes) |
+| `pcc/py_frontend/` | Python typed-frontend; type infer + native lowering |
+| `pcc/py_frontend/codegen/layer1.py` | Thin facade for Python frontend lowering |
+| `pcc/py_frontend/codegen/*_lowering.py` | Main Python lowering mixins; add focused behavior here instead of growing `layer1.py` |
+| `pcc/py_frontend/codegen/native_*.py` | Native module lowering (gc, threading, asyncio, system, os, math, modules, weakref, ...) |
+| `pcc/py_runtime/src/*.c` | Native runtime in C (objects, GC, threads, exceptions, ...) |
+| `pcc/py_runtime/py/*.py` | pcc-Python runtime ports (mirror of C; for self-host) |
+| `pcc/py_runtime/include/py_runtime.h` | Public runtime header: object header, type tags, `PCC_GC_KIND_*` enum |
+| `pcc/py_runtime/src/py_internal.h` | Runtime-internal object layouts such as `PyClassObject` |
+| `pcc/llvm_capi/` | In-repo LLVM-C builder; fallback path is `llvmlite` |
+| `pcc/backend/` | Experimental LLVM-free self backend (AArch64 Darwin, x86_64 Linux subsets) |
+| `pcc/extern/`, `pcc/unsafe/` | Python→C extern decls; compiler-recognized intrinsics |
+| `utils/fake_libc_include/` | Fake libc headers (host ABI / decl mismatches surface here) |
+| `tests/` | Unit, parity, integration regression coverage |
+| `tests/py_corpus/phase*/` | End-to-end Python corpus retained from the earlier phase taxonomy. These tests still run; the phase framework is no longer the active task board. See current priorities in `docs/current-goal-state.md`. |
+| `tests/python/test_self_host_oracle_diff.py` | Core Python semantic oracle / pcc1-pcc2 parity ratchet |
+| `tests/python/test_pcc_bootstrap_full.py` | Full stage1→stage2→stage3 self-backend bootstrap gate |
+| `tests/bootstrap_gate_baseline.json` | **Authoritative bootstrap state** (Issue 1 closure evidence) |
+| `tests/fallback_baseline.json` | **Authoritative no-libpython fallback state** |
+| `scripts/bootstrap.sh` | macOS arm64 three-stage bootstrap entry |
+| `scripts/pcc_multi.py` | Experimental multi-file Python entry |
+| `projects/lua-5.5.0/` | Real-program stress target |
+| `docs/refs_docs/gc-research/` | Reference impls for the 5 GC backends (Lua, Go, OCaml, ZGC, CPython) |
+| `codex-goal-prompt.md` | Active goal contract / work protocol index |
+| `docs/current-goal-state.md` | Current goal audit, selected task state, and investigation routing |
+| `docs/investigations/INDEX.md` | Index of investigation docs; keep it current when investigation docs change |
 
 
-## Python Frontend / Bootstrap Notes
+## Compile Modes
 
-The Python frontend is a separate subsystem from the mature C path. Do
-not assume a C-side debugging rule automatically covers Python lowering,
-runtime fallback, or bootstrap behavior.
+Be explicit about which mode you are debugging.
 
-- Single-file Python entry:
-  `env -u LC_ALL uv run pcc foo.py`
-- Multi-file/bootstrap entry:
-  `env -u LC_ALL uv run python scripts/pcc_multi.py --entry pkg.main --out out_bin pkg/main.py ...`
-- `pcc/llvm_capi/` is the active in-repo LLVM replacement path; `llvmlite`
-  is still available as a fallback/comparison path for regression
-  isolation.
-- Current verified Issue 1 metric: the stage1 tight multi-file closure
-  in `--ir-scaffold=on` has zero `py_cpy_*` call instructions, guarded
-  by `tests/fallback_baseline.json`. This is necessary but not sufficient
-  for closing Issue 1.
-- The remaining Issue 1 close criterion is a real link gate: build the
-  stage1 bootstrap binary with libpython disabled and verify there are
-  no unresolved `Py*` / `py_cpy_*` symbols. Do not describe the current
-  path as pure self-host until that link-without-libpython property has
-  been re-verified in the current tree.
-- Some bootstrap host queries intentionally use host-tool subprocess
-  boundaries (`PCC_HOST_PYTHON` or `python3`) instead of in-process
-  libpython calls. In particular, `_link_with_self_backend` must not
-  reintroduce compiled-stage imports/calls of `pcc.backend.*`; doing so
-  brings `py_cpy_*` back into the stage1 closure. The long-term target
-  is to compile those backend modules natively, not to grow in-process
-  CPython fallback again.
-- When touching Python frontend or bootstrap-shared code, run the narrow
-  dedicated gates first:
+- **Single-file**: compile exactly one `.c` / `.py` file.
+- **Merged directory** (default for directory inputs): concatenates selected
+  `.c` files into one large translation unit.
+- **`--separate-tus`**: compile each `.c` as its own TU, link at the LLVM /
+  module layer.
+- **`--sources-from-make GOAL`**: use `make -nB GOAL` to discover `.c` files.
+  Recovers preprocessor flags only when the build system actually emits them;
+  flags only documented in headers are not inferable.
 
-```bash
-env -u LC_ALL uv run pytest tests/test_py_multi_file_compile.py tests/test_py_multi_file_bootstrap_shim.py -q -n0
-env -u LC_ALL uv run pytest tests/test_llvm_capi_ir_parity.py tests/test_llvm_capi_end_to_end.py -q -n0
-env -u LC_ALL uv run pytest tests/test_fallback_baseline.py tests/test_ir_py_fallback_baseline.py -q -n0
-```
+Use the Lua commands from the current test or investigation context instead of keeping long examples in startup memory.
 
 
-## Source Collection Modes
+## Python Frontend / Bootstrap
 
-The repository has multiple ways to compile projects. Be explicit about which one you are debugging.
+The Python frontend is a separate subsystem from the mature C path. C-side
+debugging rules do not automatically cover Python lowering, runtime fallback,
+or bootstrap behavior.
 
-- Single-file mode:
-  Compile exactly one `.c` file.
-- Merged directory mode:
-  The default directory path behavior. It concatenates selected `.c` files into one large translation unit.
-- `--separate-tus`:
-  Compile each `.c` as its own translation unit, then link at the LLVM/module layer.
-- `--sources-from-make GOAL`:
-  Use `make -nB GOAL` to discover which `.c` files belong to a target.
-  It can also recover common preprocessor flags from real compile commands, but
-  only if the build system actually emits them. It cannot infer compatibility
-  flags that exist only in documentation, headers, or repository conventions.
+### Bootstrap stage names
 
-For Lua, these are the most useful entrypoints:
+`scripts/bootstrap.sh --backend self` builds a staged compiler chain:
+
+- `pcc0`: host Python running repository source.
+- `pcc1`: first native compiler binary produced by `pcc0`.
+- `pcc2`: compiler binary produced by `pcc1`.
+- `pcc3`: compiler binary produced by `pcc2`.
+
+The full self-host gate requires `pcc1` to compile `pcc2`, `pcc2` to compile
+`pcc3`, and the stage outputs/baselines to match the relevant bootstrap
+contracts. Do not describe a self-host fix as complete from a local toy repro
+alone.
+
+### Critical CLI knobs
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--python-libpython` | `off` | `off`: hard error if codegen would need a CPython fallback. `auto`: link `libpython` only when fallback was needed. `on`: always allow/link the fallback surface. |
+| `--ir-scaffold` | `on` | `on`: closed-world lowering used by the strict self-host work. `off`: older lowering escape hatch. `auto`: legacy mixed mode. |
+| `--backend` | `llvm` | `llvm`, `llvm_capi`, or `self`. Strict self-host requires `--backend self`. |
+
+Strict no-libpython self-host invocation:
 
 ```bash
-env -u LC_ALL uv run pcc --cpp-arg=-DLUA_USE_JUMPTABLE=0 --cpp-arg=-DLUA_NOBUILTIN projects/lua-5.5.0/onelua.c -- projects/lua-5.5.0/testes/math.lua
-env -u LC_ALL uv run pcc --cpp-arg=-DLUA_USE_JUMPTABLE=0 --cpp-arg=-DLUA_NOBUILTIN --sources-from-make lua projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
-env -u LC_ALL uv run pcc --cpp-arg=-DLUA_USE_JUMPTABLE=0 --cpp-arg=-DLUA_NOBUILTIN --separate-tus --sources-from-make lua projects/lua-5.5.0 -- projects/lua-5.5.0/testes/math.lua
+env -u LC_ALL uv run pcc --backend self --python-libpython=off --ir-scaffold=on \
+  pcc/__main__.py -o /tmp/pcc1_probe
 ```
+
+Multi-file/bootstrap entry:
+
+```bash
+env -u LC_ALL uv run python scripts/pcc_multi.py --entry pkg.main \
+  --out out_bin pkg/main.py ...
+```
+
+### Authoritative current state (do not invent)
+
+- **Bootstrap byte-identity** (Issue 1 closure 2026-05-01):
+  [`tests/bootstrap_gate_baseline.json`](tests/bootstrap_gate_baseline.json)
+- **No-libpython fallback ratchet**:
+  [`tests/fallback_baseline.json`](tests/fallback_baseline.json)
+- These JSON files are the source of truth. `docs/issues/open-bootstrap-issues.md`
+  is a historical tracker that may lag.
+
+### Dedicated gates for Python-frontend / bootstrap edits
+
+```bash
+env -u LC_ALL uv run pytest tests/python/test_py_multi_file_compile.py tests/python/test_py_multi_file_bootstrap_shim.py -q -n0
+env -u LC_ALL uv run pytest tests/c/test_llvm_capi_ir_parity.py tests/c/test_llvm_capi_end_to_end.py -q -n0
+env -u LC_ALL uv run pytest tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py -q -n0
+env -u LC_ALL uv run pytest tests/python/test_bootstrap_gate_baseline.py -q -n0
+```
+
+### Active self-host / package work
+
+The active multi-stage plan is to compile pcc's runtime in pcc-Python and
+shrink the libpython surface, while the current active goal prioritizes the
+package/import path when it blocks real `pip install` / `import` scenarios.
+Use `codex-goal-prompt.md` for the goal contract and
+`docs/current-goal-state.md` for the current selected task, evidence, and
+investigation routing. Older plans such as
+`docs/plans/python-runtime-no-c-plan.md` are background, not the active task
+board.
+
+### Subprocess vs in-process boundaries
+
+Some bootstrap host queries intentionally use subprocess boundaries
+(`PCC_HOST_PYTHON` or `python3`) instead of in-process libpython calls. In
+particular, `_link_with_self_backend` must not reintroduce compiled-stage
+imports/calls of `pcc.backend.*`; that brings `py_cpy_*` back into the
+stage1 closure. The long-term target is to compile those backend modules
+natively, not to grow in-process CPython fallback again.
+
+
+## Runtime & GC Backends
+
+The runtime ships **five GC backend slots** selected at runtime via
+`PCC_GC_BACKEND` (enum at `pcc/py_runtime/include/py_runtime.h::PCC_GC_KIND_*`,
+values 0..4). The current default decision is recorded in
+`docs/investigations/gc-backend-selection-matrix.md`: backend #0 remains the
+default and rollback reference.
+
+Detailed backend status lives in `docs/current-goal-state.md` and routed GC investigations. Startup needs only the invariants below.
+
+
+Rules when working on GC code:
+
+- **Read the reference before patching.** `docs/refs_docs/gc-research/<lang>/` has
+  the full upstream implementation; the pcc port is meant to mirror it. Do
+  not re-derive — read.
+- **Each backend gets its own focused gate**, not a shared one. Example:
+  ```bash
+  PCC_GC_BACKEND=1 env -u LC_ALL uv run pytest -n0 tests/python/test_gc_*.py
+  PCC_GC_BACKEND=2 PCC_WITH_THREADS=1 env -u LC_ALL uv run pytest -n0 tests/python/test_gc_*.py
+  PCC_GC_BACKEND=3 env -u LC_ALL uv run pytest -n0 tests/python/test_gc_*.py
+  ```
+- **Do not let backend X regress backend #0.** `PCC_GC_BACKEND=0` (default) is
+  the reference; any new backend must keep stage2 / stage3 green.
+- **One backend per PR** with one investigation file under
+  `docs/investigations/`. No multi-backend bundle commits.
+- **Mirror C and pcc-Python runtimes.** Most GC code has a C source file
+  under `pcc/py_runtime/src/` and a pcc-Python port under
+  `pcc/py_runtime/py/`. They must stay in sync.
+
+The `layer1.py` split has landed: `layer1.py` is now a facade, with behavior
+split across focused `*_lowering.py` mixins plus `native_*.py` modules. When
+adding Python lowering, choose the narrowest existing mixin or native module;
+do not grow `layer1.py` again.
 
 
 ## Debugging Playbook
 
-### 1. Make the failure deterministic
-
-Do not start by reading all of `c_codegen.py`. First make the failure repeatable.
-
-Examples:
-
-- fix the random seed
-- replace filesystem/time input with constants
-- run with `-n0`
-- isolate one test file instead of a whole suite
-
-If the failure is random, your first job is to remove randomness from the reproduction, not to guess the cause.
-
-
-### 2. Compare `pcc` against native from the same source
-
-When the bug appears in a real program:
-
-1. Compile the same source with `pcc`
-2. Compile the same source with the system C compiler
-3. Compare behavior, not assumptions
-
-This separates "the program is odd" from "the compiler lowered it incorrectly".
-
-
-### 2a. Use `llvmlite` as an oracle for `llvm_capi` parity
-
-If the failure looks like a codegen / IR-builder regression in
-`pcc/llvm_capi/`, do not guess blindly. Re-run the same minimized repro with
-the `llvmlite` backend and use that as the oracle.
-
-The switch is:
-
-```bash
-PCC_USE_LLVMLITE_C=1 env -u LC_ALL uv run pytest 'tests/test_clang_compat.py::test_unsigned_int_to_float_conversion_uses_unsigned_semantics' -q -n0
-```
-
-Use this workflow:
-
-1. shrink the failure to the smallest C repro or single pytest node
-2. run it under the default `llvm_capi` path
-3. run the exact same repro with `PCC_USE_LLVMLITE_C=1`
-4. compare compile result, runtime result, and when needed the emitted IR
-5. patch only the smallest semantic gap in `pcc/llvm_capi` or codegen
-6. add one focused regression test before moving on
-
-This is especially effective for:
-
-- missing `IRBuilder` ops such as `uitofp`, `fptoui`, `fpext`, or `fneg`
-- constant `gep` / `bitcast` expression lowering
-- typed-pointer semantics hidden by opaque `ptr`
-- function-type / function-pointer decay mismatches
-
-Do **not** assume `llvmlite` is the oracle for everything. It is a good oracle
-for backend parity bugs, but not for:
-
-- system preprocessor behavior
-- fake-libc or header rewrite policy
-- compile-only diagnostics policy
-- parser acceptance / rejection mismatches
-
-If both backends fail the same minimized repro, the bug is probably above the
-backend layer and you should move back to parser, preprocessor, headers, or
-semantic lowering.
-
-
-### 3. Shrink the reproducer in stages
-
-A productive sequence is:
-
-1. failing integration test
-2. smaller script or input
-3. small C harness that calls the same internal code path
-4. pure C expression or arithmetic reproducer
-
-Do not stop at step 1 if the failure is deep in semantics. The time you spend shrinking the reproducer is usually returned many times over during diagnosis.
-
-
-### 4. Test hypotheses by substitution, not only by inspection
-
-If a large function is suspect:
-
-- copy it into a temporary harness
-- replace one helper at a time with the real implementation
-- reintroduce branches incrementally
-
-This is often faster than staring at 500 lines of codegen or IR.
-
-
-### 4a. Do not waste time on avoidable harness mistakes
-
-Some failures in this repository come from the test harness or shell usage, not
-from `pcc` itself.
-
-Rules:
-
-- When running a single pytest node id that contains `[` or `]`, always quote
-  it. `zsh` will treat it as a glob otherwise.
-- Do not use `uv run python - <<'PY' ...` or other stdin-backed Python entry
-  points when the code path uses `multiprocessing` with spawn. On macOS this can
-  fail with `FileNotFoundError` for `<stdin>` and produce fake compiler
-  failures. Use a real file path or drive the behavior through pytest.
-- If a manifest says "native passes, pcc fails" or similar, rerun the case
-  through the current harness before debugging `pcc`. These manifests drift.
-  A stale bucket is a test-data bug, not a compiler bug.
-- If you change parser grammar or lexer token sets, bump the default PLY cache
-  version in [`pcc/parse/c_parser.py`](/Users/jiamo/my/pcc/pcc/parse/c_parser.py).
-  Otherwise the repository can silently keep using an old `yacctab`/`lextab`
-  and make the parser look "still broken" after the source fix.
-- Treat this as mandatory, not optional cleanup. A parser/lexer fix is not
-  complete until the default PLY cache name has been bumped in the same
-  change whenever the grammar or token set changed.
-- After any parser or lexer grammar change, run a focused parser regression
-  first, then one representative compile/runtime case. Do not jump straight to
-  a large project suite.
-- Do not declare a run "done" until the command has produced its final summary.
-  Partial progress output is not a result.
-
-
-### 5. Do not stack unverified edits in shared codegen
-
-`pcc/codegen/c_codegen.py` is shared by almost every meaningful path in the
-repository. A "small local cleanup" there can easily break:
-
-- Lua startup
-- SQLite or zstd/lz4 integration
-- GCC torture baselines
-- parser-driven constant folding in unrelated code
-
-Rules:
-
-- Do not land a broad speculative patch in `c_codegen.py`.
-- If the change is not backed by a minimized reproducer, keep it in a scratch
-  probe, not the repository.
-- Every real-project fix must end with at least one minimized regression test
-  in `tests/`. Large-project-only validation is not enough.
-- After every shared-path edit, run focused regression checks immediately
-  before making the next edit.
-- If the first fix attempt does not clearly improve the minimized reproducer,
-  stop expanding the patch and go back to reduction.
-
-### 6. Separate data-layout bugs from expression-semantics bugs
-
-When a real program fails, two common classes are:
-
-- ABI/layout bugs
-  `sizeof`, `offsetof`, fake libc declarations, struct or union layout
-- expression-semantics bugs
-  signedness, promotions, comparisons, shifts, division/remainder, aggregate copy, control flow
-
-If layout is suspicious, build a dedicated probe with `sizeof` and `offsetof` and compare native vs `pcc`. Once layout matches, move on.
-
-
-### 7. Prefer downstream-sensitive regression tests
-
-A good regression test does not just check "the bits look right right now". It checks an expression in a context where the next operation would be wrong if semantic metadata were lost.
-
-Good examples:
-
-- unsigned expression followed by `%` with a signed constant
-- unsigned expression followed by `>>`
-- unsigned expression used in `<`, `>`, `/`, `%`
-
-This matters because LLVM uses the same integer types for signed and unsigned values. The compiler must preserve signedness intent itself.
-
-
-### 8. Treat compile-time constant folding as a semantic subsystem
-
-This repository has two different places where integer semantics matter:
-
-- runtime lowering in LLVM IR
-- compile-time evaluation in `_eval_const_expr()`
-
-It is not enough to fix only the runtime path.
-
-Typical failure mode:
-
-- runtime unsigned comparisons are correct
-- but compile-time casts or ternary folding ignore width/signedness
-- macros such as `((size_t)(~(size_t)0))` fold to `-1`
-- a real project then compiles with the wrong constant and fails far away
-
-If a real program fails on a "simple constant", inspect `_eval_const_expr()` and
-macro-expanded source before assuming the runtime IR is wrong.
-
-
-## Signedness Model
-
-This repository lowers both `int` and `unsigned int` to LLVM `i32`. Therefore signedness is tracked separately in `pcc/codegen/c_codegen.py`.
-
-Important helpers:
+**Before debugging any non-trivial failure, read and follow
+[`docs/debugging-playbook.md`](docs/debugging-playbook.md) — required
+procedure, not optional reference.** The 12 titles below are the index so you
+know what exists and so `§N` references resolve; the linked file holds the
+actual procedure (commands, oracle steps, LLDB recipe). Splitting it out of
+this always-loaded file lowered its context cost, not its authority. Section
+numbers are stable, so `§9` / `§12` referenced from investigations still
+resolve. The techniques:
+
+1. Make the failure deterministic first
+2. Compare `pcc` against a reference from the same source
+3. Use `llvmlite` as an oracle for `llvm_capi` parity
+4. Treat short fallback / IR traces as locators only
+5. Shrink the reproducer in stages
+6. Test hypotheses by substitution, not only inspection
+7. Avoid harness mistakes (these look like compiler bugs and are not)
+8. Use LLDB for native crash triage, not guesswork
+9. Do not stack unverified edits in shared codegen
+10. Separate data-layout bugs from expression-semantics bugs
+11. Prefer downstream-sensitive regression tests
+12. Treat compile-time constant folding as a semantic subsystem
+
+
+## C Codegen Invariants — Signedness
+
+The repository lowers both `int` and `unsigned int` to LLVM `i32`. Signedness
+is tracked **separately** in `pcc/codegen/c_codegen.py`.
+
+Helpers:
 
 - `_tag_unsigned`
 - `_clear_unsigned`
@@ -350,165 +478,219 @@ When you add or change an expression form, ask:
 
 1. Does this produce an integer result?
 2. If yes, should the result remain unsigned?
-3. Will that result later feed `%`, `/`, `>>`, comparisons, or another arithmetic conversion?
+3. Will that result later feed `%`, `/`, `>>`, comparisons, or another
+   arithmetic conversion?
 
-The classic failure mode in this repository is:
+Classic failure mode: the immediate value bits are correct but the returned
+IR value is no longer marked unsigned, so a later operator uses `sdiv`,
+`srem`, `ashr`, or signed comparison. This is easy to miss with toy tests
+and shows up quickly in Lua, libc-heavy code, and control-flow-heavy
+programs.
 
-- the immediate value bits are correct
-- but the returned IR value is no longer marked unsigned
-- so a later operator uses `sdiv`, `srem`, `ashr`, or signed comparison
 
-This class of bug is easy to miss with toy tests and shows up quickly in Lua, libc-heavy code, and control-flow-heavy programs.
+## Python Codegen / Runtime Invariants
+
+The Python side has its own object-shape invariants that bugs cluster
+around. Confirm them in source before guessing.
+
+### Object header
+
+- All heap objects start with `PyObjectHeader` (defined in
+  `pcc/py_runtime/include/py_runtime.h` /
+  `pcc/py_runtime/src/py_internal.h`).
+- `refcount` at `obj + 0`, `type_tag` at `obj + 8` (int32). Type tag values
+  in `enum PyTypeTag` (e.g. `PY_TYPE_STR == 4`, `PY_TYPE_LIST`,
+  `PY_TYPE_DICT`, `PY_TYPE_INSTANCE`, `PY_TYPE_TASK`).
+- Header `flags` carries `PY_FLAG_FINALIZED`, `PY_FLAG_GC_TRACKED`,
+  `PY_FLAG_IMMORTAL`, etc. Checking and writing these is `__atomic_*` under
+  `PCC_WITH_THREADS=1`.
+
+### `PyClassObject` layout
+
+- 120 bytes total. `del_method` is at offset 96, `attrs` at offset 104, and
+  `metaclass` at offset 112. The pcc-Python mirror in
+  `pcc/py_runtime/py/py_class.py` must match the C `PyClassObject` in
+  `pcc/py_runtime/src/py_internal.h` exactly. Layout drift between them is a
+  recurring class of bug.
+
+### Refcount / GC discipline
+
+- Read pointer slots through `pcc_gc_load_ptr()` and write them through
+  `pcc_gc_store_ptr()`. These are barriers for backend #3 (generational
+  forwarding) and #4 (relocation read barrier). Plain `obj->slot = x` works
+  on backend #0 but breaks #3/#4.
+- For generational backend #3 / colored-relocating #4, eager slot rewrite
+  for owned items lives next to the per-type promotion code in
+  `py_gc_backend.c`; do not invent a parallel path.
+- `py_user_del_dispatch()` is invoked from `py_instance_dealloc()`. Setting
+  `PY_FLAG_FINALIZED` after dispatch is what prevents resurrection cycles
+  from re-entering the finalizer.
+
+### Exception model
+
+- `py_raise(exc)` stores in TLS and returns normally. Generated code must
+  check `py_err_occurred()` after calls that may raise and branch to the
+  error path. There is **no** Itanium-style stack unwinding; missing the
+  check turns into "compile succeeded with no output" — see
+  `docs/investigations/python-self-host-no-libpython-runtime-holes.md`.
+
+### When this bites you
+
+If a real-program failure looks like "object has no attribute X but the
+class clearly defines X", it is almost always one of:
+
+1. layout drift between C `PyClassObject` and `py_class.py`
+2. missing `pcc_gc_load_ptr()` barrier on backend #3/#4
+3. missing `py_err_occurred()` check after a raising call
+
+Check in that order before suspecting frontend codegen.
 
 
 ## Common Pitfalls
 
-- Prefix operators on unsigned values:
-  `++x` / `--x` must preserve unsignedness on the expression result.
-- Bitwise operators on unsigned values:
-  `&`, `|`, `^`, `~`, shifts, and compound assignments must preserve unsignedness where C requires it.
-- Function-scope static arrays:
-  `static const code lenfix[512] = { ... };` must become an internal global, not a stack allocation. If a returned pointer or cached table looks correct inside one helper but turns to garbage after the function returns, inspect block-scope `static` lowering first.
-- Function-scope static incomplete arrays:
-  `static const char my_version[] = "1.3.1";` must infer its top-level size from the initializer before the internal global is created. A zero-length `[0 x i8]` static local is a codegen bug, not a source quirk.
-- Function-scope aggregate init-lists:
-  `struct S s = {0};` and nested aggregate initializers must really zero and initialize the local object. If a real program shows impossible garbage in supposedly zero-initialized local state, inspect recursive local aggregate lowering before looking at the program logic.
-- File-scope incomplete arrays:
-  `extern int table[]; int table[] = { ... };` must end up as one real symbol. If IR contains both `@"table"` and `@"table.1"`, the compiler created a zero-length placeholder and then lost the real definition behind a renamed symbol.
-- Standalone tag definitions:
-  `struct S { ... };`, `union U { ... };`, and `enum E { ... };` with no declarator are type definitions, not object declarations. If a recursive type graph keeps one side opaque in IR, inspect `codegen_Decl()` before blaming the source program.
-- Forward-declared named structs with bitfields:
-  if `struct A` and `struct B` reference each other and one side contains bitfields, the final definition must reuse the existing identified tag type instead of inventing a fresh layout-only type. If `p->db == db` fails on obviously valid nested pointers, inspect named-struct finalization and tag reuse.
-- Casted function-pointer globals:
-  `static const entry table[] = { {(fnptr)target} };` must preserve the function address through the cast. Null-filled dispatch tables in VFS/syscall layers are usually constant-initializer bugs, not parser bugs.
-- Assignment expressions:
-  The stored value and the expression result are both semantically meaningful.
-- Temporary probe files:
-  Putting `foo_tmp.c` inside a project directory can accidentally change project collection behavior.
-- Build configuration vs compiler compatibility:
-  `--sources-from-make` can only recover flags that appear in real compile
-  commands. If a project still needs explicit `--cpp-arg` values after make
-  inference, first decide whether they are true build-configuration results
-  that should come from configured build metadata, or temporary compiler
-  compatibility flags that should remain explicit.
-- Fake libc changes:
-  These can fix or break real programs without touching parser or codegen.
-- Darwin multi-TU MCJIT teardown:
-  A large program can run correctly and still die later during llvmlite/LLVM cleanup. If the runtime output is correct but the host Python process crashes during GC or teardown, treat that as a lifecycle/isolation problem, not automatically a codegen bug.
+The recurring failure classes are: signedness metadata loss in C codegen, static/incomplete-array lowering, struct/union tag reuse, casted function-pointer globals, object-layout drift between C and pcc-Python runtime mirrors, missing GC barriers, missing `py_err_occurred()` checks, stale parser caches, and directory-mode probes accidentally compiled as source. Use `docs/investigations/INDEX.md` for the detailed historical routing instead of keeping the full table in startup memory.
 
 
-## Testing Policy
+
+## Testing & Definition of Done
 
 For every semantic bug fix:
 
 1. Add a focused regression test in `tests/`.
 2. Confirm the original realistic reproducer is fixed.
-3. Run the full suite before finishing.
+3. Run the focused gates that cover the touched subsystem. Full-suite runs are
+   optional by default and should be reserved for broad shared-path changes,
+   release/commit qualification, or explicit user request.
+4. Any commit-related completion must pass the bootstrap gate tests listed below.
 
-For changes in shared parser/codegen paths, add a stricter gate:
+For changes in shared parser/codegen paths, a stricter gate:
 
 1. Run the smallest reproducer first.
-2. Run one existing sensitive integration check for the same bug class before
-   making another edit.
+2. Run one existing sensitive integration check for the same bug class
+   before making another edit.
 3. Only then continue or broaden the patch.
+
+For critical bootstrap paths, the self-host must be proven green before the
+work is considered fixed. This includes changes to `pcc/parse/py_lift.py`,
+`pcc/parse/py_parse.py`, `pcc/py_frontend/py_ast.py`,
+`pcc/py_frontend/pipeline.py`, `pcc/py_frontend/type_infer.py`,
+`pcc/py_frontend/codegen/`, `pcc/cli_bootstrap.py`, the self backend, or any
+runtime object/class/dataclass semantics used by those paths. A local
+minimized reproducer is necessary but not sufficient: run the relevant
+bootstrap command or `tests/python/test_pcc_bootstrap_full.py` and do not
+claim the fix if stage1→stage2→stage3 is not demonstrated.
 
 Recommended focused gates for high-risk changes:
 
 ```bash
-env -u LC_ALL uv run pytest tests/test_c_parser.py -q -n0
-env -u LC_ALL uv run pytest 'tests/test_lua.py::test_onelua_compile_and_link' -q -n0
-env -u LC_ALL uv run pytest 'tests/test_lua.py::test_pcc_runtime_matches_native[math.lua]' -q -n0
-env -u LC_ALL uv run pytest tests/test_lz4.py -q -n0
-env -u LC_ALL uv run pytest tests/test_sqlite.py -q -n0
+env -u LC_ALL uv run pytest tests/c/test_c_parser.py -q -n0
+env -u LC_ALL uv run pytest 'tests/c/test_lua.py::test_onelua_compile_and_link' -q -n0
+env -u LC_ALL uv run pytest 'tests/c/test_lua.py::test_pcc_runtime_matches_native[math.lua]' -q -n0
+env -u LC_ALL uv run pytest tests/c/test_lz4.py -q -n0
+env -u LC_ALL uv run pytest tests/integration/test_sqlite.py -q -n0
+env -u LC_ALL uv run pytest tests/c/test_unsigned_loads.py -q -n0
 ```
 
-Useful commands:
+Python frontend / bootstrap gates: see *Python Frontend / Bootstrap* above.
+
+GC backend gates: see *Runtime & GC Backends* above.
+
+**Definition of Done** — before stopping, all of:
+
+- [ ] smallest reproducer passes
+- [ ] original integration scenario passes
+- [ ] temporary debug edits and probe files removed
+- [ ] regression test exists in `tests/`
+- [ ] focused gates covering the touched subsystem pass; if a full suite is
+  skipped, say exactly which subset was run and why it is sufficient for the
+  current change
+- [ ] bootstrap validation commands required for the submission were run successfully
+
+Commit-level bootstrap validation (mandatory before considering work complete):
 
 ```bash
-env -u LC_ALL uv run pytest tests/test_unsigned_loads.py -q -n0
-env -u LC_ALL uv run pytest tests/test_lua.py -q -n0
-env -u LC_ALL uv run pytest -q
+env -u LC_ALL uv run pytest tests/python/test_bootstrap_gate_baseline.py -q -n0
+env -u LC_ALL uv run pytest tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py -q -n0
 ```
 
-
-## Definition of Done
-
-Before you stop, confirm all of the following:
-
-- the smallest reproducer passes
-- the original integration scenario passes
-- any temporary debug edits and probe files are removed
-- a regression test exists
-- the full suite is green
+Repair principle: prefer elegant fixes (API/ABI correctness, boundary semantics, readability, and maintainability). When possible, prioritize bootstrap-driven capability first and then add compatibility patches as follow-up.
 
 
-## Platform-Specific Gotchas (macOS)
+## Package / NumPy Claim Hygiene
 
-- No `/dev/full` — Lua's `files.lua` tests `/dev/full` for write failure. On macOS this device doesn't exist. The test harness patches it out in a temporary copy.
-- Makefile flags — Lua's Makefile uses `-DLUA_USE_LINUX` and `-Wl,-E`. On macOS, override with `MYCFLAGS=-std=c99 -DLUA_USE_MACOSX`, `MYLDFLAGS=`, `MYLIBS=`.
-- `-ldl` — Not needed on macOS (dlopen is in libc), but harmless. The linker warns but still works.
+`B-P0-PKG` work is about real package install/import behavior, not a command
+shape that only looks similar.
+
+- `pcc1 -m pip install numpy ...` succeeds only when the real package artifact
+  is installed into the target site and its package metadata is usable.
+- `import numpy` is a separate gate. Do not claim NumPy support from install
+  success alone, from an array-core-only test, or from a synthetic package
+  named `numpy`.
+- Do not add package-name special cases such as `if package == "numpy"` to make
+  a gate pass. Fix the generic package/import/ABI/lowering behavior and add a
+  focused regression for the generic feature.
+- Native extension ABI compatibility and no-libpython behavior are separate
+  claims. Keep `pcc-native` rejection, `cpython-compat` acceptance, and
+  `PCC_HOST_PYTHON=/bin/false` evidence distinct.
+- See the full claim-hygiene table in `codex-goal-prompt.md` §0.10 for related
+  distinctions such as host pcc vs pcc1, libpython mode vs no-libpython, fake
+  package vs real package, and stage1 vs pcc1→pcc2→pcc3.
+- Current package priority and known blockers live in
+  `docs/current-goal-state.md`; the active protocol lives in
+  `codex-goal-prompt.md`.
 
 
-## LLVM Version Mismatch
+## Platform Gotchas (macOS)
 
-`llvmlite` bundles its own LLVM version, which may be newer than the
-system `clang`. The repository also has an in-repo LLVM-C replacement
-path under `pcc/llvm_capi`, so treat "LLVM behavior" and "llvmlite
-behavior" as related but not identical questions when debugging.
-
-- Older repository paths wrote LLVM IR text to disk and then asked the system compiler to compile that IR. In that setup, LLVM O2 could emit attributes the system `clang` did not understand, such as `nuw`, `nneg`, `range()`, `initializes()`, and `dead_on_unwind`.
-- The current system-link path does **not** rely on the system compiler parsing LLVM IR text. `run_translation_units_with_system_cc()` optimizes each module with repository-managed LLVM and emits native object files directly, then links those objects with `cc`.
-- The remaining limitation is not "no optimization". It is "no cross-translation-unit optimization" in the separate-TU path. Each TU gets optimized on its own before linking, but there is no LTO-style whole-program pass over the linked module set.
-- If you ever reintroduce a text-IR handoff to the system compiler, keep the attribute-stripping warning in mind and centralize those rewrites in `postprocess_ir_text()`.
+Keep platform-specific command details in focused tests or investigations. Startup reminder: macOS has no `/dev/full`, Lua builds need macOS flags, and Darwin multi-TU MCJIT teardown crashes can be lifecycle issues after correct runtime output.
 
 
 ## IR Fix Policy
 
-Do not put new semantic fixes into `postprocess_ir_text()` unless llvmlite
-cannot directly express the required LLVM instruction.
+Semantic bugs belong in parser / codegen source logic.
+`postprocess_ir_text()` is acceptable **only** for narrow lowering gaps that
+the IR builder cannot directly express.
 
-Current policy:
-
-- semantic bugs belong in parser/codegen source logic
-- `postprocess_ir_text()` is only acceptable for narrow lowering gaps
-- do not hide CFG, type, or signedness bugs with text rewrites
-
-At the moment, the only acceptable remaining text-level lowering is the
-`va_arg` path. Anything else should be treated as a source-level compiler bug
-and fixed before the IR string is serialized.
-
-
-## Packaging
-
-- The wheel must include `utils/fake_libc_include/`. Without it, preprocessing fails on install.
-- PyPI package name is `python-cc` (not `pcc`, which is taken).
-- GitHub Actions uses Trusted Publisher (OIDC). The PyPI project name must match `pyproject.toml`'s `name` field exactly.
-
-## Release Process
-
-To publish a new version:
-
-1. Update `version` in `pyproject.toml`.
-2. Commit and push to `master`.
-3. Create and push a git tag: `git tag v0.0.X && git push origin v0.0.X`
-4. Create a GitHub Release: `gh release create v0.0.X --title "v0.0.X" --notes "Release notes here"`
-
-GitHub Actions will automatically build and publish to PyPI via Trusted Publisher when the tag is pushed.
+- Do not hide CFG, type, or signedness bugs with text rewrites.
+- Currently, the only acceptable remaining text-level lowering is the
+  `va_arg` path. Anything else is a source-level compiler bug, fix it
+  before serializing IR.
+- The system-link path no longer hands LLVM IR text to the system compiler
+  — `run_translation_units_with_system_cc()` optimizes each module with
+  repository-managed LLVM and emits native objects directly. If you ever
+  reintroduce a text-IR handoff, centralize attribute stripping (`nuw`,
+  `nneg`, `range()`, `initializes()`, `dead_on_unwind`) in
+  `postprocess_ir_text()`.
 
 
-## Additional Reading
+## Investigation Workflow (mandatory for any non-trivial bug)
 
-- `docs/investigations/lua-sort-random-pivot-signedness.md`
-  Detailed report for a representative real-world debugging session that started as a flaky Lua `sort.lua` failure and ended as an unsigned-expression codegen fix.
-- `docs/investigations/pcre-op-lengths-incomplete-array-binding.md`
-  Detailed report for a PCRE failure that first looked like an MCJIT/link bottleneck and turned out to be a file-scope incomplete-array binding bug in global initializer lowering.
-- `docs/investigations/zlib-integration-static-local-arrays-and-layout.md`
-  Detailed report for a zlib integration session that exposed three different bug classes in sequence: enum layout, block-scope static arrays, and function-scope static incomplete arrays.
-- `docs/investigations/sqlite-integration-vfs-init-and-mcjit-lifecycle.md`
-  Detailed report for a SQLite integration session that exposed three different layers in sequence: casted syscall-table pointers, broken local aggregate zero-initialization, and Darwin MCJIT teardown instability.
-- `docs/investigations/sqlite-forward-declared-bitfield-struct-tags.md`
-  Detailed report for a later SQLite integration failure that first looked like a runtime logic bug and turned out to be incorrect handling of standalone tag definitions and forward-declared named bitfield structs in the type system.
-- `docs/investigations/make-derived-cpp-flags-vs-explicit-project-config.md`
-  Detailed report on why make-derived preprocessor inference covered PCRE but not Lua, zlib, or SQLite, and when explicit `--cpp-arg` values are the right interface instead of compiler-side project detection.
-- `docs/investigations/nbody-shootout-fp-contract-and-vectorization.md`
-  Detailed report on why `nbody_shootout` was not just a "missing vectorization" issue, how LLVM `contract` flags fixed the catastrophic regression, and which follow-up optimization directions were ruled in or out.
+Open a written investigation for anything more involved than a one-line fix,
+so the next agent can pick it up without re-reading the chat log. **Before you
+create or continue any `docs/investigations/*.md` file, read and follow
+[`docs/investigation-workflow.md`](docs/investigation-workflow.md) first** — it
+holds the mandatory-sections template and the three modes (Repro / Continue /
+Report), and they are required, not optional. The enforceable guardrails, kept
+inline so they bind even if the linked file is skipped:
+
+- **Discover first.** Scan [`docs/investigations/INDEX.md`](docs/investigations/INDEX.md)
+  before opening a new file; if the symptom matches, continue that file via a
+  `## Update` block or link to it as predecessor. One investigation = one file
+  under `docs/investigations/<specific-slug>.md`; existing files are historical
+  record — never delete or rewrite them.
+- **Regenerate the index** after adding/editing any `docs/investigations/*.md`:
+  ```bash
+  env -u LC_ALL uv run python scripts/regen_investigations_index.py
+  ```
+- **Agents must not `git commit` unless the user explicitly asks** — the
+  "save before each experiment" idiom is for the user-driven workflow.
+- **One proposal at a time**, run to a `[CONFIRMED]`/`[DENIED]` verdict; no
+  silent "while I was in there" fixes.
+- `## Test [CONFIRMED]` means the failure was observed under the listed
+  command, not optimism. `## Status` is mandatory and final. Two distinct
+  bugs → two files.
+
+
+## Maintainer Notes
+
+Packaging/release notes are maintainer workflow, not active agent startup context. Consult project docs or ask before changing release metadata.

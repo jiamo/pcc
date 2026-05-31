@@ -80,16 +80,23 @@ static PyObject *py_raise_normalize(PyObject *exc, int *owned) {
 
     PyClassObject *base = py_exc_builtin_class(PY_EXC_BASE);
     if (base != NULL && py_isinstance(exc, base)) {
-        PyClassObject *cls = NULL;
         if (py_raise_instance_like(exc)) {
-            cls = ((PyInstanceObject *)exc)->cls;
+            /* A raised user exception subclass *instance*: keep it AS-IS so
+             * the instance attributes set by its __init__ (e.g. self.code)
+             * survive. The exc machinery (exc_to_class) now projects an
+             * instance to its class for except-matching, and py_obj_str /
+             * args read through the instance. Previously this wrapped the
+             * instance in a fresh PY_TYPE_EXC carrying only a message string,
+             * silently discarding every user attribute. owned stays 0 (the
+             * caller increfs the borrowed reference). */
+            return exc;
         }
 
         PyObject *owned_attr = NULL;
         PyObject *owned_str = NULL;
         const char *msg = py_raise_message_from_object(
             exc, &owned_attr, &owned_str);
-        PyObject *normalized = py_exc_new_with_class((PyObject *)cls, msg);
+        PyObject *normalized = py_exc_new_with_class(NULL, msg);
         if (owned_str != NULL) py_decref(owned_str);
         if (owned_attr != NULL) py_decref(owned_attr);
         if (normalized != NULL) {
@@ -107,7 +114,21 @@ static PyObject *py_raise_normalize(PyObject *exc, int *owned) {
 void py_raise(PyObject *exc) {
     int exc_owned = 0;
     exc = py_raise_normalize(exc, &exc_owned);
+    pcc_runtime_log_event_code(
+        6, 3,
+        (exc != NULL && !PY_IS_TAGGED_INT(exc)) ? py_type_of(exc) : -1,
+        exc_owned, exc
+    );
     PyObject *cur = (PyObject *)py_tls_exc_get();
+    if (cur != NULL) {
+        PyObject *resolved_cur = pcc_gc_note_relocation_read(cur);
+        if (resolved_cur != cur) {
+            py_incref(resolved_cur);
+            py_tls_exc_set(resolved_cur);
+            py_decref(cur);
+            cur = resolved_cur;
+        }
+    }
     /* Auto-chain context: if a prior exception is still active
      * (we're inside an except block), stash it as __context__ on
      * the new one. Matches CPython's implicit chaining. */
@@ -115,9 +136,9 @@ void py_raise(PyObject *exc) {
         cur != exc &&
         py_type_of(exc) == PY_TYPE_EXC) {
         PyExceptionObject *new_exc = (PyExceptionObject *)exc;
-        if (new_exc->context == NULL) {
-            py_incref(cur);
-            new_exc->context = cur;
+        PyObject *existing_context = pcc_gc_load_ptr(exc, &new_exc->context);
+        if (existing_context == NULL) {
+            pcc_gc_store_ptr(exc, &new_exc->context, cur);
         }
     }
     if (exc != NULL && !exc_owned) py_incref(exc);
@@ -141,6 +162,10 @@ PyObject *py_current_exception(void) {
 void py_clear_exception(void) {
     PyObject *cur = (PyObject *)py_tls_exc_get();
     if (cur != NULL) {
+        pcc_runtime_log_event_code(
+            6, 4,
+            !PY_IS_TAGGED_INT(cur) ? py_type_of(cur) : -1, 0, cur
+        );
         py_decref(cur);
         py_tls_exc_set(NULL);
     }

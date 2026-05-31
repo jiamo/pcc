@@ -302,10 +302,10 @@ def run_ir_passes_tests() -> int:
     import pytest as _pytest
 
     subset = [
-        "tests/test_ir_passes_parity.py",
-        "tests/test_ir_passes_adce.py",
-        "tests/test_ir_passes_instcombine.py",
-        "tests/test_ir_passes_mem2reg_real.py",
+        "tests/c/test_ir_passes_parity.py",
+        "tests/c/test_ir_passes_adce.py",
+        "tests/c/test_ir_passes_instcombine.py",
+        "tests/c/test_ir_passes_mem2reg_real.py",
     ]
     try:
         _pytest.main([

@@ -29,14 +29,25 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from enum import Enum
 
 import llvmlite.binding as llvm
 
 from .manager import AnalysisKey, AnalysisManager, AnalysisResult, PreservedAnalyses
 
 
-class AliasResult(Enum):
+class AliasResult:
+    """Alias-analysis result constants.
+
+    Originally an ``enum.Enum`` subclass. Switched to a plain class
+    with string class attributes so the module compiles cleanly under
+    pcc's strict no-libpython mode (the ``enum`` stdlib module pulls
+    in the heavy ``EnumMeta`` metaclass machinery, which pcc-Python
+    can't lower yet). The four constants are used only via
+    ``AliasResult.<Name>`` member access and ``!= AliasResult.NoAlias``
+    string comparison, so an `Enum` subclass adds no behavioral value
+    here — the string equality semantics are identical.
+    """
+
     NoAlias = "no-alias"
     MayAlias = "may-alias"
     PartialAlias = "partial-alias"

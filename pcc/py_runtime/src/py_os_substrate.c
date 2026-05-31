@@ -14,6 +14,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+PyObject *py_time_monotonic(void) {
+    return py_float_from_f64((double)pcc_runtime_monotonic_us() / 1.0e6);
+}
+
 /* Classify a path by struct stat type:
  *   0 → stat() failed (missing or permission)
  *   1 → regular file
@@ -49,6 +53,13 @@ double py_path_stat_mtime(const char *p) {
 #endif
 }
 
+int64_t py_path_stat_size(const char *p) {
+    struct stat st;
+    if (p == (const char *)0) return -1;
+    if (stat(p, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+}
+
 /* Return the current working directory as a NUL-terminated cstring
  * pointer. Uses a thread-local static buffer so the caller does not
  * own the result — copy before another call clobbers it. NULL on
@@ -60,6 +71,22 @@ const char *py_path_getcwd(void) {
         return (const char *)0;
     }
     return _cwd_buf;
+}
+
+/* Resolve PATH to a canonical absolute path (symlinks collapsed) via
+ * realpath(3). Thread-local static buffer like py_path_getcwd: the caller
+ * does not own the result and must copy before the next call. Returns NULL
+ * when realpath(3) fails (e.g. a component does not exist, ENOENT), so the
+ * caller can fall back to lexical normalization. 8KB exceeds PATH_MAX. */
+static __thread char _realpath_buf[8192];
+const char *py_path_realpath(const char *p) {
+    if (p == (const char *)0) {
+        return (const char *)0;
+    }
+    if (realpath(p, _realpath_buf) == (const char *)0) {
+        return (const char *)0;
+    }
+    return _realpath_buf;
 }
 
 /* sys.platform value, picked at C compile time. Keeps the platform
@@ -134,6 +161,22 @@ PyObject *py_os_getcwd_str(void) {
     return py_str_new(p, n);
 }
 
+/* `sys.path` — closed-world minimal: a list with cwd as the only
+ * entry. CPython's sys.path is much richer (site-packages, PYTHONPATH,
+ * etc.) but those entries need the import-machinery boot sequence;
+ * pcc's closed-world programs don't import at runtime, so a single
+ * cwd entry is sufficient for ``sys.path[0]`` / ``len(sys.path)``
+ * style probes. */
+PyObject *py_sys_path_list(void) {
+    PyObject *cwd = py_os_getcwd_str();
+    if (cwd == NULL) {
+        cwd = py_str_new("", 0);
+    }
+    PyObject *lst = py_list_new(0);
+    py_list_append(lst, cwd);
+    return lst;
+}
+
 /* `os.access(path, mode)` — returns 1 if accessible, 0 otherwise.
  * `mode` is one of os.F_OK / R_OK / W_OK / X_OK (0 / 4 / 2 / 1).
  *
@@ -149,4 +192,34 @@ int32_t py_os_access(PyObject *path, int32_t mode) {
     int ok = (raw != NULL && access(raw, (int)mode) == 0) ? 1 : 0;
     py_decref(owned);
     return ok;
+}
+
+int32_t py_os_write(int32_t fd, PyObject *data) {
+    if (data == NULL) return -1;
+    const char *ptr = NULL;
+    int64_t len = 0;
+    PyObject *curr = data;
+    while (curr != NULL) {
+        int32_t tag = py_type_of(curr);
+        if (tag == PY_TYPE_STR) {
+            ptr = py_str_utf8(curr);
+            len = py_str_byte_len(curr);
+            break;
+        } else if (tag == PY_TYPE_BYTES) {
+            ptr = ((PyBytesObject *)curr)->data;
+            len = ((PyBytesObject *)curr)->byte_len;
+            break;
+        } else if (tag == PY_TYPE_BYTEARRAY) {
+            ptr = ((PyByteArrayObject *)curr)->data;
+            len = ((PyByteArrayObject *)curr)->byte_len;
+            break;
+        } else if (tag == PY_TYPE_MEMORYVIEW) {
+            curr = pcc_gc_load_ptr(curr, &((PyMemoryViewObject *)curr)->base);
+        } else {
+            return -1;
+        }
+    }
+    if (ptr == NULL || len < 0) return -1;
+    ssize_t written = write((int)fd, ptr, (size_t)len);
+    return (int32_t)written;
 }

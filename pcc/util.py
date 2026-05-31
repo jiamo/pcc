@@ -1,4 +1,3 @@
-
 _contracts = {}
 
 
@@ -25,7 +24,7 @@ class Typed(Contract):
     @classmethod
     def check(cls, value):
         if not isinstance(value, cls.type):
-            raise TypeError(f'Expected {cls.type}, got {type(value).__name__}')
+            raise TypeError(f"Expected {cls.type}, got {type(value).__name__}")
 
 
 class Integer(Typed):
@@ -34,7 +33,7 @@ class Integer(Typed):
     @classmethod
     def check(cls, value):
         if not isinstance(value, int):
-            raise TypeError(f'Expected int, got {type(value).__name__}')
+            raise TypeError(f"Expected int, got {type(value).__name__}")
         super().check(value)
 
 
@@ -42,7 +41,7 @@ class Positive(Typed):
     @classmethod
     def check(cls, value):
         if not value > 0:
-            raise ValueError(f'Must be > 0, got {value}')
+            raise ValueError(f"Must be > 0, got {value}")
         super().check(value)
 
 
@@ -56,10 +55,7 @@ from inspect import signature
 
 def checked(func):
     sig = signature(func)
-    ann = ChainMap(
-        func.__annotations__,
-        func.__globals__.get('__annotations__', {})
-    )
+    ann = ChainMap(func.__annotations__, func.__globals__.get("__annotations__", {}))
 
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -68,9 +64,15 @@ def checked(func):
             if name in ann:
                 ann[name].check(val)
         return func(*args, **kwargs)
+
     return wrapper
 
+
 from collections import ChainMap
+
+
+def _class_annotations(cls):
+    return getattr(cls, "__annotations__", {})
 
 
 class BaseMeta(type):
@@ -90,21 +92,23 @@ class Base(metaclass=BaseMeta):
             if callable(val):
                 setattr(cls, name, checked(val))
 
-        for name, val in cls.__annotations__.items():
+        for name, val in _class_annotations(cls).items():
             contract = val()
             contract.__set_name__(cls, name)
             setattr(cls, name, contract)
 
     def __init__(self, *args):
-        ann = self.__annotations__
+        ann = _class_annotations(type(self))
         if len(args) != len(ann):
             raise TypeError(
-                f'{type(self).__name__} expected {len(ann)} arguments, got {len(args)}'
+                f"{type(self).__name__} expected {len(ann)} arguments, got {len(args)}"
             )
 
         for name, val in zip(ann, args):
             setattr(self, name, val)
 
     def __repr__(self):
-        args = ",".join(repr(getattr(self, name)) for name in self.__annotations__)
-        return f'{type(self).__name__}({args})'
+        args = ",".join(
+            repr(getattr(self, name)) for name in _class_annotations(type(self))
+        )
+        return f"{type(self).__name__}({args})"

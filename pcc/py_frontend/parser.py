@@ -269,7 +269,6 @@ class _Lifter:
         )
 
     def _stmt_AsyncFor(self, node: _py_ast.AsyncFor) -> pa.For:
-        # async-for lowers to the same For node; runtime distinguishes later.
         target = self.lift_expr(node.target)
         iter_e = self.lift_expr(node.iter)
         body_stmts = tuple(self.lift_stmt(s) for s in node.body)
@@ -280,6 +279,7 @@ class _Lifter:
             iter=iter_e,
             body=body_stmts,
             else_body=else_stmts,
+            is_async=True,
         )
 
     def _stmt_While(self, node: _py_ast.While) -> pa.While:
@@ -320,6 +320,7 @@ class _Lifter:
             span=self._span(node),
             items=items,
             body=body_stmts,
+            is_async=True,
         )
 
     def _lift_with_item(
@@ -480,12 +481,15 @@ class _Lifter:
             return pa.IntLit(span=span, ty=_DYN, value=v)
         if isinstance(v, float):
             return pa.FloatLit(span=span, ty=_DYN, value=v)
+        if isinstance(v, complex):
+            return pa.ComplexLit(
+                span=span, ty=_DYN,
+                real=float(v.real), imag=float(v.imag),
+            )
         if isinstance(v, str):
             return pa.StrLit(span=span, ty=_DYN, value=v)
         if isinstance(v, bytes):
-            # Bytes don't have a dedicated node in the contract; fall to StrLit
-            # with the decoded form so downstream at least sees a literal.
-            return pa.StrLit(span=span, ty=_DYN, value=v.decode("latin-1"))
+            return pa.BytesLit(span=span, ty=_DYN, value=v)
         if v is Ellipsis:
             return pa.Name(span=span, ty=_DYN, ident="...")
         raise NotImplementedError(
@@ -722,7 +726,7 @@ class _Lifter:
         """f-string — lower to repeated str concatenation.
 
         Each piece is either a Constant (part of the format string) or a
-        FormattedValue which we lower via ``str(expr)``.
+        FormattedValue which we lower through the native format protocol.
         """
         span = self._span(node)
         pieces: list[pa.Expr] = []
@@ -730,17 +734,7 @@ class _Lifter:
             if isinstance(piece, _py_ast.Constant) and isinstance(piece.value, str):
                 pieces.append(pa.StrLit(span=span, ty=_DYN, value=piece.value))
             elif isinstance(piece, _py_ast.FormattedValue):
-                inner = self.lift_expr(piece.value)
-                str_name = pa.Name(span=span, ty=_DYN, ident="str")
-                pieces.append(
-                    pa.Call(
-                        span=span,
-                        ty=_DYN,
-                        func=str_name,
-                        args=(inner,),
-                        kwargs=(),
-                    )
-                )
+                pieces.append(self._formatted_value_call(piece))
             else:
                 pieces.append(self.lift_expr(piece))
         if not pieces:
@@ -751,12 +745,31 @@ class _Lifter:
         return result
 
     def _expr_FormattedValue(self, node: _py_ast.FormattedValue) -> pa.Expr:
-        """Bare FormattedValue (rare outside JoinedStr) → ``str(expr)``."""
+        """Bare FormattedValue (rare outside JoinedStr) → format protocol."""
+        return self._formatted_value_call(node)
+
+    def _literal_format_spec(self, node: _py_ast.AST | None) -> str:
+        if node is None:
+            return ""
+        if isinstance(node, _py_ast.JoinedStr):
+            parts: list[str] = []
+            for piece in node.values:
+                if isinstance(piece, _py_ast.Constant) and isinstance(piece.value, str):
+                    parts.append(piece.value)
+                    continue
+                return ""
+            return "".join(parts)
+        if isinstance(node, _py_ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return ""
+
+    def _formatted_value_call(self, node: _py_ast.FormattedValue) -> pa.Expr:
         span = self._span(node)
         inner = self.lift_expr(node.value)
-        str_name = pa.Name(span=span, ty=_DYN, ident="str")
+        format_name = pa.Name(span=span, ty=_DYN, ident="format")
+        spec = pa.StrLit(span=span, ty=_DYN, value=self._literal_format_spec(node.format_spec))
         return pa.Call(
-            span=span, ty=_DYN, func=str_name, args=(inner,), kwargs=()
+            span=span, ty=_DYN, func=format_name, args=(inner, spec), kwargs=()
         )
 
     def _expr_NamedExpr(self, node: _py_ast.NamedExpr) -> pa.Expr:
@@ -1036,6 +1049,24 @@ class _Lifter:
             else:
                 elems = (self._lift_annotation(slice_node),)
             return pa.TupleType(name="tuple", elems=elems)
+        if normalized == "callable":
+            if (
+                isinstance(slice_node, _py_ast.Tuple)
+                and len(slice_node.elts) == 2
+            ):
+                params_node = slice_node.elts[0]
+                ret_node = slice_node.elts[1]
+                if isinstance(params_node, _py_ast.List):
+                    params = tuple(
+                        self._lift_annotation(e) for e in params_node.elts
+                    )
+                else:
+                    params = ()
+                return pa.FuncType(
+                    name="callable",
+                    params=params,
+                    ret=self._lift_annotation(ret_node),
+                )
         return pa.DynType(name="dyn")
 
 

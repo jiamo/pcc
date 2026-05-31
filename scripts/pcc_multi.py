@@ -34,7 +34,9 @@ from pcc.extern import extern, c_int
 _USAGE = (
     "Usage:\n"
     "  pcc_multi --entry MODULE --out PATH "
-    "[--backend llvm|self] [--emit-llvm] [-v|--verbose] SRC [SRC ...]\n"
+    "[--backend llvm|self] [--python-libpython off|auto|on] "
+    "[--ir-scaffold on|off|auto] [--emit-llvm] [-v|--verbose] "
+    "SRC [SRC ...]\n"
     "\n"
     "Each SRC is either <path> or <path>=<module.name>.\n"
 )
@@ -86,6 +88,26 @@ def _infer_module_name(path: str) -> str:
     return base
 
 
+def _parse_python_libpython(value: str) -> str:
+    lowered = (value or "").strip().lower()
+    if lowered not in ("auto", "on", "off"):
+        raise ValueError(
+            "invalid --python-libpython "
+            f"{value!r}; expected auto, on, or off"
+        )
+    return lowered
+
+
+def _parse_ir_scaffold(value: str) -> str:
+    lowered = (value or "").strip().lower()
+    if lowered not in ("auto", "on", "off"):
+        raise ValueError(
+            "invalid --ir-scaffold "
+            f"{value!r}; expected on, off, or auto"
+        )
+    return lowered
+
+
 def _parse_cli(argv=None):
     argv = _normalized_argv(argv)
     entry = None
@@ -93,7 +115,9 @@ def _parse_cli(argv=None):
     emit_llvm = False
     verbose = False
     backend = None
-    sources: "list[str]" = []
+    python_libpython = None
+    ir_scaffold = None
+    sources: list[str] = []
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -133,6 +157,36 @@ def _parse_cli(argv=None):
             backend = arg[len("--backend="):]
             i += 1
             continue
+        if arg == "--python-libpython" or arg == "--ir-scaffold":
+            if i + 1 >= len(argv):
+                return None, 2, f"{arg} requires a value"
+            try:
+                if arg == "--python-libpython":
+                    python_libpython = _parse_python_libpython(argv[i + 1])
+                else:
+                    ir_scaffold = _parse_ir_scaffold(argv[i + 1])
+            except ValueError as exc:
+                return None, 2, str(exc)
+            i += 2
+            continue
+        if arg.startswith("--python-libpython="):
+            try:
+                python_libpython = _parse_python_libpython(
+                    arg[len("--python-libpython="):]
+                )
+            except ValueError as exc:
+                return None, 2, str(exc)
+            i += 1
+            continue
+        if arg.startswith("--ir-scaffold="):
+            try:
+                ir_scaffold = _parse_ir_scaffold(
+                    arg[len("--ir-scaffold="):]
+                )
+            except ValueError as exc:
+                return None, 2, str(exc)
+            i += 1
+            continue
         if len(arg) > 0 and arg[0] == "-":
             return None, 2, f"unknown option: {arg}"
         sources.append(arg)
@@ -144,11 +198,20 @@ def _parse_cli(argv=None):
         return None, 2, "missing required option --out"
     if len(sources) == 0:
         return None, 2, "at least one source is required"
-    return (entry, out, emit_llvm, verbose, backend, sources), 0, None
+    return (
+        entry,
+        out,
+        emit_llvm,
+        verbose,
+        backend,
+        python_libpython,
+        ir_scaffold,
+        sources,
+    ), 0, None
 
 
 def _normalized_argv(argv=None):
-    out: "list[str]" = []
+    out: list[str] = []
     if argv is None:
         i = 1
         while i < len(sys.argv):
@@ -169,7 +232,9 @@ def main(argv=None) -> int:
     emit_llvm = False
     verbose = False
     backend = None
-    source_specs: "list[str]" = []
+    python_libpython = None
+    ir_scaffold = None
+    source_specs: list[str] = []
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -220,6 +285,47 @@ def main(argv=None) -> int:
             backend = arg[len("--backend="):]
             i += 1
             continue
+        if arg == "--python-libpython" or arg == "--ir-scaffold":
+            if i + 1 >= len(argv):
+                _write_text(
+                    "pcc_multi: " + arg + " requires a value\n",
+                    to_stderr=True,
+                )
+                _write_text(_USAGE, to_stderr=True)
+                return 2
+            try:
+                if arg == "--python-libpython":
+                    python_libpython = _parse_python_libpython(argv[i + 1])
+                else:
+                    ir_scaffold = _parse_ir_scaffold(argv[i + 1])
+            except ValueError as exc:
+                _write_text("pcc_multi: " + str(exc) + "\n", to_stderr=True)
+                _write_text(_USAGE, to_stderr=True)
+                return 2
+            i += 2
+            continue
+        if arg.startswith("--python-libpython="):
+            try:
+                python_libpython = _parse_python_libpython(
+                    arg[len("--python-libpython="):]
+                )
+            except ValueError as exc:
+                _write_text("pcc_multi: " + str(exc) + "\n", to_stderr=True)
+                _write_text(_USAGE, to_stderr=True)
+                return 2
+            i += 1
+            continue
+        if arg.startswith("--ir-scaffold="):
+            try:
+                ir_scaffold = _parse_ir_scaffold(
+                    arg[len("--ir-scaffold="):]
+                )
+            except ValueError as exc:
+                _write_text("pcc_multi: " + str(exc) + "\n", to_stderr=True)
+                _write_text(_USAGE, to_stderr=True)
+                return 2
+            i += 1
+            continue
         if len(arg) > 0 and arg[0] == "-":
             _write_text(
                 "pcc_multi: unknown option: " + arg + "\n",
@@ -267,6 +373,8 @@ def main(argv=None) -> int:
                 emit_llvm_only=emit_llvm,
                 entry_module=entry_module,
                 module_names=module_names,
+                libpython_mode=python_libpython,
+                ir_scaffold_mode=ir_scaffold,
             )
         else:
             compile_python_multi(
@@ -277,6 +385,8 @@ def main(argv=None) -> int:
                 entry_module=entry_module,
                 module_names=module_names,
                 backend=backend,
+                libpython_mode=python_libpython,
+                ir_scaffold_mode=ir_scaffold,
             )
     except PyPipelineError as e:
         _write_text("pcc_multi: " + str(e) + "\n", to_stderr=True)

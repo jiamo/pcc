@@ -1,0 +1,524 @@
+# Investigations index
+
+Auto-generated from `docs/investigations/*.md`.
+Each entry shows the doc title and a one-line summary pulled from the first prose paragraph.
+
+Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.py`.
+
+## codegen
+
+- [codegen-mixin-self-cross-module-types.md](codegen-mixin-self-cross-module-types.md) — **layer1 mixin split breaks no-libpython self-host**
+  - resolved for the closed-world self-host path as of 2026-05-13. The
+- [codegen-self-host-host-contract-trace-fields.md](codegen-self-host-host-contract-trace-fields.md) — **self-host codegen trace fields missing from host contract**
+  - resolved (2026-05-23)
+- [pcc-bootstrap-stage2-layer1-codegen-timeout.md](pcc-bootstrap-stage2-layer1-codegen-timeout.md) — **pcc1 stage2 times out inside `codegen[pcc.py_frontend.codegen.layer1]`**
+  - historical / superseded.
+- [pcc-py-codegen-float-dyn-closed-world.md](pcc-py-codegen-float-dyn-closed-world.md) — **`float(<dyn>)` and `_to_double` re-introduce libpython linkage in closed-world build**
+  - resolved (2026-05-11)
+- [pcc-py-codegen-nested-closure-genexpr-scope.md](pcc-py-codegen-nested-closure-genexpr-scope.md) — **nested closure comprehension target leak in `compute_free_names`**
+  - resolved (2026-05-11) — No.3 root-cause codegen fix applied; bootstrap unblocked, multi-file closure remains 0 fallbacks.
+
+## self-backend
+
+- [self-backend-mach-o-stage-publish-race.md](self-backend-mach-o-stage-publish-race.md) — **self-backend Mach-O stage publish race**
+  - active follow-up: see `self-bootstrap-reliability-performance-2026-05-15.md`
+- [stage1-self-backend-ir-scaffold-segfault.md](stage1-self-backend-ir-scaffold-segfault.md) — **stage1 self-backend ir-scaffold segfault**
+  - User-reported command sequence:
+
+## pcc1-stage
+
+- [pcc1-array-core-literal-empty.md](pcc1-array-core-literal-empty.md) — **pcc1 array-core literal values collapse to empty**
+  - While validating the generic array-core `--reduce mean` slice through a freshly
+- [pcc1-self-host-generator-ctx-slot.md](pcc1-self-host-generator-ctx-slot.md) — **pcc1 self-host loses `_generator_ctx` after first assignment**
+  - User-reported regression on 2026-05-11:
+- [pcc1-self-host-parse-float-literal-uaf.md](pcc1-self-host-parse-float-literal-uaf.md) — **pcc1 self-host UAF caught in `_parse_float_literal_lift`**
+  - **Open.** pcc1 self-host crashes deterministically with macOS nano-allocator
+- [pcc1-stage2-cli-bootstrap-observability-format.md](pcc1-stage2-cli-bootstrap-observability-format.md) — **pcc1 stage2 cli_bootstrap ObservabilityOptions format failure**
+  - active, opened 2026-05-21.
+- [pcc1-stage2-lift-expr-raw-value-leak.md](pcc1-stage2-lift-expr-raw-value-leak.md) — **pcc1 stage2 leaks raw Python values into AST seen by lift_expr**
+  - After commit `18f60d6a` (UAF fix in `_parse_float_literal_lift`), pcc1
+- [pcc1-stage2-runtime-abi-set-segfault.md](pcc1-stage2-runtime-abi-set-segfault.md) — **pcc1 stage2 segfault in py_set._lookup_slot during runtime_abi.declare_runtime**
+  - After commit `a13bd0d3` resolved the lift_expr raw-value-leak (see
+- [pcc1-threaded-explicit-gc-backend0-double-free-highscale.md](pcc1-threaded-explicit-gc-backend0-double-free-highscale.md) — **backend 0 double-free / refcount underflow under high-scale threaded explicit gc.collect**
+  - Backend 0 (reference/default) + universal STW-hang: **RESOLVED & verified**
+- [pcc1-threaded-explicit-gc-collect-gap.md](pcc1-threaded-explicit-gc-collect-gap.md) — **pcc1 real pthread runtime hangs under explicit threaded gc.collect**
+  - Backend 0..4 real-pthread explicit `gc.collect()` are covered by a pcc1 hard
+
+## bootstrap
+
+- [bootstrap-default-failures-runtime-hotpaths-2026-05-06.md](bootstrap-default-failures-runtime-hotpaths-2026-05-06.md) — **Default pytest failures and pcc-py runtime hot paths**
+  - resolved for the current working tree.
+- [bootstrap-fixes-and-pass-layer-design-2026-05-07.md](bootstrap-fixes-and-pass-layer-design-2026-05-07.md) — **Bootstrap fixes and PASS layer design follow-up**
+  - Current focused correctness status is improved but not finished. The 65s cold
+- [bootstrap-self-time-after-layer1-split-2026-05-13.md](bootstrap-self-time-after-layer1-split-2026-05-13.md) — **bootstrap self-backend time after layer1 split**
+  - After the `layer1.py` split work, `tests/python/test_pcc_bootstrap_full.py::test_full_three_stage_bootstrap_self`
+- [bootstrap-sh-python-ir-passes-default-2026-05-27.md](bootstrap-sh-python-ir-passes-default-2026-05-27.md) — **bootstrap.sh should use bounded Python IR pass default**
+  - While validating a Python codegen edit, the full pytest bootstrap gate was
+- [bootstrap-types-rsplit-libpython-fallback.md](bootstrap-types-rsplit-libpython-fallback.md) — **types dotted-name rsplit reintroduced libpython fallback**
+  - Fix the bootstrap. The current bootstrap/fallback gates regressed: the tight stage1 closure
+
+## gc
+
+- [bootstrap-five-gc-current-audit-2026-05-07.md](bootstrap-five-gc-current-audit-2026-05-07.md) — **current bootstrap five-GC audit**
+  - User request: audit the bootstrap to confirm all five GC backends are
+- [bootstrap-five-gc-matrix-after-backend1-fix.md](bootstrap-five-gc-matrix-after-backend1-fix.md) — **bootstrap five-GC matrix after backend 1 fix**
+  - Follow-up to `docs/investigations/bootstrap-five-gc-matrix.md` after fixing the
+- [bootstrap-five-gc-matrix.md](bootstrap-five-gc-matrix.md) — **bootstrap chain should expose and run all five GC backends**
+  - User request: audit the bootstrap to confirm all five GC backends are
+- [bootstrap-five-gc-post-arena-deallocator-audit-2026-05-07.md](bootstrap-five-gc-post-arena-deallocator-audit-2026-05-07.md) — **bootstrap five-GC audit after arena deallocator fix**
+  - This supersedes
+- [gc-5backend-cycle-finalizer-not-run-no-libpython.md](gc-5backend-cycle-finalizer-not-run-no-libpython.md) — **__del__ finalizers on reference-cycle members are not run by the tracing collect (#1/#2/#3/#4)**
+  - resolved 2026-05-31 — added a PASS-0 finalizer dispatch to the tracing sweep so
+- [gc-5backend-exception-referent-roots-no-libpython.md](gc-5backend-exception-referent-roots-no-libpython.md) — **a live exception's referents (message) are reclaimed by the tracing collect (#1/#2/#3/#4)**
+  - resolved 2026-05-31 — fix landed in frontend root mapping for locals assigned
+- [gc-5backend-extension-module-state-roots-no-libpython.md](gc-5backend-extension-module-state-roots-no-libpython.md) — **pcc-native extension module state roots must survive GC**
+  - resolved 2026-05-31 — pcc-native extensions can now allocate `PyModuleDef.m_size`
+- [gc-5backend-finalizer-resurrection-no-libpython.md](gc-5backend-finalizer-resurrection-no-libpython.md) — **object resurrection in __del__ (PEP 442) is mishandled by the two-phase tracing sweep**
+  - resolved 2026-05-31 — fixed by a PEP-442 post-finalizer reachability recheck in
+- [gc-5backend-native-file-handle-lifetime-no-libpython.md](gc-5backend-native-file-handle-lifetime-no-libpython.md) — **native file handles are not closed when dropped in strict no-libpython mode**
+  - resolved 2026-05-31 — fixed by giving `PY_TYPE_FILE` a type-specific
+- [gc-5backend-object-lifetime-contract-no-libpython.md](gc-5backend-object-lifetime-contract-no-libpython.md) — **GC backends #1/#2/#3 fail the basic object-lifetime contract under no-libpython self-backend**
+  - resolved 2026-05-31 — the object-lifetime/cycle/container contract now passes
+- [gc-5backend-reentrant-collect-during-finalizer-no-libpython.md](gc-5backend-reentrant-collect-during-finalizer-no-libpython.md) — **reentrant gc.collect() from a cycle member's __del__ segfaults on the tracing backends**
+  - resolved 2026-05-31 — fixed by a reentrancy guard in `pcc_gc_collect`. 4th gap
+- [gc-api-callbacks.md](gc-api-callbacks.md) — **native gc callbacks should avoid libpython fallback**
+  - The Phase G5 API test for `gc.callbacks` is still xfailed. The target behavior
+- [gc-api-freeze-surface.md](gc-api-freeze-surface.md) — **native gc freeze surface should avoid libpython fallback**
+  - The Phase G5+ API test for `gc.freeze()`, `gc.unfreeze()`, and
+- [gc-api-get-referents.md](gc-api-get-referents.md) — **native gc.get_referents should avoid libpython fallback**
+  - The Phase G5 API test for `gc.get_referents(obj)` still fails before runtime
+- [gc-api-is-finalized-atomic.md](gc-api-is-finalized-atomic.md) — **gc.is_finalized atomic values should not need libpython**
+  - Phase G5 GC API has an xfail for `gc.is_finalized()` because the native gc
+- [gc-api-object-enumeration.md](gc-api-object-enumeration.md) — **native gc object enumeration should avoid libpython fallback**
+  - The Phase G5 API tests for `gc.get_objects()` and `gc.get_referrers(obj)` still
+- [gc-api-passive-surfaces.md](gc-api-passive-surfaces.md) — **passive gc API surfaces should avoid libpython fallback**
+  - Two Phase G5 API tests still fail before runtime because the native `gc`
+- [gc-backend-selection-matrix.md](gc-backend-selection-matrix.md) — **GC backend selection matrix**
+  - `goal.md` No.40 requires a final five-backend GC comparison, a default-backend
+- [gc-backend1-auto-step-sweep-debt.md](gc-backend1-auto-step-sweep-debt.md) — **Backend 1 auto step should sweep candidates and discharge debt**
+  - Continue the Backend #1 Tier 5 productionization track from `goal.md`.
+- [gc-backend1-callback-remove.md](gc-backend1-callback-remove.md) — **Backend #1 gc.callbacks.remove does not stop later callbacks**
+  - Under `PCC_GC_BACKEND=1`, `gc.callbacks.remove(cb)` does not prevent `cb`
+- [gc-backend1-closure-cycle-gate.md](gc-backend1-closure-cycle-gate.md) — **Backend 1 closure cycle gate**
+  - Continue the Tier 5 backend #1 production audit from `goal.md`. The backend #1
+- [gc-backend1-explicit-collect-sweep.md](gc-backend1-explicit-collect-sweep.md) — **Backend 1 explicit collect must sweep with live roots**
+  - Continue the Backend #1 production sweep/finalizer audit from `goal.md`.
+- [gc-backend1-incremental-tricolor-pacer.md](gc-backend1-incremental-tricolor-pacer.md) — **Backend 1 incremental tricolor pacer**
+  - Implement the first Tier 5 GC backend productionization slice from `goal.md`:
+- [gc-backend1-live-cycle-roots.md](gc-backend1-live-cycle-roots.md) — **Backend #1 collects function-local live cycles**
+  - Under `PCC_GC_BACKEND=1`, an explicit `gc.collect()` can break a cycle that is still reachable from function locals:
+- [gc-backend1-module-global-roots.md](gc-backend1-module-global-roots.md) — **Backend 1 must trace module global roots**
+  - Continue the Backend #1 production root audit from `goal.md`. Backend #1
+- [gc-backend1-object-registry-performance.md](gc-backend1-object-registry-performance.md) — **Backend #1 object registry performance gates**
+  - After the Backend #1 correctness fixes, the full `PCC_GC_BACKEND=1`
+- [gc-backend1-owned-local-frame-roots.md](gc-backend1-owned-local-frame-roots.md) — **Backend 1 needs codegen roots for owned object locals**
+  - Reduction of the Tier 5 backend #1 productionization requirement from
+- [gc-backend1-pcc-py-pause-telemetry.md](gc-backend1-pcc-py-pause-telemetry.md) — **Backend 1 pcc-Python runtime should report pause telemetry**
+  - Continue the Backend #1 Tier 5 productionization track from `goal.md`.
+- [gc-backend1-pcc-py-runtime-collect-abort.md](gc-backend1-pcc-py-runtime-collect-abort.md) — **pcc-Python backend 1 aborts after allocation churn and collect**
+  - During the bootstrap five-GC audit, `PCC_GC_BACKEND=1` accepted by all compiler
+- [gc-backend1-transitive-resurrection.md](gc-backend1-transitive-resurrection.md) — **Backend #1 drops transitive resurrection cycle**
+  - Under `PCC_GC_BACKEND=1`, `test_resurrection_is_transitive` no longer preserves
+- [gc-backend2-3-production-verdict.md](gc-backend2-3-production-verdict.md) — **Backend #2 / #3 production verdict closure**
+  - This patchset closes the production-verdict layer for Backend #2 and Backend
+- [gc-backend2-buffered-write-barrier.md](gc-backend2-buffered-write-barrier.md) — **Backend 2 buffered write barrier**
+  - Continue the Backend #2 production-algorithm work from `goal.md`. Backend #2
+- [gc-backend2-cms-worker-instability.md](gc-backend2-cms-worker-instability.md) — **Backend #2 CMS worker is unstable under focused and full GC gates**
+  - Backend #2 currently has a pthread CMS worker and a bounded queue, but the
+- [gc-backend2-cms-worker-shutdown.md](gc-backend2-cms-worker-shutdown.md) — **Backend 2 CMS worker should stop and restart cleanly**
+  - Continue Backend #2 productionization from `goal.md` and `tasksV2.md`.
+- [gc-backend2-concurrent-mark-worker.md](gc-backend2-concurrent-mark-worker.md) — **Backend 2 concurrent mark worker**
+  - Implement the next Tier 5 GC backend productionization slice from `goal.md`:
+- [gc-backend2-precycle-write-barrier.md](gc-backend2-precycle-write-barrier.md) — **Backend #2 write barrier starts mark before root seeding**
+  - `PCC_GC_BACKEND=2` fails live-root preservation and related finalizer /
+- [gc-backend2-sweep-allocation-tsan.md](gc-backend2-sweep-allocation-tsan.md) — **Backend #2 sweep/allocation TSan race**
+  - Backend #2 now has green correctness and CMS worker TSan stress gates, but the
+- [gc-backend2-tsan-alloc-size-race.md](gc-backend2-tsan-alloc-size-race.md) — **Backend #2 TSan allocation-size race**
+  - The first full-runtime ThreadSanitizer probe for Backend #2 CMS worker stress
+- [gc-backend2-worker-mark-termination.md](gc-backend2-worker-mark-termination.md) — **Backend #2 worker mark termination**
+  - Backend #2 has a pthread mark worker and a work queue, but the worker drains
+- [gc-backend2-worker-positive-work.md](gc-backend2-worker-positive-work.md) — **Backend #2 worker should trace allocation work**
+  - Backend #2 has a threaded CMS worker and a queue, but positive allocation work
+- [gc-backend2-worker-tracing-step.md](gc-backend2-worker-tracing-step.md) — **Backend 2 worker traces gray work**
+  - Continue the Tier 5 backend #2 implementation from `goal.md`. The previous
+- [gc-backend3-class-metadata-slot-rewrite.md](gc-backend3-class-metadata-slot-rewrite.md) — **Backend 3 class metadata slot rewrite**
+  - Continue Backend #3 production work from `goal.md` No.8 after
+- [gc-backend3-copy-oldification-read-barrier.md](gc-backend3-copy-oldification-read-barrier.md) — **Backend 3 copy oldification read barrier**
+  - Continue Backend #3 production work from `goal.md` No.8. Backend #3 currently
+- [gc-backend3-cross-domain-remembered-slot-rewrite.md](gc-backend3-cross-domain-remembered-slot-rewrite.md) — **Backend #3 cross-domain remembered slot rewrite**
+  - Backend #3 had many focused remembered-slot rewrite gates, but the remaining
+- [gc-backend3-forwarded-minor-source-cleanup.md](gc-backend3-forwarded-minor-source-cleanup.md) — **Backend #3 forwarded minor source cleanup**
+  - Backend #3 copy-oldifies a young minor object into old storage and installs a
+- [gc-backend3-frame-root-slot-rewrite.md](gc-backend3-frame-root-slot-rewrite.md) — **Backend 3 frame root slot rewrite**
+  - Continue Backend #3 production work from `goal.md` No.8 after
+- [gc-backend3-generational-minor-heap.md](gc-backend3-generational-minor-heap.md) — **Backend 3 generational minor heap**
+  - Implement the next Tier 5 GC backend productionization slice from `goal.md`:
+- [gc-backend3-generator-coroutine-state-slots.md](gc-backend3-generator-coroutine-state-slots.md) — **Backend #3 generator and coroutine state slots**
+  - Backend #3 relies on old object owners participating in the remembered-set when
+- [gc-backend3-minor-bump-arena.md](gc-backend3-minor-bump-arena.md) — **Backend #3 minor bump arena allocation**
+  - Implement the Backend #3 Tier 5 generational slice from `goal.md`: small
+- [gc-backend3-minor-refill-promotion.md](gc-backend3-minor-refill-promotion.md) — **Backend #3 minor refill promotion**
+  - Backend #3 now has a C-runtime minor bump arena, but arena refill still only
+- [gc-backend3-non-list-slot-rewrite.md](gc-backend3-non-list-slot-rewrite.md) — **Backend 3 non-list remembered slot rewrite**
+  - Continue Backend #3 production work from `goal.md` No.8 after
+- [gc-backend3-pcc-py-arena-deallocator.md](gc-backend3-pcc-py-arena-deallocator.md) — **backend 3 pcc-Python arena deallocator abort**
+  - Current self-bootstrap audit found that `pcc1` and `pcc2` start under
+- [gc-backend3-pcc-py-constructor-header-flags.md](gc-backend3-pcc-py-constructor-header-flags.md) — **backend 3 pcc-Python constructors clobber GC header flags**
+  - Backend #3 pcc-Python runtime-high now allocates small objects from a minor
+- [gc-backend3-pcc-py-copy-oldification-read-barrier.md](gc-backend3-pcc-py-copy-oldification-read-barrier.md) — **Backend 3 pcc-Python copy oldification read barrier**
+  - Continue Backend #3 production work from `goal.md` No.8 and follow up
+- [gc-backend3-pcc-py-minor-arena.md](gc-backend3-pcc-py-minor-arena.md) — **backend3 pcc-Python runtime minor arena parity**
+  - Backend #3 has a C-runtime single-domain minor bump arena, but the
+- [gc-backend3-pcc-py-minor-refill-promotion.md](gc-backend3-pcc-py-minor-refill-promotion.md) — **backend 3 pcc-Python minor refill promotion parity**
+  - Backend #3 has a C-runtime gate proving that minor-heap refill promotes a
+- [gc-backend3-pcc-py-remembered-slot-rewrite.md](gc-backend3-pcc-py-remembered-slot-rewrite.md) — **Backend 3 pcc-Python remembered slot rewrite**
+  - Continue Backend #3 production work from `goal.md` No.8 after
+- [gc-backend3-pcc-py-threaded-minor-current.md](gc-backend3-pcc-py-threaded-minor-current.md) — **Backend 3 pcc-Python threaded minor current**
+  - Continue Backend #3 production work from `goal.md` No.8. The C runtime now
+- [gc-backend3-pcc-py-threaded-object-graph.md](gc-backend3-pcc-py-threaded-object-graph.md) — **Backend #3 pcc-Python threaded object graph synchronization**
+  - `goal.md` still lists broader pcc-Python threaded object-index/object-list
+- [gc-backend3-remembered-slot-rewrite.md](gc-backend3-remembered-slot-rewrite.md) — **Backend 3 remembered slot rewrite**
+  - Continue Backend #3 production work from `goal.md` No.8 after
+- [gc-backend3-suspended-generator-frame-slot-rewrite.md](gc-backend3-suspended-generator-frame-slot-rewrite.md) — **Backend #3 suspended generator frame slot rewrite**
+  - The GC production goal requires Backend #3 to preserve and update references held
+- [gc-backend3-threaded-minor-arena.md](gc-backend3-threaded-minor-arena.md) — **Backend 3 threaded minor arena ownership**
+  - Continue the Backend #3 production work from `goal.md`. Backend #3 already has
+- [gc-backend4-colored-relocating-forwarding.md](gc-backend4-colored-relocating-forwarding.md) — **Backend 4 colored relocating forwarding**
+  - Implement the next Tier 5 GC backend productionization slice from `goal.md`:
+- [gc-backend4-completion-audit-2026-05-15.md](gc-backend4-completion-audit-2026-05-15.md) — **backend #4 GenZGC completion audit**
+  - The active goal is to upgrade backend #4, the colored relocating / modern
+- [gc-backend4-dict-relocation-owned-tables.md](gc-backend4-dict-relocation-owned-tables.md) — **Backend #4 dict relocation must retain owned tables**
+  - Backend #4 now relocates scalar objects, lists, tuples, sets, and Tasks. A dict
+- [gc-backend4-forwarding-table-concurrency.md](gc-backend4-forwarding-table-concurrency.md) — **Backend #4 forwarding table must be read under graph lock**
+  - The pcc-Python runtime mirror protects public forwarding operations with the
+- [gc-backend4-free-hook-side-table-concurrency.md](gc-backend4-free-hook-side-table-concurrency.md) — **Backend #4 free hook must lock side-table removal**
+  - Backend #4 collector/read-barrier paths now take the graph lock while reading
+- [gc-backend4-genzgc-store-barrier.md](gc-backend4-genzgc-store-barrier.md) — **Backend #4 GenZGC store barrier slice**
+  - `#4` was upgraded to use a latest OpenJDK GenZGC reference pack, but the
+- [gc-backend4-instance-relocation-owned-fields.md](gc-backend4-instance-relocation-owned-fields.md) — **Backend #4 instance relocation must retain owned fields**
+  - Backend #4 now relocates scalar objects, lists, tuples, dicts, sets, and Tasks.
+- [gc-backend4-list-relocation-owned-items.md](gc-backend4-list-relocation-owned-items.md) — **Backend #4 list relocation must own item arrays**
+  - Backend #4 is moving beyond scalar-object relocation. A list is a
+- [gc-backend4-pcc-py-relocate-copy-size.md](gc-backend4-pcc-py-relocate-copy-size.md) — **Backend #4 pcc-Python relocate copy size validation**
+  - pcc-Python runtime mirror `pcc_gc_relocate_copy()` should reject copy sizes
+- [gc-backend4-production-relocation.md](gc-backend4-production-relocation.md) — **Backend #4 production relocation closure**
+  - This patchset finishes the Backend #4 production-facing relocation gate on top
+- [gc-backend4-relocate-copy-single-forward.md](gc-backend4-relocate-copy-single-forward.md) — **Backend #4 relocate copy must be single-use**
+  - `pcc_gc_relocate_copy()` should not copy the same source object more than once.
+- [gc-backend4-relocate-copy.md](gc-backend4-relocate-copy.md) — **Backend #4 needs a copy relocation primitive**
+  - Backend #4 now has forwarding, stable IDs, and an object-level relocation set,
+- [gc-backend4-relocation-set.md](gc-backend4-relocation-set.md) — **Backend #4 needs a relocation set**
+  - Backend #4 is meant to model a ZGC-style colored relocating collector.
+- [gc-backend4-relocation-target-phase-progress.md](gc-backend4-relocation-target-phase-progress.md) — **Backend #4 relocation targets must wait for phase reset**
+  - Backend #4 now relocates selected objects and records forwarding from source to
+- [gc-backend4-scheduler-queue-free-read-barrier.md](gc-backend4-scheduler-queue-free-read-barrier.md) — **Backend #4 scheduler queue free must heal forwarded entries**
+  - Backend #4 queue pop already reads queued values through `pcc_gc_load_ptr()`
+- [gc-backend4-set-relocation-owned-entries.md](gc-backend4-set-relocation-owned-entries.md) — **Backend #4 set relocation must retain owned entries**
+  - Backend #4 now relocates scalar objects, lists, tuples, and Tasks. A set owns an
+- [gc-backend4-stable-relocation-id.md](gc-backend4-stable-relocation-id.md) — **Backend #4 needs stable relocation identity**
+  - Backend #4 is the colored-relocating backend. `goal.md` lists `id
+- [gc-backend4-step-object-graph-concurrency.md](gc-backend4-step-object-graph-concurrency.md) — **Backend #4 step relocation must lock object graph traversal**
+  - Backend #4 public forwarding install/read paths are now graph-lock protected,
+- [gc-backend4-step-relocates-simple-object.md](gc-backend4-step-relocates-simple-object.md) — **Backend #4 step relocates simple objects**
+  - Backend #4 `pcc_gc_step()` currently selects relocation candidates but does not
+- [gc-backend4-task-queue-forwarding.md](gc-backend4-task-queue-forwarding.md) — **Backend #4 must heal task and scheduler queue references**
+  - The user-mode scheduling gate requires Backend #4 relocation/read barriers to
+- [gc-backend4-task-relocation-owned-slots.md](gc-backend4-task-relocation-owned-slots.md) — **Backend #4 Task relocation must retain state slots**
+  - Backend #4 now relocates scalar objects, lists, and tuples. A Task is the first
+- [gc-backend4-tuple-relocation-owned-items.md](gc-backend4-tuple-relocation-owned-items.md) — **Backend #4 tuple relocation must retain owned items**
+  - Backend #4 list relocation now handles an out-of-line owned payload. Tuple is
+- [gc-backends-1-4-production-gate-progress-2026-05-14.md](gc-backends-1-4-production-gate-progress-2026-05-14.md) — **GC backends 1-4 production gate progress**
+  - The GC backend table still described backends 1-4 as partial. The practical
+- [gc-coroutine-roots-backend-matrix.md](gc-coroutine-roots-backend-matrix.md) — **suspended heap-frame roots across all GC backends**
+  - The user-mode scheduling gate requires suspended coroutine/generator frames to
+- [gc-coroutine-scheduler-roots-production.md](gc-coroutine-scheduler-roots-production.md) — **Coroutine / scheduler roots production closure**
+  - This closes the shared GC gate for stackless Python coroutine/task roots and
+- [gc-coroutine-scheduler-roots-readme.md](gc-coroutine-scheduler-roots-readme.md) — **Coroutine/scheduler roots package README**
+  - Run:
+- [gc-default-closure-cycle-capture.md](gc-default-closure-cycle-capture.md) — **default GC should collect closure capture cycles**
+  - The only remaining `tests/test_gc_g1_cycle_collector.py` xfail under the
+- [gc-effectiveness-closure-cell-cycle.md](gc-effectiveness-closure-cell-cycle.md) — **closure-cell cycle effectiveness gate**
+  - `tests/test_gc_effectiveness.py::test_closure_cell_cycle_collected` is still
+- [gc-effectiveness-generator-self-cycle.md](gc-effectiveness-generator-self-cycle.md) — **generator self-cycle effectiveness gate**
+  - `tests/test_gc_effectiveness.py::test_generator_referencing_self_collected`
+- [gc-finalizer-del-not-called.md](gc-finalizer-del-not-called.md) — **native __del__ finalizers are not called**
+  - The remaining GC xfail closure bucket includes several finalizer failures.
+- [gc-module-global-finalizer-shutdown.md](gc-module-global-finalizer-shutdown.md) — **module-global finalizers do not run at shutdown**
+  - `tests/test_gc_finalizer_corner.py::test_module_global_del_at_shutdown` is the
+- [gc-pcc-py-object-index-freeing-reuse.md](gc-pcc-py-object-index-freeing-reuse.md) — **pcc-Python GC object index stale freeing entry**
+  - While validating the No.42 Phase 2 suspended-root hook substrate, the broader
+- [gc-scheduler-queue-root-slot-race.md](gc-scheduler-queue-root-slot-race.md) — **scheduler queue root slots must be TSan-clean**
+  - The scheduler queue API registers each entry value as a GC root slot. Concurrent
+- [gc-scheduler-root-queue-api.md](gc-scheduler-root-queue-api.md) — **scheduler queue entries should own GC root slots**
+  - The scheduler root registry lets future runnable/timer/IO/wakeup queues
+- [gc-scheduler-root-registry-thread-safety.md](gc-scheduler-root-registry-thread-safety.md) — **scheduler root registry must be safe under concurrent GC**
+  - The scheduler root registry added for coroutine/task queues is shared between
+- [gc-scheduler-root-slot-registry.md](gc-scheduler-root-slot-registry.md) — **GC scheduler root slot registry**
+  - The GC production goal requires user-mode scheduler queues to be traced and
+- [gc-task-completion-waiter-release.md](gc-task-completion-waiter-release.md) — **Task completion must release waiter roots**
+  - The user-mode scheduling GC gate requires an await-chain cycle reachable only
+- [gc-task-state-slots.md](gc-task-state-slots.md) — **Task objects must expose GC-updatable state slots**
+  - The user-mode scheduling goal needs a real task object shape, not just bare
+- [gc-task-waiter-forwarded-shadow-weakref.md](gc-task-waiter-forwarded-shadow-weakref.md) — **task waiter cycles survive colored relocation**
+  - `tests/test_gc_coroutine_roots.py::test_task_completion_releases_waiter_cycle_across_backends`
+- [gc-transitive-resurrection-clear-order.md](gc-transitive-resurrection-clear-order.md) — **cycle GC clears referents before resurrection finalizers**
+  - Two remaining resurrection xfails show that pcc's cycle collector does not
+- [gc-trashcan-finalizer-count.md](gc-trashcan-finalizer-count.md) — **trashcan dealloc skips finalizers in deep chains**
+  - `tests/test_gc_trashcan.py::test_trashcan_with_del_no_overflow` still xfails
+- [gc-weakref-call-intermediate-attr-refleak-no-libpython.md](gc-weakref-call-intermediate-attr-refleak-no-libpython.md) — **weakref-call result used as an intermediate attr-access receiver (`r().v`) leaks a strong ref on #0**
+  - active — finding CONFIRMED + SCOPED 2026-05-31 (surfaced while probing the
+- [gc-xfail-closure-audit.md](gc-xfail-closure-audit.md) — **Close remaining GC xfail debt**
+  - The current full GC gate reports `181 passed, 14 xfailed in 154.32s`.
+
+## python-self-host
+
+- [python-self-host-no-libpython-runtime-holes.md](python-self-host-no-libpython-runtime-holes.md) — **Investigation Report: No-libpython Self-host Debugging Exposed Runtime Semantic Holes**
+  - Issue 1's original target is simple to state:
+
+## python-data-model
+
+- [python-data-model-b1-b6-closure.md](python-data-model-b1-b6-closure.md) — **Python data-model B1-B6 closure**
+  - This bundle turns the earlier B1-B6 runtime/ABI work into compiled
+- [python-data-model-d2-d6-closure.md](python-data-model-d2-d6-closure.md) — **Python data-model D2-D6 closure**
+  - This bundle closes D2-D6 with compiled no-libpython acceptance tests on top of
+- [python-data-model-d2-d6-readme.md](python-data-model-d2-d6-readme.md) — **D2-D6 closure package README**
+  - Run:
+
+## python
+
+- [python-class-export-schema-test-mixin-init-drift.md](python-class-export-schema-test-mixin-init-drift.md) — **`test_pcc_cross_module_class_schema_matches_local_layout` drifted past `L1CodeGen.__init__` mixin refactor**
+  - `tests/python/test_py_class_export_schema.py::test_pcc_cross_module_class_schema_matches_local_layout`
+- [python-class-init-phantom-symbol-link-fail.md](python-class-init-phantom-symbol-link-fail.md) — **Class(args) for a class without an explicit `__init__` synthesises a phantom user_<module>_<class>___init__ symbol → link error**
+  - When a user class has no `__init__` body method (e.g. `class MAError(Exception):
+- [python-class-init-vararg-not-supported.md](python-class-init-vararg-not-supported.md) — **class instantiation lowering rejects `*args` / `**kwargs` in `__init__`**
+  - `tests/py_corpus/phase4/pathlib_parts` fails:
+- [python-class-method-body-from-import-leaks-functions-binding.md](python-class-method-body-from-import-leaks-functions-binding.md) — **class method body's `from .sibling import name` leaks self.functions binding → top-level def name body attaches to sibling's symbol; local symbol undefined at link time**
+  - When a class method body contains `from .sibling import some_name` (a local
+- [python-conditional-indented-import-no-libpython.md](python-conditional-indented-import-no-libpython.md) — **conditional / indented imports in the entry module fall back to libpython (no-libpython)**
+  - resolved 2026-05-31 (present-dependency case) — fix landed in
+- [python-context-manager-exit-bound-method-3arg-dispatch-gap.md](python-context-manager-exit-bound-method-3arg-dispatch-gap.md) — **`__exit__` bound-method dispatch in `call_exit_method` / `pcc_instance_bound_method_entry` returns NULL**
+  - `tests/python/data_model/test_context_manager_runtime.py::test_context_enter_exit_runtime`
+- [python-cpy-call-kw-null-kwarg-segfault-diagnostic.md](python-cpy-call-kw-null-kwarg-segfault-diagnostic.md) — **py_cpy_call_kw NULL kwarg value crashes inside PyDict_SetItemString — defensive diagnostic + upstream bug located**
+  - resolved (defensive guard); upstream comprehension+format kwarg bug located but not yet fixed
+- [python-cpython-compat-import-numpy-multiarray-init-fails.md](python-cpython-compat-import-numpy-multiarray-init-fails.md) — **cpython-compat `import numpy` fails at `_multiarray_umath` C-extension init**
+  - The real `import numpy` end-goal for `B-P0-PKG`. Under cpython-compat
+- [python-deep-dotted-package-attr-no-libpython.md](python-deep-dotted-package-attr-no-libpython.md) — **deep dotted package attribute access `a.b.c.X` raises AttributeError (no-libpython)**
+  - resolved 2026-05-31 — fix landed in `_native_module_expr_export_info`
+- [python-dotted-module-class-attr-no-libpython.md](python-dotted-module-class-attr-no-libpython.md) — **class accessed via dotted module path `import p.sub; p.sub.Thing(...)` fails (no-libpython)**
+  - active — root cause CONFIRMED + bisected 2026-05-31; a speculative fix was
+- [python-enum-stdlib-skip-uses-native-enum-members.md](python-enum-stdlib-skip-uses-native-enum-members.md) — **`enum` recursive stdlib pull blocks native Enum support**
+  - `tests/python/data_model/test_final_language_compiled_acceptance.py::test_t1_metaclass_type_enum_abcmeta_compiled`
+- [python-extern-c_ptr-funcname-libpython-wrap-leak.md](python-extern-c_ptr-funcname-libpython-wrap-leak.md) — **extern c_ptr arg for a Name leaks py_cpy_wrap_pcc_<N>arg into the no-libpython runtime archive**
+  - `tests/py_corpus/phase4/re_match` fails at link time in the default pcc
+- [python-fake-libc-netdb-socket-addrinfo-missing.md](python-fake-libc-netdb-socket-addrinfo-missing.md) — **`fake_libc_include/netdb.h` and `sys/socket.h` lack `addrinfo` / `sockaddr` so pcc can't compile `py_http.c`**
+  - `tests/python/test_py_runtime_pcc_emit.py::test_pcc_emits_object_for_runtime_source[py_http.c]`
+- [python-for-list-int-elem-boxed-slot-i64-store.md](python-for-list-int-elem-boxed-slot-i64-store.md) — **for v in [int list] stores i64 into a boxed (ptr) slot — link error / empty loop**
+  - Iterating a list with `int` elements (`for v in xs:` where `xs` is
+- [python-format-cpy-object-render-hook.md](python-format-cpy-object-render-hook.md) — **`<object tag=N>` rendering of CPython PyObjects in pcc containers**
+  - When pcc emits code that falls through to the libpython fallback path
+- [python-format-name-bound-literal-falls-to-libpython.md](python-format-name-bound-literal-falls-to-libpython.md) — **`name = "<literal>"; name.format(...)` falls to libpython fallback even though the format string is statically a literal**
+  - `_maybe_emit_literal_str_format` (`pcc/py_frontend/codegen/format_lowering.py:116`) gates its compile-time parsed native format path on `...
+- [python-format-spec-user-format-bound-method-self-prepend.md](python-format-spec-user-format-bound-method-self-prepend.md) — **`__format__(self, spec)` receives self as `spec` when method is a bound PyFunc**
+  - `tests/python/data_model/test_d2_d6_compiled_acceptance.py::test_d6_format_spec_and_user_format_compiled`
+- [python-from-package-import-submodule-no-libpython.md](python-from-package-import-submodule-no-libpython.md) — **`from package import submodule` falls back to libpython (no-libpython)**
+  - resolved 2026-05-31 — fix landed in `_top_level_import_targets`
+- [python-fstring-bare-expr-skips-user-format-override.md](python-fstring-bare-expr-skips-user-format-override.md) — **`f"{x}"` lowered to `str(x)` skips user `__format__` override**
+  - `tests/python/test_format_protocol.py::test_fstring_forwards_spec`
+- [python-fstring-format-spec-builtins.md](python-fstring-format-spec-builtins.md) — **Builtin f-string format specs still fail**
+  - `tests/test_python_str_methods_parity.py::test_str_fstring_format_spec` is the
+- [python-generator-enumerate-counter-not-persisted.md](python-generator-enumerate-counter-not-persisted.md) — **enumerate(...) index inside a generator resets to <null> after the first yield**
+  - `for idx, v in enumerate(xs): ... yield idx, v` inside a generator yields the
+- [python-generator-owned-flag-cache-leaks-across-sibling-generators.md](python-generator-owned-flag-cache-leaks-across-sibling-generators.md) — **owned-local flag cache leaks across sibling generators — self-backend rejects undefined pointer value (closes the long-standing numpy `.owned.N` cap at 149 IR modules)**
+  - When two sibling user generator functions in the same compilation share a
+- [python-generator-range-loop-counter-not-persisted.md](python-generator-range-loop-counter-not-persisted.md) — **range(...) for-loop inside a generator stops after the first yield**
+  - A generator whose body iterates `for <name> in range(...)` and `yield`s inside
+- [python-hasattr-static-false-on-builtin-modules.md](python-hasattr-static-false-on-builtin-modules.md) — **hasattr() on a native-builtin module statically folds to False for any attr not in pcc's hardcoded attr table**
+  - resolved (the static-False fold is removed; runtime path handles it)
+- [python-ir-passes-on-huge-memory-skip-2026-05-27.md](python-ir-passes-on-huge-memory-skip-2026-05-27.md) — **PCC_PYTHON_IR_PASSES=on should stay bounded on huge modules**
+  - `PCC_PYTHON_IR_PASSES=off` is only a bounded bootstrap default. It does not
+- [python-ir-passes-self-compile-enum-and-parity-harness.md](python-ir-passes-self-compile-enum-and-parity-harness.md) — **`test_all_ir_pass_modules_emit_llvm_in_strict_frontend_mode` — `alias_analysis.py` Enum + `parity.py` harness deps**
+  - The test compiles every `pcc/ir_passes/*.py` module under
+- [python-module-attr-write-native.md](python-module-attr-write-native.md) — **Native module attribute writes still require libpython**
+  - `tests/test_python_module_imports_parity.py::test_module_attribute_write` is
+- [python-native-module-alias-module-global-attr-attribute-error.md](python-native-module-alias-module-global-attr-attribute-error.md) — **`mod_alias.module_global_attr` (e.g. `_mat.__all__`) failed with AttributeError because (a) Attr-RHS exports were dropped and (b) Attr lowering had no `module_global` branch**
+  - `numpy/__init__.py:681 set(_mat.__all__)` failed at runtime with
+- [python-nested-if-import-from-skips-native-predeclare.md](python-nested-if-import-from-skips-native-predeclare.md) — **`from .sibling import name` nested inside top-level `if/try` skips native predeclare**
+  - `numpy/__init__.py:821` raises a runtime `NameError: name 'ones' is not defined` from the no-libpython pcc build, even though `ones` is e...
+- [python-no-libpython-numpy-build-pcc-capi-include-redirect.md](python-no-libpython-numpy-build-pcc-capi-include-redirect.md) — **wire the pcc-native C-API header surface into the real numpy build (pcc-native include redirect)**
+  - The `import numpy` no-libpython (Mode D / pcc-native) end-goal for `B-P0-PKG`
+- [python-no-libpython-re-compile-general-pattern-object.md](python-no-libpython-re-compile-general-pattern-object.md) — **no-libpython `re.compile` generalization needs a runtime compiled-pattern object**
+  - `re.compile` is the single largest remaining no-libpython fallback hotspot on the
+- [python-os-path-join-splat-dyn-arg-safety-bound.md](python-os-path-join-splat-dyn-arg-safety-bound.md) — **`os.path.join(a, *parts)` native lowering smuggled CPython parts into `py_list_extend`**
+  - `tests/python/test_native_os_path_join_splat.py::test_join_splat_dyn_arg_falls_back`
+- [python-package-init-computed-module-attr-no-libpython.md](python-package-init-computed-module-attr-no-libpython.md) — **package __init__ computed module-level assignments don't bind as package attrs (no-libpython)**
+  - resolved 2026-05-31 — fix landed in pcc/py_frontend/pipeline.py multi-file
+- [python-package-init-submodule-exec-order-no-libpython.md](python-package-init-submodule-exec-order-no-libpython.md) — **submodule module-top runs BEFORE its package __init__ (module-init order, no-libpython)**
+  - active — root cause CONFIRMED + definitively bisected 2026-05-31; the fix is a
+- [python-pcc-built-archive-weak-symbol-duplicates.md](python-pcc-built-archive-weak-symbol-duplicates.md) — **`libpy_runtime_pcc.a` duplicate-symbol `pcc_gc_thread_unregister_buffers`**
+  - `tests/python/test_runtime_oracle_diff.py` (13 cases) failed link with:
+- [python-pcc-main-static-export-cli-bootstrap.md](python-pcc-main-static-export-cli-bootstrap.md) — **`pcc/__main__.py` 4 → 0 fallback via `cli_bootstrap` static export**
+  - `pcc/__main__.py` is the 2-line entry-point module:
+- [python-pcc1-list-of-functions-syntactic-fallback.md](python-pcc1-list-of-functions-syntactic-fallback.md) — **pcc1 list-of-functions value-position lowering via syntactic FuncDef fallback**
+  - `tests/python/test_pcc1_pytest_capable.py::test_pcc1_runs_test_list_via_indirect_calls`
+- [python-py_parse-static-export-py_lex-ratchet-shrink.md](python-py_parse-static-export-py_lex-ratchet-shrink.md) — **`pcc.parse.py_parse` 10→0 off-mode fallback via `py_lex` static export**
+  - `pcc.parse.py_parse` standalone per-module compile had 10 residual
+- [python-scaffold-off-mode-historical-py_cpy-assertions-stale.md](python-scaffold-off-mode-historical-py_cpy-assertions-stale.md) — **scaffold tests assert OFF-mode `py_cpy_*` behavior that pcc closed**
+  - Four tests in the scaffold reduction / load / store family failed
+- [python-self-backend-asm-assertions-stale.md](python-self-backend-asm-assertions-stale.md) — **5 self-backend asm tests assert idioms that codegen optimized past**
+  - Five tests in `tests/c/test_self_backend.py` failed asserting
+- [python-star-import-no-libpython.md](python-star-import-no-libpython.md) — **`from package import *` star import falls back to libpython (no-libpython)**
+  - resolved 2026-05-31 — fix landed in `_append_source_import_from_spec`
+- [python-substrate-spike-test-sweep.md](python-substrate-spike-test-sweep.md) — **`test_runtime_substrate_spike.py` two stale-shape failures**
+  - Two failures in `tests/python/test_runtime_substrate_spike.py`:
+- [python-user-iter-double-advance.md](python-user-iter-double-advance.md) — **User iterator __next__ advances state twice**
+  - `tests/test_python_class_features_parity.py::test_class_user_iter` is still
+- [python-valhalla-value-model-actual-state.md](python-valhalla-value-model-actual-state.md) — **Python Valhalla value-model status overclaim**
+  - The value-model plan and status report claimed the Python Valhalla-inspired
+- [python-yield-tuple-misparse-leaks-yield-sentinel.md](python-yield-tuple-misparse-leaks-yield-sentinel.md) — **`yield a, b` misparses as `(yield a), b` and leaks the `_yield` sentinel**
+  - resolved (parser fix landed 2026-05-27; regression test in
+
+## lua
+
+- [lua-sort-random-pivot-signedness.md](lua-sort-random-pivot-signedness.md) — **Investigation Report: Lua `sort.lua` Failure Caused by Lost Unsigned Semantics**
+  - A flaky failure in Lua's `sort.lua` test turned out to be a compiler bug in `pcc`, not a Lua bug.
+
+## projects
+
+- [pcre-op-lengths-incomplete-array-binding.md](pcre-op-lengths-incomplete-array-binding.md) — **Investigation Report: PCRE `OP_lengths` Failure Caused by Incomplete-Array Global Binding**
+  - A PCRE runtime hang first looked like a multi-module MCJIT performance problem.
+- [sqlite-forward-declared-bitfield-struct-tags.md](sqlite-forward-declared-bitfield-struct-tags.md) — **Investigation Report: SQLite Broke on Forward-Declared Bitfield Struct Tags**
+  - This SQLite failure was not an MCJIT scalability problem.
+- [sqlite-integration-vfs-init-and-mcjit-lifecycle.md](sqlite-integration-vfs-init-and-mcjit-lifecycle.md) — **Investigation Report: SQLite Integration Exposed Casted Syscall Tables, Local Aggregate Initialization, and Darwin MCJIT Teardown**
+  - Getting `projects/sqlite-amalgamation-3490100/sqlite3.c` to run correctly through
+- [zlib-integration-static-local-arrays-and-layout.md](zlib-integration-static-local-arrays-and-layout.md) — **Investigation Report: zlib Integration Exposed Layout and Static-Local Array Bugs**
+  - Bringing `projects/zlib-1.3.1/` up through `pcc` looked at first like a build-system and host-header problem.
+
+## llvm
+
+- [llvm-capi-vs-llvmlite-oracle-debugging.md](llvm-capi-vs-llvmlite-oracle-debugging.md) — **`llvm_capi` vs `llvmlite` Oracle Debugging**
+  - This note records the debugging pattern that worked best for recent
+
+## other
+
+- [boxed-float-dyntype-sub-mul-compare-wrong.md](boxed-float-dyntype-sub-mul-compare-wrong.md) — **DynType boxed-float `-` / `*` / comparison against int or DynType operands produce wrong results (no py_obj_sub/py_obj_mul; falls to the i64 path)**
+  - resolved (fixes #26 `+`, #27 `-`/`*`, #28 comparison — all full-bootstrap-passed)
+- [bytearray-repr-and-methods-cluster-no-libpython.md](bytearray-repr-and-methods-cluster-no-libpython.md) — **bytearray repr + mutable methods unsupported (no-libpython cluster)**
+  - active (scoped cluster; not started — bytearray repr is bounded, methods are several)
+- [contextual-per-module-fallback-gate.md](contextual-per-module-fallback-gate.md) — **contextual per-module fallback gate for Python self-host**
+  - Raw per-module fallback counts treat mixin files such as
+- [cpython-symbol-collision-and-teardown.md](cpython-symbol-collision-and-teardown.md) — **CPython Symbol Collision and Teardown Order Investigation**
+  - During the execution of Phase 4 CPython fallback tests (such as `test_callable_type_alias_literal_with_cpython_values`), compiled binarie...
+- [cross-module-shadowed-class-method-dispatch.md](cross-module-shadowed-class-method-dispatch.md) — **shadowed cross-module class method dispatch**
+  - `tests/test_industrial_cross_module_abi.py::test_shadowing_repro` failed after
+- [cross-module-static-table-native-global.md](cross-module-static-table-native-global.md) — **cross-module static table imports triggered strict fallback**
+  - After splitting static builtin type tables out of `layer1.py`, the strict
+- [custom-obj-eq-dict-set-key-no-libpython.md](custom-obj-eq-dict-set-key-no-libpython.md) — **user __eq__ in dict/set key lookup (no-libpython)**
+  - active — gap CONFIRMED + a fix ATTEMPTED and REVERTED 2026-05-30 (it works for
+- [decorator-first-class-fn-silent-null-no-libpython.md](decorator-first-class-fn-silent-null-no-libpython.md) — **function decorators silently return null under --python-libpython=off (first-class-function limitation)**
+  - Under strict no-libpython (`--backend self --python-libpython=off`, DEFAULT
+- [default-backend-verdict.md](default-backend-verdict.md) — **Default backend verdict**
+  - Default: Backend #0 — `refcount-cycle`
+- [final-language-closure.md](final-language-closure.md) — **Final language closure**
+  - This bundle closes the last six goal.md items after the GC/backend and B/D
+- [final-zero-readme.md](final-zero-readme.md) — **Final zero gate**
+  - Run:
+- [first-class-fn-key-via-inline-no-libpython.md](first-class-fn-key-via-inline-no-libpython.md) — **key= callables via inlining (no first-class functions, no-libpython)**
+  - active — `sorted`/`min`/`max(key=<simple lambda>)` RESOLVED 2026-05-30 for
+- [fstring-dynamic-format-spec-no-libpython.md](fstring-dynamic-format-spec-no-libpython.md) — **dynamic f-string format spec f"{v:>{w}}" (no-libpython)**
+  - resolved 2026-05-30 (fix #61) for the bare-identifier nested-field case
+- [fstring-format-spec-gaps-altform-exponent-spacesign.md](fstring-format-spec-gaps-altform-exponent-spacesign.md) — **f-string / format() spec gaps — alt-form `#x`, exponent `e`/`E`, space-sign ` `**
+  - resolved (#30 alt-form, #31 int space-sign format(), #32 f-string spec literal completing space-sign; e/E/g already worked — all full-boo...
+- [fstring-nested-replacement-field-in-format-spec.md](fstring-nested-replacement-field-in-format-spec.md) — **nested replacement field inside an f-string format spec (f"{val:>{width}.2f}") unsupported under no-libpython**
+  - A nested replacement field inside an f-string's format spec —
+- [goal-data-model-b1-b2-0394-0402.md](goal-data-model-b1-b2-0394-0402.md) — **goal data-model B1/B2 slice 0394-0402**
+  - This slice continues after the goal-order gate pack and advances the next
+- [goal-data-model-b3-classvar-0405-0412.md](goal-data-model-b3-classvar-0405-0412.md) — **goal data-model B3 class-level variables 0405-0412**
+  - This slice implements the runtime side of goal.md No.22:
+- [goal-data-model-b3-classvar-pack-readme.md](goal-data-model-b3-classvar-pack-readme.md) — **B3 classvar pack README**
+  - This pack advances B3 by adding runtime class-owned attributes.
+- [goal-data-model-b3-classvar-v2-0416-0425.md](goal-data-model-b3-classvar-v2-0416-0425.md) — **goal data-model B3 class-level variables v2**
+  - This supersedes the earlier classvar runtime attempt.
+- [goal-data-model-b4-user-dunder-pack-readme.md](goal-data-model-b4-user-dunder-pack-readme.md) — **B4 user dunder pack README**
+  - Run:
+- [goal-data-model-b4-user-dunders-0427-0435.md](goal-data-model-b4-user-dunders-0427-0435.md) — **goal data-model B4 user dunders**
+  - This slice advances goal.md No.23:
+- [goal-data-model-b5-exception-chaining-0438-0444.md](goal-data-model-b5-exception-chaining-0438-0444.md) — **goal data-model B5 exception chaining / traceback frames**
+  - This slice advances goal.md No.24.
+- [goal-data-model-b5-exception-pack-readme.md](goal-data-model-b5-exception-pack-readme.md) — **B5 exception chaining pack README**
+  - Run:
+- [goal-data-model-b6-call-splat-module-attrs-0447-0455.md](goal-data-model-b6-call-splat-module-attrs-0447-0455.md) — **goal data-model B6 call splat / module attrs**
+  - This slice advances goal.md No.25.
+- [goal-data-model-d2-generator-0457-0463.md](goal-data-model-d2-generator-0457-0463.md) — **goal data-model D2 generator state machine**
+  - This slice advances goal.md No.26 at the runtime boundary.
+- [goal-data-model-d3-d4-d6-runtime-0465-0476.md](goal-data-model-d3-d4-d6-runtime-0465-0476.md) — **goal data-model D3/D4/D6 runtime slice**
+  - This pack advances three later `goal.md` data-model items at the runtime/ABI
+- [goal-data-model-d5-protocol-0478-0487.md](goal-data-model-d5-protocol-0478-0487.md) — **goal data-model D5 protocol polish**
+  - This slice adds runtime dispatch for user-defined protocol dunders:
+- [goal-data-model-pack-readme.md](goal-data-model-pack-readme.md) — **Goal data-model pack README**
+  - This pack is a goal-ordered continuation.
+- [goal-order-single-pack-0379-0392.md](goal-order-single-pack-0379-0392.md) — **goal-order single pack 0379-0392**
+  - This pack is organized in goal.md order and focuses on real gates and
+- [goal-stdlib-os-io-re-math-0528-0536.md](goal-stdlib-os-io-re-math-0528-0536.md) — **goal native stdlib core: os/io/re/math**
+  - This pack expands core stdlib replacements used by pcc self-host and tests.
+- [goal-stdlib-pathlib-base64-hashlib-string-time-0517-0526.md](goal-stdlib-pathlib-base64-hashlib-string-time-0517-0526.md) — **goal native stdlib: pathlib / base64 / hashlib / string / time**
+  - This pack expands more self-host-friendly stdlib modules.
+- [goal-stdlib-surface-abc-enum-inspect-weakref-0497-0505.md](goal-stdlib-surface-abc-enum-inspect-weakref-0497-0505.md) — **goal native stdlib surface: abc / enum / inspect / weakref**
+  - This pack extends pcc's native-compilable stdlib surface to reduce fallback
+- [goal-stdlib-system-0538-0547.md](goal-stdlib-system-0538-0547.md) — **goal native stdlib system surface**
+  - This pack expands system-adjacent native stdlib modules.
+- [goal-stdlib-util-dataclasses-functools-itertools-collections-0507-0515.md](goal-stdlib-util-dataclasses-functools-itertools-collections-0507-0515.md) — **goal native stdlib util surface**
+  - This pack expands native stdlib modules commonly used in self-host and
+- [goal-typing-types-stdlib-0489-0495.md](goal-typing-types-stdlib-0489-0495.md) — **goal typing/types native stdlib slice**
+  - This pack advances the type-runtime part of the Python compatibility goals.
+- [layer1-host-helper-context-gap.md](layer1-host-helper-context-gap.md) — **Layer1 host helper extraction needs contextual host type**
+  - `pcc/py_frontend/codegen/layer1.py` is still large. A natural next split is to
+- [make-derived-cpp-flags-vs-explicit-project-config.md](make-derived-cpp-flags-vs-explicit-project-config.md) — **Investigation Report: Why Make-Derived CPP Flags Covered PCRE but Not Lua, zlib, or SQLite**
+  - After `pcc` gained `--cpp-arg` and make-derived preprocessor flag inference,
+- [malloc-history-uaf-localization.md](malloc-history-uaf-localization.md) — **Using `MallocStackLogging` + `malloc_history` to localize a UAF**
+  - When pcc1 self-host crashes with `nanov2_guard_corruption_detected` deep
+- [nbody-shootout-fp-contract-and-vectorization.md](nbody-shootout-fp-contract-and-vectorization.md) — **Investigation Report: `nbody_shootout` Was Not "Just Missing Vectorization"**
+  - `benchmarks/nbody_shootout.c` exposed a real optimization gap between `pcc` and
+- [numpy-first-import-libpython-fallback.md](numpy-first-import-libpython-fallback.md) — **Real NumPy first import still emits libpython fallback**
+  - The active `B-P0-PKG` first-import tracer for the repository-local NumPy 2.4.4 package no longer matches the stale status/test expectatio...
+- [pcc-bootstrap-stage2-type-infer-runtime-corruption.md](pcc-bootstrap-stage2-type-infer-runtime-corruption.md) — **Investigation Report: Bootstrap Stage2 Type Inference Runtime Corruption**
+  - historical — fixes from this investigation have landed (Function.__init__
+- [pcc-py-set-signed-perturb-bootstrap-timeout.md](pcc-py-set-signed-perturb-bootstrap-timeout.md) — **pcc-py set lookup signed perturb bootstrap timeout**
+  - fixed in the current working tree.
+- [pcc-py-type-infer-property-return-type.md](pcc-py-type-infer-property-return-type.md) — **`@property` return type does not propagate in pcc's type inference**
+  - open — multi-file closed-world compile of `pcc/py_stdlib/pathlib.py`
+- [pcc2-py-ast-closed-world-field-export-empty.md](pcc2-py-ast-closed-world-field-export-empty.md) — **pcc2 py_ast closed-world field export becomes empty**
+  - `tests/python/test_pcc_bootstrap_full.py` regresses in the self-backend
+- [raise-user-exception-subclass-skips-init-loses-attrs.md](raise-user-exception-subclass-skips-init-loses-attrs.md) — **raise UserExceptionSubclass(args) skips __init__, loses instance attributes (no-libpython)**
+  - A user exception subclass with a custom `__init__` that sets instance attributes
+- [reflected-arithmetic-operators-no-libpython.md](reflected-arithmetic-operators-no-libpython.md) — **reflected arithmetic operators __radd__/__rmul__/... (no-libpython)**
+  - active — gap CONFIRMED; a FRONTEND static-dispatch fix was ATTEMPTED and
+- [resurrection-class-attr-libpython-fallback.md](resurrection-class-attr-libpython-fallback.md) — **resurrection test class attributes lower through libpython**
+  - `tests/test_gc_resurrection.py::test_resurrection_only_happens_once_per_object`
+- [self-bootstrap-reliability-performance-2026-05-15.md](self-bootstrap-reliability-performance-2026-05-15.md) — **self-bootstrap reliability and performance regression**
+  - resolved for the 80s regression; future <60s work remains codegen/IR-size work
+- [sequence-builtins-len-getitem-not-iterator-protocol.md](sequence-builtins-len-getitem-not-iterator-protocol.md) — **list()/sum()/tuple()/set() consume DynType via len+getitem, silently yielding empty/wrong results for iterator-only objects (generators)**
+  - Under strict no-libpython (`--backend self --python-libpython=off`, DEFAULT
+- [sorted-min-max-custom-lt-not-used-no-libpython.md](sorted-min-max-custom-lt-not-used-no-libpython.md) — **sorted()/min()/max() ignore a custom __lt__ (no-libpython)**
+  - resolved 2026-05-30 — `sorted()` (fix #54, proposal No.4) and `min()`/`max()`
+- [splat-unpack-in-builtin-call-no-libpython.md](splat-unpack-in-builtin-call-no-libpython.md) — ***iterable splat in a builtin call / *args forwarding (no-libpython)**
+  - resolved 2026-05-30 for the common cases: `print(*items)` (#62, No.1),
+- [str-print-format-no-repr-fallback-no-libpython.md](str-print-format-no-repr-fallback-no-libpython.md) — **str()/print()/format() of an instance does not fall back to __repr__ (no-libpython)**
+  - Under strict no-libpython, `print(obj)` / `str(obj)` / `f"{obj}"` / `"x" + str(obj)`
+- [threaded-gc-safepoint-production-blocker.md](threaded-gc-safepoint-production-blocker.md) — **threaded GC safepoint production blocker**
+  - `pcc_stop_the_world()` is cooperative: the collector can only stop other live
+- [threading-list-index-native-dispatch.md](threading-list-index-native-dispatch.md) — **list-indexed threading receivers miss native dispatch**
+  - The remaining threading/Lock failures are tied to method calls whose receiver
+- [threading-list-index-start-failure.md](threading-list-index-start-failure.md) — **list-indexed Thread.start fails under pthread runtime**
+  - While reducing `threading.Lock` lost updates, the literal list-of-threads
+- [threading-lock-lost-update.md](threading-lock-lost-update.md) — **threading.Lock loses mutual exclusion under pcc-compiled threads**
+  - User-reported lost-update bug:
+- [three-arg-pow-modexp-no-libpython.md](three-arg-pow-modexp-no-libpython.md) — **pow(b, e, mod) (3-arg modular exponentiation) -> NameError under no-libpython**
+  - resolved (#45 — bootstrap biyrywrup PASSED 18/4skip, 155s)
+- [tuple-set-frozenset-over-custom-iterator-libpython-fallback.md](tuple-set-frozenset-over-custom-iterator-libpython-fallback.md) — **tuple()/set()/frozenset() over a custom __iter__/__next__ iterator falls back to libpython**
+  - resolved (#42 — tuple/set/frozenset landed + bootstrap-passed; max/min/sorted-over-custom-iter remain, see below)
+- [typed-int-unboxed-overflow-silent-wraparound.md](typed-int-unboxed-overflow-silent-wraparound.md) — **typed-int unboxed arithmetic silently wraps on i64 overflow (violates Python bignum semantics)**
+  - An external intent-vs-reality audit (2026-05-30) flagged, as the single
+- [virtual-threads-runtime-prerequisites.md](virtual-threads-runtime-prerequisites.md) — **Loom-shaped virtual threads for pcc**
+  - pcc currently has a synchronous no-suspension coroutine thunk and pthread-based
+- [zero-division-silent-no-libpython-six-paths.md](zero-division-silent-no-libpython-six-paths.md) — **division/modulo by zero silently yields 0/inf/NULL instead of ZeroDivisionError (no-libpython, six lowering paths)**
+  - Under strict no-libpython (`--backend self --python-libpython=off`), division and

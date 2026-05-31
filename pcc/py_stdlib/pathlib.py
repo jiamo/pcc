@@ -6,19 +6,18 @@ source and build scripts touch.
 """
 from __future__ import annotations
 
-from .os import path as _op
+from os import path as _op
 
 
 class PurePath:
-    def __init__(self, *parts) -> None:
-        if len(parts) == 0:
-            self._raw = ""
-        elif len(parts) == 1:
-            self._raw = str(parts[0])
-        else:
-            self._raw = _op.join(*[str(p) for p in parts])
+    def __init__(self, path: str = "", *extra) -> None:
+        raw = str(path)
+        for part in extra:
+            raw = _op.join(raw, str(part))
+        self._raw = raw
 
     def __str__(self) -> str:
+
         return self._raw
 
     def __repr__(self) -> str:
@@ -51,6 +50,21 @@ class PurePath:
             return n
         return n[:i]
 
+    def with_suffix(self, suffix: str) -> "PurePath":
+        base, _old = _op.splitext(self._raw)
+        return PurePath(base + suffix)
+
+    def with_name(self, name: str) -> "PurePath":
+        parent = _op.dirname(self._raw)
+        if parent:
+            return PurePath(_op.join(parent, name))
+        return PurePath(name)
+
+    def match(self, pattern: str) -> bool:
+        if pattern.startswith("*."):
+            return self.name.endswith(pattern[1:])
+        return self.name == pattern or self._raw == pattern
+
 
 class Path(PurePath):
     def exists(self) -> bool:
@@ -65,7 +79,9 @@ class Path(PurePath):
         return _op.exists(self._raw)
 
     def read_text(self, encoding: str = "utf-8") -> str:
-        raise NotImplementedError("Path.read_text awaits extern fopen/read")
+        with open(self._raw, "r", encoding=encoding) as f:
+            return f.read()
 
     def write_text(self, s: str) -> int:
-        raise NotImplementedError("Path.write_text awaits extern fopen/write")
+        with open(self._raw, "w", encoding="utf-8") as f:
+            return f.write(s)

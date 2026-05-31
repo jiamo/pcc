@@ -22,29 +22,32 @@
 
 
 PyExceptionObject *py_exc_alloc(PyClassObject *cls, const char *msg) {
-    PyExceptionObject *e = (PyExceptionObject *)calloc(
-        1, sizeof(PyExceptionObject));
+    PyExceptionObject *e = (PyExceptionObject *)pcc_gc_alloc(
+        (int64_t)sizeof(PyExceptionObject), PY_TYPE_EXC, 0);
     if (e == NULL) return NULL;
-    e->h.refcount = 1;
-    e->h.type_tag = PY_TYPE_EXC;
-    e->h.flags    = 0;
+    memset((char *)e + sizeof(PyObjectHeader), 0,
+           sizeof(PyExceptionObject) - sizeof(PyObjectHeader));
     if (cls == NULL) {
         cls = py_exc_builtin_class(PY_EXC_EXCEPTION);
     }
-    py_incref((PyObject *)cls);
-    e->exc_class = cls;
+    e->exc_class = NULL;
+    pcc_gc_store_ptr((PyObject *)e, (PyObject **)&e->exc_class, (PyObject *)cls);
     if (msg != NULL) {
         PyObject *s = py_str_new(msg, (int64_t)strlen(msg));
-        e->message = s;   /* owned ref from py_str_new */
+        pcc_gc_store_ptr((PyObject *)e, &e->message, s);
+        if (s != NULL) py_decref(s);
     } else {
-        py_incref(py_None);
-        e->message = py_None;
+        pcc_gc_store_ptr((PyObject *)e, &e->message, py_None);
     }
     e->cause      = NULL;
     e->context    = NULL;
     e->traceback  = NULL;
     e->n_frames   = 0;
     e->cap_frames = 0;
+    pcc_runtime_log_event_code(
+        6, 1,
+        cls != NULL ? cls->type_tag_alloc : -1, msg != NULL ? 1 : 0, e
+    );
     return e;
 }
 
@@ -52,6 +55,19 @@ PyExceptionObject *py_exc_alloc(PyClassObject *cls, const char *msg) {
 PyObject *py_exc_new(int64_t type_tag, const char *msg) {
     PyClassObject *cls = py_exc_builtin_class(type_tag);
     PyExceptionObject *e = py_exc_alloc(cls, msg);
+    PyObject *out = (PyObject *)e;
+    pcc_runtime_log_event_code(6, 2, type_tag, msg != NULL ? 1 : 0, out);
+    return out;
+}
+
+
+PyObject *py_exc_new_with_value(int64_t type_tag, PyObject *value) {
+    PyClassObject *cls = py_exc_builtin_class(type_tag);
+    PyExceptionObject *e = py_exc_alloc(cls, NULL);
+    if (e == NULL) return NULL;
+    if (value == NULL) value = py_None;
+    pcc_gc_store_ptr((PyObject *)e, &e->message, value);
+    pcc_runtime_log_event_code(6, 8, type_tag, 0, e);
     return (PyObject *)e;
 }
 
@@ -61,27 +77,25 @@ PyObject *py_exc_new_with_class(PyObject *cls, const char *msg) {
         return py_exc_new(PY_EXC_EXCEPTION, msg);
     }
     PyExceptionObject *e = py_exc_alloc((PyClassObject *)cls, msg);
-    return (PyObject *)e;
+    PyObject *out = (PyObject *)e;
+    pcc_runtime_log_event_code(6, 9, ((PyClassObject *)cls)->type_tag_alloc, msg != NULL ? 1 : 0, out);
+    return out;
 }
 
 
 void py_exc_set_cause(PyObject *exc, PyObject *cause) {
     if (exc == NULL || py_type_of(exc) != PY_TYPE_EXC) return;
     PyExceptionObject *e = (PyExceptionObject *)exc;
-    PyObject *old = e->cause;
-    if (cause != NULL) py_incref(cause);
-    e->cause = cause;
-    if (old != NULL) py_decref(old);
+    pcc_gc_store_ptr(exc, &e->cause, cause);
+    pcc_runtime_log_event_code(6, 5, cause != NULL ? 1 : 0, 0, exc);
 }
 
 
 void py_exc_set_context(PyObject *exc, PyObject *context) {
     if (exc == NULL || py_type_of(exc) != PY_TYPE_EXC) return;
     PyExceptionObject *e = (PyExceptionObject *)exc;
-    PyObject *old = e->context;
-    if (context != NULL) py_incref(context);
-    e->context = context;
-    if (old != NULL) py_decref(old);
+    pcc_gc_store_ptr(exc, &e->context, context);
+    pcc_runtime_log_event_code(6, 6, context != NULL ? 1 : 0, 0, exc);
 }
 
 
@@ -90,16 +104,54 @@ PyObject *py_exc_get_message(PyObject *exc) {
     if (exc == NULL) return NULL;
     if (py_type_of(exc) != PY_TYPE_EXC) return NULL;
     PyExceptionObject *e = (PyExceptionObject *)exc;
-    return e->message;  /* borrowed */
+    return pcc_gc_load_ptr(exc, &e->message);  /* borrowed */
+}
+
+PyObject *py_exc_get_cause(PyObject *exc) {
+    if (exc == NULL) return NULL;
+    if (py_type_of(exc) != PY_TYPE_EXC) return NULL;
+    PyExceptionObject *e = (PyExceptionObject *)exc;
+    PyObject *cause = pcc_gc_load_ptr(exc, &e->cause);
+    if (cause == NULL) cause = py_None;
+    py_incref(cause);
+    return cause;
+}
+
+PyObject *py_exc_get_context(PyObject *exc) {
+    if (exc == NULL) return NULL;
+    if (py_type_of(exc) != PY_TYPE_EXC) return NULL;
+    PyExceptionObject *e = (PyExceptionObject *)exc;
+    PyObject *context = pcc_gc_load_ptr(exc, &e->context);
+    if (context == NULL) context = py_None;
+    py_incref(context);
+    return context;
+}
+
+int64_t py_exc_traceback_len(PyObject *exc) {
+    if (exc == NULL) return 0;
+    if (py_type_of(exc) != PY_TYPE_EXC) return 0;
+    PyExceptionObject *e = (PyExceptionObject *)exc;
+    if (e->n_frames < 0) return 0;
+    return (int64_t)e->n_frames;
 }
 
 
 void py_dealloc_exc(PyObject *o) {
     PyExceptionObject *e = (PyExceptionObject *)o;
-    if (e->exc_class) py_decref((PyObject *)e->exc_class);
-    if (e->message)   py_decref(e->message);
-    if (e->cause)     py_decref(e->cause);
-    if (e->context)   py_decref(e->context);
+    PyObject *exc_class = pcc_gc_load_ptr(o, (PyObject **)&e->exc_class);
+    PyObject *message = pcc_gc_load_ptr(o, &e->message);
+    PyObject *cause = pcc_gc_load_ptr(o, &e->cause);
+    PyObject *context = pcc_gc_load_ptr(o, &e->context);
+    pcc_runtime_log_event_code(
+        6, 7,
+        exc_class != NULL ? ((PyClassObject *)exc_class)->type_tag_alloc : -1,
+        e->n_frames,
+        o
+    );
+    if (exc_class) py_decref(exc_class);
+    if (message)   py_decref(message);
+    if (cause)     py_decref(cause);
+    if (context)   py_decref(context);
     if (e->traceback) free(e->traceback);
-    free(e);
+    pcc_gc_free_object_memory(o);
 }

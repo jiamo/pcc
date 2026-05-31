@@ -182,6 +182,7 @@ def _constant_trip_count(fn, loop, cfg: CFG) -> tuple[int, bool] | None:
     symbolic_limit = False
     const_values: dict[str, int] = {}
     inc_of: dict[str, str] = {}
+    cmp_candidates: list[tuple[str, str, int, bool]] = []
 
     external_preds = [
         pred_name
@@ -234,10 +235,21 @@ def _constant_trip_count(fn, loop, cfg: CFG) -> tuple[int, bool] | None:
             if m:
                 limit_const = _resolve_small_const(m.group("limit"), const_values)
                 if limit_const is not None:
-                    limit = limit_const
-                    pred = m.group("pred")
-                    cmp_iv = m.group("iv")
-                    symbolic_limit = m.group("limit").strip().startswith("%")
+                    cmp_candidates.append((
+                        m.group("pred"),
+                        m.group("iv"),
+                        limit_const,
+                        m.group("limit").strip().startswith("%"),
+                    ))
+
+    if start_iv is not None:
+        for cand_pred, cand_iv, cand_limit, cand_symbolic in cmp_candidates:
+            if cand_iv == start_iv or inc_of.get(cand_iv) == start_iv:
+                pred = cand_pred
+                cmp_iv = cand_iv
+                limit = cand_limit
+                symbolic_limit = cand_symbolic
+                break
 
     if start_val is None or step != 1 or limit is None or pred is None:
         return None

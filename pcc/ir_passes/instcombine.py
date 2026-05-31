@@ -39,6 +39,7 @@ import llvmlite.binding as llvm
 from .dce import dce_module_text
 from .instsimplify import simplify_module_text
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
+from .simplifycfg import _function_chunk_module, _module_context_for_function
 
 
 _BINOP_RE = re.compile(
@@ -352,7 +353,10 @@ class InstCombinePass(ModulePass):
         return PreservedAnalyses.none()
 
 
-def _rewrite_function(fn_text: str) -> tuple[str, bool]:
+def _rewrite_function(
+    fn_text: str,
+    module_context: str = "",
+) -> tuple[str, bool]:
     lines = fn_text.splitlines(keepends=True)
     replacements: dict[str, str] = {}
     changed = False
@@ -2086,7 +2090,12 @@ def _rewrite_function(fn_text: str) -> tuple[str, bool]:
         return fn_text, False
 
     rewritten = "".join(lines)
-    rewritten, _ = dce_module_text(rewritten)
+    cleaned, _ = dce_module_text(
+        _function_chunk_module(module_context, rewritten)
+    )
+    for is_function, chunk in _split_functions(cleaned):
+        if is_function:
+            return chunk, True
     return rewritten, True
 
 
@@ -2099,9 +2108,10 @@ def instcombine_text(ir_text: str) -> tuple[str, bool]:
             out.append(chunk)
             continue
         current = chunk
+        context = _module_context_for_function(ir_text, chunk)
         fn_changed = False
         for _ in range(8):
-            current, local_changed = _rewrite_function(current)
+            current, local_changed = _rewrite_function(current, context)
             if not local_changed:
                 break
             fn_changed = True

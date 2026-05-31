@@ -304,11 +304,60 @@ def _check_self_partial_bucket(bucket_size: int, timeout: int) -> int:
     return 0
 
 
+def _check_self_strict_exact_bucket(bucket_size: int, timeout: int) -> int:
+    failures: list[str] = []
+    checked = 0
+    for filename in exact_match_cases(limit=bucket_size):
+        checked += 1
+        case_path = c_testsuite_case_path(filename)
+        native_result = _compile_and_run_native(case_path, timeout)
+        self_result = _compile_and_run_pcc_self_x86_64(case_path, timeout)
+        if native_result.returncode != self_result.returncode:
+            failures.append(
+                f"{filename}: returncode native={native_result.returncode} self={self_result.returncode}\n"
+                f"native stdout:\n{native_result.stdout}\n"
+                f"native stderr:\n{native_result.stderr}\n"
+                f"self stdout:\n{self_result.stdout}\n"
+                f"self stderr:\n{self_result.stderr}"
+            )
+            continue
+        if native_result.stdout != self_result.stdout:
+            failures.append(
+                f"{filename}: stdout mismatch\n"
+                f"native={native_result.stdout!r}\nself={self_result.stdout!r}"
+            )
+            continue
+        if native_result.stderr != self_result.stderr:
+            failures.append(
+                f"{filename}: stderr mismatch\n"
+                f"native={native_result.stderr!r}\nself={self_result.stderr!r}"
+            )
+            continue
+        expected = read_expected_output(case_path)
+        if expected and self_result.stdout != expected:
+            failures.append(
+                f"{filename}: output mismatch vs .expected\n"
+                f"expected={expected!r}\nself={self_result.stdout!r}"
+            )
+    if failures:
+        for failure in failures:
+            print(failure)
+            print("-" * 60)
+        return 1
+    print(f"linux x86_64 self strict-exact bucket passed: {checked} cases")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=("llvm-native-exact", "self-unsupported", "self-partial"),
+        choices=(
+            "llvm-native-exact",
+            "self-unsupported",
+            "self-partial",
+            "self-strict-exact",
+        ),
         default="llvm-native-exact",
     )
     parser.add_argument("--bucket-size", type=int, default=8)
@@ -318,6 +367,8 @@ def main() -> int:
         return _check_llvm_bucket(args.bucket_size, args.timeout)
     if args.mode == "self-partial":
         return _check_self_partial_bucket(args.bucket_size, args.timeout)
+    if args.mode == "self-strict-exact":
+        return _check_self_strict_exact_bucket(args.bucket_size, args.timeout)
     return _check_self_unsupported_bucket(args.bucket_size, args.timeout)
 
 

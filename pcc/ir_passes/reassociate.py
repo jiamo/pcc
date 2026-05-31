@@ -34,6 +34,11 @@ import llvmlite.binding as llvm
 
 from .dce import dce_module_text
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
+from .simplifycfg import (
+    _function_chunk_module,
+    _module_context_for_function,
+    _split_functions,
+)
 
 
 _ASSOC_RE = re.compile(
@@ -139,7 +144,10 @@ class ReassociatePass(ModulePass):
         return PreservedAnalyses.none()
 
 
-def _one_function_pass(fn_text: str) -> tuple[str, bool]:
+def _one_function_pass(
+    fn_text: str,
+    module_context: str = "",
+) -> tuple[str, bool]:
     lines = fn_text.splitlines(keepends=True)
     assoc: dict[str, dict[str, str]] = {}
     for idx, line in enumerate(lines):
@@ -253,7 +261,12 @@ def _one_function_pass(fn_text: str) -> tuple[str, bool]:
     if not changed:
         return fn_text, False
     rewritten = "".join(lines)
-    rewritten, _ = dce_module_text(rewritten)
+    cleaned, _ = dce_module_text(
+        _function_chunk_module(module_context, rewritten)
+    )
+    for is_function, chunk in _split_functions(cleaned):
+        if is_function:
+            return chunk, True
     return rewritten, True
 
 
@@ -261,38 +274,15 @@ def reassociate_text(ir_text: str) -> tuple[str, bool]:
     """Reassociate supported function-local constant chains."""
     out: list[str] = []
     changed = False
-    in_function = False
-    fn_lines: list[str] = []
-
-    for line in ir_text.splitlines(keepends=True):
-        stripped = line.lstrip()
-        if not in_function and stripped.startswith("define "):
-            in_function = True
-            fn_lines = [line]
+    for is_function, chunk in _split_functions(ir_text):
+        if not is_function:
+            out.append(chunk)
             continue
-        if in_function:
-            fn_lines.append(line)
-            if stripped.startswith("}"):
-                fn_text = "".join(fn_lines)
-                current = fn_text
-                fn_changed = False
-                for _ in range(8):
-                    current, local_changed = _one_function_pass(current)
-                    if not local_changed:
-                        break
-                    fn_changed = True
-                out.append(current)
-                changed = changed or fn_changed
-                in_function = False
-                fn_lines = []
-            continue
-        out.append(line)
-
-    if in_function and fn_lines:
-        current = "".join(fn_lines)
+        current = chunk
+        context = _module_context_for_function(ir_text, chunk)
         fn_changed = False
         for _ in range(8):
-            current, local_changed = _one_function_pass(current)
+            current, local_changed = _one_function_pass(current, context)
             if not local_changed:
                 break
             fn_changed = True

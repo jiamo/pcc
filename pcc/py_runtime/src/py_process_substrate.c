@@ -97,7 +97,12 @@ PyObject *py_subprocess_check_output(PyObject *argv) {
             break;
         }
     }
-    (void)pclose(fp);
+    int status = pclose(fp);
+    if (status != 0) {
+        py_raise(py_exc_new(PY_EXC_OSERROR, "subprocess failed"));
+        free(out);
+        return NULL;
+    }
     PyObject *result = py_str_new(out != NULL ? out : "", len);
     free(out);
     return result;
@@ -123,6 +128,61 @@ PyObject *py_sys_executable_str(void) {
     const char *arg0 = py_program_argv(0);
     if (arg0 == NULL) return py_str_new("", 0);
     return py_str_new(arg0, (int64_t)strlen(arg0));
+}
+
+static PyObject *py_python_sys_attr_str(const char *attr) {
+    const char *code =
+        "import sys; print(getattr(sys, sys.argv[1], ''))";
+    char *cmd = NULL;
+    int64_t len = 0;
+    int64_t cap = 0;
+    int ok = 0;
+    if (append_bytes(&cmd, &len, &cap, "python3 -c ", 11) == 0
+        && append_shell_quoted(&cmd, &len, &cap, code) == 0
+        && append_bytes(&cmd, &len, &cap, " ", 1) == 0
+        && append_shell_quoted(&cmd, &len, &cap, attr) == 0) {
+        ok = 1;
+    }
+    if (!ok) {
+        free(cmd);
+        return py_str_new("", 0);
+    }
+
+    FILE *fp = popen(cmd, "r");
+    free(cmd);
+    if (fp == NULL) return py_str_new("", 0);
+
+    char *out = NULL;
+    int64_t out_len = 0;
+    int64_t out_cap = 0;
+    char tmp[1024];
+    for (;;) {
+        size_t n = fread(tmp, 1, sizeof(tmp), fp);
+        if (n > 0) {
+            if (append_bytes(&out, &out_len, &out_cap, tmp, (int64_t)n) != 0) {
+                pclose(fp);
+                free(out);
+                return py_str_new("", 0);
+            }
+        }
+        if (n < sizeof(tmp)) break;
+    }
+    int rc = pclose(fp);
+    while (out_len > 0
+           && (out[out_len - 1] == '\n' || out[out_len - 1] == '\r')) {
+        out_len--;
+    }
+    if (rc != 0 || out == NULL) {
+        free(out);
+        return py_str_new("", 0);
+    }
+    PyObject *result = py_str_new(out, out_len);
+    free(out);
+    return result;
+}
+
+PyObject *py_sys_prefix_str(int64_t kind) {
+    return py_python_sys_attr_str(kind == 1 ? "base_prefix" : "prefix");
 }
 
 PyObject *py_sysconfig_get_config_var(PyObject *name) {
@@ -245,6 +305,10 @@ PyObject *py_os_listdir(PyObject *path) {
     free(entry);
     (void)pclose(fp);
     return out;
+}
+
+PyObject *py_os_getpid(void) {
+    return py_int_from_i64((int64_t)getpid());
 }
 
 static int has_path_separator(const char *s) {

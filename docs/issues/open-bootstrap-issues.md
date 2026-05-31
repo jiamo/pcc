@@ -1,42 +1,34 @@
 # Open bootstrap / self-host issues
 
-**Status:** these are real unresolved problems, not "design choices".
-The README's three-stage byte-identical claim is true on its narrow
-terms (`cmp pcc2 pcc3` after Mach-O signature normalization on
-macOS arm64), but the gates below are open and the bootstrap binary
-is not yet a pure-native self-host artifact.
+**Status:** historical tracker. Issue 1 was closed on 2026-05-01 for
+the macOS arm64 strict bootstrap path: `pcc1 -> pcc2 -> pcc3` succeeds
+with `--python-libpython=off`, the linked binaries do not depend on
+`libpython`, and `pcc2`/`pcc3` are byte-identical after Mach-O
+signature normalization.
 
-This file is the authoritative tracker of what's still wrong. If a
-README or plan paragraph contradicts this file, this file is right.
+The remaining sections are useful background for how the closure was
+debugged, but they are no longer the authoritative current-state
+source when they contradict `README.md` or
+`tests/bootstrap_gate_baseline.json`.
 
 ---
 
 ## Issue 1: Bootstrap binary still links `libpython`
 
-**State:** open.
+**State:** closed on 2026-05-01 for macOS arm64 strict bootstrap
+(`--backend self --python-libpython=off --ir-scaffold=on`) and for the
+LLVM backend under the same no-libpython policy.
 
-**Evidence:**
+**Current evidence:**
 
 ```
-== gate stage 3, both backends, 2026-04-27 ==
-result backend=llvm stage=3 ... libpython=True
-result backend=self stage=3 ... libpython=True
+backend=llvm: pcc1/pcc2/pcc3 link only libSystem; pcc2 == pcc3 after signature normalization
+backend=self: pcc1/pcc2/pcc3 link only libSystem; pcc2 == pcc3 after signature normalization
 ```
 
-(`scripts/run_self_backend_bootstrap_gate.py` reports
-`links_libpython=True` for every produced binary.)
-
-**Why:** the frontend (parser + type inference + codegen) runs as
-CPython-interpreted Python at bootstrap time. Codegen emits
-`py_cpy_*` calls for any dynamic-Python idiom in the frontend
-sources, which forces the link step to pull `libpython`.
-
-**What this invalidates:** the "self-host" framing is honest only as
-"`pcc` builds itself" — not as "the resulting binary has no
-external runtime dependency on CPython". A pure-native
-`pcc1`/`pcc2`/`pcc3` is *not* what the current bootstrap produces.
-
-**Concrete unresolved sub-issues:** Issue 2, Issue 4, Issue 8.
+The old evidence below this point is retained as debug history. It
+describes the pre-closure failure mode where `bootstrap.sh` defaulted
+to `--python-libpython=auto` and silently pulled CPython fallback.
 
 ---
 
@@ -262,3 +254,51 @@ CPython. Resolving Issue 11 (native builtin dispatch + recursive
 stdlib compile) likely unblocks the long tail of Issue 1 reductions
 more cleanly than continuing to hand-roll-everything in the current
 restricted subset.
+
+---
+
+## Verification re-run, 2026-04-30
+
+Re-ran the gate + probes to confirm Issue 1 and refresh Issue 2's number.
+
+```
+== bootstrap backend=llvm stage=1 ==
+result backend=llvm stage=1 exit=0 elapsed=0.9s libpython=True
+== bootstrap backend=self stage=1 ==
+result backend=self stage=1 exit=0 elapsed=0.5s libpython=True
+smoke_compile_elapsed_ratio self/llvm=2.410   ← exceeds 2.000 threshold
+```
+
+`scripts/probe_fallback_categories.py` (today): **27,853** total
+fallbacks across the tight closure (matches doc's snapshot — Issue 2's
+number is current).
+
+`scripts/probe_stage1_closure_on_mode.py` (today, ON mode):
+`layer1.py` 20,341 → 3,427 (-83%); total 24,112 → 6,149 (-74.5%) on the
+ON-eligible subset. Issue 4's "scaffold dispatch done in spirit" is
+visible here.
+
+**New root-cause finding for Issue 1**: `pcc1 --python-libpython=off
+--backend=self` cannot build `pcc/__main__.py` (would-be `pcc2`).
+Failure point:
+
+- `pcc/backend/self_backend_parse.py:1832` — `BackendUnavailable: self
+  backend does not support instruction in
+  '_pcc_py_module_init_class_method'/'entry':
+  %m.__init__.7.9 = bitcast`
+- The line shown is a malformed `bitcast` (no operands) followed by a
+  `; ModuleID = "..."` comment from a downstream module — i.e. codegen
+  emits invalid IR for class `__init__` dispatch in libpython=off
+  mode, and the parser fails on the truncated line.
+
+This is why `bootstrap.sh` succeeds (it defaults to
+`PCC_BOOTSTRAP_PYTHON_LIBPYTHON=auto` which falls back to `on`) but
+the no-libpython oracle test
+(`test_pcc2_pcc3_fixpoint_and_no_libpython`) fails. Closing Issue 1
+needs this codegen bug fixed first; the link-edge work (Issue 10) is
+downstream.
+
+`tests/test_self_host_oracle_diff.py` snapshot: 38 passed, 2 failed
+(`class_method`, `class_inheritance`), 8 errors (every
+`test_pcc2_pcc3_*` case errors with the same `bitcast` failure when
+producing pcc2 in libpython=off mode).

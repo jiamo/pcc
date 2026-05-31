@@ -1,0 +1,592 @@
+"""Module-global and top-level prescan helpers for L1CodeGen."""
+from __future__ import annotations
+
+from pcc.llvm_capi.compat import ir
+
+from ..py_ast import (
+    Assign,
+    Attr,
+    AugAssign,
+    Expr,
+    For,
+    FuncDef,
+    If,
+    Import,
+    ImportFrom,
+    IntType,
+    Name,
+    Stmt,
+    Try,
+    Type,
+    While,
+    With,
+)
+from .import_lowering import (
+    _dataclass_field_names,
+    _dataclass_field_value,
+)
+from .layer1_support import _import_from_module_or_empty
+
+
+_I8 = ir.IntType(8)
+_CSTR = _I8.as_pointer()
+
+
+def _import_names_from_stmt(stmt):
+    pairs = []
+    raw_names = getattr(stmt, "names", ())
+    if not isinstance(raw_names, (tuple, list)):
+        return tuple(pairs)
+    for raw_name in raw_names:
+        if isinstance(raw_name, (tuple, list)) and len(raw_name) >= 2:
+            pairs.append((raw_name[0], raw_name[1]))
+        elif isinstance(raw_name, (tuple, list)) and len(raw_name) >= 1:
+            pairs.append((raw_name[0], None))
+        elif hasattr(raw_name, "asname") or hasattr(raw_name, "name"):
+            pairs.append((
+                getattr(raw_name, "name", None),
+                getattr(raw_name, "asname", None),
+            ))
+        elif isinstance(raw_name, str):
+            pairs.append((raw_name, None))
+    return tuple(pairs)
+
+
+def _is_import_stmt(stmt):
+    if type(stmt).__name__ in {"Global", "Nonlocal"}:
+        return False
+    if type(stmt).__name__ in {"Import", "ImportFrom"}:
+        return True
+    if isinstance(stmt, (Import, ImportFrom)):
+        return True
+    raw_names = getattr(stmt, "names", ())
+    if not raw_names:
+        return False
+    if not isinstance(raw_names, (tuple, list)):
+        return False
+    return all(
+        isinstance(item, (tuple, list, str)) or hasattr(item, "name")
+        for item in raw_names
+    )
+
+
+def _is_import_from_stmt(stmt):
+    if type(stmt).__name__ == "ImportFrom":
+        return True
+    if isinstance(stmt, ImportFrom):
+        return True
+    if not _is_import_stmt(stmt):
+        return False
+    names = getattr(stmt, "names", ())
+    return (
+        hasattr(stmt, "module")
+        and hasattr(stmt, "names")
+        and isinstance(names, (tuple, list))
+        and bool(names)
+    )
+
+
+def _zero_initializer_for(ir_ty):
+    if isinstance(ir_ty, ir.IntType):
+        return 0
+    if isinstance(ir_ty, (ir.FloatType, ir.DoubleType)):
+        return 0.0
+    if isinstance(ir_ty, ir.PointerType):
+        return None
+    return 0
+
+
+def _maybe_declare_native_module_attr_store(host, target: Expr) -> None:
+    if not isinstance(target, Attr):
+        return
+    if not isinstance(target.obj, Name):
+        return
+    module_name = host._native_builtin_module_for_name(target.obj.ident)
+    if module_name is None:
+        module_name = getattr(
+            host,
+            "_native_module_aliases",
+            {},
+        ).get(target.obj.ident)
+    if module_name is None:
+        return
+    host._native_module_attr_global(module_name, target.name)
+
+
+class ModuleGlobalLoweringMixin:
+    def _module_global_symbol_name(
+        self,
+        module_name: str,
+        name: str,
+    ) -> str:
+        mod_suffix = self._module_symbol_suffix(module_name)
+        name_suffix = name.replace(".", "_").replace("-", "_")
+        return f".modvar.{mod_suffix}.{name_suffix}"
+
+    def _prescan_nested_imports(self, stmt) -> None:
+        """Walk ``stmt``'s transitive body for Import / ImportFrom
+        statements and seed ``_cpy_module_env`` so downstream user
+        function bodies can resolve the names. The runtime import
+        still runs inside the original stmt's body at main_body
+        execution time; the scan only registers compile-time globals.
+        """
+        from ..py_ast import (
+            Import as _Import,
+            ImportFrom as _ImportFrom,
+        )
+
+        pending = [(stmt, None)]
+        while pending:
+            s, fields = pending.pop()
+            if _is_import_stmt(s):
+                if _is_import_from_stmt(s):
+                    import_module = _import_from_module_or_empty(s)
+                    # ``continue`` (not ``return``) — the pending queue
+                    # may still hold other nested ImportFrom stmts from
+                    # sibling control-flow branches. Pre-2026-05-28 these
+                    # branches used ``return`` and silently abandoned the
+                    # rest of the queue when one nested ImportFrom hit a
+                    # scaffold/test-facade/unsafe/native-builtin shape.
+                    if self._is_extern_scaffold_import_module(import_module):
+                        self._register_extern_scaffold_imports(s)
+                        continue
+                    if self._is_test_facade_import_module(import_module):
+                        continue
+                    if import_module == "pcc.unsafe":
+                        self._register_unsafe_scaffold_imports(s)
+                        continue
+                    if self._register_native_builtin_import_from_aliases(
+                        s,
+                        self._resolve_relative_import(s),
+                    ):
+                        continue
+                    # Multi-file native cross-module pre-declare —
+                    # mirror generation_lowering.py:315-367's top-level
+                    # branch. Without this, an ``ImportFrom`` nested in
+                    # a top-level ``if/try/with`` block (e.g.
+                    # ``numpy/__init__.py``'s ``from ._core import (
+                    # ones, ...)`` inside ``if not __NUMPY_SETUP__:``)
+                    # only seeds ``_cpy_module_env`` and never binds
+                    # ``self.functions[name]`` for native sibling
+                    # exports — so a nested ``def`` that calls one of
+                    # those names emits a static NameError, capping
+                    # real-package self-host on the import path. See
+                    # docs/investigations/
+                    # python-native-module-alias-module-global-attr-attribute-error.md
+                    # for the matching attribute-access blocker; the
+                    # name-resolution blocker is its sibling.
+                    native_table = self._native_module_exports
+                    resolved = (
+                        self._resolve_relative_import(s)
+                        if native_table is not None
+                        else None
+                    )
+                    handled_as_native_submodule = False
+                    if native_table is not None:
+                        remaining_names = []
+                        for attr_name, as_name in _import_names_from_stmt(s):
+                            full_submodule = self._native_import_from_submodule(
+                                resolved,
+                                attr_name,
+                            )
+                            if full_submodule is None:
+                                full_submodule = (
+                                    self._resolve_relative_import_submodule(
+                                        s,
+                                        resolved,
+                                        attr_name,
+                                    )
+                                )
+                            if (
+                                full_submodule is not None
+                                and full_submodule in native_table
+                            ):
+                                self._register_native_module_alias(
+                                    as_name or attr_name,
+                                    full_submodule,
+                                )
+                                continue
+                            remaining_names.append((attr_name, as_name))
+                        handled_as_native_submodule = not remaining_names
+                    if handled_as_native_submodule:
+                        continue
+                    if (
+                        native_table is not None
+                        and self._has_native_import_from_targets(
+                            s,
+                            resolved,
+                        )
+                    ):
+                        self._predeclare_native_cross_module(
+                            s,
+                            resolved,
+                            native_table.get(resolved, {}),
+                        )
+                        continue
+                    for attr_name, as_name in _import_names_from_stmt(s):
+                        if attr_name == "*":
+                            self._cpy_star_module_global(import_module)
+                            continue
+                        local_name = as_name or attr_name
+                        self._cpy_module_global(local_name)
+                        self._cpy_modules()[local_name] = self._cpy_module_global(
+                            local_name
+                        )
+                    continue
+                for mod_name, as_name in _import_names_from_stmt(s):
+                    if self._is_test_facade_import_module(mod_name):
+                        continue
+                    if (
+                        mod_name.split(".")[0] in ("__future__", "typing", "abc", "click")
+                        or mod_name == "pcc.extern"
+                    ):
+                        continue
+                    if mod_name in (
+                        "builtins",
+                        "sys",
+                        "os",
+                        "time",
+                        "string",
+                        "platform",
+                        "subprocess",
+                        "asyncio",
+                        "tempfile",
+                        "fileinput",
+                        "shutil",
+                        "shlex",
+                        "sysconfig",
+                        "math",
+                        "json",
+                        "re",
+                        "codecs",
+                        "gc",
+                        "weakref",
+                        "copy",
+                        "pickle",
+                        "threading",
+                        "pcc.virtual_thread",
+                        "pcc",
+                        "importlib",
+                        "inspect",
+                        "contextlib",
+                        "warnings",
+                        "textwrap",
+                    ):
+                        self._register_native_builtin_module_alias(
+                            as_name or mod_name,
+                            mod_name,
+                        )
+                        continue
+                    if as_name is None and "." in mod_name:
+                        local_name = mod_name.split(".")[0]
+                    else:
+                        local_name = as_name or mod_name
+                    if self._resolve_pcc_native_extension_path(mod_name) is not None:
+                        gv = self._native_extension_module_global(local_name)
+                        self._native_extension_modules()[local_name] = gv
+                        continue
+                    self._cpy_module_global(local_name)
+                    self._cpy_modules()[local_name] = self._cpy_module_global(
+                        local_name
+                    )
+                continue
+            if fields is None:
+                fields = _dataclass_field_names(s)
+            for slot in fields:
+                if slot in ("span",):
+                    continue
+                v = _dataclass_field_value(s, slot, None)
+                if isinstance(v, tuple):
+                    for it in v:
+                        child_fields = _dataclass_field_names(it)
+                        if child_fields:
+                            pending.append((it, child_fields))
+                elif v is not None:
+                    child_fields = _dataclass_field_names(v)
+                    if child_fields:
+                        pending.append((v, child_fields))
+
+    def _predeclare_native_builtin_module_attr_stores(
+        self,
+        stmts: tuple[Stmt, ...],
+    ) -> None:
+        """Seed storage for ``sys.x = value`` style native module attrs.
+
+        Top-level module root registration runs before top-level statements,
+        so slots that may be written there must exist before ``@main`` is
+        emitted.  Function-body stores are also cheap to predeclare and share
+        the same root/teardown path.
+        """
+
+        for stmt in stmts:
+            pending = [(stmt, None)]
+            while pending:
+                s, fields = pending.pop()
+                if isinstance(s, FuncDef):
+                    continue
+                if isinstance(s, Assign):
+                    for target in s.targets:
+                        _maybe_declare_native_module_attr_store(self, target)
+                elif isinstance(s, AugAssign):
+                    _maybe_declare_native_module_attr_store(self, s.target)
+                if fields is None:
+                    fields = _dataclass_field_names(s)
+                for slot in fields:
+                    if slot in ("span",):
+                        continue
+                    v = _dataclass_field_value(s, slot, None)
+                    if isinstance(v, tuple):
+                        for it in v:
+                            child_fields = _dataclass_field_names(it)
+                            if child_fields:
+                                pending.append((it, child_fields))
+                    elif v is not None:
+                        child_fields = _dataclass_field_names(v)
+                        if child_fields:
+                            pending.append((v, child_fields))
+
+    def _collect_explicit_global_names(
+        self,
+        stmts: tuple[Stmt, ...],
+    ) -> set[str]:
+        """Return names declared ``global`` in ``stmts``.
+
+        Nested blocks participate in the same function scope; nested
+        ``def`` / ``class`` bodies do not.
+        """
+        from ..py_ast import (
+            ClassDef as _ClassDef,
+            FuncDef as _FuncDef,
+            Global as _Global,
+        )
+
+        names: set[str] = set()
+
+        pending = [stmts]
+        while pending:
+            items = pending.pop()
+            for s in items:
+                if isinstance(s, _Global):
+                    names.update(s.names)
+                    continue
+                if isinstance(s, (_FuncDef, _ClassDef)):
+                    continue
+                if isinstance(s, If):
+                    pending.append(s.else_body)
+                    pending.append(s.body)
+                    continue
+                if isinstance(s, While):
+                    pending.append(s.else_body)
+                    pending.append(s.body)
+                    continue
+                if isinstance(s, For):
+                    pending.append(s.else_body)
+                    pending.append(s.body)
+                    continue
+                if isinstance(s, With):
+                    pending.append(s.body)
+                    continue
+                if isinstance(s, Try):
+                    pending.append(s.finally_body)
+                    pending.append(s.else_body)
+                    for h in s.handlers:
+                        pending.append(h.body)
+                    pending.append(s.body)
+        return names
+
+    def _ensure_module_global_name(
+        self,
+        name: str,
+        target_ty: Type,
+    ) -> tuple[ir.GlobalVariable, Type]:
+        """Return the storage slot for a module-global name."""
+        existing = self._module_globals.get(name)
+        if existing is not None:
+            return existing
+        if not (self._is_scalar(target_ty) or self._is_object(target_ty)):
+            raise NotImplementedError(
+                f"Layer 1/2 cannot allocate module global {name!r} "
+                f"of type {type(target_ty).__name__}"
+            )
+        if isinstance(target_ty, IntType) and self._should_box_python_ints():
+            ir_ty = _CSTR
+        else:
+            ir_ty = self._storage_ir_type(target_ty)
+        gv = ir.GlobalVariable(
+            self.module,
+            ir_ty,
+            name=self._module_global_symbol_name(
+                self.ast_module.name or self.module.name or "mod",
+                name,
+            ),
+        )
+        gv.initializer = ir.Constant(ir_ty, _zero_initializer_for(ir_ty))
+        self._module_globals[name] = (gv, target_ty)
+        return self._module_globals[name]
+
+    def _prescan_function_module_globals(self, fd: FuncDef) -> None:
+        """Seed module-global storage for names assigned under
+        ``global`` inside ``fd`` so sibling functions can resolve them.
+        """
+        global_names = self._collect_explicit_global_names(fd.body)
+        if not global_names:
+            return
+        from ..py_ast import (
+            ClassDef as _ClassDef,
+            FuncDef as _FuncDef,
+        )
+
+        pending = [fd.body]
+        while pending:
+            items = pending.pop()
+            for s in items:
+                if isinstance(s, (_FuncDef, _ClassDef)):
+                    continue
+                if isinstance(s, Assign):
+                    target_ty = s.annotation if s.annotation is not None else s.value.ty
+                    for t in s.targets:
+                        if isinstance(t, Name) and t.ident in global_names:
+                            self._ensure_module_global_name(
+                                t.ident,
+                                target_ty,
+                            )
+                    continue
+                if isinstance(s, AugAssign):
+                    if isinstance(s.target, Name) and s.target.ident in global_names:
+                        self._ensure_module_global_name(
+                            s.target.ident,
+                            s.target.ty,
+                        )
+                    continue
+                if isinstance(s, Import):
+                    for mod_name, as_name in s.names:
+                        bound = as_name or mod_name.split(".", 1)[0]
+                        if bound in global_names:
+                            if self._resolve_pcc_native_extension_path(mod_name) is not None:
+                                gv = self._native_extension_module_global(bound)
+                                self._native_extension_modules()[bound] = gv
+                                continue
+                            gv = self._cpy_module_global(bound)
+                            self._cpy_modules()[bound] = gv
+                    continue
+                if isinstance(s, ImportFrom):
+                    for imported_name, as_name in s.names:
+                        if imported_name == "*":
+                            continue
+                        bound = as_name or imported_name
+                        if bound in global_names:
+                            gv = self._cpy_module_global(bound)
+                            self._cpy_modules()[bound] = gv
+                    continue
+                if isinstance(s, If):
+                    pending.append(s.else_body)
+                    pending.append(s.body)
+                    continue
+                if isinstance(s, While):
+                    pending.append(s.else_body)
+                    pending.append(s.body)
+                    continue
+                if isinstance(s, For):
+                    pending.append(s.else_body)
+                    pending.append(s.body)
+                    continue
+                if isinstance(s, With):
+                    pending.append(s.body)
+                    continue
+                if isinstance(s, Try):
+                    pending.append(s.finally_body)
+                    pending.append(s.else_body)
+                    for h in s.handlers:
+                        pending.append(h.body)
+                    pending.append(s.body)
+
+    def _declare_module_globals_for(self, stmt: Assign) -> None:
+        """Allocate a module-level global for each simple Name target of
+        a module-scope assignment so user functions can later load
+        the same binding."""
+        target_ty = stmt.annotation if stmt.annotation is not None else stmt.value.ty
+        for t in stmt.targets:
+            if not isinstance(t, Name):
+                continue
+            if not (self._is_scalar(target_ty) or self._is_object(target_ty)):
+                continue
+            self._ensure_module_global_name(t.ident, target_ty)
+            threading_kind = self._threading_constructor_kind_for_expr(stmt.value)
+            if threading_kind is not None:
+                self._threading_env_flags[t.ident] = threading_kind
+            else:
+                self._threading_env_flags.pop(t.ident, None)
+            threading_elem_kind = (
+                self._threading_list_elem_kind_for_type(target_ty)
+                or self._threading_list_elem_kind_for_expr(stmt.value)
+            )
+            if threading_elem_kind is not None:
+                self._threading_list_elem_flags[t.ident] = threading_elem_kind
+            else:
+                self._threading_list_elem_flags.pop(t.ident, None)
+            weak_dict_kind = self._weak_dict_constructor_kind_for_expr(stmt.value)
+            if weak_dict_kind is not None:
+                self._weak_dict_env_flags[t.ident] = weak_dict_kind
+            else:
+                self._weak_dict_env_flags.pop(t.ident, None)
+
+    def _module_global_needs_teardown(
+        self,
+        gv: ir.GlobalVariable,
+        declared_ty: Type,
+    ) -> bool:
+        if self._is_object(declared_ty):
+            return True
+        value_ty = getattr(gv, "value_type", None)
+        return value_ty is not None and self._ir_type_matches(value_ty, _CSTR)
+
+    def _store_module_global_root_value(
+        self,
+        gv: ir.GlobalVariable,
+        value: ir.Value,
+        *,
+        value_is_owned: bool = False,
+        is_cpy_value: bool = False,
+    ) -> None:
+        if (
+            is_cpy_value
+            or not isinstance(value.type, ir.PointerType)
+        ):
+            self.builder.store(value, gv)
+            return
+        old_value = self.builder.load(
+            gv,
+            name=self._fresh("mod.global.old"),
+        )
+        self.builder.call(self.runtime["pcc_gc_unpin"], [old_value])
+        self.builder.call(self.runtime["pcc_gc_pin"], [value])
+        self.builder.call(
+            self.runtime["pcc_gc_store_root"],
+            [
+                self._as_gc_ptr(gv, name=self._fresh("mod.global.slot")),
+                value,
+            ],
+        )
+        if value_is_owned:
+            self._gc_release(value, self._release_context_label("module_store_tmp"))
+
+    def _emit_module_global_root_enters(self) -> None:
+        frame_map = self._gc_one_slot_frame_map()
+        for _name, item in self._module_globals.items():
+            gv, declared_ty = item
+            if not self._module_global_needs_teardown(gv, declared_ty):
+                continue
+            self._emit_current_gc_frame_enter(frame_map, gv)
+        for gv in getattr(self, "_native_module_attr_globals", {}).values():
+            self._emit_current_gc_frame_enter(frame_map, gv)
+
+    def _emit_class_global_root_enters(self) -> None:
+        frame_map = self._gc_one_slot_frame_map()
+        for info in self.class_lowering.classes.values():
+            self._emit_current_gc_frame_enter(frame_map, info.global_var)
+            for gv, _attr_ty in info.class_attrs.values():
+                self._emit_current_gc_frame_enter(frame_map, gv)
+
+    def _emit_module_root_enters(self) -> None:
+        self._emit_module_global_root_enters()
+        self._emit_class_global_root_enters()

@@ -1,0 +1,8483 @@
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import textwrap
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).absolute().parents[2]
+RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
+
+
+def _cc() -> str:
+    return os.environ.get("CC", "cc")
+
+
+def _build_runtime(tmp_path: Path) -> Path:
+    work_runtime = tmp_path / "py_runtime"
+    shutil.copytree(
+        RUNTIME_DIR,
+        work_runtime,
+        ignore=shutil.ignore_patterns(
+            "build", "build_pcc", "build_py", "build_libpython", "*.a"
+        ),
+    )
+    result = subprocess.run(
+        ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return work_runtime
+
+
+def _compile_and_run(tmp_path: Path, source: str) -> subprocess.CompletedProcess[str]:
+    work_runtime = _build_runtime(tmp_path)
+    src = tmp_path / "backend4_prod_probe.c"
+    exe = tmp_path / "backend4_prod_probe.out"
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
+    build = subprocess.run(
+        [
+            _cc(),
+            "-std=c11",
+            f"-I{work_runtime / 'include'}",
+            f"-I{work_runtime / 'src'}",
+            str(src),
+            str(work_runtime / "libpy_runtime.a"),
+            "-lm",
+            "-o",
+            str(exe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    return subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+
+
+def _build_threaded_runtime(tmp_path: Path) -> Path:
+    work_runtime = tmp_path / "py_runtime_threads"
+    shutil.copytree(
+        RUNTIME_DIR,
+        work_runtime,
+        ignore=shutil.ignore_patterns(
+            "build", "build_pcc", "build_py", "build_libpython", "*.a"
+        ),
+    )
+    result = subprocess.run(
+        ["make", "-B", "-C", str(work_runtime), "PCC_WITH_THREADS=1", "libpy_runtime.a"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return work_runtime
+
+
+def _compile_and_run_threaded(
+    tmp_path: Path,
+    source: str,
+) -> subprocess.CompletedProcess[str]:
+    work_runtime = _build_threaded_runtime(tmp_path)
+    src = tmp_path / "backend4_threaded_probe.c"
+    exe = tmp_path / "backend4_threaded_probe.out"
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
+    build = subprocess.run(
+        [
+            _cc(),
+            "-std=c11",
+            "-pthread",
+            f"-I{work_runtime / 'include'}",
+            f"-I{work_runtime / 'src'}",
+            str(src),
+            str(work_runtime / "libpy_runtime.a"),
+            "-lm",
+            "-o",
+            str(exe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    return subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+
+
+def test_backend4_relocation_stress_stable_ids_and_no_old_addresses(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *roots[64];
+            for (int i = 0; i < 64; i++) roots[i] = 0;
+            for (int i = 0; i < 64; i++) {
+                pcc_gc_scheduler_root_register(&roots[i]);
+                PyObject *s = py_str_new("backend4-stress", 15);
+                pcc_gc_store_root(&roots[i], s);
+                (void)pcc_gc_object_id(s);
+                pcc_gc_release(s);
+            }
+
+            pcc_gc_telemetry_reset();
+            int64_t moved = 0;
+            for (int round = 0; round < 16; round++) {
+                moved += pcc_gc_step(256);
+                for (int i = 0; i < 64; i++) {
+                    PyObject *resolved = pcc_gc_load_ptr(0, &roots[i]);
+                    if (resolved == 0) return 10;
+                    if (pcc_gc_object_id(resolved) <= 0) return 11;
+                }
+            }
+
+            if (moved <= 0) return 12;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_RELOCATION_FORWARDS) <= 0) return 13;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_FORWARDING_ENTRIES) != 0) return 14;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_STABLE_IDS) < 64) return 15;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 16;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_RELOCATION_FRAGMENTATION_SCORE) < 0) return 17;
+
+            for (int i = 0; i < 64; i++) {
+                pcc_gc_store_root(&roots[i], 0);
+                pcc_gc_scheduler_root_unregister(&roots[i]);
+            }
+            printf("backend4-production-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-production-ok"
+
+
+def test_backend4_relocation_preserves_container_payloads_under_stress(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        static int check_list(PyObject *obj, int n) {
+            PyObject *resolved = pcc_gc_note_relocation_read(obj);
+            if (py_list_len(resolved) != n) return 0;
+            for (int i = 0; i < n; i++) {
+                PyObject *item = py_list_get(resolved, i);
+                int ok = py_int_to_i64(item, 0) == i;
+                pcc_gc_release(item);
+                if (!ok) return 0;
+            }
+            return 1;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+            PyObject *lst = py_list_new(0);
+            for (int i = 0; i < 100; i++) {
+                py_list_append(lst, py_int_from_i64(i));
+            }
+            int64_t stable = pcc_gc_object_id(lst);
+            pcc_gc_store_root(&root, lst);
+            pcc_gc_release(lst);
+
+            for (int round = 0; round < 8; round++) {
+                (void)pcc_gc_step(512);
+                PyObject *loaded = pcc_gc_load_ptr(0, &root);
+                if (loaded == 0) return 10;
+                if (pcc_gc_object_id(loaded) != stable) return 11;
+                if (!check_list(loaded, 100)) return 12;
+            }
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-container-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-container-ok"
+
+
+def test_backend4_obj_dispatch_loads_forwarded_exception_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeClassObject *exc_class;
+            PyObject *message;
+            PyObject *cause;
+            PyObject *context;
+            void *traceback;
+            int32_t n_frames;
+            int32_t cap_frames;
+        } ProbeExceptionObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t byte_len;
+            int64_t char_len;
+            uint64_t hash;
+            char data[];
+        } ProbeStrObject;
+
+        static int same_id(PyObject *obj, int64_t expected) {
+            return obj != 0 && pcc_gc_object_id(obj) == expected;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *exc_root = 0;
+            pcc_gc_scheduler_root_register(&exc_root);
+
+            PyObject *message = py_str_new("message", 7);
+            PyObject *cause = py_str_new("cause", 5);
+            PyObject *context = py_str_new("context", 7);
+            if (message == 0 || cause == 0 || context == 0) return 3;
+
+            PyObject *exc = py_exc_new_with_value(PY_EXC_VALUEERROR, message);
+            if (exc == 0) return 4;
+            py_exc_set_cause(exc, cause);
+            py_exc_set_context(exc, context);
+            pcc_gc_store_root(&exc_root, exc);
+
+            ProbeExceptionObject *raw_exc = (ProbeExceptionObject *)exc;
+            PyObject *cls_obj = (PyObject *)raw_exc->exc_class;
+            if (cls_obj == 0) return 5;
+            int64_t class_id = pcc_gc_object_id(cls_obj);
+            int64_t message_id = pcc_gc_object_id(message);
+            int64_t cause_id = pcc_gc_object_id(cause);
+            int64_t context_id = pcc_gc_object_id(context);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(128) <= 0) return 6;
+            if (pcc_gc_relocation_set_contains(cls_obj) != 1) return 7;
+            if (pcc_gc_relocation_set_contains(message) != 1) return 8;
+            if (pcc_gc_relocation_set_contains(cause) != 1) return 9;
+            if (pcc_gc_relocation_set_contains(context) != 1) return 10;
+            if (pcc_gc_relocate_copy(cls_obj, (int64_t)sizeof(ProbeClassObject)) == 0) return 11;
+            if (pcc_gc_relocate_copy(message, (int64_t)sizeof(ProbeStrObject) + 8) == 0) return 12;
+            if (pcc_gc_relocate_copy(cause, (int64_t)sizeof(ProbeStrObject) + 6) == 0) return 13;
+            if (pcc_gc_relocate_copy(context, (int64_t)sizeof(ProbeStrObject) + 8) == 0) return 14;
+
+            PyObject *type_name = py_obj_type_name(exc_root);
+            PyObject *expected_type_name = py_str_new("ValueError", 10);
+            if (type_name == 0 || expected_type_name == 0) return 15;
+            if (py_str_eq(type_name, expected_type_name) != 1) return 16;
+
+            PyObject *got_class = py_type_builtin(exc_root);
+            PyObject *got_value = py_obj_getattr(exc_root, "value");
+            PyObject *got_cause = py_obj_getattr(exc_root, "__cause__");
+            PyObject *got_context = py_obj_getattr(exc_root, "__context__");
+            if (!same_id(got_class, class_id)) return 17;
+            if (!same_id(got_value, message_id)) return 18;
+            if (!same_id(got_cause, cause_id)) return 19;
+            if (!same_id(got_context, context_id)) return 20;
+
+            ProbeExceptionObject *loaded_exc = (ProbeExceptionObject *)pcc_gc_load_ptr(0, &exc_root);
+            if (loaded_exc == 0) return 21;
+            if ((PyObject *)loaded_exc->exc_class == cls_obj) return 22;
+            if (loaded_exc->message == message) return 23;
+            if (loaded_exc->cause == cause) return 24;
+            if (loaded_exc->context == context) return 25;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 26;
+
+            pcc_gc_release(got_context);
+            pcc_gc_release(got_cause);
+            pcc_gc_release(got_value);
+            pcc_gc_release(got_class);
+            pcc_gc_release(expected_type_name);
+            pcc_gc_release(type_name);
+            pcc_gc_store_root(&exc_root, 0);
+            pcc_gc_scheduler_root_unregister(&exc_root);
+            printf("backend4-obj-dispatch-exc-slots-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-obj-dispatch-exc-slots-ok"
+
+
+def test_backend4_obj_dispatch_loads_forwarded_instance_class_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeClassObject *cls;
+            PyObject *fields[1];
+        } ProbeInstanceObject;
+
+        extern ProbeClassObject *py_class_new(
+            const char *name,
+            ProbeClassObject **bases,
+            int32_t n_bases,
+            const char **field_names,
+            int32_t n_fields
+        );
+        extern PyObject *py_instance_new(ProbeClassObject *cls);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *inst_root = 0;
+            pcc_gc_scheduler_root_register(&inst_root);
+
+            const char *fields[1] = {"value"};
+            ProbeClassObject *cls = py_class_new("MovedClass", 0, 0, fields, 1);
+            if (cls == 0) return 3;
+            cls->instance_size = (int32_t)sizeof(ProbeInstanceObject);
+            PyObject *inst = py_instance_new(cls);
+            if (inst == 0) return 4;
+            int64_t class_id = pcc_gc_object_id((PyObject *)cls);
+            pcc_gc_store_root(&inst_root, inst);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(128) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains((PyObject *)cls) != 1) return 6;
+            if (pcc_gc_relocate_copy((PyObject *)cls, (int64_t)sizeof(ProbeClassObject)) == 0) return 7;
+
+            PyObject *type_name = py_obj_type_name(inst_root);
+            PyObject *expected_type_name = py_str_new("MovedClass", 10);
+            if (type_name == 0 || expected_type_name == 0) return 8;
+            if (py_str_eq(type_name, expected_type_name) != 1) return 9;
+
+            PyObject *got_class = py_type_builtin(inst_root);
+            if (got_class == 0) return 10;
+            if (pcc_gc_object_id(got_class) != class_id) return 11;
+
+            ProbeInstanceObject *loaded_inst = (ProbeInstanceObject *)pcc_gc_load_ptr(0, &inst_root);
+            if (loaded_inst == 0) return 12;
+            if ((PyObject *)loaded_inst->cls == (PyObject *)cls) return 13;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 14;
+
+            pcc_gc_release(got_class);
+            pcc_gc_release(expected_type_name);
+            pcc_gc_release(type_name);
+            pcc_gc_store_root(&inst_root, 0);
+            pcc_gc_scheduler_root_unregister(&inst_root);
+            printf("backend4-obj-dispatch-instance-class-slot-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-obj-dispatch-instance-class-slot-ok"
+
+
+def test_backend4_list_get_loads_forwarded_item_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *lst = py_list_new(4);
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (lst == 0 || value == 0) return 3;
+            py_list_append(lst, value);
+            int64_t value_id = pcc_gc_object_id(value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(value) != 1) return 5;
+            PyObject *moved_value_raw = pcc_gc_relocate_copy(value, 64);
+            if (moved_value_raw == 0) return 6;
+            pcc_gc_release(moved_value_raw);
+
+            PyObject *got = py_list_get(lst, 0);
+            if (got == 0) return 7;
+            if (got == value) return 8;
+            if (pcc_gc_object_id(got) != value_id) return 9;
+            if (((ProbeListObject *)lst)->items[0] == value) return 10;
+
+            pcc_gc_release(got);
+            pcc_gc_release(value);
+            pcc_gc_release(lst);
+            printf("backend4-list-get-forwarded-item-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-list-get-forwarded-item-ok"
+
+
+def test_backend4_list_concat_loads_forwarded_item_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *left = py_list_new(4);
+            PyObject *right = py_list_new(4);
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (left == 0 || right == 0 || value == 0) return 3;
+            py_list_append(left, value);
+            int64_t value_id = pcc_gc_object_id(value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(value) != 1) return 5;
+            PyObject *moved_value_raw = pcc_gc_relocate_copy(value, 64);
+            if (moved_value_raw == 0) return 6;
+            pcc_gc_release(moved_value_raw);
+
+            PyObject *out = py_list_concat(left, right);
+            if (out == 0) return 7;
+            ProbeListObject *left_l = (ProbeListObject *)left;
+            ProbeListObject *out_l = (ProbeListObject *)out;
+            if (left_l->items[0] == value) return 8;
+            if (out_l->items[0] == value) return 9;
+            if (pcc_gc_object_id(left_l->items[0]) != value_id) return 10;
+            if (pcc_gc_object_id(out_l->items[0]) != value_id) return 11;
+
+            pcc_gc_release(out);
+            pcc_gc_release(value);
+            pcc_gc_release(right);
+            pcc_gc_release(left);
+            printf("backend4-list-concat-forwarded-item-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-list-concat-forwarded-item-ok"
+
+
+def test_backend4_list_mutations_load_forwarded_item_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static PyObject *relocate_rooted_box(PyObject **root_slot, PyObject *old_value) {
+            if (pcc_gc_select_relocation_set(128) <= 0) return 0;
+            if (pcc_gc_relocation_set_contains(*root_slot) != 1) return 0;
+            PyObject *moved_raw = pcc_gc_relocate_copy(*root_slot, 64);
+            if (moved_raw == 0) return 0;
+            pcc_gc_release(moved_raw);
+            PyObject *loaded = pcc_gc_load_ptr(0, root_slot);
+            if (loaded == 0 || loaded == old_value) return 0;
+            return loaded;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *value_root = 0;
+            pcc_gc_scheduler_root_register(&value_root);
+
+            PyObject *pop_list = py_list_new(0);
+            PyObject *remove_list = py_list_new(0);
+            PyObject *clear_list = py_list_new(0);
+            PyObject *reverse_list = py_list_new(0);
+            PyObject *old_value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            PyObject *other = py_int_from_i64(7);
+            if (pop_list == 0 || remove_list == 0 || clear_list == 0 || reverse_list == 0 || old_value == 0 || other == 0) {
+                return 3;
+            }
+
+            pcc_gc_store_root(&value_root, old_value);
+            py_list_append(pop_list, old_value);
+            py_list_append(remove_list, old_value);
+            py_list_append(clear_list, old_value);
+            py_list_append(reverse_list, old_value);
+            py_list_append(reverse_list, other);
+            pcc_gc_release(old_value);
+
+            PyObject *value = relocate_rooted_box(&value_root, old_value);
+            if (value == 0) return 10;
+
+            PyObject *popped = py_list_pop(pop_list, 0);
+            if (popped == 0) return 4;
+            if (popped != value) return 5;
+            py_decref(popped);
+
+            py_list_remove(remove_list, value);
+            if (((ProbeListObject *)remove_list)->length != 0) return 6;
+
+            py_list_clear(clear_list);
+            if (((ProbeListObject *)clear_list)->length != 0) return 7;
+
+            py_list_reverse(reverse_list);
+            ProbeListObject *rl = (ProbeListObject *)reverse_list;
+            if (rl->items[1] != value) return 8;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 9;
+
+            py_decref(other);
+            py_decref(reverse_list);
+            py_decref(clear_list);
+            py_decref(remove_list);
+            py_decref(pop_list);
+            pcc_gc_store_root(&value_root, 0);
+            pcc_gc_scheduler_root_unregister(&value_root);
+            printf("backend4-list-mutation-barriers-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-list-mutation-barriers-ok"
+
+
+def test_backend4_tuple_get_loads_forwarded_item_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t len;
+            PyObject *items[1];
+        } ProbeTupleObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *tuple = py_tuple_new(1);
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (tuple == 0 || value == 0) return 3;
+            py_tuple_set_item(tuple, 0, value);
+            int64_t value_id = pcc_gc_object_id(value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(value) != 1) return 5;
+            PyObject *moved_value_raw = pcc_gc_relocate_copy(value, 64);
+            if (moved_value_raw == 0) return 6;
+            pcc_gc_release(moved_value_raw);
+
+            PyObject *got = py_tuple_get(tuple, 0);
+            if (got == 0) return 7;
+            if (got == value) return 8;
+            if (pcc_gc_object_id(got) != value_id) return 9;
+            if (((ProbeTupleObject *)tuple)->items[0] == value) return 10;
+
+            pcc_gc_release(got);
+            pcc_gc_release(value);
+            pcc_gc_release(tuple);
+            printf("backend4-tuple-get-forwarded-item-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-tuple-get-forwarded-item-ok"
+
+
+def test_backend4_tuple_concat_loads_forwarded_item_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t len;
+            PyObject *items[1];
+        } ProbeTupleObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *left = py_tuple_new(1);
+            PyObject *right = py_tuple_new(0);
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (left == 0 || right == 0 || value == 0) return 3;
+            py_tuple_set_item(left, 0, value);
+            int64_t value_id = pcc_gc_object_id(value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(value) != 1) return 5;
+            PyObject *moved_value_raw = pcc_gc_relocate_copy(value, 64);
+            if (moved_value_raw == 0) return 6;
+            pcc_gc_release(moved_value_raw);
+
+            PyObject *out = py_tuple_concat(left, right);
+            if (out == 0) return 7;
+            ProbeTupleObject *left_t = (ProbeTupleObject *)left;
+            ProbeTupleObject *out_t = (ProbeTupleObject *)out;
+            if (left_t->items[0] == value) return 8;
+            if (out_t->items[0] == value) return 9;
+            if (pcc_gc_object_id(left_t->items[0]) != value_id) return 10;
+            if (pcc_gc_object_id(out_t->items[0]) != value_id) return 11;
+
+            pcc_gc_release(out);
+            pcc_gc_release(value);
+            pcc_gc_release(right);
+            pcc_gc_release(left);
+            printf("backend4-tuple-concat-forwarded-item-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-tuple-concat-forwarded-item-ok"
+
+
+def test_backend4_relocation_preserves_descriptor_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        enum {
+            PY_TYPE_PROPERTY = PY_TYPE_USER + 1,
+            PY_TYPE_CLASSMETHOD = PY_TYPE_USER + 2,
+            PY_TYPE_STATICMETHOD = PY_TYPE_USER + 3
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *fget;
+            PyObject *fset;
+            PyObject *fdel;
+        } ProbePropertyObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *func;
+        } ProbeClassMethodObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *func;
+        } ProbeStaticMethodObject;
+
+        static int64_t resolved_id(PyObject *obj) {
+            PyObject *resolved = pcc_gc_note_relocation_read(obj);
+            if (resolved == 0) return -1;
+            return pcc_gc_object_id(resolved);
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *prop_root = 0;
+            PyObject *cm_root = 0;
+            PyObject *sm_root = 0;
+            pcc_gc_scheduler_root_register(&prop_root);
+            pcc_gc_scheduler_root_register(&cm_root);
+            pcc_gc_scheduler_root_register(&sm_root);
+
+            PyObject *fget = py_str_new("fget", 4);
+            PyObject *fset = py_str_new("fset", 4);
+            PyObject *fdel = py_str_new("fdel", 4);
+            PyObject *cm_func = py_str_new("cm", 2);
+            PyObject *sm_func = py_str_new("sm", 2);
+            if (fget == 0 || fset == 0 || fdel == 0 || cm_func == 0 || sm_func == 0) return 3;
+            int64_t fget_id = pcc_gc_object_id(fget);
+            int64_t fset_id = pcc_gc_object_id(fset);
+            int64_t fdel_id = pcc_gc_object_id(fdel);
+            int64_t cm_id = pcc_gc_object_id(cm_func);
+            int64_t sm_id = pcc_gc_object_id(sm_func);
+
+            ProbePropertyObject *prop = (ProbePropertyObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbePropertyObject),
+                PY_TYPE_PROPERTY,
+                0x100
+            );
+            ProbeClassMethodObject *cm = (ProbeClassMethodObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassMethodObject),
+                PY_TYPE_CLASSMETHOD,
+                0x100
+            );
+            ProbeStaticMethodObject *sm = (ProbeStaticMethodObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeStaticMethodObject),
+                PY_TYPE_STATICMETHOD,
+                0x100
+            );
+            if (prop == 0 || cm == 0 || sm == 0) return 4;
+            prop->fget = fget;
+            prop->fset = fset;
+            prop->fdel = fdel;
+            cm->func = cm_func;
+            sm->func = sm_func;
+            pcc_gc_store_root(&prop_root, (PyObject *)prop);
+            pcc_gc_store_root(&cm_root, (PyObject *)cm);
+            pcc_gc_store_root(&sm_root, (PyObject *)sm);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains((PyObject *)prop) != 1) return 6;
+            if (pcc_gc_relocation_set_contains((PyObject *)cm) != 1) return 7;
+            if (pcc_gc_relocation_set_contains((PyObject *)sm) != 1) return 8;
+            if (pcc_gc_relocate_copy((PyObject *)prop, (int64_t)sizeof(ProbePropertyObject)) == 0) return 9;
+            if (pcc_gc_relocate_copy((PyObject *)cm, (int64_t)sizeof(ProbeClassMethodObject)) == 0) return 10;
+            if (pcc_gc_relocate_copy((PyObject *)sm, (int64_t)sizeof(ProbeStaticMethodObject)) == 0) return 11;
+
+            ProbePropertyObject *moved_prop = (ProbePropertyObject *)pcc_gc_load_ptr(0, &prop_root);
+            ProbeClassMethodObject *moved_cm = (ProbeClassMethodObject *)pcc_gc_load_ptr(0, &cm_root);
+            ProbeStaticMethodObject *moved_sm = (ProbeStaticMethodObject *)pcc_gc_load_ptr(0, &sm_root);
+            if (moved_prop == 0 || moved_cm == 0 || moved_sm == 0) return 12;
+            if ((PyObject *)moved_prop == (PyObject *)prop) return 13;
+            if ((PyObject *)moved_cm == (PyObject *)cm) return 14;
+            if ((PyObject *)moved_sm == (PyObject *)sm) return 15;
+            if (resolved_id(moved_prop->fget) != fget_id) return 16;
+            if (resolved_id(moved_prop->fset) != fset_id) return 17;
+            if (resolved_id(moved_prop->fdel) != fdel_id) return 18;
+            if (resolved_id(moved_cm->func) != cm_id) return 19;
+            if (resolved_id(moved_sm->func) != sm_id) return 20;
+
+            pcc_gc_store_root(&prop_root, 0);
+            pcc_gc_store_root(&cm_root, 0);
+            pcc_gc_store_root(&sm_root, 0);
+            pcc_gc_scheduler_root_unregister(&prop_root);
+            pcc_gc_scheduler_root_unregister(&cm_root);
+            pcc_gc_scheduler_root_unregister(&sm_root);
+            printf("backend4-descriptor-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-descriptor-relocation-ok"
+
+
+def test_backend4_relocation_preserves_memoryview_base(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *base;
+        } ProbeMemoryViewObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            PyObject *base = py_str_new("memoryview-base", 15);
+            if (base == 0) return 3;
+            int64_t base_id = pcc_gc_object_id(base);
+
+            ProbeMemoryViewObject *mv = (ProbeMemoryViewObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeMemoryViewObject),
+                PY_TYPE_MEMORYVIEW,
+                0x100
+            );
+            if (mv == 0) return 4;
+            mv->base = base;
+            pcc_gc_store_root(&root, (PyObject *)mv);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains((PyObject *)mv) != 1) return 6;
+            if (pcc_gc_relocate_copy((PyObject *)mv, (int64_t)sizeof(ProbeMemoryViewObject)) == 0) return 7;
+
+            ProbeMemoryViewObject *moved = (ProbeMemoryViewObject *)pcc_gc_load_ptr(0, &root);
+            if (moved == 0) return 8;
+            if ((PyObject *)moved == (PyObject *)mv) return 9;
+            PyObject *resolved_base = pcc_gc_note_relocation_read(moved->base);
+            if (resolved_base == 0) return 10;
+            if (pcc_gc_object_id(resolved_base) != base_id) return 11;
+
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-memoryview-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-memoryview-relocation-ok"
+
+
+def test_backend4_memoryview_bytes_data_loads_forwarded_base_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t byte_len;
+            char data[];
+        } ProbeBytesObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *base;
+        } ProbeMemoryViewObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *base_root = 0;
+            PyObject *mv_root = 0;
+            pcc_gc_scheduler_root_register(&base_root);
+            pcc_gc_scheduler_root_register(&mv_root);
+
+            PyObject *base = py_bytes_new("abcdef", 6);
+            PyObject *mv = py_memoryview_new(base);
+            if (base == 0 || mv == 0) return 3;
+            int64_t base_id = pcc_gc_object_id(base);
+            pcc_gc_store_root(&base_root, base);
+            pcc_gc_store_root(&mv_root, mv);
+            pcc_gc_release(base);
+            pcc_gc_release(mv);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(base_root) != 1) return 5;
+            PyObject *moved_base_raw = pcc_gc_relocate_copy(
+                base_root,
+                (int64_t)sizeof(ProbeBytesObject) + 7
+            );
+            if (moved_base_raw == 0) return 6;
+            pcc_gc_release(moved_base_raw);
+
+            PyObject *loaded_base = pcc_gc_load_ptr(0, &base_root);
+            if (loaded_base == 0) return 7;
+            if (loaded_base == base) return 8;
+
+            PyObject *idx = py_int_from_i64(1);
+            PyObject *item = py_bytes_getitem(mv_root, idx);
+            if (idx == 0 || item == 0) return 9;
+            if (py_int_to_i64(item, 0) != 98) return 10;
+
+            ProbeMemoryViewObject *loaded_mv = (ProbeMemoryViewObject *)pcc_gc_load_ptr(0, &mv_root);
+            if (loaded_mv == 0) return 11;
+            if (loaded_mv->base == base) return 12;
+            if (pcc_gc_object_id(loaded_mv->base) != base_id) return 13;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 14;
+
+            pcc_gc_release(item);
+            pcc_gc_release(idx);
+            pcc_gc_store_root(&mv_root, 0);
+            pcc_gc_store_root(&base_root, 0);
+            pcc_gc_scheduler_root_unregister(&mv_root);
+            pcc_gc_scheduler_root_unregister(&base_root);
+            printf("backend4-memoryview-base-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-memoryview-base-barrier-ok"
+
+
+def test_backend4_libpython_bridge_memoryview_base_uses_read_barrier():
+    src = (RUNTIME_DIR / "src" / "py_libpython.c").read_text(encoding="utf-8")
+    branch = src.split("case PY_TYPE_MEMORYVIEW:", 1)[1]
+    branch = branch.split("case PY_TYPE_LIST:", 1)[0]
+    assert "pcc_gc_load_ptr(o, &m->base)" in branch
+    assert "py_cpy_from_pcc_obj(m->base)" not in branch
+
+
+def test_backend4_container_dealloc_loads_forwarded_reference_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t len;
+            PyObject *items[1];
+        } ProbeTupleObject;
+
+        static int relocate_value(PyObject **root_slot) {
+            if (pcc_gc_select_relocation_set(128) <= 0) return 0;
+            if (pcc_gc_relocation_set_contains(*root_slot) != 1) return 0;
+            PyObject *moved_raw = pcc_gc_relocate_copy(*root_slot, 64);
+            if (moved_raw == 0) return 0;
+            pcc_gc_release(moved_raw);
+            return 1;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *value_root = 0;
+            pcc_gc_scheduler_root_register(&value_root);
+
+            PyObject *list = py_list_new(0);
+            PyObject *tuple = py_tuple_new(1);
+            PyObject *dict = py_dict_new();
+            PyObject *set = py_set_new();
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            PyObject *key = py_str_new("k", 1);
+            if (list == 0 || tuple == 0 || dict == 0 || set == 0 || value == 0 || key == 0) return 3;
+
+            py_list_append(list, value);
+            py_tuple_set_item(tuple, 0, value);
+            py_dict_set(dict, key, value);
+            py_set_add(set, value);
+            pcc_gc_store_root(&value_root, value);
+            pcc_gc_release(value);
+            pcc_gc_release(key);
+
+            pcc_gc_telemetry_reset();
+            if (!relocate_value(&value_root)) return 4;
+            PyObject *loaded_value = pcc_gc_load_ptr(0, &value_root);
+            if (loaded_value == 0) return 5;
+            if (loaded_value == value) return 6;
+
+            pcc_gc_telemetry_reset();
+            pcc_gc_release(list);
+            pcc_gc_release(tuple);
+            pcc_gc_release(dict);
+            pcc_gc_release(set);
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_READ_BARRIERS) < 5) return 7;
+
+            pcc_gc_store_root(&value_root, 0);
+            pcc_gc_scheduler_root_unregister(&value_root);
+            printf("backend4-container-dealloc-barriers-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-container-dealloc-barriers-ok"
+
+
+def test_backend4_relocation_preserves_func_entry_and_captures(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef PyObject *(*ProbeFuncEntry)(PyObject *captures, PyObject *args);
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeFuncEntry entry;
+            PyObject *captures;
+        } ProbeFuncObject;
+
+        static PyObject *probe_entry(PyObject *captures, PyObject *args) {
+            (void)args;
+            return py_tuple_get(captures, 0);
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            PyObject *capture = py_str_new("capture", 7);
+            PyObject *captures = py_tuple_new(1);
+            if (capture == 0 || captures == 0) return 3;
+            py_tuple_set_item(captures, 0, capture);
+
+            PyObject *fn = py_func_new((void *)probe_entry, captures);
+            if (fn == 0) return 4;
+            pcc_gc_store_root(&root, fn);
+            pcc_gc_release(fn);
+            pcc_gc_release(captures);
+            pcc_gc_release(capture);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 6;
+            PyObject *moved_raw = pcc_gc_relocate_copy(root, (int64_t)sizeof(ProbeFuncObject));
+            if (moved_raw == 0) return 7;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 8;
+            if (loaded == fn) return 9;
+            ProbeFuncObject *moved = (ProbeFuncObject *)loaded;
+            if (moved->entry != probe_entry) return 10;
+            if (moved->captures == 0) return 11;
+
+            PyObject *args = py_tuple_new(0);
+            PyObject *result = py_func_call(loaded, args);
+            PyObject *expected = py_str_new("capture", 7);
+            if (args == 0 || result == 0 || expected == 0) return 12;
+            if (py_str_eq(result, expected) != 1) return 13;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 14;
+
+            pcc_gc_release(expected);
+            pcc_gc_release(result);
+            pcc_gc_release(args);
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-func-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-func-relocation-ok"
+
+
+def test_backend4_func_call_loads_forwarded_captures_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef PyObject *(*ProbeFuncEntry)(PyObject *captures, PyObject *args);
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeFuncEntry entry;
+            PyObject *captures;
+        } ProbeFuncObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            PyObject *items[];
+        } ProbeTupleObject;
+
+        static PyObject *probe_entry(PyObject *captures, PyObject *args) {
+            (void)args;
+            return py_tuple_get(captures, 0);
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *fn_root = 0;
+            PyObject *captures_root = 0;
+            pcc_gc_scheduler_root_register(&fn_root);
+            pcc_gc_scheduler_root_register(&captures_root);
+
+            PyObject *capture = py_str_new("capture", 7);
+            PyObject *captures = py_tuple_new(1);
+            if (capture == 0 || captures == 0) return 3;
+            py_tuple_set_item(captures, 0, capture);
+
+            PyObject *fn = py_func_new((void *)probe_entry, captures);
+            if (fn == 0) return 4;
+            pcc_gc_store_root(&fn_root, fn);
+            pcc_gc_store_root(&captures_root, captures);
+            pcc_gc_release(fn);
+            pcc_gc_release(captures);
+            pcc_gc_release(capture);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(128) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(captures_root) != 1) return 6;
+            PyObject *moved_captures_raw = pcc_gc_relocate_copy(
+                captures_root,
+                (int64_t)sizeof(ProbeTupleObject) + (int64_t)sizeof(PyObject *)
+            );
+            if (moved_captures_raw == 0) return 7;
+            pcc_gc_release(moved_captures_raw);
+
+            PyObject *loaded_captures = pcc_gc_load_ptr(0, &captures_root);
+            if (loaded_captures == 0) return 8;
+            if (loaded_captures == captures) return 9;
+
+            PyObject *args = py_tuple_new(0);
+            PyObject *result = py_func_call(fn_root, args);
+            PyObject *expected = py_str_new("capture", 7);
+            if (args == 0 || result == 0 || expected == 0) return 10;
+            if (py_str_eq(result, expected) != 1) return 11;
+
+            ProbeFuncObject *loaded_fn = (ProbeFuncObject *)pcc_gc_load_ptr(0, &fn_root);
+            if (loaded_fn == 0) return 12;
+            if (loaded_fn->captures != loaded_captures) return 13;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 14;
+
+            pcc_gc_release(expected);
+            pcc_gc_release(result);
+            pcc_gc_release(args);
+            pcc_gc_store_root(&captures_root, 0);
+            pcc_gc_store_root(&fn_root, 0);
+            pcc_gc_scheduler_root_unregister(&captures_root);
+            pcc_gc_scheduler_root_unregister(&fn_root);
+            printf("backend4-func-captures-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-func-captures-barrier-ok"
+
+
+def test_backend4_func_relocation_loads_forwarded_captures_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef PyObject *(*ProbeFuncEntry)(PyObject *captures, PyObject *args);
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeFuncEntry entry;
+            PyObject *captures;
+        } ProbeFuncObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            PyObject *items[];
+        } ProbeTupleObject;
+
+        static PyObject *probe_entry(PyObject *captures, PyObject *args) {
+            (void)args;
+            return py_tuple_get(captures, 0);
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *fn_root = 0;
+            PyObject *captures_root = 0;
+            pcc_gc_scheduler_root_register(&fn_root);
+            pcc_gc_scheduler_root_register(&captures_root);
+
+            PyObject *capture = py_str_new("capture", 7);
+            PyObject *captures = py_tuple_new(1);
+            if (capture == 0 || captures == 0) return 3;
+            py_tuple_set_item(captures, 0, capture);
+
+            PyObject *fn = py_func_new((void *)probe_entry, captures);
+            if (fn == 0) return 4;
+            pcc_gc_store_root(&fn_root, fn);
+            pcc_gc_store_root(&captures_root, captures);
+            pcc_gc_release(fn);
+            pcc_gc_release(captures);
+            pcc_gc_release(capture);
+
+            if (pcc_gc_select_relocation_set(128) <= 0) return 5;
+            PyObject *moved_captures_raw = pcc_gc_relocate_copy(
+                captures_root,
+                (int64_t)sizeof(ProbeTupleObject) + (int64_t)sizeof(PyObject *)
+            );
+            if (moved_captures_raw == 0) return 6;
+            pcc_gc_release(moved_captures_raw);
+
+            PyObject *loaded_captures = pcc_gc_load_ptr(0, &captures_root);
+            if (loaded_captures == 0) return 7;
+            if (loaded_captures == captures) return 8;
+
+            pcc_gc_telemetry_reset();
+            PyObject *moved_fn_raw = pcc_gc_relocate_copy(
+                fn_root,
+                (int64_t)sizeof(ProbeFuncObject)
+            );
+            if (moved_fn_raw == 0) return 9;
+            pcc_gc_release(moved_fn_raw);
+
+            PyObject *loaded_fn_obj = pcc_gc_load_ptr(0, &fn_root);
+            if (loaded_fn_obj == 0) return 10;
+            if (loaded_fn_obj == fn) return 11;
+            ProbeFuncObject *loaded_fn = (ProbeFuncObject *)loaded_fn_obj;
+            if (loaded_fn->entry != probe_entry) return 12;
+            if (loaded_fn->captures != loaded_captures) return 13;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_READ_BARRIERS) < 1) return 14;
+
+            PyObject *args = py_tuple_new(0);
+            PyObject *result = py_func_call(loaded_fn_obj, args);
+            PyObject *expected = py_str_new("capture", 7);
+            if (args == 0 || result == 0 || expected == 0) return 15;
+            if (py_str_eq(result, expected) != 1) return 16;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 17;
+
+            pcc_gc_release(expected);
+            pcc_gc_release(result);
+            pcc_gc_release(args);
+            pcc_gc_store_root(&captures_root, 0);
+            pcc_gc_store_root(&fn_root, 0);
+            pcc_gc_scheduler_root_unregister(&captures_root);
+            pcc_gc_scheduler_root_unregister(&fn_root);
+            printf("backend4-func-relocation-captures-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-func-relocation-captures-barrier-ok"
+
+
+def test_backend4_relocation_preserves_iter_sequence_and_index(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *seq;
+            int64_t index;
+        } ProbeIterObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            PyObject *seq = py_list_new(0);
+            if (seq == 0) return 3;
+            py_list_append(seq, py_int_from_i64(10));
+            py_list_append(seq, py_int_from_i64(20));
+
+            ProbeIterObject *it = (ProbeIterObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeIterObject),
+                PY_TYPE_ITER,
+                0
+            );
+            if (it == 0) return 4;
+            it->seq = 0;
+            it->index = 1;
+            pcc_gc_store_ptr((PyObject *)it, &it->seq, seq);
+            pcc_gc_store_root(&root, (PyObject *)it);
+            pcc_gc_release((PyObject *)it);
+            pcc_gc_release(seq);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 6;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                root,
+                (int64_t)sizeof(ProbeIterObject)
+            );
+            if (moved_raw == 0) return 7;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 8;
+            if (loaded == (PyObject *)it) return 9;
+            ProbeIterObject *moved = (ProbeIterObject *)loaded;
+            if (moved->index != 1) return 10;
+            if (moved->seq == 0) return 11;
+
+            PyObject *resolved_seq = pcc_gc_note_relocation_read(moved->seq);
+            if (py_list_len(resolved_seq) != 2) return 12;
+            PyObject *item = py_list_get(resolved_seq, moved->index);
+            if (py_int_to_i64(item, 0) != 20) return 13;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 14;
+
+            pcc_gc_release(item);
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-iter-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-iter-relocation-ok"
+
+
+def test_backend4_iter_next_loads_forwarded_sequence_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject **items;
+            int64_t length;
+            int64_t capacity;
+        } ProbeListObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *seq;
+            int64_t index;
+        } ProbeIterObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *seq_root = 0;
+            PyObject *it_root = 0;
+            pcc_gc_scheduler_root_register(&seq_root);
+            pcc_gc_scheduler_root_register(&it_root);
+
+            PyObject *seq = py_list_new(0);
+            if (seq == 0) return 3;
+            py_list_append(seq, py_int_from_i64(10));
+            py_list_append(seq, py_int_from_i64(20));
+
+            PyObject *it = py_obj_iter(seq);
+            if (it == 0) return 4;
+            pcc_gc_store_root(&seq_root, seq);
+            pcc_gc_store_root(&it_root, it);
+            pcc_gc_release(seq);
+            pcc_gc_release(it);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(seq_root) != 1) return 6;
+            PyObject *moved_seq_raw = pcc_gc_relocate_copy(
+                seq_root,
+                (int64_t)sizeof(ProbeListObject)
+            );
+            if (moved_seq_raw == 0) return 7;
+            pcc_gc_release(moved_seq_raw);
+
+            PyObject *loaded_seq = pcc_gc_load_ptr(0, &seq_root);
+            if (loaded_seq == 0) return 8;
+            if (loaded_seq == seq) return 9;
+
+            PyObject *first = py_obj_next(it_root);
+            if (first == 0) return 10;
+            if (py_int_to_i64(first, 0) != 10) return 11;
+            py_decref(first);
+
+            ProbeIterObject *loaded_it = (ProbeIterObject *)pcc_gc_load_ptr(0, &it_root);
+            if (loaded_it == 0) return 12;
+            if (loaded_it->seq != loaded_seq) return 13;
+            if (loaded_it->index != 1) return 14;
+
+            PyObject *second = py_obj_next(it_root);
+            if (second == 0) return 15;
+            if (py_int_to_i64(second, 0) != 20) return 16;
+            py_decref(second);
+
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 17;
+
+            pcc_gc_store_root(&it_root, 0);
+            pcc_gc_store_root(&seq_root, 0);
+            pcc_gc_scheduler_root_unregister(&it_root);
+            pcc_gc_scheduler_root_unregister(&seq_root);
+            printf("backend4-iter-next-seq-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-iter-next-seq-barrier-ok"
+
+
+def test_backend4_relocation_preserves_generator_state_and_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef PyObject *(*ProbeGenResume)(PyObject *gen, PyObject *frame);
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeGenResume resume;
+            PyObject *frame;
+            int64_t state;
+            int64_t done;
+            PyObject *send_value;
+        } ProbeGenObject;
+
+        static PyObject *probe_resume(PyObject *gen, PyObject *frame) {
+            (void)gen;
+            return pcc_gc_retain(frame);
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            PyObject *frame = py_list_new(0);
+            PyObject *send_value = py_int_from_i64(42);
+            if (frame == 0 || send_value == 0) return 3;
+            py_list_append(frame, py_int_from_i64(7));
+
+            ProbeGenObject *gen = (ProbeGenObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeGenObject),
+                PY_TYPE_GEN,
+                0
+            );
+            if (gen == 0) return 4;
+            gen->resume = probe_resume;
+            gen->frame = 0;
+            gen->state = 3;
+            gen->done = 0;
+            gen->send_value = 0;
+            pcc_gc_store_ptr((PyObject *)gen, &gen->frame, frame);
+            pcc_gc_store_ptr((PyObject *)gen, &gen->send_value, send_value);
+            pcc_gc_store_root(&root, (PyObject *)gen);
+            pcc_gc_release((PyObject *)gen);
+            pcc_gc_release(frame);
+            pcc_gc_release(send_value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 6;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                root,
+                (int64_t)sizeof(ProbeGenObject)
+            );
+            if (moved_raw == 0) return 7;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 8;
+            if (loaded == (PyObject *)gen) return 9;
+            ProbeGenObject *moved = (ProbeGenObject *)loaded;
+            if (moved->resume != probe_resume) return 10;
+            if (moved->state != 3) return 11;
+            if (moved->done != 0) return 12;
+            if (moved->frame == 0 || moved->send_value == 0) return 13;
+
+            PyObject *resolved_frame = pcc_gc_note_relocation_read(moved->frame);
+            if (py_list_len(resolved_frame) != 1) return 14;
+            PyObject *item = py_list_get(resolved_frame, 0);
+            if (py_int_to_i64(item, 0) != 7) return 15;
+            if (py_int_to_i64(moved->send_value, 0) != 42) return 16;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 17;
+
+            pcc_gc_release(item);
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-gen-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-gen-relocation-ok"
+
+
+def test_backend4_relocation_preserves_coroutine_shell_state(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <string.h>
+
+        typedef PyObject *(*ProbeCoroEntry)(PyObject *captures, PyObject *args);
+
+        typedef struct {
+            PyObjectHeader h;
+            const char *name;
+            ProbeCoroEntry entry;
+            PyObject *captures;
+            PyObject *args;
+            PyObject *result;
+            int32_t closed;
+            int32_t done;
+        } ProbeCoroutineObject;
+
+        static PyObject *probe_coro_entry(PyObject *captures, PyObject *args) {
+            (void)args;
+            return py_tuple_get(captures, 0);
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            PyObject *captures = py_tuple_new(1);
+            PyObject *args = py_tuple_new(1);
+            PyObject *capture = py_str_new("coro-capture", 12);
+            PyObject *arg = py_int_from_i64(5);
+            PyObject *result = py_int_from_i64(99);
+            if (captures == 0 || args == 0 || capture == 0 || arg == 0 || result == 0) return 3;
+            py_tuple_set_item(captures, 0, capture);
+            py_tuple_set_item(args, 0, arg);
+
+            ProbeCoroutineObject *coro = (ProbeCoroutineObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeCoroutineObject),
+                PY_TYPE_COROUTINE,
+                0
+            );
+            if (coro == 0) return 4;
+            coro->name = "probe-coro";
+            coro->entry = probe_coro_entry;
+            coro->captures = 0;
+            coro->args = 0;
+            coro->result = 0;
+            coro->closed = 1;
+            coro->done = 1;
+            pcc_gc_store_ptr((PyObject *)coro, &coro->captures, captures);
+            pcc_gc_store_ptr((PyObject *)coro, &coro->args, args);
+            pcc_gc_store_ptr((PyObject *)coro, &coro->result, result);
+            pcc_gc_store_root(&root, (PyObject *)coro);
+            pcc_gc_release((PyObject *)coro);
+            pcc_gc_release(captures);
+            pcc_gc_release(args);
+            pcc_gc_release(capture);
+            pcc_gc_release(arg);
+            pcc_gc_release(result);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 6;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                root,
+                (int64_t)sizeof(ProbeCoroutineObject)
+            );
+            if (moved_raw == 0) return 7;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 8;
+            if (loaded == (PyObject *)coro) return 9;
+            ProbeCoroutineObject *moved = (ProbeCoroutineObject *)loaded;
+            if (strcmp(moved->name, "probe-coro") != 0) return 10;
+            if (moved->entry != probe_coro_entry) return 11;
+            if (moved->closed != 1 || moved->done != 1) return 12;
+            if (moved->captures == 0 || moved->args == 0 || moved->result == 0) return 13;
+
+            PyObject *cap = py_tuple_get(moved->captures, 0);
+            PyObject *expected = py_str_new("coro-capture", 12);
+            if (cap == 0 || expected == 0) return 14;
+            if (py_str_eq(cap, expected) != 1) return 15;
+            PyObject *arg_loaded = py_tuple_get(moved->args, 0);
+            if (py_int_to_i64(arg_loaded, 0) != 5) return 16;
+            if (py_int_to_i64(moved->result, 0) != 99) return 17;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 18;
+
+            pcc_gc_release(arg_loaded);
+            pcc_gc_release(expected);
+            pcc_gc_release(cap);
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-coroutine-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-coroutine-relocation-ok"
+
+
+def test_backend4_relocation_preserves_task_slots_and_done(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *coro;
+            PyObject *result;
+            PyObject *waiter;
+            int64_t done;
+        } ProbeTaskObject;
+
+        static int64_t resolved_id(PyObject *obj) {
+            PyObject *resolved = pcc_gc_note_relocation_read(obj);
+            if (resolved == 0) return -1;
+            return pcc_gc_object_id(resolved);
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            PyObject *coro = py_str_new("task-coro", 9);
+            PyObject *result = py_str_new("task-result", 11);
+            PyObject *waiter = py_str_new("task-waiter", 11);
+            if (coro == 0 || result == 0 || waiter == 0) return 3;
+            int64_t coro_id = pcc_gc_object_id(coro);
+            int64_t result_id = pcc_gc_object_id(result);
+            int64_t waiter_id = pcc_gc_object_id(waiter);
+
+            ProbeTaskObject *task = (ProbeTaskObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeTaskObject),
+                PY_TYPE_TASK,
+                0x100
+            );
+            if (task == 0) return 4;
+            task->coro = 0;
+            task->result = 0;
+            task->waiter = 0;
+            task->done = 1;
+            pcc_gc_store_ptr((PyObject *)task, &task->coro, coro);
+            pcc_gc_store_ptr((PyObject *)task, &task->result, result);
+            pcc_gc_store_ptr((PyObject *)task, &task->waiter, waiter);
+            pcc_gc_store_root(&root, (PyObject *)task);
+            pcc_gc_release((PyObject *)task);
+            pcc_gc_release(coro);
+            pcc_gc_release(result);
+            pcc_gc_release(waiter);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 6;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                root,
+                (int64_t)sizeof(ProbeTaskObject)
+            );
+            if (moved_raw == 0) return 7;
+            pcc_gc_release(moved_raw);
+
+            ProbeTaskObject *moved = (ProbeTaskObject *)pcc_gc_load_ptr(0, &root);
+            if (moved == 0) return 8;
+            if ((PyObject *)moved == (PyObject *)task) return 9;
+            if (moved->done != 1) return 10;
+            if (resolved_id(moved->coro) != coro_id) return 11;
+            if (resolved_id(moved->result) != result_id) return 12;
+            if (resolved_id(moved->waiter) != waiter_id) return 13;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 14;
+
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-task-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-task-relocation-ok"
+
+
+def test_backend4_relocation_preserves_exception_slots_and_traceback(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *exc_class;
+            PyObject *message;
+            PyObject *cause;
+            PyObject *context;
+            void *traceback;
+            int32_t n_frames;
+            int32_t cap_frames;
+        } ProbeExceptionObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            char data[];
+        } ProbeStrObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            PyObject *exc_class = py_str_new("exc-class", 9);
+            PyObject *message = py_str_new("message", 7);
+            PyObject *cause = py_str_new("cause", 5);
+            PyObject *context = py_str_new("context", 7);
+            if (exc_class == 0 || message == 0 || cause == 0 || context == 0) return 3;
+            int64_t exc_class_id = pcc_gc_object_id(exc_class);
+
+            ProbeExceptionObject *exc = (ProbeExceptionObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeExceptionObject),
+                PY_TYPE_EXC,
+                0
+            );
+            if (exc == 0) return 4;
+            exc->exc_class = 0;
+            exc->message = 0;
+            exc->cause = 0;
+            exc->context = 0;
+            exc->traceback = calloc(1, 24);
+            exc->n_frames = 1;
+            exc->cap_frames = 1;
+            if (exc->traceback == 0) return 5;
+            void *old_traceback = exc->traceback;
+            pcc_gc_store_ptr((PyObject *)exc, &exc->exc_class, exc_class);
+            pcc_gc_store_ptr((PyObject *)exc, &exc->message, message);
+            pcc_gc_store_ptr((PyObject *)exc, &exc->cause, cause);
+            pcc_gc_store_ptr((PyObject *)exc, &exc->context, context);
+            pcc_gc_store_root(&root, (PyObject *)exc);
+            pcc_gc_release((PyObject *)exc);
+            pcc_gc_release(exc_class);
+            pcc_gc_release(message);
+            pcc_gc_release(cause);
+            pcc_gc_release(context);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 6;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 7;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                root,
+                (int64_t)sizeof(ProbeExceptionObject)
+            );
+            if (moved_raw == 0) return 8;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 9;
+            if (loaded == (PyObject *)exc) return 10;
+            ProbeExceptionObject *moved = (ProbeExceptionObject *)loaded;
+            if (moved->traceback == 0) return 11;
+            if (moved->traceback == old_traceback) return 12;
+            if (moved->n_frames != 1 || moved->cap_frames != 1) return 13;
+
+            PyObject *expected_message = py_str_new("message", 7);
+            PyObject *expected_cause = py_str_new("cause", 5);
+            PyObject *expected_context = py_str_new("context", 7);
+            if (expected_message == 0 || expected_cause == 0 || expected_context == 0) return 14;
+            PyObject *resolved_class = pcc_gc_note_relocation_read(moved->exc_class);
+            if (resolved_class == 0) return 19;
+            if (pcc_gc_object_id(resolved_class) != exc_class_id) return 20;
+            if (py_str_eq(moved->message, expected_message) != 1) return 15;
+            if (py_str_eq(moved->cause, expected_cause) != 1) return 16;
+            if (py_str_eq(moved->context, expected_context) != 1) return 17;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 18;
+
+            pcc_gc_release(expected_context);
+            pcc_gc_release(expected_cause);
+            pcc_gc_release(expected_message);
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-exc-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-exc-relocation-ok"
+
+
+def test_backend4_exception_accessors_load_forwarded_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *exc_class;
+            PyObject *message;
+            PyObject *cause;
+            PyObject *context;
+            void *traceback;
+            int32_t n_frames;
+            int32_t cap_frames;
+        } ProbeExceptionObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            char data[];
+        } ProbeStrObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *exc_root = 0;
+            PyObject *message_root = 0;
+            PyObject *cause_root = 0;
+            PyObject *context_root = 0;
+            pcc_gc_scheduler_root_register(&exc_root);
+            pcc_gc_scheduler_root_register(&message_root);
+            pcc_gc_scheduler_root_register(&cause_root);
+            pcc_gc_scheduler_root_register(&context_root);
+
+            PyObject *message = py_str_new("message", 7);
+            PyObject *cause = py_str_new("cause", 5);
+            PyObject *context = py_str_new("context", 7);
+            if (message == 0 || cause == 0 || context == 0) return 3;
+
+            PyObject *exc = py_exc_new_with_value(PY_EXC_RUNTIMEERROR, message);
+            if (exc == 0) return 4;
+            py_exc_set_cause(exc, cause);
+            py_exc_set_context(exc, context);
+
+            pcc_gc_store_root(&exc_root, exc);
+            pcc_gc_store_root(&message_root, message);
+            pcc_gc_store_root(&cause_root, cause);
+            pcc_gc_store_root(&context_root, context);
+            pcc_gc_release(exc);
+            pcc_gc_release(message);
+            pcc_gc_release(cause);
+            pcc_gc_release(context);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(256) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(message_root) != 1) return 6;
+            if (pcc_gc_relocation_set_contains(cause_root) != 1) return 7;
+            if (pcc_gc_relocation_set_contains(context_root) != 1) return 8;
+
+            PyObject *moved_message_raw = pcc_gc_relocate_copy(
+                message_root,
+                (int64_t)sizeof(ProbeStrObject) + 8
+            );
+            PyObject *moved_cause_raw = pcc_gc_relocate_copy(
+                cause_root,
+                (int64_t)sizeof(ProbeStrObject) + 6
+            );
+            PyObject *moved_context_raw = pcc_gc_relocate_copy(
+                context_root,
+                (int64_t)sizeof(ProbeStrObject) + 8
+            );
+            if (moved_message_raw == 0 || moved_cause_raw == 0 || moved_context_raw == 0) {
+                return 9;
+            }
+            pcc_gc_release(moved_message_raw);
+            pcc_gc_release(moved_cause_raw);
+            pcc_gc_release(moved_context_raw);
+
+            PyObject *loaded_message = pcc_gc_load_ptr(0, &message_root);
+            PyObject *loaded_cause = pcc_gc_load_ptr(0, &cause_root);
+            PyObject *loaded_context = pcc_gc_load_ptr(0, &context_root);
+            if (loaded_message == 0 || loaded_cause == 0 || loaded_context == 0) return 10;
+            if (loaded_message == message || loaded_cause == cause || loaded_context == context) {
+                return 11;
+            }
+
+            PyObject *loaded_exc = pcc_gc_load_ptr(0, &exc_root);
+            if (loaded_exc == 0) return 12;
+            ProbeExceptionObject *probe = (ProbeExceptionObject *)loaded_exc;
+
+            PyObject *borrowed_message = py_exc_get_message(loaded_exc);
+            if (borrowed_message != loaded_message) return 13;
+            if (probe->message != loaded_message) return 14;
+
+            PyObject *got_cause = py_exc_get_cause(loaded_exc);
+            if (got_cause != loaded_cause) return 15;
+            py_decref(got_cause);
+            if (probe->cause != loaded_cause) return 16;
+
+            PyObject *got_context = py_exc_get_context(loaded_exc);
+            if (got_context != loaded_context) return 17;
+            py_decref(got_context);
+            if (probe->context != loaded_context) return 18;
+
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 19;
+
+            pcc_gc_store_root(&context_root, 0);
+            pcc_gc_store_root(&cause_root, 0);
+            pcc_gc_store_root(&message_root, 0);
+            pcc_gc_store_root(&exc_root, 0);
+            pcc_gc_scheduler_root_unregister(&context_root);
+            pcc_gc_scheduler_root_unregister(&cause_root);
+            pcc_gc_scheduler_root_unregister(&message_root);
+            pcc_gc_scheduler_root_unregister(&exc_root);
+            printf("backend4-exc-accessor-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-exc-accessor-barrier-ok"
+
+
+def test_backend4_exception_print_loads_forwarded_message_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            char data[];
+        } ProbeStrObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            PyClassObject *exc_class;
+            PyObject *message;
+            PyObject *cause;
+            PyObject *context;
+            void *traceback;
+            int32_t n_frames;
+            int32_t cap_frames;
+        } ProbeExceptionObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *exc_root = 0;
+            PyObject *message_root = 0;
+            pcc_gc_scheduler_root_register(&exc_root);
+            pcc_gc_scheduler_root_register(&message_root);
+
+            PyObject *message = py_str_new("print-message", 13);
+            if (message == 0) return 3;
+            PyObject *exc = py_exc_new_with_value(PY_EXC_RUNTIMEERROR, message);
+            if (exc == 0) return 4;
+            pcc_gc_store_root(&message_root, message);
+            pcc_gc_store_root(&exc_root, exc);
+            pcc_gc_release(message);
+            pcc_gc_release(exc);
+
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(message_root) != 1) return 6;
+            PyObject *moved_message_raw = pcc_gc_relocate_copy(
+                message_root,
+                (int64_t)sizeof(ProbeStrObject) + 14
+            );
+            if (moved_message_raw == 0) return 7;
+            pcc_gc_release(moved_message_raw);
+
+            PyObject *loaded_message = pcc_gc_load_ptr(0, &message_root);
+            PyObject *loaded_exc = pcc_gc_load_ptr(0, &exc_root);
+            if (loaded_message == 0 || loaded_exc == 0) return 8;
+            if (loaded_message == message) return 9;
+
+            pcc_gc_telemetry_reset();
+            py_exc_print_unhandled(loaded_exc);
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_READ_BARRIERS) <= 0) return 10;
+
+            ProbeExceptionObject *probe = (ProbeExceptionObject *)loaded_exc;
+            if (probe->message != loaded_message) return 11;
+
+            pcc_gc_store_root(&exc_root, 0);
+            pcc_gc_store_root(&message_root, 0);
+            pcc_gc_scheduler_root_unregister(&exc_root);
+            pcc_gc_scheduler_root_unregister(&message_root);
+            printf("backend4-exception-print-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-exception-print-barrier-ok"
+
+
+def test_backend4_raise_context_chaining_resolves_forwarded_current_exception(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeClassObject *exc_class;
+            PyObject *message;
+            PyObject *cause;
+            PyObject *context;
+            void *traceback;
+            int32_t n_frames;
+            int32_t cap_frames;
+        } ProbeExceptionObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *first_root = 0;
+            PyObject *second_root = 0;
+            pcc_gc_scheduler_root_register(&first_root);
+            pcc_gc_scheduler_root_register(&second_root);
+
+            PyObject *first = py_exc_new(PY_EXC_KEYERROR, "first");
+            PyObject *second = py_exc_new(PY_EXC_VALUEERROR, "second");
+            if (first == 0 || second == 0) return 3;
+            int64_t first_id = pcc_gc_object_id(first);
+            pcc_gc_store_root(&first_root, first);
+            pcc_gc_store_root(&second_root, second);
+
+            py_raise(first);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(128) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(first_root) != 1) return 5;
+            PyObject *moved_first_raw = pcc_gc_relocate_copy(
+                first_root,
+                (int64_t)sizeof(ProbeExceptionObject)
+            );
+            if (moved_first_raw == 0) return 6;
+            pcc_gc_release(moved_first_raw);
+
+            PyObject *loaded_first = pcc_gc_load_ptr(0, &first_root);
+            if (loaded_first == 0) return 7;
+            if (loaded_first == first) return 8;
+
+            py_raise(second);
+
+            PyObject *loaded_second = pcc_gc_load_ptr(0, &second_root);
+            if (loaded_second == 0) return 9;
+            PyObject *got_context = py_exc_get_context(loaded_second);
+            if (got_context == 0) return 10;
+            if (got_context != loaded_first) return 11;
+            if (pcc_gc_object_id(got_context) != first_id) return 12;
+
+            ProbeExceptionObject *second_probe = (ProbeExceptionObject *)loaded_second;
+            if (second_probe->context == first) return 13;
+            if (second_probe->context != loaded_first) return 14;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 15;
+
+            py_decref(got_context);
+            py_clear_exception();
+            pcc_gc_store_root(&second_root, 0);
+            pcc_gc_store_root(&first_root, 0);
+            pcc_gc_scheduler_root_unregister(&second_root);
+            pcc_gc_scheduler_root_unregister(&first_root);
+            printf("backend4-raise-context-forwarded-current-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-raise-context-forwarded-current-ok"
+
+
+def test_backend4_relocation_retargets_class_attrs_side_table(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct {
+            const char *name;
+            PyObject *func;
+        } ProbeClassMethod;
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            ProbeClassMethod *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t size;
+            int64_t capacity;
+            int64_t *indices;
+            void *entries;
+            int64_t entries_used;
+        } ProbeDictObject;
+
+        extern int64_t py_class_setattr(ProbeClassObject *cls, const char *name, PyObject *value);
+        extern PyObject *py_class_getattr(ProbeClassObject *cls, const char *name);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            if (cls == 0) return 3;
+            cls->name = "Probe";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 1;
+            cls->mro = (ProbeClassObject **)calloc(1, sizeof(ProbeClassObject *));
+            if (cls->mro == 0) return 4;
+            cls->mro[0] = cls;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = 32;
+            cls->type_tag_alloc = 1000;
+            cls->del_method = 0;
+            cls->attrs = 0;
+
+            PyObject *value = py_str_new("class-attr", 10);
+            if (value == 0) return 5;
+            if (py_class_setattr(cls, "answer", value) != 0) return 6;
+            if (cls->attrs == 0) return 17;
+            int64_t attrs_id = pcc_gc_object_id(cls->attrs);
+            pcc_gc_store_root(&root, (PyObject *)cls);
+            pcc_gc_release((PyObject *)cls);
+            pcc_gc_release(value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 7;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 8;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                root,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_raw == 0) return 9;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 10;
+            if (loaded == (PyObject *)cls) return 11;
+            ProbeClassObject *moved = (ProbeClassObject *)loaded;
+            if (moved->mro == 0 || moved->mro[0] != moved) return 12;
+            if (moved->name == 0 || moved->type_tag_alloc != 1000) return 13;
+            if (moved->attrs == 0) return 18;
+            if (pcc_gc_object_id(moved->attrs) != attrs_id) return 19;
+
+            PyObject *old_attrs = moved->attrs;
+            pcc_gc_reset_relocation_set();
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 20;
+            if (pcc_gc_relocation_set_contains(old_attrs) != 1) return 21;
+            PyObject *moved_attrs_raw = pcc_gc_relocate_copy(
+                old_attrs,
+                (int64_t)sizeof(ProbeDictObject)
+            );
+            if (moved_attrs_raw == 0) return 22;
+            pcc_gc_release(moved_attrs_raw);
+
+            PyObject *attr = py_class_getattr(moved, "answer");
+            PyObject *expected = py_str_new("class-attr", 10);
+            if (attr == 0 || expected == 0) return 14;
+            if (moved->attrs == old_attrs) return 23;
+            if (pcc_gc_object_id(moved->attrs) != attrs_id) return 24;
+            if (py_str_eq(attr, expected) != 1) return 15;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 16;
+
+            pcc_gc_release(expected);
+            pcc_gc_release(attr);
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-class-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-relocation-ok"
+
+
+def test_backend4_class_attrs_creation_uses_store_barrier(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        extern int64_t py_class_setattr(ProbeClassObject *cls, const char *name, PyObject *value);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0x100
+            );
+            if (cls == 0) return 3;
+            cls->name = "OldClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 0;
+            cls->mro = 0;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = 32;
+            cls->type_tag_alloc = 1001;
+            cls->del_method = 0;
+            cls->attrs = 0;
+
+            PyObject *value = py_str_new("barrier", 7);
+            if (value == 0) return 4;
+            pcc_gc_telemetry_reset();
+            if (py_class_setattr(cls, "answer", value) != 0) return 5;
+            if (cls->attrs == 0) return 6;
+            if (pcc_gc_backend4_generation_barrier_score() != 1) return 7;
+            if (pcc_gc_backend4_store_buffer_entries() != 1) return 8;
+
+            pcc_gc_release(value);
+            printf("backend4-class-attrs-store-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-attrs-store-barrier-ok"
+
+
+def test_backend4_class_relocation_loads_forwarded_attrs_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t size;
+            int64_t capacity;
+            int64_t *indices;
+            void *entries;
+            int64_t entries_used;
+        } ProbeDictObject;
+
+        extern int64_t py_class_setattr(ProbeClassObject *cls, const char *name, PyObject *value);
+        extern PyObject *py_class_getattr(ProbeClassObject *cls, const char *name);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            if (cls == 0) return 3;
+            cls->name = "ForwardedAttrsClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 0;
+            cls->mro = 0;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = 32;
+            cls->type_tag_alloc = 1002;
+            cls->del_method = 0;
+            cls->attrs = 0;
+
+            PyObject *value = py_str_new("forwarded-attrs", 15);
+            if (value == 0) return 4;
+            if (py_class_setattr(cls, "answer", value) != 0) return 5;
+            if (cls->attrs == 0) return 6;
+            PyObject *old_attrs = cls->attrs;
+            int64_t attrs_id = pcc_gc_object_id(old_attrs);
+            pcc_gc_store_root(&root, (PyObject *)cls);
+            pcc_gc_release((PyObject *)cls);
+            pcc_gc_release(value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 7;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 8;
+            if (pcc_gc_relocation_set_contains(old_attrs) != 1) return 9;
+
+            PyObject *moved_attrs_raw = pcc_gc_relocate_copy(
+                old_attrs,
+                (int64_t)sizeof(ProbeDictObject)
+            );
+            if (moved_attrs_raw == 0) return 10;
+            pcc_gc_release(moved_attrs_raw);
+
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                root,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_raw == 0) return 11;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 12;
+            ProbeClassObject *moved = (ProbeClassObject *)loaded;
+            if (moved == cls) return 13;
+            if (moved->attrs == old_attrs) return 14;
+            if (pcc_gc_object_id(moved->attrs) != attrs_id) return 15;
+
+            PyObject *attr = py_class_getattr(moved, "answer");
+            PyObject *expected = py_str_new("forwarded-attrs", 15);
+            if (attr == 0 || expected == 0) return 16;
+            if (py_str_eq(attr, expected) != 1) return 17;
+
+            pcc_gc_release(expected);
+            pcc_gc_release(attr);
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-class-forwarded-attrs-load-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-forwarded-attrs-load-ok"
+
+
+def test_backend4_class_attrs_api_resolves_forwarded_class_argument(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        extern int64_t py_class_setattr(ProbeClassObject *cls, const char *name, PyObject *value);
+        extern PyObject *py_class_getattr(ProbeClassObject *cls, const char *name);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            PyObject *value = py_str_new("forwarded-class-attr", 20);
+            if (cls == 0 || value == 0) return 3;
+            cls->name = "ForwardedAttrsApiClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 0;
+            cls->mro = 0;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = 32;
+            cls->type_tag_alloc = 1008;
+            cls->del_method = 0;
+            cls->attrs = 0;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains((PyObject *)cls) != 1) return 5;
+            PyObject *moved_cls_raw = pcc_gc_relocate_copy(
+                (PyObject *)cls,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_cls_raw == 0) return 6;
+            pcc_gc_release(moved_cls_raw);
+
+            if (py_class_setattr(cls, "answer", value) != 0) return 7;
+            ProbeClassObject *moved = (ProbeClassObject *)pcc_gc_note_relocation_read(
+                (PyObject *)cls
+            );
+            if (moved == cls) return 8;
+            if (cls->attrs != 0) return 9;
+            if (moved->attrs == 0) return 10;
+
+            PyObject *got = py_class_getattr(cls, "answer");
+            PyObject *expected = py_str_new("forwarded-class-attr", 20);
+            if (got == 0 || expected == 0) return 11;
+            if (py_str_eq(got, expected) != 1) return 12;
+
+            pcc_gc_release(expected);
+            pcc_gc_release(got);
+            pcc_gc_release(value);
+            printf("backend4-class-attrs-forwarded-class-arg-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-attrs-forwarded-class-arg-ok"
+
+
+def test_backend4_class_relocation_loads_forwarded_metadata_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct {
+            const char *name;
+            PyObject *func;
+        } ProbeClassMethod;
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            ProbeClassMethod *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        static ProbeClassObject *new_probe_class(const char *name, int32_t tag) {
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            if (cls == 0) return 0;
+            cls->name = name;
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 0;
+            cls->mro = 0;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = 32;
+            cls->type_tag_alloc = tag;
+            cls->del_method = 0;
+            cls->attrs = 0;
+            return cls;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            ProbeClassObject *base = new_probe_class("Base", 1003);
+            ProbeClassObject *cls = new_probe_class("Derived", 1004);
+            PyObject *func = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (base == 0 || cls == 0 || func == 0) return 3;
+
+            cls->n_bases = 1;
+            cls->bases = (ProbeClassObject **)calloc(1, sizeof(ProbeClassObject *));
+            cls->n_mro = 2;
+            cls->mro = (ProbeClassObject **)calloc(2, sizeof(ProbeClassObject *));
+            cls->n_methods = 1;
+            cls->methods = (ProbeClassMethod *)calloc(1, sizeof(ProbeClassMethod));
+            if (cls->bases == 0 || cls->mro == 0 || cls->methods == 0) return 4;
+            cls->bases[0] = base;
+            cls->mro[0] = cls;
+            cls->mro[1] = base;
+            cls->methods[0].name = "method";
+            cls->methods[0].func = func;
+            cls->del_method = func;
+
+            int64_t base_id = pcc_gc_object_id((PyObject *)base);
+            pcc_gc_store_root(&root, (PyObject *)cls);
+            pcc_gc_release((PyObject *)cls);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains((PyObject *)base) != 1) return 6;
+            if (pcc_gc_relocation_set_contains(func) != 1) return 7;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 8;
+
+            PyObject *moved_base_raw = pcc_gc_relocate_copy(
+                (PyObject *)base,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_base_raw == 0) return 9;
+
+            PyObject *moved_func_raw = pcc_gc_relocate_copy(func, 64);
+            if (moved_func_raw == 0) return 10;
+
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                root,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_raw == 0) return 11;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 12;
+            ProbeClassObject *moved = (ProbeClassObject *)loaded;
+            if (moved == cls) return 13;
+            if (moved->bases == 0 || moved->mro == 0 || moved->methods == 0) return 14;
+            if (moved->bases[0] == base) return 15;
+            if (pcc_gc_object_id((PyObject *)moved->bases[0]) != base_id) return 16;
+            if (moved->mro[0] != moved) return 17;
+            if (moved->mro[1] == base) return 18;
+            if (pcc_gc_object_id((PyObject *)moved->mro[1]) != base_id) return 19;
+            if (moved->methods[0].func != func) return 20;
+            if (moved->del_method != func) return 21;
+
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            pcc_gc_release(moved_func_raw);
+            pcc_gc_release(moved_base_raw);
+            printf("backend4-class-forwarded-metadata-load-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-forwarded-metadata-load-ok"
+
+
+def test_backend4_class_lookup_loads_forwarded_method_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct {
+            const char *name;
+            PyObject *func;
+        } ProbeClassMethod;
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            ProbeClassMethod *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        extern PyObject *py_class_lookup(ProbeClassObject *cls, const char *name);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            PyObject *func = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (cls == 0 || func == 0) return 3;
+            cls->name = "LookupClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 1;
+            cls->mro = (ProbeClassObject **)calloc(1, sizeof(ProbeClassObject *));
+            cls->n_methods = 1;
+            cls->methods = (ProbeClassMethod *)calloc(1, sizeof(ProbeClassMethod));
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = 32;
+            cls->type_tag_alloc = 1005;
+            cls->del_method = 0;
+            cls->attrs = 0;
+            if (cls->mro == 0 || cls->methods == 0) return 4;
+            cls->mro[0] = cls;
+            cls->methods[0].name = "method";
+            cls->methods[0].func = func;
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(func) != 1) return 6;
+            PyObject *moved_func_raw = pcc_gc_relocate_copy(func, 64);
+            if (moved_func_raw == 0) return 7;
+            pcc_gc_release(moved_func_raw);
+
+            PyObject *looked_up = py_class_lookup(cls, "method");
+            if (looked_up == 0) return 8;
+            if (looked_up != func) return 9;
+            if (cls->methods[0].func != func) return 10;
+
+            printf("backend4-class-lookup-forwarded-method-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-lookup-forwarded-method-ok"
+
+
+def test_backend4_class_add_method_uses_metadata_store_barrier(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        extern void py_class_add_method(ProbeClassObject *cls, const char *name, PyObject *func);
+        extern PyObject *py_class_lookup(ProbeClassObject *cls, const char *name);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0x100
+            );
+            PyObject *func = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (cls == 0 || func == 0) return 3;
+            cls->name = "AddMethodClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 1;
+            cls->mro = (ProbeClassObject **)calloc(1, sizeof(ProbeClassObject *));
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = 32;
+            cls->type_tag_alloc = 1006;
+            cls->del_method = 0;
+            cls->attrs = 0;
+            if (cls->mro == 0) return 4;
+            cls->mro[0] = cls;
+
+            pcc_gc_telemetry_reset();
+            py_class_add_method(cls, "method", func);
+            if (cls->n_methods != 1) return 5;
+            if (pcc_gc_backend4_generation_barrier_score() != 1) return 6;
+            if (pcc_gc_backend4_store_buffer_entries() != 1) return 7;
+            if (py_class_lookup(cls, "method") != func) return 8;
+
+            printf("backend4-class-add-method-store-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-add-method-store-barrier-ok"
+
+
+def test_backend4_isinstance_resolves_forwarded_class_argument(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeClassObject *cls;
+        } ProbeInstanceObject;
+
+        extern int64_t py_isinstance(PyObject *obj, ProbeClassObject *cls);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            ProbeInstanceObject *inst = (ProbeInstanceObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeInstanceObject),
+                PY_TYPE_INSTANCE,
+                0
+            );
+            if (cls == 0 || inst == 0) return 3;
+            cls->name = "ForwardedIsInstanceClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 1;
+            cls->mro = (ProbeClassObject **)calloc(1, sizeof(ProbeClassObject *));
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = (int32_t)sizeof(ProbeInstanceObject);
+            cls->type_tag_alloc = PY_TYPE_INSTANCE;
+            cls->del_method = 0;
+            cls->attrs = 0;
+            if (cls->mro == 0) return 4;
+            cls->mro[0] = cls;
+            inst->cls = cls;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains((PyObject *)cls) != 1) return 6;
+            PyObject *moved_cls_raw = pcc_gc_relocate_copy(
+                (PyObject *)cls,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_cls_raw == 0) return 7;
+            pcc_gc_release(moved_cls_raw);
+
+            if (py_isinstance((PyObject *)inst, cls) != 1) return 8;
+            if (inst->cls == cls) return 9;
+
+            printf("backend4-isinstance-forwarded-class-arg-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-isinstance-forwarded-class-arg-ok"
+
+
+def test_backend4_instance_get_field_loads_forwarded_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeClassObject *cls;
+            PyObject *fields[1];
+        } ProbeInstanceObject;
+
+        extern PyObject *py_instance_get_field(ProbeInstanceObject *inst, int32_t idx);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            ProbeInstanceObject *inst = (ProbeInstanceObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeInstanceObject),
+                PY_TYPE_INSTANCE,
+                0
+            );
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (cls == 0 || inst == 0 || value == 0) return 3;
+            cls->name = "FieldClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 0;
+            cls->mro = 0;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 1;
+            cls->field_names = (const char **)calloc(1, sizeof(const char *));
+            cls->instance_size = (int32_t)sizeof(ProbeInstanceObject);
+            cls->type_tag_alloc = PY_TYPE_INSTANCE;
+            cls->del_method = 0;
+            cls->attrs = 0;
+            if (cls->field_names == 0) return 10;
+            cls->field_names[0] = "field";
+            inst->cls = cls;
+            inst->fields[0] = value;
+            int64_t value_id = pcc_gc_object_id(value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(value) != 1) return 5;
+            PyObject *moved_value_raw = pcc_gc_relocate_copy(value, 64);
+            if (moved_value_raw == 0) return 6;
+            pcc_gc_release(moved_value_raw);
+
+            PyObject *got = py_instance_get_field(inst, 0);
+            if (got == 0) return 7;
+            if (got == value) return 8;
+            if (pcc_gc_object_id(got) != value_id) return 9;
+            if (inst->fields[0] == value) return 10;
+            pcc_gc_release(got);
+
+            printf("backend4-instance-get-field-forwarded-slot-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-instance-get-field-forwarded-slot-ok"
+
+
+def test_backend4_instance_get_field_resolves_forwarded_class_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeClassObject *cls;
+            PyObject *fields[1];
+        } ProbeInstanceObject;
+
+        extern PyObject *py_instance_get_field(ProbeInstanceObject *inst, int32_t idx);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            ProbeInstanceObject *inst = (ProbeInstanceObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeInstanceObject),
+                PY_TYPE_INSTANCE,
+                0
+            );
+            PyObject *value = py_str_new("field", 5);
+            if (cls == 0 || inst == 0 || value == 0) return 3;
+            cls->name = "ForwardedFieldClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 0;
+            cls->mro = 0;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 1;
+            cls->field_names = (const char **)calloc(1, sizeof(const char *));
+            cls->instance_size = (int32_t)sizeof(ProbeInstanceObject);
+            cls->type_tag_alloc = PY_TYPE_INSTANCE;
+            cls->del_method = 0;
+            cls->attrs = 0;
+            if (cls->field_names == 0) return 10;
+            cls->field_names[0] = "field";
+            inst->cls = cls;
+            inst->fields[0] = value;
+            int64_t cls_id = pcc_gc_object_id((PyObject *)cls);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains((PyObject *)cls) != 1) return 5;
+            PyObject *moved_cls_raw = pcc_gc_relocate_copy(
+                (PyObject *)cls,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_cls_raw == 0) return 6;
+            pcc_gc_release(moved_cls_raw);
+
+            PyObject *got = py_instance_get_field(inst, 0);
+            if (got == 0) return 7;
+            if (inst->cls == cls) return 8;
+            if (pcc_gc_object_id((PyObject *)inst->cls) != cls_id) return 9;
+            pcc_gc_release(got);
+            pcc_gc_release(value);
+
+            printf("backend4-instance-get-field-forwarded-class-slot-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-instance-get-field-forwarded-class-slot-ok"
+
+
+def test_backend4_instance_new_resolves_forwarded_class_argument(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeClassObject *cls;
+        } ProbeInstanceObject;
+
+        extern PyObject *py_instance_new(ProbeClassObject *cls);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            if (cls == 0) return 3;
+            cls->name = "NewInstanceClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 0;
+            cls->mro = 0;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = (int32_t)sizeof(ProbeInstanceObject);
+            cls->type_tag_alloc = PY_TYPE_INSTANCE;
+            cls->del_method = 0;
+            cls->attrs = 0;
+            int64_t cls_id = pcc_gc_object_id((PyObject *)cls);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains((PyObject *)cls) != 1) return 5;
+            PyObject *moved_cls_raw = pcc_gc_relocate_copy(
+                (PyObject *)cls,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_cls_raw == 0) return 6;
+            pcc_gc_release(moved_cls_raw);
+
+            ProbeInstanceObject *inst = (ProbeInstanceObject *)py_instance_new(cls);
+            if (inst == 0) return 7;
+            if (inst->cls == cls) return 8;
+            if (pcc_gc_object_id((PyObject *)inst->cls) != cls_id) return 9;
+            pcc_gc_release((PyObject *)inst);
+
+            printf("backend4-instance-new-forwarded-class-arg-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-instance-new-forwarded-class-arg-ok"
+
+
+def test_backend4_class_add_method_resolves_forwarded_class_argument(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct {
+            const char *name;
+            PyObject *func;
+        } ProbeClassMethod;
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            ProbeClassMethod *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        extern void py_class_add_method(ProbeClassObject *cls, const char *name, PyObject *func);
+        extern PyObject *py_class_lookup(ProbeClassObject *cls, const char *name);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject),
+                PY_TYPE_CLASS,
+                0
+            );
+            PyObject *func = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (cls == 0 || func == 0) return 3;
+            cls->name = "ForwardedAddMethodClass";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 1;
+            cls->mro = (ProbeClassObject **)calloc(1, sizeof(ProbeClassObject *));
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = 32;
+            cls->type_tag_alloc = 1007;
+            cls->del_method = 0;
+            cls->attrs = 0;
+            if (cls->mro == 0) return 4;
+            cls->mro[0] = cls;
+            int64_t cls_id = pcc_gc_object_id((PyObject *)cls);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains((PyObject *)cls) != 1) return 6;
+            PyObject *moved_cls_raw = pcc_gc_relocate_copy(
+                (PyObject *)cls,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_cls_raw == 0) return 7;
+            pcc_gc_release(moved_cls_raw);
+
+            py_class_add_method(cls, "method", func);
+            PyObject *moved_cls_obj = pcc_gc_note_relocation_read((PyObject *)cls);
+            ProbeClassObject *moved_cls = (ProbeClassObject *)moved_cls_obj;
+            if (moved_cls == cls) return 8;
+            if (pcc_gc_object_id((PyObject *)moved_cls) != cls_id) return 9;
+            if (cls->n_methods != 0) return 10;
+            if (moved_cls->n_methods != 1) return 11;
+            if (py_class_lookup(cls, "method") != func) return 12;
+
+            printf("backend4-class-add-method-forwarded-class-arg-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-add-method-forwarded-class-arg-ok"
+
+
+def test_backend4_class_new_resolves_forwarded_base_argument(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        extern ProbeClassObject *py_class_new(
+            const char *name,
+            ProbeClassObject **bases,
+            int32_t n_bases,
+            const char **field_names,
+            int32_t n_fields
+        );
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *base = py_class_new("ForwardedBase", 0, 0, 0, 0);
+            if (base == 0) return 3;
+            int64_t base_id = pcc_gc_object_id((PyObject *)base);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains((PyObject *)base) != 1) return 5;
+            PyObject *moved_base_raw = pcc_gc_relocate_copy(
+                (PyObject *)base,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_base_raw == 0) return 6;
+            pcc_gc_release(moved_base_raw);
+
+            ProbeClassObject *bases[1];
+            bases[0] = base;
+            ProbeClassObject *derived = py_class_new("Derived", bases, 1, 0, 0);
+            if (derived == 0) return 7;
+            if (derived->bases == 0 || derived->mro == 0) return 8;
+            if (derived->bases[0] == base) return 9;
+            if (pcc_gc_object_id((PyObject *)derived->bases[0]) != base_id) return 10;
+            if (derived->n_mro < 2) return 11;
+            if (derived->mro[1] == base) return 12;
+            if (pcc_gc_object_id((PyObject *)derived->mro[1]) != base_id) return 13;
+
+            pcc_gc_release((PyObject *)derived);
+            printf("backend4-class-new-forwarded-base-arg-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-new-forwarded-base-arg-ok"
+
+
+def test_backend4_class_new_resolves_forwarded_mro_entries(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *del_method;
+            PyObject *attrs;
+        } ProbeClassObject;
+
+        extern ProbeClassObject *py_class_new(
+            const char *name,
+            ProbeClassObject **bases,
+            int32_t n_bases,
+            const char **field_names,
+            int32_t n_fields
+        );
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeClassObject *grand = py_class_new("Grand", 0, 0, 0, 0);
+            if (grand == 0) return 3;
+            ProbeClassObject *base_bases[1];
+            base_bases[0] = grand;
+            ProbeClassObject *base = py_class_new("Base", base_bases, 1, 0, 0);
+            if (base == 0) return 4;
+            int64_t grand_id = pcc_gc_object_id((PyObject *)grand);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains((PyObject *)grand) != 1) return 6;
+            PyObject *moved_grand_raw = pcc_gc_relocate_copy(
+                (PyObject *)grand,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_grand_raw == 0) return 7;
+            pcc_gc_release(moved_grand_raw);
+
+            ProbeClassObject *derived_bases[1];
+            derived_bases[0] = base;
+            ProbeClassObject *derived = py_class_new("Derived", derived_bases, 1, 0, 0);
+            if (derived == 0) return 8;
+            if (derived->n_mro < 3) return 9;
+            if (derived->mro[2] == grand) return 10;
+            if (pcc_gc_object_id((PyObject *)derived->mro[2]) != grand_id) return 11;
+
+            pcc_gc_release((PyObject *)derived);
+            printf("backend4-class-new-forwarded-mro-entry-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-class-new-forwarded-mro-entry-ok"
+
+
+def test_backend4_exception_match_loads_forwarded_mro_entry(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_internal.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *attrs;
+            PyObject *del_method;
+        } ProbeClassObject;
+
+        static ProbeClassObject *new_probe_class(const char *name) {
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject), PY_TYPE_CLASS, 0
+            );
+            if (cls == 0) return 0;
+            cls->name = name;
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 0;
+            cls->mro = 0;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = 0;
+            cls->type_tag_alloc = PY_TYPE_USER + 90;
+            cls->attrs = 0;
+            cls->del_method = 0;
+            return cls;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *base_root = 0;
+            PyObject *derived_root = 0;
+            pcc_gc_scheduler_root_register(&base_root);
+            pcc_gc_scheduler_root_register(&derived_root);
+
+            ProbeClassObject *base = new_probe_class("Base");
+            ProbeClassObject *derived = new_probe_class("Derived");
+            if (base == 0 || derived == 0) return 3;
+            derived->n_mro = 2;
+            derived->mro = (ProbeClassObject **)calloc(2, sizeof(ProbeClassObject *));
+            if (derived->mro == 0) return 4;
+            pcc_gc_store_ptr((PyObject *)derived, (PyObject **)&derived->mro[0], (PyObject *)derived);
+            pcc_gc_store_ptr((PyObject *)derived, (PyObject **)&derived->mro[1], (PyObject *)base);
+
+            pcc_gc_store_root(&base_root, (PyObject *)base);
+            pcc_gc_store_root(&derived_root, (PyObject *)derived);
+            pcc_gc_release((PyObject *)base);
+            pcc_gc_release((PyObject *)derived);
+
+            if (pcc_gc_select_relocation_set(256) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(base_root) != 1) return 6;
+            PyObject *moved_base_raw = pcc_gc_relocate_copy(
+                base_root,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_base_raw == 0) return 7;
+            pcc_gc_release(moved_base_raw);
+
+            PyObject *loaded_base = pcc_gc_load_ptr(0, &base_root);
+            PyObject *loaded_derived = pcc_gc_load_ptr(0, &derived_root);
+            if (loaded_base == 0 || loaded_derived == 0) return 8;
+            if (loaded_base == (PyObject *)base) return 9;
+
+            pcc_gc_telemetry_reset();
+            if (py_exc_matches(loaded_derived, loaded_base) != 1) return 10;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_READ_BARRIERS) <= 0) return 11;
+
+            ProbeClassObject *derived_probe = (ProbeClassObject *)loaded_derived;
+            if ((PyObject *)derived_probe->mro[1] != loaded_base) return 12;
+
+            pcc_gc_store_root(&derived_root, 0);
+            pcc_gc_store_root(&base_root, 0);
+            pcc_gc_scheduler_root_unregister(&derived_root);
+            pcc_gc_scheduler_root_unregister(&base_root);
+            printf("backend4-exception-match-mro-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-exception-match-mro-barrier-ok"
+
+
+def test_backend4_dunder_lookup_loads_forwarded_instance_class_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        typedef struct ProbeClassObject {
+            PyObjectHeader h;
+            const char *name;
+            int32_t n_bases;
+            struct ProbeClassObject **bases;
+            int32_t n_mro;
+            struct ProbeClassObject **mro;
+            int32_t n_methods;
+            void *methods;
+            int32_t n_fields;
+            const char **field_names;
+            int32_t instance_size;
+            int32_t type_tag_alloc;
+            PyObject *attrs;
+            PyObject *del_method;
+        } ProbeClassObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            ProbeClassObject *cls;
+            int32_t n_fields;
+            PyObject *dict;
+            PyObject *fields[1];
+        } ProbeInstanceObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *cls_root = 0;
+            PyObject *inst_root = 0;
+            pcc_gc_scheduler_root_register(&cls_root);
+            pcc_gc_scheduler_root_register(&inst_root);
+
+            ProbeClassObject *cls = (ProbeClassObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeClassObject), PY_TYPE_CLASS, 0
+            );
+            ProbeInstanceObject *inst = (ProbeInstanceObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeInstanceObject), PY_TYPE_INSTANCE, 0
+            );
+            if (cls == 0 || inst == 0) return 3;
+            cls->name = "DunderProbe";
+            cls->n_bases = 0;
+            cls->bases = 0;
+            cls->n_mro = 0;
+            cls->mro = 0;
+            cls->n_methods = 0;
+            cls->methods = 0;
+            cls->n_fields = 0;
+            cls->field_names = 0;
+            cls->instance_size = (int32_t)sizeof(ProbeInstanceObject);
+            cls->type_tag_alloc = PY_TYPE_INSTANCE;
+            cls->attrs = 0;
+            cls->del_method = 0;
+            inst->cls = 0;
+            inst->n_fields = 0;
+            inst->dict = 0;
+            inst->fields[0] = 0;
+            pcc_gc_store_ptr((PyObject *)inst, (PyObject **)&inst->cls, (PyObject *)cls);
+
+            pcc_gc_store_root(&cls_root, (PyObject *)cls);
+            pcc_gc_store_root(&inst_root, (PyObject *)inst);
+            pcc_gc_release((PyObject *)cls);
+            pcc_gc_release((PyObject *)inst);
+
+            if (pcc_gc_select_relocation_set(256) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(cls_root) != 1) return 5;
+            PyObject *moved_cls_raw = pcc_gc_relocate_copy(
+                cls_root,
+                (int64_t)sizeof(ProbeClassObject)
+            );
+            if (moved_cls_raw == 0) return 6;
+            pcc_gc_release(moved_cls_raw);
+
+            PyObject *loaded_cls = pcc_gc_load_ptr(0, &cls_root);
+            PyObject *loaded_inst = pcc_gc_load_ptr(0, &inst_root);
+            if (loaded_cls == 0 || loaded_inst == 0) return 7;
+            if (loaded_cls == (PyObject *)cls) return 8;
+
+            pcc_gc_telemetry_reset();
+            PyObject *s = py_user_str_dispatch(loaded_inst);
+            if (s != 0) return 9;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_READ_BARRIERS) <= 0) return 10;
+
+            ProbeInstanceObject *loaded_probe = (ProbeInstanceObject *)loaded_inst;
+            if ((PyObject *)loaded_probe->cls != loaded_cls) return 11;
+
+            pcc_gc_store_root(&inst_root, 0);
+            pcc_gc_store_root(&cls_root, 0);
+            pcc_gc_scheduler_root_unregister(&inst_root);
+            pcc_gc_scheduler_root_unregister(&cls_root);
+            printf("backend4-dunder-instance-class-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-dunder-instance-class-barrier-ok"
+
+
+def test_backend4_relocation_retargets_weakref_intrusive_list(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *target;
+            PyObject *callback;
+            void *prev;
+            void *next;
+        } ProbeWeakRefObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *target_root = 0;
+            PyObject *weakref_root = 0;
+            pcc_gc_scheduler_root_register(&target_root);
+            pcc_gc_scheduler_root_register(&weakref_root);
+
+            PyObject *target = py_list_new(0);
+            if (target == 0) return 3;
+            py_list_append(target, py_int_from_i64(33));
+            pcc_gc_store_root(&target_root, target);
+
+            PyObject *wr = py_weakref_new(target, py_None);
+            if (wr == 0) return 4;
+            pcc_gc_store_root(&weakref_root, wr);
+            pcc_gc_release(wr);
+            pcc_gc_release(target);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(weakref_root) != 1) return 6;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                weakref_root,
+                (int64_t)sizeof(ProbeWeakRefObject)
+            );
+            if (moved_raw == 0) return 7;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &weakref_root);
+            if (loaded == 0) return 8;
+            if (loaded == wr) return 9;
+
+            PyObject *live = py_weakref_call(loaded);
+            if (live == 0 || live == py_None) return 10;
+            if (py_list_len(live) != 1) return 11;
+            py_decref(live);
+
+            py_weakref_invalidate(target_root);
+            PyObject *dead = py_weakref_call(loaded);
+            if (dead != py_None) return 12;
+            py_decref(dead);
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 13;
+
+            pcc_gc_store_root(&weakref_root, 0);
+            pcc_gc_store_root(&target_root, 0);
+            pcc_gc_scheduler_root_unregister(&weakref_root);
+            pcc_gc_scheduler_root_unregister(&target_root);
+            printf("backend4-weakref-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-weakref-relocation-ok"
+
+
+def test_backend4_weakref_callback_loads_forwarded_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            PyObject *target;
+            PyObject *callback;
+            void *prev;
+            void *next;
+        } ProbeWeakRefObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            void *entry;
+            PyObject *captures;
+        } ProbeFuncObject;
+
+        static PyObject *probe_callback(PyObject *captures, PyObject *args) {
+            (void)args;
+            PyObject *seen = py_tuple_get(captures, 0);
+            if (seen == 0) return 0;
+            py_list_append(seen, py_int_from_i64(1));
+            py_decref(seen);
+            return pcc_gc_retain(py_None);
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *target_root = 0;
+            PyObject *weakref_root = 0;
+            PyObject *callback_root = 0;
+            PyObject *seen_root = 0;
+            pcc_gc_scheduler_root_register(&target_root);
+            pcc_gc_scheduler_root_register(&weakref_root);
+            pcc_gc_scheduler_root_register(&callback_root);
+            pcc_gc_scheduler_root_register(&seen_root);
+
+            PyObject *target = py_list_new(0);
+            PyObject *seen = py_list_new(0);
+            PyObject *captures = py_tuple_new(1);
+            if (target == 0 || seen == 0 || captures == 0) return 3;
+            py_tuple_set_item(captures, 0, seen);
+
+            PyObject *callback = py_func_new((void *)probe_callback, captures);
+            if (callback == 0) return 4;
+            PyObject *wr = py_weakref_new(target, callback);
+            if (wr == 0) return 5;
+
+            pcc_gc_store_root(&target_root, target);
+            pcc_gc_store_root(&weakref_root, wr);
+            pcc_gc_store_root(&callback_root, callback);
+            pcc_gc_store_root(&seen_root, seen);
+            pcc_gc_release(target);
+            pcc_gc_release(seen);
+            pcc_gc_release(captures);
+            pcc_gc_release(callback);
+            pcc_gc_release(wr);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 6;
+            if (pcc_gc_relocation_set_contains(callback_root) != 1) return 7;
+            PyObject *moved_callback_raw = pcc_gc_relocate_copy(
+                callback_root,
+                (int64_t)sizeof(ProbeFuncObject)
+            );
+            if (moved_callback_raw == 0) return 8;
+            pcc_gc_release(moved_callback_raw);
+
+            PyObject *loaded_callback = pcc_gc_load_ptr(0, &callback_root);
+            if (loaded_callback == 0) return 9;
+            if (loaded_callback == callback) return 10;
+
+            py_weakref_invalidate(target_root);
+
+            ProbeWeakRefObject *loaded_wr = (ProbeWeakRefObject *)pcc_gc_load_ptr(
+                0,
+                &weakref_root
+            );
+            if (loaded_wr == 0) return 11;
+            if (loaded_wr->callback != loaded_callback) return 12;
+
+            PyObject *loaded_seen = pcc_gc_load_ptr(0, &seen_root);
+            if (loaded_seen == 0) return 13;
+            if (py_list_len(loaded_seen) != 1) return 14;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 15;
+
+            pcc_gc_store_root(&seen_root, 0);
+            pcc_gc_store_root(&callback_root, 0);
+            pcc_gc_store_root(&weakref_root, 0);
+            pcc_gc_store_root(&target_root, 0);
+            pcc_gc_scheduler_root_unregister(&seen_root);
+            pcc_gc_scheduler_root_unregister(&callback_root);
+            pcc_gc_scheduler_root_unregister(&weakref_root);
+            pcc_gc_scheduler_root_unregister(&target_root);
+            printf("backend4-weakref-callback-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-weakref-callback-barrier-ok"
+
+
+def test_backend4_gc_callback_remove_loads_forwarded_list_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader header;
+            void *entry;
+            PyObject *captures;
+        } ProbeFuncObject;
+
+        static PyObject *probe_callback(PyObject *captures, PyObject *args) {
+            (void)captures;
+            (void)args;
+            return py_None;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *callback_root = 0;
+            pcc_gc_scheduler_root_register(&callback_root);
+
+            PyObject *captures = py_tuple_new(0);
+            if (captures == 0) return 3;
+            PyObject *callback = py_func_new((void *)probe_callback, captures);
+            if (callback == 0) return 4;
+            py_gc_callbacks_append(callback);
+            pcc_gc_store_root(&callback_root, callback);
+            pcc_gc_release(captures);
+            pcc_gc_release(callback);
+
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(callback_root) != 1) return 6;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                callback_root,
+                (int64_t)sizeof(ProbeFuncObject)
+            );
+            if (moved_raw == 0) return 12;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded_callback = pcc_gc_load_ptr(0, &callback_root);
+            if (loaded_callback == 0) return 7;
+            if (loaded_callback == callback) return 8;
+
+            pcc_gc_telemetry_reset();
+            py_gc_callbacks_remove(loaded_callback);
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_READ_BARRIERS) <= 0) return 9;
+
+            PyObject *callbacks = py_gc_callbacks_list();
+            if (callbacks == 0) return 10;
+            if (py_list_len(callbacks) != 0) return 11;
+            pcc_gc_release(callbacks);
+
+            pcc_gc_store_root(&callback_root, 0);
+            pcc_gc_scheduler_root_unregister(&callback_root);
+            printf("backend4-gc-callback-remove-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-gc-callback-remove-barrier-ok"
+
+
+def test_backend4_relocation_preserves_unstarted_thread_wrapper(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            void *handle;
+            PyObject *callable;
+            PyObject *args;
+            PyObject *result;
+            int64_t started;
+            int64_t joined;
+            int64_t finished;
+        } ProbeThreadObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            PyObject *args = py_tuple_new(1);
+            PyObject *arg = py_int_from_i64(44);
+            if (args == 0 || arg == 0) return 3;
+            py_tuple_set_item(args, 0, arg);
+
+            PyObject *thread = py_threading_thread_new(py_None, args);
+            if (thread == 0) return 4;
+            pcc_gc_store_root(&root, thread);
+            pcc_gc_release(thread);
+            pcc_gc_release(args);
+            pcc_gc_release(arg);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(root) != 1) return 6;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                root,
+                (int64_t)sizeof(ProbeThreadObject)
+            );
+            if (moved_raw == 0) return 7;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 8;
+            if (loaded == thread) return 9;
+            ProbeThreadObject *moved = (ProbeThreadObject *)loaded;
+            if (moved->handle != 0) return 10;
+            if (moved->callable != py_None) return 11;
+            if (moved->args == 0) return 12;
+            if (moved->result != 0) return 13;
+            if (moved->started != 0 || moved->joined != 0 || moved->finished != 0) return 14;
+
+            PyObject *loaded_arg = py_tuple_get(moved->args, 0);
+            if (py_int_to_i64(loaded_arg, 0) != 44) return 15;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 16;
+
+            pcc_gc_release(loaded_arg);
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-thread-relocation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-thread-relocation-ok"
+
+
+def test_backend4_thread_start_loads_forwarded_args_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            void *handle;
+            PyObject *callable;
+            PyObject *args;
+            PyObject *result;
+            int64_t started;
+            int64_t joined;
+            int64_t finished;
+        } ProbeThreadObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            PyObject *items[];
+        } ProbeTupleObject;
+
+        static PyObject *probe_thread_entry(PyObject *captures, PyObject *args) {
+            (void)captures;
+            return py_tuple_get(args, 0);
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *thread_root = 0;
+            PyObject *args_root = 0;
+            pcc_gc_scheduler_root_register(&thread_root);
+            pcc_gc_scheduler_root_register(&args_root);
+
+            PyObject *captures = py_tuple_new(0);
+            PyObject *callable = py_func_new((void *)probe_thread_entry, captures);
+            PyObject *arg = py_str_new("thread-arg", 10);
+            PyObject *args = py_tuple_new(1);
+            if (captures == 0 || callable == 0 || arg == 0 || args == 0) return 3;
+            py_tuple_set_item(args, 0, arg);
+
+            PyObject *thread = py_threading_thread_new(callable, args);
+            if (thread == 0) return 4;
+            pcc_gc_store_root(&thread_root, thread);
+            pcc_gc_store_root(&args_root, args);
+            pcc_gc_release(thread);
+            pcc_gc_release(args);
+            pcc_gc_release(arg);
+            pcc_gc_release(callable);
+            pcc_gc_release(captures);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(128) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(args_root) != 1) return 6;
+            PyObject *moved_args_raw = pcc_gc_relocate_copy(
+                args_root,
+                (int64_t)sizeof(ProbeTupleObject) + (int64_t)sizeof(PyObject *)
+            );
+            if (moved_args_raw == 0) return 7;
+            pcc_gc_release(moved_args_raw);
+
+            PyObject *loaded_args = pcc_gc_load_ptr(0, &args_root);
+            if (loaded_args == 0) return 8;
+            if (loaded_args == args) return 9;
+
+            if (py_threading_thread_start(thread_root) != 0) return 10;
+
+            ProbeThreadObject *loaded_thread = (ProbeThreadObject *)pcc_gc_load_ptr(
+                0,
+                &thread_root
+            );
+            if (loaded_thread == 0) return 11;
+            if (loaded_thread->args != loaded_args) return 12;
+            if (loaded_thread->result == 0) return 13;
+            PyObject *expected = py_str_new("thread-arg", 10);
+            if (expected == 0) return 14;
+            if (py_str_eq(loaded_thread->result, expected) != 1) return 15;
+            py_decref(expected);
+            if (loaded_thread->started != 1 || loaded_thread->joined != 1) return 16;
+            if (loaded_thread->finished != 1) return 17;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 18;
+
+            pcc_gc_store_root(&args_root, 0);
+            pcc_gc_store_root(&thread_root, 0);
+            pcc_gc_scheduler_root_unregister(&args_root);
+            pcc_gc_scheduler_root_unregister(&thread_root);
+            printf("backend4-thread-args-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-thread-args-barrier-ok"
+
+
+def test_backend4_module_attr_slot_helper_loads_forwarded_value(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *slot = 0;
+            pcc_gc_scheduler_root_register(&slot);
+
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            PyObject *default_value = py_str_new("default", 7);
+            if (value == 0 || default_value == 0) return 3;
+            int64_t value_id = pcc_gc_object_id(value);
+            pcc_gc_store_root(&slot, value);
+            pcc_gc_release(value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(slot) != 1) return 5;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                slot,
+                64
+            );
+            if (moved_raw == 0) return 6;
+            pcc_gc_release(moved_raw);
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &slot);
+            if (loaded == 0) return 7;
+            if (loaded == value) return 8;
+
+            PyObject *got = py_module_attr_value_or_default(&slot, default_value);
+            if (got != loaded) return 9;
+            if (slot != loaded) return 10;
+            if (pcc_gc_object_id(got) != value_id) return 11;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 13;
+
+            pcc_gc_store_root(&slot, 0);
+            pcc_gc_scheduler_root_unregister(&slot);
+            printf("backend4-module-attr-slot-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-module-attr-slot-barrier-ok"
+
+
+def test_backend4_relocation_skips_thread_wrapper_with_native_handle(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            void *handle;
+            PyObject *callable;
+            PyObject *args;
+            PyObject *result;
+            int64_t started;
+            int64_t joined;
+            int64_t finished;
+        } ProbeThreadObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            ProbeThreadObject *thread = (ProbeThreadObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeThreadObject),
+                PY_TYPE_THREAD,
+                0x100
+            );
+            if (thread == 0) return 3;
+            thread->handle = (void *)(uintptr_t)0x1;
+            thread->callable = 0;
+            thread->args = 0;
+            thread->result = 0;
+            thread->started = 1;
+            thread->joined = 0;
+            thread->finished = 0;
+            pcc_gc_store_root(&root, (PyObject *)thread);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) != 0) return 4;
+            if (pcc_gc_relocation_set_contains((PyObject *)thread) != 0) return 5;
+            if (pcc_gc_relocate_copy((PyObject *)thread, (int64_t)sizeof(ProbeThreadObject)) != 0) return 6;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 7;
+
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-thread-native-handle-skip-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-thread-native-handle-skip-ok"
+
+
+def test_backend4_relocation_skips_native_handle_wrappers(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            void *fp;
+            int closed;
+        } ProbeFileObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            void *mutex;
+        } ProbeLockObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            void *mutex;
+            int64_t owner;
+            int64_t depth;
+        } ProbeRLockObject;
+
+        typedef struct {
+            PyObjectHeader h;
+            void *mutex;
+            void *cond;
+            int64_t value;
+        } ProbeCondLikeObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeFileObject *file = (ProbeFileObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeFileObject), PY_TYPE_FILE, 0
+            );
+            ProbeLockObject *lock = (ProbeLockObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeLockObject), PY_TYPE_THREAD_LOCK, 0
+            );
+            ProbeRLockObject *rlock = (ProbeRLockObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeRLockObject), PY_TYPE_THREAD_RLOCK, 0
+            );
+            ProbeCondLikeObject *event = (ProbeCondLikeObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeCondLikeObject), PY_TYPE_THREAD_EVENT, 0
+            );
+            ProbeCondLikeObject *cond = (ProbeCondLikeObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeCondLikeObject), PY_TYPE_THREAD_CONDITION, 0
+            );
+            ProbeCondLikeObject *sem = (ProbeCondLikeObject *)pcc_gc_alloc(
+                (int64_t)sizeof(ProbeCondLikeObject), PY_TYPE_THREAD_SEMAPHORE, 0
+            );
+            if (
+                file == 0 || lock == 0 || rlock == 0
+                || event == 0 || cond == 0 || sem == 0
+            ) return 3;
+
+            file->fp = (void *)(uintptr_t)0x1;
+            file->closed = 0;
+            lock->mutex = (void *)(uintptr_t)0x2;
+            rlock->mutex = (void *)(uintptr_t)0x3;
+            rlock->owner = 0;
+            rlock->depth = 0;
+            event->mutex = (void *)(uintptr_t)0x4;
+            event->cond = (void *)(uintptr_t)0x5;
+            event->value = 0;
+            cond->mutex = (void *)(uintptr_t)0x6;
+            cond->cond = (void *)(uintptr_t)0x7;
+            cond->value = 0;
+            sem->mutex = (void *)(uintptr_t)0x8;
+            sem->cond = (void *)(uintptr_t)0x9;
+            sem->value = 1;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(64) != 0) return 4;
+            if (pcc_gc_relocation_set_contains((PyObject *)file) != 0) return 5;
+            if (pcc_gc_relocation_set_contains((PyObject *)lock) != 0) return 6;
+            if (pcc_gc_relocation_set_contains((PyObject *)rlock) != 0) return 7;
+            if (pcc_gc_relocation_set_contains((PyObject *)event) != 0) return 8;
+            if (pcc_gc_relocation_set_contains((PyObject *)cond) != 0) return 9;
+            if (pcc_gc_relocation_set_contains((PyObject *)sem) != 0) return 10;
+
+            if (
+                pcc_gc_relocate_copy(
+                    (PyObject *)file,
+                    (int64_t)sizeof(ProbeFileObject)
+                ) != 0
+            ) return 11;
+            if (
+                pcc_gc_relocate_copy(
+                    (PyObject *)lock,
+                    (int64_t)sizeof(ProbeLockObject)
+                ) != 0
+            ) return 12;
+            if (
+                pcc_gc_relocate_copy(
+                    (PyObject *)rlock,
+                    (int64_t)sizeof(ProbeRLockObject)
+                ) != 0
+            ) return 13;
+            if (
+                pcc_gc_relocate_copy(
+                    (PyObject *)event,
+                    (int64_t)sizeof(ProbeCondLikeObject)
+                ) != 0
+            ) return 14;
+            if (
+                pcc_gc_relocate_copy(
+                    (PyObject *)cond,
+                    (int64_t)sizeof(ProbeCondLikeObject)
+                ) != 0
+            ) return 15;
+            if (
+                pcc_gc_relocate_copy(
+                    (PyObject *)sem,
+                    (int64_t)sizeof(ProbeCondLikeObject)
+                ) != 0
+            ) return 16;
+
+            printf("backend4-native-handle-wrapper-skip-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-native-handle-wrapper-skip-ok"
+
+
+def test_backend4_fragmentation_score_tracks_live_evacuation_debt(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+            PyObject *s = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            int64_t stable = pcc_gc_object_id(s);
+            if (stable <= 0) return 10;
+            pcc_gc_store_root(&root, s);
+            pcc_gc_release(s);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_backend4_stable_id_entries() != 1) return 11;
+            if (pcc_gc_backend4_forwarding_entries() != 0) return 12;
+            if (pcc_gc_backend4_fragmentation_score() != 0) return 13;
+
+            if (pcc_gc_select_relocation_set(1) != 1) return 14;
+            if (pcc_gc_relocation_set_contains(s) != 1) return 15;
+            PyObject *moved = pcc_gc_relocate_copy(s, 64);
+            if (moved == 0) return 16;
+            pcc_gc_release(moved);
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_RELOCATION_FORWARDS) != 1) return 17;
+            if (pcc_gc_backend4_forwarding_entries() != 1) return 24;
+            if (pcc_gc_backend4_fragmentation_score() != 1) return 25;
+
+            PyObject *loaded = pcc_gc_load_ptr(0, &root);
+            if (loaded == 0) return 18;
+            if (loaded == s) return 19;
+            if (pcc_gc_object_id(loaded) != stable) return 20;
+            if (pcc_gc_backend4_forwarding_entries() != 0) return 21;
+            if (pcc_gc_backend4_stable_id_entries() != 1) return 22;
+            if (pcc_gc_backend4_fragmentation_score() != 0) return 23;
+
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-fragmentation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-fragmentation-ok"
+
+
+def test_backend4_genzgc_page_policy_records_candidates_and_evacuated_bytes(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *small_root = 0;
+            PyObject *medium_root = 0;
+            PyObject *large_root = 0;
+            pcc_gc_scheduler_root_register(&small_root);
+            pcc_gc_scheduler_root_register(&medium_root);
+            pcc_gc_scheduler_root_register(&large_root);
+
+            PyObject *small = pcc_gc_alloc(128, PY_TYPE_INT, 0x100);
+            PyObject *medium = pcc_gc_alloc(8192, PY_TYPE_INT, 0x100);
+            PyObject *large = pcc_gc_alloc(70000, PY_TYPE_INT, 0x100);
+            if (small == 0 || medium == 0 || large == 0) return 3;
+            pcc_gc_store_root(&small_root, small);
+            pcc_gc_store_root(&medium_root, medium);
+            pcc_gc_store_root(&large_root, large);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(32) != 2) return 4;
+            if (pcc_gc_relocation_set_size() != 2) return 5;
+            if (pcc_gc_relocation_set_contains(small) != 1) return 6;
+            if (pcc_gc_relocation_set_contains(medium) != 1) return 24;
+            if (pcc_gc_relocation_set_contains(large) != 0) return 7;
+            if (pcc_gc_backend4_evacuation_candidate_score() != 2) return 8;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATES) != 2) return 9;
+            if (pcc_gc_backend4_small_page_candidate_score() != 1) return 25;
+            if (pcc_gc_backend4_medium_page_candidate_score() != 1) return 26;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATES) != 1) return 27;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATES) != 1) return 28;
+            if (pcc_gc_backend4_evacuation_candidate_bytes() != 8320) return 29;
+            if (pcc_gc_backend4_small_page_candidate_bytes() != 128) return 30;
+            if (pcc_gc_backend4_medium_page_candidate_bytes() != 8192) return 31;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATE_BYTES) != 8320) return 32;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATE_BYTES) != 128) return 33;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATE_BYTES) != 8192) return 34;
+            if (pcc_gc_backend4_page_pressure_score() != 78320) return 35;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_PAGE_PRESSURE_SCORE) != 78320) return 36;
+            if (pcc_gc_backend4_page_policy_score() != 2) return 10;
+            if (pcc_gc_backend4_large_object_defer_score() != 1) return 15;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_DEFERS) != 1) return 16;
+            if (pcc_gc_backend4_large_object_deferred_bytes() != 70000) return 18;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_DEFERRED_BYTES) != 70000) return 19;
+            if (pcc_gc_backend4_large_object_reconsiderations() != 0) return 51;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_backend4_evacuation_candidate_score() != 2) return 43;
+            if (pcc_gc_backend4_evacuation_candidate_bytes() != 8320) return 44;
+            if (pcc_gc_backend4_small_page_candidate_score() != 1) return 45;
+            if (pcc_gc_backend4_medium_page_candidate_score() != 1) return 46;
+            if (pcc_gc_backend4_large_object_defer_score() != 0) return 47;
+            if (pcc_gc_backend4_large_object_deferred_bytes() != 0) return 48;
+            if (pcc_gc_backend4_large_object_reconsiderations() != 1) return 52;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_RECONSIDERATIONS) != 1) return 53;
+
+            if (pcc_gc_select_relocation_set(32) != 0) return 20;
+            if (pcc_gc_backend4_large_object_defer_score() != 1) return 21;
+            if (pcc_gc_backend4_large_object_deferred_bytes() != 70000) return 22;
+            if (pcc_gc_backend4_evacuation_candidate_score() != 2) return 49;
+            if (pcc_gc_backend4_evacuation_candidate_bytes() != 8320) return 50;
+
+            if (pcc_gc_step(2) < 2) return 11;
+            if (pcc_gc_backend4_evacuated_bytes() != 8320) return 12;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_EVACUATED_BYTES) != 8320) return 13;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_PAGE_POLICY_SCORE) != 8322) return 14;
+            if (pcc_gc_backend4_large_object_defer_score() != 1) return 17;
+            if (pcc_gc_backend4_large_object_deferred_bytes() != 70000) return 23;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_backend4_large_object_defer_score() != 0) return 37;
+            if (pcc_gc_backend4_large_object_deferred_bytes() != 0) return 38;
+            if (pcc_gc_backend4_large_object_reconsiderations() != 1) return 54;
+            if (pcc_gc_select_relocation_set(32) != 0) return 39;
+            if (pcc_gc_backend4_large_object_defer_score() != 1) return 40;
+            if (pcc_gc_backend4_large_object_deferred_bytes() != 70000) return 41;
+            if (pcc_gc_backend4_page_pressure_score() != 70000) return 42;
+
+            pcc_gc_store_root(&small_root, 0);
+            pcc_gc_store_root(&medium_root, 0);
+            pcc_gc_store_root(&large_root, 0);
+            pcc_gc_scheduler_root_unregister(&small_root);
+            pcc_gc_scheduler_root_unregister(&medium_root);
+            pcc_gc_scheduler_root_unregister(&large_root);
+            printf("backend4-page-policy-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-page-policy-ok"
+
+
+def test_backend4_genzgc_reset_relocation_set_clears_page_policy_shape(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *small_root = 0;
+            PyObject *medium_root = 0;
+            pcc_gc_scheduler_root_register(&small_root);
+            pcc_gc_scheduler_root_register(&medium_root);
+
+            PyObject *small = pcc_gc_alloc(128, PY_TYPE_INT, 0x100);
+            PyObject *medium = pcc_gc_alloc(8192, PY_TYPE_INT, 0x100);
+            if (small == 0 || medium == 0) return 3;
+            pcc_gc_store_root(&small_root, small);
+            pcc_gc_store_root(&medium_root, medium);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(32) != 2) return 4;
+            if (pcc_gc_relocation_set_size() != 2) return 5;
+            if (pcc_gc_backend4_evacuation_candidate_score() != 2) return 6;
+            if (pcc_gc_backend4_evacuation_candidate_bytes() != 8320) return 7;
+            if (pcc_gc_backend4_small_page_candidate_score() != 1) return 8;
+            if (pcc_gc_backend4_medium_page_candidate_score() != 1) return 9;
+
+            pcc_gc_reset_relocation_set();
+            if (pcc_gc_relocation_set_size() != 0) return 10;
+            if (pcc_gc_backend4_evacuation_candidate_score() != 0) return 11;
+            if (pcc_gc_backend4_evacuation_candidate_bytes() != 0) return 12;
+            if (pcc_gc_backend4_small_page_candidate_score() != 0) return 13;
+            if (pcc_gc_backend4_medium_page_candidate_score() != 0) return 14;
+            if (pcc_gc_backend4_small_page_candidate_bytes() != 0) return 15;
+            if (pcc_gc_backend4_medium_page_candidate_bytes() != 0) return 16;
+            if (pcc_gc_backend4_page_pressure_score() != 0) return 17;
+
+            pcc_gc_store_root(&small_root, 0);
+            pcc_gc_store_root(&medium_root, 0);
+            pcc_gc_scheduler_root_unregister(&small_root);
+            pcc_gc_scheduler_root_unregister(&medium_root);
+            printf("backend4-reset-relocation-shape-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-reset-relocation-shape-ok"
+
+
+def test_backend4_genzgc_store_barrier_remembers_old_to_young_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100,
+            PY_FLAG_GC_REMEMBERED = 0x200
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 2;
+            owner->capacity = 2;
+            owner->items = (PyObject **)calloc(2, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *child = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (child == 0) return 5;
+            PyObject *child2 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (child2 == 0) return 15;
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], child);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[1], child2);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], child);
+
+            if ((owner->h.flags & PY_FLAG_GC_REMEMBERED) == 0) return 6;
+            if (pcc_gc_backend4_generation_barrier_score() != 2) return 7;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BARRIERS) != 2) return 8;
+            if (pcc_gc_backend4_store_buffer_entries() != 2) return 12;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_ENTRIES) != 2) return 13;
+            if (pcc_gc_backend4_store_buffer_duplicate_skips() != 1) return 26;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DUPLICATE_SKIPS) != 1) return 27;
+            if (pcc_gc_backend4_store_buffer_high_water() != 2) return 28;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_HIGH_WATER) != 2) return 29;
+            if (pcc_gc_backend4_store_buffer_owner_fanout_high_water() != 2) return 31;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_OWNER_FANOUT_HIGH_WATER) != 2) return 32;
+
+            if (pcc_gc_step(1) < 1) return 9;
+            if ((owner->h.flags & PY_FLAG_GC_REMEMBERED) == 0) return 10;
+            if (pcc_gc_backend4_store_buffer_entries() != 1) return 14;
+            if (pcc_gc_backend4_store_buffer_drain_batches() != 1) return 20;
+            if (pcc_gc_backend4_store_buffer_drained_entries() != 1) return 21;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DRAIN_BATCHES) != 1) return 22;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DRAINED_ENTRIES) != 1) return 23;
+            if (pcc_gc_backend4_store_buffer_incomplete_drains() != 1) return 34;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_INCOMPLETE_DRAINS) != 1) return 35;
+
+            if (pcc_gc_step(1) < 1) return 16;
+            if ((owner->h.flags & PY_FLAG_GC_REMEMBERED) != 0) return 17;
+            if ((((PyObjectHeader *)child)->flags & PY_FLAG_GC_OLD) == 0) return 11;
+            if ((((PyObjectHeader *)child2)->flags & PY_FLAG_GC_OLD) == 0) return 18;
+            if (pcc_gc_backend4_store_buffer_entries() != 0) return 19;
+            if (pcc_gc_backend4_store_buffer_drain_batches() != 2) return 24;
+            if (pcc_gc_backend4_store_buffer_drained_entries() != 2) return 25;
+            if (pcc_gc_backend4_store_buffer_high_water() != 2) return 30;
+            if (pcc_gc_backend4_store_buffer_owner_fanout_high_water() != 2) return 33;
+            if (pcc_gc_backend4_store_buffer_incomplete_drains() != 1) return 36;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], 0);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[1], 0);
+            pcc_gc_release(child);
+            pcc_gc_release(child2);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-genzgc-store-barrier-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-genzgc-store-barrier-ok"
+
+
+def test_backend4_genzgc_store_buffer_owner_count_high_water(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100,
+            PY_FLAG_GC_PINNED = 0x40
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static ProbeListObject *new_owner(void) {
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 0;
+            owner->length = 1;
+            owner->capacity = 1;
+            owner->items = (PyObject **)calloc(1, sizeof(PyObject *));
+            if (owner->items == 0) return 0;
+            return owner;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner1 = new_owner();
+            ProbeListObject *owner2 = new_owner();
+            if (owner1 == 0 || owner2 == 0) return 3;
+
+            PyObject *child1 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *child2 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (child1 == 0 || child2 == 0) return 4;
+
+            pcc_gc_store_ptr((PyObject *)owner1, &owner1->items[0], child1);
+            pcc_gc_store_ptr((PyObject *)owner2, &owner2->items[0], child2);
+
+            if (pcc_gc_backend4_store_buffer_entries() != 2) return 5;
+            if (pcc_gc_backend4_store_buffer_high_water() != 2) return 6;
+            if (pcc_gc_backend4_store_buffer_owner_fanout_high_water() != 1) return 7;
+            if (pcc_gc_backend4_store_buffer_owner_count_high_water() != 2) return 8;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_OWNER_COUNT_HIGH_WATER) != 2) return 9;
+
+            if (pcc_gc_step(2) < 2) return 10;
+            if (pcc_gc_backend4_store_buffer_entries() != 0) return 11;
+            if (pcc_gc_backend4_store_buffer_owner_count_high_water() != 2) return 12;
+
+            pcc_gc_release(child1);
+            pcc_gc_release(child2);
+            pcc_gc_release((PyObject *)owner1);
+            pcc_gc_release((PyObject *)owner2);
+            printf("backend4-owner-count-high-water-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-owner-count-high-water-ok"
+
+
+def test_backend4_genzgc_store_buffer_drains_in_bounded_batches(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100,
+            PY_FLAG_GC_PINNED = 0x40
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 10;
+            owner->capacity = 10;
+            owner->items = (PyObject **)calloc(10, sizeof(PyObject *));
+            PyObject **children = (PyObject **)calloc(10, sizeof(PyObject *));
+            if (owner->items == 0 || children == 0) return 4;
+
+            for (int i = 0; i < 10; i++) {
+                children[i] = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+                if (children[i] == 0) return 5;
+                pcc_gc_store_ptr((PyObject *)owner, &owner->items[i], children[i]);
+            }
+
+            if (pcc_gc_backend4_store_buffer_entries() != 10) return 6;
+            if (pcc_gc_backend4_store_buffer_batch_capacity() != 8) return 7;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_BATCH_CAPACITY) != 8) return 8;
+
+            if (pcc_gc_step(10) < 8) return 9;
+            if (pcc_gc_backend4_store_buffer_entries() != 2) return 10;
+            if (pcc_gc_backend4_store_buffer_drain_batches() != 1) return 11;
+            if (pcc_gc_backend4_store_buffer_drained_entries() != 8) return 12;
+            if (pcc_gc_backend4_store_buffer_max_batch_size() != 8) return 13;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MAX_BATCH_SIZE) != 8) return 14;
+            if (pcc_gc_backend4_store_buffer_full_batches() != 1) return 15;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_FULL_BATCHES) != 1) return 16;
+            if (pcc_gc_backend4_store_buffer_incomplete_drains() != 1) return 17;
+
+            if (pcc_gc_step(10) < 2) return 18;
+            if (pcc_gc_backend4_store_buffer_entries() != 0) return 19;
+            if (pcc_gc_backend4_store_buffer_drain_batches() != 2) return 20;
+            if (pcc_gc_backend4_store_buffer_drained_entries() != 10) return 21;
+            if (pcc_gc_backend4_store_buffer_max_batch_size() != 8) return 22;
+            if (pcc_gc_backend4_store_buffer_full_batches() != 1) return 23;
+            if (pcc_gc_backend4_store_buffer_incomplete_drains() != 1) return 24;
+
+            for (int i = 0; i < 10; i++) {
+                pcc_gc_store_ptr((PyObject *)owner, &owner->items[i], 0);
+                pcc_gc_release(children[i]);
+            }
+            free(children);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-store-buffer-batches-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-store-buffer-batches-ok"
+
+
+def test_backend4_genzgc_store_buffer_uses_medium_path_before_global_flush(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 33;
+            owner->capacity = 33;
+            owner->items = (PyObject **)calloc(33, sizeof(PyObject *));
+            PyObject **children = (PyObject **)calloc(33, sizeof(PyObject *));
+            if (owner->items == 0 || children == 0) return 4;
+
+            if (pcc_gc_backend4_store_buffer_medium_capacity() != 32) return 5;
+            for (int i = 0; i < 33; i++) {
+                children[i] = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+                if (children[i] == 0) return 6;
+                pcc_gc_store_ptr((PyObject *)owner, &owner->items[i], children[i]);
+            }
+
+            if (pcc_gc_backend4_store_buffer_entries() != 33) return 7;
+            if (pcc_gc_backend4_store_buffer_medium_pending() != 1) return 8;
+            if (pcc_gc_backend4_store_buffer_medium_flushes() != 1) return 9;
+            if (pcc_gc_backend4_store_buffer_medium_flushed_entries() != 32) return 10;
+            if (pcc_gc_backend4_store_buffer_medium_full_flushes() != 1) return 11;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_PENDING) != 1) return 12;
+
+            if (pcc_gc_step(8) < 8) return 13;
+            if (pcc_gc_backend4_store_buffer_medium_pending() != 0) return 14;
+            if (pcc_gc_backend4_store_buffer_medium_flushes() != 2) return 15;
+            if (pcc_gc_backend4_store_buffer_medium_flushed_entries() != 33) return 16;
+            if (pcc_gc_backend4_store_buffer_entries() != 25) return 17;
+
+            if (pcc_gc_set_backend(PCC_GC_KIND_REFCOUNT_CYCLE) != 0) return 18;
+            if (pcc_gc_backend4_store_buffer_entries() != 0) return 19;
+            for (int i = 0; i < 33; i++) {
+                owner->items[i] = 0;
+                pcc_gc_release(children[i]);
+            }
+            free(children);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-store-buffer-medium-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-store-buffer-medium-ok"
+
+
+def test_backend4_genzgc_step_flushes_other_mutator_medium_buffer(tmp_path):
+    proc = _compile_and_run_threaded(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <unistd.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static int64_t worker_ready = 0;
+        static int64_t worker_done = 0;
+
+        static PyObject *probe_thread_entry(PyObject *captures, PyObject *args) {
+            (void)captures;
+            (void)args;
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return py_None;
+            owner->length = 5;
+            owner->capacity = 5;
+            owner->items = (PyObject **)calloc(5, sizeof(PyObject *));
+            if (owner->items == 0) return py_None;
+
+            for (int i = 0; i < 5; i++) {
+                PyObject *child = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+                if (child == 0) return py_None;
+                pcc_gc_store_ptr((PyObject *)owner, &owner->items[i], child);
+                pcc_gc_release(child);
+            }
+
+            __atomic_store_n(&worker_ready, 1, __ATOMIC_RELEASE);
+            while (__atomic_load_n(&worker_done, __ATOMIC_ACQUIRE) == 0) {
+                usleep(1000);
+            }
+            return py_None;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            PyObject *captures = py_tuple_new(0);
+            PyObject *args = py_tuple_new(0);
+            PyObject *callable = py_func_new((void *)probe_thread_entry, captures);
+            if (captures == 0 || args == 0 || callable == 0) return 3;
+            PyObject *thread = py_threading_thread_new(callable, args);
+            if (thread == 0) return 4;
+            pcc_gc_release(callable);
+            pcc_gc_release(args);
+            pcc_gc_release(captures);
+
+            if (py_threading_thread_start(thread) != 0) return 5;
+            int spins = 0;
+            while (__atomic_load_n(&worker_ready, __ATOMIC_ACQUIRE) == 0) {
+                usleep(1000);
+                spins++;
+                if (spins > 5000) return 6;
+            }
+
+            if (pcc_gc_backend4_store_buffer_medium_pending() != 5) return 7;
+            if (pcc_gc_backend4_store_buffer_entries() != 5) return 8;
+            if (pcc_gc_backend4_store_buffer_cross_thread_medium_flushes() != 0) return 9;
+            if (pcc_gc_backend4_store_buffer_cross_thread_medium_flushed_entries() != 0) return 10;
+
+            if (pcc_gc_step(8) < 5) return 11;
+            if (pcc_gc_backend4_store_buffer_medium_pending() != 0) return 12;
+            if (pcc_gc_backend4_store_buffer_entries() != 0) return 13;
+            if (pcc_gc_backend4_store_buffer_medium_flushes() != 1) return 14;
+            if (pcc_gc_backend4_store_buffer_medium_flushed_entries() != 5) return 15;
+            if (pcc_gc_backend4_store_buffer_cross_thread_medium_flushes() != 1) return 16;
+            if (pcc_gc_backend4_store_buffer_cross_thread_medium_flushed_entries() != 5) return 17;
+
+            __atomic_store_n(&worker_done, 1, __ATOMIC_RELEASE);
+            if (py_threading_thread_join(thread) != 0) return 18;
+            pcc_gc_release(thread);
+            printf("backend4-cross-thread-medium-flush-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-cross-thread-medium-flush-ok"
+
+
+def test_backend4_genzgc_fragmentation_policy_exposes_backlog_and_efficiency(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_reset_relocation_set();
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_backend4_small_page_limit_bytes() != 4096) return 20;
+            if (pcc_gc_backend4_medium_page_limit_bytes() != 65536) return 21;
+            if (pcc_gc_backend4_large_defer_limit_bytes() != 65536) return 22;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_SMALL_PAGE_LIMIT_BYTES) != 4096) return 23;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_LIMIT_BYTES) != 65536) return 24;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_LARGE_DEFER_LIMIT_BYTES) != 65536) return 25;
+
+            PyObject *a = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+
+            if (pcc_gc_select_relocation_set(2) != 2) return 4;
+            if (pcc_gc_backend4_evacuation_candidate_bytes() != 128) return 5;
+            if (pcc_gc_backend4_fragmentation_backlog_bytes() != 128) return 6;
+            if (pcc_gc_backend4_evacuation_efficiency_per_mille() != 0) return 7;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_FRAGMENTATION_BACKLOG_BYTES) != 128) return 8;
+
+            PyObject *moved = pcc_gc_relocate_copy(a, 64);
+            if (moved == 0) return 9;
+            if (pcc_gc_backend4_evacuated_bytes() != 64) return 10;
+            if (pcc_gc_backend4_fragmentation_backlog_bytes() != 64) return 11;
+            if (pcc_gc_backend4_evacuation_efficiency_per_mille() != 500) return 12;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_EVACUATION_EFFICIENCY_PER_MILLE) != 500) return 13;
+            if (pcc_gc_backend4_fragmentation_policy_score() != 64) return 14;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_FRAGMENTATION_POLICY_SCORE) != 64) return 15;
+
+            pcc_gc_reset_relocation_set();
+            pcc_gc_release(moved);
+            pcc_gc_release(a);
+            pcc_gc_release(b);
+            printf("backend4-fragmentation-policy-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-fragmentation-policy-ok"
+
+
+def test_backend4_genzgc_selector_prefers_fragmented_zpage(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_reset_relocation_set();
+            pcc_gc_telemetry_reset();
+
+            PyObject *medium = pcc_gc_alloc(8192, PY_TYPE_INT, 0);
+            PyObject *small = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (medium == 0 || small == 0) return 3;
+
+            if (pcc_gc_select_relocation_set(1) != 1) return 4;
+            if (pcc_gc_relocation_set_contains(medium) != 1) return 5;
+            if (pcc_gc_relocation_set_contains(small) != 0) return 6;
+            if (pcc_gc_backend4_medium_page_candidate_score() != 1) return 7;
+            if (pcc_gc_backend4_small_page_candidate_score() != 0) return 8;
+            if (pcc_gc_backend4_evacuation_candidate_bytes() != 8192) return 9;
+
+            pcc_gc_reset_relocation_set();
+            pcc_gc_release(small);
+            pcc_gc_release(medium);
+            printf("backend4-fragmented-zpage-selector-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-fragmented-zpage-selector-ok"
+
+
+def test_backend4_genzgc_remembered_set_tracks_unique_dirty_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 2;
+            owner->capacity = 2;
+            owner->items = (PyObject **)calloc(2, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *child1 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *child2 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *child3 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (child1 == 0 || child2 == 0 || child3 == 0) return 5;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], child1);
+            if (pcc_gc_backend4_remembered_set_entries() != 1) return 6;
+            if (pcc_gc_backend4_remembered_set_high_water() != 1) return 7;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], child2);
+            if (pcc_gc_backend4_remembered_set_entries() != 1) return 8;
+            if (pcc_gc_backend4_remembered_set_duplicate_skips() != 1) return 9;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[1], child3);
+            if (pcc_gc_backend4_remembered_set_entries() != 2) return 10;
+            if (pcc_gc_backend4_remembered_set_high_water() != 2) return 11;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_ENTRIES) != 2) return 12;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_DUPLICATE_SKIPS) != 1) return 13;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_HIGH_WATER) != 2) return 14;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_backend4_remembered_set_entries() != 2) return 15;
+            if (pcc_gc_backend4_remembered_set_high_water() != 2) return 16;
+            if (pcc_gc_backend4_remembered_set_duplicate_skips() != 0) return 17;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], 0);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[1], 0);
+            pcc_gc_release(child1);
+            pcc_gc_release(child2);
+            pcc_gc_release(child3);
+            pcc_gc_release((PyObject *)owner);
+            if (pcc_gc_backend4_remembered_set_entries() != 0) return 18;
+            printf("backend4-remset-bitmap-slots-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-remset-bitmap-slots-ok"
+
+
+def test_backend4_genzgc_remembered_page_bitmap_predicate_and_clear(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 3;
+            owner->capacity = 3;
+            owner->items = (PyObject **)calloc(3, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *child0 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *child2 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (child0 == 0 || child2 == 0) return 5;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], child0);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[2], child2);
+            if (pcc_gc_backend4_remembered_page_entries() != 1) return 6;
+            if (pcc_gc_backend4_remembered_page_slot_entries() != 2) return 7;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[0]) != 1) return 8;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[1]) != 0) return 9;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[2]) != 1) return 10;
+
+            if (pcc_gc_backend4_remembered_page_clear_slot(&owner->items[0]) != 1) return 11;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[0]) != 0) return 12;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[2]) != 1) return 13;
+            if (pcc_gc_backend4_remembered_set_entries() != 1) return 14;
+            if (pcc_gc_backend4_remembered_page_slot_entries() != 1) return 15;
+            if (pcc_gc_backend4_remembered_page_entries() != 1) return 16;
+
+            if (pcc_gc_backend4_remembered_page_clear_slot(&owner->items[0]) != 0) return 17;
+            if (pcc_gc_backend4_remembered_page_clear_slot(&owner->items[2]) != 1) return 18;
+            if (pcc_gc_backend4_remembered_page_entries() != 0) return 19;
+            if (pcc_gc_backend4_remembered_page_slot_entries() != 0) return 20;
+            if (pcc_gc_backend4_remembered_set_entries() != 0) return 21;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], 0);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[2], 0);
+            pcc_gc_release(child0);
+            pcc_gc_release(child2);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-remset-page-bitmap-api-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-remset-page-bitmap-api-ok"
+
+
+def test_backend4_genzgc_telemetry_reset_reseeds_pending_store_buffer_shape(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 2;
+            owner->capacity = 2;
+            owner->items = (PyObject **)calloc(2, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *child1 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *child2 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (child1 == 0 || child2 == 0) return 5;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], child1);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[1], child2);
+            if (pcc_gc_backend4_store_buffer_entries() != 2) return 6;
+            if (pcc_gc_backend4_store_buffer_high_water() != 2) return 7;
+            if (pcc_gc_backend4_store_buffer_owner_fanout_high_water() != 2) return 8;
+            if (pcc_gc_backend4_store_buffer_owner_count_high_water() != 1) return 9;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_backend4_store_buffer_entries() != 2) return 10;
+            if (pcc_gc_backend4_store_buffer_high_water() != 2) return 11;
+            if (pcc_gc_backend4_store_buffer_owner_fanout_high_water() != 2) return 12;
+            if (pcc_gc_backend4_store_buffer_owner_count_high_water() != 1) return 13;
+            if (pcc_gc_backend4_store_buffer_duplicate_skips() != 0) return 14;
+            if (pcc_gc_backend4_store_buffer_drain_batches() != 0) return 15;
+
+            if (pcc_gc_step(2) < 2) return 16;
+            if (pcc_gc_backend4_store_buffer_entries() != 0) return 17;
+
+            pcc_gc_release(child1);
+            pcc_gc_release(child2);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-reset-reseeds-store-buffer-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-reset-reseeds-store-buffer-ok"
+
+
+def test_backend4_genzgc_store_buffer_clear_resets_shape_telemetry(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 1;
+            owner->capacity = 1;
+            owner->items = (PyObject **)calloc(1, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *child = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (child == 0) return 5;
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], child);
+
+            if (pcc_gc_backend4_store_buffer_entries() != 1) return 6;
+            if (pcc_gc_backend4_store_buffer_high_water() != 1) return 7;
+            if (pcc_gc_backend4_store_buffer_owner_fanout_high_water() != 1) return 8;
+            if (pcc_gc_backend4_store_buffer_owner_count_high_water() != 1) return 9;
+
+            if (pcc_gc_set_backend(PCC_GC_KIND_REFCOUNT_CYCLE) != 0) return 10;
+            if (pcc_gc_backend4_store_buffer_entries() != 0) return 11;
+            if (pcc_gc_backend4_store_buffer_high_water() != 0) return 12;
+            if (pcc_gc_backend4_store_buffer_owner_fanout_high_water() != 0) return 13;
+            if (pcc_gc_backend4_store_buffer_owner_count_high_water() != 0) return 14;
+
+            pcc_gc_release(child);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-clear-resets-store-buffer-shape-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-clear-resets-store-buffer-shape-ok"
+
+
+def test_backend4_genzgc_store_buffer_keeps_value_snapshot_until_drain(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100,
+            PY_FLAG_GC_REMEMBERED = 0x200
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 1;
+            owner->capacity = 1;
+            owner->items = (PyObject **)calloc(1, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *child = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (child == 0) return 5;
+            PyObject *child2 = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (child2 == 0) return 16;
+
+            pcc_gc_note_slot_write_barrier((PyObject *)owner, &owner->items[0], child);
+            pcc_gc_note_slot_write_barrier((PyObject *)owner, &owner->items[0], child2);
+            pcc_gc_note_slot_write_barrier((PyObject *)owner, &owner->items[0], child);
+            if ((owner->h.flags & PY_FLAG_GC_REMEMBERED) == 0) return 6;
+            if (pcc_gc_backend4_generation_barrier_score() != 2) return 7;
+            if (pcc_gc_backend4_store_buffer_entries() != 2) return 8;
+            if (owner->items[0] != 0) return 9;
+
+            if (pcc_gc_step(1) < 1) return 10;
+            if ((owner->h.flags & PY_FLAG_GC_REMEMBERED) == 0) return 11;
+            if (pcc_gc_backend4_store_buffer_entries() != 1) return 12;
+            if (owner->items[0] != 0) return 13;
+
+            if (pcc_gc_step(1) < 1) return 14;
+            if ((((PyObjectHeader *)child)->flags & PY_FLAG_GC_OLD) == 0) return 15;
+            if ((((PyObjectHeader *)child)->flags & PY_FLAG_GC_YOUNG) != 0) return 17;
+            if ((((PyObjectHeader *)child2)->flags & PY_FLAG_GC_OLD) == 0) return 18;
+            if ((((PyObjectHeader *)child2)->flags & PY_FLAG_GC_YOUNG) != 0) return 19;
+            if ((owner->h.flags & PY_FLAG_GC_REMEMBERED) != 0) return 20;
+            if (pcc_gc_backend4_store_buffer_entries() != 0) return 21;
+            if (owner->items[0] != 0) return 22;
+
+            pcc_gc_release(child);
+            pcc_gc_release(child2);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-genzgc-store-snapshot-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-genzgc-store-snapshot-ok"
+
+
+def test_backend4_genzgc_allocations_default_young_and_age_to_old(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            PyObject *young = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (young == 0) return 3;
+            if ((((PyObjectHeader *)young)->flags & PY_FLAG_GC_YOUNG) == 0) return 4;
+            if ((((PyObjectHeader *)young)->flags & PY_FLAG_GC_OLD) != 0) return 5;
+
+            PyObject *explicit_old = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_OLD);
+            if (explicit_old == 0) return 6;
+            if ((((PyObjectHeader *)explicit_old)->flags & PY_FLAG_GC_OLD) == 0) return 7;
+            if ((((PyObjectHeader *)explicit_old)->flags & PY_FLAG_GC_YOUNG) != 0) return 8;
+            if (pcc_gc_backend4_young_object_count() != 1) return 14;
+            if (pcc_gc_backend4_old_object_count() != 1) return 15;
+            if (pcc_gc_backend4_young_bytes() != 64) return 16;
+            if (pcc_gc_backend4_old_bytes() != 64) return 17;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_YOUNG_OBJECTS) != 1) return 18;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_OLD_OBJECTS) != 1) return 19;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_YOUNG_BYTES) != 64) return 20;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_OLD_BYTES) != 64) return 21;
+
+            if (pcc_gc_step(1) < 1) return 9;
+            if ((((PyObjectHeader *)young)->flags & PY_FLAG_GC_OLD) == 0) return 10;
+            if ((((PyObjectHeader *)young)->flags & PY_FLAG_GC_YOUNG) != 0) return 11;
+            if (pcc_gc_backend4_generation_promotion_score() != 1) return 12;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_YOUNG_PROMOTIONS) != 1) return 13;
+            if (pcc_gc_backend4_young_object_count() != 0) return 22;
+            if (pcc_gc_backend4_old_object_count() != 2) return 23;
+            if (pcc_gc_backend4_young_bytes() != 0) return 24;
+            if (pcc_gc_backend4_old_bytes() != 128) return 25;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_YOUNG_OBJECTS) != 0) return 26;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_OLD_OBJECTS) != 2) return 27;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_YOUNG_BYTES) != 0) return 28;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_OLD_BYTES) != 128) return 29;
+
+            pcc_gc_release(young);
+            pcc_gc_release(explicit_old);
+            printf("backend4-genzgc-aging-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-genzgc-aging-ok"
+
+
+def test_backend4_genzgc_page_class_live_population_telemetry(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t small_count0 = pcc_gc_backend4_small_page_object_count();
+            int64_t medium_count0 = pcc_gc_backend4_medium_page_object_count();
+            int64_t large_count0 = pcc_gc_backend4_large_page_object_count();
+            int64_t small_bytes0 = pcc_gc_backend4_small_page_live_bytes();
+            int64_t medium_bytes0 = pcc_gc_backend4_medium_page_live_bytes();
+            int64_t large_bytes0 = pcc_gc_backend4_large_page_live_bytes();
+
+            PyObject *small = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *medium = pcc_gc_alloc(8192, PY_TYPE_INT, 0);
+            PyObject *large = pcc_gc_alloc(70000, PY_TYPE_INT, 0);
+            if (small == 0 || medium == 0 || large == 0) return 3;
+
+            if (pcc_gc_backend4_small_page_object_count() - small_count0 != 1) return 4;
+            if (pcc_gc_backend4_medium_page_object_count() - medium_count0 != 1) return 5;
+            if (pcc_gc_backend4_large_page_object_count() - large_count0 != 1) return 6;
+            if (pcc_gc_backend4_small_page_live_bytes() - small_bytes0 != 128) return 7;
+            if (pcc_gc_backend4_medium_page_live_bytes() - medium_bytes0 != 8192) return 8;
+            if (pcc_gc_backend4_large_page_live_bytes() - large_bytes0 != 70000) return 9;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_SMALL_PAGE_OBJECTS) - small_count0 != 1) return 10;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_OBJECTS) - medium_count0 != 1) return 11;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_LARGE_PAGE_OBJECTS) - large_count0 != 1) return 12;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_SMALL_PAGE_BYTES) - small_bytes0 != 128) return 13;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_BYTES) - medium_bytes0 != 8192) return 14;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_LARGE_PAGE_BYTES) - large_bytes0 != 70000) return 15;
+
+            pcc_gc_release(large);
+            pcc_gc_release(medium);
+            pcc_gc_release(small);
+            printf("backend4-page-class-live-telemetry-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-page-class-live-telemetry-ok"
+
+
+def test_backend4_genzgc_zpage_ownership_telemetry(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t count0 = pcc_gc_backend4_zpage_count();
+            int64_t capacity0 = pcc_gc_backend4_zpage_capacity_bytes();
+            int64_t fragmentation0 = pcc_gc_backend4_zpage_fragmentation_bytes();
+            int64_t large0 = pcc_gc_backend4_zpage_large_pages();
+            int64_t used0 = pcc_gc_backend4_zpage_used_bytes();
+            int64_t fragmented0 = pcc_gc_backend4_zpage_fragmented_pages();
+            int64_t young0 = pcc_gc_backend4_zpage_young_pages();
+            int64_t old0 = pcc_gc_backend4_zpage_old_pages();
+            int64_t policy0 = pcc_gc_backend4_zpage_policy_score();
+
+            PyObject *small = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *medium = pcc_gc_alloc(8192, PY_TYPE_INT, 0);
+            PyObject *large = pcc_gc_alloc(70000, PY_TYPE_INT, 0);
+            if (small == 0 || medium == 0 || large == 0) return 3;
+
+            int64_t expected_capacity = 4096 + 65536 + 131072;
+            int64_t expected_fragmentation = (4096 - 128) + (65536 - 8192) + (131072 - 70000);
+            int64_t expected_policy = expected_fragmentation + 3;
+            if (pcc_gc_backend4_zpage_count() - count0 != 3) return 4;
+            if (pcc_gc_backend4_zpage_capacity_bytes() - capacity0 != expected_capacity) return 5;
+            if (pcc_gc_backend4_zpage_fragmentation_bytes() - fragmentation0 != expected_fragmentation) return 6;
+            if (pcc_gc_backend4_zpage_large_pages() - large0 != 1) return 7;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 78320) return 12;
+            if (pcc_gc_backend4_zpage_fragmentation_per_mille() <= 0) return 13;
+            if (pcc_gc_backend4_zpage_fragmented_pages() - fragmented0 != 3) return 23;
+            if (pcc_gc_backend4_zpage_young_pages() - young0 != 3) return 26;
+            if (pcc_gc_backend4_zpage_old_pages() != old0) return 27;
+            if (pcc_gc_backend4_zpage_policy_score() - policy0 != expected_policy) return 16;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_COUNT) - count0 != 3) return 8;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_CAPACITY_BYTES) - capacity0 != expected_capacity) return 9;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTATION_BYTES) - fragmentation0 != expected_fragmentation) return 10;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_LARGE_PAGES) - large0 != 1) return 11;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_USED_BYTES) - used0 != 78320) return 14;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTATION_PER_MILLE) <= 0) return 15;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_POLICY_SCORE) - policy0 != expected_policy) return 17;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTED_PAGES) - fragmented0 != 3) return 24;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_YOUNG_PAGES) - young0 != 3) return 28;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_OLD_PAGES) != old0) return 29;
+
+            pcc_gc_release(large);
+            pcc_gc_release(medium);
+            pcc_gc_release(small);
+            if (pcc_gc_backend4_zpage_count() != count0) return 18;
+            if (pcc_gc_backend4_zpage_capacity_bytes() != capacity0) return 19;
+            if (pcc_gc_backend4_zpage_fragmentation_bytes() != fragmentation0) return 20;
+            if (pcc_gc_backend4_zpage_large_pages() != large0) return 21;
+            if (pcc_gc_backend4_zpage_used_bytes() != used0) return 22;
+            if (pcc_gc_backend4_zpage_fragmented_pages() != fragmented0) return 25;
+            if (pcc_gc_backend4_zpage_young_pages() != young0) return 30;
+            if (pcc_gc_backend4_zpage_old_pages() != old0) return 31;
+            printf("backend4-zpage-telemetry-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-telemetry-ok"
+
+
+def test_backend4_genzgc_small_objects_share_zpage(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t count0 = pcc_gc_backend4_zpage_count();
+            int64_t capacity0 = pcc_gc_backend4_zpage_capacity_bytes();
+            int64_t used0 = pcc_gc_backend4_zpage_used_bytes();
+            int64_t fragmentation0 = pcc_gc_backend4_zpage_fragmentation_bytes();
+            int64_t fragmented0 = pcc_gc_backend4_zpage_fragmented_pages();
+            int64_t young0 = pcc_gc_backend4_zpage_young_pages();
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+
+            if (pcc_gc_backend4_zpage_count() - count0 != 1) return 4;
+            if (pcc_gc_backend4_zpage_capacity_bytes() - capacity0 != 4096) return 5;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 256) return 6;
+            if (pcc_gc_backend4_zpage_fragmentation_bytes() - fragmentation0 != 3840) return 7;
+            if (pcc_gc_backend4_zpage_fragmented_pages() - fragmented0 != 1) return 8;
+            if (pcc_gc_backend4_zpage_young_pages() - young0 != 1) return 9;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_COUNT) - count0 != 1) return 10;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_CAPACITY_BYTES) - capacity0 != 4096) return 11;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_USED_BYTES) - used0 != 256) return 12;
+
+            pcc_gc_release(b);
+            if (pcc_gc_backend4_zpage_count() - count0 != 1) return 13;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 128) return 14;
+            if (pcc_gc_backend4_zpage_fragmentation_bytes() - fragmentation0 != 3968) return 15;
+
+            pcc_gc_release(a);
+            if (pcc_gc_backend4_zpage_count() != count0) return 16;
+            if (pcc_gc_backend4_zpage_capacity_bytes() != capacity0) return 17;
+            if (pcc_gc_backend4_zpage_used_bytes() != used0) return 18;
+            if (pcc_gc_backend4_zpage_fragmentation_bytes() != fragmentation0) return 19;
+            printf("backend4-small-zpage-sharing-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-small-zpage-sharing-ok"
+
+
+def test_backend4_genzgc_zpage_tracks_virtual_span_gap(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t count0 = pcc_gc_backend4_zpage_count();
+            int64_t used0 = pcc_gc_backend4_zpage_used_bytes();
+            int64_t allocated0 = pcc_gc_backend4_zpage_allocated_bytes();
+            int64_t gap0 = pcc_gc_backend4_zpage_reclaimable_gap_bytes();
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+
+            if (pcc_gc_backend4_zpage_count() - count0 != 1) return 4;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 256) return 5;
+            if (pcc_gc_backend4_zpage_allocated_bytes() - allocated0 != 256) return 6;
+            if (pcc_gc_backend4_zpage_reclaimable_gap_bytes() != gap0) return 7;
+
+            pcc_gc_release(b);
+            if (pcc_gc_backend4_zpage_count() - count0 != 1) return 8;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 128) return 9;
+            if (pcc_gc_backend4_zpage_allocated_bytes() - allocated0 != 256) return 10;
+            if (pcc_gc_backend4_zpage_reclaimable_gap_bytes() - gap0 != 128) return 11;
+
+            PyObject *c = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (c == 0) return 12;
+            if (pcc_gc_backend4_zpage_count() - count0 != 1) return 13;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 256) return 14;
+            if (pcc_gc_backend4_zpage_allocated_bytes() - allocated0 != 384) return 15;
+            if (pcc_gc_backend4_zpage_reclaimable_gap_bytes() - gap0 != 128) return 16;
+
+            pcc_gc_release(c);
+            pcc_gc_release(a);
+            if (pcc_gc_backend4_zpage_count() != count0) return 17;
+            if (pcc_gc_backend4_zpage_used_bytes() != used0) return 18;
+            if (pcc_gc_backend4_zpage_allocated_bytes() != allocated0) return 19;
+            if (pcc_gc_backend4_zpage_reclaimable_gap_bytes() != gap0) return 20;
+
+            printf("backend4-zpage-virtual-span-gap-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-virtual-span-gap-ok"
+
+
+def test_backend4_genzgc_objects_are_carved_from_zpage_span(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t count0 = pcc_gc_backend4_zpage_count();
+            int64_t used0 = pcc_gc_backend4_zpage_used_bytes();
+            int64_t allocated0 = pcc_gc_backend4_zpage_allocated_bytes();
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+            if ((uintptr_t)b - (uintptr_t)a != 128) return 4;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(a) != 0) return 5;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(b) != 128) return 6;
+            if (pcc_gc_backend4_zpage_count() - count0 != 1) return 7;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 256) return 8;
+            if (pcc_gc_backend4_zpage_allocated_bytes() - allocated0 != 256) return 9;
+
+            pcc_gc_release(b);
+            pcc_gc_release(a);
+            if (pcc_gc_backend4_zpage_count() != count0) return 10;
+            if (pcc_gc_backend4_zpage_used_bytes() != used0) return 11;
+            if (pcc_gc_backend4_zpage_allocated_bytes() != allocated0) return 12;
+
+            printf("backend4-zpage-real-span-alloc-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-real-span-alloc-ok"
+
+
+def test_backend4_genzgc_large_object_uses_dedicated_zpage_span(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t count0 = pcc_gc_backend4_zpage_count();
+            int64_t large0 = pcc_gc_backend4_zpage_large_pages();
+            int64_t capacity0 = pcc_gc_backend4_zpage_capacity_bytes();
+            int64_t used0 = pcc_gc_backend4_zpage_used_bytes();
+            int64_t allocated0 = pcc_gc_backend4_zpage_allocated_bytes();
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+            int64_t freecap0 = pcc_gc_backend4_zpage_free_capacity_bytes();
+
+            PyObject *large = pcc_gc_alloc(70000, PY_TYPE_INT, 0);
+            if (large == 0) return 3;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(large) != 0) return 4;
+            if (pcc_gc_backend4_zpage_owner_size_bytes(large) != 70000) return 5;
+            if (pcc_gc_backend4_zpage_count() - count0 != 1) return 6;
+            if (pcc_gc_backend4_zpage_large_pages() - large0 != 1) return 7;
+            if (pcc_gc_backend4_zpage_capacity_bytes() - capacity0 != 131072) return 8;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 70000) return 9;
+            if (pcc_gc_backend4_zpage_allocated_bytes() - allocated0 != 70000) return 10;
+
+            pcc_gc_release(large);
+            if (pcc_gc_backend4_zpage_count() != count0) return 11;
+            if (pcc_gc_backend4_zpage_large_pages() != large0) return 12;
+            if (pcc_gc_backend4_zpage_capacity_bytes() != capacity0) return 13;
+            if (pcc_gc_backend4_zpage_used_bytes() != used0) return 14;
+            if (pcc_gc_backend4_zpage_allocated_bytes() != allocated0) return 15;
+            if (pcc_gc_backend4_zpage_free_pages() != free0) return 16;
+            if (pcc_gc_backend4_zpage_free_capacity_bytes() != freecap0) return 17;
+
+            printf("backend4-large-zpage-span-lifecycle-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-large-zpage-span-lifecycle-ok"
+
+
+def test_backend4_genzgc_step_evacuates_fragmented_large_zpage(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *root = 0;
+            pcc_gc_scheduler_root_register(&root);
+
+            int64_t large0 = pcc_gc_backend4_zpage_large_pages();
+            int64_t capacity0 = pcc_gc_backend4_zpage_capacity_bytes();
+            int64_t used0 = pcc_gc_backend4_zpage_used_bytes();
+            int64_t allocated0 = pcc_gc_backend4_zpage_allocated_bytes();
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+            int64_t freecap0 = pcc_gc_backend4_zpage_free_capacity_bytes();
+
+            PyObject *large = pcc_gc_alloc(70000, PY_TYPE_INT, 0x100);
+            if (large == 0) return 3;
+            pcc_gc_store_root(&root, large);
+            pcc_gc_release(large);
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(root) != 0) return 4;
+            if (pcc_gc_backend4_zpage_owner_size_bytes(root) != 70000) return 5;
+            if (pcc_gc_backend4_zpage_large_pages() - large0 != 1) return 6;
+            if (pcc_gc_backend4_zpage_capacity_bytes() - capacity0 != 131072) return 7;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 70000) return 8;
+            if (pcc_gc_backend4_zpage_allocated_bytes() - allocated0 != 70000) return 9;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_step(1) != 1) return 10;
+            if (pcc_gc_backend4_evacuated_bytes() != 70000) return 11;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_EVACUATED_BYTES) != 70000) return 12;
+            if (pcc_gc_relocation_set_size() != 0) return 13;
+
+            PyObject *moved = pcc_gc_load_ptr(0, &root);
+            if (moved == 0) return 14;
+            if (moved == large) return 15;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(large) != -1) return 16;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(moved) != 0) return 17;
+            if (pcc_gc_backend4_zpage_owner_size_bytes(moved) != 70000) return 18;
+            if (pcc_gc_backend4_zpage_large_pages() - large0 != 1) return 19;
+            if (pcc_gc_backend4_zpage_capacity_bytes() - capacity0 != 131072) return 20;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 70000) return 21;
+            if (pcc_gc_backend4_zpage_allocated_bytes() - allocated0 != 70000) return 22;
+            if (pcc_gc_backend4_zpage_free_pages() != free0) return 23;
+            if (pcc_gc_backend4_zpage_free_capacity_bytes() != freecap0) return 24;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 25;
+
+            pcc_gc_store_root(&root, 0);
+            pcc_gc_scheduler_root_unregister(&root);
+            printf("backend4-large-zpage-step-evacuation-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-large-zpage-step-evacuation-ok"
+
+
+def test_backend4_genzgc_zpage_exposes_owner_virtual_span_location(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            PyObject *a = pcc_gc_alloc(600, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(600, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(a) != 0) return 4;
+            if (pcc_gc_backend4_zpage_owner_size_bytes(a) != 600) return 5;
+            if (pcc_gc_backend4_zpage_owner_span_card(a) != 0) return 6;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(b) != 600) return 7;
+            if (pcc_gc_backend4_zpage_owner_size_bytes(b) != 600) return 8;
+            if (pcc_gc_backend4_zpage_owner_span_card(b) != 1) return 9;
+
+            pcc_gc_release(b);
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(b) != -1) return 10;
+            if (pcc_gc_backend4_zpage_owner_size_bytes(b) != -1) return 11;
+            if (pcc_gc_backend4_zpage_owner_span_card(b) != -1) return 12;
+
+            PyObject *c = pcc_gc_alloc(600, PY_TYPE_INT, 0);
+            if (c == 0) return 13;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(c) != 1200) return 14;
+            if (pcc_gc_backend4_zpage_owner_size_bytes(c) != 600) return 15;
+            if (pcc_gc_backend4_zpage_owner_span_card(c) != 2) return 16;
+
+            pcc_gc_release(c);
+            pcc_gc_release(a);
+            printf("backend4-zpage-owner-span-location-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-owner-span-location-ok"
+
+
+def test_backend4_genzgc_zpage_backing_span_survives_free_cache(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t active_span0 = pcc_gc_backend4_zpage_span_bytes();
+            int64_t free_span0 = pcc_gc_backend4_zpage_free_span_bytes();
+            int64_t free_pages0 = pcc_gc_backend4_zpage_free_pages();
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (a == 0) return 3;
+            if (pcc_gc_backend4_zpage_span_bytes() - active_span0 != 4096) return 4;
+            if (pcc_gc_backend4_zpage_free_span_bytes() != free_span0) return 5;
+
+            pcc_gc_release(a);
+            if (pcc_gc_backend4_zpage_span_bytes() != active_span0) return 6;
+            if (pcc_gc_backend4_zpage_free_pages() - free_pages0 != 1) return 7;
+            if (pcc_gc_backend4_zpage_free_span_bytes() - free_span0 != 4096) return 8;
+
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (b == 0) return 9;
+            if (pcc_gc_backend4_zpage_span_bytes() - active_span0 != 4096) return 10;
+            if (pcc_gc_backend4_zpage_free_pages() != free_pages0) return 11;
+            if (pcc_gc_backend4_zpage_free_span_bytes() != free_span0) return 12;
+
+            pcc_gc_release(b);
+            if (pcc_gc_backend4_zpage_span_bytes() != active_span0) return 13;
+            if (pcc_gc_backend4_zpage_free_pages() - free_pages0 != 1) return 14;
+            if (pcc_gc_backend4_zpage_free_span_bytes() - free_span0 != 4096) return 15;
+
+            printf("backend4-zpage-backing-span-cache-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-backing-span-cache-ok"
+
+
+def test_backend4_genzgc_candidate_zpage_bytes_count_shared_page_once(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+            if (pcc_gc_backend4_zpage_count() < 1) return 4;
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(2) != 2) return 5;
+            if (pcc_gc_relocation_set_contains(a) != 1) return 6;
+            if (pcc_gc_relocation_set_contains(b) != 1) return 7;
+            if (pcc_gc_backend4_evacuation_candidate_bytes() != 256) return 8;
+            if (pcc_gc_backend4_small_page_candidate_bytes() != 256) return 9;
+            if (pcc_gc_backend4_evacuation_candidate_zpage_bytes() != 256) return 10;
+            if (pcc_gc_backend4_small_page_candidate_zpage_bytes() != 256) return 11;
+            if (pcc_gc_backend4_medium_page_candidate_zpage_bytes() != 0) return 12;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 1) return 20;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATE_ZPAGE_BYTES) != 256) return 13;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATE_ZPAGE_BYTES) != 256) return 14;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATE_ZPAGE_BYTES) != 0) return 15;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_EVACUATION_PAGE_CANDIDATES) != 1) return 21;
+
+            int64_t pages_before_move = pcc_gc_backend4_zpage_count();
+            PyObject *moved_a = pcc_gc_relocate_copy(a, 128);
+            if (moved_a == 0) return 24;
+            if (pcc_gc_backend4_zpage_count() <= pages_before_move) return 29;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 1) return 25;
+            PyObject *moved_b = pcc_gc_relocate_copy(b, 128);
+            if (moved_b == 0) return 26;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 0) return 27;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_EVACUATION_PAGE_CANDIDATES) != 0) return 28;
+            if (pcc_gc_backend4_zpage_free_pages() <= free0) return 30;
+            py_decref(moved_a);
+            py_decref(moved_b);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_backend4_evacuation_candidate_zpage_bytes() != 0) return 16;
+            if (pcc_gc_backend4_small_page_candidate_zpage_bytes() != 0) return 17;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 0) return 22;
+
+            pcc_gc_reset_relocation_set();
+            if (pcc_gc_backend4_evacuation_candidate_zpage_bytes() != 0) return 18;
+            if (pcc_gc_backend4_small_page_candidate_zpage_bytes() != 0) return 19;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 0) return 23;
+            printf("backend4-zpage-candidate-bytes-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-candidate-bytes-ok"
+
+
+def test_backend4_genzgc_relocation_targets_use_non_evacuation_zpage(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+            if ((uintptr_t)b - (uintptr_t)a != 128) return 4;
+
+            int64_t pages0 = pcc_gc_backend4_zpage_count();
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+            if (pcc_gc_select_relocation_set(2) != 2) return 5;
+
+            PyObject *moved_a = pcc_gc_relocate_copy(a, 128);
+            if (moved_a == 0) return 6;
+            if (moved_a == a || moved_a == b) return 7;
+            if (pcc_gc_backend4_zpage_count() <= pages0) return 8;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(moved_a) != 0) return 9;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(b) != 128) return 10;
+
+            PyObject *moved_b = pcc_gc_relocate_copy(b, 128);
+            if (moved_b == 0) return 11;
+            if ((uintptr_t)moved_b - (uintptr_t)moved_a != 128) return 12;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(moved_b) != 128) return 13;
+            if (pcc_gc_backend4_zpage_free_pages() <= free0) return 14;
+
+            py_decref(moved_a);
+            py_decref(moved_b);
+            printf("backend4-relocation-target-zpage-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-relocation-target-zpage-ok"
+
+
+def test_backend4_genzgc_medium_objects_share_zpage(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t count0 = pcc_gc_backend4_zpage_count();
+            int64_t capacity0 = pcc_gc_backend4_zpage_capacity_bytes();
+            int64_t used0 = pcc_gc_backend4_zpage_used_bytes();
+            int64_t fragmentation0 = pcc_gc_backend4_zpage_fragmentation_bytes();
+            int64_t fragmented0 = pcc_gc_backend4_zpage_fragmented_pages();
+
+            PyObject *a = pcc_gc_alloc(8192, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(8192, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+
+            if (pcc_gc_backend4_zpage_count() - count0 != 1) return 4;
+            if (pcc_gc_backend4_zpage_capacity_bytes() - capacity0 != 65536) return 5;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 16384) return 6;
+            if (pcc_gc_backend4_zpage_fragmentation_bytes() - fragmentation0 != 49152) return 7;
+            if (pcc_gc_backend4_zpage_fragmented_pages() - fragmented0 != 1) return 8;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_COUNT) - count0 != 1) return 9;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_CAPACITY_BYTES) - capacity0 != 65536) return 10;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_USED_BYTES) - used0 != 16384) return 11;
+
+            pcc_gc_release(b);
+            if (pcc_gc_backend4_zpage_count() - count0 != 1) return 12;
+            if (pcc_gc_backend4_zpage_used_bytes() - used0 != 8192) return 13;
+            if (pcc_gc_backend4_zpage_fragmentation_bytes() - fragmentation0 != 57344) return 14;
+
+            pcc_gc_release(a);
+            if (pcc_gc_backend4_zpage_count() != count0) return 15;
+            if (pcc_gc_backend4_zpage_capacity_bytes() != capacity0) return 16;
+            if (pcc_gc_backend4_zpage_used_bytes() != used0) return 17;
+            if (pcc_gc_backend4_zpage_fragmentation_bytes() != fragmentation0) return 18;
+            printf("backend4-medium-zpage-sharing-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-medium-zpage-sharing-ok"
+
+
+def test_backend4_genzgc_reuses_empty_zpages_from_free_list(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t active0 = pcc_gc_backend4_zpage_count();
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+            int64_t freecap0 = pcc_gc_backend4_zpage_free_capacity_bytes();
+
+            PyObject *small = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (small == 0) return 3;
+            pcc_gc_release(small);
+            if (pcc_gc_backend4_zpage_count() != active0) return 4;
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 1) return 5;
+            if (pcc_gc_backend4_zpage_free_capacity_bytes() - freecap0 != 4096) return 6;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_PAGES) - free0 != 1) return 7;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_CAPACITY_BYTES) - freecap0 != 4096) return 8;
+
+            small = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (small == 0) return 9;
+            if (pcc_gc_backend4_zpage_count() - active0 != 1) return 10;
+            if (pcc_gc_backend4_zpage_free_pages() != free0) return 11;
+            if (pcc_gc_backend4_zpage_free_capacity_bytes() != freecap0) return 12;
+            pcc_gc_release(small);
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 1) return 13;
+
+            PyObject *medium = pcc_gc_alloc(8192, PY_TYPE_INT, 0);
+            if (medium == 0) return 14;
+            pcc_gc_release(medium);
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 2) return 15;
+            if (pcc_gc_backend4_zpage_free_capacity_bytes() - freecap0 != 69632) return 16;
+
+            medium = pcc_gc_alloc(8192, PY_TYPE_INT, 0);
+            if (medium == 0) return 17;
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 1) return 18;
+            if (pcc_gc_backend4_zpage_free_capacity_bytes() - freecap0 != 4096) return 19;
+            pcc_gc_release(medium);
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 2) return 20;
+
+            PyObject *large = pcc_gc_alloc(70000, PY_TYPE_INT, 0);
+            if (large == 0) return 21;
+            pcc_gc_release(large);
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 2) return 22;
+            if (pcc_gc_backend4_zpage_free_capacity_bytes() - freecap0 != 69632) return 23;
+
+            printf("backend4-zpage-free-list-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-free-list-ok"
+
+
+def test_backend4_genzgc_free_zpage_cache_is_bounded(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+            int64_t freecap0 = pcc_gc_backend4_zpage_free_capacity_bytes();
+            PyObject *small[320];
+            PyObject *medium[48];
+
+            for (int i = 0; i < 320; i++) {
+                small[i] = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+                if (small[i] == 0) return 3;
+            }
+            for (int i = 0; i < 320; i++) pcc_gc_release(small[i]);
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 8) return 4;
+            if (pcc_gc_backend4_zpage_free_capacity_bytes() - freecap0 != 32768) return 5;
+
+            for (int i = 0; i < 48; i++) {
+                medium[i] = pcc_gc_alloc(8192, PY_TYPE_INT, 0);
+                if (medium[i] == 0) return 6;
+            }
+            for (int i = 0; i < 48; i++) pcc_gc_release(medium[i]);
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 12) return 7;
+            if (pcc_gc_backend4_zpage_free_capacity_bytes() - freecap0 != 294912) return 8;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_PAGES) - free0 != 12) return 9;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_CAPACITY_BYTES) - freecap0 != 294912) return 10;
+
+            printf("backend4-zpage-free-cache-bounded-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-free-cache-bounded-ok"
+
+
+def test_backend4_genzgc_zpage_tracks_generation_age_pressure(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            int64_t young0 = pcc_gc_backend4_zpage_young_pages();
+            int64_t old0 = pcc_gc_backend4_zpage_old_pages();
+            int64_t count0 = pcc_gc_backend4_zpage_count();
+            int64_t capacity0 = pcc_gc_backend4_zpage_capacity_bytes();
+            int64_t policy0 = pcc_gc_backend4_zpage_policy_score();
+
+            PyObject *young = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *old = pcc_gc_alloc(128, PY_TYPE_INT, PY_FLAG_GC_OLD);
+            if (young == 0 || old == 0) return 3;
+
+            int64_t expected_fragmentation = (4096 - 128) * 2;
+            int64_t expected_policy = expected_fragmentation + 2 + 1;
+            if (pcc_gc_backend4_zpage_young_pages() - young0 != 1) return 4;
+            if (pcc_gc_backend4_zpage_old_pages() - old0 != 1) return 5;
+            if (pcc_gc_backend4_zpage_count() - count0 != 2) return 12;
+            if (pcc_gc_backend4_zpage_capacity_bytes() - capacity0 != 8192) return 13;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_YOUNG_PAGES) - young0 != 1) return 6;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_OLD_PAGES) - old0 != 1) return 7;
+            if (pcc_gc_backend4_zpage_policy_score() - policy0 != expected_policy) return 8;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_POLICY_SCORE) - policy0 != expected_policy) return 9;
+
+            pcc_gc_release(old);
+            pcc_gc_release(young);
+            if (pcc_gc_backend4_zpage_young_pages() != young0) return 10;
+            if (pcc_gc_backend4_zpage_old_pages() != old0) return 11;
+            printf("backend4-zpage-age-pressure-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-age-pressure-ok"
+
+
+def test_backend4_genzgc_zpage_tracks_owner_remembered_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100,
+            PY_FLAG_GC_PINNED = 0x40
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 9;
+            owner->capacity = 9;
+            owner->items = (PyObject **)calloc(9, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *a = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *b = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *c = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (a == 0 || b == 0 || c == 0) return 5;
+
+            int64_t slots0 = pcc_gc_backend4_zpage_remembered_slots();
+            int64_t cards0 = pcc_gc_backend4_zpage_remembered_cards();
+            int64_t ratio0 = pcc_gc_backend4_zpage_remembered_card_ratio_per_mille();
+            int64_t dirty0 = pcc_gc_backend4_zpage_dirty_pages();
+            int64_t policy0 = pcc_gc_backend4_zpage_policy_score();
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_SLOTS) != slots0) return 6;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARDS) != cards0) return 20;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARD_RATIO_PER_MILLE) != ratio0) return 21;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_DIRTY_PAGES) != dirty0) return 22;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], a);
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 7;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_SLOTS) - slots0 != 1) return 8;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 9;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARDS) - cards0 != 1) return 23;
+            if (pcc_gc_backend4_zpage_remembered_card_ratio_per_mille() <= ratio0) return 24;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARD_RATIO_PER_MILLE) != pcc_gc_backend4_zpage_remembered_card_ratio_per_mille()) return 25;
+            if (pcc_gc_backend4_zpage_policy_score() - policy0 != 3) return 26;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 27;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_ZPAGE_DIRTY_PAGES) - dirty0 != 1) return 28;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], b);
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 10;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 26;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 27;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[1], b);
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 2) return 11;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 12;
+            if (pcc_gc_backend4_zpage_policy_score() - policy0 != 4) return 13;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 29;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[8], c);
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 3) return 35;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 36;
+            if (pcc_gc_backend4_zpage_policy_score() - policy0 != 5) return 37;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 38;
+
+            if (pcc_gc_backend4_remembered_page_clear_slot(&owner->items[0]) != 1) return 14;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 2) return 15;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 16;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 44;
+            if (pcc_gc_backend4_remembered_page_clear_slot(&owner->items[0]) != 0) return 17;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 2) return 18;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 19;
+            if (pcc_gc_backend4_remembered_page_clear_slot(&owner->items[1]) != 1) return 30;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 31;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 32;
+            if (pcc_gc_backend4_remembered_page_clear_slot(&owner->items[8]) != 1) return 39;
+            if (pcc_gc_backend4_zpage_remembered_slots() != slots0) return 40;
+            if (pcc_gc_backend4_zpage_remembered_cards() != cards0) return 41;
+            if (pcc_gc_backend4_zpage_remembered_card_ratio_per_mille() != ratio0) return 45;
+            if (pcc_gc_backend4_zpage_policy_score() != policy0) return 42;
+            if (pcc_gc_backend4_zpage_dirty_pages() != dirty0) return 43;
+
+            owner->items[0] = 0;
+            owner->items[1] = 0;
+            owner->items[8] = 0;
+            pcc_gc_release(a);
+            pcc_gc_release(b);
+            pcc_gc_release(c);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-zpage-remembered-slots-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-remembered-slots-ok"
+
+
+def test_backend4_genzgc_zpage_card_api_clears_owner_card(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 9;
+            owner->capacity = 9;
+            owner->items = (PyObject **)calloc(9, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *a = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *b = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *c = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (a == 0 || b == 0 || c == 0) return 5;
+
+            int64_t slots0 = pcc_gc_backend4_zpage_remembered_slots();
+            int64_t cards0 = pcc_gc_backend4_zpage_remembered_cards();
+            int64_t dirty0 = pcc_gc_backend4_zpage_dirty_pages();
+            int64_t pages0 = pcc_gc_backend4_remembered_page_entries();
+            int64_t page_slots0 = pcc_gc_backend4_remembered_page_slot_entries();
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], a);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[1], b);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[8], c);
+
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 3) return 6;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 7;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 8;
+            if (pcc_gc_backend4_remembered_page_entries() - pages0 != 1) return 9;
+            if (pcc_gc_backend4_remembered_page_slot_entries() - page_slots0 != 3) return 10;
+
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->items[0]) != 1) return 11;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->items[7]) != 1) return 12;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->items[8]) != 1) return 13;
+            if (pcc_gc_backend4_zpage_contains_remembered_card(a, &owner->items[0]) != 0) return 14;
+
+            if (pcc_gc_backend4_zpage_clear_remembered_card((PyObject *)owner, &owner->items[0]) != 3) return 15;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[0]) != 0) return 16;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[1]) != 0) return 17;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[8]) != 0) return 18;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->items[0]) != 0) return 19;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->items[8]) != 0) return 20;
+            if (pcc_gc_backend4_zpage_remembered_slots() != slots0) return 21;
+            if (pcc_gc_backend4_zpage_remembered_cards() != cards0) return 22;
+            if (pcc_gc_backend4_zpage_dirty_pages() != dirty0) return 23;
+
+            if (pcc_gc_backend4_zpage_clear_remembered_card((PyObject *)owner, &owner->items[0]) != 0) return 24;
+            if (pcc_gc_backend4_zpage_clear_remembered_card(a, &owner->items[8]) != 0) return 25;
+            if (pcc_gc_backend4_zpage_clear_remembered_card((PyObject *)owner, &owner->items[8]) != 0) return 26;
+            if (pcc_gc_backend4_zpage_remembered_slots() != slots0) return 27;
+            if (pcc_gc_backend4_zpage_remembered_cards() != cards0) return 28;
+            if (pcc_gc_backend4_zpage_dirty_pages() != dirty0) return 29;
+            if (pcc_gc_backend4_remembered_page_entries() != pages0) return 30;
+            if (pcc_gc_backend4_remembered_page_slot_entries() != page_slots0) return 31;
+
+            owner->items[0] = 0;
+            owner->items[1] = 0;
+            owner->items[8] = 0;
+            pcc_gc_release(a);
+            pcc_gc_release(b);
+            pcc_gc_release(c);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-zpage-card-api-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-card-api-ok"
+
+
+def test_backend4_genzgc_zpage_card_refcount_is_shared_by_page_span_card(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *left = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            ProbeListObject *right = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (left == 0 || right == 0) return 3;
+            left->length = 1;
+            left->capacity = 1;
+            right->length = 1;
+            right->capacity = 1;
+            left->items = (PyObject **)calloc(1, sizeof(PyObject *));
+            right->items = (PyObject **)calloc(1, sizeof(PyObject *));
+            if (left->items == 0 || right->items == 0) return 4;
+
+            if (pcc_gc_backend4_zpage_owner_span_card((PyObject *)left) != 0) return 5;
+            if (pcc_gc_backend4_zpage_owner_span_card((PyObject *)right) != 0) return 6;
+
+            PyObject *a = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *b = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (a == 0 || b == 0) return 7;
+
+            int64_t slots0 = pcc_gc_backend4_zpage_remembered_slots();
+            int64_t cards0 = pcc_gc_backend4_zpage_remembered_cards();
+            int64_t dirty0 = pcc_gc_backend4_zpage_dirty_pages();
+            int64_t page_slots0 = pcc_gc_backend4_remembered_page_slot_entries();
+
+            pcc_gc_store_ptr((PyObject *)left, &left->items[0], a);
+            pcc_gc_store_ptr((PyObject *)right, &right->items[0], b);
+
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 2) return 8;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 9;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 10;
+            if (pcc_gc_backend4_remembered_page_slot_entries() - page_slots0 != 2) return 11;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)left, &left->items[0]) != 1) return 12;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)right, &right->items[0]) != 1) return 13;
+
+            if (pcc_gc_backend4_zpage_clear_remembered_card((PyObject *)left, &left->items[0]) != 1) return 14;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&left->items[0]) != 0) return 15;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&right->items[0]) != 1) return 16;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 17;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 18;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 19;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)left, &left->items[0]) != 1) return 20;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)right, &right->items[0]) != 1) return 21;
+
+            if (pcc_gc_backend4_zpage_clear_remembered_card((PyObject *)right, &right->items[0]) != 1) return 22;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&right->items[0]) != 0) return 23;
+            if (pcc_gc_backend4_zpage_remembered_slots() != slots0) return 24;
+            if (pcc_gc_backend4_zpage_remembered_cards() != cards0) return 25;
+            if (pcc_gc_backend4_zpage_dirty_pages() != dirty0) return 26;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)left, &left->items[0]) != 0) return 27;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)right, &right->items[0]) != 0) return 28;
+
+            left->items[0] = 0;
+            right->items[0] = 0;
+            pcc_gc_release(a);
+            pcc_gc_release(b);
+            pcc_gc_release((PyObject *)right);
+            pcc_gc_release((PyObject *)left);
+            printf("backend4-zpage-shared-span-card-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-shared-span-card-ok"
+
+
+def test_backend4_genzgc_inline_slots_use_owner_slot_span_card(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stddef.h>
+        #include <stdint.h>
+        #include <stdio.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            char pad0[520];
+            PyObject *near_slot;
+            char pad1[512];
+            PyObject *far_slot;
+        } ProbeInlineSlots;
+
+        static int64_t expected_card(int64_t owner_offset, size_t slot_offset) {
+            return ((owner_offset + (int64_t)slot_offset)
+                / PCC_GC_BACKEND4_ZPAGE_SPAN_CARD_BYTES) % 64;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeInlineSlots *owner = (ProbeInlineSlots *)pcc_gc_alloc(
+                sizeof(ProbeInlineSlots),
+                PY_TYPE_INT,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->near_slot = 0;
+            owner->far_slot = 0;
+
+            int64_t owner_offset = pcc_gc_backend4_zpage_owner_offset_bytes((PyObject *)owner);
+            if (owner_offset < 0) return 4;
+            int64_t near_card = pcc_gc_backend4_zpage_owner_slot_span_card(
+                (PyObject *)owner,
+                &owner->near_slot
+            );
+            int64_t far_card = pcc_gc_backend4_zpage_owner_slot_span_card(
+                (PyObject *)owner,
+                &owner->far_slot
+            );
+            if (near_card != expected_card(owner_offset, offsetof(ProbeInlineSlots, near_slot))) return 5;
+            if (far_card != expected_card(owner_offset, offsetof(ProbeInlineSlots, far_slot))) return 6;
+            if (near_card == far_card) return 7;
+
+            PyObject *a = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *b = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (a == 0 || b == 0) return 8;
+
+            int64_t slots0 = pcc_gc_backend4_zpage_remembered_slots();
+            int64_t cards0 = pcc_gc_backend4_zpage_remembered_cards();
+            int64_t dirty0 = pcc_gc_backend4_zpage_dirty_pages();
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->near_slot, a);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->far_slot, b);
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 2) return 9;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 2) return 10;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 11;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->near_slot) != 1) return 12;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->far_slot) != 1) return 13;
+
+            if (pcc_gc_backend4_zpage_clear_remembered_card((PyObject *)owner, &owner->near_slot) != 1) return 14;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->near_slot) != 0) return 15;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->far_slot) != 1) return 16;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 17;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 18;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 19;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->near_slot) != 0) return 20;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->far_slot) != 1) return 21;
+
+            if (pcc_gc_backend4_zpage_clear_remembered_card((PyObject *)owner, &owner->far_slot) != 1) return 22;
+            if (pcc_gc_backend4_zpage_remembered_slots() != slots0) return 23;
+            if (pcc_gc_backend4_zpage_remembered_cards() != cards0) return 24;
+            if (pcc_gc_backend4_zpage_dirty_pages() != dirty0) return 25;
+
+            owner->near_slot = 0;
+            owner->far_slot = 0;
+            pcc_gc_release(a);
+            pcc_gc_release(b);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-inline-slot-span-card-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-inline-slot-span-card-ok"
+
+
+def test_backend4_genzgc_payload_slots_use_registered_payload_span_card(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static int64_t expected_card(int64_t span_offset) {
+            return (span_offset / PCC_GC_BACKEND4_ZPAGE_SPAN_CARD_BYTES) % 64;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 96;
+            owner->capacity = 96;
+            owner->items = (PyObject **)calloc(96, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            int64_t payload_offset = pcc_gc_backend4_zpage_register_owner_payload_span(
+                (PyObject *)owner,
+                owner->items,
+                96 * (int64_t)sizeof(PyObject *)
+            );
+            if (payload_offset < 0) return 5;
+
+            int64_t first_card = pcc_gc_backend4_zpage_owner_slot_span_card(
+                (PyObject *)owner,
+                &owner->items[0]
+            );
+            int64_t far_card = pcc_gc_backend4_zpage_owner_slot_span_card(
+                (PyObject *)owner,
+                &owner->items[80]
+            );
+            if (first_card != expected_card(payload_offset)) return 6;
+            if (far_card != expected_card(payload_offset + 80 * (int64_t)sizeof(PyObject *))) return 7;
+            if (first_card == far_card) return 8;
+
+            PyObject *a = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *b = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (a == 0 || b == 0) return 9;
+
+            int64_t slots0 = pcc_gc_backend4_zpage_remembered_slots();
+            int64_t cards0 = pcc_gc_backend4_zpage_remembered_cards();
+            int64_t dirty0 = pcc_gc_backend4_zpage_dirty_pages();
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], a);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[80], b);
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 2) return 10;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 2) return 11;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 12;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->items[0]) != 1) return 13;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->items[80]) != 1) return 14;
+
+            if (pcc_gc_backend4_zpage_clear_remembered_card((PyObject *)owner, &owner->items[0]) != 1) return 15;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[0]) != 0) return 16;
+            if (pcc_gc_backend4_remembered_page_contains_slot(&owner->items[80]) != 1) return 17;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 18;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 19;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->items[0]) != 0) return 20;
+            if (pcc_gc_backend4_zpage_contains_remembered_card((PyObject *)owner, &owner->items[80]) != 1) return 21;
+
+            if (pcc_gc_backend4_zpage_clear_remembered_card((PyObject *)owner, &owner->items[80]) != 1) return 22;
+            if (pcc_gc_backend4_zpage_remembered_slots() != slots0) return 23;
+            if (pcc_gc_backend4_zpage_remembered_cards() != cards0) return 24;
+            if (pcc_gc_backend4_zpage_dirty_pages() != dirty0) return 25;
+
+            owner->items[0] = 0;
+            owner->items[80] = 0;
+            pcc_gc_release(a);
+            pcc_gc_release(b);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-payload-slot-span-card-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-payload-slot-span-card-ok"
+
+
+def test_backend4_genzgc_container_payload_allocators_register_spans(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        static int card_differs(int64_t a, int64_t b) {
+            return a >= 0 && b >= 0 && a != b;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            PyObject *list_obj = py_list_new(96);
+            if (list_obj == 0) return 3;
+            PyListObject *list = (PyListObject *)list_obj;
+            if (list->capacity < 96 || list->items == 0) return 4;
+            int64_t list_card0 = pcc_gc_backend4_zpage_owner_slot_span_card(
+                list_obj,
+                &list->items[0]
+            );
+            int64_t list_card80 = pcc_gc_backend4_zpage_owner_slot_span_card(
+                list_obj,
+                &list->items[80]
+            );
+            if (!card_differs(list_card0, list_card80)) return 5;
+
+            PyObject *dict_obj = py_dict_new();
+            if (dict_obj == 0) return 6;
+            PyDictObject *dict = (PyDictObject *)dict_obj;
+            for (int64_t i = 0; i < 20; i++) {
+                PyObject *key = py_int_from_i64(i);
+                PyObject *value = py_int_from_i64(i + 1000);
+                if (key == 0 || value == 0) return 7;
+                py_dict_set(dict_obj, key, value);
+                pcc_gc_release(key);
+                pcc_gc_release(value);
+            }
+            if (dict->capacity <= 24 || dict->entries == 0) return 8;
+            int64_t dict_card0 = pcc_gc_backend4_zpage_owner_slot_span_card(
+                dict_obj,
+                &dict->entries[0].key
+            );
+            int64_t dict_card24 = pcc_gc_backend4_zpage_owner_slot_span_card(
+                dict_obj,
+                &dict->entries[24].key
+            );
+            if (!card_differs(dict_card0, dict_card24)) return 9;
+
+            pcc_gc_release(dict_obj);
+            pcc_gc_release(list_obj);
+
+            PyObject *set_obj = py_set_new();
+            if (set_obj == 0) return 10;
+            PySetObject *set = (PySetObject *)set_obj;
+            for (int64_t i = 0; i < 22; i++) {
+                PyObject *item = py_int_from_i64(i + 2000);
+                if (item == 0) return 11;
+                py_set_add(set_obj, item);
+                pcc_gc_release(item);
+            }
+            if (set->capacity <= 32 || set->entries == 0) return 12;
+            int64_t set_card0 = pcc_gc_backend4_zpage_owner_slot_span_card(
+                set_obj,
+                &set->entries[0].key
+            );
+            int64_t set_card32 = pcc_gc_backend4_zpage_owner_slot_span_card(
+                set_obj,
+                &set->entries[32].key
+            );
+            if (!card_differs(set_card0, set_card32)) return 13;
+
+            pcc_gc_release(set_obj);
+            printf("backend4-container-payload-span-registration-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-container-payload-span-registration-ok"
+
+
+def test_backend4_genzgc_relocation_retargets_remembered_list_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 2;
+            owner->capacity = 2;
+            owner->items = (PyObject **)calloc(2, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *young = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (young == 0) return 5;
+
+            int64_t slots0 = pcc_gc_backend4_zpage_remembered_slots();
+            int64_t cards0 = pcc_gc_backend4_zpage_remembered_cards();
+            int64_t dirty0 = pcc_gc_backend4_zpage_dirty_pages();
+
+            PyObject **old_slot = &owner->items[0];
+            pcc_gc_store_ptr((PyObject *)owner, old_slot, young);
+            if (pcc_gc_backend4_remembered_page_contains_slot(old_slot) != 1) return 6;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 7;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 8;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 9;
+
+            if (pcc_gc_select_relocation_set(8) <= 0) return 10;
+            if (pcc_gc_relocation_set_contains((PyObject *)owner) != 1) return 11;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                (PyObject *)owner,
+                (int64_t)sizeof(ProbeListObject)
+            );
+            if (moved_raw == 0) return 12;
+            ProbeListObject *moved = (ProbeListObject *)moved_raw;
+            if (moved == owner) return 13;
+            if (moved->items == owner->items) return 14;
+            if (moved->items[0] != young) return 15;
+
+            PyObject **new_slot = &moved->items[0];
+            if (pcc_gc_backend4_remembered_page_contains_slot(old_slot) != 0) return 16;
+            if (pcc_gc_backend4_remembered_page_contains_slot(new_slot) != 1) return 17;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 18;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 19;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 20;
+
+            if (pcc_gc_backend4_remembered_page_clear_slot(new_slot) != 1) return 21;
+            if (pcc_gc_backend4_zpage_remembered_slots() != slots0) return 22;
+            if (pcc_gc_backend4_zpage_remembered_cards() != cards0) return 23;
+            if (pcc_gc_backend4_zpage_dirty_pages() != dirty0) return 24;
+
+            moved->items[0] = 0;
+            py_decref(moved_raw);
+            py_decref(young);
+            printf("backend4-remembered-slot-retarget-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-remembered-slot-retarget-ok"
+
+
+def test_backend4_genzgc_relocation_retargets_inline_tuple_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t len;
+            PyObject *items[2];
+        } ProbeTupleObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeTupleObject *owner = (ProbeTupleObject *)pcc_gc_alloc(
+                sizeof(ProbeTupleObject),
+                PY_TYPE_TUPLE,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->len = 2;
+
+            PyObject *young = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (young == 0) return 4;
+
+            int64_t slots0 = pcc_gc_backend4_zpage_remembered_slots();
+            int64_t cards0 = pcc_gc_backend4_zpage_remembered_cards();
+            int64_t dirty0 = pcc_gc_backend4_zpage_dirty_pages();
+
+            PyObject **old_slot = &owner->items[0];
+            pcc_gc_store_ptr((PyObject *)owner, old_slot, young);
+            if (pcc_gc_backend4_remembered_page_contains_slot(old_slot) != 1) return 5;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 6;
+
+            if (pcc_gc_select_relocation_set(8) <= 0) return 7;
+            if (pcc_gc_relocation_set_contains((PyObject *)owner) != 1) return 8;
+            PyObject *moved_raw = pcc_gc_relocate_copy(
+                (PyObject *)owner,
+                (int64_t)sizeof(ProbeTupleObject)
+            );
+            if (moved_raw == 0) return 9;
+            ProbeTupleObject *moved = (ProbeTupleObject *)moved_raw;
+            if (moved == owner) return 10;
+            if (moved->items[0] != young) return 11;
+
+            PyObject **new_slot = &moved->items[0];
+            if (pcc_gc_backend4_remembered_page_contains_slot(old_slot) != 0) return 12;
+            if (pcc_gc_backend4_remembered_page_contains_slot(new_slot) != 1) return 13;
+            if (pcc_gc_backend4_zpage_remembered_slots() - slots0 != 1) return 14;
+            if (pcc_gc_backend4_zpage_remembered_cards() - cards0 != 1) return 15;
+            if (pcc_gc_backend4_zpage_dirty_pages() - dirty0 != 1) return 16;
+
+            if (pcc_gc_backend4_remembered_page_clear_slot(new_slot) != 1) return 17;
+            if (pcc_gc_backend4_zpage_remembered_slots() != slots0) return 18;
+            if (pcc_gc_backend4_zpage_remembered_cards() != cards0) return 19;
+            if (pcc_gc_backend4_zpage_dirty_pages() != dirty0) return 20;
+
+            moved->items[0] = 0;
+            py_decref(moved_raw);
+            py_decref(young);
+            printf("backend4-inline-slot-retarget-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-inline-slot-retarget-ok"
+
+
+def test_backend4_genzgc_selector_uses_zpage_remembered_pressure(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100,
+            PY_FLAG_GC_PINNED = 0x40
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static ProbeListObject *new_owner(void) {
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 0;
+            owner->length = 1;
+            owner->capacity = 1;
+            owner->items = (PyObject **)calloc(1, sizeof(PyObject *));
+            if (owner->items == 0) return 0;
+            return owner;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *dirty = new_owner();
+            ProbeListObject *clean = new_owner();
+            PyObject *young = pcc_gc_alloc(
+                64,
+                PY_TYPE_INT,
+                PY_FLAG_GC_YOUNG | PY_FLAG_GC_PINNED
+            );
+            if (dirty == 0 || clean == 0 || young == 0) return 3;
+
+            pcc_gc_store_ptr((PyObject *)dirty, &dirty->items[0], young);
+            if (pcc_gc_backend4_zpage_remembered_slots() < 1) return 4;
+            if (pcc_gc_select_relocation_set(1) != 1) return 5;
+            if (pcc_gc_relocation_set_contains((PyObject *)dirty) != 1) return 6;
+            if (pcc_gc_relocation_set_contains((PyObject *)clean) != 0) return 7;
+
+            pcc_gc_reset_relocation_set();
+            dirty->items[0] = 0;
+            pcc_gc_release(young);
+            pcc_gc_release((PyObject *)clean);
+            pcc_gc_release((PyObject *)dirty);
+            printf("backend4-zpage-remembered-selector-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-remembered-selector-ok"
+
+
+def test_backend4_genzgc_selector_prefers_old_zpage_age_pressure(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+            pcc_gc_reset_relocation_set();
+
+            PyObject *old_obj = pcc_gc_alloc(128, PY_TYPE_INT, PY_FLAG_GC_OLD);
+            PyObject *young_obj = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (old_obj == 0 || young_obj == 0) return 3;
+            if (pcc_gc_backend4_zpage_old_pages() < 1) return 4;
+            if (pcc_gc_backend4_zpage_young_pages() < 1) return 5;
+
+            if (pcc_gc_select_relocation_set(1) != 1) return 6;
+            if (pcc_gc_relocation_set_contains(old_obj) != 1) return 7;
+            if (pcc_gc_relocation_set_contains(young_obj) != 0) return 8;
+
+            pcc_gc_reset_relocation_set();
+            pcc_gc_release(young_obj);
+            pcc_gc_release(old_obj);
+            printf("backend4-zpage-age-selector-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-age-selector-ok"
+
+
+def test_backend4_genzgc_selector_skips_zero_benefit_zpage(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+            pcc_gc_reset_relocation_set();
+
+            PyObject *exact = pcc_gc_alloc(4096, PY_TYPE_INT, 0);
+            if (exact == 0) return 3;
+            if (pcc_gc_backend4_zpage_fragmentation_bytes() != 0) return 4;
+            if (pcc_gc_backend4_zpage_remembered_slots() != 0) return 5;
+            if (pcc_gc_backend4_zpage_fragmented_pages() != 0) return 8;
+            if (pcc_gc_select_relocation_set(1) != 0) return 6;
+            if (pcc_gc_relocation_set_contains(exact) != 0) return 7;
+
+            pcc_gc_release(exact);
+            printf("backend4-zpage-zero-benefit-selector-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-zpage-zero-benefit-selector-ok"
+
+
+def test_backend4_genzgc_remembered_page_telemetry_groups_dirty_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            pcc_gc_telemetry_reset();
+
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                sizeof(ProbeListObject),
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 3;
+            owner->length = 2;
+            owner->capacity = 2;
+            owner->items = (PyObject **)calloc(2, sizeof(PyObject *));
+            if (owner->items == 0) return 4;
+
+            PyObject *a = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            PyObject *b = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+            if (a == 0 || b == 0) return 5;
+
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[0], a);
+            pcc_gc_store_ptr((PyObject *)owner, &owner->items[1], b);
+            if (pcc_gc_backend4_remembered_set_entries() != 2) return 6;
+            if (pcc_gc_backend4_remembered_page_entries() != 1) return 7;
+            if (pcc_gc_backend4_remembered_page_slot_entries() != 2) return 8;
+            if (pcc_gc_backend4_remembered_page_high_water() != 1) return 9;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_ENTRIES) != 1) return 10;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_SLOT_ENTRIES) != 2) return 11;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_HIGH_WATER) != 1) return 12;
+
+            if (pcc_gc_set_backend(PCC_GC_KIND_REFCOUNT_CYCLE) != 0) return 13;
+            if (pcc_gc_backend4_remembered_page_entries() != 0) return 14;
+            if (pcc_gc_backend4_remembered_page_slot_entries() != 0) return 15;
+            owner->items[0] = 0;
+            owner->items[1] = 0;
+            pcc_gc_release(a);
+            pcc_gc_release(b);
+            pcc_gc_release((PyObject *)owner);
+            printf("backend4-remembered-page-telemetry-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-remembered-page-telemetry-ok"
+
+
+def test_backend4_genzgc_evacuation_incomplete_batches_track_budget_backlog(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+            PyObject *small_root = 0;
+            PyObject *medium_root = 0;
+            pcc_gc_scheduler_root_register(&small_root);
+            pcc_gc_scheduler_root_register(&medium_root);
+
+            PyObject *small = pcc_gc_alloc(128, PY_TYPE_INT, 0x100);
+            PyObject *medium = pcc_gc_alloc(8192, PY_TYPE_INT, 0x100);
+            if (small == 0 || medium == 0) return 3;
+            pcc_gc_store_root(&small_root, small);
+            pcc_gc_store_root(&medium_root, medium);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(32) != 2) return 4;
+            if (pcc_gc_relocation_set_size() != 2) return 5;
+            if (pcc_gc_step(1) < 1) return 6;
+            if (pcc_gc_relocation_set_size() != 1) return 7;
+            if (pcc_gc_backend4_evacuation_incomplete_batches() != 1) return 8;
+            if (pcc_gc_telemetry(PCC_GC_COUNTER_GENZGC_EVACUATION_INCOMPLETE_BATCHES) != 1) return 9;
+            if (pcc_gc_step(1) < 1) return 10;
+            if (pcc_gc_relocation_set_size() != 0) return 11;
+            if (pcc_gc_backend4_evacuation_incomplete_batches() != 1) return 12;
+
+            pcc_gc_store_root(&small_root, 0);
+            pcc_gc_store_root(&medium_root, 0);
+            pcc_gc_scheduler_root_unregister(&small_root);
+            pcc_gc_scheduler_root_unregister(&medium_root);
+            printf("backend4-genzgc-evacuation-backlog-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-genzgc-evacuation-backlog-ok"
+
+
+def test_backend4_genzgc_evacuation_drain_preserves_page_handoff_until_empty(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        enum {
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, PY_FLAG_GC_OLD);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, PY_FLAG_GC_OLD);
+            if (a == 0 || b == 0) return 3;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(8) != 2) return 4;
+            if (pcc_gc_relocation_set_size() != 2) return 5;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 1) return 6;
+
+            if (pcc_gc_backend4_evacuation_drain(1) != 1) return 7;
+            if (pcc_gc_relocation_set_size() != 1) return 8;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 1) return 9;
+            if (pcc_gc_backend4_evacuation_incomplete_batches() != 1) return 10;
+            if (pcc_gc_backend4_evacuation_efficiency_per_mille() != 500) return 11;
+
+            if (pcc_gc_backend4_evacuation_drain(1) != 1) return 12;
+            if (pcc_gc_relocation_set_size() != 0) return 13;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 0) return 14;
+            if (pcc_gc_backend4_evacuation_incomplete_batches() != 1) return 15;
+            if (pcc_gc_backend4_evacuation_efficiency_per_mille() != 1000) return 16;
+            if (pcc_gc_backend4_evacuation_drain(1) != 0) return 17;
+
+            printf("backend4-evacuation-drain-page-handoff-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-evacuation-drain-page-handoff-ok"
+
+
+def test_backend4_genzgc_evacuation_page_handoff_reports_current_pressure(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100,
+            PY_FLAG_GC_PINNED = 0x40
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static ProbeListObject *new_old_owner(void) {
+            ProbeListObject *owner = (ProbeListObject *)pcc_gc_alloc(
+                128,
+                PY_TYPE_LIST,
+                PY_FLAG_GC_OLD
+            );
+            if (owner == 0) return 0;
+            owner->length = 1;
+            owner->capacity = 1;
+            owner->items = (PyObject **)calloc(1, sizeof(PyObject *));
+            if (owner->items == 0) return 0;
+            return owner;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            ProbeListObject *dirty = new_old_owner();
+            ProbeListObject *clean = new_old_owner();
+            PyObject *young = pcc_gc_alloc(
+                64,
+                PY_TYPE_INT,
+                PY_FLAG_GC_YOUNG | PY_FLAG_GC_PINNED
+            );
+            if (dirty == 0 || clean == 0 || young == 0) return 3;
+
+            pcc_gc_store_ptr((PyObject *)dirty, &dirty->items[0], young);
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(8) != 2) return 4;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 1) return 5;
+            if (pcc_gc_backend4_evacuation_page_candidate_bytes() != 256) return 6;
+            if (pcc_gc_backend4_evacuation_page_dirty_cards() != 1) return 7;
+
+            if (pcc_gc_backend4_evacuation_drain(1) != 1) return 8;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 1) return 9;
+            if (pcc_gc_backend4_evacuation_page_candidate_bytes() != 128) return 10;
+
+            if (pcc_gc_backend4_evacuation_drain(1) != 1) return 11;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 0) return 12;
+            if (pcc_gc_backend4_evacuation_page_candidate_bytes() != 0) return 13;
+            if (pcc_gc_backend4_evacuation_page_dirty_cards() != 0) return 14;
+
+            printf("backend4-evacuation-page-pressure-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-evacuation-page-pressure-ok"
+
+
+def test_backend4_genzgc_evacuation_page_drain_moves_whole_selected_page(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        enum {
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, PY_FLAG_GC_OLD);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, PY_FLAG_GC_OLD);
+            if (a == 0 || b == 0) return 3;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(8) != 2) return 4;
+            if (pcc_gc_relocation_set_size() != 2) return 5;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 1) return 6;
+            if (pcc_gc_backend4_evacuation_page_candidate_bytes() != 256) return 7;
+
+            if (pcc_gc_backend4_evacuation_page_drain(1) != 2) return 8;
+            if (pcc_gc_relocation_set_size() != 0) return 9;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 0) return 10;
+            if (pcc_gc_backend4_evacuation_page_candidate_bytes() != 0) return 11;
+            if (pcc_gc_backend4_evacuation_efficiency_per_mille() != 1000) return 12;
+            if (pcc_gc_backend4_evacuation_page_drain(1) != 0) return 13;
+
+            printf("backend4-evacuation-page-drain-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-evacuation-page-drain-ok"
+
+
+def test_backend4_genzgc_step_drains_selected_zpage_as_page_budget(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        enum {
+            PY_FLAG_GC_OLD = 0x100
+        };
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, PY_FLAG_GC_OLD);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, PY_FLAG_GC_OLD);
+            if (a == 0 || b == 0) return 3;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(a) != 0) return 4;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(b) != 128) return 5;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(8) != 2) return 6;
+            if (pcc_gc_relocation_set_size() != 2) return 7;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 1) return 8;
+            if (pcc_gc_backend4_evacuation_page_candidate_bytes() != 256) return 9;
+
+            if (pcc_gc_step(1) != 2) return 10;
+            if (pcc_gc_relocation_set_size() != 0) return 11;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 0) return 12;
+            if (pcc_gc_backend4_evacuation_page_candidate_bytes() != 0) return 13;
+            if (pcc_gc_backend4_evacuation_efficiency_per_mille() != 1000) return 14;
+
+            printf("backend4-step-page-drain-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-step-page-drain-ok"
+
+
+def test_backend4_genzgc_step_selects_and_drains_whole_zpage(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80
+        };
+
+        static int offsets_are_one_page_pair(PyObject *a, PyObject *b) {
+            int64_t oa = pcc_gc_backend4_zpage_owner_offset_bytes(a);
+            int64_t ob = pcc_gc_backend4_zpage_owner_offset_bytes(b);
+            return ((oa == 0 && ob == 128) || (oa == 128 && ob == 0));
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *root_a = 0;
+            PyObject *root_b = 0;
+            pcc_gc_scheduler_root_register(&root_a);
+            pcc_gc_scheduler_root_register(&root_b);
+
+            int64_t active0 = pcc_gc_backend4_zpage_count();
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+            int64_t freecap0 = pcc_gc_backend4_zpage_free_capacity_bytes();
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+            pcc_gc_store_root(&root_a, a);
+            pcc_gc_store_root(&root_b, b);
+            ((PyObjectHeader *)a)->flags &= ~PY_FLAG_GC_YOUNG;
+            ((PyObjectHeader *)b)->flags &= ~PY_FLAG_GC_YOUNG;
+            if (pcc_gc_backend4_zpage_count() - active0 != 1) return 4;
+            if (!offsets_are_one_page_pair(a, b)) return 5;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_step(1) != 2) return 6;
+            if (pcc_gc_relocation_set_size() != 0) return 7;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 0) return 8;
+            if (pcc_gc_backend4_evacuation_page_candidate_bytes() != 0) return 9;
+
+            PyObject *moved_a = pcc_gc_load_ptr(0, &root_a);
+            PyObject *moved_b = pcc_gc_load_ptr(0, &root_b);
+            if (moved_a == 0 || moved_b == 0) return 10;
+            if (moved_a == a || moved_b == b) return 11;
+            if (!offsets_are_one_page_pair(moved_a, moved_b)) return 12;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(a) != -1) return 13;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(b) != -1) return 14;
+            if (pcc_gc_backend4_zpage_count() - active0 != 1) return 15;
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 1) return 16;
+            if (
+                pcc_gc_backend4_zpage_free_capacity_bytes() - freecap0
+                != 4096
+            ) return 17;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 18;
+
+            pcc_gc_store_root(&root_a, 0);
+            pcc_gc_store_root(&root_b, 0);
+            pcc_gc_scheduler_root_unregister(&root_a);
+            pcc_gc_scheduler_root_unregister(&root_b);
+            printf("backend4-step-selects-drains-whole-zpage-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-step-selects-drains-whole-zpage-ok"
+
+
+def test_backend4_genzgc_page_drain_reclaims_source_zpage_to_free_cache(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        static int offsets_are_one_page_pair(PyObject *a, PyObject *b) {
+            int64_t oa = pcc_gc_backend4_zpage_owner_offset_bytes(a);
+            int64_t ob = pcc_gc_backend4_zpage_owner_offset_bytes(b);
+            return ((oa == 0 && ob == 128) || (oa == 128 && ob == 0));
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *root_a = 0;
+            PyObject *root_b = 0;
+            pcc_gc_scheduler_root_register(&root_a);
+            pcc_gc_scheduler_root_register(&root_b);
+
+            int64_t active0 = pcc_gc_backend4_zpage_count();
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+            int64_t freecap0 = pcc_gc_backend4_zpage_free_capacity_bytes();
+
+            PyObject *a = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            PyObject *b = pcc_gc_alloc(128, PY_TYPE_INT, 0);
+            if (a == 0 || b == 0) return 3;
+            pcc_gc_store_root(&root_a, a);
+            pcc_gc_store_root(&root_b, b);
+            if (pcc_gc_backend4_zpage_count() - active0 != 1) return 4;
+            if (!offsets_are_one_page_pair(a, b)) return 5;
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(8) != 2) return 6;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 1) return 7;
+            if (pcc_gc_backend4_evacuation_page_drain(1) != 2) return 8;
+            if (pcc_gc_backend4_evacuation_page_candidate_score() != 0) return 9;
+
+            PyObject *moved_a = pcc_gc_load_ptr(0, &root_a);
+            PyObject *moved_b = pcc_gc_load_ptr(0, &root_b);
+            if (moved_a == 0 || moved_b == 0) return 10;
+            if (moved_a == a || moved_b == b) return 11;
+            if (!offsets_are_one_page_pair(moved_a, moved_b)) return 12;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(a) != -1) return 13;
+            if (pcc_gc_backend4_zpage_owner_offset_bytes(b) != -1) return 14;
+
+            if (pcc_gc_backend4_zpage_count() - active0 != 1) return 15;
+            if (pcc_gc_backend4_zpage_free_pages() - free0 != 1) return 16;
+            if (
+                pcc_gc_backend4_zpage_free_capacity_bytes() - freecap0
+                != 4096
+            ) return 17;
+            if (pcc_gc_backend4_verify_no_old_addresses() != 1) return 18;
+
+            pcc_gc_store_root(&root_a, 0);
+            pcc_gc_store_root(&root_b, 0);
+            pcc_gc_scheduler_root_unregister(&root_a);
+            pcc_gc_scheduler_root_unregister(&root_b);
+            printf("backend4-page-drain-reclaims-source-zpage-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-page-drain-reclaims-source-zpage-ok"
+
+
+def test_backend4_dict_get_loads_forwarded_key_and_value_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *dict = py_dict_new();
+            PyObject *key = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (dict == 0 || key == 0 || value == 0) return 3;
+
+            int64_t key_id = pcc_gc_object_id(key);
+            int64_t value_id = pcc_gc_object_id(value);
+            py_dict_set(dict, key, value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(256) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(key) != 1) return 5;
+            if (pcc_gc_relocation_set_contains(value) != 1) return 6;
+            PyObject *new_key = pcc_gc_relocate_copy(key, 64);
+            PyObject *new_value = pcc_gc_relocate_copy(value, 64);
+            if (new_key == 0 || new_value == 0) return 7;
+
+            PyObject *got = py_dict_get(dict, new_key);
+            if (got == 0) return 8;
+            if (got == value) return 9;
+            if (got != new_value) return 10;
+            if (pcc_gc_object_id(new_key) != key_id) return 11;
+            if (pcc_gc_object_id(got) != value_id) return 12;
+            py_decref(got);
+
+            PyObject *got_again = py_dict_get(dict, new_key);
+            if (got_again != new_value) return 13;
+            py_decref(got_again);
+
+            pcc_gc_release(new_key);
+            pcc_gc_release(new_value);
+            py_decref(dict);
+            printf("backend4-dict-forwarded-slots-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-dict-forwarded-slots-ok"
+
+
+def test_backend4_dict_traversal_loads_forwarded_key_and_value_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            int64_t hash;
+            PyObject *key;
+            PyObject *value;
+        } ProbeDictEntry;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t size;
+            int64_t capacity;
+            int64_t *indices;
+            ProbeDictEntry *entries;
+            int64_t entries_used;
+        } ProbeDictObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *dict = py_dict_new();
+            PyObject *key = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (dict == 0 || key == 0 || value == 0) return 3;
+            py_dict_set(dict, key, value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(256) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(key) != 1) return 5;
+            if (pcc_gc_relocation_set_contains(value) != 1) return 6;
+            PyObject *new_key = pcc_gc_relocate_copy(key, 64);
+            PyObject *new_value = pcc_gc_relocate_copy(value, 64);
+            if (new_key == 0 || new_value == 0) return 7;
+
+            PyObject *keys = py_dict_keys(dict);
+            PyObject *values = py_dict_values(dict);
+            if (keys == 0 || values == 0) return 8;
+            PyObject *got_key = py_list_get(keys, 0);
+            PyObject *got_value = py_list_get(values, 0);
+            if (got_key != new_key) return 9;
+            if (got_value != new_value) return 10;
+
+            ProbeDictObject *probe = (ProbeDictObject *)dict;
+            if (probe->entries[0].key == key) return 11;
+            if (probe->entries[0].value == value) return 12;
+            if (probe->entries[0].key != new_key) return 13;
+            if (probe->entries[0].value != new_value) return 14;
+
+            py_decref(got_key);
+            py_decref(got_value);
+            py_decref(keys);
+            py_decref(values);
+            pcc_gc_release(new_key);
+            pcc_gc_release(new_value);
+            py_decref(dict);
+            printf("backend4-dict-traversal-forwarded-slots-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-dict-traversal-forwarded-slots-ok"
+
+
+def test_backend4_set_contains_loads_forwarded_key_slot(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include <stdio.h>
+
+        typedef struct {
+            int64_t hash;
+            PyObject *key;
+        } ProbeSetEntry;
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t size;
+            int64_t capacity;
+            int64_t fill;
+            ProbeSetEntry *entries;
+        } ProbeSetObject;
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *set = py_set_new();
+            PyObject *value = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            if (set == 0 || value == 0) return 3;
+            py_set_add(set, value);
+            int64_t value_id = pcc_gc_object_id(value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(128) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(value) != 1) return 5;
+            PyObject *moved_value = pcc_gc_relocate_copy(value, 64);
+            if (moved_value == 0) return 6;
+
+            if (py_set_contains(set, moved_value) != 1) return 7;
+
+            ProbeSetObject *probe = (ProbeSetObject *)set;
+            int64_t seen_moved = 0;
+            for (int64_t i = 0; i < probe->capacity; i++) {
+                PyObject *slot_key = probe->entries[i].key;
+                if (slot_key == value) return 8;
+                if (slot_key == moved_value) seen_moved++;
+            }
+            if (seen_moved != 1) return 9;
+            if (pcc_gc_object_id(moved_value) != value_id) return 10;
+
+            pcc_gc_release(moved_value);
+            pcc_gc_release(value);
+            pcc_gc_release(set);
+            printf("backend4-set-forwarded-key-slot-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-set-forwarded-key-slot-ok"
+
+
+def test_backend4_obj_compare_loads_forwarded_container_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *tuple_a = py_tuple_new(1);
+            PyObject *tuple_b = py_tuple_new(1);
+            PyObject *list_a = py_list_new(1);
+            PyObject *list_b = py_list_new(1);
+            PyObject *dict_a = py_dict_new();
+            PyObject *dict_b = py_dict_new();
+            PyObject *set_a = py_set_new();
+            PyObject *set_b = py_set_new();
+            PyObject *tuple_s = py_str_new("tuple-slot", 10);
+            PyObject *list_s = py_str_new("list-slot", 9);
+            PyObject *dict_k = py_str_new("dict-key", 8);
+            PyObject *dict_v = py_str_new("dict-value", 10);
+            PyObject *set_s = py_str_new("set-slot", 8);
+            if (tuple_a == 0 || tuple_b == 0 || list_a == 0 || list_b == 0) return 3;
+            if (dict_a == 0 || dict_b == 0 || set_a == 0 || set_b == 0) return 4;
+            if (tuple_s == 0 || list_s == 0 || dict_k == 0 || dict_v == 0 || set_s == 0) return 5;
+
+            py_tuple_set_item(tuple_a, 0, tuple_s);
+            py_list_append(list_a, list_s);
+            py_dict_set(dict_a, dict_k, dict_v);
+            py_set_add(set_a, set_s);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(512) <= 0) return 6;
+            if (pcc_gc_relocation_set_contains(tuple_s) != 1) return 19;
+            if (pcc_gc_relocation_set_contains(list_s) != 1) return 20;
+            if (pcc_gc_relocation_set_contains(dict_k) != 1) return 21;
+            if (pcc_gc_relocation_set_contains(dict_v) != 1) return 22;
+            if (pcc_gc_relocation_set_contains(set_s) != 1) return 23;
+            PyObject *tuple_moved = pcc_gc_relocate_copy(tuple_s, (int64_t)sizeof(PyStrObject) + 11);
+            PyObject *list_moved = pcc_gc_relocate_copy(list_s, (int64_t)sizeof(PyStrObject) + 10);
+            PyObject *dict_k_moved = pcc_gc_relocate_copy(dict_k, (int64_t)sizeof(PyStrObject) + 9);
+            PyObject *dict_v_moved = pcc_gc_relocate_copy(dict_v, (int64_t)sizeof(PyStrObject) + 11);
+            PyObject *set_moved = pcc_gc_relocate_copy(set_s, (int64_t)sizeof(PyStrObject) + 9);
+            if (tuple_moved == 0) return 24;
+            if (list_moved == 0) return 25;
+            if (dict_k_moved == 0) return 26;
+            if (dict_v_moved == 0) return 27;
+            if (set_moved == 0) return 28;
+
+            py_tuple_set_item(tuple_b, 0, tuple_moved);
+            py_list_append(list_b, list_moved);
+            py_dict_set(dict_b, dict_k_moved, dict_v_moved);
+            py_set_add(set_b, set_moved);
+
+            if (py_obj_eq(tuple_a, tuple_b) != 1) return 7;
+            if (((PyTupleObject *)tuple_a)->items[0] != tuple_moved) return 8;
+            if (py_obj_eq(list_a, list_b) != 1) return 9;
+            if (((PyListObject *)list_a)->items[0] != list_moved) return 10;
+            if (py_obj_eq(dict_a, dict_b) != 1) return 11;
+            if (((PyDictObject *)dict_a)->entries[0].key != dict_k_moved) return 12;
+            if (((PyDictObject *)dict_a)->entries[0].value != dict_v_moved) return 13;
+            if (py_obj_eq(set_a, set_b) != 1) return 14;
+
+            int64_t saw_set_moved = 0;
+            PySetObject *sa = (PySetObject *)set_a;
+            for (int64_t i = 0; i < sa->capacity; i++) {
+                if (sa->entries[i].key == set_s) return 15;
+                if (sa->entries[i].key == set_moved) saw_set_moved++;
+            }
+            if (saw_set_moved != 1) return 16;
+
+            PyObject *sorted_set = py_obj_sorted(set_a);
+            if (sorted_set == 0) return 17;
+            PyObject *sorted_item = py_list_get(sorted_set, 0);
+            if (sorted_item != set_moved) return 18;
+            py_decref(sorted_item);
+            py_decref(sorted_set);
+
+            pcc_gc_release(tuple_moved);
+            pcc_gc_release(list_moved);
+            pcc_gc_release(dict_k_moved);
+            pcc_gc_release(dict_v_moved);
+            pcc_gc_release(set_moved);
+            py_decref(tuple_a);
+            py_decref(tuple_b);
+            py_decref(list_a);
+            py_decref(list_b);
+            py_decref(dict_a);
+            py_decref(dict_b);
+            py_decref(set_a);
+            py_decref(set_b);
+            printf("backend4-obj-compare-forwarded-slots-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-obj-compare-forwarded-slots-ok"
+
+
+def test_backend4_json_dumps_loads_forwarded_container_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *lst = py_list_new(1);
+            PyObject *dict = py_dict_new();
+            PyObject *list_value = py_str_new("list-json", 9);
+            PyObject *dict_key = py_str_new("json-key", 8);
+            PyObject *dict_value = py_str_new("json-value", 10);
+            if (lst == 0 || dict == 0 || list_value == 0 || dict_key == 0 || dict_value == 0) return 3;
+            py_list_append(lst, list_value);
+            py_dict_set(dict, dict_key, dict_value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(256) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(list_value) != 1) return 5;
+            if (pcc_gc_relocation_set_contains(dict_key) != 1) return 6;
+            if (pcc_gc_relocation_set_contains(dict_value) != 1) return 7;
+
+            PyObject *list_moved = pcc_gc_relocate_copy(list_value, (int64_t)sizeof(PyStrObject) + 10);
+            PyObject *key_moved = pcc_gc_relocate_copy(dict_key, (int64_t)sizeof(PyStrObject) + 9);
+            PyObject *value_moved = pcc_gc_relocate_copy(dict_value, (int64_t)sizeof(PyStrObject) + 11);
+            if (list_moved == 0 || key_moved == 0 || value_moved == 0) return 8;
+
+            PyObject *list_json = py_json_dumps(lst);
+            PyObject *dict_json = py_json_dumps(dict);
+            if (list_json == 0 || dict_json == 0) return 9;
+            PyObject *expected_list = py_str_new("[\\"list-json\\"]", 13);
+            PyObject *expected_dict = py_str_new("{\\"json-key\\": \\"json-value\\"}", 26);
+            if (expected_list == 0 || expected_dict == 0) return 10;
+            if (py_str_eq(list_json, expected_list) != 1) return 11;
+            if (py_str_eq(dict_json, expected_dict) != 1) return 12;
+
+            if (((PyListObject *)lst)->items[0] != list_moved) return 13;
+            if (((PyDictObject *)dict)->entries[0].key != key_moved) return 14;
+            if (((PyDictObject *)dict)->entries[0].value != value_moved) return 15;
+
+            py_decref(expected_list);
+            py_decref(expected_dict);
+            py_decref(list_json);
+            py_decref(dict_json);
+            pcc_gc_release(list_moved);
+            pcc_gc_release(key_moved);
+            pcc_gc_release(value_moved);
+            py_decref(lst);
+            py_decref(dict);
+            printf("backend4-json-forwarded-slots-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-json-forwarded-slots-ok"
+
+
+def test_backend4_print_format_loads_forwarded_sequence_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *lst = py_list_new(1);
+            PyObject *tuple = py_tuple_new(1);
+            PyObject *many = py_tuple_new(1);
+            PyObject *list_value = py_str_new("list-print", 10);
+            PyObject *tuple_value = py_str_new("tuple-print", 11);
+            PyObject *many_value = py_str_new("many-print", 10);
+            if (lst == 0 || tuple == 0 || many == 0) return 3;
+            if (list_value == 0 || tuple_value == 0 || many_value == 0) return 4;
+            py_list_append(lst, list_value);
+            py_tuple_set_item(tuple, 0, tuple_value);
+            py_tuple_set_item(many, 0, many_value);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(256) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(list_value) != 1) return 6;
+            if (pcc_gc_relocation_set_contains(tuple_value) != 1) return 7;
+            if (pcc_gc_relocation_set_contains(many_value) != 1) return 8;
+
+            PyObject *list_moved = pcc_gc_relocate_copy(list_value, (int64_t)sizeof(PyStrObject) + 11);
+            PyObject *tuple_moved = pcc_gc_relocate_copy(tuple_value, (int64_t)sizeof(PyStrObject) + 12);
+            PyObject *many_moved = pcc_gc_relocate_copy(many_value, (int64_t)sizeof(PyStrObject) + 11);
+            if (list_moved == 0 || tuple_moved == 0 || many_moved == 0) return 9;
+
+            py_print(lst);
+            py_print(tuple);
+            py_print_many(many, py_None, py_None);
+
+            if (((PyListObject *)lst)->items[0] != list_moved) return 10;
+            if (((PyTupleObject *)tuple)->items[0] != tuple_moved) return 11;
+            if (((PyTupleObject *)many)->items[0] != many_moved) return 12;
+
+            pcc_gc_release(list_moved);
+            pcc_gc_release(tuple_moved);
+            pcc_gc_release(many_moved);
+            py_decref(lst);
+            py_decref(tuple);
+            py_decref(many);
+            printf("backend4-print-forwarded-slots-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout == (
+        "['list-print']\n"
+        "('tuple-print',)\n"
+        "many-print\n"
+        "backend4-print-forwarded-slots-ok\n"
+    )
+
+
+def test_backend4_os_path_helpers_load_forwarded_sequence_slots(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *join_parts = py_list_new(2);
+            PyObject *common_paths = py_tuple_new(2);
+            PyObject *join_a = py_str_new("root", 4);
+            PyObject *join_b = py_str_new("leaf", 4);
+            PyObject *common_a = py_str_new("/tmp/pcc/a", 10);
+            PyObject *common_b = py_str_new("/tmp/pcc/b", 10);
+            if (join_parts == 0 || common_paths == 0) return 3;
+            if (join_a == 0 || join_b == 0 || common_a == 0 || common_b == 0) return 4;
+
+            py_list_append(join_parts, join_a);
+            py_list_append(join_parts, join_b);
+            py_tuple_set_item(common_paths, 0, common_a);
+            py_tuple_set_item(common_paths, 1, common_b);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(256) <= 0) return 5;
+            if (pcc_gc_relocation_set_contains(join_a) != 1) return 6;
+            if (pcc_gc_relocation_set_contains(join_b) != 1) return 7;
+            if (pcc_gc_relocation_set_contains(common_a) != 1) return 8;
+            if (pcc_gc_relocation_set_contains(common_b) != 1) return 9;
+
+            PyObject *join_a_moved = pcc_gc_relocate_copy(join_a, (int64_t)sizeof(PyStrObject) + 5);
+            PyObject *join_b_moved = pcc_gc_relocate_copy(join_b, (int64_t)sizeof(PyStrObject) + 5);
+            PyObject *common_a_moved = pcc_gc_relocate_copy(common_a, (int64_t)sizeof(PyStrObject) + 11);
+            PyObject *common_b_moved = pcc_gc_relocate_copy(common_b, (int64_t)sizeof(PyStrObject) + 11);
+            if (join_a_moved == 0 || join_b_moved == 0 || common_a_moved == 0 || common_b_moved == 0) return 10;
+
+            PyObject *joined = py_os_path_join(join_parts);
+            PyObject *common = py_os_path_commonpath(common_paths);
+            PyObject *expected_join = py_str_new("root/leaf", 9);
+            PyObject *expected_common = py_str_new("/tmp/pcc", 8);
+            if (joined == 0 || common == 0 || expected_join == 0 || expected_common == 0) return 11;
+            if (py_str_eq(joined, expected_join) != 1) return 12;
+            if (py_str_eq(common, expected_common) != 1) return 13;
+
+            if (((PyListObject *)join_parts)->items[0] != join_a_moved) return 14;
+            if (((PyListObject *)join_parts)->items[1] != join_b_moved) return 15;
+            if (((PyTupleObject *)common_paths)->items[0] != common_a_moved) return 16;
+            if (((PyTupleObject *)common_paths)->items[1] != common_b_moved) return 17;
+
+            py_decref(joined);
+            py_decref(common);
+            py_decref(expected_join);
+            py_decref(expected_common);
+            pcc_gc_release(join_a_moved);
+            pcc_gc_release(join_b_moved);
+            pcc_gc_release(common_a_moved);
+            pcc_gc_release(common_b_moved);
+            py_decref(join_parts);
+            py_decref(common_paths);
+            printf("backend4-os-path-forwarded-slots-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-os-path-forwarded-slots-ok"
+
+
+def test_backend4_str_join_loads_forwarded_list_items(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        '''
+        #include "py_runtime.h"
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
+
+            PyObject *sep = py_str_new("/", 1);
+            PyObject *lst = py_list_new(2);
+            PyObject *left = py_str_new("left", 4);
+            PyObject *right = py_str_new("right", 5);
+            if (sep == 0 || lst == 0 || left == 0 || right == 0) return 3;
+            py_list_append(lst, left);
+            py_list_append(lst, right);
+
+            pcc_gc_telemetry_reset();
+            if (pcc_gc_select_relocation_set(128) <= 0) return 4;
+            if (pcc_gc_relocation_set_contains(left) != 1) return 5;
+            if (pcc_gc_relocation_set_contains(right) != 1) return 6;
+
+            PyObject *left_moved = pcc_gc_relocate_copy(left, (int64_t)sizeof(PyStrObject) + 5);
+            PyObject *right_moved = pcc_gc_relocate_copy(right, (int64_t)sizeof(PyStrObject) + 6);
+            if (left_moved == 0 || right_moved == 0) return 7;
+
+            PyObject *joined = py_str_join(sep, lst);
+            PyObject *expected = py_str_new("left/right", 10);
+            if (joined == 0 || expected == 0) return 8;
+            if (py_str_eq(joined, expected) != 1) return 9;
+            if (((PyListObject *)lst)->items[0] != left_moved) return 10;
+            if (((PyListObject *)lst)->items[1] != right_moved) return 11;
+
+            py_decref(joined);
+            py_decref(expected);
+            pcc_gc_release(left_moved);
+            pcc_gc_release(right_moved);
+            py_decref(sep);
+            py_decref(lst);
+            printf("backend4-str-join-forwarded-items-ok\\n");
+            return 0;
+        }
+        ''',
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "backend4-str-join-forwarded-items-ok"
+
+
+def test_backend4_public_telemetry_symbols_are_wired():
+    header = (RUNTIME_DIR / "include" / "py_runtime.h").read_text()
+    c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text()
+    py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text()
+    py_substrate = (RUNTIME_DIR / "py" / "py_substrate.py").read_text()
+    abi = (REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "runtime_abi.py").read_text()
+
+    assert "PCC_GC_COUNTER_RELOCATION_FRAGMENTATION_SCORE" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BARRIERS" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_ENTRIES" in header
+    assert "PCC_GC_COUNTER_GENZGC_YOUNG_PROMOTIONS" in header
+    assert "PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATES" in header
+    assert "PCC_GC_COUNTER_GENZGC_EVACUATED_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_PAGE_POLICY_SCORE" in header
+    assert "PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_DEFERS" in header
+    assert "PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_DEFERRED_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATES" in header
+    assert "PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATES" in header
+    assert "PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATE_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATE_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATE_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DRAIN_BATCHES" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DRAINED_ENTRIES" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DUPLICATE_SKIPS" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_HIGH_WATER" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_OWNER_FANOUT_HIGH_WATER" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_OWNER_COUNT_HIGH_WATER" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_INCOMPLETE_DRAINS" in header
+    assert "PCC_GC_COUNTER_GENZGC_EVACUATION_INCOMPLETE_BATCHES" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_BATCH_CAPACITY" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MAX_BATCH_SIZE" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_FULL_BATCHES" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_CAPACITY" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_PENDING" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FLUSHES" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FLUSHED_ENTRIES" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FULL_FLUSHES" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_CROSS_THREAD_MEDIUM_FLUSHES" in header
+    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_CROSS_THREAD_MEDIUM_FLUSHED_ENTRIES" in header
+    assert "PCC_GC_COUNTER_GENZGC_EVACUATION_EFFICIENCY_PER_MILLE" in header
+    assert "PCC_GC_COUNTER_GENZGC_FRAGMENTATION_BACKLOG_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_FRAGMENTATION_POLICY_SCORE" in header
+    assert "PCC_GC_COUNTER_GENZGC_SMALL_PAGE_LIMIT_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_LIMIT_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_LARGE_DEFER_LIMIT_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_RECONSIDERATIONS" in header
+    assert "PCC_GC_COUNTER_GENZGC_YOUNG_OBJECTS" in header
+    assert "PCC_GC_COUNTER_GENZGC_OLD_OBJECTS" in header
+    assert "PCC_GC_COUNTER_GENZGC_YOUNG_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_OLD_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_SMALL_PAGE_OBJECTS" in header
+    assert "PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_OBJECTS" in header
+    assert "PCC_GC_COUNTER_GENZGC_LARGE_PAGE_OBJECTS" in header
+    assert "PCC_GC_COUNTER_GENZGC_SMALL_PAGE_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_LARGE_PAGE_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_ENTRIES" in header
+    assert "PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_DUPLICATE_SKIPS" in header
+    assert "PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_HIGH_WATER" in header
+    assert "PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_ENTRIES" in header
+    assert "PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_SLOT_ENTRIES" in header
+    assert "PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_HIGH_WATER" in header
+    assert "pcc_gc_backend4_remembered_page_contains_slot" in header
+    assert "pcc_gc_backend4_remembered_page_clear_slot" in header
+    assert "pcc_gc_backend4_zpage_contains_remembered_card" in header
+    assert "pcc_gc_backend4_zpage_clear_remembered_card" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_COUNT" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_CAPACITY_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTATION_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_LARGE_PAGES" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_USED_BYTES" in header
+    assert "pcc_gc_backend4_zpage_allocated_bytes" in header
+    assert "pcc_gc_backend4_zpage_reclaimable_gap_bytes" in header
+    assert "pcc_gc_backend4_zpage_span_bytes" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTATION_PER_MILLE" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_POLICY_SCORE" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_SLOTS" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARDS" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARDS = 102" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARD_RATIO_PER_MILLE" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARD_RATIO_PER_MILLE = 103" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_DIRTY_PAGES" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTED_PAGES" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_YOUNG_PAGES" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_OLD_PAGES" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_PAGES" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_PAGES = 104" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_CAPACITY_BYTES" in header
+    assert "PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_CAPACITY_BYTES = 105" in header
+    assert "pcc_gc_backend4_zpage_free_span_bytes" in header
+    assert "PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATE_ZPAGE_BYTES = 106" in header
+    assert "PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATE_ZPAGE_BYTES = 107" in header
+    assert "PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATE_ZPAGE_BYTES = 108" in header
+    assert "PCC_GC_COUNTER_GENZGC_EVACUATION_PAGE_CANDIDATES = 109" in header
+    assert "pcc_gc_backend4_evacuation_page_candidate_score" in header
+    assert "pcc_gc_backend4_evacuation_page_candidate_bytes" in header
+    assert "pcc_gc_backend4_evacuation_page_dirty_cards" in header
+    assert "pcc_gc_backend4_evacuation_drain" in header
+    assert "pcc_gc_backend4_evacuation_page_drain" in header
+    assert "PCC_GC_COUNTER_GENZGC_PAGE_PRESSURE_SCORE" in header
+    assert "pcc_gc_note_slot_write_barrier" in header
+    assert "pcc_gc_backend4_verify_no_old_addresses" in header
+    assert "pcc_gc_backend4_fragmentation_score" in c_src
+    assert "pcc_gc_backend4_generation_barrier_score" in c_src
+    assert "pcc_gc_backend4_store_buffer_entries" in c_src
+    assert "pcc_gc_backend4_generation_promotion_score" in c_src
+    assert "pcc_gc_backend4_evacuation_candidate_score" in c_src
+    assert "pcc_gc_backend4_evacuated_bytes" in c_src
+    assert "pcc_gc_backend4_page_policy_score" in c_src
+    assert "pcc_gc_backend4_large_object_defer_score" in c_src
+    assert "pcc_gc_backend4_large_object_deferred_bytes" in c_src
+    assert "pcc_gc_backend4_small_page_candidate_score" in c_src
+    assert "pcc_gc_backend4_medium_page_candidate_score" in c_src
+    assert "pcc_gc_backend4_evacuation_candidate_bytes" in c_src
+    assert "pcc_gc_backend4_small_page_candidate_bytes" in c_src
+    assert "pcc_gc_backend4_medium_page_candidate_bytes" in c_src
+    assert "pcc_gc_backend4_evacuation_candidate_zpage_bytes" in c_src
+    assert "pcc_gc_backend4_small_page_candidate_zpage_bytes" in c_src
+    assert "pcc_gc_backend4_medium_page_candidate_zpage_bytes" in c_src
+    assert "pcc_gc_backend4_evacuation_page_candidate_score" in c_src
+    assert "pcc_gc_backend4_evacuation_page_candidate_bytes" in c_src
+    assert "pcc_gc_backend4_evacuation_page_dirty_cards" in c_src
+    assert "pcc_gc_backend4_evacuation_drain" in c_src
+    assert "pcc_gc_backend4_evacuation_page_drain" in c_src
+    assert "pcc_gc_backend4_relocate_selected_page_unlocked" in c_src
+    assert "pcc_gc_backend4_store_buffer_drain_batches" in c_src
+    assert "pcc_gc_backend4_store_buffer_drained_entries" in c_src
+    assert "pcc_gc_backend4_store_buffer_duplicate_skips" in c_src
+    assert "pcc_gc_backend4_store_buffer_high_water" in c_src
+    assert "pcc_gc_backend4_store_buffer_owner_fanout_high_water" in c_src
+    assert "pcc_gc_backend4_store_buffer_owner_count_high_water" in c_src
+    assert "pcc_gc_backend4_store_buffer_incomplete_drains" in c_src
+    assert "pcc_gc_backend4_evacuation_incomplete_batches" in c_src
+    assert "pcc_gc_backend4_store_buffer_batch_capacity" in c_src
+    assert "pcc_gc_backend4_store_buffer_max_batch_size" in c_src
+    assert "pcc_gc_backend4_store_buffer_full_batches" in c_src
+    assert "pcc_gc_backend4_store_buffer_medium_capacity" in c_src
+    assert "pcc_gc_backend4_store_buffer_medium_pending" in c_src
+    assert "pcc_gc_backend4_store_buffer_medium_flushes" in c_src
+    assert "pcc_gc_backend4_store_buffer_medium_flushed_entries" in c_src
+    assert "pcc_gc_backend4_store_buffer_medium_full_flushes" in c_src
+    assert "pcc_gc_backend4_store_buffer_cross_thread_medium_flushes" in c_src
+    assert "pcc_gc_backend4_store_buffer_cross_thread_medium_flushed_entries" in c_src
+    assert "pcc_gc_backend4_evacuation_efficiency_per_mille" in c_src
+    assert "pcc_gc_backend4_fragmentation_backlog_bytes" in c_src
+    assert "pcc_gc_backend4_fragmentation_policy_score" in c_src
+    assert "pcc_gc_backend4_small_page_limit_bytes" in c_src
+    assert "pcc_gc_backend4_medium_page_limit_bytes" in c_src
+    assert "pcc_gc_backend4_large_defer_limit_bytes" in c_src
+    assert "pcc_gc_backend4_large_object_reconsiderations" in c_src
+    assert "pcc_gc_backend4_young_object_count" in c_src
+    assert "pcc_gc_backend4_old_object_count" in c_src
+    assert "pcc_gc_backend4_young_bytes" in c_src
+    assert "pcc_gc_backend4_old_bytes" in c_src
+    assert "pcc_gc_backend4_small_page_object_count" in c_src
+    assert "pcc_gc_backend4_medium_page_object_count" in c_src
+    assert "pcc_gc_backend4_large_page_object_count" in c_src
+    assert "pcc_gc_backend4_small_page_live_bytes" in c_src
+    assert "pcc_gc_backend4_medium_page_live_bytes" in c_src
+    assert "pcc_gc_backend4_large_page_live_bytes" in c_src
+    assert "pcc_gc_backend4_remembered_set_entries" in c_src
+    assert "pcc_gc_backend4_remembered_set_duplicate_skips" in c_src
+    assert "pcc_gc_backend4_remembered_set_high_water" in c_src
+    assert "pcc_gc_backend4_remembered_page_entries" in c_src
+    assert "pcc_gc_backend4_remembered_page_slot_entries" in c_src
+    assert "pcc_gc_backend4_remembered_page_high_water" in c_src
+    assert "pcc_gc_backend4_remembered_page_contains_slot" in c_src
+    assert "pcc_gc_backend4_remembered_page_clear_slot" in c_src
+    assert "pcc_gc_backend4_zpage_contains_remembered_card" in c_src
+    assert "pcc_gc_backend4_zpage_clear_remembered_card" in c_src
+    assert "pcc_gc_backend4_zpage_card_for_slot_unlocked" in c_src
+    assert "PccGcZPageNode" in c_src
+    assert "pcc_gc_backend4_zpage_track_alloc_unlocked" in c_src
+    assert "pcc_gc_backend4_zpage_find_reusable_page_unlocked" in c_src
+    assert "pcc_gc_backend4_evacuation_page_find_unlocked(page) != NULL" in c_src
+    assert "pcc_gc_backend4_zpage_note_owner_promoted_unlocked" in c_src
+    assert "pcc_gc_backend4_zpage_pop_free_page_unlocked" in c_src
+    assert "PCC_GC_BACKEND4_FREE_SMALL_PAGE_LIMIT 8" in c_src
+    assert "PCC_GC_BACKEND4_FREE_MEDIUM_PAGE_LIMIT 4" in c_src
+    assert "pcc_gc_backend4_zpage_remove_unlocked" in c_src
+    assert "typedef struct PccGcZPageEvacuationCandidate" in c_src
+    assert "pcc_gc_backend4_zpage_candidate_snapshot" in c_src
+    assert "PccGcZPageNode *zp = pcc_gc_backend4_zpages" in c_src
+    assert "pcc_gc_backend4_zpage_count" in c_src
+    assert "pcc_gc_backend4_zpage_capacity_bytes" in c_src
+    assert "pcc_gc_backend4_zpage_fragmentation_bytes" in c_src
+    assert "pcc_gc_backend4_zpage_large_pages" in c_src
+    assert "pcc_gc_backend4_zpage_used_bytes" in c_src
+    assert "pcc_gc_backend4_zpage_allocated_bytes" in c_src
+    assert "pcc_gc_backend4_zpage_reclaimable_gap_bytes" in c_src
+    assert "pcc_gc_backend4_zpage_span_bytes" in c_src
+    assert "pcc_gc_backend4_zpage_fragmentation_per_mille" in c_src
+    assert "pcc_gc_backend4_zpage_policy_score" in c_src
+    assert "typedef struct PccGcZPage" in c_src
+    assert "allocated_bytes" in c_src
+    assert "offset_bytes" in c_src
+    assert "size_bytes" in c_src
+    assert "span_base" in c_src
+    assert "span_capacity_bytes" in c_src
+    assert "PccGcZPage *page" in c_src
+    assert "pcc_gc_backend4_pages" in c_src
+    assert "pcc_gc_backend4_free_pages" in c_src
+    assert "pcc_gc_backend4_zpage_remembered_slots" in c_src
+    assert "pcc_gc_backend4_zpage_remembered_cards" in c_src
+    assert "pcc_gc_backend4_zpage_remembered_card_ratio_per_mille" in c_src
+    assert "pcc_gc_backend4_zpage_dirty_pages" in c_src
+    assert "pcc_gc_backend4_zpage_fragmented_pages" in c_src
+    assert "pcc_gc_backend4_zpage_young_pages" in c_src
+    assert "pcc_gc_backend4_zpage_old_pages" in c_src
+    assert "pcc_gc_backend4_zpage_free_pages" in c_src
+    assert "pcc_gc_backend4_zpage_free_capacity_bytes" in c_src
+    assert "pcc_gc_backend4_zpage_free_span_bytes" in c_src
+    assert "PCC_GC_BACKEND4_ZPAGE_SPAN_CARD_BYTES" in header
+    assert "PCC_GC_BACKEND4_ZPAGE_SPAN_CARD_BYTES" in c_src
+    assert "pcc_gc_backend4_zpage_owner_offset_bytes" in header
+    assert "pcc_gc_backend4_zpage_owner_size_bytes" in header
+    assert "pcc_gc_backend4_zpage_owner_span_card" in header
+    assert "pcc_gc_backend4_zpage_owner_slot_span_card" in header
+    assert "pcc_gc_backend4_zpage_register_owner_payload_span" in header
+    assert "pcc_gc_backend4_zpage_owner_offset_bytes" in c_src
+    assert "pcc_gc_backend4_zpage_owner_size_bytes" in c_src
+    assert "pcc_gc_backend4_zpage_owner_span_card" in c_src
+    assert "pcc_gc_backend4_zpage_owner_slot_span_card" in c_src
+    assert "pcc_gc_backend4_zpage_register_owner_payload_span" in c_src
+    assert "PccGcZPagePayloadSpanNode" in c_src
+    assert "pcc_gc_backend4_zpage_card_for_node_slot_unlocked" in c_src
+    assert "pcc_gc_backend4_relocation_set_contains_page_unlocked" in c_src
+    assert "PccGcZPageEvacuationNode" in c_src
+    assert "pcc_gc_backend4_select_page_objects_unlocked" in c_src
+    assert "pcc_gc_backend4_select_relocation_pages_unlocked" in c_src
+    assert "pcc_gc_backend4_evacuation_page_remove_unlocked" in c_src
+    assert "pcc_gc_backend4_page_pressure_score" in c_src
+    assert '@c_abi_export("pcc_gc_backend4_fragmentation_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_generation_barrier_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_entries")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_generation_promotion_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_candidate_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuated_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_page_policy_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_large_object_defer_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_large_object_deferred_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_small_page_candidate_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_medium_page_candidate_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_candidate_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_small_page_candidate_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_medium_page_candidate_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_candidate_zpage_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_small_page_candidate_zpage_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_medium_page_candidate_zpage_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_page_candidate_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_page_candidate_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_page_dirty_cards")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_drain")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_page_drain")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_drain_batches")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_drained_entries")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_duplicate_skips")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_high_water")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_owner_fanout_high_water")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_owner_count_high_water")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_incomplete_drains")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_incomplete_batches")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_batch_capacity")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_max_batch_size")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_full_batches")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_capacity")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_pending")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_flushes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_flushed_entries")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_full_flushes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_cross_thread_medium_flushes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_store_buffer_cross_thread_medium_flushed_entries")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_evacuation_efficiency_per_mille")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_fragmentation_backlog_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_fragmentation_policy_score")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_small_page_limit_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_medium_page_limit_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_large_defer_limit_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_large_object_reconsiderations")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_young_object_count")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_old_object_count")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_young_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_old_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_small_page_object_count")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_medium_page_object_count")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_large_page_object_count")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_small_page_live_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_medium_page_live_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_large_page_live_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_remembered_set_entries")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_remembered_set_duplicate_skips")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_remembered_set_high_water")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_remembered_page_entries")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_remembered_page_slot_entries")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_remembered_page_high_water")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_remembered_page_contains_slot")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_remembered_page_clear_slot")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_contains_remembered_card")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_clear_remembered_card")' in py_src
+    assert "_backend4_owner_remembered_slots" in py_src
+    assert "_backend4_zpage_track_alloc" in py_src
+    assert "pcc_gc_backend4_try_zpage_alloc" in py_src
+    assert "_backend4_zpage_find_page_for_addr" in py_src
+    assert "pcc_gc_backend4_try_zpage_alloc" in c_src
+    assert "PY_FLAG_GC_ZPAGE_ALLOC" in c_src
+    assert "_backend4_zpage_find_reusable_page" in py_src
+    assert "ptr_is_null(_backend4_evacuation_page_find(page)) != 0" in py_src
+    assert "_backend4_zpage_note_owner_promoted" in py_src
+    assert "_backend4_zpage_pop_free_page" in py_src
+    assert "_backend4_relocation_set_contains_page" in py_src
+    assert "_backend4_evacuation_page_add" in py_src
+    assert "_backend4_evacuation_page_remove" in py_src
+    assert "_backend4_zpage_page_for_owner" in py_src
+    assert "_backend4_select_page_objects" in py_src
+    assert "_backend4_select_relocation_pages" in py_src
+    assert "_backend4_zpage_candidate_score" in py_src
+    assert "_backend4_free_page_limit_for_class" in py_src
+    assert "pcc_gc_backend4_zpage_payload_span_head" in py_src
+    assert "_backend4_zpage_remove_payload_spans" in py_src
+    assert "_backend4_zpage_remove" in py_src
+    assert "_backend4_remembered_set_retarget_slot" in py_src
+    assert "_backend4_remembered_set_retarget_inline_slot" in py_src
+    assert py_src.count("_backend4_remembered_set_retarget_inline_slot(from_obj, to_obj, 16)") >= 6
+    assert py_src.count("_backend4_remembered_set_retarget_inline_slot(from_obj, to_obj, 24)") >= 6
+    assert py_src.count("_backend4_remembered_set_retarget_inline_slot(from_obj, to_obj, 32)") >= 5
+    assert py_src.count("_backend4_remembered_set_retarget_inline_slot(from_obj, to_obj, 40)") >= 3
+    assert py_src.count("_backend4_remembered_set_retarget_inline_slot(from_obj, to_obj, 48)") >= 2
+    assert "_backend4_remembered_set_retarget_inline_slot(from_obj, to_obj, 104)" in py_src
+    assert "_backend4_remembered_set_retarget_inline_slot(from_obj, to_obj, offset)" in py_src
+    assert py_src.count("ptr_add(src_entries, offset + 8)") >= 2
+    assert py_src.count("ptr_add(entries, offset + 8)") >= 2
+    assert "ptr_add(src_entries, offset + 16)" in py_src
+    assert "ptr_add(entries, offset + 16)" in py_src
+    assert "ptr_add(from_obj, 24 + i * 8)" in py_src
+    assert "ptr_add(to_obj, 24 + i * 8)" in py_src
+    assert "node = _zpage_head()" in py_src
+    assert 'define_global_ptr_null("pcc_gc_backend4_zpage_head")' in py_substrate
+    assert '@c_abi_export("pcc_gc_backend4_zpage_count")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_capacity_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_fragmentation_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_large_pages")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_used_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_allocated_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_reclaimable_gap_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_span_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_owner_offset_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_owner_size_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_owner_span_card")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_owner_slot_span_card")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_register_owner_payload_span")' in py_src
+    assert "ptr_diff" in py_src
+    assert "_backend4_zpage_payload_offset_for_slot" in py_src
+    assert "inline_delta: int = ptr_diff(slot, owner)" in py_src
+    assert "delta: int = ptr_diff(slot, base)" in py_src
+    assert "span = malloc(48)" in py_src
+    assert "return allocated" in py_src
+    assert "return (offset // 512) % 64" in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_fragmentation_per_mille")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_policy_score")' in py_src
+    assert "pcc_gc_backend4_page_head" in py_src
+    assert "pcc_gc_backend4_free_page_head" in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_remembered_slots")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_remembered_cards")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_remembered_card_ratio_per_mille")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_dirty_pages")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_fragmented_pages")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_young_pages")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_old_pages")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_free_pages")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_free_capacity_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_zpage_free_span_bytes")' in py_src
+    assert '@c_abi_export("pcc_gc_backend4_page_pressure_score")' in py_src
+    assert '@c_abi_export("pcc_gc_note_slot_write_barrier")' in py_src
+    assert '"pcc_gc_backend4_fragmentation_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_generation_barrier_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_entries": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_generation_promotion_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_candidate_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuated_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_page_policy_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_large_object_defer_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_large_object_deferred_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_small_page_candidate_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_medium_page_candidate_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_candidate_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_small_page_candidate_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_medium_page_candidate_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_candidate_zpage_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_small_page_candidate_zpage_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_medium_page_candidate_zpage_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_page_candidate_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_page_candidate_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_page_dirty_cards": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_drain": (_I64, [_I64], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_page_drain": (_I64, [_I64], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_drain_batches": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_drained_entries": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_duplicate_skips": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_high_water": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_owner_fanout_high_water": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_owner_count_high_water": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_incomplete_drains": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_incomplete_batches": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_batch_capacity": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_max_batch_size": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_full_batches": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_medium_capacity": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_medium_pending": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_medium_flushes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_medium_flushed_entries": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_medium_full_flushes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_cross_thread_medium_flushes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_store_buffer_cross_thread_medium_flushed_entries": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_evacuation_efficiency_per_mille": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_fragmentation_backlog_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_fragmentation_policy_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_small_page_limit_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_medium_page_limit_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_large_defer_limit_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_large_object_reconsiderations": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_young_object_count": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_old_object_count": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_young_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_old_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_small_page_object_count": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_medium_page_object_count": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_large_page_object_count": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_small_page_live_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_medium_page_live_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_large_page_live_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_remembered_set_entries": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_remembered_set_duplicate_skips": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_remembered_set_high_water": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_remembered_page_entries": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_remembered_page_slot_entries": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_remembered_page_high_water": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_remembered_page_contains_slot": (_I64, [_PTR], False)' in abi
+    assert '"pcc_gc_backend4_remembered_page_clear_slot": (_I64, [_PTR], False)' in abi
+    assert '"pcc_gc_backend4_zpage_contains_remembered_card": (_I64, [_PTR, _PTR], False)' in abi
+    assert '"pcc_gc_backend4_zpage_clear_remembered_card": (_I64, [_PTR, _PTR], False)' in abi
+    assert '"pcc_gc_backend4_zpage_count": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_capacity_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_fragmentation_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_large_pages": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_used_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_allocated_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_reclaimable_gap_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_span_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_owner_offset_bytes": (_I64, [_PYOBJ], False)' in abi
+    assert '"pcc_gc_backend4_zpage_owner_size_bytes": (_I64, [_PYOBJ], False)' in abi
+    assert '"pcc_gc_backend4_zpage_owner_span_card": (_I64, [_PYOBJ], False)' in abi
+    assert '"pcc_gc_backend4_zpage_owner_slot_span_card": (_I64, [_PYOBJ, _PTR], False)' in abi
+    assert '"pcc_gc_backend4_zpage_register_owner_payload_span": (_I64, [_PYOBJ, _PTR, _I64], False)' in abi
+    assert '"pcc_gc_backend4_zpage_fragmentation_per_mille": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_policy_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_remembered_slots": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_remembered_cards": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_remembered_card_ratio_per_mille": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_dirty_pages": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_fragmented_pages": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_young_pages": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_old_pages": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_free_pages": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_free_capacity_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_zpage_free_span_bytes": (_I64, [], False)' in abi
+    assert '"pcc_gc_backend4_page_pressure_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_note_slot_write_barrier": (_VOID, [_PYOBJ, _PTR, _PYOBJ], False)' in abi
+    assert 'define_global_ptr_null("pcc_gc_backend4_free_page_head")' in py_substrate
+    assert 'define_global_ptr_null("pcc_gc_backend4_zpage_payload_span_head")' in py_substrate
+    assert 'define_global_ptr_null("pcc_gc_backend4_evacuation_page_head")' in py_substrate
+    assert 'define_global_i32("pcc_gc_backend4_evacuation_candidate_zpage_bytes_count", 0)' in py_substrate
+
+
+def test_backend4_class_method_metadata_is_not_treated_as_gc_slots() -> None:
+    c_class = (RUNTIME_DIR / "src" / "py_class.c").read_text()
+    py_class = (RUNTIME_DIR / "py" / "py_class.py").read_text()
+    c_gc = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text()
+    py_gc = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text()
+
+    assert "return m->methods[j].func;" in c_class
+    assert "&m->methods[j].func" not in c_class
+    assert "return load_ptr(methods, m_off + 8)" in py_class
+    assert "pcc_gc_load_ptr(m, ptr_add(methods, m_off + 8))" not in py_class
+
+    assert "src->methods[i].func;" in c_gc
+    assert "visit(cls->methods[i].func)" not in c_gc
+    assert "visit(cls->del_method)" not in c_gc
+    assert "pcc_gc_promote_young_borrowed_slot(&cls->methods[i].func)" in c_gc
+    assert "pcc_gc_promote_young_borrowed_slot(&cls->del_method)" in c_gc
+
+    assert "del_method = load_ptr(from_obj, 96)" in py_gc
+    assert "method_func = load_ptr(methods, method_off + 8)" in py_gc
+    assert "_mark_gray_if_known(load_ptr(methods, k * 16 + 8))" not in py_gc
+    assert "_mark_gray_if_known(load_ptr(o, 96))" not in py_gc
+    assert "_promote_young_borrowed_slot(methods, k * 16 + 8)" in py_gc
+    assert "_promote_young_borrowed_slot(o, 96)" in py_gc

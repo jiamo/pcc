@@ -110,7 +110,7 @@ def pytest_configure(config):
         nginx_dir = os.path.join(_repo_root(), "projects", "nginx-1.28.3")
         nginx_makefile = os.path.join(nginx_dir, "objs", "Makefile")
         if os.path.isdir(nginx_dir) and not os.path.isfile(nginx_makefile):
-            from tests.test_nginx import _ensure_nginx_configured
+            from tests.integration.test_nginx import _ensure_nginx_configured
 
             _ensure_nginx_configured()
 

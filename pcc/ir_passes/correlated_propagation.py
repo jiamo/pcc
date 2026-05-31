@@ -26,7 +26,7 @@ import re
 
 import llvmlite.binding as llvm
 
-from .dominator_tree import compute_dominator_tree
+from .dominator_tree import CFG, compute_dominator_tree
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
 
 
@@ -116,6 +116,7 @@ def _collect_eq_facts(fn) -> list[tuple[str, str, str, str, str]]:
             if var is not None and const_val is not None:
                 compares[m.group("res")] = (m.group("pred"), var, const_val)
 
+    cfg = CFG.of_function(fn)
     facts: list[tuple[str, str, str, str, str]] = []
     for block in fn.blocks:
         block_name = block.name or ""
@@ -131,8 +132,14 @@ def _collect_eq_facts(fn) -> list[tuple[str, str, str, str, str]]:
         if cond not in compares:
             continue
         pred, var, const_val = compares[cond]
-        facts.append((block_name, m.group("t"), pred, var, const_val))
-        facts.append((block_name, m.group("f"), _negate(pred), var, const_val))
+        for target, fact_pred in (
+            (m.group("t"), pred),
+            (m.group("f"), _negate(pred)),
+        ):
+            target_preds = tuple(cfg.predecessors.get(target, ()))
+            if len(target_preds) != 1 or target_preds[0] != block_name:
+                continue
+            facts.append((block_name, target, fact_pred, var, const_val))
     return facts
 
 

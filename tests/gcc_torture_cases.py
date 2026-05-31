@@ -6,12 +6,12 @@ import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.project import TranslationUnit
 from tests.worker_process import run_worker_process
-
 
 # GCC torture cases run under pytest-xdist and then spawn an extra worker
 # process per case. A 10s budget is too tight under load and causes flaky
@@ -51,6 +51,7 @@ def _read_case_source(case_path: Path) -> str:
         return case_path.read_text(encoding="latin-1")
 
 
+@lru_cache(maxsize=None)
 def compile_native(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT):
     cc = _host_cc()
     with tempfile.TemporaryDirectory(prefix="gcc_torture_native_compile_") as tmpdir:
@@ -65,6 +66,7 @@ def compile_native(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIME
         )
 
 
+@lru_cache(maxsize=None)
 def run_native(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT):
     cc = _host_cc()
     with tempfile.TemporaryDirectory(prefix="gcc_torture_native_") as tmpdir:
@@ -89,11 +91,15 @@ def run_native(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT)
         )
 
 
+@lru_cache(maxsize=None)
 def compile_pcc(case_path: Path, timeout: int = DEFAULT_TIMEOUT) -> PccCompileResult:
     return _run_pcc_worker("compile", case_path, timeout)
 
 
-def run_pcc(case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT) -> PccCompileResult:
+@lru_cache(maxsize=None)
+def run_pcc(
+    case_path: Path, repo_root: Path, timeout: int = DEFAULT_TIMEOUT
+) -> PccCompileResult:
     del repo_root
     return _run_pcc_worker("run", case_path, timeout)
 

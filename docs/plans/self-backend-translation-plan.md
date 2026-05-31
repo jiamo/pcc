@@ -3,7 +3,7 @@
 Related plans:
 
 - `docs/plans/dual-llvm-backend-compat-plan.md`
-- `docs/plans/llvmcapi-wire-spike-report.md`
+- `docs/plans/archive/llvmcapi-wire-spike-report.md`
 - `docs/plans/all-pass-llvm-ir-1to1-master-plan.md`
 - `docs/plans/python-frontend-plan.md`
 - `docs/plans/self-backend-bootstrap-default-plan.md`
@@ -598,7 +598,7 @@ providers can consume the same front-half output.
 Primary dependency:
 
 - `β4` text-first builder / `llvm_capi` work from
-  `docs/plans/llvmcapi-wire-spike-report.md`
+  `docs/plans/archive/llvmcapi-wire-spike-report.md`
 
 Deliverables:
 

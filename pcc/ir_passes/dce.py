@@ -149,7 +149,12 @@ def _is_trivially_dead_call(
         return False
     attrs = attrs_by_func.get(match.group("callee"), set())
     return (
-        ("readnone" in attrs or "memory(none)" in attrs)
+        (
+            "readnone" in attrs
+            or "readonly" in attrs
+            or "memory(none)" in attrs
+            or "memory(read)" in attrs
+        )
         and "willreturn" in attrs
         and "nounwind" in attrs
     )

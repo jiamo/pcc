@@ -1,20 +1,42 @@
-"""pcc ``extern "C"`` FFI declarations (P6C.1 scaffold).
+"""pcc ``extern "C"`` FFI declarations (P6C.1).
 
 The self-hosting roadmap (``docs/plans/python-frontend-plan.md``
 §Phase 6C.1) requires that compiled Python be able to declare and
 call arbitrary C library entry points directly, without going
 through CPython or any other interpreter. This module hosts the
-type markers and the ``extern()`` factory that pcc's codegen will
-recognize.
+type markers and the ``extern()`` factory that pcc's codegen
+recognizes.
 
-Runtime status (2026-04-20): the types here are plain Python classes
-used by the frontend for static-analysis / type-inference. The
-codegen recognition that lowers ``extern("libc_func")(x, y)`` into a
-direct LLVM ``call`` has NOT yet landed — that is P6C.1's full
-deliverable. The scaffold exists so user code can be written in the
-intended shape today and compiled as soon as the codegen lands.
+Runtime status (2026-05-12): **codegen has landed**. The frontend
+records ``extern()`` calls into ``L1CodeGen._extern_decls`` (see
+``pcc/py_frontend/codegen/layer1.py::_emit_extern_call``); a call
+through an extern lowers to a direct LLVM ``call`` to the named
+external symbol with the declared C ABI. There is **no Python /
+``py_obj_*`` trampoline** — the emitted asm is just ``bl <symbol>``
+plus the int truncate/extend conversions performed by
+``_coerce_to_extern``.
 
-Example (forward-looking)::
+Known sharp edges still under P6C.1:
+
+* ``c_str`` **argument**: pcc's ``str`` value is a ``PyStrObject*``,
+  but the extern declaration expects a raw ``char*``. The current
+  codegen passes the ``PyStrObject*`` through unchanged (see
+  ``_coerce_to_extern`` line ~13483). For libc symbols that read
+  bytes (``access``, ``getenv``, ...) this is wrong unless the
+  callee happens to skip the header — most callers go through a
+  helper that materialises a NUL-terminated buffer first.
+* ``c_str`` **return**: extern functions returning ``char*`` (e.g.
+  ``getenv``) hand back raw ``i8*``. There is no runtime helper
+  yet that wraps the result into a ``PyStrObject``; the pcc-side
+  caller currently has to raise ``NotImplementedError``. See
+  ``pcc/py_stdlib/os.py::getenv`` for the canonical "blocked on
+  string-return marshalling" stub.
+* **Errno**: extern calls do not raise Python-level exceptions on
+  failure; the C return contract is the only signal (``-1`` +
+  ``errno`` for libc). Wrappers that want ``OSError`` semantics
+  must inspect errno explicitly.
+
+Example::
 
     from pcc.extern import extern, c_int, c_str, c_ptr
 
@@ -29,10 +51,6 @@ Example (forward-looking)::
         printf(c_str("hello\\n"))
 
     main()
-
-The eventual codegen recognizes the ``extern()`` factory result as
-an opaque callable and lowers calls through it to a direct LLVM
-``call @printf(...)`` with no Python-runtime trampoline.
 """
 from __future__ import annotations
 

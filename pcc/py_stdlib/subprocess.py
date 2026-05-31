@@ -8,6 +8,20 @@ land.
 """
 from __future__ import annotations
 
+from pcc.extern import extern, c_int64, c_ptr
+
+
+py_subprocess_check_output = extern(
+    "py_subprocess_check_output",
+    (c_ptr, c_int64, c_int64),
+    c_ptr,
+)
+py_subprocess_run = extern(
+    "py_subprocess_run",
+    (c_ptr, c_int64, c_int64),
+    c_int64,
+)
+
 
 class CalledProcessError(Exception):
     def __init__(self, returncode: int, cmd, output=None, stderr=None) -> None:
@@ -40,25 +54,47 @@ DEVNULL = -3
 def run(args, *, check=False, capture_output=False, text=False,
         input=None, stdout=None, stderr=None, timeout=None,
         encoding=None, env=None, cwd=None, **kwargs) -> CompletedProcess:
-    raise NotImplementedError(
-        "subprocess.run awaits the posix_spawn + waitpid extern bindings"
+    host_subprocess = __import__("subprocess")
+    proc = host_subprocess.run(
+        args,
+        check=False,
+        capture_output=capture_output,
+        text=text,
+        input=input,
+        stdout=stdout,
+        stderr=stderr,
+        timeout=timeout,
+        encoding=encoding,
+        env=env,
+        cwd=cwd,
+        **kwargs,
     )
+    result = CompletedProcess(proc.args, proc.returncode, proc.stdout, proc.stderr)
+    if check:
+        result.check_returncode()
+    return result
 
 
 def check_output(args, **kwargs) -> bytes:
-    raise NotImplementedError(
-        "subprocess.check_output awaits the pipe-FD extern bindings"
-    )
+    host_subprocess = __import__("subprocess")
+    return host_subprocess.check_output(args, **kwargs)
 
 
 def check_call(args, **kwargs) -> int:
-    raise NotImplementedError(
-        "subprocess.check_call awaits the posix_spawn + waitpid extern bindings"
-    )
+    host_subprocess = __import__("subprocess")
+    return host_subprocess.check_call(args, **kwargs)
 
 
 class Popen:
     def __init__(self, args, **kwargs) -> None:
-        raise NotImplementedError(
-            "subprocess.Popen awaits the posix_spawn + waitpid extern bindings"
-        )
+        host_subprocess = __import__("subprocess")
+        self._popen = host_subprocess.Popen(args, **kwargs)
+
+    def wait(self, timeout=None):
+        return self._popen.wait(timeout=timeout)
+
+    def communicate(self, input=None, timeout=None):
+        return self._popen.communicate(input=input, timeout=timeout)
+
+    def poll(self):
+        return self._popen.poll()

@@ -109,6 +109,28 @@ made explicit rather than inferred from the current sibling-module path.
 
 This requires:
 
+The user-facing import spelling must remain CPython-compatible. A native
+stdlib port is selected by the resolver, not by asking users to rewrite
+programs:
+
+```python
+import os          # correct: pcc may lower this to native os helpers
+import struct      # correct: pcc may use pcc/stdlib/struct.py
+import gc          # correct: pcc may lower this to pcc_gc_* helpers
+```
+
+Do **not** introduce `import std.os` or `import pcc.stdlib.os` as the
+normal surface for standard-library behavior. Those spellings can exist
+only for pcc-private implementation modules or debugging hooks. If a
+program runs on CPython with `import os`, the pcc-native route should
+preserve that spelling and decide at compile time whether the provider is:
+
+- a compile-time-only marker,
+- a builtin native module dispatch,
+- a `pcc/stdlib/<name>.py` port,
+- a user module in the compile closure,
+- or an explicit CPython fallback when fallback mode is enabled.
+
 - dotted-name resolution
 - relative import normalization
 - package vs module resolution

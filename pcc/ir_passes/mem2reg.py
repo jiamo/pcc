@@ -89,13 +89,17 @@ def mem2reg_module(ir_text: str) -> tuple[str, bool]:
     module.verify()
 
     any_changed = False
+    mut = MutableModule.parse(ir_text)
     for fn in module.functions:
         if fn.is_declaration:
             continue
-        new_text, changed = _promote_fn(ir_text, fn)
-        if changed:
-            ir_text = new_text
+        plan = _promotion_plan_for_fn(fn)
+        if plan is None:
+            continue
+        if _apply_promotion_plan(mut, fn.name, plan):
             any_changed = True
+    if any_changed:
+        return mut.serialize(), True
     return ir_text, any_changed
 
 
@@ -150,10 +154,10 @@ def _collect_alloca_info(fn: llvm.ValueRef) -> dict[str, dict]:
     return info
 
 
-def _promote_fn(ir_text: str, fn: llvm.ValueRef) -> tuple[str, bool]:
+def _promotion_plan_for_fn(fn: llvm.ValueRef) -> dict[str, object] | None:
     alloca_info = _collect_alloca_info(fn)
     if not alloca_info:
-        return ir_text, False
+        return None
 
     dom = compute_dominator_tree(fn)
     cfg = CFG.of_function(fn)
@@ -257,7 +261,7 @@ def _promote_fn(ir_text: str, fn: llvm.ValueRef) -> tuple[str, bool]:
             phi_plan[name] = phi_candidate
 
     if not promote_plan and not phi_plan and not linear_plan:
-        return ir_text, False
+        return None
 
     # Also collect load results to substitute with the stored value.
     load_substitutions: dict[str, str] = {}  # load_result → stored_val
@@ -269,10 +273,29 @@ def _promote_fn(ir_text: str, fn: llvm.ValueRef) -> tuple[str, bool]:
     for substitutions in linear_plan.values():
         load_substitutions.update(substitutions)
 
-    mut = MutableModule.parse(ir_text)
-    fn_mut = mut.function(fn.name)
+    return {
+        "alloca_info": alloca_info,
+        "promote_plan": promote_plan,
+        "phi_plan": phi_plan,
+        "linear_plan": linear_plan,
+        "load_substitutions": load_substitutions,
+    }
+
+
+def _apply_promotion_plan(
+    mut: MutableModule,
+    fn_name: str,
+    plan: dict[str, object],
+) -> bool:
+    fn_mut = mut.function(fn_name)
     if fn_mut is None:
-        return ir_text, False
+        return False
+
+    alloca_info = plan["alloca_info"]
+    promote_plan = plan["promote_plan"]
+    phi_plan = plan["phi_plan"]
+    linear_plan = plan["linear_plan"]
+    load_substitutions = plan["load_substitutions"]
 
     promoted_allocas = set(promote_plan) | set(phi_plan) | set(linear_plan)
     for block in fn_mut.blocks:
@@ -293,8 +316,8 @@ def _promote_fn(ir_text: str, fn: llvm.ValueRef) -> tuple[str, bool]:
 
     phi_insert_positions: dict[str, int] = {}
     phi_entries: dict[str, list[tuple[str, dict[str, object]]]] = {}
-    for alloca_name, plan in phi_plan.items():
-        for phi in plan["phis"]:
+    for alloca_name, phi_data in phi_plan.items():
+        for phi in phi_data["phis"]:
             phi_entries.setdefault(phi["block"], []).append((alloca_name, phi))
 
     for block_name, entries in phi_entries.items():
@@ -303,7 +326,7 @@ def _promote_fn(ir_text: str, fn: llvm.ValueRef) -> tuple[str, bool]:
         for alloca_name, phi in entries:
             load_block = fn_mut.block(phi["block"])
             if load_block is None:
-                return ir_text, False
+                return False
             insert_at = phi_insert_positions.get(block_name, 0)
             incoming_text = ", ".join(
                 f"[ {phi['incoming'][pred]}, %{pred} ]"
@@ -316,14 +339,31 @@ def _promote_fn(ir_text: str, fn: llvm.ValueRef) -> tuple[str, bool]:
             load_block.instructions.insert(insert_at, Instruction.from_text(phi_text))
             phi_insert_positions[block_name] = insert_at + 1
 
-    text = mut.serialize()
-    # Substitute each load's result with the stored value at use sites.
-    for load_res, stored_val in load_substitutions.items():
-        text = re.sub(
-            r"%" + re.escape(load_res) + r"\b", stored_val, text
-        )
+    resolved_load_substitutions = {
+        load_res: _resolve_phi_value(stored_val, load_substitutions)
+        for load_res, stored_val in load_substitutions.items()
+    }
 
-    return text, True
+    # Substitute each load's result with the stored value at use sites.
+    for load_res, stored_val in resolved_load_substitutions.items():
+        pattern = re.compile(r"%" + re.escape(load_res) + r"\b")
+        for block in fn_mut.blocks:
+            for inst in block.instructions:
+                new_text = pattern.sub(stored_val, inst.text)
+                if new_text != inst.text:
+                    inst.text = new_text
+
+    return True
+
+
+def _promote_fn(ir_text: str, fn: llvm.ValueRef) -> tuple[str, bool]:
+    plan = _promotion_plan_for_fn(fn)
+    if plan is None:
+        return ir_text, False
+    mut = MutableModule.parse(ir_text)
+    if not _apply_promotion_plan(mut, fn.name, plan):
+        return ir_text, False
+    return mut.serialize(), True
 
 
 def _defined_names(fn: llvm.ValueRef) -> set[str]:
@@ -594,6 +634,21 @@ def _ssa_plan_for_alloca(
                 return None
             load_substitutions[res] = info[0]
 
+    for phi in phi_nodes:
+        incoming = phi["incoming"]
+        for pred in phi["preds"]:
+            if pred in incoming:
+                continue
+            info = block_exit_value(pred)
+            if info is None:
+                return None
+            incoming[pred] = info[0]
+
+    for phi in phi_nodes:
+        incoming = phi["incoming"]
+        if any(pred not in incoming for pred in phi["preds"]):
+            return None
+
     phi_replacements: dict[str, str] = {}
     changed = True
     while changed:
@@ -675,7 +730,13 @@ def _phi_candidate_for_alloca(
     ]
     if not candidate_blocks:
         return None
-    load_block = min(candidate_blocks, key=lambda block: len(dom.dominators(block)))
+    load_block = candidate_blocks[0]
+    load_block_depth = len(dom.dominators(load_block))
+    for candidate in candidate_blocks:
+        candidate_depth = len(dom.dominators(candidate))
+        if candidate_depth < load_block_depth:
+            load_block = candidate
+            load_block_depth = candidate_depth
     preds = tuple(cfg.predecessors.get(load_block, ()))
     if len(preds) < 2:
         return None

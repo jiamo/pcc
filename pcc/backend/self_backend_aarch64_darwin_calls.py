@@ -1226,6 +1226,52 @@ def emit_floor_intrinsic_call(
     args: tuple[tuple[TypeDesc, str], ...],
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
+    return _emit_frint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols, "frintm")
+
+
+def emit_ceil_intrinsic_call(
+    func: ParsedFunction,
+    dest: str | None,
+    ret_type: TypeDesc,
+    callee: str,
+    args: tuple[tuple[TypeDesc, str], ...],
+    module_symbols: PreparedModuleSymbols,
+) -> list[str]:
+    return _emit_frint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols, "frintp")
+
+
+def emit_trunc_intrinsic_call(
+    func: ParsedFunction,
+    dest: str | None,
+    ret_type: TypeDesc,
+    callee: str,
+    args: tuple[tuple[TypeDesc, str], ...],
+    module_symbols: PreparedModuleSymbols,
+) -> list[str]:
+    return _emit_frint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols, "frintz")
+
+
+def emit_rint_intrinsic_call(
+    func: ParsedFunction,
+    dest: str | None,
+    ret_type: TypeDesc,
+    callee: str,
+    args: tuple[tuple[TypeDesc, str], ...],
+    module_symbols: PreparedModuleSymbols,
+) -> list[str]:
+    # llvm.rint / llvm.nearbyint round-to-nearest-even.
+    return _emit_frint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols, "frintn")
+
+
+def _emit_frint_intrinsic_call(
+    func: ParsedFunction,
+    dest: str | None,
+    ret_type: TypeDesc,
+    callee: str,
+    args: tuple[tuple[TypeDesc, str], ...],
+    module_symbols: PreparedModuleSymbols,
+    asm_op: str,
+) -> list[str]:
     if dest is None or dest not in func.value_slots:
         return []
     if len(args) != 1:
@@ -1238,7 +1284,7 @@ def emit_floor_intrinsic_call(
             f"self backend {callee} intrinsic currently only supports float/double in {func.name!r}"
         )
     lines = materialize_value(func, value, value_type, 9, module_symbols)
-    lines.append(f"  frintm {reg_name(ret_type, 11)}, {reg_name(value_type, 9)}")
+    lines.append(f"  {asm_op} {reg_name(ret_type, 11)}, {reg_name(value_type, 9)}")
     lines.extend(store_value_regs_to_slot(func.value_slots[dest], 11))
     return lines
 
@@ -1297,34 +1343,111 @@ def emit_is_fpclass_intrinsic_call(
     bits_reg = "x12" if value_type.width > 32 else "w12"
     mask_reg = "x13" if value_type.width > 32 else "w13"
     tmp_reg = "x15" if value_type.width > 32 else "w15"
+    tmp2_reg = "x16" if value_type.width > 32 else "w16"
     sign_bit = 1 << (value_type.width - 1)
     exponent_mask = 0x7FF0000000000000 if value_type.width > 32 else 0x7F800000
+    fraction_mask = 0x000FFFFFFFFFFFFF if value_type.width > 32 else 0x007FFFFF
+    quiet_nan_bit = 0x0008000000000000 if value_type.width > 32 else 0x00400000
     lines = materialize_value(func, value, value_type, 9, module_symbols)
     lines.append(f"  fmov {bits_reg}, {reg_name(value_type, 9)}")
     lines.append("  movz w11, #0")
     handled_mask = 0
-    if mask & 0x20:
-        lines.extend(emit_const_to_reg(int_type, mask_reg, sign_bit))
-        lines.append(f"  cmp {bits_reg}, {mask_reg}")
+
+    def _or_eq_const(value_bits: int) -> None:
+        if value_bits == 0:
+            lines.append(f"  cmp {bits_reg}, #0")
+        else:
+            lines.extend(emit_const_to_reg(int_type, mask_reg, value_bits))
+            lines.append(f"  cmp {bits_reg}, {mask_reg}")
         lines.append("  cset w14, eq")
         lines.append("  orr w11, w11, w14")
-        handled_mask |= 0x20
-    if mask & 0x40:
-        lines.append(f"  cmp {bits_reg}, #0")
-        lines.append("  cset w14, eq")
-        lines.append("  orr w11, w11, w14")
-        handled_mask |= 0x40
-    if (mask & 0x1C0) == 0x1C0:
+
+    def _start_sign_predicate(negative: bool) -> None:
         lines.extend(emit_const_to_reg(int_type, mask_reg, sign_bit))
         lines.append(f"  tst {bits_reg}, {mask_reg}")
-        lines.append("  cset w14, eq")
+        lines.append("  cset w14, " + ("ne" if negative else "eq"))
+
+    def _and_exponent_zero(expected_zero: bool) -> None:
+        lines.extend(emit_const_to_reg(int_type, mask_reg, exponent_mask))
+        lines.append(f"  and {tmp_reg}, {bits_reg}, {mask_reg}")
+        lines.append(f"  cmp {tmp_reg}, #0")
+        lines.append("  cset w15, " + ("eq" if expected_zero else "ne"))
+        lines.append("  and w14, w14, w15")
+
+    def _and_exponent_all(expected_all: bool) -> None:
         lines.extend(emit_const_to_reg(int_type, mask_reg, exponent_mask))
         lines.append(f"  and {tmp_reg}, {bits_reg}, {mask_reg}")
         lines.append(f"  cmp {tmp_reg}, {mask_reg}")
-        lines.append("  cset w15, ne")
+        lines.append("  cset w15, " + ("eq" if expected_all else "ne"))
         lines.append("  and w14, w14, w15")
+
+    def _and_fraction_zero(expected_zero: bool) -> None:
+        lines.extend(emit_const_to_reg(int_type, mask_reg, fraction_mask))
+        lines.append(f"  and {tmp2_reg}, {bits_reg}, {mask_reg}")
+        lines.append(f"  cmp {tmp2_reg}, #0")
+        lines.append("  cset w15, " + ("eq" if expected_zero else "ne"))
+        lines.append("  and w14, w14, w15")
+
+    def _and_quiet_nan_bit_set(expected_set: bool) -> None:
+        lines.extend(emit_const_to_reg(int_type, mask_reg, quiet_nan_bit))
+        lines.append(f"  tst {bits_reg}, {mask_reg}")
+        lines.append("  cset w15, " + ("ne" if expected_set else "eq"))
+        lines.append("  and w14, w14, w15")
+
+    def _or_normal(negative: bool) -> None:
+        _start_sign_predicate(negative)
+        _and_exponent_zero(False)
+        _and_exponent_all(False)
         lines.append("  orr w11, w11, w14")
-        handled_mask |= 0x1C0
+
+    def _or_subnormal(negative: bool) -> None:
+        _start_sign_predicate(negative)
+        _and_exponent_zero(True)
+        _and_fraction_zero(False)
+        lines.append("  orr w11, w11, w14")
+
+    def _or_nan(signaling: bool) -> None:
+        # LLVM defines these mask bits in llvm/ADT/FloatingPointMode.h's
+        # FPClassTest enum; keep this expansion aligned with that source.
+        lines.append("  movz w14, #1")
+        _and_exponent_all(True)
+        if signaling:
+            _and_fraction_zero(False)
+            _and_quiet_nan_bit_set(False)
+        else:
+            _and_quiet_nan_bit_set(True)
+        lines.append("  orr w11, w11, w14")
+
+    if mask & 0x1:
+        _or_nan(signaling=True)
+        handled_mask |= 0x1
+    if mask & 0x2:
+        _or_nan(signaling=False)
+        handled_mask |= 0x2
+    if mask & 0x4:
+        _or_eq_const(sign_bit | exponent_mask)
+        handled_mask |= 0x4
+    if mask & 0x8:
+        _or_normal(negative=True)
+        handled_mask |= 0x8
+    if mask & 0x10:
+        _or_subnormal(negative=True)
+        handled_mask |= 0x10
+    if mask & 0x20:
+        _or_eq_const(sign_bit)
+        handled_mask |= 0x20
+    if mask & 0x40:
+        _or_eq_const(0)
+        handled_mask |= 0x40
+    if mask & 0x80:
+        _or_subnormal(negative=False)
+        handled_mask |= 0x80
+    if mask & 0x100:
+        _or_normal(negative=False)
+        handled_mask |= 0x100
+    if mask & 0x200:
+        _or_eq_const(exponent_mask)
+        handled_mask |= 0x200
     if mask & ~handled_mask:
         raise BackendUnavailable(
             f"self backend {callee} intrinsic mask not translated yet in {func.name!r}: {mask}"
@@ -1394,6 +1517,12 @@ def emit_call_instruction(
         return emit_fabs_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
     if not is_indirect and callee.startswith("llvm.floor."):
         return emit_floor_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+    if not is_indirect and callee.startswith("llvm.ceil."):
+        return emit_ceil_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+    if not is_indirect and callee.startswith("llvm.trunc."):
+        return emit_trunc_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+    if not is_indirect and callee.startswith(("llvm.rint.", "llvm.nearbyint.")):
+        return emit_rint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
     if not is_indirect and callee.startswith("llvm.sqrt."):
         return emit_sqrt_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
     if not is_indirect and callee.startswith("llvm.is.fpclass."):

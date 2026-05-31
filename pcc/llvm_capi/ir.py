@@ -19,8 +19,11 @@ The implementation philosophy matches ``pcc.parse.py_parse`` /
 ``c_parse_driver``: static typed Python, no heavy reflection, ready
 for self-host compilation.
 """
+
 from __future__ import annotations
 
+import os
+import sys
 from typing import Iterable, Optional
 
 
@@ -103,6 +106,42 @@ def _bits_to_float64_ir(bits: int) -> float:
     return -f if sign else f
 
 
+def _env_flag_enabled(name: str) -> bool:
+    value = str(os.environ.get(name, "") or "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+_DEBUG_IR_RENDER_ENABLED = _env_flag_enabled("PCC_DEBUG_IR_RENDER")
+_DEBUG_IR_CALL_ENABLED = _env_flag_enabled("PCC_DEBUG_IR_CALL")
+
+
+def _debug_ir_render_enabled() -> bool:
+    return _DEBUG_IR_RENDER_ENABLED
+
+
+def _debug_ir_call_enabled() -> bool:
+    return _DEBUG_IR_CALL_ENABLED
+
+
+def _debug_ir_render_enabled_uncached() -> bool:
+    value = str(os.environ.get("PCC_DEBUG_IR_RENDER", "") or "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _debug_ir_call_enabled_uncached() -> bool:
+    value = str(os.environ.get("PCC_DEBUG_IR_CALL", "") or "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _join_text(parts, sep: str) -> str:
+    out_parts = []
+    i = 0
+    while i < len(parts):
+        out_parts.append(str(parts[i]))
+        i += 1
+    return sep.join(out_parts)
+
+
 def _round_to_float32_ir(f: float) -> float:
     inf = 1e309
     if f != f or f == inf or f == -inf or f == 0.0:
@@ -178,7 +217,7 @@ class Type:
         raise NotImplementedError
 
     def __repr__(self) -> str:
-        return f"<{self._name} {str(self)}>"
+        return "<" + str(self._name) + " " + str(self) + ">"
 
     def __eq__(self, other) -> bool:
         return type(self) is type(other) and str(self) == str(other)
@@ -193,7 +232,9 @@ class Type:
 
 class _SingletonType(Type):
     """Scalar types with no parameters — interned per subclass."""
+
     _instance = None
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -234,27 +275,33 @@ class IntType(Type):
         self.width = width
 
     def __str__(self) -> str:
-        return f"i{self.width}"
+        return "i" + str(self.width)
 
     def __call__(self, value: int) -> "Constant":
         """``IntType(32)(0)`` shorthand for ``Constant(IntType(32), 0)``."""
         return Constant(self, value)
 
 
+_I1 = IntType(1)
+
+
 class HalfType(_SingletonType):
     _name = "half"
+
     def __str__(self) -> str:
         return "half"
 
 
 class FloatType(_SingletonType):
     _name = "float"
+
     def __str__(self) -> str:
         return "float"
 
 
 class DoubleType(_SingletonType):
     _name = "double"
+
     def __str__(self) -> str:
         return "double"
 
@@ -273,8 +320,28 @@ class PointerType(Type):
     def __str__(self) -> str:
         # Opaque pointer form (LLVM 15+). addrspace qualifier inline.
         if self.addrspace:
-            return f"ptr addrspace({self.addrspace})"
+            return "ptr addrspace(" + str(self.addrspace) + ")"
         return "ptr"
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, PointerType)
+            and self.addrspace == other.addrspace
+            and self.pointee == other.pointee
+        )
+
+    def __hash__(self) -> int:
+        return hash((PointerType, self.addrspace, self.pointee))
+
+
+def _same_llvm_text_type(a: Type, b: Type) -> bool:
+    return str(a) == str(b)
+
+
+def _same_tracked_type(a: Type, b: Type) -> bool:
+    if isinstance(a, PointerType) and isinstance(b, PointerType):
+        return a.addrspace == b.addrspace and _same_tracked_type(a.pointee, b.pointee)
+    return type(a) is type(b) and str(a) == str(b)
 
 
 class ArrayType(Type):
@@ -285,7 +352,7 @@ class ArrayType(Type):
         self.count = count
 
     def __str__(self) -> str:
-        return f"[{self.count} x {self.element}]"
+        return "[" + str(self.count) + " x " + str(self.element) + "]"
 
     def gep(self, indices) -> Type:
         """Type-level GEP — array has uniform element type, so any
@@ -341,10 +408,13 @@ class LiteralStructType(BaseStructType):
         self.packed = packed
 
     def __str__(self) -> str:
-        body = ", ".join(str(e) for e in self.elements)
+        body_parts = []
+        for e in self.elements:
+            body_parts.append(str(e))
+        body = _join_text(body_parts, ", ")
         if self.packed:
-            return f"<{{ {body} }}>"
-        return f"{{ {body} }}"
+            return "<{ " + body + " }>"
+        return "{ " + body + " }"
 
 
 class IdentifiedStructType(BaseStructType):
@@ -386,16 +456,19 @@ class IdentifiedStructType(BaseStructType):
     def get_declaration(self) -> str:
         """Top-level type declaration text for the module."""
         if not self._body_set:
-            return f"%{self.name} = type opaque"
-        body = ", ".join(str(e) for e in self.elements)
+            return "%" + str(self.name) + " = type opaque"
+        body_parts = []
+        for e in self.elements:
+            body_parts.append(str(e))
+        body = _join_text(body_parts, ", ")
         if self.packed:
-            return f"%{self.name} = type <{{ {body} }}>"
-        return f"%{self.name} = type {{ {body} }}"
+            return "%" + str(self.name) + " = type <{ " + body + " }>"
+        return "%" + str(self.name) + " = type { " + body + " }"
 
     def __str__(self) -> str:
         # As an operand, refer by its name — actual body is emitted
         # at module top via ``get_declaration``.
-        return f"%{self.name}"
+        return "%" + str(self.name)
 
 
 def _type_gep_result(base_ty: Type, indices) -> Type:
@@ -456,10 +529,13 @@ class FunctionType(Type):
         self.var_arg = var_arg
 
     def __str__(self) -> str:
-        args_text = ", ".join(str(a) for a in self.args)
+        arg_parts = []
+        for a in self.args:
+            arg_parts.append(str(a))
+        args_text = _join_text(arg_parts, ", ")
         if self.var_arg:
-            args_text = f"{args_text}, ..." if args_text else "..."
-        return f"{self.return_type} ({args_text})"
+            args_text = args_text + ", ..." if args_text else "..."
+        return str(self.return_type) + " (" + args_text + ")"
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +593,7 @@ class Value:
         # Find the opcode position: optional "%name = " prefix, then opcode.
         eq = old.find(" = ")
         if eq >= 0:
-            body = old[eq + 3:]
+            body = old[eq + 3 :]
             head = old[:eq] + " = "
         else:
             body = old
@@ -526,30 +602,55 @@ class Value:
         split = body.find(" ")
         if split >= 0:
             op = body[:split]
-            tail = body[split + 1:]
+            tail = body[split + 1 :]
         else:
             op = body
             tail = ""
-        flag_text = ("".join(f" {f}" for f in self._flags)).lstrip()
+        flag_parts = []
+        for f in self._flags:
+            flag_parts.append(" " + str(f))
+        flag_text = _join_text(flag_parts, "").lstrip()
         if flag_text:
-            new = f"{head}{op} {flag_text} {tail}"
+            new = str(head) + str(op) + " " + flag_text + " " + str(tail)
         else:
-            new = f"{head}{op} {tail}"
-        self._instr.text = new
+            new = str(head) + str(op) + " " + str(tail)
+        self._instr.block._replace_record_text(self._instr, new)
 
     def bitcast(self, target_ty: Type) -> "Value":
-        expr = f"bitcast ({self.type} {self._ref} to {target_ty})"
+        if _same_tracked_type(self.type, target_ty):
+            return self
+        expr = (
+            "bitcast ("
+            + str(self.type)
+            + " "
+            + str(self._ref)
+            + " to "
+            + str(target_ty)
+            + ")"
+        )
         return Value(target_ty, expr)
 
     def gep(self, indices, inbounds: bool = True) -> "Value":
         indices_list = list(indices)
-        idx_text = ", ".join(f"{i.type} {i}" for i in indices_list)
+        idx_parts = []
+        for i in indices_list:
+            idx_parts.append(str(i.type) + " " + str(i))
+        idx_text = _join_text(idx_parts, ", ")
         base_ty = self.type.pointee if isinstance(self.type, PointerType) else self.type
         result_pointee = _type_gep_result(base_ty, indices_list[1:])
         inb = "inbounds " if inbounds else ""
         expr = (
-            f"getelementptr {inb}({base_ty}, {self.type} "
-            f"{self._ref}, {idx_text})"
+            "getelementptr "
+            + inb
+            + "("
+            + str(base_ty)
+            + ", "
+            + str(self.type)
+            + " "
+            + str(self._ref)
+            + ", "
+            + idx_text
+            + ")"
         )
         return Value(PointerType(result_pointee), expr)
 
@@ -569,12 +670,30 @@ class Constant(Value):
         the inline ``inttoptr (<ty> <val> to <target>)`` form.
         Matches llvmlite's chained-constant API used by codegen
         for label-address tables."""
-        expr = f"inttoptr ({self.type} {self._ref} to {target_ty})"
+        expr = (
+            "inttoptr ("
+            + str(self.type)
+            + " "
+            + str(self._ref)
+            + " to "
+            + str(target_ty)
+            + ")"
+        )
         return Value(target_ty, expr)
 
     def bitcast(self, target_ty: Type) -> Value:
         """Constant-expression bitcast. Same shape as ``inttoptr``."""
-        expr = f"bitcast ({self.type} {self._ref} to {target_ty})"
+        if _same_tracked_type(self.type, target_ty):
+            return self
+        expr = (
+            "bitcast ("
+            + str(self.type)
+            + " "
+            + str(self._ref)
+            + " to "
+            + str(target_ty)
+            + ")"
+        )
         return Value(target_ty, expr)
 
     @staticmethod
@@ -614,6 +733,23 @@ class Constant(Value):
         return out
 
     @staticmethod
+    def _format_i8_array(value) -> str | None:
+        parts = ['c"']
+        digits = "0123456789ABCDEF"
+        for v in value:
+            if isinstance(v, Value) or not isinstance(v, int):
+                return None
+            if v < 0 or v > 255:
+                return None
+            hi = (v >> 4) & 15
+            lo = v & 15
+            parts.append("\\")
+            parts.append(digits[hi])
+            parts.append(digits[lo])
+        parts.append('"')
+        return _join_text(parts, "")
+
+    @staticmethod
     def _format(ty: Type, value) -> str:
         # Already a Value/Constant — use its pre-formatted ref text.
         if isinstance(value, Value):
@@ -638,17 +774,40 @@ class Constant(Value):
         if isinstance(ty, ArrayType):
             # [count x elem] [ <elem1>, <elem2>, ... ]
             # value is a sequence of Python-side values
-            parts = [Constant(ty.element, v)._ref for v in value]
+            elem_ty = ty.element
+            if isinstance(elem_ty, IntType) and elem_ty.width == 8:
+                c_string = Constant._format_i8_array(value)
+                if c_string is not None:
+                    return c_string
+            parts = []
+            if isinstance(elem_ty, IntType):
+                for v in value:
+                    if isinstance(v, Value):
+                        parts.append(v._ref)
+                    elif isinstance(v, bool):
+                        parts.append("1" if v else "0")
+                    else:
+                        parts.append(Constant._format_int(v))
+            else:
+                for v in value:
+                    if isinstance(v, Value):
+                        parts.append(v._ref)
+                    else:
+                        parts.append(Constant(elem_ty, v)._ref)
             # Each operand is printed as ``<elem_ty> <val>``
-            body = ", ".join(f"{ty.element} {p}" for p in parts)
-            return f"[{body}]"
+            elem_text = str(elem_ty)
+            body_parts = []
+            for p in parts:
+                body_parts.append(elem_text + " " + str(p))
+            body = _join_text(body_parts, ", ")
+            return "[" + body + "]"
         if isinstance(ty, BaseStructType):
             # struct constant: { <ty1> <val1>, <ty2> <val2>, ... }
             parts = []
             for elem_ty, val in zip(ty.elements, value):
                 c = Constant(elem_ty, val)
-                parts.append(f"{elem_ty} {c._ref}")
-            return "{ " + ", ".join(parts) + " }"
+                parts.append(str(elem_ty) + " " + str(c._ref))
+            return "{ " + _join_text(parts, ", ") + " }"
         # Fallback: stringify the raw value
         return str(value)
 
@@ -686,7 +845,7 @@ class Argument(Value):
         self.index = index
         self._name = ""
         # Match llvmlite: args are ``%.1``, ``%.2``, ... (1-based)
-        self._ref = f"%.{index + 1}"
+        self._ref = "%." + str(index + 1)
 
     @property
     def name(self) -> str:
@@ -695,7 +854,7 @@ class Argument(Value):
     @name.setter
     def name(self, value: str) -> None:
         self._name = value
-        self._ref = f"%{value}" if value else f"%.{self.index + 1}"
+        self._ref = "%" + str(value) if value else "%." + str(self.index + 1)
 
 
 class InstructionRecord:
@@ -705,8 +864,6 @@ class InstructionRecord:
     a terminator?" when hoisting or positioning new instructions.
     llvmlite's Instruction has ``opname``; we expose the same property
     derived from the first token of the emitted text."""
-
-    __slots__ = ("text", "opname", "block")
 
     def __init__(self, text: str, opname: str, block: "Block") -> None:
         self.text = text
@@ -724,10 +881,48 @@ def _opname_of(line: str) -> str:
     if stripped.startswith("%"):
         eq = stripped.find(" = ")
         if eq >= 0:
-            stripped = stripped[eq + 3:]
+            stripped = stripped[eq + 3 :]
+    # The self-hosted pcc-Python runtime has to keep these opname strings in
+    # long-lived InstructionRecord fields. Returning stable literals for the
+    # common opcodes avoids allocating a short slice solely to store metadata.
+    if stripped.startswith("call "):
+        return "call"
+    if stripped.startswith("br "):
+        return "br"
+    if stripped.startswith("ret void"):
+        return "ret void"
+    if stripped.startswith("ret "):
+        return "ret"
+    if stripped.startswith("switch "):
+        return "switch"
+    if stripped.startswith("alloca "):
+        return "alloca"
+    if stripped.startswith("load "):
+        return "load"
+    if stripped.startswith("store "):
+        return "store"
+    if stripped.startswith("unreachable"):
+        return "unreachable"
+    if stripped.startswith("phi "):
+        return "phi"
     # First whitespace-delimited token is the opcode
     idx = stripped.find(" ")
     return stripped[:idx] if idx >= 0 else stripped
+
+
+def _render_instruction_lines(
+    lines: list[str],
+    start: int,
+    end: int,
+) -> str:
+    out = ""
+    i = start
+    while i < end:
+        out = out + "  "
+        out = out + str(lines[i])
+        out = out + "\n"
+        i += 1
+    return out
 
 
 class Block:
@@ -742,6 +937,7 @@ class Block:
         self.function = parent
         self.name = name
         self._instrs: list[InstructionRecord] = []
+        self._text_lines: list[str] = []
         self._terminated = False
 
     @property
@@ -755,44 +951,191 @@ class Block:
         return list(self._instrs)
 
     def append(self, line: str) -> None:
-        self._instrs.append(InstructionRecord(line, _opname_of(line), self))
+        op = _opname_of(line)
+        self._instrs.append(InstructionRecord(line, op, self))
+        self._text_lines.append(line)
 
     def insert(self, idx: int, line: str) -> None:
         self._instrs.insert(
-            idx, InstructionRecord(line, _opname_of(line), self),
+            idx,
+            InstructionRecord(line, _opname_of(line), self),
         )
+        self._text_lines.insert(idx, line)
+
+    def _replace_record_text(self, rec: InstructionRecord, text: str) -> None:
+        rec.text = text
+        i = 0
+        while i < len(self._instrs):
+            if self._instrs[i] is rec:
+                self._text_lines[i] = text
+                return
+            i += 1
 
     def render(self) -> str:
         """Render as ``name:\\n  instr1\\n  instr2\\n``."""
-        header = f"{self.name}:\n"
-        body = "\n".join(f"  {r.text}" for r in self._instrs)
-        return header + (body + "\n" if body else "")
+        header = str(self.name) + ":\n"
+        if (
+            _debug_ir_render_enabled()
+            and self.parent.name == "user_prog_Parser_make"
+        ):
+            try:
+                sys.stderr.write(
+                    "[pcc.ir.block] "
+                    + str(self.name)
+                    + " lines="
+                    + str(len(self._text_lines))
+                    + "\n"
+                )
+                j = 0
+                while j < len(self._text_lines):
+                    line = self._text_lines[j]
+                    if not isinstance(line, str):
+                        sys.stderr.write(
+                            "[pcc.ir.block] nonstr line i="
+                            + str(j)
+                            + " type="
+                            + str(type(line).__name__)
+                            + "\n"
+                        )
+                        break
+                    if self.name == "t.owned.cont.15":
+                        sys.stderr.write(
+                            "[pcc.ir.block] line i="
+                            + str(j)
+                            + " len="
+                            + str(len(line))
+                            + " text="
+                            + line[:80]
+                            + "\n"
+                        )
+                    j += 1
+            except Exception:
+                pass
+        if (
+            _debug_ir_render_enabled()
+            and self.name == "entry"
+            and self.parent.name == "user_pcc_parse_py_lex__is_digit_code"
+        ):
+            try:
+                first_text = "<none>"
+                if len(self._instrs) > 0:
+                    first_text = str(self._instrs[0].text)
+                sys.stderr.write(
+                    "[pcc.ir.render] block entry instrs="
+                    + str(len(self._instrs))
+                    + " first="
+                    + first_text
+                    + "\n"
+                )
+            except Exception:
+                pass
+        body = _render_instruction_lines(self._text_lines, 0, len(self._text_lines))
+        if (
+            _debug_ir_render_enabled()
+            and self.parent.name == "user_prog_Parser_make"
+        ):
+            try:
+                sys.stderr.write(
+                    "[pcc.ir.block] rendered "
+                    + str(self.name)
+                    + " type="
+                    + str(type(body).__name__)
+                    + " len="
+                    + str(len(body))
+                    + "\n"
+                )
+            except Exception:
+                pass
+        if (
+            _debug_ir_render_enabled()
+            and self.name == "entry"
+            and self.parent.name == "user_pcc_parse_py_lex__is_digit_code"
+        ):
+            try:
+                first_part = "<none>"
+                first_part_len = -1
+                first_render_len = -1
+                second_part = "<none>"
+                second_part_len = -1
+                second_render_len = -1
+                render2_len = -1
+                render3_len = -1
+                if len(self._instrs) > 0:
+                    first_part = "  " + str(self._instrs[0].text)
+                    first_part_len = len(first_part)
+                    first_render_len = len(
+                        _render_instruction_lines(self._text_lines, 0, 1)
+                    )
+                    if len(self._instrs) > 1:
+                        second_part = "  " + str(self._instrs[1].text)
+                        second_part_len = len(second_part)
+                        second_render_len = len(
+                            _render_instruction_lines(self._text_lines, 1, 2)
+                        )
+                    render2_len = len(_render_instruction_lines(self._text_lines, 0, 2))
+                    render3_len = len(_render_instruction_lines(self._text_lines, 0, 3))
+                sys.stderr.write(
+                    "[pcc.ir.render] block entry stream=1 body_len="
+                    + str(len(body))
+                    + " parts="
+                    + str(len(self._instrs))
+                    + " first_part_len="
+                    + str(first_part_len)
+                    + " first_render_len="
+                    + str(first_render_len)
+                    + " second_part_len="
+                    + str(second_part_len)
+                    + " second_render_len="
+                    + str(second_render_len)
+                    + " render2_len="
+                    + str(render2_len)
+                    + " render3_len="
+                    + str(render3_len)
+                    + " first_part="
+                    + first_part
+                    + " second_part="
+                    + second_part
+                    + "\n"
+                )
+            except Exception:
+                pass
+        return header + body
 
 
-class Function:
+class Function(Value):
     """A function in a Module. Holds a signature, blocks, and a name
-    counter for temp %N identifiers."""
+    counter for temp %N identifiers.
+
+    Subclasses ``Value`` because in LLVM IR a Function is also a typed
+    SSA value: a global pointer to a function type. Codegen call sites
+    that take ``Value`` accept ``Function`` directly without a separate
+    downcast.
+    """
 
     def __init__(
         self,
-        module: "Module",
+        module: Module,
         function_type: FunctionType,
         name: str = "",
     ) -> None:
+        # As a value, a function has a pointer type — matches llvmlite
+        # (``Function.type`` is ``PointerType(FunctionType, 0)``).
+        Value.__init__(self, PointerType(function_type), "@" + str(name))
         self.module = module
         self.ftype = function_type
         # llvmlite also exposes ``function_type``; alias both so codegen
         # code that reads either attribute works.
         self.function_type = function_type
-        # As a value, a function has a pointer type — matches llvmlite
-        # (``Function.type`` is ``PointerType(FunctionType, 0)``).
-        self.type = PointerType(function_type)
         self.name = name
         self.blocks: list[Block] = []
         # Formal parameter objects
-        self.args = tuple(
-            Argument(ty, i) for i, ty in enumerate(function_type.args)
-        )
+        args_list: list[Argument] = []
+        i = 0
+        n_args = len(function_type.args)
+        while i < n_args:
+            args_list.append(Argument(function_type.args[i], i))
+            i += 1
+        self.args = tuple(args_list)
         # Anonymous-temp counter continues from args (%.1..%.N are args,
         # next temp is %.{N+1}). llvmlite uses the ``.`` prefix on all
         # auto-numbered identifiers — matches lets canonical-IR diff
@@ -815,7 +1158,7 @@ class Function:
 
     def append_basic_block(self, name: str = "") -> Block:
         if not name:
-            name = f"bb{self._block_counter}"
+            name = "bb" + str(self._block_counter)
             self._block_counter += 1
         else:
             # Dedup against existing blocks + SSA names in this
@@ -830,7 +1173,7 @@ class Function:
         """Generate a fresh ``.N`` identifier for anonymous temps
         (llvmlite convention: ``%.N``)."""
         self._name_counter += 1
-        return f".{self._name_counter}"
+        return "." + str(self._name_counter)
 
     def _unique(self, name: str) -> str:
         """Return a unique variant of ``name`` within this function.
@@ -842,15 +1185,17 @@ class Function:
             return name
         # Keep scanning upward in case ``name.K`` has already been
         # registered explicitly elsewhere.
-        while f"{name}.{n}" in self._name_registry:
+        candidate = str(name) + "." + str(n)
+        while candidate in self._name_registry:
             n += 1
-        self._name_registry[f"{name}.{n}"] = 1
-        return f"{name}.{n}"
+            candidate = str(name) + "." + str(n)
+        self._name_registry[candidate] = 1
+        return candidate
 
     def __str__(self) -> str:
         """Function-as-operand: render as ``@name`` so it can be used
         directly as a call target or inside constant expressions."""
-        return f"@{self.name}"
+        return "@" + str(self.name)
 
     @property
     def return_value(self) -> "Value":
@@ -881,15 +1226,22 @@ class Function:
         ret_ty = fty.return_type
         # Argument list text
         arg_parts = []
-        for arg in self.args:
-            if arg._name:
-                arg_parts.append(f"{arg.type} %{arg._name}")
+        i = 0
+        while i < len(self.args):
+            arg = self.args[i]
+            if i < len(fty.args):
+                arg_ty = fty.args[i]
             else:
-                arg_parts.append(f"{arg.type} {arg._ref}")
+                arg_ty = arg.type
+            if arg._name:
+                arg_parts.append(str(arg_ty) + " %" + str(arg._name))
+            else:
+                arg_parts.append(str(arg_ty) + " " + str(arg._ref))
+            i += 1
         if fty.var_arg:
             arg_parts.append("...")
-        args_text = ", ".join(arg_parts)
-        linkage = f"{self.linkage} " if self.linkage else ""
+        args_text = _join_text(arg_parts, ", ")
+        linkage = str(self.linkage) + " " if self.linkage else ""
 
         # Personality + attributes (declarations don't carry them).
         pers_text = ""
@@ -897,23 +1249,169 @@ class Function:
         if self.attributes.personality is not None:
             pers = self.attributes.personality
             pers_ty = PointerType(pers.ftype)
-            pers_text = f" personality {pers_ty} @{pers.name}"
+            pers_text = " personality " + str(pers_ty) + " @" + str(pers.name)
         if self.attributes._attrs:
-            attrs_text = " " + " ".join(sorted(self.attributes._attrs))
+            attrs_text = " " + _join_text(sorted(self.attributes._attrs), " ")
 
         if not self.blocks:
-            arg_type_only = ", ".join(str(t) for t in fty.args)
+            arg_type_parts = []
+            i = 0
+            while i < len(fty.args):
+                t = fty.args[i]
+                arg_type_parts.append(str(t))
+                i += 1
+            arg_type_only = _join_text(arg_type_parts, ", ")
             if fty.var_arg:
-                arg_type_only = f"{arg_type_only}, ..." if arg_type_only else "..."
+                arg_type_only = arg_type_only + ", ..." if arg_type_only else "..."
             return (
-                f"declare {linkage}{ret_ty} @{self.name}({arg_type_only})\n"
+                "declare "
+                + linkage
+                + str(ret_ty)
+                + " @"
+                + str(self.name)
+                + "("
+                + arg_type_only
+                + ")"
+                + attrs_text
+                + "\n"
             )
-        body = "\n".join(b.render() for b in self.blocks)
-        return (
-            f"define {linkage}{ret_ty} @{self.name}({args_text})"
-            f"{attrs_text}{pers_text} {{\n"
-            f"{body}}}\n"
-        )
+        if _debug_ir_render_enabled() and self.name == "user_pcc_parse_py_lex__is_digit_code":
+            try:
+                entry_instrs = -1
+                first_text = "<none>"
+                if len(self.blocks) > 0:
+                    entry_instrs = len(self.blocks[0]._instrs)
+                    if entry_instrs > 0:
+                        first_text = str(self.blocks[0]._instrs[0].text)
+                sys.stderr.write(
+                    "[pcc.ir.render] function "
+                    + str(self.name)
+                    + " blocks="
+                    + str(len(self.blocks))
+                    + " entry_instrs="
+                    + str(entry_instrs)
+                    + " first="
+                    + first_text
+                    + "\n"
+                )
+            except Exception:
+                pass
+        body_parts = []
+        i = 0
+        while i < len(self.blocks):
+            b = self.blocks[i]
+            rendered_block = b.render()
+            if _debug_ir_render_enabled() and self.name == "user_prog_Parser_make":
+                try:
+                    if not isinstance(rendered_block, str):
+                        sys.stderr.write(
+                            "[pcc.ir.function] nonstr block i="
+                            + str(i)
+                            + " name="
+                            + str(b.name)
+                            + " type="
+                            + str(type(rendered_block).__name__)
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+            body_parts.append(rendered_block)
+            i += 1
+        body = _join_text(body_parts, "\n")
+        if _debug_ir_render_enabled() and self.name == "user_prog_Parser_make":
+            try:
+                sys.stderr.write(
+                    "[pcc.ir.function] body type="
+                    + str(type(body).__name__)
+                    + " len="
+                    + str(len(body))
+                    + "\n"
+                )
+            except Exception:
+                pass
+        out = "define "
+        out = out + linkage
+        out = out + str(ret_ty)
+        out = out + " @"
+        out = out + str(self.name)
+        out = out + "("
+        out = out + args_text
+        out = out + ")"
+        out = out + attrs_text
+        out = out + pers_text
+        out = out + " {\n"
+        out = out + body
+        out = out + "}\n"
+        return out
+
+
+def _value_ref(value) -> str:
+    """Render an operand reference without relying on virtual ``__str__``.
+
+    Self-hosted pcc currently exercises this path before all Python object
+    dispatch edge cases are closed.  Function operands have an unambiguous LLVM
+    spelling, so keep that critical case explicit.
+    """
+    if isinstance(value, Function):
+        return "@" + str(value.name)
+    try:
+        name = value.name
+        value.ftype
+        if name:
+            return "@" + str(name)
+    except AttributeError:
+        pass
+    try:
+        ref = value._ref
+        if ref:
+            return ref
+    except AttributeError:
+        pass
+    try:
+        index = value.index
+        if index is not None:
+            return "%." + str(index + 1)
+    except AttributeError:
+        pass
+    return str(value)
+
+
+def _looks_like_function(value) -> bool:
+    if isinstance(value, Function):
+        return True
+    try:
+        ftype = value.ftype
+        name = value.name
+    except AttributeError:
+        return False
+    return name is not None and _looks_like_function_type(ftype)
+
+
+def _looks_like_pointer_type(value) -> bool:
+    if isinstance(value, PointerType):
+        return True
+    try:
+        pointee = value.pointee
+    except AttributeError:
+        return False
+    return pointee is not None
+
+
+def _looks_like_function_type(value) -> bool:
+    if isinstance(value, FunctionType):
+        return True
+    try:
+        return_type = value.return_type
+        args = value.args
+    except AttributeError:
+        return False
+    return return_type is not None and args is not None
+
+
+def _looks_like_void_type(value) -> bool:
+    if isinstance(value, VoidType):
+        return True
+    return str(value) == "void"
 
 
 class FunctionAttributes:
@@ -922,11 +1420,16 @@ class FunctionAttributes:
     with the function definition."""
 
     def __init__(self) -> None:
-        self._attrs: set[str] = set()
+        # NOTE: backed by a list (sorted on read) instead of a set —
+        # pcc1 self-host has a UAF in py_set.add on freshly-constructed
+        # sets under tight heap. See
+        # docs/investigations/pcc1-stage2-runtime-abi-set-segfault.md.
+        self._attrs: list[str] = []
         self.personality: Optional["Function"] = None
 
     def add(self, attr: str) -> None:
-        self._attrs.add(attr)
+        if attr not in self._attrs:
+            self._attrs.append(attr)
 
     def __bool__(self) -> bool:
         return bool(self._attrs) or self.personality is not None
@@ -957,7 +1460,7 @@ class GlobalVariable(Value):
         self.section = ""
         self.align: Optional[int] = None
         self.unnamed_addr = False
-        self._ref = f"@{name}"
+        self._ref = "@" + str(name)
         module._globals.append(self)
         module.globals[name] = self
 
@@ -966,33 +1469,50 @@ class GlobalVariable(Value):
         ``getelementptr (inbounds) (<ty>, ptr @name, i32 i0, i32 i1, ...)``.
         Used by codegen to materialize a pointer-to-first-element of
         a global array or struct without a separate builder call."""
-        indices_list = list(indices)
+        indices_list = []
+        for idx in indices:
+            indices_list.append(idx)
         idx_parts = []
         for v in indices_list:
-            idx_parts.append(f"{v.type} {v}")
-        idx_text = ", ".join(idx_parts)
+            idx_parts.append(str(v.type) + " " + str(v))
+        idx_text = _join_text(idx_parts, ", ")
         inb = "inbounds " if inbounds else ""
         result_pointee = _type_gep_result(self.value_type, indices_list[1:])
         expr = (
-            f"getelementptr {inb}({self.value_type}, {self.type} "
-            f"@{self.name}, {idx_text})"
+            "getelementptr "
+            + inb
+            + "("
+            + str(self.value_type)
+            + ", "
+            + str(self.type)
+            + " @"
+            + str(self.name)
+            + ", "
+            + idx_text
+            + ")"
         )
         return Value(PointerType(result_pointee), expr)
 
     def render(self) -> str:
-        linkage = f"{self.linkage} " if self.linkage else ""
+        linkage = str(self.linkage) + " " if self.linkage else ""
         kind = "constant" if self.global_constant else "global"
         init_text = ""
         if self.initializer is not None:
-            init_text = f" {self.initializer._ref}" if isinstance(
-                self.initializer, Value
-            ) else f" {self.initializer}"
+            init_text = " " + str(self.initializer)
         else:
             init_text = " zeroinitializer" if self.linkage != "external" else ""
-        align_text = f", align {self.align}" if self.align else ""
+        align_text = ", align " + str(self.align) if self.align else ""
         return (
-            f"@{self.name} = {linkage}{kind} {self.value_type}{init_text}"
-            f"{align_text}\n"
+            "@"
+            + str(self.name)
+            + " = "
+            + linkage
+            + kind
+            + " "
+            + str(self.value_type)
+            + init_text
+            + align_text
+            + "\n"
         )
 
 
@@ -1026,7 +1546,7 @@ class Module:
         self._name_counters[base] = n + 1
         if n == 0:
             return base
-        return f"{base}.{n}"
+        return str(base) + "." + str(n)
 
     @property
     def functions(self) -> list[Function]:
@@ -1062,23 +1582,71 @@ class Module:
 
     def __str__(self) -> str:
         parts: list[str] = []
+        if _debug_ir_render_enabled():
+            try:
+                sys.stderr.write(
+                    "[pcc.ir.module] start funcs="
+                    + str(len(self._functions))
+                    + " globals="
+                    + str(len(self._globals))
+                    + "\n"
+                )
+            except Exception:
+                pass
         if self.name:
-            parts.append(f'; ModuleID = "{self.name}"')
+            parts.append('; ModuleID = "' + str(self.name) + '"')
         # Always emit triple + datalayout (even if empty) to match llvmlite
-        parts.append(f'target triple = "{self.triple}"')
-        parts.append(f'target datalayout = "{self.data_layout}"')
+        parts.append('target triple = "' + str(self.triple) + '"')
+        parts.append('target datalayout = "' + str(self.data_layout) + '"')
         parts.append("")
         # Identified struct type declarations — must precede globals
         # and functions that reference them.
-        for t in self.context.identified_types.values():
+        identified_type_values = list(self.context.identified_types.values())
+        i = 0
+        while i < len(identified_type_values):
+            t = identified_type_values[i]
             parts.append(t.get_declaration())
+            i += 1
         if self.context.identified_types:
             parts.append("")
-        for gv in self._globals:
+        i = 0
+        while i < len(self._globals):
+            gv = self._globals[i]
             parts.append(gv.render())
-        for fn in self._functions:
-            parts.append(fn.render())
-        return "\n".join(parts)
+            i += 1
+        i = 0
+        while i < len(self._functions):
+            fn = self._functions[i]
+            rendered_fn = fn.render()
+            if _debug_ir_render_enabled():
+                try:
+                    if not isinstance(rendered_fn, str):
+                        sys.stderr.write(
+                            "[pcc.ir.module] nonstr function i="
+                            + str(i)
+                            + " name="
+                            + str(fn.name)
+                            + " type="
+                            + str(type(rendered_fn).__name__)
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+            parts.append(rendered_fn)
+            i += 1
+        out = _join_text(parts, "\n")
+        if _debug_ir_render_enabled():
+            try:
+                sys.stderr.write(
+                    "[pcc.ir.module] end parts="
+                    + str(len(parts))
+                    + " out="
+                    + str(len(out))
+                    + "\n"
+                )
+            except Exception:
+                pass
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1166,7 +1734,12 @@ class IRBuilder:
             self._pos = "end"
             return
         # Fallback — position at start of the inferred block
-        blk = getattr(instr_or_block, "block", None) or self._block
+        try:
+            blk = instr_or_block.block
+        except AttributeError:
+            blk = None
+        if blk is None:
+            blk = self._block
         if blk is not None:
             self.position_at_start(blk)
 
@@ -1211,19 +1784,31 @@ class IRBuilder:
             raise ValueError("IRBuilder has no current function")
         fn._name_counter += 1
         if name == "":
-            return f".{fn._name_counter}"
-        return f"{name}.{fn._name_counter}"
+            return "." + str(fn._name_counter)
+        return name + "." + str(fn._name_counter)
 
     def _next(self, name: str, ty: Type) -> Value:
         """Produce a new local SSA value with ``name`` (or a fresh temp
         if empty). Named temporaries use a function-wide serial suffix,
         trading llvmlite text parity for O(1) self-hosted codegen."""
-        return Value(ty, f"%{self._next_name(name)}")
+        fn = self._fn
+        if fn is None:
+            raise ValueError("IRBuilder has no current function")
+        fn._name_counter += 1
+        if name == "":
+            ref = "%."
+            ref = ref + str(fn._name_counter)
+        else:
+            ref = "%"
+            ref = ref + str(name)
+            ref = ref + "."
+            ref = ref + str(fn._name_counter)
+        return Value(ty, ref)
 
     # ------------- return / branch / terminator -------------
 
     def ret(self, value: Value) -> Value:
-        self._emit(f"ret {value.type} {value}")
+        self._emit("ret " + str(value.type) + " " + str(value))
         if self._block is not None:
             self._block._terminated = True
         return Value(VoidType(), "")
@@ -1235,13 +1820,19 @@ class IRBuilder:
         return Value(VoidType(), "")
 
     def branch(self, target: Block) -> Value:
-        self._emit(f"br label %{target.name}")
+        self._emit("br label %" + str(target.name))
         if self._block is not None:
             self._block._terminated = True
         return Value(VoidType(), "")
 
     def cbranch(self, cond: Value, t: Block, f: Block) -> Value:
-        self._emit(f"br i1 {cond}, label %{t.name}, label %{f.name}")
+        line = "br i1 "
+        line = line + str(cond)
+        line = line + ", label %"
+        line = line + str(t.name)
+        line = line + ", label %"
+        line = line + str(f.name)
+        self._emit(line)
         if self._block is not None:
             self._block._terminated = True
         return Value(VoidType(), "")
@@ -1256,7 +1847,7 @@ class IRBuilder:
         """Emit a ``switch`` terminator. Returns a ``SwitchInstr`` that
         the caller extends via ``add_case(int_value, target_block)``."""
         sw = SwitchInstr(self, value, default_block)
-        self._emit(sw._render())
+        sw._instr = self._emit(sw._render())
         if self._block is not None:
             self._block._terminated = True
         return sw
@@ -1265,27 +1856,99 @@ class IRBuilder:
 
     def alloca(self, ty: Type, size: Optional[Value] = None, name: str = "") -> Value:
         v = self._next(name, PointerType(ty))
-        size_text = f", {size.type} {size}" if size is not None else ""
-        self._emit(f"{v} = alloca {ty}{size_text}")
+        size_text = ""
+        if size is not None:
+            size_text = ", " + str(size.type) + " " + str(size)
+        self._emit(str(v) + " = alloca " + str(ty) + size_text)
         return v
 
     def load(self, ptr: Value, name: str = "", align: Optional[int] = None) -> Value:
         pointee = ptr.type.pointee if isinstance(ptr.type, PointerType) else ptr.type
         v = self._next(name, pointee)
-        align_text = f", align {align}" if align else ""
-        self._emit(f"{v} = load {pointee}, {ptr.type} {ptr}{align_text}")
+        align_text = ", align " + str(align) if align else ""
+        line = str(v)
+        line = line + " = load "
+        line = line + str(pointee)
+        line = line + ", "
+        line = line + str(ptr.type)
+        line = line + " "
+        line = line + str(ptr)
+        line = line + align_text
+        self._emit(line)
         return v
 
     def store(self, value: Value, ptr: Value, align: Optional[int] = None) -> Value:
-        align_text = f", align {align}" if align else ""
+        align_text = ", align " + str(align) if align else ""
+        stored_ty = ptr.type.pointee if isinstance(ptr.type, PointerType) else value.type
+        parts = [
+            "store ",
+            str(stored_ty),
+            " ",
+            _value_ref(value),
+            ", ",
+            str(ptr.type),
+            " ",
+            _value_ref(ptr),
+            align_text,
+        ]
+        self._emit(_join_text(parts, ""))
+        return Value(VoidType(), "")
+
+    def load_atomic(
+        self,
+        ptr: Value,
+        ordering: str,
+        align: int,
+        name: str = "",
+        typ: Optional[Type] = None,
+    ) -> Value:
+        pointee = (
+            typ
+            if typ is not None
+            else (ptr.type.pointee if isinstance(ptr.type, PointerType) else ptr.type)
+        )
+        v = self._next(name, pointee)
         self._emit(
-            f"store {value.type} {value}, {ptr.type} {ptr}{align_text}"
+            str(v)
+            + " = load atomic "
+            + str(pointee)
+            + ", "
+            + str(ptr.type)
+            + " "
+            + str(ptr)
+            + " "
+            + str(ordering)
+            + ", align "
+            + str(align)
+        )
+        return v
+
+    def store_atomic(
+        self,
+        value: Value,
+        ptr: Value,
+        ordering: str,
+        align: int,
+    ) -> Value:
+        self._emit(
+            "store atomic "
+            + str(value.type)
+            + " "
+            + str(value)
+            + ", "
+            + str(ptr.type)
+            + " "
+            + str(ptr)
+            + " "
+            + str(ordering)
+            + ", align "
+            + str(align)
         )
         return Value(VoidType(), "")
 
     def fence(self, ordering: str, syncscope: Optional[str] = None) -> Value:
-        scope_text = f'syncscope("{syncscope}") ' if syncscope else ""
-        self._emit(f"fence {scope_text}{ordering}")
+        scope_text = 'syncscope("' + str(syncscope) + '") ' if syncscope else ""
+        self._emit("fence " + scope_text + str(ordering))
         return Value(VoidType(), "")
 
     def gep(
@@ -1304,80 +1967,229 @@ class IRBuilder:
         # GEP result is a pointer to the drilled type
         result_ptr_ty = PointerType(result_pointee)
         v = self._next(name, result_ptr_ty)
-        idx_text = ", ".join(f"{i.type} {i}" for i in indices_list)
+        idx_parts = []
+        for i in indices_list:
+            idx_parts.append(str(i.type) + " " + str(i))
+        idx_text = _join_text(idx_parts, ", ")
         inb = "inbounds " if inbounds else ""
-        self._emit(
-            f"{v} = getelementptr {inb}{base_ty}, {ptr.type} {ptr}, {idx_text}"
-        )
+        line = str(v)
+        line = line + " = getelementptr "
+        line = line + inb
+        line = line + str(base_ty)
+        line = line + ", "
+        line = line + str(ptr.type)
+        line = line + " "
+        line = line + str(ptr)
+        line = line + ", "
+        line = line + idx_text
+        self._emit(line)
         return v
 
     # ------------- casts -------------
 
     def bitcast(self, value: Value, ty: Type, name: str = "") -> Value:
+        try:
+            value_ty = value.type
+        except AttributeError:
+            value_ty = None
+        value_ref = _value_ref(value)
+        if isinstance(value, Function):
+            fn_name = value.name
+            fn_type = value.ftype
+            value_ty = PointerType(fn_type)
+            value_ref = "@" + str(fn_name)
+        if value_ty is None:
+            value_ty = value.type
+        if _same_tracked_type(value_ty, ty):
+            return value
         v = self._next(name, ty)
-        self._emit(f"{v} = bitcast {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = bitcast "
+            + str(value_ty)
+            + " "
+            + str(value_ref)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def sext(self, value: Value, ty: Type, name: str = "") -> Value:
+        if _same_llvm_text_type(value.type, ty):
+            return value
         v = self._next(name, ty)
-        self._emit(f"{v} = sext {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = sext "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def zext(self, value: Value, ty: Type, name: str = "") -> Value:
+        if _same_llvm_text_type(value.type, ty):
+            return value
         v = self._next(name, ty)
-        self._emit(f"{v} = zext {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = zext "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def trunc(self, value: Value, ty: Type, name: str = "") -> Value:
+        if _same_llvm_text_type(value.type, ty):
+            return value
         v = self._next(name, ty)
-        self._emit(f"{v} = trunc {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = trunc "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def ptrtoint(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(f"{v} = ptrtoint {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = ptrtoint "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def inttoptr(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(f"{v} = inttoptr {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = inttoptr "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def sitofp(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(f"{v} = sitofp {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = sitofp "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def uitofp(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(f"{v} = uitofp {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = uitofp "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def fptosi(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(f"{v} = fptosi {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = fptosi "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def fptoui(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(f"{v} = fptoui {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = fptoui "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def fpext(self, value: Value, ty: Type, name: str = "") -> Value:
+        if _same_llvm_text_type(value.type, ty):
+            return value
         v = self._next(name, ty)
-        self._emit(f"{v} = fpext {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = fpext "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     def fptrunc(self, value: Value, ty: Type, name: str = "") -> Value:
+        if _same_llvm_text_type(value.type, ty):
+            return value
         v = self._next(name, ty)
-        self._emit(f"{v} = fptrunc {value.type} {value} to {ty}")
+        self._emit(
+            str(v)
+            + " = fptrunc "
+            + str(value.type)
+            + " "
+            + str(value)
+            + " to "
+            + str(ty)
+        )
         return v
 
     # ------------- integer arithmetic -------------
 
     def _int_binop(self, op: str, lhs: Value, rhs: Value, name: str) -> Value:
-        v = self._next(name, lhs.type)
-        self._emit(f"{v} = {op} {lhs.type} {lhs}, {rhs}")
+        lhs_ty = lhs.type
+        rhs_ty = rhs.type
+        if not isinstance(lhs_ty, Type):
+            if isinstance(rhs_ty, Type):
+                lhs_ty = rhs_ty
+            else:
+                lhs_ty = IntType(64)
+        v = self._next(name, lhs_ty)
+        parts = [
+            str(v),
+            " = ",
+            str(op),
+            " ",
+            str(lhs_ty),
+            " ",
+            _value_ref(lhs),
+            ", ",
+            _value_ref(rhs),
+        ]
+        self._emit(_join_text(parts, ""))
         return v
 
     def add(self, a: Value, b: Value, name: str = "") -> Value:
@@ -1438,7 +2250,17 @@ class IRBuilder:
 
     def _fp_binop(self, op: str, lhs: Value, rhs: Value, name: str) -> Value:
         v = self._next(name, lhs.type)
-        rec = self._emit(f"{v} = {op} {lhs.type} {lhs}, {rhs}")
+        rec = self._emit(
+            str(v)
+            + " = "
+            + str(op)
+            + " "
+            + str(lhs.type)
+            + " "
+            + str(lhs)
+            + ", "
+            + str(rhs)
+        )
         # Attach the emitted record so flags (fast-math contract etc.)
         # can be added retroactively via ``v.flags = [...]``.
         v._instr = rec
@@ -1461,42 +2283,106 @@ class IRBuilder:
 
     def fneg(self, value: Value, name: str = "") -> Value:
         v = self._next(name, value.type)
-        rec = self._emit(f"{v} = fneg {value.type} {value}")
+        rec = self._emit(
+            str(v) + " = fneg " + str(value.type) + " " + str(value)
+        )
         v._instr = rec
         return v
 
     # ------------- comparisons -------------
 
     def icmp_signed(self, op: str, a: Value, b: Value, name: str = "") -> Value:
-        pred_map = {"==": "eq", "!=": "ne", "<": "slt", "<=": "sle",
-                    ">": "sgt", ">=": "sge"}
+        pred_map = {
+            "==": "eq",
+            "!=": "ne",
+            "<": "slt",
+            "<=": "sle",
+            ">": "sgt",
+            ">=": "sge",
+        }
         pred = pred_map.get(op, op)
         v = self._next(name, IntType(1))
-        self._emit(f"{v} = icmp {pred} {a.type} {a}, {b}")
+        line = str(v)
+        line = line + " = icmp "
+        line = line + str(pred)
+        line = line + " "
+        line = line + str(a.type)
+        line = line + " "
+        line = line + str(a)
+        line = line + ", "
+        line = line + str(b)
+        self._emit(line)
         return v
 
     def icmp_unsigned(self, op: str, a: Value, b: Value, name: str = "") -> Value:
-        pred_map = {"==": "eq", "!=": "ne", "<": "ult", "<=": "ule",
-                    ">": "ugt", ">=": "uge"}
+        pred_map = {
+            "==": "eq",
+            "!=": "ne",
+            "<": "ult",
+            "<=": "ule",
+            ">": "ugt",
+            ">=": "uge",
+        }
         pred = pred_map.get(op, op)
         v = self._next(name, IntType(1))
-        self._emit(f"{v} = icmp {pred} {a.type} {a}, {b}")
+        line = str(v)
+        line = line + " = icmp "
+        line = line + str(pred)
+        line = line + " "
+        line = line + str(a.type)
+        line = line + " "
+        line = line + str(a)
+        line = line + ", "
+        line = line + str(b)
+        self._emit(line)
         return v
 
     def fcmp_ordered(self, op: str, a: Value, b: Value, name: str = "") -> Value:
-        pred_map = {"==": "oeq", "!=": "one", "<": "olt", "<=": "ole",
-                    ">": "ogt", ">=": "oge"}
+        pred_map = {
+            "==": "oeq",
+            "!=": "one",
+            "<": "olt",
+            "<=": "ole",
+            ">": "ogt",
+            ">=": "oge",
+        }
         pred = pred_map.get(op, op)
         v = self._next(name, IntType(1))
-        self._emit(f"{v} = fcmp {pred} {a.type} {a}, {b}")
+        self._emit(
+            str(v)
+            + " = fcmp "
+            + str(pred)
+            + " "
+            + str(a.type)
+            + " "
+            + str(a)
+            + ", "
+            + str(b)
+        )
         return v
 
     def fcmp_unordered(self, op: str, a: Value, b: Value, name: str = "") -> Value:
-        pred_map = {"==": "ueq", "!=": "une", "<": "ult", "<=": "ule",
-                    ">": "ugt", ">=": "uge"}
+        pred_map = {
+            "==": "ueq",
+            "!=": "une",
+            "<": "ult",
+            "<=": "ule",
+            ">": "ugt",
+            ">=": "uge",
+        }
         pred = pred_map.get(op, op)
         v = self._next(name, IntType(1))
-        self._emit(f"{v} = fcmp {pred} {a.type} {a}, {b}")
+        self._emit(
+            str(v)
+            + " = fcmp "
+            + str(pred)
+            + " "
+            + str(a.type)
+            + " "
+            + str(a)
+            + ", "
+            + str(b)
+        )
         return v
 
     # ------------- call -------------
@@ -1508,50 +2394,54 @@ class IRBuilder:
         name: str = "",
         tail: bool = False,
     ) -> Value:
-        args_list = list(args)
-        args_text = ", ".join(f"{a.type} {a}" for a in args_list)
-        if isinstance(fn, Function):
-            callee_ref = f"@{fn.name}"
-            ret_ty = fn.ftype.return_type
-            arg_types = ", ".join(str(t) for t in fn.ftype.args)
-            if fn.ftype.var_arg:
-                arg_types = f"{arg_types}, ..." if arg_types else "..."
-            sig_text = f"{ret_ty} ({arg_types})"
-        else:
-            # Function pointer value
-            callee_ref = str(fn)
-            # Must have a FunctionType somewhere; require caller to
-            # pre-cast to a FunctionType-pointee pointer.
-            if isinstance(fn.type, PointerType) and isinstance(fn.type.pointee, FunctionType):
-                fty = fn.type.pointee
-                ret_ty = fty.return_type
-                arg_types = ", ".join(str(t) for t in fty.args)
-                if fty.var_arg:
-                    arg_types = f"{arg_types}, ..." if arg_types else "..."
-                sig_text = f"{ret_ty} ({arg_types})"
-            else:
-                ret_ty = VoidType()
-                sig_text = "void ()"
+        return _irbuilder_call_from_args_list(self, fn, list(args), name, tail)
 
-        tail_prefix = "tail " if tail else ""
-        if isinstance(ret_ty, VoidType):
-            self._emit(f"{tail_prefix}call {sig_text} {callee_ref}({args_text})")
-            return Value(VoidType(), "")
-        v = self._next(name, ret_ty)
-        self._emit(
-            f"{v} = {tail_prefix}call {sig_text} {callee_ref}({args_text})"
+    def call4_i32(
+        self,
+        fn: Function | Value,
+        arg0: Value,
+        arg1: Value,
+        arg2: Value,
+        arg3: int,
+        name: str = "",
+        tail: bool = False,
+    ) -> Value:
+        """Emit a four-argument call whose final operand is a raw i32.
+
+        Kept as a small compatibility wrapper for call sites that pass a raw
+        source line number into runtime helpers such as py_exc_append_frame.
+        """
+        del tail
+        return self.call(
+            fn,
+            [arg0, arg1, arg2, Constant(IntType(32), arg3)],
+            name=name,
         )
-        return v
 
     # ------------- select / phi -------------
 
     def select(
-        self, cond: Value, then_v: Value, else_v: Value, name: str = "",
+        self,
+        cond: Value,
+        then_v: Value,
+        else_v: Value,
+        name: str = "",
     ) -> Value:
         v = self._next(name, then_v.type)
         self._emit(
-            f"{v} = select {cond.type} {cond}, {then_v.type} {then_v}, "
-            f"{else_v.type} {else_v}"
+            str(v)
+            + " = select "
+            + str(cond.type)
+            + " "
+            + str(cond)
+            + ", "
+            + str(then_v.type)
+            + " "
+            + str(then_v)
+            + ", "
+            + str(else_v.type)
+            + " "
+            + str(else_v)
         )
         return v
 
@@ -1572,33 +2462,59 @@ class IRBuilder:
         name: str = "",
     ) -> Value:
         args_list = list(args)
-        args_text = ", ".join(f"{a.type} {a}" for a in args_list)
+        arg_parts = []
+        for a in args_list:
+            arg_parts.append(str(a.type) + " " + str(a))
+        args_text = _join_text(arg_parts, ", ")
         if isinstance(fn, Function):
-            callee_ref = f"@{fn.name}"
+            callee_ref = "@" + str(fn.name)
             ret_ty = fn.ftype.return_type
-            arg_types = ", ".join(str(t) for t in fn.ftype.args)
-            sig_text = f"{ret_ty} ({arg_types})"
+            arg_type_parts = []
+            for t in fn.ftype.args:
+                arg_type_parts.append(str(t))
+            arg_types = _join_text(arg_type_parts, ", ")
+            sig_text = str(ret_ty) + " (" + arg_types + ")"
         else:
             callee_ref = str(fn)
             fty = fn.type.pointee
             ret_ty = fty.return_type
-            arg_types = ", ".join(str(t) for t in fty.args)
+            arg_type_parts = []
+            for t in fty.args:
+                arg_type_parts.append(str(t))
+            arg_types = _join_text(arg_type_parts, ", ")
             if fty.var_arg:
-                arg_types = f"{arg_types}, ..." if arg_types else "..."
-            sig_text = f"{ret_ty} ({arg_types})"
+                arg_types = arg_types + ", ..." if arg_types else "..."
+            sig_text = str(ret_ty) + " (" + arg_types + ")"
 
         if isinstance(ret_ty, VoidType):
             self._emit(
-                f"invoke {sig_text} {callee_ref}({args_text}) "
-                f"to label %{normal_block.name} unwind label %{unwind_block.name}"
+                "invoke "
+                + sig_text
+                + " "
+                + callee_ref
+                + "("
+                + args_text
+                + ") to label %"
+                + str(normal_block.name)
+                + " unwind label %"
+                + str(unwind_block.name)
             )
             if self._block is not None:
                 self._block._terminated = True
             return Value(VoidType(), "")
         v = self._next(name, ret_ty)
         self._emit(
-            f"{v} = invoke {sig_text} {callee_ref}({args_text}) "
-            f"to label %{normal_block.name} unwind label %{unwind_block.name}"
+            str(v)
+            + " = invoke "
+            + sig_text
+            + " "
+            + callee_ref
+            + "("
+            + args_text
+            + ") to label %"
+            + str(normal_block.name)
+            + " unwind label %"
+            + str(unwind_block.name)
         )
         if self._block is not None:
             self._block._terminated = True
@@ -1613,7 +2529,21 @@ class IRBuilder:
         name: str = "",
     ) -> Value:
         v = self._next(name, val.type)
-        self._emit(f"{v} = atomicrmw {op} {ptr.type} {ptr}, {val.type} {val} {ordering}")
+        self._emit(
+            str(v)
+            + " = atomicrmw "
+            + str(op)
+            + " "
+            + str(ptr.type)
+            + " "
+            + str(ptr)
+            + ", "
+            + str(val.type)
+            + " "
+            + str(val)
+            + " "
+            + str(ordering)
+        )
         return v
 
     def cmpxchg(
@@ -1625,16 +2555,34 @@ class IRBuilder:
         failure_ordering: str,
         name: str = "",
     ) -> Value:
-        pair_ty = LiteralStructType([cmp.type, IntType(1)])
+        pair_ty = LiteralStructType([cmp.type, _I1])
         v = self._next(name, pair_ty)
         self._emit(
-            f"{v} = cmpxchg {ptr.type} {ptr}, {cmp.type} {cmp}, "
-            f"{val.type} {val} {success_ordering} {failure_ordering}"
+            str(v)
+            + " = cmpxchg "
+            + str(ptr.type)
+            + " "
+            + str(ptr)
+            + ", "
+            + str(cmp.type)
+            + " "
+            + str(cmp)
+            + ", "
+            + str(val.type)
+            + " "
+            + str(val)
+            + " "
+            + str(success_ordering)
+            + " "
+            + str(failure_ordering)
         )
         return v
 
     def landingpad(
-        self, ty: Type, name: str = "", cleanup: bool = False,
+        self,
+        ty: Type,
+        name: str = "",
+        cleanup: bool = False,
     ) -> "LandingPadInstr":
         v = LandingPadInstr(self, ty, self._next_name(name), cleanup)
         self._emit(v._placeholder_line)
@@ -1643,7 +2591,10 @@ class IRBuilder:
     def extract_value(self, agg: Value, indices, name: str = "") -> Value:
         if isinstance(indices, int):
             indices = [indices]
-        idx_text = ", ".join(str(i) for i in indices)
+        idx_parts = []
+        for i in indices:
+            idx_parts.append(str(i))
+        idx_text = _join_text(idx_parts, ", ")
         # Element type is tricky without struct-type info; default to i32
         # for aggregates we don't know (pcc's uses are typically phi-
         # aggregates of (ptr, i32) where index 1 → i32).
@@ -1652,8 +2603,107 @@ class IRBuilder:
         else:
             elem_ty = IntType(32)
         v = self._next(name, elem_ty)
-        self._emit(f"{v} = extractvalue {agg.type} {agg}, {idx_text}")
+        self._emit(
+            str(v)
+            + " = extractvalue "
+            + str(agg.type)
+            + " "
+            + str(agg)
+            + ", "
+            + idx_text
+        )
         return v
+
+
+def _irbuilder_call_from_args_list(
+    builder: IRBuilder,
+    fn: Function | Value,
+    args_list,
+    name: str = "",
+    tail: bool = False,
+) -> Value:
+    if _debug_ir_call_enabled():
+        try:
+            sys.stderr.write(
+                "[pcc.ir.call] enter argc=" + str(len(args_list)) + "\n"
+            )
+        except Exception:
+            pass
+    expected_arg_types = []
+    if _looks_like_function(fn):
+        callee_ref = "@" + str(fn.name)
+        ret_ty = fn.ftype.return_type
+        arg_type_parts = []
+        for t in fn.ftype.args:
+            expected_arg_types.append(t)
+            arg_type_parts.append(str(t))
+        arg_types = _join_text(arg_type_parts, ", ")
+        if fn.ftype.var_arg:
+            arg_types = arg_types + ", ..." if arg_types else "..."
+        sig_text = str(ret_ty) + " (" + arg_types + ")"
+    else:
+        callee_ref = str(fn)
+        if _looks_like_pointer_type(fn.type) and _looks_like_function_type(
+            fn.type.pointee
+        ):
+            fty = fn.type.pointee
+            ret_ty = fty.return_type
+            arg_type_parts = []
+            for t in fty.args:
+                expected_arg_types.append(t)
+                arg_type_parts.append(str(t))
+            arg_types = _join_text(arg_type_parts, ", ")
+            if fty.var_arg:
+                arg_types = arg_types + ", ..." if arg_types else "..."
+            sig_text = str(ret_ty) + " (" + arg_types + ")"
+        else:
+            ret_ty = VoidType()
+            sig_text = "void ()"
+
+    if _debug_ir_call_enabled():
+        try:
+            sys.stderr.write(
+                "[pcc.ir.call] sig callee="
+                + str(callee_ref)
+                + " expected="
+                + str(len(expected_arg_types))
+                + "\n"
+            )
+        except Exception:
+            pass
+
+    arg_parts = []
+    i = 0
+    while i < len(args_list):
+        a = args_list[i]
+        if i < len(expected_arg_types):
+            arg_ty = expected_arg_types[i]
+        else:
+            arg_ty = a.type
+        arg_parts.append(str(arg_ty) + " " + _value_ref(a))
+        i += 1
+    args_text = ", ".join(arg_parts)
+    tail_prefix = "tail " if tail else ""
+    if _looks_like_void_type(ret_ty):
+        line = tail_prefix + "call " + sig_text + " " + callee_ref + "("
+        line = line + args_text + ")"
+        if _debug_ir_call_enabled():
+            try:
+                sys.stderr.write("[pcc.ir.call] emit void\n")
+            except Exception:
+                pass
+        builder._emit(line)
+        return Value(VoidType(), "")
+    v = builder._next(name, ret_ty)
+    line = str(v) + " = " + tail_prefix + "call " + sig_text + " " + callee_ref
+    line = line + "(" + args_text + ")"
+    if _debug_ir_call_enabled():
+        try:
+            sys.stderr.write("[pcc.ir.call] emit value\n")
+        except Exception:
+            pass
+    builder._emit(line)
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -1667,29 +2717,43 @@ class PhiInstr(Value):
 
     def __init__(self, builder: IRBuilder, ty: Type, name: str) -> None:
         self.type = ty
-        self._ref = f"%{name}"
+        self._ref = "%" + str(name)
         self._builder = builder
         self._incomings: list[tuple[Value, Block]] = []
         self._placeholder_line = ""
         self._refresh()
 
     def _refresh(self) -> None:
-        pairs = ", ".join(
-            f"[{v}, %{b.name}]" for v, b in self._incomings
-        )
-        self._placeholder_line = (
-            f"{self} = phi {self.type} {pairs}" if pairs
-            else f"{self} = phi {self.type}"
-        )
+        pair_parts = []
+        for v, b in self._incomings:
+            pair_parts.append("[" + str(v) + ", %" + str(b.name) + "]")
+        pairs = ""
+        if len(pair_parts) == 1:
+            pairs = pair_parts[0]
+        elif len(pair_parts) >= 2:
+            pairs = pair_parts[0] + ", " + pair_parts[1]
+            i = 2
+            while i < len(pair_parts):
+                pairs = pairs + ", " + pair_parts[i]
+                i += 1
+        if pairs:
+            self._placeholder_line = (
+                str(self) + " = phi " + str(self.type) + " " + pairs
+            )
+        else:
+            self._placeholder_line = str(self) + " = phi " + str(self.type)
         # Update the emitted line in-place — scan records for the
         # prior placeholder and replace its text field.
         blk: Block = self._builder._block
         if blk is None:
             return
-        for rec in blk._instrs:
+        i = 0
+        while i < len(blk._instrs):
+            rec = blk._instrs[i]
             if rec.text.startswith(str(self) + " = phi"):
-                rec.text = self._placeholder_line
+                blk._replace_record_text(rec, self._placeholder_line)
                 return
+            i += 1
 
     def add_incoming(self, value: Value, block: Block) -> None:
         self._incomings.append((value, block))
@@ -1701,7 +2765,7 @@ class LandingPadInstr(Value):
 
     def __init__(self, builder: IRBuilder, ty: Type, name: str, cleanup: bool) -> None:
         self.type = ty
-        self._ref = f"%{name}"
+        self._ref = "%" + str(name)
         self._builder = builder
         self._clauses: list[str] = []
         self._cleanup = cleanup
@@ -1709,20 +2773,30 @@ class LandingPadInstr(Value):
         self._refresh()
 
     def _refresh(self) -> None:
-        clause_text = "\n    ".join(self._clauses) if self._clauses else ""
+        clause_text = _join_text(self._clauses, "\n    ") if self._clauses else ""
         cleanup_text = " cleanup" if self._cleanup else ""
         if clause_text:
-            line = f"{self} = landingpad {self.type}\n    {clause_text}{cleanup_text}"
+            line = (
+                str(self)
+                + " = landingpad "
+                + str(self.type)
+                + "\n    "
+                + clause_text
+                + cleanup_text
+            )
         else:
-            line = f"{self} = landingpad {self.type}{cleanup_text}"
+            line = str(self) + " = landingpad " + str(self.type) + cleanup_text
         self._placeholder_line = line
         blk = self._builder.block
         if blk is None:
             return
-        for rec in blk._instrs:
+        i = 0
+        while i < len(blk._instrs):
+            rec = blk._instrs[i]
             if rec.text.startswith(str(self) + " = landingpad"):
-                rec.text = line
+                blk._replace_record_text(rec, line)
                 return
+            i += 1
 
     def add_clause(self, clause: "CatchClause | FilterClause") -> None:
         self._clauses.append(clause.render())
@@ -1736,7 +2810,7 @@ class CatchClause:
         self.value = value
 
     def render(self) -> str:
-        return f"catch {self.value.type} {self.value}"
+        return "catch " + str(self.value.type) + " " + str(self.value)
 
 
 class SwitchInstr:
@@ -1748,12 +2822,16 @@ class SwitchInstr:
     """
 
     def __init__(
-        self, builder: IRBuilder, value: Value, default: Block,
+        self,
+        builder: IRBuilder,
+        value: Value,
+        default: Block,
     ) -> None:
         self.builder = builder
         self.value = value
         self.default = default
         self.cases: list[tuple[int, Block]] = []
+        self._instr = None
 
     def add_case(self, int_value, target: Block) -> None:
         """Register a ``<int> -> %target`` case. ``int_value`` may be
@@ -1770,13 +2848,19 @@ class SwitchInstr:
 
     def _render(self) -> str:
         val_ty = self.value.type
-        cases_text = " ".join(
-            f"{val_ty} {iv}, label %{blk.name}"
-            for iv, blk in self.cases
-        )
-        body = f" [ {cases_text} ]" if cases_text else " [ ]"
+        parts = []
+        for iv, blk in self.cases:
+            parts.append(str(val_ty) + " " + str(iv) + ", label %" + str(blk.name))
+        cases_text = _join_text(parts, " ")
+        body = " [ " + cases_text + " ]" if cases_text else " [ ]"
         return (
-            f"switch {val_ty} {self.value}, label %{self.default.name}{body}"
+            "switch "
+            + str(val_ty)
+            + " "
+            + str(self.value)
+            + ", label %"
+            + str(self.default.name)
+            + body
         )
 
     def _refresh(self) -> None:
@@ -1786,10 +2870,16 @@ class SwitchInstr:
         # Replace the placeholder line in the current block's
         # instruction list. Expected prefix: "switch <ty>".
         new_line = self._render()
-        for rec in blk._instrs:
+        if self._instr is not None:
+            self._instr.block._replace_record_text(self._instr, new_line)
+            return
+        idx = 0
+        while idx < len(blk._instrs):
+            rec = blk._instrs[idx]
             if rec.text.startswith("switch "):
-                rec.text = new_line
+                blk._replace_record_text(rec, new_line)
                 return
+            idx += 1
 
 
 class FilterClause:
@@ -1800,8 +2890,11 @@ class FilterClause:
         self.values = tuple(values)
 
     def render(self) -> str:
-        vals_text = ", ".join(f"{v.type} {v}" for v in self.values)
-        return f"filter {self.ty} [{vals_text}]"
+        val_parts = []
+        for v in self.values:
+            val_parts.append(str(v.type) + " " + str(v))
+        vals_text = _join_text(val_parts, ", ")
+        return "filter " + str(self.ty) + " [" + vals_text + "]"
 
 
 # ---------------------------------------------------------------------------
@@ -1852,6 +2945,10 @@ def scaffold_Context():
 
 def scaffold_IdentifiedStructType(context, name):
     return IdentifiedStructType(context, name)
+
+
+def scaffold_Value(ty, ref):
+    return Value(ty, str(ref))
 
 
 def VoidType___init__():
@@ -1918,44 +3015,100 @@ def scaffold_Module___init__():
     return Module(name="")
 
 
+def LiteralStructType___init__1(arg0):
+    return LiteralStructType((arg0,))
+
+
+def LiteralStructType___init__2(arg0, arg1):
+    return LiteralStructType((arg0, arg1))
+
+
 def LiteralStructType___init__3(arg0, arg1, arg2):
     return LiteralStructType((arg0, arg1, arg2))
 
 
+def LiteralStructType___init__4(arg0, arg1, arg2, arg3):
+    return LiteralStructType((arg0, arg1, arg2, arg3))
+
+
+def LiteralStructType___init__5(arg0, arg1, arg2, arg3, arg4):
+    return LiteralStructType((arg0, arg1, arg2, arg3, arg4))
+
+
+def LiteralStructType___init__6(arg0, arg1, arg2, arg3, arg4, arg5):
+    return LiteralStructType((arg0, arg1, arg2, arg3, arg4, arg5))
+
+
+def LiteralStructType___init__7(arg0, arg1, arg2, arg3, arg4, arg5, arg6):
+    return LiteralStructType((arg0, arg1, arg2, arg3, arg4, arg5, arg6))
+
+
 def IRBuilder_call0(builder, fn):
-    return IRBuilder.call(builder, fn, ())
+    return _irbuilder_call_from_args_list(builder, fn, [])
 
 
 def IRBuilder_call1(builder, fn, arg0):
-    return IRBuilder.call(builder, fn, (arg0,))
+    return _irbuilder_call_from_args_list(builder, fn, [arg0])
 
 
 def IRBuilder_call2(builder, fn, arg0, arg1):
-    return IRBuilder.call(builder, fn, (arg0, arg1))
+    return _irbuilder_call_from_args_list(builder, fn, [arg0, arg1])
 
 
 def IRBuilder_call3(builder, fn, arg0, arg1, arg2):
-    return IRBuilder.call(builder, fn, (arg0, arg1, arg2))
+    return _irbuilder_call_from_args_list(builder, fn, [arg0, arg1, arg2])
 
 
 def IRBuilder_call4(builder, fn, arg0, arg1, arg2, arg3):
-    return IRBuilder.call(builder, fn, (arg0, arg1, arg2, arg3))
+    return _irbuilder_call_from_args_list(builder, fn, [arg0, arg1, arg2, arg3])
+
+
+def IRBuilder_call4_i32(builder, fn, arg0, arg1, arg2, arg3: int):
+    return IRBuilder.call4_i32(builder, fn, arg0, arg1, arg2, arg3)
 
 
 def IRBuilder_call5(builder, fn, arg0, arg1, arg2, arg3, arg4):
-    return IRBuilder.call(builder, fn, (arg0, arg1, arg2, arg3, arg4))
+    return _irbuilder_call_from_args_list(builder, fn, [arg0, arg1, arg2, arg3, arg4])
 
 
 def IRBuilder_call6(builder, fn, arg0, arg1, arg2, arg3, arg4, arg5):
-    return IRBuilder.call(builder, fn, (arg0, arg1, arg2, arg3, arg4, arg5))
+    return _irbuilder_call_from_args_list(
+        builder, fn, [arg0, arg1, arg2, arg3, arg4, arg5]
+    )
 
 
 def IRBuilder_call7(builder, fn, arg0, arg1, arg2, arg3, arg4, arg5, arg6):
-    return IRBuilder.call(builder, fn, (arg0, arg1, arg2, arg3, arg4, arg5, arg6))
+    return _irbuilder_call_from_args_list(
+        builder, fn, [arg0, arg1, arg2, arg3, arg4, arg5, arg6]
+    )
 
 
 def IRBuilder_call_dyn(builder, fn, args):
     return IRBuilder.call(builder, fn, args)
+
+
+def IRBuilder_emit_raw(builder, line: str):
+    return IRBuilder._emit(builder, line)
+
+
+def IRBuilder_next_value(builder, name: str, typ):
+    return IRBuilder._next(builder, name, typ)
+
+
+def IRBuilder_current_instruction_count(builder) -> int:
+    block = builder._block
+    if block is None:
+        return 0
+    return len(block._instrs)
+
+
+def IRBuilder_instruction_text_at(builder, index: int) -> str:
+    block = builder._block
+    if block is None:
+        return ""
+    if index < 0 or index >= len(block._instrs):
+        return ""
+    return block._instrs[index].text
 
 
 def IRBuilder_gep1(builder, ptr, idx0):
@@ -1969,6 +3122,20 @@ def IRBuilder_gep2_inbounds(builder, ptr, idx0, idx1):
 def IRBuilder_add_incoming(phi: PhiInstr, value: Value, block: Block):
     phi._incomings.append((value, block))
     phi._refresh()
+
+
+def scaffold_SwitchInstr_add_case_i64(
+    switch_inst: SwitchInstr,
+    int_value: int,
+    target: Block,
+):
+    switch_inst.cases.append((int_value, target))
+    new_line = switch_inst._render()
+    for blk in switch_inst.default.parent.blocks:
+        for rec in blk._instrs:
+            if rec.text.startswith("switch ") and f"label %{switch_inst.default.name}" in rec.text:
+                blk._replace_record_text(rec, new_line)
+                return
 
 
 def IRBuilder_as_pointer(ty):
@@ -1993,18 +3160,42 @@ def scaffold_Function_append_basic_block(fn, name):
 
 __all__ = [
     # Types
-    "Type", "VoidType", "IntType", "HalfType", "FloatType", "DoubleType",
-    "PointerType", "ArrayType", "BaseStructType",
-    "LiteralStructType", "IdentifiedStructType", "FunctionType",
-    "Context", "global_context",
+    "Type",
+    "VoidType",
+    "IntType",
+    "HalfType",
+    "FloatType",
+    "DoubleType",
+    "PointerType",
+    "ArrayType",
+    "BaseStructType",
+    "LiteralStructType",
+    "IdentifiedStructType",
+    "FunctionType",
+    "Context",
+    "global_context",
     # Values / constants
-    "Value", "Constant", "Undefined",
+    "Value",
+    "Constant",
+    "Undefined",
     # Containers
-    "Argument", "Block", "Function", "FunctionAttributes",
-    "GlobalVariable", "Module",
+    "Argument",
+    "Block",
+    "Function",
+    "FunctionAttributes",
+    "GlobalVariable",
+    "Module",
     # Builder + insts
-    "IRBuilder", "PhiInstr", "LandingPadInstr", "SwitchInstr",
-    "CatchClause", "FilterClause",
+    "IRBuilder",
+    "IRBuilder_emit_raw",
+    "IRBuilder_next_value",
+    "IRBuilder_current_instruction_count",
+    "IRBuilder_instruction_text_at",
+    "PhiInstr",
+    "LandingPadInstr",
+    "SwitchInstr",
+    "CatchClause",
+    "FilterClause",
 ]
 
 

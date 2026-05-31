@@ -29,6 +29,9 @@ INITIAL_CAPACITY = 8 (must be power of 2; inlined per the
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
     free,
+    is_tagged_int,
+    load_i32,
+    ptr_add,
     load_i64,
     load_ptr,
     malloc,
@@ -38,17 +41,52 @@ from pcc.unsafe import (
     store_i32,
     store_i64,
     store_ptr,
+    untag_int,
 )
 
 py_incref            = extern("py_incref",            (c_ptr,),                    c_void)
 py_decref            = extern("py_decref",            (c_ptr,),                    c_void)
 py_obj_hash          = extern("py_obj_hash",          (c_ptr,),                    c_int64)
 py_obj_eq            = extern("py_obj_eq",            (c_ptr, c_ptr),              c_int32)
+py_gc_track          = extern("py_gc_track",          (c_ptr,),                    c_void)
+pcc_gc_store_ptr     = extern("pcc_gc_store_ptr",     (c_ptr, c_ptr, c_ptr),       c_void)
+pcc_gc_load_ptr      = extern("pcc_gc_load_ptr",      (c_ptr, c_ptr),              c_ptr)
+pcc_gc_alloc         = extern("pcc_gc_alloc",         (c_int64, c_int32, c_int32), c_ptr)
 
 py_list_new          = extern("py_list_new",          (c_int64,),                  c_ptr)
 py_list_append       = extern("py_list_append",       (c_ptr, c_ptr),              c_void)
 py_tuple_new         = extern("py_tuple_new",         (c_int64,),                  c_ptr)
 py_tuple_set_item    = extern("py_tuple_set_item",    (c_ptr, c_int64, c_ptr),     c_void)
+py_exc_new_with_value = extern("py_exc_new_with_value", (c_int64, c_ptr),          c_ptr)
+py_raise         = extern("py_raise",         (c_ptr,),                    c_void)
+py_obj_iter      = extern("py_obj_iter",      (c_ptr,),                    c_ptr)
+py_obj_next      = extern("py_obj_next",      (c_ptr,),                    c_ptr)
+py_err_occurred  = extern("py_err_occurred",  (),                          c_int64)
+py_current_exception = extern("py_current_exception", (),                  c_ptr)
+py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,),          c_ptr)
+py_exc_matches   = extern("py_exc_matches",   (c_ptr, c_ptr),              c_int64)
+py_clear_exception = extern("py_clear_exception", (),                      c_void)
+
+
+def _ptr_can_have_header(o) -> bool:
+    if ptr_is_null(o) != 0:
+        return False
+    if is_tagged_int(o) != 0:
+        return False
+    bits: int = untag_int(o)
+    if bits < 2048:
+        return False
+    if (bits & 3) != 0:
+        return False
+    if bits >= 140737488355328:
+        return False
+    return True
+
+
+def _ptr_is_dict(o) -> bool:
+    if not _ptr_can_have_header(o):
+        return False
+    return load_i32(o, 8) == 6
 
 
 def _alloc_tables(d, capacity: int) -> int:
@@ -78,15 +116,29 @@ def _lookup(d, hash_val: int, key) -> int:
     # Pack two int64 results into i64 return: high 32 = slot, low 32 =
     # entry_idx. Both fit because capacity is bounded. We return i64 here
     # as (slot << 32) | (entry_idx_or_minus1 & 0xFFFFFFFF).
+    if not _ptr_is_dict(d):
+        return 0xFFFFFFFF
     capacity: int = load_i64(d, 24)
     indices = load_ptr(d, 32)
     entries = load_ptr(d, 40)
+    if capacity <= 0:
+        return 0xFFFFFFFF
+    if ptr_is_null(indices) != 0:
+        return 0xFFFFFFFF
+    if ptr_is_null(entries) != 0:
+        return 0xFFFFFFFF
     mask: int = capacity - 1
-    perturb: int = hash_val
+    # Probe perturb must eventually shift down to zero. Hashes are
+    # signed i64 in the pcc-Python runtime; using a signed negative
+    # value here makes ``perturb >> 5`` stay negative forever and can
+    # trap lookup in a probe sub-cycle.
+    perturb: int = hash_val & 9223372036854775807
     j: int = hash_val & mask
     first_tombstone: int = -1
+    probes: int = 0
+    limit: int = capacity * 2
 
-    while True:
+    while probes < limit:
         ix: int = load_i64(indices, j * 8)
         if ix == -1:                       # PY_DICT_EMPTY
             slot: int = j
@@ -98,7 +150,7 @@ def _lookup(d, hash_val: int, key) -> int:
                 first_tombstone = j
         else:
             entry_off: int = ix * 24
-            ek = load_ptr(entries, entry_off + 8)
+            ek = pcc_gc_load_ptr(d, ptr_add(entries, entry_off + 8))
             if ptr_is_null(ek) == 0:
                 eh: int = load_i64(entries, entry_off)
                 if eh == hash_val:
@@ -108,6 +160,12 @@ def _lookup(d, hash_val: int, key) -> int:
                         return (j << 32) | (ix & 0xFFFFFFFF)
         perturb = perturb >> 5
         j = (j * 5 + perturb + 1) & mask
+        probes = probes + 1
+
+    fallback_slot: int = 0
+    if first_tombstone >= 0:
+        fallback_slot = first_tombstone
+    return (fallback_slot << 32) | (0xFFFFFFFF)
 
 
 def _slot_of(packed: int) -> int:
@@ -122,6 +180,20 @@ def _entry_idx_of(packed: int) -> int:
     return low
 
 
+def _entry_key(d, entries, entry_off: int):
+    k = load_ptr(entries, entry_off + 8)
+    if ptr_is_null(k) != 0:
+        return k
+    return pcc_gc_load_ptr(d, ptr_add(entries, entry_off + 8))
+
+
+def _entry_value(d, entries, entry_off: int):
+    v = load_ptr(entries, entry_off + 16)
+    if ptr_is_null(v) != 0:
+        return v
+    return pcc_gc_load_ptr(d, ptr_add(entries, entry_off + 16))
+
+
 def _insert_fresh(d, hash_val: int, key, value) -> None:
     # Inlined lookup + entry move. INCREFs key and value.
     packed: int = _lookup(d, hash_val, key)
@@ -131,11 +203,11 @@ def _insert_fresh(d, hash_val: int, key, value) -> None:
     ei: int = load_i64(d, 48)            # entries_used
     store_i64(d, 48, ei + 1)
     entry_off: int = ei * 24
-    py_incref(key)
-    py_incref(value)
     store_i64(entries, entry_off, hash_val)
-    store_ptr(entries, entry_off + 8, key)
-    store_ptr(entries, entry_off + 16, value)
+    store_ptr(entries, entry_off + 8, null())
+    store_ptr(entries, entry_off + 16, null())
+    pcc_gc_store_ptr(d, ptr_add(entries, entry_off + 8), key)
+    pcc_gc_store_ptr(d, ptr_add(entries, entry_off + 16), value)
     store_i64(indices, slot * 8, ei)
     sz: int = load_i64(d, 16)
     store_i64(d, 16, sz + 1)
@@ -169,10 +241,10 @@ def _rehash(d, new_capacity: int) -> int:
     j: int = 0
     while j < old_entries_used:
         old_off: int = j * 24
-        k = load_ptr(old_entries, old_off + 8)
+        k = _entry_key(d, old_entries, old_off)
         if ptr_is_null(k) == 0:
             h: int = load_i64(old_entries, old_off)
-            v = load_ptr(old_entries, old_off + 16)
+            v = _entry_value(d, old_entries, old_off)
             packed: int = _lookup(d, h, k)
             slot: int = _slot_of(packed)
             ei: int = load_i64(d, 48)
@@ -204,26 +276,24 @@ def _maybe_grow(d) -> int:
 
 @c_abi_export("py_dict_new")
 def py_dict_new():
-    d = malloc(56)
+    d = pcc_gc_alloc(56, 6, 0)
     if ptr_is_null(d) != 0:
         return null()
-    store_i64(d, 0, 1)              # refcount
-    store_i32(d, 8, 6)              # PY_TYPE_DICT
-    store_i32(d, 12, 0)             # flags
     store_i64(d, 16, 0)             # size
     store_i64(d, 24, 0)             # capacity
     store_ptr(d, 32, null())   # indices
     store_ptr(d, 40, null())   # entries
     store_i64(d, 48, 0)             # entries_used
     if _alloc_tables(d, 8) != 0:
-        free(d)
+        py_decref(d)
         return null()
+    py_gc_track(d)
     return d
 
 
 @c_abi_export("py_dict_set")
 def py_dict_set(d, key, value) -> None:
-    if ptr_is_null(d) != 0:
+    if not _ptr_is_dict(d):
         return
     if ptr_is_null(key) != 0:
         return
@@ -234,10 +304,7 @@ def py_dict_set(d, key, value) -> None:
         # Update existing — replace value, keep key.
         entries = load_ptr(d, 40)
         entry_off: int = ix * 24
-        old_value = load_ptr(entries, entry_off + 16)
-        py_incref(value)
-        py_decref(old_value)
-        store_ptr(entries, entry_off + 16, value)
+        pcc_gc_store_ptr(d, ptr_add(entries, entry_off + 16), value)
         return
     _insert_fresh(d, h, key, value)
     _maybe_grow(d)
@@ -245,7 +312,7 @@ def py_dict_set(d, key, value) -> None:
 
 @c_abi_export("py_dict_get")
 def py_dict_get(d, key):
-    if ptr_is_null(d) != 0:
+    if not _ptr_is_dict(d):
         return null()
     if ptr_is_null(key) != 0:
         return null()
@@ -255,7 +322,9 @@ def py_dict_get(d, key):
     if ix < 0:
         return null()
     entries = load_ptr(d, 40)
-    v = load_ptr(entries, ix * 24 + 16)
+    v = pcc_gc_load_ptr(d, ptr_add(entries, ix * 24 + 16))
+    if ptr_is_null(v) != 0:
+        return null()
     py_incref(v)
     return v
 
@@ -269,9 +338,61 @@ def py_dict_get_default(d, key, default_value):
     return default_value
 
 
+@c_abi_export("py_dict_getitem")
+def py_dict_getitem(d, key):
+    # d[key] subscript: like py_dict_get but raises KeyError (carrying the key)
+    # when absent, so try/except can catch it. Mirrors py_dict_getitem in
+    # py_dict.c; py_dict_get stays non-raising for dict.get()/setdefault().
+    v = py_dict_get(d, key)
+    if ptr_is_null(v) == 0:
+        return v
+    exc = py_exc_new_with_value(4, key)  # PY_EXC_KEYERROR
+    py_raise(exc)
+    return null()
+
+
+@c_abi_export("py_dict_fromkeys")
+def py_dict_fromkeys(iterable, value):
+    # dict.fromkeys(iterable, value): new dict, each element -> value (caller
+    # passes None when omitted). Iterator protocol; clears a terminal
+    # StopIteration. Mirrors py_dict_fromkeys in py_dict.c. No break -> use a
+    # done flag.
+    d = py_dict_new()
+    if ptr_is_null(d) != 0:
+        return null()
+    it = py_obj_iter(iterable)
+    if ptr_is_null(it) == 0:
+        done: int = 0
+        while done == 0:
+            k = py_obj_next(it)
+            if ptr_is_null(k) != 0:
+                if py_err_occurred() != 0:
+                    cur = py_current_exception()
+                    stop = py_exc_builtin_class(8)   # PY_EXC_STOPITERATION
+                    if py_exc_matches(cur, stop) != 0:
+                        py_clear_exception()
+                done = 1
+            else:
+                py_dict_set(d, k, value)
+                py_decref(k)
+        py_decref(it)
+    return d
+
+
+@c_abi_export("py_dict_pop")
+def py_dict_pop(d, key):
+    v = py_dict_get(d, key)
+    if ptr_is_null(v) == 0:
+        py_dict_del(d, key)
+        return v
+    exc = py_exc_new_with_value(4, key)  # PY_EXC_KEYERROR
+    py_raise(exc)
+    return null()
+
+
 @c_abi_export("py_dict_contains")
 def py_dict_contains(d, key) -> int:
-    if ptr_is_null(d) != 0:
+    if not _ptr_is_dict(d):
         return 0
     if ptr_is_null(key) != 0:
         return 0
@@ -285,7 +406,7 @@ def py_dict_contains(d, key) -> int:
 
 @c_abi_export("py_dict_del")
 def py_dict_del(d, key) -> int:
-    if ptr_is_null(d) != 0:
+    if not _ptr_is_dict(d):
         return -1
     if ptr_is_null(key) != 0:
         return -1
@@ -298,8 +419,8 @@ def py_dict_del(d, key) -> int:
     entries = load_ptr(d, 40)
     indices = load_ptr(d, 32)
     entry_off: int = ix * 24
-    ek = load_ptr(entries, entry_off + 8)
-    ev = load_ptr(entries, entry_off + 16)
+    ek = _entry_key(d, entries, entry_off)
+    ev = _entry_value(d, entries, entry_off)
     py_decref(ek)
     py_decref(ev)
     store_ptr(entries, entry_off + 8, null())
@@ -310,16 +431,44 @@ def py_dict_del(d, key) -> int:
     return 0
 
 
+@c_abi_export("py_dict_clear")
+def py_dict_clear(d) -> None:
+    if not _ptr_is_dict(d):
+        return
+    entries = load_ptr(d, 40)
+    entries_used: int = load_i64(d, 48)
+    i: int = 0
+    while i < entries_used:
+        off: int = i * 24
+        k = _entry_key(d, entries, off)
+        if ptr_is_null(k) == 0:
+            v = _entry_value(d, entries, off)
+            py_decref(k)
+            py_decref(v)
+            store_i64(entries, off, 0)
+            store_ptr(entries, off + 8, null())
+            store_ptr(entries, off + 16, null())
+        i = i + 1
+    indices = load_ptr(d, 32)
+    capacity: int = load_i64(d, 24)
+    j: int = 0
+    while j < capacity:
+        store_i64(indices, j * 8, -1)
+        j = j + 1
+    store_i64(d, 16, 0)
+    store_i64(d, 48, 0)
+
+
 @c_abi_export("py_dict_len")
 def py_dict_len(d) -> int:
-    if ptr_is_null(d) != 0:
+    if not _ptr_is_dict(d):
         return 0
     return load_i64(d, 16)
 
 
 @c_abi_export("py_dict_keys")
 def py_dict_keys(d):
-    if ptr_is_null(d) != 0:
+    if not _ptr_is_dict(d):
         return null()
     size: int = load_i64(d, 16)
     cap_hint: int = size
@@ -333,7 +482,7 @@ def py_dict_keys(d):
     i: int = 0
     while i < entries_used:
         off: int = i * 24
-        k = load_ptr(entries, off + 8)
+        k = _entry_key(d, entries, off)
         if ptr_is_null(k) == 0:
             py_list_append(out, k)
         i = i + 1
@@ -342,7 +491,7 @@ def py_dict_keys(d):
 
 @c_abi_export("py_dict_values")
 def py_dict_values(d):
-    if ptr_is_null(d) != 0:
+    if not _ptr_is_dict(d):
         return null()
     size: int = load_i64(d, 16)
     cap_hint: int = size
@@ -356,9 +505,9 @@ def py_dict_values(d):
     i: int = 0
     while i < entries_used:
         off: int = i * 24
-        k = load_ptr(entries, off + 8)
+        k = _entry_key(d, entries, off)
         if ptr_is_null(k) == 0:
-            v = load_ptr(entries, off + 16)
+            v = _entry_value(d, entries, off)
             py_list_append(out, v)
         i = i + 1
     return out
@@ -366,7 +515,7 @@ def py_dict_values(d):
 
 @c_abi_export("py_dict_items")
 def py_dict_items(d):
-    if ptr_is_null(d) != 0:
+    if not _ptr_is_dict(d):
         return null()
     size: int = load_i64(d, 16)
     cap_hint: int = size
@@ -380,9 +529,9 @@ def py_dict_items(d):
     i: int = 0
     while i < entries_used:
         off: int = i * 24
-        k = load_ptr(entries, off + 8)
+        k = _entry_key(d, entries, off)
         if ptr_is_null(k) == 0:
-            v = load_ptr(entries, off + 16)
+            v = _entry_value(d, entries, off)
             pair = py_tuple_new(2)
             if ptr_is_null(pair) != 0:
                 py_decref(out)
@@ -393,3 +542,21 @@ def py_dict_items(d):
             py_decref(pair)
         i = i + 1
     return out
+
+
+@c_abi_export("py_dict_update")
+def py_dict_update(dst, src) -> None:
+    if not _ptr_is_dict(dst):
+        return
+    if not _ptr_is_dict(src):
+        return
+    entries = load_ptr(src, 40)
+    entries_used: int = load_i64(src, 48)
+    i: int = 0
+    while i < entries_used:
+        off: int = i * 24
+        k = _entry_key(src, entries, off)
+        if ptr_is_null(k) == 0:
+            v = _entry_value(src, entries, off)
+            py_dict_set(dst, k, v)
+        i = i + 1

@@ -1,0 +1,50 @@
+"""set methods union/intersection/difference/symmetric_difference/issubset/
+issuperset/isdisjoint/copy under strict no-libpython.
+
+Only add/remove/discard/update were in the set-method dispatch gate
+(_DYN_SET_METHOD_NATIVE), so `a.union(b)` etc. raised AttributeError (issubset/
+issuperset were even implemented but unreachable through the gate). Fix
+(frontend): widen the gate + handle the methods — intersection/difference/
+symmetric_difference via the existing runtime helpers; union/copy via
+py_set_new + py_set_update; isdisjoint via intersection length; issubset/
+issuperset via py_set_issubset/issuperset. No runtime change.
+
+Runs under ``--backend self --python-libpython=off`` in DEFAULT runtime mode.
+"""
+from __future__ import annotations
+import os, subprocess
+from pathlib import Path
+
+
+def _run(tmp_path, source):
+    src = tmp_path / "p.py"; src.write_text(source, encoding="utf-8")
+    exe = tmp_path / "p_bin"; env = os.environ.copy(); env.pop("LC_ALL", None)
+    b = subprocess.run(["uv","run","pcc","--backend","self","--python-libpython=off","--ir-scaffold=on",str(src),"-o",str(exe)], text=True, capture_output=True, timeout=420, env=env)
+    assert b.returncode == 0, b.stderr
+    r = subprocess.run([str(exe)], text=True, capture_output=True, timeout=30, env=env)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def test_set_methods(tmp_path):
+    out = _run(tmp_path,
+        "def main():\n"
+        "    a = {1, 2, 3}\n"
+        "    b = {2, 3, 4}\n"
+        "    print(sorted(a.union(b)))\n"                  # [1, 2, 3, 4]
+        "    print(sorted(a.intersection(b)))\n"           # [2, 3]
+        "    print(sorted(a.difference(b)))\n"             # [1]
+        "    print(sorted(a.symmetric_difference(b)))\n"   # [1, 4]
+        "    print(a.issubset({1, 2, 3, 4}))\n"            # True
+        "    print(a.issubset(b))\n"                       # False
+        "    print({1, 2}.issuperset({1}))\n"             # True
+        "    print(a.isdisjoint({5, 6}))\n"               # True
+        "    print(a.isdisjoint(b))\n"                     # False
+        "    print(sorted(a.copy()))\n"                    # [1, 2, 3]
+        "    print(sorted(a))\n"                           # [1, 2, 3] (union didn't mutate a)
+        "main()\n")
+    assert out.split("\n")[:11] == [
+        "[1, 2, 3, 4]", "[2, 3]", "[1]", "[1, 4]",
+        "True", "False", "True", "True", "False",
+        "[1, 2, 3]", "[1, 2, 3]",
+    ], out

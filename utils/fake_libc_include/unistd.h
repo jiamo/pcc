@@ -43,5 +43,8 @@ int access(const char *path, int amode);
 #ifndef _SC_PAGESIZE
 #define _SC_PAGESIZE 29
 #endif
+#ifndef _SC_NPROCESSORS_ONLN
+#define _SC_NPROCESSORS_ONLN 58
+#endif
 
 #endif

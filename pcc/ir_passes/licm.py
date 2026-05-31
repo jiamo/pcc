@@ -40,6 +40,7 @@ track, but a narrow AA-backed subset is implemented:
 
 from __future__ import annotations
 
+import os
 import re
 
 import llvmlite.binding as llvm
@@ -59,6 +60,8 @@ _HOISTABLE_OPCODES = {
     "getelementptr",
 }
 _SINKABLE_OPCODES = set(_HOISTABLE_OPCODES) | {"load"}
+_DEFAULT_LOOP_BUDGET = 64
+_LICM_LOOP_BUDGET_ENV = "PCC_LICM_LOOP_BUDGET"
 
 
 class LICMPass(ModulePass):
@@ -106,9 +109,10 @@ _ASSIGN_RE = re.compile(
 def _one_round(ir_text: str) -> tuple[str, bool]:
     module = llvm.parse_assembly(ir_text)
     module.verify()
-    aa = AliasAnalysis(module)
 
     any_change = False
+    loop_work = []
+    loop_count = 0
 
     for fn in module.functions:
         if fn.is_declaration:
@@ -117,8 +121,18 @@ def _one_round(ir_text: str) -> tuple[str, bool]:
         if not info.loops():
             continue
         cfg = CFG.of_function(fn)
+        loops = info.loops()
+        loop_count += len(loops)
+        if loop_count > _licm_loop_budget():
+            return ir_text, False
+        loop_work.append((fn, loops, cfg))
 
-        for loop in info.loops():
+    if not loop_work:
+        return ir_text, False
+
+    aa = AliasAnalysis(module)
+    for fn, loops, cfg in loop_work:
+        for loop in loops:
             preds = cfg.predecessors.get(loop.header, ())
             ext = [p for p in preds if p not in loop.blocks]
             if len(ext) != 1:
@@ -156,6 +170,15 @@ def _one_round(ir_text: str) -> tuple[str, bool]:
                     continue
 
     return ir_text, any_change
+
+
+def _licm_loop_budget() -> int:
+    raw = os.environ.get(_LICM_LOOP_BUDGET_ENV, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = _DEFAULT_LOOP_BUDGET
+    return max(0, value)
 
 
 def _hoist_one_loop(

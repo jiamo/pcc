@@ -2,6 +2,18 @@
 from __future__ import annotations
 
 
+class Error(Exception):
+    pass
+
+
+def _copy_user_object(x):
+    cls = type(x)
+    out = cls.__new__(cls)
+    if hasattr(x, "__dict__"):
+        out.__dict__.update(x.__dict__)
+    return out
+
+
 def copy(x):
     """Shallow copy."""
     if isinstance(x, list):
@@ -15,6 +27,8 @@ def copy(x):
     # Fallback: if the object exposes ``__copy__``, use it.
     if hasattr(x, "__copy__"):
         return x.__copy__()
+    if hasattr(x, "__dict__"):
+        return _copy_user_object(x)
     return x
 
 
@@ -47,4 +61,11 @@ def deepcopy(x, memo=None):
         r = x.__deepcopy__(memo)
         memo[oid] = r
         return r
+    if hasattr(x, "__dict__"):
+        cls = type(x)
+        out = cls.__new__(cls)
+        memo[oid] = out
+        for k, v in x.__dict__.items():
+            setattr(out, k, deepcopy(v, memo))
+        return out
     return x

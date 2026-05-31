@@ -1,0 +1,71 @@
+name: pcc1 package parity
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "pcc/cli_bootstrap.py"
+      - "pcc/package/**"
+      - "pcc/package_compat.py"
+      - "pcc/py_frontend/**"
+      - "pcc/py_runtime/**"
+      - "tests/python/test_package_*.py"
+      - "tests/python/pcc1_gate.py"
+      - "tests/python/test_pcc_native_extension_loader.py"
+      - "scripts/bootstrap.sh"
+      - ".github/workflows/pcc1-package-parity.yml"
+
+jobs:
+  pcc1-package-parity:
+    name: Build current pcc1, then run package parity without skip
+    runs-on: macos-14
+    timeout-minutes: 35
+    env:
+      PCC_REQUIRE_CURRENT_PCC1: "1"
+      PCC_BOOTSTRAP_OUT_DIR: "${{ github.workspace }}/build/bootstrap-pytest-self"
+      PCC_CURRENT_PCC1: "${{ github.workspace }}/build/bootstrap-pytest-self/pcc1"
+      PCC_BOOTSTRAP_RUNTIME_CC: "pcc"
+      PCC_BOOTSTRAP_RUNTIME_HIGH: "py"
+      PCC_BOOTSTRAP_PYTHON_LIBPYTHON: "off"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require macOS arm64 self-backend runner
+        run: |
+          test "$(uname)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Build current pcc1
+        run: |
+          env -u LC_ALL bash scripts/bootstrap.sh \
+            --backend self \
+            --stage 1 \
+            --out-dir "$PCC_BOOTSTRAP_OUT_DIR"
+          test -x "$PCC_BOOTSTRAP_OUT_DIR/pcc1"
+
+      - name: Run pcc1 package parity hard gate
+        run: |
+          env -u LC_ALL uv run pytest -q -n0 \
+            tests/python/test_package_pcc1_parity_gate.py \
+            tests/python/test_package_import_path.py \
+            tests/python/test_package_install.py \
+            tests/python/test_package_campaign.py \
+            tests/python/test_package_linkage.py \
+            tests/python/test_package_inspect.py \
+            tests/python/test_package_extension_abi.py \
+            tests/python/test_package_toolchain.py \
+            tests/python/test_package_build_exec.py \
+            tests/python/test_package_wheel_repo.py \
+            tests/python/test_package_build_plan.py \
+            tests/python/test_package_array_core.py

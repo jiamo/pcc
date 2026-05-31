@@ -41,6 +41,60 @@ static int64_t fnv1a(const unsigned char *p, size_t n) {
     return out;
 }
 
+static int is_bytes_like(int32_t tag) {
+    return tag == PY_TYPE_BYTES
+        || tag == PY_TYPE_BYTEARRAY
+        || tag == PY_TYPE_MEMORYVIEW;
+}
+
+static const char *bytes_like_data(PyObject *o, int64_t *n) {
+    if (o == NULL) {
+        *n = 0;
+        return NULL;
+    }
+    int32_t tag = py_type_of(o);
+    if (tag == PY_TYPE_BYTES) {
+        PyBytesObject *b = (PyBytesObject *)o;
+        *n = b->byte_len;
+        return b->data;
+    }
+    if (tag == PY_TYPE_BYTEARRAY) {
+        PyByteArrayObject *b = (PyByteArrayObject *)o;
+        *n = b->byte_len;
+        return b->data;
+    }
+    if (tag == PY_TYPE_MEMORYVIEW) {
+        PyMemoryViewObject *m = (PyMemoryViewObject *)o;
+        return bytes_like_data(pcc_gc_load_ptr(o, &m->base), n);
+    }
+    *n = 0;
+    return NULL;
+}
+
+static PyObject *cmp_tuple_item(PyObject *owner, PyTupleObject *t, int64_t i) {
+    return pcc_gc_load_ptr(owner, &t->items[i]);
+}
+
+static PyObject *cmp_list_item(PyObject *owner, PyListObject *l, int64_t i) {
+    return pcc_gc_load_ptr(owner, &l->items[i]);
+}
+
+static PyObject *cmp_dict_key(PyDictObject *d, DictEntry *e) {
+    if (e->key == NULL) return NULL;
+    return pcc_gc_load_ptr((PyObject *)d, &e->key);
+}
+
+static PyObject *cmp_dict_value(PyDictObject *d, DictEntry *e) {
+    if (e->value == NULL) return NULL;
+    return pcc_gc_load_ptr((PyObject *)d, &e->value);
+}
+
+static PyObject *cmp_set_key(PySetObject *s, SetEntry *e) {
+    PyObject *raw = e->key;
+    if (raw == NULL || raw == py_set_dummy) return raw;
+    return pcc_gc_load_ptr((PyObject *)s, &e->key);
+}
+
 int py_obj_cmp_threeway(PyObject *a, PyObject *b) {
     if (a == b) return 0;
     if (a == NULL) return (b == NULL) ? 0 : -1;
@@ -85,12 +139,29 @@ int py_obj_cmp_threeway(PyObject *a, PyObject *b) {
         return 0;
     }
 
+    if (is_bytes_like(ta) && is_bytes_like(tb)) {
+        int64_t na = 0;
+        int64_t nb = 0;
+        const char *da = bytes_like_data(a, &na);
+        const char *db = bytes_like_data(b, &nb);
+        int64_t n = na < nb ? na : nb;
+        int r = 0;
+        if (n > 0) r = memcmp(da, db, (size_t)n);
+        if (r != 0) return r < 0 ? -1 : 1;
+        if (na < nb) return -1;
+        if (na > nb) return 1;
+        return 0;
+    }
+
     if (ta == PY_TYPE_TUPLE && tb == PY_TYPE_TUPLE) {
         PyTupleObject *ta_o = (PyTupleObject *)a;
         PyTupleObject *tb_o = (PyTupleObject *)b;
         int64_t n = ta_o->len < tb_o->len ? ta_o->len : tb_o->len;
         for (int64_t i = 0; i < n; i++) {
-            int r = py_obj_cmp_threeway(ta_o->items[i], tb_o->items[i]);
+            int r = py_obj_cmp_threeway(
+                cmp_tuple_item(a, ta_o, i),
+                cmp_tuple_item(b, tb_o, i)
+            );
             if (r != 0) return r;
         }
         if (ta_o->len < tb_o->len) return -1;
@@ -103,7 +174,10 @@ int py_obj_cmp_threeway(PyObject *a, PyObject *b) {
         PyListObject *lb = (PyListObject *)b;
         int64_t n = la->length < lb->length ? la->length : lb->length;
         for (int64_t i = 0; i < n; i++) {
-            int r = py_obj_cmp_threeway(la->items[i], lb->items[i]);
+            int r = py_obj_cmp_threeway(
+                cmp_list_item(a, la, i),
+                cmp_list_item(b, lb, i)
+            );
             if (r != 0) return r;
         }
         if (la->length < lb->length) return -1;
@@ -116,6 +190,26 @@ int py_obj_cmp_threeway(PyObject *a, PyObject *b) {
     if ((uintptr_t)a < (uintptr_t)b) return -1;
     if ((uintptr_t)a > (uintptr_t)b) return 1;
     return 0;
+}
+
+static int64_t valuebox_cstr_eq(const char *a, const char *b) {
+    if (a == b) return 1;
+    if (a == NULL || b == NULL) return 0;
+    return strcmp(a, b) == 0;
+}
+
+static int64_t valuebox_classes_eq(PyClassObject *ca, PyClassObject *cb) {
+    if (ca == cb) return ca != NULL;
+    if (ca == NULL || cb == NULL) return 0;
+    if (!valuebox_cstr_eq(ca->name, cb->name)) return 0;
+    if (ca->n_fields != cb->n_fields) return 0;
+    if (ca->n_fields < 0) return 0;
+    for (int32_t i = 0; i < ca->n_fields; i++) {
+        const char *fa = ca->field_names != NULL ? ca->field_names[i] : NULL;
+        const char *fb = cb->field_names != NULL ? cb->field_names[i] : NULL;
+        if (!valuebox_cstr_eq(fa, fb)) return 0;
+    }
+    return 1;
 }
 
 int64_t py_obj_eq(PyObject *a, PyObject *b) {
@@ -148,12 +242,25 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
         return py_str_eq(a, b);
     }
 
+    if (is_bytes_like(ta) && is_bytes_like(tb)) {
+        int64_t na = 0;
+        int64_t nb = 0;
+        const char *da = bytes_like_data(a, &na);
+        const char *db = bytes_like_data(b, &nb);
+        if (na != nb) return 0;
+        if (na == 0) return 1;
+        return memcmp(da, db, (size_t)na) == 0;
+    }
+
     if (ta == PY_TYPE_TUPLE && tb == PY_TYPE_TUPLE) {
         PyTupleObject *ta_o = (PyTupleObject *)a;
         PyTupleObject *tb_o = (PyTupleObject *)b;
         if (ta_o->len != tb_o->len) return 0;
         for (int64_t i = 0; i < ta_o->len; i++) {
-            if (!py_obj_eq(ta_o->items[i], tb_o->items[i])) return 0;
+            if (!py_obj_eq(
+                    cmp_tuple_item(a, ta_o, i),
+                    cmp_tuple_item(b, tb_o, i)
+                )) return 0;
         }
         return 1;
     }
@@ -163,7 +270,27 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
         PyListObject *lb = (PyListObject *)b;
         if (la->length != lb->length) return 0;
         for (int64_t i = 0; i < la->length; i++) {
-            if (!py_obj_eq(la->items[i], lb->items[i])) return 0;
+            if (!py_obj_eq(
+                    cmp_list_item(a, la, i),
+                    cmp_list_item(b, lb, i)
+                )) return 0;
+        }
+        return 1;
+    }
+
+    if (ta == PY_TYPE_DICT && tb == PY_TYPE_DICT) {
+        PyDictObject *da = (PyDictObject *)a;
+        PyDictObject *db = (PyDictObject *)b;
+        if (da->size != db->size) return 0;
+        for (int64_t i = 0; i < da->entries_used; i++) {
+            DictEntry *e = &da->entries[i];
+            PyObject *key = cmp_dict_key(da, e);
+            if (key == NULL) continue;
+            PyObject *other = py_dict_get(b, key);
+            if (other == NULL) return 0;
+            int64_t eq = py_obj_eq(cmp_dict_value(da, e), other);
+            py_decref(other);
+            if (!eq) return 0;
         }
         return 1;
     }
@@ -173,9 +300,33 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
         PySetObject *sb = (PySetObject *)b;
         if (sa->size != sb->size) return 0;
         for (int64_t i = 0; i < sa->capacity; i++) {
-            PyObject *key = sa->entries[i].key;
+            PyObject *key = cmp_set_key(sa, &sa->entries[i]);
             if (key == NULL || key == py_set_dummy) continue;
             if (!py_set_contains(b, key)) return 0;
+        }
+        return 1;
+    }
+
+    if (ta == PY_TYPE_VALUEBOX && tb == PY_TYPE_VALUEBOX) {
+        PyValueBoxObject *ba = (PyValueBoxObject *)a;
+        PyValueBoxObject *bb = (PyValueBoxObject *)b;
+        PyClassObject *ca = (PyClassObject *)pcc_gc_load_ptr(
+            a,
+            (PyObject **)&ba->cls
+        );
+        PyClassObject *cb = (PyClassObject *)pcc_gc_load_ptr(
+            b,
+            (PyObject **)&bb->cls
+        );
+        if (!valuebox_classes_eq(ca, cb)) return 0;
+        int32_t n_fields = ca->n_fields;
+        if (n_fields < 0) return 0;
+        for (int32_t i = 0; i < n_fields; i++) {
+            PyObject *va = pcc_gc_load_ptr(a, &ba->fields[i]);
+            PyObject *vb = pcc_gc_load_ptr(b, &bb->fields[i]);
+            if (va == vb) continue;
+            if (va == NULL || vb == NULL) return 0;
+            if (!py_obj_eq(va, vb)) return 0;
         }
         return 1;
     }
@@ -183,6 +334,24 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
     if (ta == PY_TYPE_NONE || tb == PY_TYPE_NONE) return 0;
 
     return 0;
+}
+
+static int64_t py_valuebox_hash(PyValueBoxObject *box) {
+    if (box == NULL) return 0;
+    PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
+        (PyObject *)box,
+        (PyObject **)&box->cls
+    );
+    if (cls == NULL) return 0;
+    int32_t n_fields = cls->n_fields;
+    if (n_fields < 0) return 0;
+    int64_t h = n_fields;
+    for (int32_t i = 0; i < n_fields; i++) {
+        PyObject *v = pcc_gc_load_ptr((PyObject *)box, &box->fields[i]);
+        int64_t field_hash = (v == NULL) ? 0 : py_obj_hash(v);
+        h = (h * 31 + (field_hash % 1000003)) % 1000000007;
+    }
+    return (h == -1) ? -2 : h;
 }
 
 int64_t py_obj_hash(PyObject *o) {
@@ -219,15 +388,28 @@ int64_t py_obj_hash(PyObject *o) {
             s->hash = h;
             return h;
         }
+        case PY_TYPE_VALUEBOX:
+            return py_valuebox_hash((PyValueBoxObject *)o);
+        case PY_TYPE_BYTES: {
+            PyBytesObject *b = (PyBytesObject *)o;
+            return fnv1a((const unsigned char *)b->data, (size_t)b->byte_len);
+        }
         case PY_TYPE_TUPLE: {
             PyTupleObject *t = (PyTupleObject *)o;
             int64_t h = 0;
             for (int64_t i = 0; i < t->len; i++) {
-                h ^= py_obj_hash(t->items[i]);
+                h ^= py_obj_hash(cmp_tuple_item(o, t, i));
             }
             return (h == -1) ? -2 : h;
         }
         default:
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+                int64_t handled = 0;
+                int64_t user_hash = py_user_hash_dispatch(o, &handled);
+                if (handled) {
+                    return user_hash;
+                }
+            }
             return 0;
     }
 }
@@ -240,21 +422,52 @@ int64_t py_obj_ge(PyObject *a, PyObject *b) { return py_obj_cmp_threeway(a, b) >
 PyObject *py_obj_sorted(PyObject *x) {
     if (x == NULL) return NULL;
     int64_t n = py_obj_len(x);
+    /* py_obj_len is only a sizing hint here. A custom iterator (user class
+     * with __iter__/__next__ but no __len__) raises from py_obj_len; left
+     * pending, that aborts the iterator loop below and yields []. Clear it —
+     * the iterator-protocol branch handles length-less sources. */
+    if (py_err_occurred()) {
+        py_clear_exception();
+        n = 0;
+    }
     PyObject *out = py_list_new(n);
     if (out == NULL) return NULL;
     if (py_type_of(x) == PY_TYPE_SET) {
         PySetObject *s = (PySetObject *)x;
         for (int64_t i = 0; i < s->capacity; i++) {
-            PyObject *key = s->entries[i].key;
+            PyObject *key = cmp_set_key(s, &s->entries[i]);
             if (key == NULL || key == py_set_dummy) continue;
             py_list_append(out, key);
         }
-    } else {
+    } else if (py_type_of(x) == PY_TYPE_LIST || py_type_of(x) == PY_TYPE_TUPLE) {
         for (int64_t i = 0; i < n; i++) {
             PyObject *idx_box = py_int_from_i64(i);
             PyObject *el = py_obj_getitem(x, idx_box);
             py_list_append(out, el);
             py_decref(idx_box);
+        }
+    } else {
+        /* General iterable that is not integer-indexable: dict (-> keys),
+         * generator, range, etc. Use the iterator protocol. (Previously this
+         * branch used py_obj_getitem(x, i), which returns NULL for a dict
+         * since 0/1/... are not keys -> sorted(dict) gave [<null>, ...].) */
+        PyObject *it = py_obj_iter(x);
+        if (it != NULL) {
+            for (;;) {
+                PyObject *el = py_obj_next(it);
+                if (el == NULL) {
+                    if (py_err_occurred()) {
+                        PyObject *cur = py_current_exception();
+                        PyObject *stop =
+                            py_exc_builtin_class(PY_EXC_STOPITERATION);
+                        if (py_exc_matches(cur, stop)) py_clear_exception();
+                    }
+                    break;
+                }
+                py_list_append(out, el);
+                py_decref(el);
+            }
+            py_decref(it);
         }
     }
     int64_t m = py_list_len(out);
@@ -292,6 +505,11 @@ int64_t py_obj_contains(PyObject *container, PyObject *item) {
         }
         case PY_TYPE_STR:   return py_str_contains(container, item);
         default:
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+                int64_t handled = 0;
+                int64_t result = py_user_contains_dispatch(container, item, &handled);
+                if (handled) return result;
+            }
             return 0;
     }
 }

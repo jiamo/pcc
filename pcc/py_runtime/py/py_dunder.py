@@ -1,0 +1,473 @@
+"""pcc-Python port of py_dunder.c."""
+
+from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr, c_void
+from pcc.unsafe import (
+    call_void_ptr1,
+    call_ptr1,
+    cstr,
+    free,
+    global_load_ptr,
+    is_tagged_int,
+    load_i8,
+    load_i32,
+    load_ptr,
+    malloc,
+    null,
+    ptr_add,
+    ptr_eq,
+    ptr_is_null,
+    store_i8,
+    store_i32,
+    store_i64,
+)
+
+
+py_bigint_from_any = extern("py_bigint_from_any", (c_ptr,), c_ptr)
+py_bigint_to_cstr = extern("py_bigint_to_cstr", (c_ptr,), c_ptr)
+py_class_lookup = extern("py_class_lookup", (c_ptr, c_ptr), c_ptr)
+py_clear_exception = extern("py_clear_exception", (), c_void)
+py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
+py_int_to_i64 = extern("py_int_to_i64", (c_ptr, c_ptr), c_int64)
+py_raise = extern("py_raise", (c_ptr,), c_void)
+py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
+py_decref = extern("py_decref", (c_ptr,), c_void)
+strlen = extern("strlen", (c_ptr,), c_int64)
+pcc_runtime_log_event_code = extern("pcc_runtime_log_event_code", (c_int32, c_int32, c_int64, c_int64, c_ptr), c_void)
+pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
+pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+
+
+def _type_of(obj) -> int:
+    if is_tagged_int(obj):
+        return 2
+    return load_i32(obj, 8)
+
+
+def _load_instance_cls(o):
+    backend: int = pcc_gc_backend()
+    if backend == 3 or backend == 4:
+        return pcc_gc_load_ptr(o, ptr_add(o, 16))
+    return load_ptr(o, 16)
+
+
+@c_abi_export("py_int_to_str_obj")
+def py_int_to_str_obj(o):
+    if ptr_is_null(o):
+        return null()
+    if _type_of(o) != 2:
+        return null()
+    b = py_bigint_from_any(o)
+    if ptr_is_null(b):
+        return null()
+    raw = py_bigint_to_cstr(b)
+    free(b)
+    if ptr_is_null(raw):
+        return null()
+    out = py_str_new(raw, strlen(raw))
+    free(raw)
+    return out
+
+
+def _store_rev_hex_digits(rev, mag: int) -> int:
+    ndigits: int = 0
+    while True:
+        digit: int = mag & 15
+        ch: int = 0
+        if digit < 10:
+            ch = 48 + digit
+        else:
+            ch = 97 + digit - 10
+        store_i8(rev, ndigits, ch)
+        ndigits = ndigits + 1
+        mag = mag >> 4
+        if mag == 0 or ndigits >= 32:
+            break
+    return ndigits
+
+
+def _store_min_i64_hex_digits(rev) -> int:
+    i: int = 0
+    while i < 15:
+        store_i8(rev, i, 48)
+        i = i + 1
+    store_i8(rev, 15, 56)
+    return 16
+
+
+@c_abi_export("py_int_format_hex")
+def py_int_format_hex(o, width: int, zero_pad: int):
+    overflow = malloc(4)
+    if ptr_is_null(overflow):
+        return null()
+    store_i32(overflow, 0, 0)
+    v: int = py_int_to_i64(o, overflow)
+    overflowed: int = load_i32(overflow, 0)
+    free(overflow)
+    if overflowed != 0:
+        return py_int_to_str_obj(o)
+
+    neg: int = 0
+    mag: int = v
+    min_i64: int = -9223372036854775807
+    min_i64 = min_i64 - 1
+    if v < 0:
+        neg = 1
+        if v != min_i64:
+            mag = 0 - v
+
+    rev = malloc(32)
+    if ptr_is_null(rev):
+        return null()
+    ndigits: int = 0
+    if v == min_i64:
+        ndigits = _store_min_i64_hex_digits(rev)
+    else:
+        ndigits = _store_rev_hex_digits(rev, mag)
+
+    if width < 0:
+        width = 0
+    if width > 120:
+        width = 120
+    min_len: int = ndigits + neg
+    pad: int = width - min_len
+    if pad < 0:
+        pad = 0
+
+    buf = malloc(128)
+    if ptr_is_null(buf):
+        free(rev)
+        return null()
+    pos: int = 0
+    if neg != 0 and zero_pad != 0:
+        store_i8(buf, pos, 45)
+        pos = pos + 1
+    pad_ch: int = 32
+    if zero_pad != 0:
+        pad_ch = 48
+    i: int = 0
+    while i < pad and pos < 128:
+        store_i8(buf, pos, pad_ch)
+        pos = pos + 1
+        i = i + 1
+    if neg != 0 and zero_pad == 0 and pos < 128:
+        store_i8(buf, pos, 45)
+        pos = pos + 1
+    i = ndigits - 1
+    while i >= 0 and pos < 128:
+        store_i8(buf, pos, load_i8(rev, i) & 0xFF)
+        pos = pos + 1
+        i = i - 1
+    out = py_str_new(buf, pos)
+    free(buf)
+    free(rev)
+    return out
+
+
+@c_abi_export("py_int_format_decimal")
+def py_int_format_decimal(o, width: int, zero_pad: int, comma: int):
+    overflow = malloc(4)
+    if ptr_is_null(overflow):
+        return null()
+    store_i32(overflow, 0, 0)
+    v: int = py_int_to_i64(o, overflow)
+    overflowed: int = load_i32(overflow, 0)
+    free(overflow)
+    if overflowed != 0:
+        return py_int_to_str_obj(o)
+
+    neg: int = 0
+    mag: int = v
+    min_i64: int = -9223372036854775807
+    min_i64 = min_i64 - 1
+    if v < 0:
+        neg = 1
+        if v == min_i64:
+            return py_int_to_str_obj(o)
+        mag = 0 - v
+
+    rev = malloc(32)
+    if ptr_is_null(rev):
+        return null()
+    ndigits: int = 0
+    while True:
+        digit: int = mag % 10
+        store_i8(rev, ndigits, 48 + digit)
+        ndigits = ndigits + 1
+        mag = mag // 10
+        if mag == 0 or ndigits >= 32:
+            break
+
+    comma_count: int = 0
+    if comma != 0 and ndigits > 3:
+        comma_count = (ndigits - 1) // 3
+    if width < 0:
+        width = 0
+    if width > 120:
+        width = 120
+    min_len: int = ndigits + comma_count + neg
+    pad: int = width - min_len
+    if pad < 0:
+        pad = 0
+
+    buf = malloc(160)
+    if ptr_is_null(buf):
+        free(rev)
+        return null()
+    pos: int = 0
+    if neg != 0 and zero_pad != 0:
+        store_i8(buf, pos, 45)
+        pos = pos + 1
+    pad_ch: int = 32
+    if zero_pad != 0:
+        pad_ch = 48
+    i: int = 0
+    while i < pad and pos < 160:
+        store_i8(buf, pos, pad_ch)
+        pos = pos + 1
+        i = i + 1
+    if neg != 0 and zero_pad == 0 and pos < 160:
+        store_i8(buf, pos, 45)
+        pos = pos + 1
+    i = ndigits - 1
+    while i >= 0 and pos < 160:
+        store_i8(buf, pos, load_i8(rev, i) & 0xFF)
+        pos = pos + 1
+        if comma != 0 and i > 0 and (i % 3) == 0 and pos < 160:
+            store_i8(buf, pos, comma & 0xFF)
+            pos = pos + 1
+        i = i - 1
+    out = py_str_new(buf, pos)
+    free(buf)
+    free(rev)
+    return out
+
+
+def _int_based_repr(o, base: int, prefix_ch: int):
+    # bin()/hex()/oct() shared body, mirrors py_dunder.c::py_int_based_repr.
+    # Negatives use half = -(v+1) (always fits i64, even min_i64) then a +1
+    # carry on the digit string, so min_i64 is handled without overflow.
+    overflow = malloc(4)
+    if ptr_is_null(overflow):
+        return null()
+    store_i32(overflow, 0, 0)
+    v: int = py_int_to_i64(o, overflow)
+    overflowed: int = load_i32(overflow, 0)
+    free(overflow)
+    if overflowed != 0:
+        return py_int_to_str_obj(o)   # bignum: best-effort (rare edge)
+    neg: int = 0
+    half: int = v
+    add_one: int = 0
+    if v < 0:
+        neg = 1
+        half = 0 - (v + 1)
+        add_one = 1
+    rev = malloc(72)   # digit VALUES (not chars), so the carry is easy
+    if ptr_is_null(rev):
+        return null()
+    nd: int = 0
+    done: int = 0
+    while done == 0:
+        d: int = half % base
+        store_i8(rev, nd, d)
+        nd = nd + 1
+        half = half // base
+        if half == 0:
+            done = 1
+        if nd >= 72:
+            done = 1
+    if add_one != 0:
+        carry: int = 1
+        ci: int = 0
+        while ci < nd and carry != 0:
+            dv: int = (load_i8(rev, ci) & 0xFF) + 1
+            if dv >= base:
+                store_i8(rev, ci, 0)
+            else:
+                store_i8(rev, ci, dv)
+                carry = 0
+            ci = ci + 1
+        if carry != 0 and nd < 72:
+            store_i8(rev, nd, 1)
+            nd = nd + 1
+    buf = malloc(96)
+    if ptr_is_null(buf):
+        free(rev)
+        return null()
+    pos: int = 0
+    if neg != 0:
+        store_i8(buf, pos, 45)   # '-'
+        pos = pos + 1
+    store_i8(buf, pos, 48)       # '0'
+    pos = pos + 1
+    store_i8(buf, pos, prefix_ch)
+    pos = pos + 1
+    i: int = nd - 1
+    while i >= 0:
+        dv2: int = load_i8(rev, i) & 0xFF
+        ch: int = 48 + dv2       # '0' + d
+        if dv2 >= 10:
+            ch = 97 + dv2 - 10   # 'a' + (d - 10)
+        store_i8(buf, pos, ch)
+        pos = pos + 1
+        i = i - 1
+    out = py_str_new(buf, pos)
+    free(buf)
+    free(rev)
+    return out
+
+
+@c_abi_export("py_builtin_bin")
+def py_builtin_bin(o):
+    return _int_based_repr(o, 2, 98)    # 'b'
+
+
+@c_abi_export("py_builtin_hex")
+def py_builtin_hex(o):
+    return _int_based_repr(o, 16, 120)  # 'x'
+
+
+@c_abi_export("py_builtin_oct")
+def py_builtin_oct(o):
+    return _int_based_repr(o, 8, 111)   # 'o'
+
+
+@c_abi_export("py_user_str_dispatch")
+def py_user_str_dispatch(o):
+    if ptr_is_null(o):
+        return null()
+    if is_tagged_int(o):
+        return null()
+    tag: int = load_i32(o, 8)
+    if tag != 11 and tag < 100:
+        return null()
+    cls = _load_instance_cls(o)
+    if ptr_is_null(cls):
+        return null()
+    func = py_class_lookup(cls, cstr("__str__"))
+    if ptr_is_null(func):
+        return null()
+    return call_ptr1(func, o)
+
+
+@c_abi_export("py_user_repr_dispatch")
+def py_user_repr_dispatch(o):
+    if ptr_is_null(o):
+        return null()
+    if is_tagged_int(o):
+        return null()
+    tag: int = load_i32(o, 8)
+    if tag != 11 and tag < 100:
+        return null()
+    cls = _load_instance_cls(o)
+    if ptr_is_null(cls):
+        return null()
+    func = py_class_lookup(cls, cstr("__repr__"))
+    if ptr_is_null(func):
+        return null()
+    return call_ptr1(func, o)
+
+
+@c_abi_export("py_user_hash_dispatch")
+def py_user_hash_dispatch(o, handled) -> int:
+    if ptr_is_null(handled) == 0:
+        store_i64(handled, 0, 0)
+    if ptr_is_null(o):
+        return 0
+    if is_tagged_int(o):
+        return 0
+    tag: int = load_i32(o, 8)
+    if tag != 11 and tag < 100:
+        return 0
+    cls = _load_instance_cls(o)
+    if ptr_is_null(cls):
+        return 0
+    func = py_class_lookup(cls, cstr("__hash__"))
+    if ptr_is_null(func):
+        return 0
+    if ptr_eq(func, global_load_ptr("py_None")) != 0:
+        if ptr_is_null(handled) == 0:
+            store_i64(handled, 0, 1)
+        py_raise(py_exc_new(3, cstr("unhashable type")))
+        return 0
+    result = call_ptr1(func, o)
+    if ptr_is_null(handled) == 0:
+        store_i64(handled, 0, 1)
+    if ptr_is_null(result):
+        return 0
+    overflow = malloc(4)
+    if ptr_is_null(overflow):
+        py_decref(result)
+        return 0
+    store_i32(overflow, 0, 0)
+    value: int = py_int_to_i64(result, overflow)
+    overflowed: int = load_i32(overflow, 0)
+    free(overflow)
+    py_decref(result)
+    if overflowed != 0:
+        return 0
+    if value == -1:
+        return -2
+    return value
+
+
+@c_abi_export("py_user_iter_dispatch")
+def py_user_iter_dispatch(o):
+    if ptr_is_null(o):
+        return null()
+    if is_tagged_int(o):
+        return null()
+    tag: int = load_i32(o, 8)
+    if tag != 11 and tag < 100:
+        return null()
+    cls = _load_instance_cls(o)
+    if ptr_is_null(cls):
+        return null()
+    func = py_class_lookup(cls, cstr("__iter__"))
+    if ptr_is_null(func):
+        return null()
+    return call_ptr1(func, o)
+
+
+@c_abi_export("py_user_next_dispatch")
+def py_user_next_dispatch(o):
+    if ptr_is_null(o):
+        return null()
+    if is_tagged_int(o):
+        return null()
+    tag: int = load_i32(o, 8)
+    if tag != 11 and tag < 100:
+        return null()
+    cls = _load_instance_cls(o)
+    if ptr_is_null(cls):
+        return null()
+    func = py_class_lookup(cls, cstr("__next__"))
+    if ptr_is_null(func):
+        return null()
+    return call_ptr1(func, o)
+
+
+@c_abi_export("py_user_del_dispatch")
+def py_user_del_dispatch(o) -> None:
+    if ptr_is_null(o):
+        return
+    if is_tagged_int(o):
+        return
+    tag: int = load_i32(o, 8)
+    if tag != 11 and tag < 100:
+        return
+    flags: int = load_i32(o, 12)
+    if (flags & 4) != 0:
+        pcc_runtime_log_event_code(5, 4, tag, 1, o)
+        return
+    cls = _load_instance_cls(o)
+    if ptr_is_null(cls):
+        return
+    func = py_class_lookup(cls, cstr("__del__"))
+    if ptr_is_null(func):
+        return
+    store_i32(o, 12, flags | 4)
+    pcc_runtime_log_event_code(5, 2, tag, 0, o)
+    call_void_ptr1(func, o)
+    pcc_runtime_log_event_code(5, 3, tag, 0, o)
+    py_clear_exception()

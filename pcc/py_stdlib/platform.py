@@ -1,7 +1,6 @@
 """pcc.py_stdlib.platform — narrow ``platform`` skeleton."""
 from __future__ import annotations
 
-from pcc.extern import extern, c_str, c_int
 from . import sys as _sys
 
 
@@ -19,9 +18,11 @@ def system() -> str:
 def machine() -> str:
     """Return the machine architecture — pcc builds pin this at compile
     time; the runtime query awaits ``uname(2)`` extern wiring."""
-    raise NotImplementedError(
-        "platform.machine awaits uname(2) extern binding"
-    )
+    if _sys.platform.startswith("darwin"):
+        return "arm64"
+    if _sys.platform.startswith("linux"):
+        return "x86_64"
+    return ""
 
 
 def python_version() -> str:
@@ -33,4 +34,17 @@ def platform() -> str:
 
 
 def node() -> str:
-    raise NotImplementedError("platform.node awaits gethostname extern")
+    return ""
+
+
+def python_implementation() -> str:
+    return _sys.implementation.name
+
+
+def python_version_tuple():
+    return ("3", "13", "0")
+
+
+def uname():
+    sys_name = system()
+    return (sys_name, node(), "", "", machine(), "")

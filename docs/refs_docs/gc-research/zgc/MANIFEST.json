@@ -1,0 +1,815 @@
+{
+  "commit": "4e1dd4daba5a619bbbc9720fdd509e609d6f0032",
+  "fetched_on": "2026-05-14",
+  "files": [
+    {
+      "bytes": 9498,
+      "path": "zArguments.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zArguments.cpp",
+      "sha256": "1bd6a5a904b893fe1e0714f1fcb8b2ebb80811a7a360ee133d796d1843de6aa8",
+      "upstream_path": "src/hotspot/share/gc/z/zArguments.cpp"
+    },
+    {
+      "bytes": 1681,
+      "path": "zArguments.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zArguments.hpp",
+      "sha256": "47744b84e7973b4f79d025b6df21d26e4e751d52156af79468d81683a6c4e8c0",
+      "upstream_path": "src/hotspot/share/gc/z/zArguments.hpp"
+    },
+    {
+      "bytes": 1467,
+      "path": "zGlobals.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zGlobals.cpp",
+      "sha256": "18d7206fe27248712c2af0aafacd9713983a469e3329dddbb6e18875d7c764f6",
+      "upstream_path": "src/hotspot/share/gc/z/zGlobals.cpp"
+    },
+    {
+      "bytes": 3597,
+      "path": "zGlobals.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zGlobals.hpp",
+      "sha256": "ad56a59f58619be86ddd72523d66172574e1333327ada540a63631710ac14a84",
+      "upstream_path": "src/hotspot/share/gc/z/zGlobals.hpp"
+    },
+    {
+      "bytes": 9788,
+      "path": "z_globals.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/z_globals.hpp",
+      "sha256": "b21a7e458fd544c7446c94e01078c058f89bd1251a498e713c9ad82bd9f187d3",
+      "upstream_path": "src/hotspot/share/gc/z/z_globals.hpp"
+    },
+    {
+      "bytes": 16066,
+      "path": "zHeap.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zHeap.cpp",
+      "sha256": "3b45222b931e0ddc15a07bb1ec01f26b806c441d9d98a4b6da3da00918ce7a7a",
+      "upstream_path": "src/hotspot/share/gc/z/zHeap.cpp"
+    },
+    {
+      "bytes": 5018,
+      "path": "zHeap.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zHeap.hpp",
+      "sha256": "22b51b764b9e5d775c4cab94836d54f9c2db483740e1990da03a06cac69d9f9e",
+      "upstream_path": "src/hotspot/share/gc/z/zHeap.hpp"
+    },
+    {
+      "bytes": 3577,
+      "path": "zHeap.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zHeap.inline.hpp",
+      "sha256": "d02ad57d56110dd573190e55a6d80c91259da7e1a90a2dc62b9002abb69c947f",
+      "upstream_path": "src/hotspot/share/gc/z/zHeap.inline.hpp"
+    },
+    {
+      "bytes": 12173,
+      "path": "zCollectedHeap.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zCollectedHeap.cpp",
+      "sha256": "b297168b0affe4532607bdb6ab2d78fe9a0b40074f038029486c3b7ffd25e9b3",
+      "upstream_path": "src/hotspot/share/gc/z/zCollectedHeap.cpp"
+    },
+    {
+      "bytes": 4542,
+      "path": "zCollectedHeap.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zCollectedHeap.hpp",
+      "sha256": "719ea96c1f6ed4c7b6d8333ad49353dede3ba6f0d1f31159495a73e9f04c36f2",
+      "upstream_path": "src/hotspot/share/gc/z/zCollectedHeap.hpp"
+    },
+    {
+      "bytes": 47701,
+      "path": "zGeneration.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zGeneration.cpp",
+      "sha256": "c52b2c00b57e0f85fde9cdb6130f5c8ea5cc8a17b28fff8f73931e41fc54ecdc",
+      "upstream_path": "src/hotspot/share/gc/z/zGeneration.cpp"
+    },
+    {
+      "bytes": 9130,
+      "path": "zGeneration.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zGeneration.hpp",
+      "sha256": "2b24e1946067afd33e826e2d9c95d5e9980577635b3aeeef3bfc84f09dbc289b",
+      "upstream_path": "src/hotspot/share/gc/z/zGeneration.hpp"
+    },
+    {
+      "bytes": 5230,
+      "path": "zGeneration.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zGeneration.inline.hpp",
+      "sha256": "ecda9ce55c8fadce5b7092d0cee6c5b423585fbba102cd95533b233486d56d7d",
+      "upstream_path": "src/hotspot/share/gc/z/zGeneration.inline.hpp"
+    },
+    {
+      "bytes": 1344,
+      "path": "zGenerationId.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zGenerationId.hpp",
+      "sha256": "835b5cd2a199c8dd81e1896cd919dea7337748cabf3bb1a2f9af1ec98a23229b",
+      "upstream_path": "src/hotspot/share/gc/z/zGenerationId.hpp"
+    },
+    {
+      "bytes": 41062,
+      "path": "zDirector.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zDirector.cpp",
+      "sha256": "deaa952548d7fffd3540640eca1c686fccd035deb026e25e7951f2493f939bb7",
+      "upstream_path": "src/hotspot/share/gc/z/zDirector.cpp"
+    },
+    {
+      "bytes": 1542,
+      "path": "zDirector.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zDirector.hpp",
+      "sha256": "e6d76f19041937c5bdbef738d292b1c2a36902c34cad0d052db746cee16e7173",
+      "upstream_path": "src/hotspot/share/gc/z/zDirector.hpp"
+    },
+    {
+      "bytes": 13027,
+      "path": "zDriver.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zDriver.cpp",
+      "sha256": "a44a6c572817d70a826758f0b9a1f202d63744d7d1432ab7171da3010c261aea",
+      "upstream_path": "src/hotspot/share/gc/z/zDriver.cpp"
+    },
+    {
+      "bytes": 3523,
+      "path": "zDriver.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zDriver.hpp",
+      "sha256": "143ef54d41938eccf0db0a3d1b96b1554b14436e7368b97558b0d70eb013d1af",
+      "upstream_path": "src/hotspot/share/gc/z/zDriver.hpp"
+    },
+    {
+      "bytes": 4973,
+      "path": "zDriverPort.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zDriverPort.cpp",
+      "sha256": "d6156a205c684114402b68dfbdeefe74954452abec6b2478289fed984147fa00",
+      "upstream_path": "src/hotspot/share/gc/z/zDriverPort.cpp"
+    },
+    {
+      "bytes": 2114,
+      "path": "zDriverPort.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zDriverPort.hpp",
+      "sha256": "2f2f30bb2f58f30ffd1aaa620223e6347d0a3dd5fbf47142e4f4e23cbfb46d46",
+      "upstream_path": "src/hotspot/share/gc/z/zDriverPort.hpp"
+    },
+    {
+      "bytes": 5039,
+      "path": "zHeuristics.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zHeuristics.cpp",
+      "sha256": "9bf925c5c7adb35427f48946398f075d359ca7964a8521c3177c71788a98ceec",
+      "upstream_path": "src/hotspot/share/gc/z/zHeuristics.cpp"
+    },
+    {
+      "bytes": 1585,
+      "path": "zHeuristics.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zHeuristics.hpp",
+      "sha256": "026a43f8f6bcaf7fbac39ccdd62a0afdbf788499ad7971a71066584d4c6ebb43",
+      "upstream_path": "src/hotspot/share/gc/z/zHeuristics.hpp"
+    },
+    {
+      "bytes": 8804,
+      "path": "zBarrier.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zBarrier.cpp",
+      "sha256": "07bcdce343ef9005e9c7fdc0e20f725020024bc1e502f8b91bf0c3bf9d74d2ac",
+      "upstream_path": "src/hotspot/share/gc/z/zBarrier.cpp"
+    },
+    {
+      "bytes": 9238,
+      "path": "zBarrier.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zBarrier.hpp",
+      "sha256": "14a6490b7e24e0a36afc369647509840d2cb2ee4764f9433c3737c0c851bcf0e",
+      "upstream_path": "src/hotspot/share/gc/z/zBarrier.hpp"
+    },
+    {
+      "bytes": 30436,
+      "path": "zBarrier.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zBarrier.inline.hpp",
+      "sha256": "4eff4733b344e0f34b56c39f38dab2574a70017b4a750cbb52c57dcdca678483",
+      "upstream_path": "src/hotspot/share/gc/z/zBarrier.inline.hpp"
+    },
+    {
+      "bytes": 8663,
+      "path": "zBarrierSet.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zBarrierSet.cpp",
+      "sha256": "39e2f3e2760ac6826f06ab19e23c5be9d572bcf283eeb96827131d519ba522f6",
+      "upstream_path": "src/hotspot/share/gc/z/zBarrierSet.cpp"
+    },
+    {
+      "bytes": 9135,
+      "path": "zBarrierSet.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zBarrierSet.hpp",
+      "sha256": "af2cddc2d8cc8e1863d30f39a58a0e7552f2653d4c6e1e3edf1d1b3d8d95b186",
+      "upstream_path": "src/hotspot/share/gc/z/zBarrierSet.hpp"
+    },
+    {
+      "bytes": 18657,
+      "path": "zBarrierSet.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zBarrierSet.inline.hpp",
+      "sha256": "eed694fd18d22b27aaa43d81079edbd48c7b47b775f1a0a7112efe1ab65bf34f",
+      "upstream_path": "src/hotspot/share/gc/z/zBarrierSet.inline.hpp"
+    },
+    {
+      "bytes": 6421,
+      "path": "zBarrierSetRuntime.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zBarrierSetRuntime.cpp",
+      "sha256": "810af581b276a04f53f8bfaaf539d0010d29165825471dc35332f00e446e6155",
+      "upstream_path": "src/hotspot/share/gc/z/zBarrierSetRuntime.cpp"
+    },
+    {
+      "bytes": 3235,
+      "path": "zBarrierSetRuntime.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zBarrierSetRuntime.hpp",
+      "sha256": "2d2a68df570fb2c8c561e7785cfe8a7665f3735cec00a258fd8fa9a5b01b303b",
+      "upstream_path": "src/hotspot/share/gc/z/zBarrierSetRuntime.hpp"
+    },
+    {
+      "bytes": 10539,
+      "path": "zStoreBarrierBuffer.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zStoreBarrierBuffer.cpp",
+      "sha256": "286fd129ae01ae34fab757bbff3ea33b0953aedfd776b395da7d3ecb39fe0ab1",
+      "upstream_path": "src/hotspot/share/gc/z/zStoreBarrierBuffer.cpp"
+    },
+    {
+      "bytes": 2925,
+      "path": "zStoreBarrierBuffer.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zStoreBarrierBuffer.hpp",
+      "sha256": "2770204c94b290fe623544321b842978d8fd07cc7bc8e49a30d002eb79641e3d",
+      "upstream_path": "src/hotspot/share/gc/z/zStoreBarrierBuffer.hpp"
+    },
+    {
+      "bytes": 2107,
+      "path": "zStoreBarrierBuffer.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zStoreBarrierBuffer.inline.hpp",
+      "sha256": "d52e8d374e62e1123a808a86e4cbfe4f3f5db4594c2552dc36160a1313bc38be",
+      "upstream_path": "src/hotspot/share/gc/z/zStoreBarrierBuffer.inline.hpp"
+    },
+    {
+      "bytes": 20142,
+      "path": "zRemembered.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRemembered.cpp",
+      "sha256": "4c42cfca95e08f405fa1d9c8b200bda240b33fc0a510996a2ebd567cfb101c3d",
+      "upstream_path": "src/hotspot/share/gc/z/zRemembered.cpp"
+    },
+    {
+      "bytes": 3893,
+      "path": "zRemembered.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRemembered.hpp",
+      "sha256": "1fdcd388d8ae53ff56db9ded4a773b85d10e3b54a10f9ae9450027cfe0166fda",
+      "upstream_path": "src/hotspot/share/gc/z/zRemembered.hpp"
+    },
+    {
+      "bytes": 1744,
+      "path": "zRemembered.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRemembered.inline.hpp",
+      "sha256": "e29a07992b526edd6609cc09d2e62ca994e15d49b5c5f7838cd56ea0e6bbacb2",
+      "upstream_path": "src/hotspot/share/gc/z/zRemembered.inline.hpp"
+    },
+    {
+      "bytes": 6957,
+      "path": "zRememberedSet.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRememberedSet.cpp",
+      "sha256": "e1f42eff4b2d119ff76dc6de927db3a854060946dc13f2892953cb11ffe3e45a",
+      "upstream_path": "src/hotspot/share/gc/z/zRememberedSet.cpp"
+    },
+    {
+      "bytes": 4466,
+      "path": "zRememberedSet.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRememberedSet.hpp",
+      "sha256": "cdf4892c732e49fc058f7878ea0f82e6fe663f5dfca609a5b15bf8f5d21a7570",
+      "upstream_path": "src/hotspot/share/gc/z/zRememberedSet.hpp"
+    },
+    {
+      "bytes": 3372,
+      "path": "zRememberedSet.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRememberedSet.inline.hpp",
+      "sha256": "7e401f49ba2533f5832091748f15ae9e2f1271da200dbf76eae647ca87d2650d",
+      "upstream_path": "src/hotspot/share/gc/z/zRememberedSet.inline.hpp"
+    },
+    {
+      "bytes": 6718,
+      "path": "zPage.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPage.cpp",
+      "sha256": "476c1317bf1c9fcd0928e0bb3b27c3d02653bc4ec99d0555904bc14911726531",
+      "upstream_path": "src/hotspot/share/gc/z/zPage.cpp"
+    },
+    {
+      "bytes": 6566,
+      "path": "zPage.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPage.hpp",
+      "sha256": "3330a3d74829b7c0472be4a70f13ed955c60429a08fd50eadf2f099d9fa5dd1b",
+      "upstream_path": "src/hotspot/share/gc/z/zPage.hpp"
+    },
+    {
+      "bytes": 15310,
+      "path": "zPage.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPage.inline.hpp",
+      "sha256": "f14539dc96fcfbbd0282e17ba58361658404a954f4679444a50bf375f9c4e8ac",
+      "upstream_path": "src/hotspot/share/gc/z/zPage.inline.hpp"
+    },
+    {
+      "bytes": 2417,
+      "path": "zPageAge.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPageAge.hpp",
+      "sha256": "c9c09ceac0ed2309d3f36d396ade95e2b0bcf7ecf72950b811e5790667c727fe",
+      "upstream_path": "src/hotspot/share/gc/z/zPageAge.hpp"
+    },
+    {
+      "bytes": 1846,
+      "path": "zPageAge.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPageAge.inline.hpp",
+      "sha256": "126306a4ee641999221fd2487aa0606b8a08c7466b59c257dec2e9435d7f6326",
+      "upstream_path": "src/hotspot/share/gc/z/zPageAge.inline.hpp"
+    },
+    {
+      "bytes": 80492,
+      "path": "zPageAllocator.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPageAllocator.cpp",
+      "sha256": "e7d10b4a9ea9709465e793409e89571ae1c15a67c3f8e4af2186c90c01cdef22",
+      "upstream_path": "src/hotspot/share/gc/z/zPageAllocator.cpp"
+    },
+    {
+      "bytes": 13278,
+      "path": "zPageAllocator.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPageAllocator.hpp",
+      "sha256": "734cb85c3dac3ec34b9e7f16a2ce8e6f2c82178c8eca20178aca404f1b2aea19",
+      "upstream_path": "src/hotspot/share/gc/z/zPageAllocator.hpp"
+    },
+    {
+      "bytes": 3379,
+      "path": "zPageAllocator.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPageAllocator.inline.hpp",
+      "sha256": "c173b480b8223bddb2d0e4d1a02bed203a68a6de6e37d46f25c6486bf7ea254f",
+      "upstream_path": "src/hotspot/share/gc/z/zPageAllocator.inline.hpp"
+    },
+    {
+      "bytes": 3392,
+      "path": "zPageTable.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPageTable.cpp",
+      "sha256": "a2bf8ebdda4cec6e8cdc0a0e5efd428950a10d8800653040c0ca33eebc9d2482",
+      "upstream_path": "src/hotspot/share/gc/z/zPageTable.cpp"
+    },
+    {
+      "bytes": 3187,
+      "path": "zPageTable.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPageTable.hpp",
+      "sha256": "9317639a12c8a54b612348bb6a5899f8bb3327300b10e66004f59aba4831c0c6",
+      "upstream_path": "src/hotspot/share/gc/z/zPageTable.hpp"
+    },
+    {
+      "bytes": 3585,
+      "path": "zPageTable.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPageTable.inline.hpp",
+      "sha256": "caeae3ab669ca3d34ca8d13f8631a657d532ab24acb3e16f5f4525d559f04817",
+      "upstream_path": "src/hotspot/share/gc/z/zPageTable.inline.hpp"
+    },
+    {
+      "bytes": 15383,
+      "path": "zForwarding.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zForwarding.cpp",
+      "sha256": "3558efbe932290611e9a149aac38f2084ebaa79f438a6bbc1010959c244fc541",
+      "upstream_path": "src/hotspot/share/gc/z/zForwarding.cpp"
+    },
+    {
+      "bytes": 5918,
+      "path": "zForwarding.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zForwarding.hpp",
+      "sha256": "a3829883294b5e27c9ae4eaf6134c826b030dcc9c5573601356cdd34d989572b",
+      "upstream_path": "src/hotspot/share/gc/z/zForwarding.hpp"
+    },
+    {
+      "bytes": 13479,
+      "path": "zForwarding.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zForwarding.inline.hpp",
+      "sha256": "236365fc32cc73ecaebf45538f57d4a7f29ae5967e8924e4d9c139f3407f8afb",
+      "upstream_path": "src/hotspot/share/gc/z/zForwarding.inline.hpp"
+    },
+    {
+      "bytes": 1484,
+      "path": "zForwardingAllocator.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zForwardingAllocator.cpp",
+      "sha256": "1803a6c703f837c54376cabc3e13b48bf7a436946355240a739c15efd0587027",
+      "upstream_path": "src/hotspot/share/gc/z/zForwardingAllocator.cpp"
+    },
+    {
+      "bytes": 1543,
+      "path": "zForwardingAllocator.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zForwardingAllocator.hpp",
+      "sha256": "a1732fccd649baf4693341308320520cf43d5d0232e0291b392ad0baeb073512",
+      "upstream_path": "src/hotspot/share/gc/z/zForwardingAllocator.hpp"
+    },
+    {
+      "bytes": 1654,
+      "path": "zForwardingAllocator.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zForwardingAllocator.inline.hpp",
+      "sha256": "897bd14d5a39a1d6047284d314d244b00ee994fb4c872ee44f9b7161c792f91b",
+      "upstream_path": "src/hotspot/share/gc/z/zForwardingAllocator.inline.hpp"
+    },
+    {
+      "bytes": 3259,
+      "path": "zForwardingEntry.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zForwardingEntry.hpp",
+      "sha256": "e744d9f796bace54fa7625ee74b07f1167ce2a07959da89cd8f464a4126adc9a",
+      "upstream_path": "src/hotspot/share/gc/z/zForwardingEntry.hpp"
+    },
+    {
+      "bytes": 1609,
+      "path": "zForwardingTable.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zForwardingTable.hpp",
+      "sha256": "1002e42691f7b417bf05451d9c3b6ab77c218490caf516be6ed432564a7a149a",
+      "upstream_path": "src/hotspot/share/gc/z/zForwardingTable.hpp"
+    },
+    {
+      "bytes": 2290,
+      "path": "zForwardingTable.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zForwardingTable.inline.hpp",
+      "sha256": "f202b35798b3e81396b610cab00293e7638f36338fa97250449d89b21134e174",
+      "upstream_path": "src/hotspot/share/gc/z/zForwardingTable.inline.hpp"
+    },
+    {
+      "bytes": 45794,
+      "path": "zRelocate.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRelocate.cpp",
+      "sha256": "9b3138eb21cfda8a39208736eba55975b9e8c3633f731d6aa69a7910b441c374",
+      "upstream_path": "src/hotspot/share/gc/z/zRelocate.cpp"
+    },
+    {
+      "bytes": 3707,
+      "path": "zRelocate.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRelocate.hpp",
+      "sha256": "c2ad558b592235fdc3901aa9fd7d6dbb49753106c7bc5e2e320ba3f5e61e9ad5",
+      "upstream_path": "src/hotspot/share/gc/z/zRelocate.hpp"
+    },
+    {
+      "bytes": 7809,
+      "path": "zRelocationSet.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRelocationSet.cpp",
+      "sha256": "453ea649a0f643f273129ef5e5c7eb90ba0d9dd9be0dae371da470d63878e39a",
+      "upstream_path": "src/hotspot/share/gc/z/zRelocationSet.cpp"
+    },
+    {
+      "bytes": 2774,
+      "path": "zRelocationSet.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRelocationSet.hpp",
+      "sha256": "488ffdc10e1226c278e056b3f1f456b79a9878752ac2bc68cda9048edaacdb88",
+      "upstream_path": "src/hotspot/share/gc/z/zRelocationSet.hpp"
+    },
+    {
+      "bytes": 1750,
+      "path": "zRelocationSet.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRelocationSet.inline.hpp",
+      "sha256": "7b6a15f8ceaf6af5b840d59fc3cef425aad6514d3d599463f694970b3127692c",
+      "upstream_path": "src/hotspot/share/gc/z/zRelocationSet.inline.hpp"
+    },
+    {
+      "bytes": 9319,
+      "path": "zRelocationSetSelector.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRelocationSetSelector.cpp",
+      "sha256": "9ab16eda326f76cd4e3abdab3dfb4770faf84c71c261b6b4eb3b330f942ea412",
+      "upstream_path": "src/hotspot/share/gc/z/zRelocationSetSelector.cpp"
+    },
+    {
+      "bytes": 4858,
+      "path": "zRelocationSetSelector.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRelocationSetSelector.hpp",
+      "sha256": "47ed471a93d607306fc239baf9d5a72dc7b536d22a423a61a5b448f68d6360b3",
+      "upstream_path": "src/hotspot/share/gc/z/zRelocationSetSelector.hpp"
+    },
+    {
+      "bytes": 7507,
+      "path": "zRelocationSetSelector.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRelocationSetSelector.inline.hpp",
+      "sha256": "80c31017e612363e89a48334a00311d75987580be27c508b31ea9122dd7d09af",
+      "upstream_path": "src/hotspot/share/gc/z/zRelocationSetSelector.inline.hpp"
+    },
+    {
+      "bytes": 32187,
+      "path": "zMark.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMark.cpp",
+      "sha256": "f104418bc19b3049c8e5d7e4739e17725d6437947263b289bd91ac974b1510c6",
+      "upstream_path": "src/hotspot/share/gc/z/zMark.cpp"
+    },
+    {
+      "bytes": 4032,
+      "path": "zMark.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMark.hpp",
+      "sha256": "95718e3cc40475802b28a3b4b381c4fbe7ef1a057b1ccab924aaa64491840663",
+      "upstream_path": "src/hotspot/share/gc/z/zMark.hpp"
+    },
+    {
+      "bytes": 3238,
+      "path": "zMark.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMark.inline.hpp",
+      "sha256": "9d0c72763a8e6b48e0c84de4c96d297194e22b739dd4776c55649518b01760d1",
+      "upstream_path": "src/hotspot/share/gc/z/zMark.inline.hpp"
+    },
+    {
+      "bytes": 1811,
+      "path": "zMarkContext.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkContext.hpp",
+      "sha256": "a749d9f8814c4ca508f9d86107f5d115e40ec29323e726032c7f6a2864afd7cd",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkContext.hpp"
+    },
+    {
+      "bytes": 1958,
+      "path": "zMarkContext.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkContext.inline.hpp",
+      "sha256": "610d58b7e6b55bd80083790a01f83a5881eb1c9fa9c5ad993b2d69327047c853",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkContext.inline.hpp"
+    },
+    {
+      "bytes": 10010,
+      "path": "zMarkStack.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkStack.cpp",
+      "sha256": "9f9c889aa8ab77e68ba458df3212cf9cc21e05df855f978d6a6dd4009fcd1b56",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkStack.cpp"
+    },
+    {
+      "bytes": 4110,
+      "path": "zMarkStack.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkStack.hpp",
+      "sha256": "d2ddeb72b734cb14b15c839e241375816834cbb16544957e9bb877e0884462d0",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkStack.hpp"
+    },
+    {
+      "bytes": 5956,
+      "path": "zMarkStack.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkStack.inline.hpp",
+      "sha256": "be3cfe10a37ff5764724afe3b7fe2eb84b610898ec3c65d5ca2d778c71cb077a",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkStack.inline.hpp"
+    },
+    {
+      "bytes": 1683,
+      "path": "zMarkCache.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkCache.cpp",
+      "sha256": "48bebddb255485b089788b968327f34cf44df1bef6e76de56cc87f922a07f343",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkCache.cpp"
+    },
+    {
+      "bytes": 1685,
+      "path": "zMarkCache.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkCache.hpp",
+      "sha256": "d358e44d64253362b5535bfc6c2631534243dec50cb79f57cb00bd787b857427",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkCache.hpp"
+    },
+    {
+      "bytes": 1879,
+      "path": "zMarkCache.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkCache.inline.hpp",
+      "sha256": "a42b6099042d5092994004a9be0b74e9099d63377517c5ce10279f324d668371",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkCache.inline.hpp"
+    },
+    {
+      "bytes": 4489,
+      "path": "zMarkingSMR.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkingSMR.cpp",
+      "sha256": "ee9abf72b865e5834128b1439b9752a4d6d86a328bef734bedc0520024477acf",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkingSMR.cpp"
+    },
+    {
+      "bytes": 1836,
+      "path": "zMarkingSMR.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zMarkingSMR.hpp",
+      "sha256": "1b5a7a8a2166b5f3b7086b9ecc6f5386bcd41e41cb86b45b6cc6a22872768fc8",
+      "upstream_path": "src/hotspot/share/gc/z/zMarkingSMR.hpp"
+    },
+    {
+      "bytes": 6719,
+      "path": "zRootsIterator.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRootsIterator.cpp",
+      "sha256": "c843eb2c4f8f2033466f260958953c51ccd976d44e3e0c679c2b768250453037",
+      "upstream_path": "src/hotspot/share/gc/z/zRootsIterator.cpp"
+    },
+    {
+      "bytes": 6540,
+      "path": "zRootsIterator.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRootsIterator.hpp",
+      "sha256": "e3f185d75f4445145e2f93b4b66971c998461f2ff284c3ba53041d56566cef03",
+      "upstream_path": "src/hotspot/share/gc/z/zRootsIterator.hpp"
+    },
+    {
+      "bytes": 2351,
+      "path": "zWeakRootsProcessor.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zWeakRootsProcessor.cpp",
+      "sha256": "1d153750fda22aeab32ca67df59021440ea16f3cb4f198d9c9cbd12bc5150920",
+      "upstream_path": "src/hotspot/share/gc/z/zWeakRootsProcessor.cpp"
+    },
+    {
+      "bytes": 1357,
+      "path": "zWeakRootsProcessor.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zWeakRootsProcessor.hpp",
+      "sha256": "3b5927781d71160040c8ecf63bfb85b32896b3a246ccc2a98a98b630a6250d75",
+      "upstream_path": "src/hotspot/share/gc/z/zWeakRootsProcessor.hpp"
+    },
+    {
+      "bytes": 17260,
+      "path": "zReferenceProcessor.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zReferenceProcessor.cpp",
+      "sha256": "73e04cc1aab583b7352a964a43b9f19cf75741290062f67e988c4d08f751ae45",
+      "upstream_path": "src/hotspot/share/gc/z/zReferenceProcessor.cpp"
+    },
+    {
+      "bytes": 2920,
+      "path": "zReferenceProcessor.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zReferenceProcessor.hpp",
+      "sha256": "1f74ec03440313ce2f7c0ccce3a87677be28d46aa8877e9090faa5de3daf40e0",
+      "upstream_path": "src/hotspot/share/gc/z/zReferenceProcessor.hpp"
+    },
+    {
+      "bytes": 1617,
+      "path": "zResurrection.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zResurrection.cpp",
+      "sha256": "f873d676521e5ac65b7ffb200af67395f6541d799af8cceab53160f557afa633",
+      "upstream_path": "src/hotspot/share/gc/z/zResurrection.cpp"
+    },
+    {
+      "bytes": 1377,
+      "path": "zResurrection.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zResurrection.hpp",
+      "sha256": "1b794a7fa8d1daebbc268c5d41a27831a13e92e7e9a28400f5293b9561482f86",
+      "upstream_path": "src/hotspot/share/gc/z/zResurrection.hpp"
+    },
+    {
+      "bytes": 1350,
+      "path": "zResurrection.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zResurrection.inline.hpp",
+      "sha256": "a03cc2dd2c23f3daf3ec7f61cbbc5cc6bdd1e66ad2182ab89f6b04350fa3d443",
+      "upstream_path": "src/hotspot/share/gc/z/zResurrection.inline.hpp"
+    },
+    {
+      "bytes": 8884,
+      "path": "zObjectAllocator.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zObjectAllocator.cpp",
+      "sha256": "d64787f55df15352b0674d4baff655a3f52bc0c269f072893165b706b26220c4",
+      "upstream_path": "src/hotspot/share/gc/z/zObjectAllocator.cpp"
+    },
+    {
+      "bytes": 3169,
+      "path": "zObjectAllocator.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zObjectAllocator.hpp",
+      "sha256": "0df2b855e8b00d953aa2b749c9afba612018e204b549bd0d9d632552c86099fa",
+      "upstream_path": "src/hotspot/share/gc/z/zObjectAllocator.hpp"
+    },
+    {
+      "bytes": 2624,
+      "path": "zThreadLocalAllocBuffer.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zThreadLocalAllocBuffer.cpp",
+      "sha256": "32ff3ae129f798bffa9a74e6785231f684296788a2dc036df347fdd2b405e71c",
+      "upstream_path": "src/hotspot/share/gc/z/zThreadLocalAllocBuffer.cpp"
+    },
+    {
+      "bytes": 1674,
+      "path": "zThreadLocalAllocBuffer.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zThreadLocalAllocBuffer.hpp",
+      "sha256": "d70f568b16b8b9c793f2205418b4e3d31cadd19f080f72bdbaad641104670432",
+      "upstream_path": "src/hotspot/share/gc/z/zThreadLocalAllocBuffer.hpp"
+    },
+    {
+      "bytes": 1669,
+      "path": "zThread.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zThread.cpp",
+      "sha256": "a0a3e7eb485ad64d003d05270e4c8b17bc9fe424e84e5e1a51c09891fda4f264",
+      "upstream_path": "src/hotspot/share/gc/z/zThread.cpp"
+    },
+    {
+      "bytes": 1471,
+      "path": "zThread.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zThread.hpp",
+      "sha256": "c3c1c78d80c8792ad226bee6c73b670f47a3654d3fff44f6154b0d4e0b907976",
+      "upstream_path": "src/hotspot/share/gc/z/zThread.hpp"
+    },
+    {
+      "bytes": 4728,
+      "path": "zThreadLocalData.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zThreadLocalData.hpp",
+      "sha256": "4514e44e03838f1c52791ae7180b2a300845cf86d50c674f204ca26b788d1c77",
+      "upstream_path": "src/hotspot/share/gc/z/zThreadLocalData.hpp"
+    },
+    {
+      "bytes": 5615,
+      "path": "zAddress.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zAddress.cpp",
+      "sha256": "619936d15c3232308cab4a540ca60026ea433e8f0526860c92be19f9a7536123",
+      "upstream_path": "src/hotspot/share/gc/z/zAddress.cpp"
+    },
+    {
+      "bytes": 13998,
+      "path": "zAddress.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zAddress.hpp",
+      "sha256": "5bf0a0c93a193f33bc019c7b1bb2c363c8f3f2b0003199ebae089ed6a5fec484",
+      "upstream_path": "src/hotspot/share/gc/z/zAddress.hpp"
+    },
+    {
+      "bytes": 32867,
+      "path": "zAddress.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zAddress.inline.hpp",
+      "sha256": "003510ba80300e5ad17e649400fee73a4a94d29898ed74e5856d4476a2bc9e0d",
+      "upstream_path": "src/hotspot/share/gc/z/zAddress.inline.hpp"
+    },
+    {
+      "bytes": 1819,
+      "path": "zAddressSpaceLimit.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zAddressSpaceLimit.cpp",
+      "sha256": "3ffabeac323a7886d22221875bef34e802fc6743505470375bfa5d4c5b3c89e0",
+      "upstream_path": "src/hotspot/share/gc/z/zAddressSpaceLimit.cpp"
+    },
+    {
+      "bytes": 1376,
+      "path": "zAddressSpaceLimit.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zAddressSpaceLimit.hpp",
+      "sha256": "9c42b92bec926c85532de343ea81f644ee05a4801573fe89333e9afbed28a4a2",
+      "upstream_path": "src/hotspot/share/gc/z/zAddressSpaceLimit.hpp"
+    },
+    {
+      "bytes": 12771,
+      "path": "zVirtualMemoryManager.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zVirtualMemoryManager.cpp",
+      "sha256": "03310510bccee0f874ac9fe0066003590053ae30e6415f567a969789c8e4e578",
+      "upstream_path": "src/hotspot/share/gc/z/zVirtualMemoryManager.cpp"
+    },
+    {
+      "bytes": 4012,
+      "path": "zVirtualMemoryManager.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zVirtualMemoryManager.hpp",
+      "sha256": "2a8f709b1935ece9d24afb133cd64eaea4847979b9bed4e5cbe0b52de8712b22",
+      "upstream_path": "src/hotspot/share/gc/z/zVirtualMemoryManager.hpp"
+    },
+    {
+      "bytes": 1969,
+      "path": "zVirtualMemoryManager.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zVirtualMemoryManager.inline.hpp",
+      "sha256": "c0a2bcf7781b3990ad57ab28c19515ae69867dd3c82b4ad8eb64b145a3c7a8a6",
+      "upstream_path": "src/hotspot/share/gc/z/zVirtualMemoryManager.inline.hpp"
+    },
+    {
+      "bytes": 14103,
+      "path": "zPhysicalMemoryManager.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPhysicalMemoryManager.cpp",
+      "sha256": "b1176d0a7e2fc07c168e30bf6e5772ab57cce048549f983a4370d7edaf339167",
+      "upstream_path": "src/hotspot/share/gc/z/zPhysicalMemoryManager.cpp"
+    },
+    {
+      "bytes": 3121,
+      "path": "zPhysicalMemoryManager.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zPhysicalMemoryManager.hpp",
+      "sha256": "a07aaedb5160ad3362b293c3e29118f1628741a811d1bdf5938cd0c012429653",
+      "upstream_path": "src/hotspot/share/gc/z/zPhysicalMemoryManager.hpp"
+    },
+    {
+      "bytes": 4923,
+      "path": "zWorkers.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zWorkers.cpp",
+      "sha256": "82555ea62f15f56c2a0c9e044f1d3912c36c0d7cae9684f5d817e3173ba3c2ec",
+      "upstream_path": "src/hotspot/share/gc/z/zWorkers.cpp"
+    },
+    {
+      "bytes": 2090,
+      "path": "zWorkers.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zWorkers.hpp",
+      "sha256": "0f58775503209442d55a931ae9d5c2c9027ddae60050e979ef1aa3cddb505f1d",
+      "upstream_path": "src/hotspot/share/gc/z/zWorkers.hpp"
+    },
+    {
+      "bytes": 1351,
+      "path": "zWorkers.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zWorkers.inline.hpp",
+      "sha256": "6ca7728de5fdae5d217bd9e91f3e07ece454eb54631b0cade38a0684abb6c763",
+      "upstream_path": "src/hotspot/share/gc/z/zWorkers.inline.hpp"
+    },
+    {
+      "bytes": 1771,
+      "path": "zRuntimeWorkers.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRuntimeWorkers.cpp",
+      "sha256": "fd8ac72d334926238cfc9b44baab8d0d155557822539be4f3aee0a89278bf695",
+      "upstream_path": "src/hotspot/share/gc/z/zRuntimeWorkers.cpp"
+    },
+    {
+      "bytes": 1406,
+      "path": "zRuntimeWorkers.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zRuntimeWorkers.hpp",
+      "sha256": "41dae8f514716d255e23617d85b0f4a2814f97b15319d70b0db6820f85bb2ec2",
+      "upstream_path": "src/hotspot/share/gc/z/zRuntimeWorkers.hpp"
+    },
+    {
+      "bytes": 25775,
+      "path": "zVerify.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zVerify.cpp",
+      "sha256": "37c67615ff23bb37db23b0680d205072cb25e9a31a78828c511f46e3eecf2292",
+      "upstream_path": "src/hotspot/share/gc/z/zVerify.cpp"
+    },
+    {
+      "bytes": 1912,
+      "path": "zVerify.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zVerify.hpp",
+      "sha256": "311ccdab83a226509b5a61bcf4a4d58e12817fdbbfea860f15c81fd1d7f5065f",
+      "upstream_path": "src/hotspot/share/gc/z/zVerify.hpp"
+    },
+    {
+      "bytes": 63555,
+      "path": "zStat.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zStat.cpp",
+      "sha256": "48987887ede3629a2f411b6bf56a0d27ae614717bca30af14d92818d78143d78",
+      "upstream_path": "src/hotspot/share/gc/z/zStat.cpp"
+    },
+    {
+      "bytes": 17360,
+      "path": "zStat.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/jdk/jdk-27%2B21/src/hotspot/share/gc/z/zStat.hpp",
+      "sha256": "2aa89bebffa1dd610a03a6249e8aa320923f8afe8e73e0dde8e944e2e414227a",
+      "upstream_path": "src/hotspot/share/gc/z/zStat.hpp"
+    }
+  ],
+  "selection": "Modern Generational ZGC reference pack for pcc backend #4: heap/generation, barriers, remembered sets, forwarding, relocation, marking, pages, roots, workers, and verification.",
+  "source_dir": "src/hotspot/share/gc/z",
+  "tag": "jdk-27+21",
+  "upstream": "https://github.com/openjdk/jdk"
+}

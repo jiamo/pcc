@@ -4,6 +4,7 @@ import sys
 _PASS_DISABLE_ENV = "PCC_DISABLE_PASSES"
 _LLVM_TEXT_PIPELINE_ENV = "PCC_LLVM_PIPELINE"
 _LLVM_OPT_BIN_ENV = "PCC_LLVM_OPT_BIN"
+_SELF_BACKEND_VECTORIZE_ENV = "PCC_SELF_BACKEND_VECTORIZE"
 _DEFAULT_EMIT_LL = "__PCC_DEFAULT_LL__"
 
 _HELP_TEXT = """Usage: pcc [OPTIONS] PATH [PROG_ARGS...]
@@ -15,8 +16,10 @@ Any arguments after PATH (or after --) are passed to the compiled program.
 
 Options:
   -h, --help                Show this help message and exit.
-  --python-libpython MODE   auto, on, or off for Python fallback linkage.
-  --ir-scaffold MODE        off (default), on, or auto. Enables Path A
+  -m MODULE [ARGS...]       Run a host Python module through pcc's safe module shim.
+  --python-libpython MODE   off (default), auto, or on for Python fallback linkage.
+  --python-library          For .py inputs, emit a library module without @main.
+  --ir-scaffold MODE        on (default), off, or auto. Enables Path A
                             closed-world IR-builder lowering (Issue 1).
   --pass NAME               Repeat to enable only the named pass(es).
   --disable-pass NAME       Repeat to disable named pass(es).
@@ -40,6 +43,9 @@ Options:
   --emit-llvm[=PATH]        Emit LLVM IR instead of running.
   -o PATH                   Output path for Python inputs.
   --backend BACKEND         llvm, llvm_capi, or self.
+  --diagnostic-format FMT   text (default), json, or sarif for hard errors.
+  --profile-json PATH       Write compiler phase/profile JSON.
+  --explain-fallback        Include native/fallback routing diagnostics.
   --verbose                 Print Python pipeline timing.
 """
 
@@ -144,7 +150,9 @@ def _pass_env_overrides(opt_level, enabled_passes=(), disabled_passes=()):
     visible_managed = set(
         unique_managed_pass_names(opt_level, include_llvm=opt_level > 0)
     )
-    unknown = sorted((set(enabled_requested) | set(disabled_requested)) - visible_managed)
+    unknown = sorted(
+        (set(enabled_requested) | set(disabled_requested)) - visible_managed
+    )
     if unknown:
         raise ValueError("unknown pass name(s): " + ", ".join(unknown))
 
@@ -175,10 +183,12 @@ def _pass_env_overrides(opt_level, enabled_passes=(), disabled_passes=()):
     if disabled:
         overrides.append((_PASS_DISABLE_ENV, ",".join(disabled)))
     if touches_llvm:
-        overrides.append((
-            _LLVM_TEXT_PIPELINE_ENV,
-            os.getenv(_LLVM_TEXT_PIPELINE_ENV) or "default",
-        ))
+        overrides.append(
+            (
+                _LLVM_TEXT_PIPELINE_ENV,
+                os.getenv(_LLVM_TEXT_PIPELINE_ENV) or "default",
+            )
+        )
     return overrides
 
 
@@ -201,18 +211,35 @@ def _parse_backend(value):
         lowered = value.strip().lower()
     if lowered not in ("llvm", "llvm_capi", "self"):
         raise ValueError(
-            "invalid backend "
-            f"{value!r}; expected one of llvm, llvm_capi, self"
+            "invalid backend " f"{value!r}; expected one of llvm, llvm_capi, self"
         )
     return lowered
+
+
+def _self_backend_vectorize_requested() -> bool:
+    """Whether callers explicitly allow LLVM vectorizers before self-backend.
+
+    The self backend still lacks full lowering for LLVM's vectorized pointer
+    stores, e.g. Lua's `<4 x ptr>` strcache broadcast.  Keep the default safe:
+    `--backend=self` lowers through an O0/O1-floor path rather than the default
+    O2 path.  Developers can opt back in while working on vector lowering.
+    """
+    value = os.environ.get(_SELF_BACKEND_VECTORIZE_ENV, "").strip().lower()
+    return value in {"1", "true", "yes", "on", "allow", "enabled"}
+
+
+def _effective_self_backend_opt_level(backend, opt_level: int) -> int:
+    backend_name = (backend or os.environ.get("PCC_BACKEND", "") or "").strip().lower()
+    if backend_name == "self" and int(opt_level) > 0 and not _self_backend_vectorize_requested():
+        return 0
+    return int(opt_level)
 
 
 def _parse_python_libpython(value):
     lowered = (value or "").strip().lower()
     if lowered not in ("auto", "on", "off"):
         raise ValueError(
-            "invalid --python-libpython "
-            f"{value!r}; expected auto, on, or off"
+            "invalid --python-libpython " f"{value!r}; expected auto, on, or off"
         )
     return lowered
 
@@ -221,8 +248,7 @@ def _parse_ir_scaffold(value):
     lowered = (value or "").strip().lower()
     if lowered not in ("auto", "on", "off"):
         raise ValueError(
-            "invalid --ir-scaffold "
-            f"{value!r}; expected off, on, or auto"
+            "invalid --ir-scaffold " f"{value!r}; expected off, on, or auto"
         )
     return lowered
 
@@ -257,6 +283,33 @@ def _normalized_sys_argv():
         argv.append((sys.argv[i] or "") + "")
         i += 1
     return argv
+
+
+def _run_module_request(argv) -> int:
+    if len(argv) < 2:
+        _write_text("Error: -m requires a module name", err=True)
+        return 2
+    module_name = argv[1]
+    module_args = _copy_seq(argv[2:])
+    if module_name in ("pip", "pip3"):
+        module_name = "pcc.package.pip_shim"
+    import runpy
+
+    old_argv = sys.argv
+    sys.argv = [module_name] + module_args
+    try:
+        runpy.run_module(module_name, run_name="__main__", alter_sys=True)
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            return code
+        _write_text(str(code), err=True)
+        return 1
+    finally:
+        sys.argv = old_argv
+    return 0
 
 
 def parse_cli_args(argv=None):
@@ -298,6 +351,7 @@ def parse_cli_args(argv=None):
     output_path = None
     backend = None
     python_libpython = None
+    python_library = False
     ir_scaffold = None
     verbose = False
     prog_args = []
@@ -332,6 +386,43 @@ def parse_cli_args(argv=None):
             continue
         if arg in ("-v", "--verbose"):
             verbose = True
+            i += 1
+            continue
+        if arg == "--python-library":
+            python_library = True
+            i += 1
+            continue
+        if arg.startswith("--diagnostic-format="):
+            value = _option_value(arg, "--diagnostic-format=").strip().lower()
+            if value not in ("text", "json", "sarif"):
+                return None, 2, "--diagnostic-format must be text, json, or sarif"
+            os.environ["PCC_DIAGNOSTIC_FORMAT"] = value
+            i += 1
+            continue
+        if arg == "--diagnostic-format":
+            if i + 1 >= len(argv):
+                return None, 2, "--diagnostic-format requires a value"
+            value = argv[i + 1].strip().lower()
+            if value not in ("text", "json", "sarif"):
+                return None, 2, "--diagnostic-format must be text, json, or sarif"
+            os.environ["PCC_DIAGNOSTIC_FORMAT"] = value
+            i += 2
+            continue
+        if arg.startswith("--profile-json="):
+            value = _option_value(arg, "--profile-json=")
+            if not value:
+                return None, 2, "--profile-json requires a value"
+            os.environ["PCC_PROFILE_JSON"] = value
+            i += 1
+            continue
+        if arg == "--profile-json":
+            if i + 1 >= len(argv):
+                return None, 2, "--profile-json requires a value"
+            os.environ["PCC_PROFILE_JSON"] = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--explain-fallback":
+            os.environ["PCC_EXPLAIN_FALLBACK"] = "1"
             i += 1
             continue
         if arg.startswith("--pass="):
@@ -522,9 +613,7 @@ def parse_cli_args(argv=None):
             continue
         if arg.startswith("--ir-scaffold="):
             try:
-                ir_scaffold = _parse_ir_scaffold(
-                    _option_value(arg, "--ir-scaffold=")
-                )
+                ir_scaffold = _parse_ir_scaffold(_option_value(arg, "--ir-scaffold="))
             except ValueError as exc:
                 return None, 2, str(exc)
             i += 1
@@ -540,9 +629,7 @@ def parse_cli_args(argv=None):
             continue
         if arg.startswith("-O") and arg != "-O":
             try:
-                opt_level = _parse_int_option(
-                    "-O", arg[2:], minimum=0, maximum=3
-                )
+                opt_level = _parse_int_option("-O", arg[2:], minimum=0, maximum=3)
             except ValueError as exc:
                 return None, 2, str(exc)
             i += 1
@@ -551,9 +638,7 @@ def parse_cli_args(argv=None):
             if i + 1 >= len(argv):
                 return None, 2, "-O requires a value"
             try:
-                opt_level = _parse_int_option(
-                    "-O", argv[i + 1], minimum=0, maximum=3
-                )
+                opt_level = _parse_int_option("-O", argv[i + 1], minimum=0, maximum=3)
             except ValueError as exc:
                 return None, 2, str(exc)
             i += 2
@@ -606,6 +691,7 @@ def parse_cli_args(argv=None):
             output_path,
             backend,
             python_libpython,
+            python_library,
             ir_scaffold,
             verbose,
             prog_args,
@@ -658,11 +744,49 @@ def _execute_python_path(
     emit_llvm,
     output_path,
     python_libpython,
+    python_library,
     ir_scaffold,
     verbose,
     prog_args,
 ):
     from pcc.py_frontend.pipeline import PyPipelineError, compile_python
+    from pcc.compile_observability import (
+        ObservabilityOptions,
+        ObservedCompileError,
+        observed_compile,
+    )
+
+    def _observed_compile(
+        compile_input,
+        compile_output,
+        compile_verbose,
+        compile_emit_llvm_only,
+        compile_libpython_mode,
+        compile_python_library,
+        compile_ir_scaffold_mode,
+    ):
+        opts = ObservabilityOptions(
+            diagnostic_format=os.getenv("PCC_DIAGNOSTIC_FORMAT", "text"),
+            profile_json=os.getenv("PCC_PROFILE_JSON") or None,
+            explain_fallback=os.getenv("PCC_EXPLAIN_FALLBACK") == "1",
+            phase="python-frontend",
+            entry="pcc.cli_core",
+        )
+        try:
+            return observed_compile(
+                compile_python,
+                compile_input,
+                compile_output,
+                options=opts,
+                metadata={"entry": "cli_core"},
+                verbose=compile_verbose,
+                emit_llvm_only=compile_emit_llvm_only,
+                libpython_mode=compile_libpython_mode,
+                python_library=compile_python_library,
+                ir_scaffold_mode=compile_ir_scaffold_mode,
+            )
+        except ObservedCompileError as exc:
+            raise PyPipelineError(exc.formatted) from exc
 
     src_path = path
     emit_ll_only = emit_llvm is not None
@@ -673,13 +797,14 @@ def _execute_python_path(
         else:
             ll_out = output_path if output_path else emit_llvm
         try:
-            compile_python(
+            _observed_compile(
                 src_path,
                 ll_out,
-                verbose=verbose,
-                emit_llvm_only=True,
-                libpython_mode=python_libpython,
-                ir_scaffold_mode=ir_scaffold,
+                verbose,
+                True,
+                python_libpython,
+                python_library,
+                ir_scaffold,
             )
         except PyPipelineError as exc:
             _write_text("Error: " + str(exc), err=True)
@@ -688,12 +813,14 @@ def _execute_python_path(
 
     if output_path:
         try:
-            compile_python(
+            _observed_compile(
                 src_path,
                 output_path,
-                verbose=verbose,
-                libpython_mode=python_libpython,
-                ir_scaffold_mode=ir_scaffold,
+                verbose,
+                False,
+                python_libpython,
+                python_library,
+                ir_scaffold,
             )
         except PyPipelineError as exc:
             _write_text("Error: " + str(exc), err=True)
@@ -706,12 +833,14 @@ def _execute_python_path(
     with _tmp.TemporaryDirectory(prefix="pcc_py_run_") as td:
         exe_path = os.path.join(td, os.path.basename(src_path)[:-3] or "pcc_run")
         try:
-            compile_python(
+            _observed_compile(
                 src_path,
                 exe_path,
-                verbose=verbose,
-                libpython_mode=python_libpython,
-                ir_scaffold_mode=ir_scaffold,
+                verbose,
+                False,
+                python_libpython,
+                python_library,
+                ir_scaffold,
             )
         except PyPipelineError as exc:
             _write_text("Error: " + str(exc), err=True)
@@ -751,6 +880,7 @@ def execute_cli(
     output_path=None,
     backend=None,
     python_libpython=None,
+    python_library=False,
     ir_scaffold=None,
     verbose=False,
     prog_args=(),
@@ -778,6 +908,7 @@ def execute_cli(
             emit_llvm=emit_llvm,
             output_path=output_path,
             python_libpython=python_libpython,
+            python_library=python_library,
             ir_scaffold=ir_scaffold,
             verbose=verbose,
             prog_args=prog_args,
@@ -802,6 +933,7 @@ def execute_cli(
     try:
         run_prepare_commands(prepare_cmds)
         ensure_make_goals(ensure_make_goal_specs, jobs=jobs)
+        opt_level = _effective_self_backend_opt_level(backend, opt_level)
         pass_env = _pass_env_overrides(
             opt_level,
             enabled_passes=enabled_passes,
@@ -977,6 +1109,9 @@ def execute_cli(
 
 
 def cli_main(argv=None) -> int:
+    raw_argv = _normalized_sys_argv() if argv is None else _copy_seq(argv)
+    if raw_argv and raw_argv[0] == "-m":
+        return _run_module_request(raw_argv)
     if _argv_requests_help(argv):
         _write_text(_HELP_TEXT, nl=False)
         return 0
@@ -1014,6 +1149,7 @@ def cli_main(argv=None) -> int:
         output_path_raw,
         backend_raw,
         python_libpython_raw,
+        python_library_raw,
         ir_scaffold_raw,
         verbose_raw,
         prog_args_raw,
@@ -1032,6 +1168,45 @@ def cli_main(argv=None) -> int:
             _write_text("Error: input file not found: " + path, err=True)
             return 1
         from pcc.py_frontend.pipeline import PyPipelineError, compile_python
+        from pcc.compile_observability import (
+            ObservabilityOptions,
+            ObservedCompileError,
+            observed_compile,
+        )
+
+        def _observed_compile(
+            compile_input,
+            compile_output,
+            compile_verbose,
+            compile_emit_llvm_only,
+            compile_libpython_mode,
+            compile_python_library,
+            compile_ir_scaffold_mode,
+            compile_backend,
+        ):
+            opts = ObservabilityOptions(
+                diagnostic_format=os.getenv("PCC_DIAGNOSTIC_FORMAT", "text"),
+                profile_json=os.getenv("PCC_PROFILE_JSON") or None,
+                explain_fallback=os.getenv("PCC_EXPLAIN_FALLBACK") == "1",
+                phase="python-frontend",
+                entry="pcc.cli_core",
+            )
+            try:
+                return observed_compile(
+                    compile_python,
+                    compile_input,
+                    compile_output,
+                    options=opts,
+                    metadata={"entry": "cli_core"},
+                    verbose=compile_verbose,
+                    emit_llvm_only=compile_emit_llvm_only,
+                    libpython_mode=compile_libpython_mode,
+                    python_library=compile_python_library,
+                    ir_scaffold_mode=compile_ir_scaffold_mode,
+                    backend=compile_backend,
+                )
+            except ObservedCompileError as exc:
+                raise PyPipelineError(exc.formatted) from exc
 
         emit_ll_only = emit_llvm is not None
         if emit_ll_only:
@@ -1041,14 +1216,15 @@ def cli_main(argv=None) -> int:
             else:
                 ll_out = output_path if output_path else emit_llvm
             try:
-                compile_python(
+                _observed_compile(
                     path,
                     ll_out,
-                    verbose=verbose,
-                    emit_llvm_only=True,
-                    libpython_mode=python_libpython_raw,
-                    ir_scaffold_mode=ir_scaffold_raw,
-                    backend=backend_raw,
+                    verbose,
+                    True,
+                    python_libpython_raw,
+                    bool(python_library_raw),
+                    ir_scaffold_raw,
+                    backend_raw,
                 )
             except PyPipelineError as exc:
                 _write_text("Error: " + str(exc), err=True)
@@ -1057,13 +1233,15 @@ def cli_main(argv=None) -> int:
 
         if output_path:
             try:
-                compile_python(
+                _observed_compile(
                     path,
                     output_path,
-                    verbose=verbose,
-                    libpython_mode=python_libpython_raw,
-                    ir_scaffold_mode=ir_scaffold_raw,
-                    backend=backend_raw,
+                    verbose,
+                    False,
+                    python_libpython_raw,
+                    bool(python_library_raw),
+                    ir_scaffold_raw,
+                    backend_raw,
                 )
             except PyPipelineError as exc:
                 _write_text("Error: " + str(exc), err=True)
@@ -1076,13 +1254,15 @@ def cli_main(argv=None) -> int:
         with _tmp.TemporaryDirectory(prefix="pcc_py_run_") as td:
             exe_path = os.path.join(td, os.path.basename(path)[:-3] or "pcc_run")
             try:
-                compile_python(
+                _observed_compile(
                     path,
                     exe_path,
-                    verbose=verbose,
-                    libpython_mode=python_libpython_raw,
-                    ir_scaffold_mode=ir_scaffold_raw,
-                    backend=backend_raw,
+                    verbose,
+                    False,
+                    python_libpython_raw,
+                    bool(python_library_raw),
+                    ir_scaffold_raw,
+                    backend_raw,
                 )
             except PyPipelineError as exc:
                 _write_text("Error: " + str(exc), err=True)
@@ -1116,6 +1296,7 @@ def cli_main(argv=None) -> int:
     emit_asm = _normalize_cli_optional_text(emit_asm_raw)
     backend = _normalize_cli_optional_text(backend_raw)
     python_libpython = _normalize_cli_optional_text(python_libpython_raw)
+    python_library = _normalize_cli_flag(python_library_raw)
     ir_scaffold = _normalize_cli_optional_text(ir_scaffold_raw)
     return execute_cli(
         path=path,
@@ -1143,6 +1324,7 @@ def cli_main(argv=None) -> int:
         output_path=output_path,
         backend=backend,
         python_libpython=python_libpython,
+        python_library=python_library,
         ir_scaffold=ir_scaffold,
         verbose=verbose,
         prog_args=prog_args,
@@ -1166,18 +1348,3 @@ def cli_main_sys_argv_exit() -> None:
         from sys import exit as _exit
 
         _exit(code)
-
-
-def cli_main_strict_sys_argv_exit() -> None:
-    """Entry point for the ``pcc-static`` console script.
-
-    Same as ``pcc`` but with the no-libpython flag combination
-    (``--python-libpython=off`` + ``--ir-scaffold=on``) wired in as
-    the default. An explicitly-passed ``--python-libpython`` /
-    ``--ir-scaffold`` CLI flag, or a pre-set ``PCC_PYTHON_LIBPYTHON``
-    / ``PCC_IR_SCAFFOLD`` env var, still takes precedence.
-    """
-    import os
-    os.environ.setdefault("PCC_PYTHON_LIBPYTHON", "off")
-    os.environ.setdefault("PCC_IR_SCAFFOLD", "on")
-    cli_main_sys_argv_exit()

@@ -1,0 +1,108 @@
+# Workflow to build and test wheels, similarly to numpy/numpy-release.
+# To work on these jobs in a fork, comment out:
+#
+#     if: github.repository == 'numpy/numpy'
+name: Wheel builder
+
+on:
+  pull_request:
+    branches:
+      - main
+      - maintenance/**
+    paths-ignore:
+      - '**.pyi'
+      - '**.md'
+      - '**.rst'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  build_wheels:
+    name: Build wheel ${{ matrix.python }}-${{ matrix.buildplat[1] }}-${{ matrix.buildplat[2] }}
+    # To enable this job on a fork, comment out:
+    if: github.repository == 'numpy/numpy'
+    runs-on: ${{ matrix.buildplat[0] }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Github Actions doesn't support pairing matrix values together, let's improvise
+        # https://github.com/github/feedback/discussions/7835#discussioncomment-1769026
+        buildplat:
+          - [ubuntu-22.04, manylinux_x86_64, ""]
+          - [ubuntu-22.04, musllinux_x86_64, ""]
+          - [ubuntu-22.04-arm, manylinux_aarch64, ""]
+          - [ubuntu-22.04-arm, musllinux_aarch64, ""]
+          - [macos-15-intel, macosx_x86_64, openblas]
+          - [macos-14, macosx_arm64, openblas]
+          - [windows-2022, win_amd64, ""]
+          - [windows-11-arm, win_arm64, ""]
+        python: ["cp311"]
+
+    env:
+      IS_32_BIT: ${{ matrix.buildplat[1] == 'win32' }}  # used in cibw_test_command.sh
+    steps:
+      - name: Checkout numpy
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Setup MSVC (32-bit)
+        if: ${{ matrix.buildplat[1] == 'win32' }}
+        uses: bus1/cabuild/action/msdevshell@e22aba57d6e74891d059d66501b6b5aed8123c4d  # v1
+        with:
+          architecture: 'x86'
+
+      - name: Setup LLVM for Windows ARM64
+        if: ${{ matrix.buildplat[1] == 'win_arm64' }}
+        uses: ./.github/windows_arm64_steps
+
+      - name: pkg-config-for-win
+        if: runner.os == 'windows'
+        run: |
+          choco install -y --no-progress --stoponfirstfailure --checksum 6004DF17818F5A6DBF19CB335CC92702 pkgconfiglite
+          $CIBW = "${{ github.workspace }}/.openblas"
+          # pkgconfig needs a complete path, and not just "./openblas since the
+          # build is run in a tmp dir (?)
+          # It seems somewhere in the env passing, `\` is not
+          # passed through, so convert it to '/'
+          $CIBW = $CIBW.replace("\","/")
+          echo "CIBW_ENVIRONMENT_WINDOWS=PKG_CONFIG_PATH=$CIBW" >> $env:GITHUB_ENV
+
+      - name: Setup macOS
+        if: matrix.buildplat[0] == 'macos-15-intel' || matrix.buildplat[0] == 'macos-14'
+        run: |
+          # Needed due to https://github.com/actions/runner-images/issues/3371
+          # Supported versions: https://github.com/actions/runner-images/blob/main/images/macos/macos-14-arm64-Readme.md
+          echo "FC=gfortran-13" >> "$GITHUB_ENV"
+          echo "F77=gfortran-13" >> "$GITHUB_ENV"
+          echo "F90=gfortran-13" >> "$GITHUB_ENV"
+          if [[ ${{ matrix.buildplat[2] }} == 'accelerate' ]]; then
+            # macosx_arm64 and macosx_x86_64 with accelerate
+            # only target Sonoma onwards
+            CIBW="MACOSX_DEPLOYMENT_TARGET=14.0 INSTALL_OPENBLAS=false RUNNER_OS=macOS"
+            echo "CIBW_ENVIRONMENT_MACOS=$CIBW" >> "$GITHUB_ENV"
+          else
+            # macosx_x86_64 with OpenBLAS
+            # if INSTALL_OPENBLAS isn't specified then scipy-openblas is automatically installed
+            CIBW="RUNNER_OS=macOS"
+            PKG_CONFIG_PATH="$PWD/.openblas"
+            DYLD="$DYLD_LIBRARY_PATH:/$PWD/.openblas/lib"
+            echo "CIBW_ENVIRONMENT_MACOS=$CIBW PKG_CONFIG_PATH=$PKG_CONFIG_PATH DYLD_LIBRARY_PATH=$DYLD" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@63fd63b352a9a8bdcc24791c9dbee952ee9a8abc  # v3.3.0
+        env:
+          CIBW_BUILD: ${{ matrix.python }}-${{ matrix.buildplat[1] }}
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: ${{ matrix.python }}-${{ matrix.buildplat[1] }}-${{ matrix.buildplat[2] }}
+          path: ./wheelhouse/*.whl

@@ -52,6 +52,7 @@ _STORE_VALUE_RE = re.compile(
 _BITCAST_ALIAS_RE = re.compile(
     r"^\s*%(?P<dst>[\w\.]+)\s*=\s*bitcast\s+ptr\s+[@%](?P<src>[\w\.]+)\s+to\s+ptr\b"
 )
+_BLOCK_LABEL_RE = re.compile(r"^[\w\.\-]+:\s*(?:;.*)?$")
 
 _COMMUTATIVE_BINOPS = {"add", "mul", "and", "or", "xor"}
 _COMMUTATIVE_ICMPS = {"eq", "ne"}
@@ -153,7 +154,7 @@ def _rewrite_function(fn_text: str) -> tuple[str, bool]:
         if stripped == "}":
             reset_block()
             continue
-        if re.match(r"^[\w\.]+:\s*$", stripped):
+        if _BLOCK_LABEL_RE.match(stripped):
             reset_block()
             continue
 

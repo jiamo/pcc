@@ -36,6 +36,10 @@ def global_store_ptr(symbol: str, value: Any) -> None:
     _trap("global_store_ptr")
 
 
+def define_global_ptr_null(symbol: str) -> None:
+    _trap("define_global_ptr_null")
+
+
 def calloc(count: int, size: int) -> Any:
     _trap("calloc")
 
@@ -50,6 +54,10 @@ def free(ptr: Any) -> None:
 
 def ptr_add(ptr: Any, offset: int) -> Any:
     _trap("ptr_add")
+
+
+def ptr_diff(lhs: Any, rhs: Any) -> int:
+    _trap("ptr_diff")
 
 
 def null() -> Any:
@@ -152,16 +160,46 @@ def access(path: Any, mode: int) -> int:
     _trap("access")
 
 
+def stat_kind(path: Any) -> int:
+    _trap("stat_kind")
+
+
+def stat_mtime(path: Any) -> float:
+    _trap("stat_mtime")
+
+
+def target_sys_platform() -> Any:
+    _trap("target_sys_platform")
+
+
+def target_platform_machine() -> Any:
+    _trap("target_platform_machine")
+
+
+def call_ptr1(fn: Any, arg0: Any) -> Any:
+    _trap("call_ptr1")
+
+
+def call_void_ptr1(fn: Any, arg0: Any) -> None:
+    _trap("call_void_ptr1")
+
+
+def call_ptr2(fn: Any, arg0: Any, arg1: Any) -> Any:
+    _trap("call_ptr2")
+
+
 __all__ = [
     "malloc",
     "cstr",
     "global_addr",
     "global_load_ptr",
     "global_store_ptr",
+    "define_global_ptr_null",
     "calloc",
     "realloc",
     "free",
     "ptr_add",
+    "ptr_diff",
     "null",
     "ptr_eq",
     "ptr_is_null",
@@ -187,4 +225,11 @@ __all__ = [
     "setenv",
     "unsetenv",
     "access",
+    "stat_kind",
+    "stat_mtime",
+    "target_sys_platform",
+    "target_platform_machine",
+    "call_ptr1",
+    "call_void_ptr1",
+    "call_ptr2",
 ]

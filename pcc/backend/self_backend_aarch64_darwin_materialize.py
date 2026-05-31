@@ -422,17 +422,66 @@ def _store_symbolic_pointer_literal_to_address(
     return lines
 
 
+def _materialize_symbolic_ptr_array_literal_to_regs(
+    func: ParsedFunction,
+    value_type: TypeDesc,
+    value: str,
+    regs: tuple[str, ...],
+    module_symbols: PreparedModuleSymbols,
+) -> list[str]:
+    """Materialize a small `[N x ptr]` aggregate literal into ABI GPRs.
+
+    `aggregate_literal_to_bytes()` intentionally cannot encode symbolic pointer
+    lanes such as `@foo` or constant GEPs because relocation needs target symbol
+    materialization.  Small pointer arrays still fit the self-backend aggregate
+    register ABI (`[2 x ptr]` -> `xN`, `xN+1`), so lower each lane as a pointer
+    scalar rather than trying to byte-pack the whole aggregate.
+    """
+    if not value_type.is_array or value_type.elem is None or not value_type.elem.is_ptr:
+        raise BackendUnavailable(
+            f"self backend symbolic aggregate register materialization currently expects ptr arrays, got {value_type.describe()}"
+        )
+    text = value.strip()
+    if text.startswith("<") and text.endswith(">"):
+        text = "[" + text[1:-1].strip() + "]"
+    if not (text.startswith("[") and text.endswith("]")):
+        raise BackendUnavailable(
+            f"self backend expected ptr-array aggregate literal, got {value!r}"
+        )
+    items = split_top_level(text[1:-1].strip())
+    if len(items) != value_type.count or len(regs) < value_type.count:
+        raise BackendUnavailable(
+            f"self backend ptr-array literal lane count mismatch for {value_type.describe()}: {value!r}"
+        )
+    lines: list[str] = []
+    for item, reg in zip(items, regs, strict=False):
+        if not reg.startswith("x"):
+            raise BackendUnavailable(f"self backend expected GPR for ptr lane, got {reg}")
+        lane_value = decode_value_token(strip_typed_initializer(item))
+        lines.extend(materialize_value(func, lane_value, value_type.elem, int(reg[1:]), module_symbols))
+    return lines
+
+
 def copy_large_aggregate_value_to_slot(
     func: ParsedFunction,
     value: str,
     value_type: TypeDesc,
     dest_slot: SlotInfo,
+    *,
+    module_symbols: PreparedModuleSymbols | None = None,
 ) -> list[str]:
     if value == "zeroinitializer":
         return zero_slot(dest_slot)
     if is_aggregate_literal_value(value):
         lines = emit_slot_base_address(dest_slot, "x15")
-        lines.extend(store_large_aggregate_literal_to_address(value_type, value, "x15"))
+        lines.extend(
+            store_large_aggregate_literal_to_address(
+                value_type,
+                value,
+                "x15",
+                module_symbols=module_symbols,
+            )
+        )
         return lines
     if value in func.value_slots:
         return copy_slot_to_slot(func.value_slots[value], dest_slot)
@@ -450,7 +499,7 @@ def materialize_pointer(
     reg_index: int,
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
-    if value == "null":
+    if value in {"null", "poison", "undef"}:
         return materialize_value(
             func,
             value,
@@ -590,7 +639,14 @@ def materialize_value(
             raise BackendUnavailable(
                 f"self backend aggregate literal used as non-aggregate in {func.name!r}: {value!r}"
             )
-        literal_bytes = aggregate_literal_to_bytes(expected_type, value)
+        try:
+            literal_bytes = aggregate_literal_to_bytes(expected_type, value)
+        except BackendUnavailable:
+            if module_symbols is None:
+                raise
+            return _materialize_symbolic_ptr_array_literal_to_regs(
+                func, expected_type, value, regs, module_symbols
+            )
         lines: list[str] = []
         offset = 0
         for chunk_reg, chunk_size in zip(regs, aggregate_reg_chunks(expected_type), strict=False):

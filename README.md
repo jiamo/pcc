@@ -13,20 +13,37 @@ native code without LLVM for selected targets.
 This is a research compiler with practical integration tests, not a drop-in
 replacement for Clang or CPython.
 
+The Python-side strategy is compatibility first, then specialization:
+preserve CPython semantics where supported, fail loudly where strict native
+mode cannot prove them yet, and seek performance wins through typed native
+lowering, value payloads, array/shape specialization, startup, GC, and
+threading work. "Fully compatible with Python and faster in every scenario" is
+not a credible current claim. Dynamic, reflection-heavy, or CPython-extension
+heavy code must be made correct and diagnosable before it can be optimized.
+
 ## Status
 
 | Area | Current state |
 |---|---|
 | C frontend | Mature relative to the rest of the repo; validated through C tests, GCC/Clang-derived suites, and real projects such as Lua, SQLite, PostgreSQL `libpq`, zlib, lz4, zstd, PCRE, OpenSSL, readline, and nginx. |
-| Python frontend | Experimental. Typed code can lower to native IR; unsupported Python idioms may route through a CPython bridge unless `--python-libpython=off` forbids it. |
+| Python frontend | Experimental. Typed code can lower to native IR; unsupported Python idioms fail by default and only route through the CPython bridge when `--python-libpython=auto/on` is explicit. |
 | Runtime | Active migration from C runtime sources to pcc-Python modules under `pcc/py_runtime/py/`, using `pcc.unsafe` and `pcc.extern` for low-level operations. |
 | Self backend | Experimental LLVM-free emission path for AArch64 Darwin and x86_64 Linux subsets. It is used by bootstrap/build gates, but the default public backend remains LLVM unless explicitly selected. |
-| Bootstrap | macOS arm64 three-stage bootstrap completes as `pcc1 -> pcc2 -> pcc3` in both the default path and the strict self-backend path (`--backend self --python-libpython=off --ir-scaffold=on`). In the strict path, the emitted IR for `pcc2` and `pcc3` is byte-identical with 0 `py_cpy_*` calls; linked binaries have no `libpython` dependency and are byte-identical after Mach-O signature normalization. |
-| Tests | Broad unit, corpus, self-backend, and integration coverage. The Python corpus currently contains 177 end-to-end programs. |
+| Bootstrap | macOS arm64 three-stage bootstrap completes as `pcc1 -> pcc2 -> pcc3` in both the default path and the strict self-backend path (`--backend self --python-libpython=off --ir-scaffold=on`). In the strict path, the emitted IR for `pcc2` and `pcc3` is byte-identical with 0 `py_cpy_*` calls; linked binaries have no `libpython` dependency and are byte-identical after Mach-O signature normalization. Issue 1 (strict no-libpython bootstrap) closed 2026-05-01; the authoritative current snapshot is [`tests/bootstrap_gate_baseline.json`](tests/bootstrap_gate_baseline.json). |
+| pcc1 C frontend | `pcc1` can act as a driver for C inputs today by delegating `.c` files, C project directories, and C-only flags to the full host `pcc` CLI. That is a compatibility shell, not yet `pcc1` natively executing `pcc/pcc.py`, `cli_core.py`, `project.py`, `c_evaluator.py`, `c_codegen.py`, or `pycparser`. |
+| Tests | Broad unit, corpus, self-backend, and integration coverage. The Python corpus contains about 180 end-to-end programs. |
 
-Historical bootstrap gap notes live in
-[docs/issues/open-bootstrap-issues.md](docs/issues/open-bootstrap-issues.md).
-This README records the current verified bootstrap status.
+The authoritative current bootstrap status is
+[`tests/bootstrap_gate_baseline.json`](tests/bootstrap_gate_baseline.json).
+[docs/issues/open-bootstrap-issues.md](docs/issues/open-bootstrap-issues.md) is a historical
+tracker only and may lag behind the JSON baseline.
+
+## Current Work State
+
+This README is the public overview. The active goal and task board live in
+[`codex-goal-prompt.md`](codex-goal-prompt.md) and
+[`docs/current-goal-state.md`](docs/current-goal-state.md). Maintainer and agent
+workflow rules live in [`AGENTS.md`](AGENTS.md).
 
 ## Install
 
@@ -74,39 +91,35 @@ pcc --emit-obj out.o --target x86_64-unknown-linux-gnu hello.c
 pcc hello.py
 pcc hello.py -o hello
 pcc hello.py --emit-llvm
-pcc hello.py --python-libpython=off
-pcc-static hello.py
+pcc hello.py --python-libpython=auto
 pcc hello.py --backend self
 ```
 
 `pcc hello.py` compiles the file to a native executable and runs it. Passing
 `-o` writes the executable without running it. Passing `--emit-llvm` stops after
-IR generation. `pcc-static hello.py` is the strict no-libpython entrypoint: it
-uses the same compiler as `pcc`, but defaults to
-`--python-libpython=off --ir-scaffold=on`. Explicit CLI flags and existing
-`PCC_PYTHON_LIBPYTHON` / `PCC_IR_SCAFFOLD` environment variables still take
-precedence.
+IR generation. Python inputs default to the strict no-libpython path:
+`--python-libpython=off --ir-scaffold=on`. Use `--python-libpython=auto` only
+when you intentionally want the experimental CPython fallback bridge.
 
-The strict command is available from the normal package install:
+The normal package install provides the `pcc` command:
 
 ```bash
 pip install python-cc
-pcc-static hello.py
+pcc hello.py
 ```
 
 There is no separate `python-cc[no-libpython]` extra; it would install the same
-files without changing runtime behavior. Use `pcc-static` or pass
-`--python-libpython=off --ir-scaffold=on` explicitly.
+files without changing runtime behavior. No-libpython is the default.
 
 For Python inputs, the most important controls are:
 
 | Option | Meaning |
 |---|---|
-| `--python-libpython=auto` | Default. Link `libpython` only if codegen needed a CPython fallback. |
+| `--python-libpython=off` | Default. Hard error if the program would need a CPython fallback. |
+| `--python-libpython=auto` | Compatibility mode. Link `libpython` only if codegen needed a CPython fallback. |
 | `--python-libpython=on` | Always allow/link the CPython fallback surface. |
-| `--python-libpython=off` | Hard error if the program would need a CPython fallback. |
-| `--ir-scaffold=on` | Experimental closed-world lowering used by the strict self-host work. |
-| `pcc-static` | Console-script shortcut for `--python-libpython=off --ir-scaffold=on`. |
+| `--ir-scaffold=on` | Default. Closed-world lowering used by the strict self-host work. |
+| `--ir-scaffold=off` | Compatibility escape hatch for the older Python lowering path. |
 | `--backend {llvm,llvm_capi,self}` | Select the backend. `llvm` is the public default; `self` is experimental. |
 
 ### Use pcc From Python
@@ -155,10 +168,11 @@ CLI / Python API
 | Python frontend | `pcc/py_frontend/`, `pcc/parse/py_*` | Python parse/lift, type inference, native lowering, CPython fallback decisions. |
 | Runtime | `pcc/py_runtime/`, `pcc/extern/`, `pcc/unsafe/` | Runtime objects, extern-C bridge, compiler-recognized low-level intrinsics. |
 | Backends | `pcc/llvm_capi/`, `pcc/backend/` | LLVM compatibility layer and experimental self backend. |
-| Tests/integrations | `tests/`, `projects/`, `bench/`, `benchmarks/` | Regression, corpus, real-project, and performance coverage. |
+| Tests/integrations | `tests/`, `projects/`, `benchmarks/` | Regression, corpus, real-project, and performance coverage. |
 
-See [docs/system-architecture.md](docs/system-architecture.md) for the fuller
-architecture guide.
+See [AGENTS.md](AGENTS.md) for the full repository map and maintainer workflow.
+Some older docs predate the no-libpython default; use
+[docs/current-goal-state.md](docs/current-goal-state.md) for current status.
 
 ## Capabilities
 
@@ -181,14 +195,14 @@ The C pipeline is the production-quality part of the repository. It supports:
 Representative C integration commands:
 
 ```bash
-uv run pcc \
+env -u LC_ALL uv run pcc \
   --cpp-arg=-DLUA_USE_JUMPTABLE=0 \
   --cpp-arg=-DLUA_NOBUILTIN \
   projects/lua-5.5.0/onelua.c -- projects/lua-5.5.0/testes/math.lua
 ```
 
 ```bash
-uv run pcc \
+env -u LC_ALL uv run pcc \
   --cpp-arg=-DHAVE_CONFIG_H \
   --depends-on projects/pcre-8.45=libpcre.la \
   projects/test_pcre_main.c
@@ -200,6 +214,14 @@ The Python frontend is intentionally described as experimental. It is useful for
 typed-native programs, runtime-authoring work, and the self-host track, but it
 does not implement the full Python data model.
 
+The self-host path is stricter than normal user Python code. `pcc`'s own source
+still has to avoid or isolate many dynamic idioms: runtime `getattr` /
+`setattr`, string-keyed method dispatch, broad `dict[str, Any]` plumbing,
+generators, decorators with runtime effects, deep closure capture, dynamic
+imports, and other features outside the native lowering subset. That restriction
+is a real current limitation of the bootstrap track, not just a documentation
+gap.
+
 Supported or actively exercised areas include:
 
 - Typed functions and local variables lowered to native LLVM IR.
@@ -207,22 +229,60 @@ Supported or actively exercised areas include:
   exception, dunder, and selected stdlib/runtime paths in the corpus.
 - Direct C interop through `pcc.extern`.
 - Low-level runtime authoring through `pcc.unsafe`.
-- CPython fallback for imports and dynamic idioms that are not yet in the
-  native subset.
+- Explicit CPython fallback (`--python-libpython=auto/on`) for imports and
+  dynamic idioms that are not yet in the native subset.
 - Multi-file/bootstrap compilation through `scripts/pcc_multi.py` and
   `pcc/cli_bootstrap.py`.
 
 The core limitation is not parsing; it is preserving Python semantics without
-falling back to CPython. The strict gate is:
+falling back to CPython. The default Python gate is:
 
 ```bash
-pcc program.py --python-libpython=off --ir-scaffold=on
+pcc program.py
 ```
 
-That mode still fails on programs that need an unsupported CPython bridge. The
-bootstrap and fallback ratchets live in
+That mode still fails on programs that need an unsupported CPython bridge.
+Use `pcc program.py --python-libpython=auto` for compatibility experiments,
+not for no-libpython claims. The bootstrap and fallback ratchets live in
 [tests/fallback_baseline.json](tests/fallback_baseline.json) and
 [tests/bootstrap_gate_baseline.json](tests/bootstrap_gate_baseline.json).
+
+The current long-term Python compatibility roadmap is tracked in
+[docs/plans/python-compat-specialization-strategy.md](docs/plans/python-compat-specialization-strategy.md)
+and [docs/plans/numpy_plan.md](docs/plans/numpy_plan.md). The strategy keeps
+three workstreams separate: CPython/package compatibility, no-libpython
+self-backend evidence, and specialization performance. A result in one
+workstream must not be reported as completion in another.
+
+The NumPy plan treats NumPy as both an extension-ABI project and a broader
+pcc1 Python-library compatibility project. Its Track B explicitly targets
+no-libpython support for real-library surfaces such as `inspect`, docstring
+metadata, `re`, module introspection, dynamic method discovery, heavy container
+mutation, file/cache I/O, and `importlib`-style behavior. These are goals and
+gated milestones, not current blanket support claims. Current local NumPy 2.4.4
+L5 smoke evidence is `cpython-compat` package/build/import evidence: strict
+pcc-native no-libpython correctly rejects CPython ABI extension artifacts with
+`PCC-PKG-004` until the generic pcc-native NumPy C-API/extension ABI work lands.
+The focused rejection gate is
+[`tests/python/test_package_extension_abi.py`](tests/python/test_package_extension_abi.py),
+and the active package/import work is tracked in
+[`codex-goal-prompt.md`](codex-goal-prompt.md) and
+[`docs/current-goal-state.md`](docs/current-goal-state.md). That blocker is
+intentional; it prevents a CPython ABI artifact from being misreported as
+pcc-native NumPy support. Array-core checks, `pip install` progress, extension
+ABI acceptance, and `import numpy` are separate claims.
+
+For C inputs, `pcc1` currently has two distinct modes:
+
+- **Driver/delegation mode**: `.c` inputs, C directories, and C-specific
+  flags are forwarded to the host `pcc` command. This lets pcc1 launch C
+  tests and project-shaped C commands while preserving the strict Python
+  self-host closure.
+- **Native C frontend target**: future work will make pcc1 execute the C
+  frontend library closure itself with `--python-libpython=off`. That is
+  not complete today; follow the current roadmap in
+  [`codex-goal-prompt.md`](codex-goal-prompt.md) and
+  [`docs/current-goal-state.md`](docs/current-goal-state.md).
 
 ### Self Backend
 
@@ -263,6 +323,17 @@ scripts/bootstrap.sh --backend self
 scripts/bootstrap.sh --stage 1
 ```
 
+After a stage1 binary exists, it can launch the repository pytest suite
+itself:
+
+```bash
+./build/bootstrap/pcc1 --pytest tests -q -n0
+```
+
+The launcher delegates to `env -u LC_ALL uv run pytest ...` and sets
+`PCC1_BINARY` to the running `pcc1`, so pcc1-specific pytest cases use
+that same binary.
+
 The strict no-libpython macOS arm64 path has also been verified to complete:
 
 ```bash
@@ -271,50 +342,204 @@ pcc --ir-scaffold=on --python-libpython=off --backend self pcc/__main__.py -o pc
 ./pcc2 --ir-scaffold=on --python-libpython=off --backend self pcc/__main__.py -o pcc3
 ```
 
-As of 2026-04-29, this strict path verifies with 0 `py_cpy_*` calls in the
-`pcc2`/`pcc3` emitted IR, no `libpython` entry in `otool -L`, byte-identical
-`pcc2`/`pcc3` emitted IR, and byte-identical `pcc2`/`pcc3` binaries after
-Mach-O signature removal. The public default CLI still uses the LLVM backend
-and `--python-libpython=auto` unless strict flags or `pcc-static` are selected.
+As of 2026-05-01 (Issue 1 closure), this strict path verifies with 0 `py_cpy_*`
+calls in the `pcc2`/`pcc3` emitted IR, no `libpython` entry in `otool -L`,
+byte-identical `pcc2`/`pcc3` emitted IR, and byte-identical `pcc2`/`pcc3`
+binaries after Mach-O signature removal. The frozen evidence lives in
+[`tests/bootstrap_gate_baseline.json`](tests/bootstrap_gate_baseline.json)
+and is enforced by `tests/python/test_bootstrap_gate_baseline.py`. The public
+default CLI still uses the LLVM backend, but Python inputs now default to
+no-libpython with the IR scaffold enabled.
+
+## GC Status
+
+pcc's runtime ships five GC backend slots, each mirroring a real
+reference implementation kept in tree under
+[docs/refs_docs/gc-research/](docs/refs_docs/gc-research/) so the algorithm can be
+read alongside pcc's port. The current default decision is recorded in
+[docs/investigations/gc-backend-selection-matrix.md](docs/investigations/gc-backend-selection-matrix.md):
+backend #0 remains the default; #1 and #3 are the nearest future default
+challengers, while #2 and #4 remain selectable advanced backends.
+
+| Slot | Algorithm | Reference | Status in pcc |
+|---|---|---|---|
+| **#0** | refcount + STW cycle | CPython (`docs/refs_docs/gc-research/python/`) | **Production / default.** Broadest bootstrap and language coverage; keep as rollback/reference path for all other backend work. |
+| **#1** | incremental tricolor mark-sweep | Lua 5.4 (`docs/refs_docs/gc-research/lua/`) | **Selectable and gated.** Current pcc1 explicit-collection and runtime-subset gates are green. Remaining work is production hardening: pacer/debt tuning, finalizer/resurrection audit, and broader workload coverage. |
+| **#2** | concurrent mark-sweep | Go (greentea, `docs/refs_docs/gc-research/go-greentea/`) | **Selectable and gated for the current threaded subset.** CMS worker, bounded queue, mutator assist, lifecycle, and TSan/stress slices are green. Remaining work is a fuller Go-style work-buffer/drain model and concurrent sweep policy. |
+| **#3** | generational young/old | OCaml (`docs/refs_docs/gc-research/ocaml/`) | **Selectable and production-facing on focused gates.** Minor arena, remembered-set promotion, copy-oldification, owned-slot rewrite, frame/scheduler roots, and class metadata slot rewrite exist in C and pcc-Python paths. Remaining work is cross-domain/threaded object-graph proof and workload-level performance data. |
+| **#4** | colored relocating / modern GenZGC | ZGC (`docs/refs_docs/gc-research/zgc/`, OpenJDK `jdk-27+21`; freshness checked against OpenJDK `master` on 2026-05-14) | **Selectable and production-facing on focused gates, not default.** Forwarding/read barriers, container relocation, scheduler-root healing, store-buffer telemetry, page-class telemetry, and first large-page policy slices exist. Remaining work is true ZPage allocation/evacuation, full GenZGC young/old policy, fragmentation policy, native-handle protocols, pcc-Python threaded mirror flushing, and full reference updating. |
+
+Known semantic gaps versus CPython on backend #0 (production path):
+
+- Cycle collector runs (`py_obj_gc.c::py_gc_collect` walks tracked objects,
+  recomputes reachability, finalizes, clears referents, and frees), but is
+  not yet auto-paced — `gc.collect()` is the only trigger; allocation-debt
+  pacing comparable to CPython's generational thresholds is still pending.
+- `__del__` is dispatched (`py_class.c::py_instance_dealloc` calls
+  `py_user_del_dispatch`), but resurrection and per-finalizer
+  exception-as-warning policy are minimal compared with CPython.
+- `weakref` is implemented (`py_weakref.c`: `py_weakref_new`,
+  `py_weakref_call`, `py_weakref_invalidate` hooked into instance
+  dealloc and cycle clear); however `weakref.WeakValueDictionary`,
+  weak-method binding, and full callback semantics are not all complete.
+- Refcount is atomic only when built with `PCC_WITH_THREADS=1`; the
+  default build keeps non-atomic refcount.
+- Concurrent mutation of shared mutable containers under user-level
+  locks is **not yet correct** — see the threading paragraph below.
+
+The bootstrap closure (pcc compiling itself) does not construct cycles,
+rely on `__del__`, or use weakrefs in a way that exercises the remaining
+gaps, so these do not block `pcc1 → pcc2 → pcc3` byte-identical
+reproduction. Real-world Python programs with parent-pointer trees,
+heavy `__del__` use, or long-lived servers may still surface them.
+
+Threading model: the runtime is free-threaded under
+`PCC_WITH_THREADS=1`. Refcounts use `__atomic_*` operations
+(`ldadd` / `ldaddal` on aarch64) rather than a process-wide GIL, so
+multiple pthreads can run pcc-compiled Python code on separate cores.
+The threading shim
+([pcc/py_stdlib/threading.py](pcc/py_stdlib/threading.py)) is backed
+by `pthread_mutex` / `pthread_cond` / `pthread_create` for `Lock`,
+`RLock`, `Event`, `Condition`, `Semaphore`, and `Thread`. A
+behavior-oriented-concurrency helper
+([pcc/py_stdlib/boc.py](pcc/py_stdlib/boc.py)) defines `Cown` and a
+`locked` context manager that acquires multiple cowns in canonical
+total-id order — the BoC trick that makes deadlock impossible by
+construction.
+
+The parallel speedup proof at
+[benchmarks/python/boc_bank_demo.py](benchmarks/python/boc_bank_demo.py) and
+[tests/python/test_boc_threading_proof.py](tests/python/test_boc_threading_proof.py)
+builds the runtime with `PCC_WITH_THREADS=1`, runs four pthreads each
+performing CPU-bound integer mixing with no shared mutation, and
+asserts that wall-clock(serial) / wall-clock(parallel) ≥ 2.5×. On a
+4-thread macOS arm64 host this currently lands around 3.5×.
+
+Threaded pcc1 smoke gates now cover lock-protected counter updates,
+thread object lifetime under GC churn, and real-pthread explicit
+`gc.collect()` across GC backends. This is still not a blanket
+"free-threaded Python containers are complete" claim: unsynchronized shared
+container mutation remains unsupported, backend-specific stress continues,
+and the reliability record lives in
+[docs/investigations/pcc1-threaded-explicit-gc-collect-gap.md](docs/investigations/pcc1-threaded-explicit-gc-collect-gap.md).
 
 ## Testing
 
 Use `uv run ...` for repository commands.
 
 ```bash
-uv run pytest -q
-uv run pytest -m integration
-uv run pytest tests/test_lua.py -q -n0
-uv run pytest tests/test_sqlite.py -q -n0
-uv run pytest tests/test_postgres.py -q -n0
+env -u LC_ALL uv run pytest -q
+env -u LC_ALL uv run pytest -m integration
+env -u LC_ALL uv run pytest tests/c/test_lua.py -q -n0
+env -u LC_ALL uv run pytest tests/integration/test_sqlite.py -q -n0
+env -u LC_ALL uv run pytest tests/integration/test_postgres.py -q -n0
 ```
 
 Focused gates:
 
 ```bash
-uv run pytest tests/test_c_testsuite.py tests/test_clang_c.py -q -n0
-uv run pytest tests/test_gcc_torture_execute.py -q -n0
-uv run pytest tests/test_py_multi_file_compile.py tests/test_py_multi_file_bootstrap_shim.py -q -n0
-uv run pytest tests/test_self_backend.py tests/test_self_backend_bootstrap_gate.py -q -n0
+env -u LC_ALL uv run pytest tests/c/test_c_testsuite.py tests/c/test_clang_c.py -q -n0
+env -u LC_ALL uv run pytest tests/c/test_gcc_torture_execute.py -q -n0
+env -u LC_ALL uv run pytest tests/python/test_py_multi_file_compile.py tests/python/test_py_multi_file_bootstrap_shim.py -q -n0
+env -u LC_ALL uv run pytest tests/c/test_self_backend.py tests/python/test_self_backend_bootstrap_gate.py -q -n0
 ```
 
-Codex users should unset `LC_ALL` before `uv run ...` commands in this repo:
+Fast full-test strategy (no script needed):
 
 ```bash
-env -u LC_ALL uv run pytest -q
-env -u LC_ALL uv run pcc hello.c
+# Normal lane
+env -u LC_ALL uv run pytest -n auto --dist=loadgroup tests/c tests/python --maxfail=1 --durations=20
+
+# All non-integration regression tests now live under tests/c and tests/python, so one command
+# covers both buckets.
+
+# Integration lane by directory (same as integration markers)
+env -u LC_ALL uv run pytest -n0 tests/integration --maxfail=1 --durations=20
+
+# If your machine can handle it, run integration lane in parallel:
+env -u LC_ALL uv run pytest -n 4 --dist=loadgroup tests/integration --maxfail=1 --durations=20
 ```
+
+All repository command examples use `env -u LC_ALL`; this is required for Codex
+locale handling and harmless elsewhere.
+
+### Performance Benches
+
+Performance tooling lives under `benchmarks/`. For the compiled self-host
+compiler specifically, use `benchmarks/bench_pcc1.py` against an existing
+`pcc1` binary:
+
+```bash
+mkdir -p build/bootstrap-strict-self
+env -u LC_ALL uv run pcc \
+  --backend self \
+  --python-libpython off \
+  --ir-scaffold on \
+  pcc/__main__.py -o build/bootstrap-strict-self/pcc1
+
+env -u LC_ALL uv run python benchmarks/bench_pcc1.py \
+  --pcc1 build/bootstrap-strict-self/pcc1
+```
+
+`bench_pcc1.py` defaults to the same strict settings for programs compiled by
+`pcc1`: `--backend self --python-libpython off --ir-scaffold on`. It also
+rejects a `pcc1` that links `libpython` unless `--allow-libpython-pcc1` is
+passed explicitly.
+
+```bash
+env -u LC_ALL uv run python benchmarks/bench_pcc1.py \
+  --pcc1 build/bootstrap-strict-self/pcc1 \
+  --backend self \
+  --python-libpython off \
+  --ir-scaffold on
+```
+
+The heavy measurement is pcc1 compiling `pcc/__main__.py` into a fresh pcc2.
+It is opt-in because it can take long enough to be noisy during normal
+development:
+
+```bash
+env -u LC_ALL uv run python benchmarks/bench_pcc1.py \
+  --pcc1 build/bootstrap-strict-self/pcc1 \
+  --include-self-compile
+```
+
+For generated Python program runtime, compare the no-libpython binary against
+CPython with:
+
+```bash
+env -u LC_ALL uv run python benchmarks/bench_py_runtime.py
+```
+
+This benchmark is intentionally separate from `bench_pcc1.py`: `bench_pcc1.py`
+measures the compiled compiler, while `bench_py_runtime.py` measures a program
+compiled by `pcc`. Current Python frontend runtime speed is not yet a CPython
+replacement; this bench is the guardrail for the unboxed-loop and runtime
+startup work needed to change that. Performance claims should be scoped to
+benchmarked workload classes and should record correctness, fallback mode,
+allocation behavior, startup/runtime time, and whether the binary linked
+`libpython`.
 
 ## Documentation
 
+Current work state is tracked by
+[`codex-goal-prompt.md`](codex-goal-prompt.md) and
+[`docs/current-goal-state.md`](docs/current-goal-state.md). Some older guides
+below predate the no-libpython default and are retained as background rather
+than current task status.
+
 | Topic | Path |
 |---|---|
-| Architecture | [docs/system-architecture.md](docs/system-architecture.md) |
-| Python tutorial | [docs/python-tutorial.md](docs/python-tutorial.md) |
-| Python how-to | [docs/python-howto.md](docs/python-howto.md) |
-| Python limitations | [docs/python-limitations.md](docs/python-limitations.md) |
-| Python scorecard | [docs/python-scorecard.md](docs/python-scorecard.md) |
-| Bootstrap issue history | [docs/issues/open-bootstrap-issues.md](docs/issues/open-bootstrap-issues.md) |
+| Active goal and task board | [codex-goal-prompt.md](codex-goal-prompt.md), [docs/current-goal-state.md](docs/current-goal-state.md) |
+| Architecture background | [docs/system-architecture.md](docs/system-architecture.md) |
+| Python tutorial background | [docs/python-tutorial.md](docs/python-tutorial.md) |
+| Python how-to background | [docs/python-howto.md](docs/python-howto.md) |
+| Python limitations background | [docs/python-limitations.md](docs/python-limitations.md) |
+| Python scorecard background | [docs/python-scorecard.md](docs/python-scorecard.md) |
+| Python compatibility/specialization strategy | [docs/plans/python-compat-specialization-strategy.md](docs/plans/python-compat-specialization-strategy.md) |
+| NumPy no-libpython plan | [docs/plans/numpy_plan.md](docs/plans/numpy_plan.md) |
+| NumPy ecosystem expansion plan | [docs/plans/numpy_ecosystem_plan.md](docs/plans/numpy_ecosystem_plan.md) |
+| Bootstrap historical tracker | [docs/issues/open-bootstrap-issues.md](docs/issues/open-bootstrap-issues.md) |
 | Python data-model gaps | [docs/issues/python-data-model-gaps.md](docs/issues/python-data-model-gaps.md) |
 | Python semantics discussion | [docs/issues/python-semantics-preservation.md](docs/issues/python-semantics-preservation.md) |
 | GC semantics gap | [docs/issues/gc-semantics-gap.md](docs/issues/gc-semantics-gap.md) |
@@ -350,7 +575,7 @@ Recommended investigation reports:
 | `utils/fake_libc_include/` | Fake libc headers used by the C frontend. |
 | `tests/` | Unit, corpus, bootstrap, and integration tests. |
 | `projects/` | Third-party projects used as stress targets. |
-| `bench/`, `benchmarks/` | Performance tooling. |
+| `benchmarks/` | Performance tooling. |
 
 ## Development
 
@@ -358,7 +583,7 @@ Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run pytest -q
+env -u LC_ALL uv run pytest -q
 ```
 
 ### Environment Controls
@@ -372,8 +597,8 @@ General compiler controls:
 | Variable | Values | Effect |
 |---|---|---|
 | `PCC_BACKEND` | `llvm`, `llvm_capi`, `self` | Default backend when `--backend` is not passed. |
-| `PCC_PYTHON_LIBPYTHON` | `auto`, `on`, `off` | Default Python fallback/linkage policy when `--python-libpython` is not passed. |
-| `PCC_IR_SCAFFOLD` | `off`, `on`, `auto` | Default for the experimental closed-world Python IR scaffold. |
+| `PCC_PYTHON_LIBPYTHON` | `auto`, `on`, `off` | Default Python fallback/linkage policy when `--python-libpython` is not passed; unset means `off`. |
+| `PCC_IR_SCAFFOLD` | `off`, `on`, `auto` | Default for the closed-world Python IR scaffold; unset means `on`. |
 | `PCC_COMPILE_CACHE_DIR` | path | Override the translation-unit compile cache directory. |
 | `PCC_DISABLE_COMPILE_CACHE` | `1`, `true`, `yes`, `on` | Disable the translation-unit compile cache. |
 | `PCC_USE_PLY_C_PARSER` | `1` | Use the legacy PLY C parser instead of the native C parser. |
@@ -411,7 +636,7 @@ Python runtime, linking, packaging, and bootstrap controls:
 | `PCC_BOOTSTRAP_OUT_DIR` | path | `scripts/bootstrap.sh` output directory. |
 | `PCC_BOOTSTRAP_RUNTIME_CC` | `pcc`, `cc` | Bootstrap wrapper default for `PCC_RUNTIME_CC`. |
 | `PCC_BOOTSTRAP_RUNTIME_HIGH` | `py`, `c` | Bootstrap wrapper default for `PCC_RUNTIME_HIGH`. |
-| `PCC_BOOTSTRAP_PYTHON_LIBPYTHON` | `auto`, `on`, `off` | Bootstrap wrapper default for `--python-libpython`. |
+| `PCC_BOOTSTRAP_PYTHON_LIBPYTHON` | `off`, `auto`, `on` | Bootstrap wrapper default for `--python-libpython`; unset means `off`. |
 
 Diagnostics and local gates:
 

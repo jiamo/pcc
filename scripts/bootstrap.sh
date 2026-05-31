@@ -28,7 +28,10 @@
 # Runtime defaults for every stage:
 #   PCC_BOOTSTRAP_RUNTIME_CC=pcc
 #   PCC_BOOTSTRAP_RUNTIME_HIGH=py
-#   PCC_BOOTSTRAP_PYTHON_LIBPYTHON=auto
+#   PCC_BOOTSTRAP_PYTHON_LIBPYTHON=off
+#   PCC_BOOTSTRAP_PYTHON_IR_PASSES=${PCC_PYTHON_IR_PASSES:-off}
+#   PCC_BOOTSTRAP_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-auto} for stage2+
+#   PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-auto}
 
 set -euo pipefail
 
@@ -37,7 +40,12 @@ OUT_DIR="${PCC_BOOTSTRAP_OUT_DIR:-${REPO_ROOT}/build/bootstrap}"
 MAIN_PY="${REPO_ROOT}/pcc/__main__.py"
 BOOTSTRAP_RUNTIME_CC="${PCC_BOOTSTRAP_RUNTIME_CC:-pcc}"
 BOOTSTRAP_RUNTIME_HIGH="${PCC_BOOTSTRAP_RUNTIME_HIGH:-py}"
-BOOTSTRAP_PYTHON_LIBPYTHON="${PCC_BOOTSTRAP_PYTHON_LIBPYTHON:-auto}"
+BOOTSTRAP_PYTHON_LIBPYTHON="${PCC_BOOTSTRAP_PYTHON_LIBPYTHON:-off}"
+BOOTSTRAP_PYTHON_IR_PASSES="${PCC_BOOTSTRAP_PYTHON_IR_PASSES:-${PCC_PYTHON_IR_PASSES:-off}}"
+BOOTSTRAP_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-auto}}"
+BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-auto}}"
+BOOTSTRAP_PROFILE_DIR="${PCC_BOOTSTRAP_PROFILE_DIR:-}"
+BOOTSTRAP_STAGE_EXEC_DELAY="${PCC_BOOTSTRAP_STAGE_EXEC_DELAY:-0.10}"
 
 STAGE_LIMIT=3
 CLEAN=0
@@ -83,6 +91,105 @@ banner() {
     echo "=============================================================="
 }
 
+now_ms() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(int(time.monotonic() * 1000))'
+    else
+        echo "$(($(date +%s) * 1000))"
+    fi
+}
+
+stage_exec_barrier() {
+    local out_exe="$1"
+    if [[ "${BACKEND}" != "self" ]]; then
+        return
+    fi
+    if [[ "$(uname)" != "Darwin" ]]; then
+        return
+    fi
+    if command -v codesign >/dev/null 2>&1; then
+        codesign --verify "${out_exe}" >/dev/null 2>&1 || true
+    fi
+    cat "${out_exe}" >/dev/null
+    if [[ -n "${BOOTSTRAP_STAGE_EXEC_DELAY}" && "${BOOTSTRAP_STAGE_EXEC_DELAY}" != "0" ]]; then
+        sleep "${BOOTSTRAP_STAGE_EXEC_DELAY}"
+    fi
+    "${out_exe}" --help >/dev/null 2>&1
+    local smoke_dir
+    smoke_dir="$(mktemp -d "${OUT_DIR}/stage-smoke.XXXXXX")"
+    local smoke_src="${smoke_dir}/smoke.py"
+    local smoke_out="${smoke_dir}/smoke"
+    printf 'def main() -> int:\n    return 0\n\nmain()\n' > "${smoke_src}"
+    env \
+        "PCC_RUNTIME_CC=${BOOTSTRAP_RUNTIME_CC}" \
+        "PCC_RUNTIME_HIGH=${BOOTSTRAP_RUNTIME_HIGH}" \
+        "${out_exe}" \
+        --ir-scaffold=on \
+        --backend "${BACKEND}" \
+        --python-libpython "${BOOTSTRAP_PYTHON_LIBPYTHON}" \
+        "${smoke_src}" -o "${smoke_out}" >/dev/null 2>&1
+    local smoke_returncode=$?
+    rm -rf "${smoke_dir}"
+    return "${smoke_returncode}"
+}
+
+write_stage_result_json() {
+    local stage="$1"
+    local out_exe="$2"
+    local compile_elapsed_ms="$3"
+    local barrier_elapsed_ms="$4"
+    local stage_elapsed_ms="$5"
+    local returncode="$6"
+    local time_file="$7"
+    local barrier_returncode="$8"
+    if [[ -z "${BOOTSTRAP_PROFILE_DIR}" ]]; then
+        return
+    fi
+    python3 - "$BOOTSTRAP_PROFILE_DIR/stage${stage}.result.json" \
+        "$stage" "$out_exe" "$BACKEND" "$compile_elapsed_ms" \
+        "$barrier_elapsed_ms" "$stage_elapsed_ms" "$returncode" \
+        "$time_file" "$barrier_returncode" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+path = sys.argv[1]
+stage, output, backend = sys.argv[2:5]
+compile_ms, barrier_ms, wall_ms, returncode, time_file = sys.argv[5:10]
+barrier_returncode = sys.argv[10]
+payload = {
+    "schema": "pcc.bootstrap_stage_result.v1",
+    "stage": int(stage),
+    "output": output,
+    "backend": backend,
+    "compile_wall_ms": int(compile_ms),
+    "publish_barrier_ms": int(barrier_ms),
+    "wall_ms": int(wall_ms),
+    "returncode": int(returncode),
+    "publish_barrier_returncode": int(barrier_returncode),
+}
+if time_file:
+    try:
+        with open(time_file, "r", encoding="utf-8") as f:
+            for raw in f:
+                key, sep, value = raw.strip().partition("=")
+                if sep != "=":
+                    continue
+                if key == "user_s":
+                    payload["compile_user_ms"] = int(float(value) * 1000)
+                elif key == "sys_s":
+                    payload["compile_sys_ms"] = int(float(value) * 1000)
+                elif key == "real_s":
+                    payload["compile_time_real_ms"] = int(float(value) * 1000)
+    except OSError:
+        pass
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+}
+
 run_stage() {
     local stage="$1"
     local out_exe="$2"
@@ -95,7 +202,19 @@ run_stage() {
     if [[ -n "${BACKEND}" ]]; then
         backend_args=(--backend "${BACKEND}")
     fi
+    if [[ -n "${BOOTSTRAP_PROFILE_DIR}" ]]; then
+        mkdir -p "${BOOTSTRAP_PROFILE_DIR}"
+    fi
+    # Never let a failed/short-circuited compile leave a previous run's stage
+    # binary in place. Without this, stage3 can accidentally execute a stale
+    # pcc2 from the shared pytest/bootstrap directory.
+    rm -f "${out_exe}" "${out_exe}.tmp"
+
     local backend_label="${BACKEND}"
+    local frontend_jobs="${BOOTSTRAP_PY_FRONTEND_JOBS}"
+    if [[ "${stage}" == "1" ]]; then
+        frontend_jobs="${BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS}"
+    fi
     if [[ "${BACKEND_EXPLICIT}" -eq 0 ]]; then
         backend_label="${BACKEND} (default)"
     fi
@@ -103,7 +222,14 @@ run_stage() {
         env
         "PCC_RUNTIME_CC=${BOOTSTRAP_RUNTIME_CC}"
         "PCC_RUNTIME_HIGH=${BOOTSTRAP_RUNTIME_HIGH}"
+        "PCC_PYTHON_IR_PASSES=${BOOTSTRAP_PYTHON_IR_PASSES}"
+        "PCC_PY_FRONTEND_JOBS=${frontend_jobs}"
         "${cmd[@]}"
+    )
+    if [[ -n "${BOOTSTRAP_PROFILE_DIR}" ]]; then
+        full_cmd+=(--profile-json "${BOOTSTRAP_PROFILE_DIR}/stage${stage}.json")
+    fi
+    full_cmd+=(
         "${backend_args[@]}"
         --python-libpython "${BOOTSTRAP_PYTHON_LIBPYTHON}"
         "${MAIN_PY}" -o "${out_exe}"
@@ -111,11 +237,69 @@ run_stage() {
     banner "stage ${stage}: backend ${backend_label}: ${cmd[*]}"
     echo "input: ${MAIN_PY}"
     echo "output: ${out_exe}"
-    echo "runtime: PCC_RUNTIME_CC=${BOOTSTRAP_RUNTIME_CC} PCC_RUNTIME_HIGH=${BOOTSTRAP_RUNTIME_HIGH} --python-libpython ${BOOTSTRAP_PYTHON_LIBPYTHON}"
+    echo "runtime: PCC_RUNTIME_CC=${BOOTSTRAP_RUNTIME_CC} PCC_RUNTIME_HIGH=${BOOTSTRAP_RUNTIME_HIGH} PCC_PYTHON_IR_PASSES=${BOOTSTRAP_PYTHON_IR_PASSES} PCC_PY_FRONTEND_JOBS=${frontend_jobs} --python-libpython ${BOOTSTRAP_PYTHON_LIBPYTHON}"
+    if [[ -n "${BOOTSTRAP_PROFILE_DIR}" ]]; then
+        echo "profile: ${BOOTSTRAP_PROFILE_DIR}/stage${stage}.json"
+    fi
+    local stage_start_ms
+    local compile_start_ms
+    local compile_end_ms
+    local compile_elapsed_ms
+    local barrier_start_ms
+    local barrier_end_ms
+    local barrier_elapsed_ms
+    local stage_end_ms
+    local stage_elapsed_ms
+    local stage_returncode
+    local barrier_returncode=0
+    local stage_time_file=""
+    if [[ -n "${BOOTSTRAP_PROFILE_DIR}" ]]; then
+        stage_time_file="${BOOTSTRAP_PROFILE_DIR}/stage${stage}.time"
+    fi
+    stage_start_ms="$(now_ms)"
+    compile_start_ms="${stage_start_ms}"
+    set +e
     if command -v time >/dev/null 2>&1; then
-        time "${full_cmd[@]}"
+        if [[ -n "${stage_time_file}" ]]; then
+            { TIMEFORMAT=$'real_s=%3R\nuser_s=%3U\nsys_s=%3S'; time "${full_cmd[@]}" 2>&3; } 3>&2 2> "${stage_time_file}"
+        else
+            time "${full_cmd[@]}"
+        fi
+        stage_returncode=$?
     else
         "${full_cmd[@]}"
+        stage_returncode=$?
+    fi
+    set -e
+    compile_end_ms="$(now_ms)"
+    compile_elapsed_ms=$((compile_end_ms - compile_start_ms))
+    barrier_start_ms="${compile_end_ms}"
+    if [[ ${stage_returncode} -eq 0 ]]; then
+        if [[ ! -s "${out_exe}" || ! -x "${out_exe}" ]]; then
+            echo "FAIL — stage ${stage} did not produce executable ${out_exe}; refusing stale stage artifact." >&2
+            stage_returncode=127
+        fi
+    fi
+    if [[ ${stage_returncode} -eq 0 ]]; then
+        set +e
+        stage_exec_barrier "${out_exe}"
+        barrier_returncode=$?
+        set -e
+        if [[ ${barrier_returncode} -ne 0 ]]; then
+            stage_returncode="${barrier_returncode}"
+        fi
+    fi
+    barrier_end_ms="$(now_ms)"
+    barrier_elapsed_ms=$((barrier_end_ms - barrier_start_ms))
+    stage_end_ms="$(now_ms)"
+    stage_elapsed_ms=$((stage_end_ms - stage_start_ms))
+    write_stage_result_json \
+        "${stage}" "${out_exe}" "${compile_elapsed_ms}" \
+        "${barrier_elapsed_ms}" "${stage_elapsed_ms}" "${stage_returncode}" \
+        "${stage_time_file}" "${barrier_returncode}"
+    echo "PCC_BOOTSTRAP_STAGE_RESULT stage=${stage} elapsed_ms=${stage_elapsed_ms} output=${out_exe}"
+    if [[ ${stage_returncode} -ne 0 ]]; then
+        exit "${stage_returncode}"
     fi
 }
 

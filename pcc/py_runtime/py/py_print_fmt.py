@@ -27,7 +27,23 @@ from pcc.unsafe import (
 
 py_int_value_i64 = extern("py_int_value_i64", (c_ptr,), c_int64)
 py_bigint_to_cstr = extern("py_bigint_to_cstr", (c_ptr,), c_ptr)
+py_float_format_fixed = extern("py_float_format_fixed", (c_ptr, c_int64), c_ptr)
+py_float_repr_shortest = extern("py_float_repr_shortest", (c_ptr,), c_ptr)
+pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+py_decref = extern("py_decref", (c_ptr,), c_void)
+py_exc_get_message = extern("py_exc_get_message", (c_ptr,), c_ptr)
+py_obj_str = extern("py_obj_str", (c_ptr,), c_ptr)
+py_obj_repr = extern("py_obj_repr", (c_ptr,), c_ptr)
 fflush = extern("fflush", (c_ptr,), c_int32)
+# Returns 1 if the unknown-tag object was a CPython PyObject and was
+# rendered via PyObject_Str (libpython mode). Returns 0 in strict
+# no-libpython mode (the hook variable is NULL there) so the caller
+# falls through to ``<object tag=N>``. See py_process.c.
+py_format_try_cpy_object_into_fd = extern(
+    "py_format_try_cpy_object_into_fd",
+    (c_int32, c_ptr, c_int32),
+    c_int32,
+)
 
 
 def _type_of(obj) -> int:
@@ -139,6 +155,55 @@ def _format_str_repr(o) -> None:
     _write_lit(cstr("'"), 1)
 
 
+def _format_bytes(o) -> None:
+    _write_lit(cstr("b'"), 2)
+    data = ptr_add(o, 24)
+    n: int = load_i64(o, 16)
+    i: int = 0
+    while i < n:
+        c: int = load_i8(data, i) & 255
+        if c == 92:                  # '\\'
+            _write_lit(cstr("\\\\"), 2)
+        elif c == 39:                # "'"
+            _write_lit(cstr("\\'"), 2)
+        elif c == 10:
+            _write_lit(cstr("\\n"), 2)
+        elif c == 13:
+            _write_lit(cstr("\\r"), 2)
+        elif c == 9:
+            _write_lit(cstr("\\t"), 2)
+        elif c < 32 or c >= 127:
+            # bytes repr: only printable ASCII (32..126) raw; control, DEL and
+            # all high bytes (>=128) escape as \xNN. (c == 127 missed 128..255,
+            # so b'\xcf\x80' printed the raw UTF-8 char instead of the escapes.)
+            _write_lit(cstr("\\x"), 2)
+            _write_hex2(c)
+        else:
+            write(1, ptr_add(data, i), 1)
+        i = i + 1
+    _write_lit(cstr("'"), 1)
+
+
+def _format_bytearray(o) -> None:
+    # bytearray repr: bytearray(b'...'); byte escaping is identical to bytes
+    # (same layout: byte_len @16, data @24), wrapped in bytearray( ... ).
+    _write_lit(cstr("bytearray("), 10)
+    _format_bytes(o)
+    _write_lit(cstr(")"), 1)
+
+
+def _format_float(o) -> None:
+    # CPython shortest-round-trip repr (handles inf/nan and the trailing ".0"
+    # internally), via the shared C helper py_float_repr_shortest. The old path
+    # used py_float_format_fixed(o, 6) which printed "3.333333" for 10/3.
+    s = py_float_repr_shortest(o)
+    if ptr_is_null(s) != 0:
+        return
+    data = ptr_add(s, 40)
+    n: int = load_i64(s, 16)
+    write(1, data, n)
+
+
 def _format_list(o) -> None:
     _write_lit(cstr("["), 1)
     length: int = load_i64(o, 16)
@@ -147,7 +212,7 @@ def _format_list(o) -> None:
     while i < length:
         if i > 0:
             _write_lit(cstr(", "), 2)
-        _format_repr(load_ptr(items, i * 8))
+        _format_repr(pcc_gc_load_ptr(o, ptr_add(items, i * 8)))
         i = i + 1
     _write_lit(cstr("]"), 1)
 
@@ -159,11 +224,57 @@ def _format_tuple(o) -> None:
     while i < length:
         if i > 0:
             _write_lit(cstr(", "), 2)
-        _format_repr(load_ptr(o, 24 + i * 8))
+        _format_repr(pcc_gc_load_ptr(o, ptr_add(o, 24 + i * 8)))
         i = i + 1
     if length == 1:
         _write_lit(cstr(","), 1)
     _write_lit(cstr(")"), 1)
+
+
+def _format_dict(o) -> None:
+    # PyDictObject: entries ptr @40, entries_used @48.
+    # DictEntry (24 bytes): hash @0, key @8, value @16; key NULL = dead slot.
+    _write_lit(cstr("{"), 1)
+    entries = load_ptr(o, 40)
+    entries_used: int = load_i64(o, 48)
+    emitted: int = 0
+    i: int = 0
+    while i < entries_used:
+        entry = ptr_add(entries, i * 24)
+        if ptr_is_null(load_ptr(entry, 8)) == 0:
+            if emitted > 0:
+                _write_lit(cstr(", "), 2)
+            _format_repr(pcc_gc_load_ptr(o, ptr_add(entry, 8)))
+            _write_lit(cstr(": "), 2)
+            _format_repr(pcc_gc_load_ptr(o, ptr_add(entry, 16)))
+            emitted = emitted + 1
+        i = i + 1
+    _write_lit(cstr("}"), 1)
+
+
+def _format_set(o) -> None:
+    # PySetObject: size @16, capacity @24, entries ptr @40.
+    # SetEntry (16 bytes): key @8 (NULL empty, py_set_dummy tombstone).
+    size: int = load_i64(o, 16)
+    if size == 0:
+        _write_lit(cstr("set()"), 5)
+        return
+    _write_lit(cstr("{"), 1)
+    entries = load_ptr(o, 40)
+    dummy = global_load_ptr("py_set_dummy")
+    cap: int = load_i64(o, 24)
+    emitted: int = 0
+    i: int = 0
+    while i < cap:
+        key = load_ptr(entries, i * 16 + 8)
+        if ptr_is_null(key) == 0:
+            if ptr_eq(key, dummy) == 0:
+                if emitted > 0:
+                    _write_lit(cstr(", "), 2)
+                _format_repr(pcc_gc_load_ptr(o, ptr_add(entries, i * 16 + 8)))
+                emitted = emitted + 1
+        i = i + 1
+    _write_lit(cstr("}"), 1)
 
 
 def _format_repr(o) -> None:
@@ -177,6 +288,22 @@ def _format_repr(o) -> None:
     if tag == 4:                    # PY_TYPE_STR
         _format_str_repr(o)
         return
+    if tag == 17:                   # PY_TYPE_BYTES
+        _format_bytes(o)
+        return
+    if tag == 18:                   # PY_TYPE_BYTEARRAY
+        _format_bytearray(o)
+        return
+    if tag == 11 or tag >= 100:     # PY_TYPE_INSTANCE / user classes
+        # repr() of a user instance must dispatch __repr__, not __str__.
+        # Container elements recurse here, so a class with both __str__ and
+        # __repr__ would otherwise show __str__ inside a list. On NULL (no
+        # __repr__) fall through to _format's default handling.
+        s = py_obj_repr(o)
+        if ptr_is_null(s) == 0:
+            _format_str(s)
+            py_decref(s)
+            return
     _format(o)
 
 
@@ -198,16 +325,52 @@ def _format(o) -> None:
             _write_lit(cstr("False"), 5)
     elif tag == 2:                  # PY_TYPE_INT
         _format_int(o)
+    elif tag == 3:                  # PY_TYPE_FLOAT
+        _format_float(o)
     elif tag == 4:                  # PY_TYPE_STR
         _format_str(o)
+    elif tag == 17:                 # PY_TYPE_BYTES
+        _format_bytes(o)
+    elif tag == 18:                 # PY_TYPE_BYTEARRAY
+        _format_bytearray(o)
     elif tag == 5:                  # PY_TYPE_LIST
         _format_list(o)
     elif tag == 7:                  # PY_TYPE_TUPLE
         _format_tuple(o)
+    elif tag == 6:                  # PY_TYPE_DICT
+        _format_dict(o)
+    elif tag == 8:                  # PY_TYPE_SET
+        _format_set(o)
+    elif tag == 20:                 # PY_TYPE_COROUTINE
+        _write_lit(cstr("<coroutine object>"), 18)
+    elif tag == 29:                 # PY_TYPE_CONTINUATION
+        _write_lit(cstr("<continuation object>"), 21)
+    elif tag == 30:                 # PY_TYPE_VIRTUAL_THREAD
+        _write_lit(cstr("<virtual thread object>"), 23)
+    elif tag == 12:                 # PY_TYPE_EXC
+        # str(exc) is the str of its single message value (CPython: the
+        # exception args). py_exc_get_message returns a borrowed ref, so
+        # no decref here; an arg-less exception (NULL message) renders as
+        # the empty string. KeyError's repr-quoting of the key is a
+        # separate, pre-existing gap shared with the traceback printer.
+        msg = py_exc_get_message(o)
+        if ptr_is_null(msg) == 0:
+            _format(msg)
     else:
-        _write_lit(cstr("<object tag="), 12)
-        _write_i64(tag)
-        _write_lit(cstr(">"), 1)
+        # User-class instances and other objects: str(x) routes through
+        # py_obj_str, which dispatches __str__ (then __repr__). This is what
+        # print() uses in CPython; without it print(<instance>) rendered the
+        # opaque "<object tag=N>" even when the class defines __str__. A NULL
+        # result (no __str__/__repr__) falls back to the libpython hook then
+        # "<object tag=N>".
+        s = py_obj_str(o)
+        if ptr_is_null(s) == 0:
+            _format_str(s)
+            py_decref(s)
+        elif py_format_try_cpy_object_into_fd(1, o, tag) == 0:
+            _write_lit(cstr("<object tag="), 12)
+            _write_i64(tag)
+            _write_lit(cstr(">"), 1)
 
 
 @c_abi_export("py_print")
@@ -246,6 +409,6 @@ def py_print_many(args_tuple, sep, end) -> None:
     while i < length:
         if i > 0:
             write(1, sep_data, sep_len)
-        _format(load_ptr(args_tuple, 24 + i * 8))
+        _format(pcc_gc_load_ptr(args_tuple, ptr_add(args_tuple, 24 + i * 8)))
         i = i + 1
     write(1, end_data, end_len)

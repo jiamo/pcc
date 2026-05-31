@@ -16,8 +16,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .py_ast import (
+    Attr,
     BoolType,
+    ByteArrayType,
+    BytesType,
     ClassType,
+    ComplexType,
     DictType,
     DynType,
     Expr,
@@ -26,6 +30,7 @@ from .py_ast import (
     IntType,
     ListType,
     ListExpr,
+    MemoryViewType,
     Name,
     NoneLit,
     NoneType,
@@ -49,9 +54,13 @@ from .py_ast import (
 
 TYPE_INT: IntType = IntType(name="int", width=64, signed=True)
 TYPE_FLOAT: FloatType = FloatType(name="float", width=64)
+TYPE_COMPLEX: ComplexType = ComplexType(name="complex")
 TYPE_BOOL: BoolType = BoolType(name="bool")
 TYPE_NONE: NoneType = NoneType(name="None")
 TYPE_STR: StrType = StrType(name="str")
+TYPE_BYTES: BytesType = BytesType(name="bytes")
+TYPE_BYTEARRAY: ByteArrayType = ByteArrayType(name="bytearray")
+TYPE_MEMORYVIEW: MemoryViewType = MemoryViewType(name="memoryview")
 TYPE_DYN: DynType = DynType(name="dyn")
 
 
@@ -101,8 +110,12 @@ class PyFrontendError(Exception):
 _BUILTIN_NAMED_TYPES: dict[str, Type] = {
     "int": TYPE_INT,
     "float": TYPE_FLOAT,
+    "complex": TYPE_COMPLEX,
     "bool": TYPE_BOOL,
     "str": TYPE_STR,
+    "bytes": TYPE_BYTES,
+    "bytearray": TYPE_BYTEARRAY,
+    "memoryview": TYPE_MEMORYVIEW,
     "None": TYPE_NONE,
     "NoneType": TYPE_NONE,
     "object": TYPE_DYN,
@@ -119,6 +132,38 @@ def _name_ident(expr: Expr) -> Optional[str]:
     return None
 
 
+def _dotted_name(expr: Expr) -> Optional[str]:
+    ident = _name_ident(expr)
+    if ident is not None:
+        return ident
+    if isinstance(expr, Attr):
+        prefix = _dotted_name(expr.obj)
+        if prefix:
+            return prefix + "." + expr.name
+    return None
+
+
+def _class_type_from_dotted(name: str) -> ClassType:
+    if "." in name:
+        last_dot = -1
+        i = 0
+        while i < len(name):
+            if name[i] == ".":
+                last_dot = i
+            i += 1
+        module = name[:last_dot]
+        leaf = name[last_dot + 1:]
+        return ClassType(name=leaf, module=module, fields=(), bases=())
+    return ClassType(name=name, module="", fields=(), bases=())
+
+
+def _parse_string_annotation(text: str) -> Optional[Type]:
+    text = text.strip()
+    if text.startswith("Optional[") and text.endswith("]"):
+        return _class_type_from_dotted(text[len("Optional["):-1].strip())
+    return None
+
+
 def parse_annotation(expr: Expr) -> Type:
     """Convert a Python annotation AST node into a ``Type`` instance.
 
@@ -132,19 +177,22 @@ def parse_annotation(expr: Expr) -> Type:
     """
 
     # Bare name annotation: int, float, bool, str, None, MyClass, ...
-    ident = _name_ident(expr)
+    ident = _dotted_name(expr)
     if ident is not None:
         if ident in _BUILTIN_NAMED_TYPES:
             return _BUILTIN_NAMED_TYPES[ident]
         # User-defined class name — we do not have the class body yet in
         # Phase 1, so record it as a ClassType with no fields/bases.  The
         # inference pass can refine later once class defs are collected.
-        return ClassType(name=ident, module="", fields=(), bases=())
+        return _class_type_from_dotted(ident)
 
     if isinstance(expr, StrLit) and expr.value:
+        parsed = _parse_string_annotation(expr.value)
+        if parsed is not None:
+            return parsed
         if expr.value in _BUILTIN_NAMED_TYPES:
             return _BUILTIN_NAMED_TYPES[expr.value]
-        return ClassType(name=expr.value, module="", fields=(), bases=())
+        return _class_type_from_dotted(expr.value)
 
     # A NoneLit used as an annotation (``-> None`` parses that way in some
     # frontends; robustness only).
@@ -153,7 +201,7 @@ def parse_annotation(expr: Expr) -> Type:
 
     # Subscripted generic: list[int], dict[str, int], tuple[int, str], ...
     if isinstance(expr, Subscript):
-        head = _name_ident(expr.obj)
+        head = _dotted_name(expr.obj)
         idx = expr.idx
 
         # Collect the index expressions (Subscript holds a single Expr; for
@@ -186,10 +234,21 @@ def parse_annotation(expr: Expr) -> Type:
                 elems=tuple(parse_annotation(e) for e in idx_exprs),
             )
 
-        if head == "Optional":
+        if head in ("Optional", "typing.Optional"):
             if len(idx_exprs) == 1:
                 # Phase 1: drop the optionality, keep the payload type.
                 return parse_annotation(idx_exprs[0])
+            return TYPE_DYN
+
+        if head in ("Union", "typing.Union"):
+            non_none = []
+            for e in idx_exprs:
+                parsed = parse_annotation(e)
+                if isinstance(parsed, NoneType):
+                    continue
+                non_none.append(e)
+            if len(non_none) == 1:
+                return parse_annotation(non_none[0])
             return TYPE_DYN
 
         if head == "Callable":
@@ -222,6 +281,37 @@ def parse_annotation(expr: Expr) -> Type:
 # ---------------------------------------------------------------------------
 
 
+def _type_name(ty: Type) -> str:
+    try:
+        return ty.name
+    except AttributeError:
+        return ""
+
+
+def _class_type_module(ty: Type) -> str:
+    try:
+        module = ty.module
+    except AttributeError:
+        return ""
+    return module or ""
+
+
+def _class_type_fields(ty: Type):
+    try:
+        fields = ty.fields
+    except AttributeError:
+        return ()
+    return fields or ()
+
+
+def _class_type_bases(ty: Type):
+    try:
+        bases = ty.bases
+    except AttributeError:
+        return ()
+    return bases or ()
+
+
 def type_eq(a: Type, b: Type) -> bool:
     """Structural equality on ``Type`` instances.
 
@@ -236,7 +326,11 @@ def type_eq(a: Type, b: Type) -> bool:
         a.name == "int"
         or a.name == "float"
         or a.name == "bool"
+        or a.name == "complex"
         or a.name == "str"
+        or a.name == "bytes"
+        or a.name == "bytearray"
+        or a.name == "memoryview"
         or a.name == "None"
         or a.name == "dyn"
     )
@@ -250,6 +344,12 @@ def type_eq(a: Type, b: Type) -> bool:
         if not (isinstance(a, FloatType) and isinstance(b, FloatType)):
             return False
         return a.name == b.name
+    if isinstance(a, ComplexType) or isinstance(b, ComplexType):
+        return (
+            isinstance(a, ComplexType)
+            and isinstance(b, ComplexType)
+            and a.name == b.name
+        )
     if isinstance(a, BoolType) or isinstance(b, BoolType):
         return (
             isinstance(a, BoolType)
@@ -266,6 +366,24 @@ def type_eq(a: Type, b: Type) -> bool:
         return (
             isinstance(a, StrType)
             and isinstance(b, StrType)
+            and a.name == b.name
+        )
+    if isinstance(a, BytesType) or isinstance(b, BytesType):
+        return (
+            isinstance(a, BytesType)
+            and isinstance(b, BytesType)
+            and a.name == b.name
+        )
+    if isinstance(a, ByteArrayType) or isinstance(b, ByteArrayType):
+        return (
+            isinstance(a, ByteArrayType)
+            and isinstance(b, ByteArrayType)
+            and a.name == b.name
+        )
+    if isinstance(a, MemoryViewType) or isinstance(b, MemoryViewType):
+        return (
+            isinstance(a, MemoryViewType)
+            and isinstance(b, MemoryViewType)
             and a.name == b.name
         )
     if isinstance(a, DynType) or isinstance(b, DynType):
@@ -311,23 +429,29 @@ def type_eq(a: Type, b: Type) -> bool:
     if isinstance(a, ClassType) or isinstance(b, ClassType):
         if not (isinstance(a, ClassType) and isinstance(b, ClassType)):
             return False
+        a_name = _type_name(a)
+        b_name = _type_name(b)
+        a_fields = _class_type_fields(a)
+        b_fields = _class_type_fields(b)
+        a_bases = _class_type_bases(a)
+        b_bases = _class_type_bases(b)
         if (
-            a.name != b.name
-            or a.module != b.module
-            or len(a.fields) != len(b.fields)
-            or len(a.bases) != len(b.bases)
+            a_name != b_name
+            or _class_type_module(a) != _class_type_module(b)
+            or len(a_fields) != len(b_fields)
+            or len(a_bases) != len(b_bases)
         ):
             return False
         i = 0
-        while i < len(a.fields):
-            a_name, a_ty = a.fields[i]
-            b_name, b_ty = b.fields[i]
-            if a_name != b_name or not type_eq(a_ty, b_ty):
+        while i < len(a_fields):
+            a_field_name, a_ty = a_fields[i]
+            b_field_name, b_ty = b_fields[i]
+            if a_field_name != b_field_name or not type_eq(a_ty, b_ty):
                 return False
             i += 1
         i = 0
-        while i < len(a.bases):
-            if not type_eq(a.bases[i], b.bases[i]):
+        while i < len(a_bases):
+            if not type_eq(a_bases[i], b_bases[i]):
                 return False
             i += 1
         return True
@@ -341,7 +465,7 @@ def is_numeric(t: Type) -> bool:
     subclass of ``int``.  ``DynType`` is *not* numeric — dynamic operands
     force a dynamic result.
     """
-    return isinstance(t, (IntType, FloatType, BoolType))
+    return isinstance(t, (IntType, FloatType, BoolType, ComplexType))
 
 
 def _is_int_like(t: Type) -> bool:
@@ -362,6 +486,8 @@ def common_type(a: Type, b: Type) -> Type:
     """
 
     # Float wins over anything int-like.
+    if isinstance(a, ComplexType) or isinstance(b, ComplexType):
+        return TYPE_COMPLEX
     if isinstance(a, FloatType) and isinstance(b, FloatType):
         return FloatType(name="float", width=max(a.width, b.width))
     if isinstance(a, FloatType) and _is_int_like(b):
@@ -395,9 +521,13 @@ def common_type(a: Type, b: Type) -> Type:
 __all__ = [
     "TYPE_INT",
     "TYPE_FLOAT",
+    "TYPE_COMPLEX",
     "TYPE_BOOL",
     "TYPE_NONE",
     "TYPE_STR",
+    "TYPE_BYTES",
+    "TYPE_BYTEARRAY",
+    "TYPE_MEMORYVIEW",
     "TYPE_DYN",
     "PyFrontendError",
     "parse_annotation",

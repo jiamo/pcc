@@ -73,7 +73,7 @@ import llvmlite.binding as llvm
 
 _DEFINE_HEADER_RE = re.compile(
     r"""
-    ^(?P<prefix>\s*define\s+(?:\w+\s+)*[\w\*<>\s]+?\s+@)
+    ^(?P<prefix>\s*define\s+.+?\s+@)
     (?P<name>[\w\.]+)\s*
     \((?P<args>[^)]*)\)
     (?P<trailing>[^{\n]*)
@@ -573,10 +573,9 @@ def _parse_function(lines: list[str], start: int) -> tuple[Function, int]:
                 fn.blocks.append(current_block)
             elif current_block is not None and current_block.name == "entry" \
                 and not current_block.instructions:
-                # Empty "entry" placeholder — discard only if we found
-                # a real named entry label.
-                if lm.group(1) != "entry":
-                    fn.blocks.append(current_block)
+                # Empty synthetic entry placeholder. LLVM functions may
+                # legally start with any block label, not only "entry".
+                pass
             current_block = BasicBlock(
                 name=lm.group(1),
                 label_line=line,

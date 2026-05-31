@@ -101,6 +101,7 @@ _COMPILE_CACHE_VERSION = "v4"
 _CHEAP_LLVM_PIPELINE_ENV = "PCC_CHEAP_LLVM_PIPELINE"
 _PASS_DISABLE_ENV = "PCC_DISABLE_PASSES"
 _LLVM_TEXT_PIPELINE_ENV = "PCC_LLVM_PIPELINE"
+_LLVM_PIPELINE_TRANSPORT_ENV = "PCC_LLVM_PIPELINE_TRANSPORT"
 _LLVM_DISABLE_PASSES_ENV = "PCC_LLVM_DISABLE_PASSES"
 _LLVM_OPT_BIN_ENV = "PCC_LLVM_OPT_BIN"
 _DEFAULT_CHEAP_LLVM_PASSES = (
@@ -190,8 +191,9 @@ def _resolve_cheap_llvm_pipeline_passes(raw_value=None):
 def _llvm_optimization_signature(opt_level, cheap_passes=None):
     pipeline_spec = _resolve_external_llvm_pipeline_spec(opt_level)
     if pipeline_spec:
+        transport = _resolve_llvm_pipeline_transport()
         disabled = ",".join(_resolve_disabled_llvm_passes())
-        signature_source = f"{pipeline_spec}\0{disabled}"
+        signature_source = f"{pipeline_spec}\0{transport}\0{disabled}"
         digest = hashlib.sha256(signature_source.encode("utf-8")).hexdigest()[:16]
         return f"LLVMPIPE:{digest}"
     if opt_level > 0:
@@ -288,6 +290,20 @@ def _resolve_external_llvm_pipeline_spec(opt_level, raw_value=None):
     return value
 
 
+def _resolve_llvm_pipeline_transport(raw_value=None):
+    if raw_value is None:
+        raw_value = os.environ.get(_LLVM_PIPELINE_TRANSPORT_ENV, "")
+    value = str(raw_value or "").strip().lower()
+    if value in {"", "text"}:
+        return "text"
+    if value == "memory":
+        return "memory"
+    raise RuntimeError(
+        f"{_LLVM_PIPELINE_TRANSPORT_ENV} must be 'text' or 'memory', "
+        f"got {raw_value!r}"
+    )
+
+
 def _resolve_external_llvm_pipeline(opt_level, pass_ctx=None):
     spec = _resolve_external_llvm_pipeline_spec(opt_level)
     if not spec:
@@ -328,7 +344,63 @@ def _resolve_external_llvm_pipeline(opt_level, pass_ctx=None):
     }
 
 
+def _resolve_memory_llvm_pipeline(opt_level, pass_ctx=None):
+    spec = _resolve_external_llvm_pipeline_spec(opt_level)
+    if not spec:
+        return None
+
+    from ..passes.llvm_text_pipeline import (
+        default_pipeline_spec,
+        default_profile_pass_names,
+        expand_pipeline,
+        find_opt_binary,
+        leaf_pass_names,
+        parse_pipeline,
+        prune_disabled_passes,
+        serialize_pipeline,
+    )
+
+    disabled = set(_resolve_disabled_llvm_passes())
+    if pass_ctx is not None:
+        disabled.update(pass_ctx.disabled_passes)
+
+    expanded = ""
+    if disabled:
+        opt_binary = find_opt_binary(os.environ.get(_LLVM_OPT_BIN_ENV))
+        if not opt_binary:
+            raise RuntimeError(
+                f"{_LLVM_PIPELINE_TRANSPORT_ENV}=memory with disabled LLVM "
+                "passes requires an LLVM opt binary to expand and prune the "
+                f"pipeline; set {_LLVM_OPT_BIN_ENV} or remove disabled passes"
+            )
+        expanded = expand_pipeline(opt_binary, spec)
+        nodes = parse_pipeline(expanded)
+        pruned = prune_disabled_passes(nodes, disabled)
+        pipeline_text = serialize_pipeline(pruned)
+        all_passes = leaf_pass_names(nodes)
+        active_passes = leaf_pass_names(pruned)
+    else:
+        pipeline_text = spec
+        if spec == default_pipeline_spec(opt_level):
+            all_passes = default_profile_pass_names(opt_level)
+        else:
+            all_passes = leaf_pass_names(parse_pipeline(spec))
+        active_passes = all_passes
+
+    return {
+        "spec": spec,
+        "expanded": expanded,
+        "all_passes": all_passes,
+        "active_passes": active_passes,
+        "pipeline_text": pipeline_text,
+        "profile_name": f"llvm-memory-pipeline[{spec}]",
+    }
+
+
 def _apply_external_llvm_pipeline_to_text(ir_text, opt_level, pass_ctx=None):
+    if _resolve_llvm_pipeline_transport() == "memory":
+        return _apply_memory_llvm_pipeline_to_text(ir_text, opt_level, pass_ctx)
+
     resolved = _resolve_external_llvm_pipeline(opt_level, pass_ctx=pass_ctx)
     if resolved is None:
         return ir_text, None
@@ -363,6 +435,47 @@ def _apply_external_llvm_pipeline_to_text(ir_text, opt_level, pass_ctx=None):
             "llvm",
             f"{len(resolved['active_passes'])} concrete LLVM passes via "
             f"{os.path.basename(resolved['opt_binary'])}",
+        )
+
+    return ir_text, status
+
+
+def _apply_memory_llvm_pipeline_to_text(ir_text, opt_level, pass_ctx=None):
+    resolved = _resolve_memory_llvm_pipeline(opt_level, pass_ctx=pass_ctx)
+    if resolved is None:
+        return ir_text, None
+
+    skipped = tuple(
+        pass_name
+        for pass_name in resolved["all_passes"]
+        if pass_name not in resolved["active_passes"]
+    )
+
+    t0 = time.monotonic()
+    if resolved["pipeline_text"]:
+        from ..llvm_capi import binding as llvm_capi_binding
+
+        ir_text = llvm_capi_binding.run_passes_on_ir(
+            ir_text,
+            resolved["pipeline_text"],
+        )
+        status = "llvm-memory-pipeline"
+    else:
+        status = "llvm-memory-pipeline-empty"
+    elapsed_ms = round((time.monotonic() - t0) * 1000, 3)
+
+    if pass_ctx is not None:
+        for pass_name in skipped:
+            pass_ctx.note_pass_skip(pass_name, "llvm", "disabled")
+        for pass_name in resolved["active_passes"]:
+            pass_ctx.note_pass_run(pass_name, "llvm", 0.0)
+        pass_ctx.note_pass_run(resolved["profile_name"], "llvm", elapsed_ms)
+        pass_ctx.record(
+            resolved["profile_name"],
+            "ran",
+            "llvm",
+            f"{len(resolved['active_passes'])} concrete LLVM passes via "
+            "LLVMRunPasses",
         )
 
     return ir_text, status
@@ -424,6 +537,7 @@ def _compile_cache_key(
     preprocessed_source,
     frontend_opt_level=None,
     backend_sig=None,
+    target_triple=None,
 ):
     hasher = hashlib.sha256()
     pass_signature = _pass_selection_signature()
@@ -432,6 +546,7 @@ def _compile_cache_key(
         _COMPILER_CACHE_FINGERPRINT,
         pass_signature,
         backend_sig or backend_signature(None),
+        target_triple or "",
         "" if frontend_opt_level is None else str(int(frontend_opt_level)),
         unit_name or "",
         preprocessed_source,
@@ -1051,6 +1166,7 @@ def _compile_preprocessed_translation_unit_artifact(
     pass_pipeline=None,
     pass_ctx=None,
     frontend_opt_level=None,
+    target_triple=None,
 ):
     from ..passes import PassContext, PassPipeline
 
@@ -1074,6 +1190,11 @@ def _compile_preprocessed_translation_unit_artifact(
         translation_unit_name=unit_name, emit_debug=emit_debug,
         pass_ctx=pass_ctx,
     )
+    if target_triple:
+        llvm.initialize_all_targets()
+        llvm.initialize_all_asmprinters()
+        target_machine = llvm.Target.from_triple(target_triple).create_target_machine()
+        codegen.set_target_machine(target_triple, target_machine)
     codegen.generate_code(ast)
 
     ir_text = postprocess_ir_text(str(codegen.module))
@@ -1126,6 +1247,7 @@ def _compile_translation_unit_artifact_job(
     use_compile_cache,
     frontend_opt_level=None,
     backend_sig=None,
+    target_triple=None,
 ):
     unit_base_dir = os.path.dirname(unit.path) if unit.path else base_dir
     codestr = _preprocess_translation_unit_source(
@@ -1143,6 +1265,7 @@ def _compile_translation_unit_artifact_job(
             codestr,
             frontend_opt_level=frontend_opt_level,
             backend_sig=backend_sig,
+            target_triple=target_triple,
         )
         cached = _load_compiled_artifact(normalized_cache_dir, cache_key)
         if cached is not None:
@@ -1151,6 +1274,7 @@ def _compile_translation_unit_artifact_job(
             unit.name,
             codestr,
             frontend_opt_level=frontend_opt_level,
+            target_triple=target_triple,
         )
         _store_compiled_artifact(normalized_cache_dir, cache_key, artifact)
         return artifact
@@ -1159,6 +1283,7 @@ def _compile_translation_unit_artifact_job(
         unit.name,
         codestr,
         frontend_opt_level=frontend_opt_level,
+        target_triple=target_triple,
     )
 
 
@@ -1166,6 +1291,7 @@ def _invoke_compile_preprocessed_translation_unit_artifact(
     unit_name,
     codestr,
     frontend_opt_level=None,
+    target_triple=None,
 ):
     """Call the compile helper with backward-compatible monkeypatch support.
 
@@ -1177,7 +1303,7 @@ def _invoke_compile_preprocessed_translation_unit_artifact(
     narrow wrappers.
     """
     fn = _compile_preprocessed_translation_unit_artifact
-    if frontend_opt_level is None:
+    if frontend_opt_level is None and target_triple is None:
         return fn(unit_name, codestr)
 
     try:
@@ -1189,12 +1315,17 @@ def _invoke_compile_preprocessed_translation_unit_artifact(
         param.kind == inspect.Parameter.VAR_KEYWORD
         for param in params.values()
     )
-    if supports_frontend_opt_level:
-        return fn(
-            unit_name,
-            codestr,
-            frontend_opt_level=frontend_opt_level,
-        )
+    supports_target_triple = "target_triple" in params or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in params.values()
+    )
+    kwargs = {}
+    if frontend_opt_level is not None and supports_frontend_opt_level:
+        kwargs["frontend_opt_level"] = frontend_opt_level
+    if target_triple is not None and supports_target_triple:
+        kwargs["target_triple"] = target_triple
+    if kwargs:
+        return fn(unit_name, codestr, **kwargs)
     return fn(unit_name, codestr)
 
 
@@ -1298,6 +1429,10 @@ class CEvaluator(object):
         self.parser = make_c_parser()
         self.target_triple = target_triple or llvm.get_default_triple()
         self.target = llvm.Target.from_triple(self.target_triple)
+        self.codegen.set_target_machine(
+            self.target_triple,
+            self.target.create_target_machine(),
+        )
         self.is_cross = target_triple is not None and target_triple != llvm.get_default_triple()
         self.ee = None
         self._bound_modules = []
@@ -1567,6 +1702,7 @@ class CEvaluator(object):
                     use_compile_cache,
                     frontend_opt_level,
                     self.backend_sig,
+                    self.target_triple,
                 )
                 for unit in units
             ]
@@ -1585,6 +1721,7 @@ class CEvaluator(object):
                     repeat(use_compile_cache),
                     repeat(frontend_opt_level),
                     repeat(self.backend_sig),
+                    repeat(self.target_triple),
                 )
             )
 

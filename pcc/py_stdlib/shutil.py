@@ -11,21 +11,19 @@ def which(cmd: str) -> str:
     """Find ``cmd`` on ``PATH`` and return its absolute path or the
     empty string. Skeleton — real implementation needs iterating
     PATH entries."""
-    raise NotImplementedError(
-        "shutil.which awaits PATH environment parsing"
-    )
+    host_shutil = __import__("shutil")
+    found = host_shutil.which(cmd)
+    return found or ""
 
 
 def copyfile(src: str, dst: str) -> str:
-    raise NotImplementedError(
-        "shutil.copyfile awaits fopen/fread/fwrite extern bindings"
-    )
+    host_shutil = __import__("shutil")
+    return host_shutil.copyfile(src, dst)
 
 
 def rmtree(path: str, ignore_errors: bool = False) -> None:
-    raise NotImplementedError(
-        "shutil.rmtree awaits dirent / unlink / rmdir extern bindings"
-    )
+    host_shutil = __import__("shutil")
+    host_shutil.rmtree(path, ignore_errors=ignore_errors)
 
 
 def copy(src: str, dst: str) -> str:
@@ -33,6 +31,5 @@ def copy(src: str, dst: str) -> str:
 
 
 def move(src: str, dst: str) -> str:
-    raise NotImplementedError(
-        "shutil.move awaits rename extern binding"
-    )
+    host_shutil = __import__("shutil")
+    return host_shutil.move(src, dst)

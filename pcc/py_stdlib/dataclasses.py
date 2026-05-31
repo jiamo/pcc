@@ -10,21 +10,24 @@ under CPython before pcc's class_gen picks them up.
 from __future__ import annotations
 
 
-MISSING = object()
+_host_dataclasses = __import__("dataclasses")
+
+MISSING = _host_dataclasses.MISSING
 
 
 def field(default=MISSING, default_factory=MISSING, init=True, repr=True,
           compare=True, kw_only=False):
-    class _Field:
-        pass
-    f = _Field()
-    f.default = default
-    f.default_factory = default_factory
-    f.init = init
-    f.repr = repr
-    f.compare = compare
-    f.kw_only = kw_only
-    return f
+    kwargs = {
+        "init": init,
+        "repr": repr,
+        "compare": compare,
+        "kw_only": kw_only,
+    }
+    if default is not MISSING:
+        kwargs["default"] = default
+    if default_factory is not MISSING:
+        kwargs["default_factory"] = default_factory
+    return _host_dataclasses.field(**kwargs)
 
 
 class _DataclassFactory:
@@ -58,69 +61,38 @@ def dataclass(cls=None, init=True, repr=True, eq=True, frozen=False,
               kw_only=False, slots=False, order=False, unsafe_hash=False):
     """``@dataclass`` — synthesize ``__init__``, ``__repr__``, ``__eq__``
     from the class-level annotations."""
-    if cls is None:
-        return _DataclassFactory(
-            init=init,
-            repr=repr,
-            eq=eq,
-            frozen=frozen,
-            kw_only=kw_only,
-            slots=slots,
-            order=order,
-            unsafe_hash=unsafe_hash,
-        )
-
-    ann = getattr(cls, "__annotations__", {})
-    field_names = list(ann.keys())
-
-    if init and "__init__" not in cls.__dict__:
-        params = ", ".join(field_names)
-        body = "\n".join(
-            f"    self.{n} = {n}" for n in field_names
-        ) or "    pass"
-        src = f"def __init__(self, {params}):\n{body}\n"
-        ns: dict = {}
-        exec(src, ns)
-        cls.__init__ = ns["__init__"]
-
-    if repr and "__repr__" not in cls.__dict__:
-        def __repr__(self, _field_names=field_names):
-            parts = ", ".join(
-                f"{n}={getattr(self, n)!r}" for n in _field_names
-            )
-            return f"{type(self).__name__}({parts})"
-        cls.__repr__ = __repr__
-
-    if eq and "__eq__" not in cls.__dict__:
-        def __eq__(self, other, _field_names=field_names):
-            if type(other) is not type(self):
-                return NotImplemented
-            for n in _field_names:
-                if getattr(self, n) != getattr(other, n):
-                    return False
-            return True
-        cls.__eq__ = __eq__
-
-    return cls
-
-
-def fields(class_or_instance):
-    ann = getattr(class_or_instance, "__annotations__", {})
-    out = []
-    for name, ty in ann.items():
-        f = field()
-        f.name = name
-        f.type = ty
-        out.append(f)
-    return out
-
-
-def is_dataclass(obj):
-    return hasattr(obj, "__dataclass_fields__") or hasattr(
-        type(obj), "__dataclass_fields__",
+    return _host_dataclasses.dataclass(
+        cls,
+        init=init,
+        repr=repr,
+        eq=eq,
+        frozen=frozen,
+        kw_only=kw_only,
+        slots=slots,
+        order=order,
+        unsafe_hash=unsafe_hash,
     )
 
 
+def fields(class_or_instance):
+    return _host_dataclasses.fields(class_or_instance)
+
+
+def is_dataclass(obj):
+    return _host_dataclasses.is_dataclass(obj)
+
+
 def asdict(obj):
-    ann = getattr(type(obj), "__annotations__", {})
-    return {n: getattr(obj, n) for n in ann}
+    return _host_dataclasses.asdict(obj)
+
+
+def astuple(obj):
+    return _host_dataclasses.astuple(obj)
+
+
+def replace(obj, **changes):
+    return _host_dataclasses.replace(obj, **changes)
+
+
+def make_dataclass(cls_name: str, fields, **kwargs):
+    return _host_dataclasses.make_dataclass(cls_name, fields, **kwargs)

@@ -38,6 +38,7 @@ from .dominator_tree import CFG
 from .ir_mutator import Instruction, MutableModule
 from .loop_info import compute_loop_info
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
+from .simplifycfg import _split_functions
 
 
 _PHI_RE = re.compile(
@@ -76,40 +77,65 @@ class IndVarSimplifyPass(ModulePass):
 
 def indvars_text(ir_text: str) -> tuple[str, bool]:
     """Merge isomorphic IVs within each basic block."""
-    # Group phis by block, then pair up IVs with matching (start, step).
-    # 1. Collect phi incomings per name.
-    phi_incomings: dict[str, list[tuple[str, str]]] = {}
-    phi_types: dict[str, str] = {}
+    text, changed = _merge_isomorphic_ivs_by_function(ir_text)
+
+    text, lcssa_changed = _insert_single_pred_exit_lcssa(text)
+    text, flags_changed = _mark_simple_iv_increments_no_wrap(text)
+    text, smax_changed = _rewrite_simple_iv_exit_to_smax(text)
+    return text, changed or lcssa_changed or flags_changed or smax_changed
+
+
+def _merge_isomorphic_ivs_by_function(ir_text: str) -> tuple[str, bool]:
+    out: list[str] = []
+    changed = False
+    for is_function, chunk in _split_functions(ir_text):
+        if not is_function:
+            out.append(chunk)
+            continue
+        new_chunk, local = _merge_isomorphic_ivs_in_function(chunk)
+        out.append(new_chunk)
+        changed = changed or local
+    if not changed:
+        return ir_text, False
+    return "".join(out), True
+
+
+def _merge_isomorphic_ivs_in_function(fn_text: str) -> tuple[str, bool]:
     incoming_re = re.compile(
         r"\[\s*(?P<val>[^,\]]+?)\s*,\s*%(?P<block>[\w\.]+)\s*\]"
     )
-    for line in ir_text.splitlines():
+    block_label_re = re.compile(r"^(?P<label>[\w\.\-]+):(?:\s*;.*)?$")
+    current_block = ""
+    phi_incomings: dict[str, list[tuple[str, str]]] = {}
+    phi_types: dict[str, str] = {}
+    phi_blocks: dict[str, str] = {}
+    for line in fn_text.splitlines():
+        stripped = line.strip()
+        label = block_label_re.match(stripped)
+        if label is not None:
+            current_block = label.group("label")
+            continue
         m = _PHI_RE.match(line.rstrip("\n"))
         if not m:
             continue
-        phi_types[m.group("name")] = m.group("ty")
-        phi_incomings[m.group("name")] = [
+        phi_name = m.group("name")
+        phi_types[phi_name] = m.group("ty")
+        phi_blocks[phi_name] = current_block
+        phi_incomings[phi_name] = [
             (g.group("val").strip(), g.group("block"))
             for g in incoming_re.finditer(m.group("rest"))
         ]
 
-    # 2. Collect inc patterns: %n.next = add ty, %phi_name, step.
     inc_map: dict[str, tuple[str, int]] = {}
-    for line in ir_text.splitlines():
+    for line in fn_text.splitlines():
         m = _INC_RE.match(line.rstrip("\n"))
         if not m:
             continue
-        # Only track increments whose LHS phi is known.
         if m.group("iv") not in phi_incomings:
             continue
         inc_map[m.group("name")] = (m.group("iv"), int(m.group("step")))
 
-    # 3. For each phi, identify its "signature": (start_const, step).
-    # The start_const is the incoming whose block is the preheader
-    # (non-latch). We approximate: the incoming that's a literal
-    # integer constant is the start. The other incoming should be
-    # a %X.next that maps via inc_map to the same phi.
-    signatures: dict[str, tuple[int, int, str]] = {}
+    signatures: dict[str, tuple[str, int, int, str]] = {}
     for phi_name, incomings in phi_incomings.items():
         start_val: int | None = None
         step_from_latch: int | None = None
@@ -124,64 +150,61 @@ def indvars_text(ir_text: str) -> tuple[str, bool]:
                     if iv == phi_name:
                         step_from_latch = step
         if start_val is not None and step_from_latch is not None:
-            signatures[phi_name] = (start_val, step_from_latch, ty)
+            signatures[phi_name] = (
+                phi_blocks.get(phi_name, ""),
+                start_val,
+                step_from_latch,
+                ty,
+            )
+
+    groups: dict[tuple[str, int, int, str], list[str]] = {}
+    for name, sig in signatures.items():
+        groups.setdefault(sig, []).append(name)
 
     replacements: dict[str, str] = {}
-    drop_lines: set[int] = set()
-    if len(signatures) >= 2:
-        # 4. Group IVs by (start, step, ty). Keep one per group, replace
-        # the rest with the keeper.
-        groups: dict[tuple[int, int, str], list[str]] = {}
-        for name, sig in signatures.items():
-            groups.setdefault(sig, []).append(name)
-
-        for sig, members in groups.items():
-            if len(members) < 2:
+    for sig, members in groups.items():
+        if len(members) < 2:
+            continue
+        keeper = sorted(members)[0]
+        keeper_inc = next(
+            (inc_n for inc_n, (iv, step) in inc_map.items()
+             if iv == keeper and step == sig[2]),
+            None,
+        )
+        for dup in members:
+            if dup == keeper:
                 continue
-            keeper = sorted(members)[0]
-            # Find keeper's inc-name for mapping %dup.next uses.
-            keeper_inc = next(
+            replacements[dup] = keeper
+            dup_inc = next(
                 (inc_n for inc_n, (iv, step) in inc_map.items()
-                 if iv == keeper and step == sig[1]),
+                 if iv == dup and step == sig[2]),
                 None,
             )
-            for dup in members:
-                if dup == keeper:
-                    continue
-                replacements[dup] = keeper
-                dup_inc = next(
-                    (inc_n for inc_n, (iv, step) in inc_map.items()
-                     if iv == dup and step == sig[1]),
-                    None,
-                )
-                if dup_inc and keeper_inc:
-                    replacements[dup_inc] = keeper_inc
+            if dup_inc and keeper_inc:
+                replacements[dup_inc] = keeper_inc
 
-    text = ir_text
-    changed = False
+    if not replacements:
+        return fn_text, False
 
-    if replacements:
-        # 5. Drop duplicate phi + inc lines; substitute uses.
-        lines = ir_text.splitlines(keepends=True)
-        for idx, line in enumerate(lines):
-            m = _PHI_RE.match(line.rstrip("\n"))
-            if m and m.group("name") in replacements:
-                drop_lines.add(idx)
-                continue
-            m = _INC_RE.match(line.rstrip("\n"))
-            if m and m.group("name") in replacements:
-                drop_lines.add(idx)
+    drop_lines: set[int] = set()
+    lines = fn_text.splitlines(keepends=True)
+    for idx, line in enumerate(lines):
+        m = _PHI_RE.match(line.rstrip("\n"))
+        if m and m.group("name") in replacements:
+            drop_lines.add(idx)
+            continue
+        m = _INC_RE.match(line.rstrip("\n"))
+        if m and m.group("name") in replacements:
+            drop_lines.add(idx)
 
-        kept = [ln for i, ln in enumerate(lines) if i not in drop_lines]
-        text = "".join(kept)
-        for dup, keeper in replacements.items():
-            text = re.sub(r"%" + re.escape(dup) + r"(?![\w\.])", f"%{keeper}", text)
-        changed = True
-
-    text, lcssa_changed = _insert_single_pred_exit_lcssa(text)
-    text, flags_changed = _mark_simple_iv_increments_no_wrap(text)
-    text, smax_changed = _rewrite_simple_iv_exit_to_smax(text)
-    return text, changed or lcssa_changed or flags_changed or smax_changed
+    text = "".join(ln for i, ln in enumerate(lines) if i not in drop_lines)
+    for dup, keeper in replacements.items():
+        text = re.sub(
+            r"%" + re.escape(dup) + r"(?![\w\.])",
+            f"%{keeper}",
+            text,
+        )
+    return text, True
 
 
 def _insert_single_pred_exit_lcssa(ir_text: str) -> tuple[str, bool]:

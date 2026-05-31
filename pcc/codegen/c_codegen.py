@@ -10,7 +10,12 @@ from itertools import count
 # (PCC_USE_LLVMCAPI_C=1 opts into pcc.llvm_capi).
 from pcc.llvm_capi.compat import ir_c as ir
 IRBuilder = ir.IRBuilder
+from .c_varargs import (
+    build_report as _build_varargs_report,
+    postprocess_varargs_ir as _postprocess_varargs_ir,
+)
 from ..ast import c_ast as c_ast
+from pcc.c_libc_registry import LibcSignature, iter_signatures
 
 _logger = logging.getLogger("pcc.codegen")
 
@@ -383,6 +388,17 @@ LIBC_FUNCTIONS = {
     "__sync_bool_compare_and_swap": (int32_t, [voidptr_t, int64_t, int64_t], False),
     "__atomic_load_n": (int64_t, [voidptr_t, int32_t], False),
     "__atomic_store_n": (_VOID, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_add_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_sub_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_or_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_and_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_compare_exchange_n": (
+        int32_t,
+        [voidptr_t, voidptr_t, int64_t, int32_t, int32_t, int32_t],
+        False,
+    ),
+    "__atomic_test_and_set": (int32_t, [voidptr_t, int32_t], False),
+    "__atomic_clear": (_VOID, [voidptr_t, int32_t], False),
     "modf": (_double, [_double, ir.DoubleType().as_pointer()], False),
     "ldexp": (_double, [_double, int32_t], False),
     "__builtin_va_arg": (voidptr_t, [voidptr_t, int64_t], False),
@@ -399,6 +415,87 @@ LIBC_FUNCTIONS = {
     "freopen": (voidptr_t, [cstring, cstring, voidptr_t], False),
     "getc": (int32_t, [voidptr_t], False),
 }
+
+
+def _libc_registry_ir_type(type_name: str):
+    """Lower a declarative libc type into the c_codegen IR type universe.
+
+    The declarative registry intentionally stores portable C spelling.  This
+    adapter is the bridge that makes the registry affect the real C frontend
+    today without waiting for the full C1 codegen split.
+    """
+    raw = (type_name or "").strip()
+    clean = raw.replace("const ", "").replace("volatile ", "").strip()
+    clean = clean.replace("struct FILE", "FILE")
+    if clean == "...":
+        return None
+    pointer_depth = 0
+    while clean.endswith("*"):
+        pointer_depth += 1
+        clean = clean[:-1].strip()
+    base_map = {
+        "void": _VOID,
+        "char": int8_t,
+        "signed char": int8_t,
+        "unsigned char": int8_t,
+        "int": int32_t,
+        "signed int": int32_t,
+        "unsigned int": int32_t,
+        "long": int64_t,
+        "long int": int64_t,
+        "unsigned long": int64_t,
+        "long long": int64_t,
+        "unsigned long long": int64_t,
+        "size_t": _size_t,
+        "ssize_t": int64_t,
+        "time_t": _time_t,
+        "double": _double,
+        "float": _float,
+        "FILE": _FILE_ptr,
+    }
+    if pointer_depth == 0:
+        return base_map.get(clean, voidptr_t)
+    if clean == "char" and pointer_depth == 1:
+        return cstring
+    if clean == "FILE" and pointer_depth == 1:
+        return _FILE_ptr
+    ir_type = base_map.get(clean, int8_t)
+    if clean == "void":
+        ir_type = int8_t
+    while pointer_depth > 0:
+        ir_type = ir_type.as_pointer()
+        pointer_depth -= 1
+    return ir_type
+
+
+def _libc_registry_signature_to_codegen(sig: LibcSignature):
+    params = []
+    var_arg = False
+    for arg in sig.arg_types:
+        if arg.strip() == "...":
+            var_arg = True
+            continue
+        lowered = _libc_registry_ir_type(arg)
+        if lowered is not None:
+            params.append(lowered)
+    return (_libc_registry_ir_type(sig.return_type), params, var_arg)
+
+
+def refresh_libc_registry_from_declarative() -> int:
+    """Merge pcc.c_libc_registry into the real codegen libc map.
+
+    This function is intentionally callable by tests and future platform setup
+    code.  It replaces duplicate built-in entries with the declarative source
+    of truth and adds new signatures without touching call sites.
+    """
+    count = 0
+    for sig in iter_signatures():
+        LIBC_FUNCTIONS[sig.name] = _libc_registry_signature_to_codegen(sig)
+        count += 1
+    return count
+
+
+refresh_libc_registry_from_declarative()
 
 
 class _NewScopeCtx:
@@ -527,20 +624,35 @@ _PCC_VAARG_CALL_RE = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class IRTextRewrite:
+    name: str
+    count: int
+    reason: str
+
+    def as_dict(self):
+        return {
+            "name": self.name,
+            "count": self.count,
+            "reason": self.reason,
+        }
+
+
+def postprocess_ir_text_with_report(text):
+    """Apply textual lowering and return a structured rewrite report.
+
+    Delegates to :mod:`pcc.codegen.c_varargs` so the varargs lowering is no
+    longer buried in the 10k-line C codegen module (roadmap C1 split).
+    Returns ``(new_text, VarargsRewriteReport)``.
+    """
+    rewrites = []
+    new_text = _postprocess_varargs_ir(text, report=rewrites)
+    return new_text, _build_varargs_report(rewrites)
+
+
 def postprocess_ir_text(text):
     """Apply the minimal textual lowering that llvmlite cannot express directly."""
-
-    text = _PCC_VAARG_DECL_RE.sub("", text)
-
-    def repl(match):
-        lhs = match.group("lhs")
-        rettype = match.group("rettype")
-        argtype = match.group("argtype")
-        argval = match.group("argval")
-        return f"{lhs} = va_arg {argtype} {argval}, {rettype}"
-
-    text = _PCC_VAARG_CALL_RE.sub(repl, text)
-    return text
+    return _postprocess_varargs_ir(text)
 
 
 def get_ir_type_from_names(names):
@@ -867,6 +979,11 @@ class LLVMCodeGenerator(object):
 
         # Pass framework context (HighTier analysis results)
         self._pass_ctx = pass_ctx
+
+    def set_target_machine(self, triple, target_machine):
+        self.module.triple = triple
+        self.module.data_layout = str(target_machine.target_data)
+        self._target_data = target_machine.target_data
 
     def _get_var_alloc_strategy(self, var_name):
         """Query PassContext for the allocation strategy of a variable."""
@@ -4504,7 +4621,18 @@ class LLVMCodeGenerator(object):
             except Exception:
                 sym = None
             if isinstance(sym, ir.Function):
-                return sym if sym.type == ir_type else sym.bitcast(ir_type)
+                if sym.type == ir_type:
+                    return sym
+                try:
+                    return sym.bitcast(ir_type)
+                except AttributeError:
+                    # llvmlite Function values do not expose bitcast().
+                    # With opaque pointers, a function symbol is already a
+                    # valid ptr constant for object-pointer initializers such
+                    # as `void *p = fn` or `{ (void *)fn }`.
+                    if isinstance(ir_type, ir.PointerType):
+                        return sym
+                    return None
             if isinstance(sym, ir.GlobalVariable):
                 if isinstance(sym.value_type, ir.ArrayType):
                     return self._const_pointer_to_first_elem(sym, ir_type)
@@ -6950,7 +7078,7 @@ class LLVMCodeGenerator(object):
 
         self.builder.position_at_end(rhs_bb)
         rhs, _ = self.codegen(node.right)
-        rhs_bool = self._to_bool(rhs, "and_rhs")
+        rhs_bool = self._to_bool(rhs, "and_rhs_bool")
         rhs_result = self.builder.zext(rhs_bool, int64_t, "and_rhs_ext")
         rhs_bb_end = self.builder.block
         self.builder.branch(merge_bb)
@@ -6974,7 +7102,7 @@ class LLVMCodeGenerator(object):
 
         self.builder.position_at_end(rhs_bb)
         rhs, _ = self.codegen(node.right)
-        rhs_bool = self._to_bool(rhs, "or_rhs")
+        rhs_bool = self._to_bool(rhs, "or_rhs_bool")
         rhs_result = self.builder.zext(rhs_bool, int64_t, "or_rhs_ext")
         rhs_bb_end = self.builder.block
         self.builder.branch(merge_bb)
@@ -7025,12 +7153,12 @@ class LLVMCodeGenerator(object):
             self.codegen(node.init)
 
         # The builder is what? loop is a block which begin with loop
-        test_bb = self.builder.function.append_basic_block("test")
-        loop_bb = self.builder.function.append_basic_block("loop")
-        next_bb = self.builder.function.append_basic_block("next")
+        test_bb = self.builder.function.append_basic_block("__pcc_for_test")
+        loop_bb = self.builder.function.append_basic_block("__pcc_for_loop")
+        next_bb = self.builder.function.append_basic_block("__pcc_for_next")
 
         # append by name nor just add it
-        after_loop_label = self.new_label("afterloop")
+        after_loop_label = self.new_label("__pcc_for_afterloop")
         after_bb = self.builder.function.append_basic_block(after_loop_label)
 
         self.builder.branch(test_bb)
@@ -7686,6 +7814,20 @@ class LLVMCodeGenerator(object):
                 return self._codegen_builtin_atomic_load(node)
             if callee == "__atomic_store_n":
                 return self._codegen_builtin_atomic_store(node)
+            if callee == "__atomic_add_fetch":
+                return self._codegen_builtin_atomic_fetch_op(node, "add")
+            if callee == "__atomic_sub_fetch":
+                return self._codegen_builtin_atomic_fetch_op(node, "sub")
+            if callee == "__atomic_or_fetch":
+                return self._codegen_builtin_atomic_fetch_op(node, "or")
+            if callee == "__atomic_and_fetch":
+                return self._codegen_builtin_atomic_fetch_op(node, "and")
+            if callee == "__atomic_compare_exchange_n":
+                return self._codegen_builtin_atomic_compare_exchange(node)
+            if callee == "__atomic_test_and_set":
+                return self._codegen_builtin_atomic_test_and_set(node)
+            if callee == "__atomic_clear":
+                return self._codegen_builtin_atomic_clear(node)
         else:
             # Calling function pointer in struct: s.fn(args)
             call_args = []
@@ -8473,6 +8615,20 @@ class LLVMCodeGenerator(object):
             5: "seq_cst",    # __ATOMIC_SEQ_CST
         }.get(value, "monotonic")
 
+    def _atomic_rmw_ordering(self, node):
+        try:
+            value = self._eval_const_expr(node)
+        except Exception:
+            return "monotonic"
+        return {
+            0: "monotonic",  # __ATOMIC_RELAXED
+            1: "acquire",    # __ATOMIC_CONSUME
+            2: "acquire",    # __ATOMIC_ACQUIRE
+            3: "release",    # __ATOMIC_RELEASE
+            4: "acq_rel",    # __ATOMIC_ACQ_REL
+            5: "seq_cst",    # __ATOMIC_SEQ_CST
+        }.get(value, "monotonic")
+
     def _codegen_builtin_atomic_load(self, node):
         if not node.args or len(node.args.exprs) < 2:
             return ir.Constant(int64_t, 0), None
@@ -8500,6 +8656,113 @@ class LLVMCodeGenerator(object):
         align = max(1, self._ir_type_align(pointee_type))
         ordering = self._atomic_ordering(node.args.exprs[2], is_store=True)
         self.builder.store_atomic(value, ptr, ordering, align)
+        return ir.Constant(int64_t, 0), None
+
+    def _codegen_builtin_atomic_fetch_op(self, node, op):
+        if not node.args or len(node.args.exprs) < 3:
+            return ir.Constant(int64_t, 0), None
+        ptr, _ = self.codegen(node.args.exprs[0])
+        value, _ = self.codegen(node.args.exprs[1])
+        if not isinstance(getattr(ptr, "type", None), ir.PointerType):
+            return ir.Constant(int64_t, 0), None
+        pointee_type = ptr.type.pointee
+        if not isinstance(pointee_type, ir.IntType):
+            return ir.Constant(int64_t, 0), None
+        if value.type != pointee_type:
+            value = self._implicit_convert(value, pointee_type)
+        ordering = self._atomic_rmw_ordering(node.args.exprs[2])
+        old = self.builder.atomic_rmw(
+            op, ptr, value, ordering, name=f"atomic.{op}.old"
+        )
+        if op == "add":
+            result = self.builder.add(old, value, name="atomic.add.new")
+        elif op == "sub":
+            result = self.builder.sub(old, value, name="atomic.sub.new")
+        elif op == "or":
+            result = self.builder.or_(old, value, name="atomic.or.new")
+        elif op == "and":
+            result = self.builder.and_(old, value, name="atomic.and.new")
+        else:
+            result = old
+        if self._is_unsigned_pointee(ptr):
+            self._tag_unsigned(result)
+        return result, None
+
+    def _codegen_builtin_atomic_compare_exchange(self, node):
+        if not node.args or len(node.args.exprs) < 6:
+            return ir.Constant(int32_t, 0), None
+        ptr, _ = self.codegen(node.args.exprs[0])
+        expected_ptr, _ = self.codegen(node.args.exprs[1])
+        desired, _ = self.codegen(node.args.exprs[2])
+        if not isinstance(getattr(ptr, "type", None), ir.PointerType):
+            return ir.Constant(int32_t, 0), None
+        if not isinstance(getattr(expected_ptr, "type", None), ir.PointerType):
+            return ir.Constant(int32_t, 0), None
+        pointee_type = ptr.type.pointee
+        if not isinstance(pointee_type, ir.IntType):
+            return ir.Constant(int32_t, 0), None
+        expected = self._safe_load(expected_ptr)
+        if expected.type != pointee_type:
+            expected = self._implicit_convert(expected, pointee_type)
+        if desired.type != pointee_type:
+            desired = self._implicit_convert(desired, pointee_type)
+        success_order = self._atomic_rmw_ordering(node.args.exprs[4])
+        failure_order = self._atomic_ordering(node.args.exprs[5], is_store=False)
+        pair = self.builder.cmpxchg(
+            ptr,
+            expected,
+            desired,
+            success_order,
+            failure_order,
+            name="atomic.cmpxchg",
+        )
+        old = self.builder.extract_value(pair, 0, name="atomic.cmpxchg.old")
+        success = self.builder.extract_value(pair, 1, name="atomic.cmpxchg.ok")
+        stored_expected = old
+        if stored_expected.type != expected_ptr.type.pointee:
+            stored_expected = self._implicit_convert(
+                stored_expected, expected_ptr.type.pointee
+            )
+        self._safe_store(stored_expected, expected_ptr)
+        result = self.builder.zext(success, int32_t, name="atomic.cmpxchg.i32")
+        self._clear_unsigned(result)
+        return result, None
+
+    def _codegen_builtin_atomic_test_and_set(self, node):
+        if not node.args or len(node.args.exprs) < 2:
+            return ir.Constant(int32_t, 0), None
+        ptr, _ = self.codegen(node.args.exprs[0])
+        if not isinstance(getattr(ptr, "type", None), ir.PointerType):
+            return ir.Constant(int32_t, 0), None
+        pointee_type = ptr.type.pointee
+        if not isinstance(pointee_type, ir.IntType):
+            return ir.Constant(int32_t, 0), None
+        one = ir.Constant(pointee_type, 1)
+        ordering = self._atomic_rmw_ordering(node.args.exprs[1])
+        old = self.builder.atomic_rmw(
+            "xchg", ptr, one, ordering, name="atomic.test_and_set.old"
+        )
+        is_set = self.builder.icmp_unsigned(
+            "!=", old, ir.Constant(pointee_type, 0), name="atomic.test_and_set.bool"
+        )
+        result = self.builder.zext(is_set, int32_t, name="atomic.test_and_set.i32")
+        self._clear_unsigned(result)
+        return result, None
+
+    def _codegen_builtin_atomic_clear(self, node):
+        if not node.args or len(node.args.exprs) < 2:
+            return ir.Constant(int64_t, 0), None
+        ptr, _ = self.codegen(node.args.exprs[0])
+        if not isinstance(getattr(ptr, "type", None), ir.PointerType):
+            return ir.Constant(int64_t, 0), None
+        pointee_type = ptr.type.pointee
+        if not isinstance(pointee_type, ir.IntType):
+            return ir.Constant(int64_t, 0), None
+        ordering = self._atomic_ordering(node.args.exprs[1], is_store=True)
+        align = max(1, self._ir_type_align(pointee_type))
+        self.builder.store_atomic(
+            ir.Constant(pointee_type, 0), ptr, ordering, align
+        )
         return ir.Constant(int64_t, 0), None
 
     def _convert_call_args(self, call_args, callee_func, arg_nodes=None):

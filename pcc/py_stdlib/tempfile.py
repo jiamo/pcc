@@ -12,18 +12,35 @@ class NamedTemporaryFile:
                  suffix: str = "", prefix: str = "tmp", dir=None) -> None:
         self.mode = mode
         self.delete = delete
-        self.name: str = ""
-        raise NotImplementedError(
-            "NamedTemporaryFile awaits mkstemp extern binding"
+        host_tempfile = __import__("tempfile")
+        self._file = host_tempfile.NamedTemporaryFile(
+            mode=mode,
+            delete=delete,
+            suffix=suffix,
+            prefix=prefix,
+            dir=dir,
         )
+        self.name: str = self._file.name
+
+    def write(self, text: str) -> int:
+        return self._file.write(text)
+
+    def flush(self) -> None:
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
 
 
 class TemporaryDirectory:
     def __init__(self, suffix: str = "", prefix: str = "tmp", dir=None) -> None:
-        self.name: str = ""
-        raise NotImplementedError(
-            "TemporaryDirectory awaits mkdtemp extern binding"
+        host_tempfile = __import__("tempfile")
+        self._tempdir = host_tempfile.TemporaryDirectory(
+            suffix=suffix,
+            prefix=prefix,
+            dir=dir,
         )
+        self.name: str = self._tempdir.name
 
     def __enter__(self):
         return self.name
@@ -32,19 +49,22 @@ class TemporaryDirectory:
         self.cleanup()
 
     def cleanup(self) -> None:
-        pass
+        self._tempdir.cleanup()
 
 
 def mkstemp(suffix: str = "", prefix: str = "tmp", dir=None, text: bool = False):
-    raise NotImplementedError(
-        "mkstemp awaits the libc extern binding"
+    host_tempfile = __import__("tempfile")
+    return host_tempfile.mkstemp(
+        suffix=suffix,
+        prefix=prefix,
+        dir=dir,
+        text=text,
     )
 
 
 def mkdtemp(suffix: str = "", prefix: str = "tmp", dir=None) -> str:
-    raise NotImplementedError(
-        "mkdtemp awaits the libc extern binding"
-    )
+    host_tempfile = __import__("tempfile")
+    return host_tempfile.mkdtemp(suffix=suffix, prefix=prefix, dir=dir)
 
 
 def gettempdir() -> str:

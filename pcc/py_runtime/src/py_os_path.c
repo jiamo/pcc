@@ -36,9 +36,15 @@ static PyObject *path_seq_borrow(PyObject *parts, int64_t i) {
     if (parts == NULL || PY_IS_TAGGED_INT(parts)) return NULL;
     switch (py_type_of(parts)) {
         case PY_TYPE_LIST:
-            return ((PyListObject *)parts)->items[i];
+            return pcc_gc_load_ptr(
+                parts,
+                &((PyListObject *)parts)->items[i]
+            );
         case PY_TYPE_TUPLE:
-            return ((PyTupleObject *)parts)->items[i];
+            return pcc_gc_load_ptr(
+                parts,
+                &((PyTupleObject *)parts)->items[i]
+            );
         default:
             return NULL;
     }
@@ -192,6 +198,48 @@ PyObject *py_os_path_basename(PyObject *path) {
     return out;
 }
 
+PyObject *py_os_path_split(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        return NULL;
+    }
+    PyStrObject *s = (PyStrObject *)item;
+    int64_t n = s->byte_len;
+
+    int64_t split_at = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (s->data[i] == '/') split_at = i + 1;
+    }
+
+    int64_t head_len = split_at;
+    if (head_len > 0) {
+        int all_slash = 1;
+        for (int64_t j = 0; j < head_len; j++) {
+            if (s->data[j] != '/') { all_slash = 0; break; }
+        }
+        if (!all_slash) {
+            while (head_len > 0 && s->data[head_len - 1] == '/') {
+                head_len--;
+            }
+        }
+    }
+
+    PyObject *head = py_str_new(s->data, head_len);
+    PyObject *tail = py_str_new(s->data + split_at, n - split_at);
+    PyObject *out = py_tuple_new(2);
+    if (out != NULL) {
+        py_tuple_set_item(out, 0, head);
+        py_tuple_set_item(out, 1, tail);
+    } else {
+        py_decref(head);
+        py_decref(tail);
+    }
+    py_decref(owned);
+    return out;
+}
+
 int py_os_path_isfile(PyObject *path) {
     PyObject *owned = NULL;
     PyObject *item = coerce_path_str(path, &owned);
@@ -201,6 +249,19 @@ int py_os_path_isfile(PyObject *path) {
     }
     const char *raw = py_str_utf8(item);
     int ok = (py_path_stat_kind(raw) == 1) ? 1 : 0;
+    py_decref(owned);
+    return ok;
+}
+
+int py_os_path_isabs(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        return 0;
+    }
+    PyStrObject *s = (PyStrObject *)item;
+    int ok = (s->byte_len > 0 && s->data[0] == '/') ? 1 : 0;
     py_decref(owned);
     return ok;
 }
@@ -263,6 +324,79 @@ PyObject *py_os_path_abspath(PyObject *path) {
     return out;
 }
 
+PyObject *py_os_path_expanduser(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        return NULL;
+    }
+    PyStrObject *s = (PyStrObject *)item;
+    int64_t n = s->byte_len;
+
+    /* Only a bare "~" or "~/..." prefix expands to $HOME. A "~user" prefix
+       (no '/' right after '~') and any path without a leading '~' are
+       returned unchanged (CPython posixpath.expanduser). */
+    int is_home = (n >= 1 && s->data[0] == '~' &&
+                   (n == 1 || s->data[1] == '/'));
+    const char *home = is_home ? getenv("HOME") : NULL;
+    if (!is_home || home == NULL || home[0] == '\0') {
+        PyObject *out = py_str_new(s->data, n);
+        py_decref(owned);
+        return out;
+    }
+
+    /* userhome = home.rstrip('/'); result = (userhome + path[1:]) or "/". */
+    int64_t home_len = (int64_t)strlen(home);
+    while (home_len > 0 && home[home_len - 1] == '/') {
+        home_len--;
+    }
+    int64_t rest_len = n - 1; /* path[1:] */
+    int64_t total = home_len + rest_len;
+    if (total == 0) {
+        py_decref(owned);
+        return py_str_new("/", 1);
+    }
+    PyObject *out = py_str_new(NULL, total);
+    if (out == NULL) {
+        py_decref(owned);
+        return NULL;
+    }
+    PyStrObject *outs = (PyStrObject *)out;
+    memcpy(outs->data, home, (size_t)home_len);
+    memcpy(outs->data + home_len, s->data + 1, (size_t)rest_len);
+    py_decref(owned);
+    return out;
+}
+
+PyObject *py_os_path_realpath(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        return NULL;
+    }
+    const char *raw = py_str_utf8(item);
+    const char *resolved = (raw != NULL) ? py_path_realpath(raw) : NULL;
+    if (resolved != NULL) {
+        PyObject *out = py_str_new(resolved, (int64_t)strlen(resolved));
+        py_decref(owned);
+        return out;
+    }
+    /* realpath(3) failed (path or a component does not exist): fall back to
+       lexical normpath(abspath(path)) — absolute with "." / ".." collapsed.
+       Matches CPython os.path.realpath except that symlinks inside the
+       existing prefix of a non-existent path are not resolved (rare). */
+    py_decref(owned);
+    PyObject *abs = py_os_path_abspath(path);
+    if (abs == NULL) {
+        return NULL;
+    }
+    PyObject *out = py_os_path_normpath(abs);
+    py_decref(abs);
+    return out;
+}
+
 PyObject *py_os_path_getmtime(PyObject *path) {
     PyObject *owned = NULL;
     PyObject *item = coerce_path_str(path, &owned);
@@ -274,6 +408,229 @@ PyObject *py_os_path_getmtime(PyObject *path) {
     double t = py_path_stat_mtime(raw);
     py_decref(owned);
     return py_float_from_f64(t);
+}
+
+PyObject *py_os_path_getsize(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        return NULL;
+    }
+    const char *raw = py_str_utf8(item);
+    int64_t size = py_path_stat_size(raw);
+    py_decref(owned);
+    return py_int_from_i64(size);
+}
+
+PyObject *py_os_path_splitext(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        return NULL;
+    }
+    PyStrObject *s = (PyStrObject *)item;
+    int64_t n = s->byte_len;
+
+    int64_t slash = -1;
+    int64_t dot = -1;
+    for (int64_t i = 0; i < n; i++) {
+        if (s->data[i] == '/') {
+            slash = i;
+            dot = -1;
+        } else if (s->data[i] == '.') {
+            dot = i;
+        }
+    }
+
+    PyObject *base, *ext;
+    if (dot <= slash + 1) {
+        base = py_str_new(s->data, n);
+        ext = py_str_new("", 0);
+    } else {
+        base = py_str_new(s->data, dot);
+        ext = py_str_new(s->data + dot, n - dot);
+    }
+
+    PyObject *out = py_tuple_new(2);
+    if (out != NULL) {
+        py_tuple_set_item(out, 0, base);
+        py_tuple_set_item(out, 1, ext);
+    } else {
+        py_decref(base);
+        py_decref(ext);
+    }
+    py_decref(owned);
+    return out;
+}
+
+PyObject *py_os_path_normcase(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        return NULL;
+    }
+    PyStrObject *s = (PyStrObject *)item;
+    PyObject *out = py_str_new(s->data, s->byte_len);
+    py_decref(owned);
+    return out;
+}
+
+static int path_component_is_dotdot(const char *data, int64_t len) {
+    return len == 2 && data[0] == '.' && data[1] == '.';
+}
+
+PyObject *py_os_path_normpath(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        return NULL;
+    }
+    PyStrObject *s = (PyStrObject *)item;
+    const char *data = s->data;
+    int64_t n = s->byte_len;
+    int64_t work_cap = n > 0 ? n + 2 : 2;
+    char *work = (char *)malloc((size_t)work_cap);
+    int64_t *starts = (int64_t *)malloc(sizeof(int64_t) * (size_t)(n + 1));
+    int64_t *lens = (int64_t *)malloc(sizeof(int64_t) * (size_t)(n + 1));
+    if (work == NULL || starts == NULL || lens == NULL) {
+        free(work);
+        free(starts);
+        free(lens);
+        py_decref(owned);
+        return NULL;
+    }
+
+    int64_t initial = 0;
+    if (n > 0 && data[0] == '/') {
+        initial = 1;
+        if (n > 1 && data[1] == '/' && (n == 2 || data[2] != '/')) {
+            initial = 2;
+        }
+    }
+
+    int64_t out_len = 0;
+    for (int64_t k = 0; k < initial; k++) {
+        work[out_len++] = '/';
+    }
+    int64_t base_len = initial;
+    int64_t comps = 0;
+    int64_t i = initial;
+    while (i < n) {
+        while (i < n && data[i] == '/') i++;
+        int64_t start = i;
+        while (i < n && data[i] != '/') i++;
+        int64_t len = i - start;
+        if (len == 0 || (len == 1 && data[start] == '.')) {
+            continue;
+        }
+        int is_dotdot = path_component_is_dotdot(data + start, len);
+        if (is_dotdot) {
+            if (comps > 0) {
+                int64_t last_start = starts[comps - 1];
+                int64_t last_len = lens[comps - 1];
+                int last_is_dotdot = path_component_is_dotdot(
+                    work + last_start,
+                    last_len
+                );
+                if (!last_is_dotdot) {
+                    comps--;
+                    out_len = last_start;
+                    if (out_len > base_len && work[out_len - 1] == '/') {
+                        out_len--;
+                    }
+                    continue;
+                }
+            }
+            if (initial > 0) {
+                continue;
+            }
+        }
+        if (out_len > base_len && work[out_len - 1] != '/') {
+            work[out_len++] = '/';
+        }
+        starts[comps] = out_len;
+        lens[comps] = len;
+        memcpy(work + out_len, data + start, (size_t)len);
+        out_len += len;
+        comps++;
+    }
+
+    PyObject *out = NULL;
+    if (out_len == 0) {
+        out = py_str_new(".", 1);
+    } else {
+        out = py_str_new(work, out_len);
+    }
+    free(work);
+    free(starts);
+    free(lens);
+    py_decref(owned);
+    return out;
+}
+
+PyObject *py_os_path_splitdrive(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        return NULL;
+    }
+    PyStrObject *s = (PyStrObject *)item;
+    PyObject *drive = py_str_new("", 0);
+    PyObject *tail = py_str_new(s->data, s->byte_len);
+    PyObject *out = py_tuple_new(2);
+    if (out != NULL) {
+        py_tuple_set_item(out, 0, drive);
+        py_tuple_set_item(out, 1, tail);
+    } else {
+        py_decref(drive);
+        py_decref(tail);
+    }
+    py_decref(owned);
+    return out;
+}
+
+PyObject *py_os_path_commonprefix(PyObject *paths) {
+    int64_t n = path_seq_len(paths);
+    if (n < 0) return NULL;
+    if (n == 0) return py_str_new("", 0);
+
+    PyObject *first_owned = NULL;
+    PyObject *first = coerce_path_str(path_seq_borrow(paths, 0), &first_owned);
+    if (first == NULL) {
+        py_decref(first_owned);
+        return NULL;
+    }
+    PyStrObject *first_s = (PyStrObject *)first;
+    const char *first_data = first_s->data;
+    int64_t common_len = first_s->byte_len;
+
+    for (int64_t i = 1; i < n; i++) {
+        PyObject *owned = NULL;
+        PyObject *item = coerce_path_str(path_seq_borrow(paths, i), &owned);
+        if (item == NULL) {
+            py_decref(owned);
+            py_decref(first_owned);
+            return NULL;
+        }
+        PyStrObject *s = (PyStrObject *)item;
+        int64_t limit = common_len < s->byte_len ? common_len : s->byte_len;
+        int64_t j = 0;
+        while (j < limit && first_data[j] == s->data[j]) {
+            j++;
+        }
+        common_len = j;
+        py_decref(owned);
+        if (common_len == 0) break;
+    }
+
+    PyObject *out = py_str_new(first_data, common_len);
+    py_decref(first_owned);
+    return out;
 }
 
 int py_os_path_exists(PyObject *path) {

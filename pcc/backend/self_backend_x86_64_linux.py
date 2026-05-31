@@ -26,8 +26,10 @@ from .self_backend_parse import (
     aggregate_literal_to_bytes,
     const_int_from_value,
     is_aggregate_literal_value,
+    parse_constant_gep,
 )
 from .self_backend_prepare import prepare_module_for_target
+from .self_backend_target_passes import run_self_target_memory_pass_pipeline
 from .self_backend_target_match import is_x86_64_linux_triple
 from .self_backend_terminator_dispatch import emit_terminator_dispatch
 from .self_backend_x86_64_linux_data import emit_globals
@@ -37,17 +39,86 @@ _MODULE_SYMBOLS = PreparedModuleSymbols(
     defined_symbols=frozenset(),
     internal_symbols=frozenset(),
 )
+_VARARG_FUNCTIONS: frozenset[str] = frozenset()
 
 _ARG_REGS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
 _ARG_REGS_32 = ("edi", "esi", "edx", "ecx", "r8d", "r9d")
 _ARG_REGS_16 = ("di", "si", "dx", "cx", "r8w", "r9w")
 _ARG_REGS_8 = ("dil", "sil", "dl", "cl", "r8b", "r9b")
 _FP_ARG_REGS = ("xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7")
+_RESERVED_ASM_SYMBOLS = frozenset(
+    {
+        "al",
+        "ah",
+        "ax",
+        "eax",
+        "rax",
+        "bl",
+        "bh",
+        "bx",
+        "ebx",
+        "rbx",
+        "cl",
+        "ch",
+        "cx",
+        "ecx",
+        "rcx",
+        "dl",
+        "dh",
+        "dx",
+        "edx",
+        "rdx",
+        "si",
+        "esi",
+        "rsi",
+        "di",
+        "edi",
+        "rdi",
+        "bp",
+        "ebp",
+        "rbp",
+        "sp",
+        "esp",
+        "rsp",
+        "fs",
+        "gs",
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "and",
+        "or",
+        "not",
+        "mod",
+        "shl",
+        "shr",
+    }
+    | {f"r{i}" for i in range(8, 16)}
+    | {f"r{i}d" for i in range(8, 16)}
+    | {f"r{i}w" for i in range(8, 16)}
+    | {f"r{i}b" for i in range(8, 16)}
+    | {f"xmm{i}" for i in range(32)}
+)
+_GP_REG_ALIASES = {
+    "rax": {1: "al", 2: "ax", 4: "eax", 8: "rax"},
+    "rdx": {1: "dl", 2: "dx", 4: "edx", 8: "rdx"},
+    "rdi": {1: "dil", 2: "di", 4: "edi", 8: "rdi"},
+    "rsi": {1: "sil", 2: "si", 4: "esi", 8: "rsi"},
+    "rcx": {1: "cl", 2: "cx", 4: "ecx", 8: "rcx"},
+    "r8": {1: "r8b", 2: "r8w", 4: "r8d", 8: "r8"},
+    "r9": {1: "r9b", 2: "r9w", 4: "r9d", 8: "r9"},
+    "r10": {1: "r10b", 2: "r10w", 4: "r10d", 8: "r10"},
+    "r11": {1: "r11b", 2: "r11w", 4: "r11d", 8: "r11"},
+}
 
 
 def _asm_symbol(name: str) -> str:
     if name in _MODULE_SYMBOLS.internal_symbols:
         return f"{_MODULE_SYMBOLS.internal_prefix}{name}"
+    if name in _MODULE_SYMBOLS.defined_symbols and name.lower() in _RESERVED_ASM_SYMBOLS:
+        return f"__pcc_sym_{name}"
     return name
 
 
@@ -107,19 +178,76 @@ def _is_memory_aggregate_arg(type_desc: TypeDesc) -> bool:
     return (type_desc.is_array or type_desc.is_struct) and type_desc.slot_size > 16
 
 
+def _aggregate_returned_indirect(ty: TypeDesc) -> bool:
+    return (ty.is_array or ty.is_struct) and ty.slot_size > 16
+
+
+def _aggregate_reg_chunks(type_desc: TypeDesc) -> tuple[int, ...]:
+    if not (type_desc.is_array or type_desc.is_struct):
+        raise BackendUnavailable(
+            f"x86_64 self backend aggregate chunks requested for scalar {type_desc.describe()}"
+        )
+    size = type_desc.slot_size
+    if size <= 0 or size > 16:
+        raise BackendUnavailable(
+            f"x86_64 self backend aggregate register chunks not available for {type_desc.describe()}"
+        )
+    chunks: list[int] = []
+    offset = 0
+    while offset < size:
+        chunk_size = min(8, size - offset)
+        chunks.append(chunk_size)
+        offset += chunk_size
+    return tuple(chunks)
+
+
+def _reg_alias(reg64: str, size: int) -> str:
+    aliases = _GP_REG_ALIASES.get(reg64)
+    if aliases is None or size not in aliases:
+        raise BackendUnavailable(f"x86_64 self backend register alias not translated: {reg64}/{size}")
+    return aliases[size]
+
+
+def _reg32_alias(reg64: str) -> str:
+    return _reg_alias(reg64, 4)
+
+
+def _int_type_for_size(size: int) -> TypeDesc:
+    return TypeDesc("int", size * 8)
+
+
 def _stack_arg_storage_size(type_desc: TypeDesc) -> int:
     if _is_memory_aggregate_arg(type_desc):
         return _align_to(type_desc.slot_size, 8)
     return 8
 
 
-def _iter_arg_locations(arg_types: list[TypeDesc]) -> tuple[list[tuple[str, str | int]], int, int]:
-    locations: list[tuple[str, str | int]] = []
-    gp_index = 0
-    fp_index = 0
+def _vararg_stack_storage_size(type_desc: TypeDesc) -> int:
+    if type_desc.is_array or type_desc.is_struct:
+        return _align_to(type_desc.slot_size, 8)
+    return 8
+
+
+def _iter_arg_locations(
+    arg_types: list[TypeDesc],
+    *,
+    gp_index: int = 0,
+    fp_index: int = 0,
+) -> tuple[list[tuple[str, object]], int, int]:
+    locations: list[tuple[str, object]] = []
     stack_offset = 0
     for arg_type in arg_types:
         if _is_memory_aggregate_arg(arg_type):
+            locations.append(("stack_byval", stack_offset))
+            stack_offset += _stack_arg_storage_size(arg_type)
+            continue
+        if arg_type.is_array or arg_type.is_struct:
+            chunks = _aggregate_reg_chunks(arg_type)
+            if gp_index + len(chunks) <= len(_ARG_REGS):
+                regs = tuple(_ARG_REGS[gp_index + index] for index in range(len(chunks)))
+                locations.append(("aggregate_regs", tuple(zip(regs, chunks, strict=False))))
+                gp_index += len(chunks)
+                continue
             locations.append(("stack_byval", stack_offset))
             stack_offset += _stack_arg_storage_size(arg_type)
             continue
@@ -131,10 +259,6 @@ def _iter_arg_locations(arg_types: list[TypeDesc]) -> tuple[list[tuple[str, str 
             locations.append(("stack_scalar", stack_offset))
             stack_offset += _stack_arg_storage_size(arg_type)
             continue
-        if arg_type.is_array or arg_type.is_struct:
-            raise BackendUnavailable(
-                f"x86_64 self backend aggregate arg classification not translated yet: {arg_type.describe()}"
-            )
         if gp_index < len(_ARG_REGS):
             locations.append(("reg", _stack_arg_reg(arg_type, gp_index)))
             gp_index += 1
@@ -162,12 +286,21 @@ def _global_addr(name: str) -> str:
     return f"{_asm_symbol(name[1:])}[rip]"
 
 
+def _global_symbol_addr(name: str) -> str:
+    return f"{_asm_symbol(name)}[rip]"
+
+
 def _block_label(func_name: str, block_name: str) -> str:
     return f".L{func_name}_{block_name}"
 
 
 def _edge_label(func_name: str, source_block: str, target_block: str) -> str:
     return f".L{func_name}_{source_block}_to_{target_block}"
+
+
+def _value_label(func_name: str, value_name: str, suffix: str) -> str:
+    safe = value_name.replace(".", "_").replace("-", "_").replace("$", "_")
+    return f".L{func_name}_{safe}_{suffix}"
 
 
 def _load_global_to_reg(name: str, reg: str, type_desc: TypeDesc) -> list[str]:
@@ -196,6 +329,50 @@ def _store_to_address(addr_reg: str, reg: str, type_desc: TypeDesc) -> list[str]
         op = "movsd" if type_desc.width > 32 else "movss"
         return [f"  {op} {_mem_size(type_desc)} [{addr_reg}], {reg}"]
     return [f"  mov {_mem_size(type_desc)} [{addr_reg}], {reg}"]
+
+
+def _addr_with_offset(addr_reg: str, offset: int) -> str:
+    if offset == 0:
+        return f"[{addr_reg}]"
+    return f"[{addr_reg} + {offset}]"
+
+
+def _store_reg_to_address_offset(
+    addr_reg: str,
+    offset: int,
+    reg: str,
+    type_desc: TypeDesc,
+) -> list[str]:
+    if type_desc.is_fp:
+        op = "movsd" if type_desc.width > 32 else "movss"
+        return [f"  {op} {_mem_size(type_desc)} {_addr_with_offset(addr_reg, offset)}, {reg}"]
+    return [f"  mov {_mem_size(type_desc)} {_addr_with_offset(addr_reg, offset)}, {reg}"]
+
+
+def _load_address_offset_to_reg(
+    addr_reg: str,
+    offset: int,
+    reg: str,
+    type_desc: TypeDesc,
+) -> list[str]:
+    if type_desc.is_fp:
+        op = "movsd" if type_desc.width > 32 else "movss"
+        return [f"  {op} {reg}, {_mem_size(type_desc)} {_addr_with_offset(addr_reg, offset)}"]
+    return [f"  mov {reg}, {_mem_size(type_desc)} {_addr_with_offset(addr_reg, offset)}"]
+
+
+def _store_reg_to_temp(reg: str, offset: int, type_desc: TypeDesc) -> list[str]:
+    if type_desc.is_fp:
+        op = "movsd" if type_desc.width > 32 else "movss"
+        return [f"  {op} {_mem_size(type_desc)} [rsp + {offset}], {reg}"]
+    return [f"  mov {_mem_size(type_desc)} [rsp + {offset}], {reg}"]
+
+
+def _load_temp_to_reg(offset: int, reg: str, type_desc: TypeDesc) -> list[str]:
+    if type_desc.is_fp:
+        op = "movsd" if type_desc.width > 32 else "movss"
+        return [f"  {op} {reg}, {_mem_size(type_desc)} [rsp + {offset}]"]
+    return [f"  mov {reg}, {_mem_size(type_desc)} [rsp + {offset}]"]
 
 
 def _zero_address(addr_reg: str, size: int) -> list[str]:
@@ -241,6 +418,176 @@ def _copy_address_to_address(src_reg: str, dst_reg: str, size: int) -> list[str]
     return lines
 
 
+def _store_gp_chunk_to_address(reg64: str, addr_reg: str, offset: int, size: int) -> list[str]:
+    if size in (1, 2, 4, 8):
+        return _store_reg_to_address_offset(addr_reg, offset, _reg_alias(reg64, size), _int_type_for_size(size))
+    if not 1 < size < 8:
+        raise BackendUnavailable(f"x86_64 self backend cannot store aggregate register chunk of size {size}")
+    lines = [f"  mov rax, {reg64}"]
+    sub_offset = 0
+    remaining = size
+    if remaining >= 4:
+        lines.append(f"  mov DWORD PTR {_addr_with_offset(addr_reg, offset)}, eax")
+        lines.append("  shr rax, 32")
+        sub_offset += 4
+        remaining -= 4
+    if remaining >= 2:
+        lines.append(f"  mov WORD PTR {_addr_with_offset(addr_reg, offset + sub_offset)}, ax")
+        lines.append("  shr rax, 16")
+        sub_offset += 2
+        remaining -= 2
+    if remaining:
+        lines.append(f"  mov BYTE PTR {_addr_with_offset(addr_reg, offset + sub_offset)}, al")
+    return lines
+
+
+def _load_address_chunk_to_gp_reg(addr_reg: str, offset: int, size: int, reg64: str) -> list[str]:
+    if size == 8:
+        return [f"  mov {reg64}, QWORD PTR {_addr_with_offset(addr_reg, offset)}"]
+    if size == 4:
+        return [f"  mov {_reg32_alias(reg64)}, DWORD PTR {_addr_with_offset(addr_reg, offset)}"]
+    if size == 2:
+        return [f"  movzx {_reg32_alias(reg64)}, WORD PTR {_addr_with_offset(addr_reg, offset)}"]
+    if size == 1:
+        return [f"  movzx {_reg32_alias(reg64)}, BYTE PTR {_addr_with_offset(addr_reg, offset)}"]
+    if not 1 < size < 8:
+        raise BackendUnavailable(f"x86_64 self backend cannot load aggregate register chunk of size {size}")
+    lines = [f"  xor {_reg32_alias(reg64)}, {_reg32_alias(reg64)}"]
+    sub_offset = 0
+    remaining = size
+    if remaining >= 4:
+        lines.append(f"  mov {_reg32_alias(reg64)}, DWORD PTR {_addr_with_offset(addr_reg, offset)}")
+        sub_offset += 4
+        remaining -= 4
+    elif remaining >= 2:
+        lines.append(f"  movzx {_reg32_alias(reg64)}, WORD PTR {_addr_with_offset(addr_reg, offset)}")
+        sub_offset += 2
+        remaining -= 2
+    if remaining >= 2:
+        lines.append(f"  movzx r11d, WORD PTR {_addr_with_offset(addr_reg, offset + sub_offset)}")
+        lines.append(f"  shl r11, {sub_offset * 8}")
+        lines.append(f"  or {reg64}, r11")
+        sub_offset += 2
+        remaining -= 2
+    if remaining:
+        shift = sub_offset * 8
+        lines.append(f"  movzx r11d, BYTE PTR {_addr_with_offset(addr_reg, offset + sub_offset)}")
+        lines.append(f"  shl r11, {shift}")
+        lines.append(f"  or {reg64}, r11")
+    return lines
+
+
+def _store_aggregate_regs_to_slot(
+    type_desc: TypeDesc,
+    slot_offset: int,
+    regs_and_chunks: tuple[tuple[str, int], ...],
+) -> list[str]:
+    lines = [f"  lea r10, {_slot_addr(slot_offset)}"]
+    offset = 0
+    for reg64, chunk_size in regs_and_chunks:
+        lines.extend(_store_gp_chunk_to_address(reg64, "r10", offset, chunk_size))
+        offset += chunk_size
+    if offset < type_desc.slot_size:
+        lines.extend(_zero_address("r10", type_desc.slot_size - offset))
+    return lines
+
+
+def _materialize_aggregate_to_gp_regs(
+    func: ParsedFunction,
+    value: str,
+    type_desc: TypeDesc,
+    regs_and_chunks: tuple[tuple[str, int], ...],
+) -> list[str]:
+    if value in {"zeroinitializer", "poison", "undef"}:
+        return [f"  xor {_reg32_alias(reg64)}, {_reg32_alias(reg64)}" for reg64, _chunk in regs_and_chunks]
+    if is_aggregate_literal_value(value):
+        literal_bytes = aggregate_literal_to_bytes(type_desc, value)
+        lines: list[str] = []
+        offset = 0
+        for reg64, chunk_size in regs_and_chunks:
+            chunk_value = int.from_bytes(
+                literal_bytes[offset : offset + chunk_size],
+                byteorder="little",
+                signed=False,
+            )
+            lines.append(f"  mov {reg64}, {chunk_value}")
+            offset += chunk_size
+        return lines
+    lines = _materialize_aggregate_value_address(func, value, type_desc, "r10")
+    offset = 0
+    for reg64, chunk_size in regs_and_chunks:
+        lines.extend(_load_address_chunk_to_gp_reg("r10", offset, chunk_size, reg64))
+        offset += chunk_size
+    return lines
+
+
+def _store_literal_bytes_to_address(data: bytes, dst_reg: str) -> list[str]:
+    lines: list[str] = []
+    offset = 0
+    size = len(data)
+    while size - offset >= 8:
+        value = int.from_bytes(data[offset : offset + 8], "little", signed=False)
+        lines.append(f"  mov r10, {value}")
+        lines.append(f"  mov QWORD PTR [{dst_reg} + {offset}], r10")
+        offset += 8
+    if size - offset >= 4:
+        value = int.from_bytes(data[offset : offset + 4], "little", signed=False)
+        lines.append(f"  mov r10d, {value}")
+        lines.append(f"  mov DWORD PTR [{dst_reg} + {offset}], r10d")
+        offset += 4
+    if size - offset >= 2:
+        value = int.from_bytes(data[offset : offset + 2], "little", signed=False)
+        lines.append(f"  mov r10w, {value}")
+        lines.append(f"  mov WORD PTR [{dst_reg} + {offset}], r10w")
+        offset += 2
+    if size - offset >= 1:
+        value = data[offset]
+        lines.append(f"  mov r10b, {value}")
+        lines.append(f"  mov BYTE PTR [{dst_reg} + {offset}], r10b")
+    return lines
+
+
+def _fill_address_with_byte(dst_reg: str, size: int, byte_value: int) -> list[str]:
+    byte_value &= 0xFF
+    lines: list[str] = []
+    offset = 0
+    if byte_value == 0:
+        lines.append("  xor eax, eax")
+        while size - offset >= 8:
+            lines.append(f"  mov QWORD PTR [{dst_reg} + {offset}], rax")
+            offset += 8
+        if size - offset >= 4:
+            lines.append(f"  mov DWORD PTR [{dst_reg} + {offset}], eax")
+            offset += 4
+        if size - offset >= 2:
+            lines.append(f"  mov WORD PTR [{dst_reg} + {offset}], ax")
+            offset += 2
+        if size - offset >= 1:
+            lines.append(f"  mov BYTE PTR [{dst_reg} + {offset}], al")
+        return lines
+
+    word = byte_value
+    word |= word << 8
+    word |= word << 16
+    qword = word | (word << 32)
+    while size - offset >= 8:
+        lines.append(f"  mov r10, {qword}")
+        lines.append(f"  mov QWORD PTR [{dst_reg} + {offset}], r10")
+        offset += 8
+    if size - offset >= 4:
+        lines.append(f"  mov r10d, {word}")
+        lines.append(f"  mov DWORD PTR [{dst_reg} + {offset}], r10d")
+        offset += 4
+    if size - offset >= 2:
+        lines.append(f"  mov r10w, {word & 0xFFFF}")
+        lines.append(f"  mov WORD PTR [{dst_reg} + {offset}], r10w")
+        offset += 2
+    if size - offset >= 1:
+        lines.append(f"  mov r10b, {byte_value}")
+        lines.append(f"  mov BYTE PTR [{dst_reg} + {offset}], r10b")
+    return lines
+
+
 def _materialize_fp_constant(value: str, type_desc: TypeDesc, reg: str) -> list[str]:
     if type_desc.width <= 32:
         if value.startswith("0x"):
@@ -262,8 +609,18 @@ def _materialize_value(func: ParsedFunction, value: str, type_desc: TypeDesc, re
         return []
     if value == "null":
         return [f"  xor {reg}, {reg}"]
+    if value in {"poison", "undef"}:
+        if type_desc.is_fp:
+            return _materialize_fp_constant("0.0", type_desc, reg)
+        return [f"  xor {reg}, {reg}"]
     if value in func.alloca_slots and type_desc.is_ptr:
         return [f"  lea {reg}, {_slot_addr(func.alloca_slots[value].offset)}"]
+    if _is_constant_gep_value(value):
+        if not type_desc.is_ptr:
+            raise BackendUnavailable(
+                f"x86_64 self backend cannot use GEP constant {value!r} as non-pointer in {func.name!r}"
+            )
+        return _materialize_constant_gep(value, reg)
     if value.startswith("@"):
         if type_desc.is_ptr:
             return [f"  lea {reg}, {_global_addr(value)}"]
@@ -296,6 +653,275 @@ def _materialize_aggregate_value_address(
     )
 
 
+def _materialize_pointer_storage_address(func: ParsedFunction, value: str, reg: str) -> list[str]:
+    if value in func.alloca_slots:
+        return [f"  lea {reg}, {_slot_addr(func.alloca_slots[value].offset)}"]
+    ptr_type = func.value_types.get(value, TypeDesc("ptr", pointee=TypeDesc("void")))
+    if (
+        value in func.value_slots
+        or value.startswith("@")
+        or _is_constant_gep_value(value)
+        or value in {"null", "poison", "undef"}
+    ):
+        return _materialize_value(func, value, ptr_type, reg)
+    raise BackendUnavailable(
+        f"x86_64 self backend pointer storage address not translated yet in {func.name!r}: {value}"
+    )
+
+
+def _vector_elem_type(type_desc: TypeDesc) -> TypeDesc:
+    if not type_desc.is_array or type_desc.elem is None:
+        raise BackendUnavailable(
+            f"x86_64 self backend expected vector-as-array type, got {type_desc.describe()}"
+        )
+    if not (type_desc.elem.is_int or type_desc.elem.is_ptr or type_desc.elem.is_fp):
+        raise BackendUnavailable(
+            f"x86_64 self backend vector lane type not translated yet: {type_desc.elem.describe()}"
+        )
+    return type_desc.elem
+
+
+def _materialize_vector_lane_to_reg(
+    func: ParsedFunction,
+    value: str,
+    vector_type: TypeDesc,
+    lane: int,
+    reg: str,
+) -> list[str]:
+    elem_type = _vector_elem_type(vector_type)
+    lane_offset = lane * elem_type.slot_size
+    if value in func.value_slots:
+        return _load_slot_to_reg(func.value_slots[value].offset - lane_offset, reg, elem_type)
+    if value == "zeroinitializer" or value == "poison":
+        return [f"  xor {reg}, {reg}"] if not elem_type.is_fp else _materialize_fp_constant("0.0", elem_type, reg)
+    if is_aggregate_literal_value(value):
+        data = aggregate_literal_to_bytes(vector_type, value)
+        lane_bytes = data[lane_offset : lane_offset + elem_type.slot_size]
+        if elem_type.is_fp:
+            int_value = int.from_bytes(lane_bytes, "little", signed=False)
+            return _materialize_fp_constant(f"0x{int_value:x}", elem_type, reg)
+        int_value = int.from_bytes(lane_bytes, "little", signed=False)
+        if elem_type.is_int and elem_type.width > 0 and int_value >= (1 << (elem_type.width - 1)):
+            int_value -= 1 << elem_type.width
+        return [f"  mov {reg}, {int_value}"]
+    return _materialize_value(func, value, elem_type, reg)
+
+
+def _materialize_vector_value_to_address(
+    func: ParsedFunction,
+    value: str,
+    vector_type: TypeDesc,
+    addr_reg: str,
+) -> list[str]:
+    elem_type = _vector_elem_type(vector_type)
+    if value in func.value_slots:
+        lines = [f"  lea r10, {_slot_addr(func.value_slots[value].offset)}"]
+        lines.extend(_copy_address_to_address("r10", addr_reg, vector_type.slot_size))
+        return lines
+    if value == "zeroinitializer" or value == "poison":
+        return _zero_address(addr_reg, vector_type.slot_size)
+    if is_aggregate_literal_value(value):
+        return _store_literal_bytes_to_address(aggregate_literal_to_bytes(vector_type, value), addr_reg)
+    lines: list[str] = []
+    lane_reg = _reg_name(elem_type, 10)
+    lines.extend(_materialize_value(func, value, elem_type, lane_reg))
+    for lane in range(vector_type.count):
+        lines.extend(
+            _store_reg_to_address_offset(
+                addr_reg,
+                lane * elem_type.slot_size,
+                lane_reg,
+                elem_type,
+            )
+        )
+    return lines
+
+
+def _emit_vararg_start(func: ParsedFunction, ap_ptr: str) -> list[str]:
+    if not func.is_vararg:
+        raise BackendUnavailable(f"x86_64 self backend saw llvm.va_start in non-variadic function {func.name!r}")
+    _locations, fixed_stack_bytes, _fp_count = _iter_arg_locations([arg.type for arg in func.args])
+    first_vararg_offset = 16 + fixed_stack_bytes
+    lines = _materialize_pointer_storage_address(func, ap_ptr, "r11")
+    lines.append(f"  lea r10, {_stack_arg_addr(first_vararg_offset)}")
+    lines.append("  mov QWORD PTR [r11], r10")
+    return lines
+
+
+def _emit_va_arg(
+    func: ParsedFunction,
+    dest: str,
+    ap_type: TypeDesc,
+    ap: str,
+    value_type: TypeDesc,
+) -> list[str]:
+    if not ap_type.is_ptr:
+        raise BackendUnavailable(
+            f"x86_64 self backend va_arg expects pointer va_list storage, got {ap_type.describe()}"
+        )
+    lines = _materialize_pointer_storage_address(func, ap, "r11")
+    lines.append("  mov r10, QWORD PTR [r11]")
+    if dest in func.value_slots:
+        if value_type.is_array or value_type.is_struct:
+            lines.append(f"  lea rax, {_slot_addr(func.value_slots[dest].offset)}")
+            lines.extend(_copy_address_to_address("r10", "rax", value_type.slot_size))
+        elif value_type.is_int or value_type.is_ptr or value_type.is_fp:
+            value_reg = _reg_name(value_type, 0)
+            lines.extend(_load_from_address("r10", value_reg, value_type))
+            lines.extend(_store_reg_to_slot(value_reg, func.value_slots[dest].offset, value_type))
+        else:
+            raise BackendUnavailable(
+                f"x86_64 self backend va_arg type not translated yet in {func.name!r}: {value_type.describe()}"
+            )
+    lines.extend(_emit_add_immediate_to_reg("r10", _vararg_stack_storage_size(value_type)))
+    lines.append("  mov QWORD PTR [r11], r10")
+    return lines
+
+
+def _store_vararg_stack_value(func: ParsedFunction, arg_type: TypeDesc, value: str, stack_offset: int) -> list[str]:
+    if arg_type.is_array or arg_type.is_struct:
+        lines = [f"  lea r11, [rsp + {stack_offset}]"]
+        if value in {"zeroinitializer", "poison", "undef"}:
+            lines.extend(_zero_address("r11", arg_type.slot_size))
+            return lines
+        if is_aggregate_literal_value(value):
+            lines.extend(_store_literal_bytes_to_address(aggregate_literal_to_bytes(arg_type, value), "r11"))
+            return lines
+        lines.extend(_materialize_aggregate_value_address(func, value, arg_type, "r10"))
+        lines.extend(_copy_address_to_address("r10", "r11", arg_type.slot_size))
+        return lines
+    if not (arg_type.is_int or arg_type.is_ptr or arg_type.is_fp):
+        raise BackendUnavailable(
+            f"x86_64 self backend vararg stack type not translated yet in {func.name!r}: {arg_type.describe()}"
+        )
+    lines = _materialize_value(func, value, arg_type, _reg_name(arg_type, 10))
+    lines.append(f"  mov {_mem_size(arg_type)} [rsp + {stack_offset}], {_reg_name(arg_type, 10)}")
+    return lines
+
+
+def _emit_internal_vararg_call(
+    func: ParsedFunction,
+    dest: str | None,
+    ret_type: TypeDesc,
+    callee: str,
+    args: tuple[tuple[TypeDesc, str], ...],
+    fixed_arg_count: int,
+) -> list[str]:
+    fixed_args = args[:fixed_arg_count]
+    vararg_args = args[fixed_arg_count:]
+    hidden_sret = _aggregate_returned_indirect(ret_type)
+    if hidden_sret and (dest is None or dest not in func.value_slots):
+        raise BackendUnavailable(
+            f"x86_64 self backend aggregate return needs a destination slot in {func.name!r}: {callee}"
+        )
+    fixed_locations, fixed_stack_bytes, _fp_reg_count = _iter_arg_locations(
+        [arg_type for arg_type, _value in fixed_args],
+        gp_index=1 if hidden_sret else 0,
+    )
+    vararg_offsets: list[int] = []
+    stack_bytes = fixed_stack_bytes
+    for arg_type, _value in vararg_args:
+        stack_bytes = _align_to(stack_bytes, 8)
+        vararg_offsets.append(stack_bytes)
+        stack_bytes += _vararg_stack_storage_size(arg_type)
+    call_stack_size = _align_to(stack_bytes, 16)
+    lines: list[str] = []
+    if call_stack_size:
+        lines.append(f"  sub rsp, {call_stack_size}")
+    if hidden_sret:
+        lines.append(f"  lea rdi, {_slot_addr(func.value_slots[dest].offset)}")
+    for (arg_type, value), (kind, payload) in zip(fixed_args, fixed_locations, strict=False):
+        if kind == "reg":
+            lines.extend(_materialize_value(func, value, arg_type, str(payload)))
+            continue
+        if kind == "aggregate_regs":
+            lines.extend(_materialize_aggregate_to_gp_regs(func, value, arg_type, payload))
+            continue
+        if kind == "stack_scalar":
+            stack_offset = int(payload)
+            lines.extend(_materialize_value(func, value, arg_type, _reg_name(arg_type, 10)))
+            lines.append(f"  mov {_mem_size(arg_type)} [rsp + {stack_offset}], {_reg_name(arg_type, 10)}")
+            continue
+        if kind == "stack_byval":
+            stack_offset = int(payload)
+            lines.append(f"  lea r11, [rsp + {stack_offset}]")
+            lines.extend(_materialize_aggregate_value_address(func, value, arg_type, "r10"))
+            lines.extend(_copy_address_to_address("r10", "r11", arg_type.slot_size))
+            continue
+        raise BackendUnavailable(
+            f"x86_64 self backend internal vararg fixed arg kind not translated yet in {func.name!r}: {kind}"
+        )
+    for (arg_type, value), stack_offset in zip(vararg_args, vararg_offsets, strict=False):
+        lines.extend(_store_vararg_stack_value(func, arg_type, value, stack_offset))
+    lines.append(f"  call {_asm_symbol(callee)}")
+    if call_stack_size:
+        lines.append(f"  add rsp, {call_stack_size}")
+    if dest is None or ret_type.is_void or dest not in func.value_slots:
+        return lines
+    if ret_type.is_array or ret_type.is_struct:
+        if hidden_sret:
+            return lines
+        lines.extend(
+            _store_aggregate_regs_to_slot(
+                ret_type,
+                func.value_slots[dest].offset,
+                tuple(zip(("rax", "rdx"), _aggregate_reg_chunks(ret_type), strict=False)),
+            )
+        )
+        return lines
+    lines.extend(_store_reg_to_slot(_reg_name(ret_type, 0), func.value_slots[dest].offset, ret_type))
+    return lines
+
+
+def _emit_vector_binop(
+    func: ParsedFunction,
+    op: str,
+    dest: str,
+    vector_type: TypeDesc,
+    lhs: str,
+    rhs: str,
+) -> list[str]:
+    if dest not in func.value_slots:
+        return []
+    elem_type = _vector_elem_type(vector_type)
+    if not elem_type.is_int:
+        raise BackendUnavailable(
+            f"x86_64 self backend vector binop lane type not translated yet in {func.name!r}: "
+            f"{elem_type.describe()}"
+        )
+    lines = [f"  lea rax, {_slot_addr(func.value_slots[dest].offset)}"]
+    for lane in range(vector_type.count):
+        lhs_reg = _reg_name(elem_type, 10)
+        rhs_reg = _reg_name(elem_type, 11)
+        lines.extend(_materialize_vector_lane_to_reg(func, lhs, vector_type, lane, lhs_reg))
+        lines.extend(_materialize_vector_lane_to_reg(func, rhs, vector_type, lane, rhs_reg))
+        if op == "add":
+            lines.append(f"  add {lhs_reg}, {rhs_reg}")
+        elif op == "sub":
+            lines.append(f"  sub {lhs_reg}, {rhs_reg}")
+        elif op == "mul":
+            lines.append(f"  imul {lhs_reg}, {rhs_reg}")
+        elif op == "and":
+            lines.append(f"  and {lhs_reg}, {rhs_reg}")
+        elif op == "or":
+            lines.append(f"  or {lhs_reg}, {rhs_reg}")
+        elif op == "xor":
+            lines.append(f"  xor {lhs_reg}, {rhs_reg}")
+        else:
+            raise BackendUnavailable(
+                f"x86_64 self backend vector binop {op!r} not translated yet in {func.name!r}"
+            )
+        lines.extend(
+            _store_reg_to_address_offset(
+                "rax",
+                lane * elem_type.slot_size,
+                lhs_reg,
+                elem_type,
+            )
+        )
+    return lines
+
+
 def _emit_memcpy_intrinsic_call(
     func: ParsedFunction,
     args: tuple[tuple[TypeDesc, str], ...],
@@ -320,6 +946,92 @@ def _emit_memcpy_intrinsic_call(
     lines = _materialize_value(func, src_value, src_type, "r10")
     lines.extend(_materialize_value(func, dst_value, dst_type, "r11"))
     lines.extend(_copy_address_to_address("r10", "r11", size))
+    return lines
+
+
+def _emit_memset_intrinsic_call(
+    func: ParsedFunction,
+    args: tuple[tuple[TypeDesc, str], ...],
+) -> list[str]:
+    if len(args) < 4:
+        raise BackendUnavailable(
+            f"x86_64 self backend memset intrinsic expects at least 4 args in {func.name!r}"
+        )
+    dst_type, dst_value = args[0]
+    value_type, value = args[1]
+    size_type, size_value = args[2]
+    _isvolatile_type, _isvolatile_value = args[3]
+    if not (dst_type.is_ptr and value_type.is_int and size_type.is_int):
+        raise BackendUnavailable(
+            f"x86_64 self backend memset intrinsic arg types not translated yet in {func.name!r}"
+        )
+    size = const_int_from_value(size_value)
+    byte_value = const_int_from_value(value)
+    if size is None or byte_value is None:
+        raise BackendUnavailable(
+            f"x86_64 self backend memset intrinsic only supports constant size/value right now in {func.name!r}"
+        )
+    lines = _materialize_value(func, dst_value, dst_type, "r11")
+    lines.extend(_fill_address_with_byte("r11", size, byte_value))
+    return lines
+
+
+def _emit_floor_intrinsic_call(
+    func: ParsedFunction,
+    dest: str | None,
+    ret_type: TypeDesc,
+    callee: str,
+    args: tuple[tuple[TypeDesc, str], ...],
+) -> list[str]:
+    if dest is None or dest not in func.value_slots:
+        return []
+    if len(args) != 1:
+        raise BackendUnavailable(
+            f"x86_64 self backend {callee} expects 1 arg in {func.name!r}"
+        )
+    value_type, value = args[0]
+    if (
+        value_type.describe() != ret_type.describe()
+        or not value_type.is_fp
+        or value_type.width not in (32, 64)
+    ):
+        raise BackendUnavailable(
+            f"x86_64 self backend {callee} currently only supports "
+            f"float/double in {func.name!r}"
+        )
+    lines = _materialize_value(func, value, value_type, "xmm0")
+    lines.append("  call floorf" if value_type.width <= 32 else "  call floor")
+    lines.extend(_store_reg_to_slot("xmm0", func.value_slots[dest].offset, ret_type))
+    return lines
+
+
+def _emit_sqrt_intrinsic_call(
+    func: ParsedFunction,
+    dest: str | None,
+    ret_type: TypeDesc,
+    callee: str,
+    args: tuple[tuple[TypeDesc, str], ...],
+) -> list[str]:
+    if dest is None or dest not in func.value_slots:
+        return []
+    if len(args) != 1:
+        raise BackendUnavailable(
+            f"x86_64 self backend {callee} expects 1 arg in {func.name!r}"
+        )
+    value_type, value = args[0]
+    if (
+        value_type.describe() != ret_type.describe()
+        or not value_type.is_fp
+        or value_type.width not in (32, 64)
+    ):
+        raise BackendUnavailable(
+            f"x86_64 self backend {callee} currently only supports "
+            f"float/double in {func.name!r}"
+        )
+    lines = _materialize_value(func, value, value_type, "xmm10")
+    op = "sqrtss" if value_type.width <= 32 else "sqrtsd"
+    lines.append(f"  {op} xmm10, xmm10")
+    lines.extend(_store_reg_to_slot("xmm10", func.value_slots[dest].offset, ret_type))
     return lines
 
 
@@ -353,11 +1065,35 @@ def _materialize_index_to_r10(func: ParsedFunction, index_value: str) -> list[st
 
 
 def _emit_add_immediate_to_r11(offset: int) -> list[str]:
+    return _emit_add_immediate_to_reg("r11", offset)
+
+
+def _emit_add_immediate_to_reg(reg: str, offset: int) -> list[str]:
     if offset == 0:
         return []
     if offset > 0:
-        return [f"  lea r11, [r11 + {offset}]"]
-    return [f"  lea r11, [r11 - {-offset}]"]
+        return [f"  lea {reg}, [{reg} + {offset}]"]
+    return [f"  lea {reg}, [{reg} - {-offset}]"]
+
+
+def _materialize_constant_gep(value: str, reg: str) -> list[str]:
+    if value.startswith("gep0:"):
+        return [f"  lea {reg}, {_global_symbol_addr(value.split(':', 1)[1])}"]
+    if value.startswith("gepconst:"):
+        _tag, base, offset_text = value.split(":", 2)
+        lines = [f"  lea {reg}, {_global_symbol_addr(base)}"]
+        lines.extend(_emit_add_immediate_to_reg(reg, int(offset_text)))
+        return lines
+    if value.startswith("getelementptr"):
+        base, offset = parse_constant_gep(value)
+        lines = [f"  lea {reg}, {_global_symbol_addr(base)}"]
+        lines.extend(_emit_add_immediate_to_reg(reg, offset))
+        return lines
+    raise BackendUnavailable(f"x86_64 self backend expected constant GEP value, got {value!r}")
+
+
+def _is_constant_gep_value(value: str) -> bool:
+    return value.startswith(("gep0:", "gepconst:", "getelementptr"))
 
 
 def _emit_indexed_pointer_add(func: ParsedFunction, index_value: str, elem_size: int) -> list[str]:
@@ -437,12 +1173,28 @@ def _emit_prologue(func: ParsedFunction) -> list[str]:
     lines.append("  mov rbp, rsp")
     if func.frame_size:
         lines.append(f"  sub rsp, {func.frame_size}")
-    arg_locations, _total_stack, _fp_reg_count = _iter_arg_locations([arg.type for arg in func.args])
+    gp_start = 0
+    if func.hidden_sret_slot is not None:
+        lines.extend(_store_reg_to_slot("rdi", func.hidden_sret_slot.offset, func.hidden_sret_slot.type))
+        gp_start = 1
+    arg_locations, _total_stack, _fp_reg_count = _iter_arg_locations(
+        [arg.type for arg in func.args],
+        gp_index=gp_start,
+    )
     for arg, (kind, payload) in zip(func.args, arg_locations, strict=False):
         if arg.name not in func.value_slots:
             continue
         if kind == "reg":
             lines.extend(_store_reg_to_slot(str(payload), func.value_slots[arg.name].offset, arg.type))
+            continue
+        if kind == "aggregate_regs":
+            lines.extend(
+                _store_aggregate_regs_to_slot(
+                    arg.type,
+                    func.value_slots[arg.name].offset,
+                    payload,
+                )
+            )
             continue
         if kind == "stack_scalar":
             stack_offset = 16 + int(payload)
@@ -473,6 +1225,8 @@ def _emit_memory_instruction(func: ParsedFunction, kind: str, data: tuple) -> li
                 lines = [f"  lea r11, {_slot_addr(func.alloca_slots[ptr_name].offset)}"]
             elif ptr_name.startswith("@"):
                 lines = [f"  lea r11, {_global_addr(ptr_name)}"]
+            elif _is_constant_gep_value(ptr_name):
+                lines = _materialize_value(func, ptr_name, _ptr_type, "r11")
             elif ptr_name in func.value_slots:
                 ptr_type = func.value_types.get(ptr_name)
                 if ptr_type is None or not ptr_type.is_ptr:
@@ -502,6 +1256,11 @@ def _emit_memory_instruction(func: ParsedFunction, kind: str, data: tuple) -> li
             lines = _materialize_value(func, value, value_type, _reg_name(value_type, 10))
             lines.extend(_store_reg_to_global(ptr_name, _reg_name(value_type, 10), value_type))
             return lines
+        if _is_constant_gep_value(ptr_name):
+            lines = _materialize_value(func, value, value_type, _reg_name(value_type, 10))
+            lines.extend(_materialize_value(func, ptr_name, _ptr_type, "r11"))
+            lines.extend(_store_to_address("r11", _reg_name(value_type, 10), value_type))
+            return lines
         if ptr_name in func.value_slots:
             ptr_type = func.value_types.get(ptr_name)
             if ptr_type is None or not ptr_type.is_ptr:
@@ -525,6 +1284,8 @@ def _emit_memory_instruction(func: ParsedFunction, kind: str, data: tuple) -> li
                 lines = [f"  lea r10, {_slot_addr(func.alloca_slots[ptr_name].offset)}"]
             elif ptr_name.startswith("@"):
                 lines = [f"  lea r10, {_global_addr(ptr_name)}"]
+            elif _is_constant_gep_value(ptr_name):
+                lines = _materialize_value(func, ptr_name, _ptr_type, "r10")
             elif ptr_name in func.value_slots:
                 ptr_type = func.value_types.get(ptr_name)
                 if ptr_type is None or not ptr_type.is_ptr:
@@ -547,6 +1308,9 @@ def _emit_memory_instruction(func: ParsedFunction, kind: str, data: tuple) -> li
             lines = _load_slot_to_reg(func.alloca_slots[ptr_name].offset, _reg_name(value_type, 10), value_type)
         elif ptr_name.startswith("@"):
             lines = _load_global_to_reg(ptr_name, _reg_name(value_type, 10), value_type)
+        elif _is_constant_gep_value(ptr_name):
+            lines = _materialize_value(func, ptr_name, _ptr_type, "r11")
+            lines.extend(_load_from_address("r11", _reg_name(value_type, 10), value_type))
         elif ptr_name in func.value_slots:
             ptr_type = func.value_types.get(ptr_name)
             if ptr_type is None or not ptr_type.is_ptr:
@@ -570,6 +1334,8 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
         op, dest, value_type, lhs, rhs = data
         if dest not in func.value_slots:
             return []
+        if value_type.is_array:
+            return _emit_vector_binop(func, op, dest, value_type, lhs, rhs)
         if not value_type.is_int:
             raise BackendUnavailable(
                 f"x86_64 self backend binop type not translated yet in {func.name!r}: {value_type.describe()}"
@@ -590,6 +1356,14 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
             lines.append(f"  or {lhs_reg}, {rhs_reg}")
         elif op == "xor":
             lines.append(f"  xor {lhs_reg}, {rhs_reg}")
+        elif op in {"shl", "lshr", "ashr"}:
+            instr = {"shl": "shl", "lshr": "shr", "ashr": "sar"}[op]
+            count = const_int_from_value(rhs)
+            if count is not None:
+                lines.append(f"  {instr} {lhs_reg}, {count & 0xFF}")
+            else:
+                lines.append("  mov cl, r11b")
+                lines.append(f"  {instr} {lhs_reg}, cl")
         elif op in {"sdiv", "srem", "udiv", "urem"}:
             dividend_reg = _reg_name(value_type, 0)
             divisor_reg = _reg_name(value_type, 10)
@@ -781,11 +1555,13 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
                     src_reg = _reg_name(src_type, 10)
                     dst_reg = _reg_name(dst_type, 10)
                     if src_type.width <= 8:
-                        lines = [f"  movzx {dst_reg}, {src_reg}"]
+                        lines.append(f"  movzx {dst_reg}, {src_reg}")
                     elif src_type.width <= 16:
-                        lines = [f"  movzx {dst_reg}, {src_reg}"]
+                        lines.append(f"  movzx {dst_reg}, {src_reg}")
                     elif src_type.width <= 32 and dst_type.width > 32:
-                        lines = []
+                        # Writing the 32-bit subregister already zero-extends
+                        # into the full 64-bit register on x86_64.
+                        pass
             lines.extend(_store_reg_to_slot(_reg_name(dst_type, 10), func.value_slots[dest].offset, dst_type))
             return lines
         if op == "sext" and src_type.is_int and dst_type.is_int and src_type.width <= dst_type.width:
@@ -828,6 +1604,14 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
             lines.append(f"  {cvt_op} {dst_reg}, {src_reg}")
             lines.extend(_store_reg_to_slot(dst_reg, func.value_slots[dest].offset, dst_type))
             return lines
+        if op == "fptosi" and src_type.is_fp and dst_type.is_int:
+            src_reg = _reg_name(src_type, 10)
+            cvt_dst_reg = "r10" if dst_type.width > 32 else "r10d"
+            lines = _materialize_value(func, value, src_type, src_reg)
+            cvt_op = "cvttss2si" if src_type.width <= 32 else "cvttsd2si"
+            lines.append(f"  {cvt_op} {cvt_dst_reg}, {src_reg}")
+            lines.extend(_store_reg_to_slot(_reg_name(dst_type, 10), func.value_slots[dest].offset, dst_type))
+            return lines
         if op == "fptrunc" and src_type.is_fp and dst_type.is_fp and src_type.width > dst_type.width:
             lines = _materialize_value(func, value, src_type, _reg_name(src_type, 10))
             lines.append("  cvtsd2ss xmm10, xmm10")
@@ -868,6 +1652,147 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
         lines.extend(_store_reg_to_slot(_reg_name(result_type, 10), func.value_slots[dest].offset, result_type))
         return lines
 
+    if kind == "insertvalue":
+        dest, aggregate_type, aggregate_value, elem_type, elem_value, _indices, offset = data
+        if dest not in func.value_slots:
+            return []
+        lines = [f"  lea r11, {_slot_addr(func.value_slots[dest].offset)}"]
+        if aggregate_value in {"zeroinitializer", "poison", "undef"}:
+            lines.extend(_zero_address("r11", aggregate_type.slot_size))
+        elif is_aggregate_literal_value(aggregate_value):
+            lines.extend(
+                _store_literal_bytes_to_address(
+                    aggregate_literal_to_bytes(aggregate_type, aggregate_value),
+                    "r11",
+                )
+            )
+        else:
+            lines.extend(_materialize_aggregate_value_address(func, aggregate_value, aggregate_type, "r10"))
+            lines.extend(_copy_address_to_address("r10", "r11", aggregate_type.slot_size))
+        if offset:
+            lines.extend(_emit_add_immediate_to_reg("r11", offset))
+        if elem_type.is_array or elem_type.is_struct:
+            if elem_value in {"zeroinitializer", "poison", "undef"}:
+                lines.extend(_zero_address("r11", elem_type.slot_size))
+                return lines
+            if is_aggregate_literal_value(elem_value):
+                lines.extend(
+                    _store_literal_bytes_to_address(
+                        aggregate_literal_to_bytes(elem_type, elem_value),
+                        "r11",
+                    )
+                )
+                return lines
+            lines.extend(_materialize_aggregate_value_address(func, elem_value, elem_type, "r10"))
+            lines.extend(_copy_address_to_address("r10", "r11", elem_type.slot_size))
+            return lines
+        lines.extend(_materialize_value(func, elem_value, elem_type, _reg_name(elem_type, 10)))
+        lines.extend(_store_to_address("r11", _reg_name(elem_type, 10), elem_type))
+        return lines
+
+    if kind == "freeze":
+        dest, value_type, value = data
+        if dest not in func.value_slots:
+            return []
+        if value_type.is_array or value_type.is_struct:
+            raise BackendUnavailable(
+                f"x86_64 self backend freeze aggregate result not translated yet in {func.name!r}: "
+                f"{value_type.describe()}"
+            )
+        lines = _materialize_value(func, value, value_type, _reg_name(value_type, 10))
+        lines.extend(_store_reg_to_slot(_reg_name(value_type, 10), func.value_slots[dest].offset, value_type))
+        return lines
+
+    if kind == "select":
+        dest, value_type, cond, true_value, false_value = data
+        if dest not in func.value_slots:
+            return []
+        if value_type.is_array or value_type.is_struct:
+            raise BackendUnavailable(
+                f"x86_64 self backend select aggregate result not translated yet in {func.name!r}: "
+                f"{value_type.describe()}"
+            )
+        cond_type = func.value_types.get(cond, TypeDesc("int", 1))
+        false_label = _value_label(func.name, dest, "select_false")
+        done_label = _value_label(func.name, dest, "select_done")
+        lines = _materialize_value(func, cond, cond_type, _reg_name(cond_type, 0))
+        lines.extend(
+            [
+                "  test al, al",
+                f"  je {false_label}",
+            ]
+        )
+        lines.extend(_materialize_value(func, true_value, value_type, _reg_name(value_type, 10)))
+        lines.append(f"  jmp {done_label}")
+        lines.append(f"{false_label}:")
+        lines.extend(_materialize_value(func, false_value, value_type, _reg_name(value_type, 10)))
+        lines.append(f"{done_label}:")
+        lines.extend(_store_reg_to_slot(_reg_name(value_type, 10), func.value_slots[dest].offset, value_type))
+        return lines
+
+    if kind == "insertelement":
+        dest, vector_type, vector_value, elem_type, elem_value, index_value = data
+        if dest not in func.value_slots:
+            return []
+        lane = const_int_from_value(index_value)
+        if lane is None:
+            raise BackendUnavailable(
+                f"x86_64 self backend insertelement requires constant lane index in {func.name!r}: {index_value}"
+            )
+        expected_elem = _vector_elem_type(vector_type)
+        if expected_elem.describe() != elem_type.describe():
+            raise BackendUnavailable(
+                f"x86_64 self backend insertelement lane type mismatch in {func.name!r}: "
+                f"{elem_type.describe()} -> {expected_elem.describe()}"
+            )
+        lines = [f"  lea rax, {_slot_addr(func.value_slots[dest].offset)}"]
+        lines.extend(_materialize_vector_value_to_address(func, vector_value, vector_type, "rax"))
+        elem_reg = _reg_name(elem_type, 10)
+        lines.extend(_materialize_value(func, elem_value, elem_type, elem_reg))
+        lines.extend(_store_reg_to_address_offset("rax", lane * elem_type.slot_size, elem_reg, elem_type))
+        return lines
+
+    if kind == "shufflevector":
+        dest, vector_type, lhs, rhs, _mask_type, mask_value = data
+        if dest not in func.value_slots:
+            return []
+        elem_type = _vector_elem_type(vector_type)
+        lines = [f"  lea rax, {_slot_addr(func.value_slots[dest].offset)}"]
+        if mask_value == "zeroinitializer":
+            for lane in range(vector_type.count):
+                reg = _reg_name(elem_type, 10)
+                lines.extend(_materialize_vector_lane_to_reg(func, lhs, vector_type, 0, reg))
+                lines.extend(_store_reg_to_address_offset("rax", lane * elem_type.slot_size, reg, elem_type))
+            return lines
+        if not is_aggregate_literal_value(mask_value):
+            raise BackendUnavailable(
+                f"x86_64 self backend shufflevector mask not translated yet in {func.name!r}: {mask_value}"
+            )
+        mask_bytes = aggregate_literal_to_bytes(vector_type, mask_value)
+        for lane in range(vector_type.count):
+            mask_offset = lane * elem_type.slot_size
+            source_lane = int.from_bytes(
+                mask_bytes[mask_offset : mask_offset + elem_type.slot_size],
+                "little",
+                signed=True,
+            )
+            if source_lane < 0:
+                lines.append("  xor r10d, r10d")
+                lines.extend(_store_reg_to_address_offset("rax", lane * elem_type.slot_size, "r10d", elem_type))
+                continue
+            source_value = lhs
+            if source_lane >= vector_type.count:
+                source_value = rhs
+                source_lane -= vector_type.count
+            reg = _reg_name(elem_type, 10)
+            lines.extend(_materialize_vector_lane_to_reg(func, source_value, vector_type, source_lane, reg))
+            lines.extend(_store_reg_to_address_offset("rax", lane * elem_type.slot_size, reg, elem_type))
+        return lines
+
+    if kind == "va_arg":
+        dest, ap_type, ap, value_type = data
+        return _emit_va_arg(func, dest, ap_type, ap, value_type)
+
     if kind == "gep":
         dest, base_type, _ptr_type, ptr_name, indices = data
         return _emit_gep_instruction(func, dest, base_type, ptr_name, indices)
@@ -880,6 +1805,48 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
             )
         if not is_indirect and callee.startswith("llvm.memcpy."):
             return _emit_memcpy_intrinsic_call(func, args)
+        if not is_indirect and callee.startswith("llvm.memset."):
+            return _emit_memset_intrinsic_call(func, args)
+        if not is_indirect and callee.startswith("llvm.floor."):
+            return _emit_floor_intrinsic_call(func, dest, ret_type, callee, args)
+        if not is_indirect and callee.startswith("llvm.sqrt."):
+            return _emit_sqrt_intrinsic_call(func, dest, ret_type, callee, args)
+        if not is_indirect and callee.startswith("llvm.va_start"):
+            if len(args) != 1:
+                raise BackendUnavailable(f"x86_64 self backend llvm.va_start expects 1 arg in {func.name!r}")
+            _arg_type, ap_ptr = args[0]
+            return _emit_vararg_start(func, ap_ptr)
+        if not is_indirect and callee.startswith(("llvm.va_end", "llvm.lifetime.start", "llvm.lifetime.end")):
+            return []
+        if _is_vararg_call and not is_indirect and callee in _VARARG_FUNCTIONS:
+            return _emit_internal_vararg_call(
+                func,
+                dest,
+                ret_type,
+                callee,
+                args,
+                _fixed_arg_count,
+            )
+        if not is_indirect and callee == "llvm.vector.reduce.mul.v4i32":
+            if dest is None or dest not in func.value_slots:
+                return []
+            if len(args) != 1:
+                raise BackendUnavailable(
+                    f"x86_64 self backend {callee} expects 1 arg in {func.name!r}"
+                )
+            vector_type, vector_value = args[0]
+            elem_type = _vector_elem_type(vector_type)
+            if not elem_type.is_int or elem_type.width != 32 or vector_type.count != 4:
+                raise BackendUnavailable(
+                    f"x86_64 self backend {callee} type not translated yet in {func.name!r}: "
+                    f"{vector_type.describe()}"
+                )
+            lines = ["  mov r10d, 1"]
+            for lane in range(vector_type.count):
+                lines.extend(_materialize_vector_lane_to_reg(func, vector_value, vector_type, lane, "r11d"))
+                lines.append("  imul r10d, r11d")
+            lines.extend(_store_reg_to_slot("r10d", func.value_slots[dest].offset, ret_type))
+            return lines
         if not is_indirect and callee.startswith(("llvm.smax.", "llvm.smin.", "llvm.umax.", "llvm.umin.")):
             if dest is None or dest not in func.value_slots:
                 return []
@@ -917,13 +1884,26 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
                 f"x86_64 self backend intrinsic not translated yet in {func.name!r}: {callee}"
             )
         lines: list[str] = []
-        arg_locations, stack_bytes, fp_reg_count = _iter_arg_locations([arg_type for arg_type, _value in args])
+        hidden_sret = _aggregate_returned_indirect(ret_type)
+        if hidden_sret and (dest is None or dest not in func.value_slots):
+            raise BackendUnavailable(
+                f"x86_64 self backend aggregate return needs a destination slot in {func.name!r}: {callee}"
+            )
+        arg_locations, stack_bytes, fp_reg_count = _iter_arg_locations(
+            [arg_type for arg_type, _value in args],
+            gp_index=1 if hidden_sret else 0,
+        )
         call_stack_size = _align_to(stack_bytes, 16)
         if call_stack_size:
             lines.append(f"  sub rsp, {call_stack_size}")
+        if hidden_sret:
+            lines.append(f"  lea rdi, {_slot_addr(func.value_slots[dest].offset)}")
         for (arg_type, value), (kind, payload) in zip(args, arg_locations, strict=False):
             if kind == "reg":
                 lines.extend(_materialize_value(func, value, arg_type, str(payload)))
+                continue
+            if kind == "aggregate_regs":
+                lines.extend(_materialize_aggregate_to_gp_regs(func, value, arg_type, payload))
                 continue
             if kind == "stack_scalar":
                 stack_offset = int(payload)
@@ -942,11 +1922,15 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
             raise BackendUnavailable(
                 f"x86_64 self backend call arg location kind not translated yet in {func.name!r}: {kind}"
             )
-        if _is_vararg_call:
-            if fp_reg_count == 0:
-                lines.append("  xor eax, eax")
-            else:
-                lines.append(f"  mov al, {fp_reg_count}")
+        # SysV uses %al to pass the number of vector registers consumed by
+        # variadic arguments. For non-variadic calls %rax is caller-saved and
+        # not an argument register, so setting it here is harmless. Emitting it
+        # unconditionally keeps self-host output deterministic even when a
+        # declaration's vararg bit is normalized at a different stage.
+        if fp_reg_count == 0:
+            lines.append("  xor eax, eax")
+        else:
+            lines.append(f"  mov al, {fp_reg_count}")
         if is_indirect:
             callee_type = func.value_types.get(callee, TypeDesc("ptr", pointee=ret_type))
             if not callee_type.is_ptr:
@@ -961,6 +1945,17 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
             lines.append(f"  add rsp, {call_stack_size}")
         if dest is None or ret_type.is_void or dest not in func.value_slots:
             return lines
+        if ret_type.is_array or ret_type.is_struct:
+            if hidden_sret:
+                return lines
+            lines.extend(
+                _store_aggregate_regs_to_slot(
+                    ret_type,
+                    func.value_slots[dest].offset,
+                    tuple(zip(("rax", "rdx"), _aggregate_reg_chunks(ret_type), strict=False)),
+                )
+            )
+            return lines
         if not (ret_type.is_int or ret_type.is_ptr or ret_type.is_fp):
             raise BackendUnavailable(
                 f"x86_64 self backend call return type not translated yet in {func.name!r}: {ret_type.describe()}"
@@ -974,6 +1969,31 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
 def _emit_return_terminator(func: ParsedFunction, ret_type: TypeDesc, value: str) -> list[str]:
     if ret_type.is_void:
         return _emit_epilogue(func)
+    if ret_type.is_array or ret_type.is_struct:
+        if _aggregate_returned_indirect(ret_type):
+            if func.hidden_sret_slot is None:
+                raise BackendUnavailable(
+                    f"x86_64 self backend missing hidden sret slot for aggregate return in {func.name!r}"
+                )
+            lines = _load_slot_to_reg(func.hidden_sret_slot.offset, "r11", func.hidden_sret_slot.type)
+            if value == "zeroinitializer":
+                lines.extend(_zero_address("r11", ret_type.slot_size))
+            elif is_aggregate_literal_value(value):
+                literal = aggregate_literal_to_bytes(ret_type, value)
+                lines.extend(_store_literal_bytes_to_address(literal, "r11"))
+            else:
+                lines.extend(_materialize_aggregate_value_address(func, value, ret_type, "r10"))
+                lines.extend(_copy_address_to_address("r10", "r11", ret_type.slot_size))
+            lines.extend(_emit_epilogue(func))
+            return lines
+        lines = _materialize_aggregate_to_gp_regs(
+            func,
+            value,
+            ret_type,
+            tuple(zip(("rax", "rdx"), _aggregate_reg_chunks(ret_type), strict=False)),
+        )
+        lines.extend(_emit_epilogue(func))
+        return lines
     if not (ret_type.is_int or ret_type.is_ptr or ret_type.is_fp):
         raise BackendUnavailable(
             f"x86_64 self backend return type not translated yet in {func.name!r}: {ret_type.describe()}"
@@ -999,7 +2019,8 @@ def _emit_phi_assignments(func: ParsedFunction, *, source_block: str, target_blo
             f"x86_64 self backend branch targets unknown block {target_block!r} in {func.name!r}"
         )
 
-    lines: list[str] = []
+    assignments = []
+    temp_offset = 0
     for phi in target.phis:
         if phi.dest not in func.value_slots:
             continue
@@ -1008,13 +2029,52 @@ def _emit_phi_assignments(func: ParsedFunction, *, source_block: str, target_blo
             raise BackendUnavailable(
                 f"x86_64 self backend could not resolve phi incoming for {phi.dest!r} from {source_block!r}"
             )
-        if not (phi.type.is_int or phi.type.is_ptr or phi.type.is_fp):
+        if not (phi.type.is_int or phi.type.is_ptr or phi.type.is_fp or phi.type.is_array or phi.type.is_struct):
             raise BackendUnavailable(
                 f"x86_64 self backend phi type not translated yet in {func.name!r}: {phi.type.describe()}"
             )
+        temp_align = max(1, min(phi.type.align, 8))
+        temp_offset = _align_to(temp_offset, temp_align)
+        assignments.append((phi, match, temp_offset))
+        temp_offset += phi.type.slot_size
+
+    if not assignments:
+        return []
+
+    total_temp = _align_to(temp_offset, 16)
+    lines: list[str] = []
+    if total_temp:
+        lines.append(f"  sub rsp, {total_temp}")
+
+    for phi, match, offset in assignments:
+        if phi.type.is_array or phi.type.is_struct:
+            lines.append(f"  lea r11, [rsp + {offset}]")
+            if phi.type.is_array and phi.type.elem is not None:
+                lines.extend(_materialize_vector_value_to_address(func, match.value, phi.type, "r11"))
+            elif match.value == "zeroinitializer":
+                lines.extend(_zero_address("r11", phi.type.slot_size))
+            elif is_aggregate_literal_value(match.value):
+                lines.extend(_store_literal_bytes_to_address(aggregate_literal_to_bytes(phi.type, match.value), "r11"))
+            else:
+                lines.extend(_materialize_aggregate_value_address(func, match.value, phi.type, "r10"))
+                lines.extend(_copy_address_to_address("r10", "r11", phi.type.slot_size))
+            continue
         reg = _reg_name(phi.type, 10)
         lines.extend(_materialize_value(func, match.value, phi.type, reg))
+        lines.extend(_store_reg_to_temp(reg, offset, phi.type))
+
+    for phi, _match, offset in assignments:
+        if phi.type.is_array or phi.type.is_struct:
+            lines.append(f"  lea r10, [rsp + {offset}]")
+            lines.append(f"  lea r11, {_slot_addr(func.value_slots[phi.dest].offset)}")
+            lines.extend(_copy_address_to_address("r10", "r11", phi.type.slot_size))
+            continue
+        reg = _reg_name(phi.type, 10)
+        lines.extend(_load_temp_to_reg(offset, reg, phi.type))
         lines.extend(_store_reg_to_slot(reg, func.value_slots[phi.dest].offset, phi.type))
+
+    if total_temp:
+        lines.append(f"  add rsp, {total_temp}")
     return lines
 
 
@@ -1109,10 +2169,6 @@ def _emit_unreachable_terminator() -> list[str]:
     return ["  ud2"]
 
 
-def _aggregate_returned_direct(_ty) -> bool:
-    return False
-
-
 def _emit_function(func: ParsedFunction) -> list[str]:
     symbol = _asm_symbol(func.name)
     lines = _emit_prologue(func)
@@ -1129,17 +2185,22 @@ def _emit_function(func: ParsedFunction) -> list[str]:
 
 
 def emit_x86_64_linux_asm(ir_text: str) -> str:
-    global _MODULE_SYMBOLS
+    global _MODULE_SYMBOLS, _VARARG_FUNCTIONS
     prepared = prepare_module_for_target(
         ir_text,
-        aggregate_returned_indirect=_aggregate_returned_direct,
+        aggregate_returned_indirect=_aggregate_returned_indirect,
     )
     triple = prepared.triple
     if not is_x86_64_linux_triple(triple):
         raise BackendUnavailable(
             f"self backend asm Linux slice only supports x86_64 Linux, got {triple!r}"
         )
+    prepared = run_self_target_memory_pass_pipeline(
+        prepared,
+        "self-x86_64-linux-v0",
+    )
     _MODULE_SYMBOLS = prepared.module_symbols
+    _VARARG_FUNCTIONS = frozenset(func.name for func in prepared.functions if func.is_vararg)
     lines = [".intel_syntax noprefix"]
     lines.extend(emit_globals(prepared.globals_, _MODULE_SYMBOLS))
     for func in prepared.functions:

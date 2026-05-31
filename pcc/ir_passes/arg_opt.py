@@ -223,13 +223,7 @@ def _rewrite_signatures_and_calls(
         call_re = re.compile(
             r"(call\s+[^@]*@" + re.escape(fn_name) + r")\s*\((?P<args>[^)]*)\)"
         )
-
-        def repl(mm: re.Match, dead=dead) -> str:
-            args = [a.strip() for a in _ARG_SPLIT_RE.split(mm.group("args"))] if mm.group("args").strip() else []
-            kept = [a for i, a in enumerate(args) if i not in dead]
-            return f"{mm.group(1)}({', '.join(kept)})"
-
-        text = call_re.sub(repl, text)
+        text = _rewrite_dead_call_args(text, call_re, dead)
 
     for fn_name in dead_return_plan:
         call_assign_re = re.compile(
@@ -266,6 +260,28 @@ def _rewrite_signatures_and_calls(
             text,
         )
     return text
+
+
+def _rewrite_dead_call_args(
+    text: str,
+    call_re: re.Pattern,
+    dead: list[int],
+) -> str:
+    out: list[str] = []
+    pos = 0
+    for match in call_re.finditer(text):
+        out.append(text[pos:match.start()])
+        raw_args = match.group("args")
+        args = (
+            [a.strip() for a in _ARG_SPLIT_RE.split(raw_args)]
+            if raw_args.strip()
+            else []
+        )
+        kept = [a for i, a in enumerate(args) if i not in dead]
+        out.append(f"{match.group(1)}({', '.join(kept)})")
+        pos = match.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _collect_function_sections(ir_text: str) -> dict[str, list[str]]:

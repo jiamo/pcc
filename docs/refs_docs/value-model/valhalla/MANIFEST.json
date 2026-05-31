@@ -1,0 +1,1248 @@
+{
+  "repository": "https://github.com/openjdk/valhalla",
+  "branch": "lworld",
+  "commit": "b13d505a7be19e4c5348ef91b9517bcaafd56649",
+  "commit_date": "2026-05-15T22:11:35Z",
+  "fetched_on": "2026-05-18",
+  "files": [
+    {
+      "bytes": 19274,
+      "path": "LICENSE",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/LICENSE",
+      "sha256": "4b9abebc4338048a7c2dc184e9f800deb349366bdf28eb23c2677a77b4c87726",
+      "upstream_path": "LICENSE"
+    },
+    {
+      "bytes": 34719,
+      "path": "src/hotspot/share/include/jvm.h",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/include/jvm.h",
+      "sha256": "7f02d8621334aedffdbf24cd19848c0f14b81d2a361fb4a08cf33a71ff76a8bd",
+      "upstream_path": "src/hotspot/share/include/jvm.h"
+    },
+    {
+      "bytes": 275980,
+      "path": "src/hotspot/share/classfile/classFileParser.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/classFileParser.cpp",
+      "sha256": "e41fc8601e9d067cdeda4effd11a4bae9a12558bf16b2405ff6f649020516b31",
+      "upstream_path": "src/hotspot/share/classfile/classFileParser.cpp"
+    },
+    {
+      "bytes": 24574,
+      "path": "src/hotspot/share/classfile/classFileParser.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/classFileParser.hpp",
+      "sha256": "4fa739b10ba4f9899d4937554293585cf6107152748d490ac6db095489e3ce28",
+      "upstream_path": "src/hotspot/share/classfile/classFileParser.hpp"
+    },
+    {
+      "bytes": 74263,
+      "path": "src/hotspot/share/classfile/fieldLayoutBuilder.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/fieldLayoutBuilder.cpp",
+      "sha256": "576428ae98feab000d124459a075ac24f45d633c86ede7c111ff558a5f0314e9",
+      "upstream_path": "src/hotspot/share/classfile/fieldLayoutBuilder.cpp"
+    },
+    {
+      "bytes": 15645,
+      "path": "src/hotspot/share/classfile/fieldLayoutBuilder.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/fieldLayoutBuilder.hpp",
+      "sha256": "6d492c23ef2677087c5f1491810418589c6fdea9a92e80ea1b24423b2b13f6ea",
+      "upstream_path": "src/hotspot/share/classfile/fieldLayoutBuilder.hpp"
+    },
+    {
+      "bytes": 207301,
+      "path": "src/hotspot/share/classfile/javaClasses.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/javaClasses.cpp",
+      "sha256": "489acae3140f49a5190348c451af19deda2d0e6cc808a02e711d4682a4fd6c2a",
+      "upstream_path": "src/hotspot/share/classfile/javaClasses.cpp"
+    },
+    {
+      "bytes": 63367,
+      "path": "src/hotspot/share/classfile/javaClasses.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/javaClasses.hpp",
+      "sha256": "2136b2cc4cad205ce5100eaec2d7441d7b6b2ff30a0cb30516103ea925645825",
+      "upstream_path": "src/hotspot/share/classfile/javaClasses.hpp"
+    },
+    {
+      "bytes": 13792,
+      "path": "src/hotspot/share/classfile/javaClasses.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/javaClasses.inline.hpp",
+      "sha256": "feeecc5228ed4e97359964590c096b94ccd8ef446cfaf3767a7bc0e80e97ddf8",
+      "upstream_path": "src/hotspot/share/classfile/javaClasses.inline.hpp"
+    },
+    {
+      "bytes": 113160,
+      "path": "src/hotspot/share/classfile/systemDictionary.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/systemDictionary.cpp",
+      "sha256": "9b479f852cd93963ae4ea502adcea5f3ceaed8183e7585859f39b7b64291feae",
+      "upstream_path": "src/hotspot/share/classfile/systemDictionary.cpp"
+    },
+    {
+      "bytes": 18490,
+      "path": "src/hotspot/share/classfile/systemDictionary.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/systemDictionary.hpp",
+      "sha256": "4a9f664f6c5ec856af4b5e93d60e875f8f13da6188cb08e5f5a5c32d76d82742",
+      "upstream_path": "src/hotspot/share/classfile/systemDictionary.hpp"
+    },
+    {
+      "bytes": 21732,
+      "path": "src/hotspot/share/classfile/vmClassMacros.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/vmClassMacros.hpp",
+      "sha256": "0afa8410a635d2b536cdad6f02b67def947cda0c04176776a6b776a75f96ab6c",
+      "upstream_path": "src/hotspot/share/classfile/vmClassMacros.hpp"
+    },
+    {
+      "bytes": 30228,
+      "path": "src/hotspot/share/classfile/vmIntrinsics.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/vmIntrinsics.cpp",
+      "sha256": "8f4ffe244c4e7d586602502e8c7056fefa84f6dd9cc5a48620546c56cf672fe3",
+      "upstream_path": "src/hotspot/share/classfile/vmIntrinsics.cpp"
+    },
+    {
+      "bytes": 191872,
+      "path": "src/hotspot/share/classfile/vmIntrinsics.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/vmIntrinsics.hpp",
+      "sha256": "a877795e4c2e4e6e0735147d1fc41683ee355a68fd000e936f72ac2ca17fb0da",
+      "upstream_path": "src/hotspot/share/classfile/vmIntrinsics.hpp"
+    },
+    {
+      "bytes": 12396,
+      "path": "src/hotspot/share/classfile/vmSymbols.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/vmSymbols.cpp",
+      "sha256": "f5816c9e286a3cbe0c19c3dcb769fbee3108ee462280305ddf87eb84ed68067d",
+      "upstream_path": "src/hotspot/share/classfile/vmSymbols.cpp"
+    },
+    {
+      "bytes": 84542,
+      "path": "src/hotspot/share/classfile/vmSymbols.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/classfile/vmSymbols.hpp",
+      "sha256": "767da4f29b743c3b425e3d5990c9fda354c907570b8427dc4c3fa509e7c15696",
+      "upstream_path": "src/hotspot/share/classfile/vmSymbols.hpp"
+    },
+    {
+      "bytes": 11860,
+      "path": "src/hotspot/share/oops/arrayKlass.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/arrayKlass.cpp",
+      "sha256": "a6264948e3c730963cbc83a8b88995b13550fdf639fd0d52661be11236d241ba",
+      "upstream_path": "src/hotspot/share/oops/arrayKlass.cpp"
+    },
+    {
+      "bytes": 6715,
+      "path": "src/hotspot/share/oops/arrayKlass.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/arrayKlass.hpp",
+      "sha256": "0f8aa9943ee722833144dd0f8eadce3b497097075246ac60ea3edce8c5d49426",
+      "upstream_path": "src/hotspot/share/oops/arrayKlass.hpp"
+    },
+    {
+      "bytes": 1515,
+      "path": "src/hotspot/share/oops/arrayKlass.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/arrayKlass.inline.hpp",
+      "sha256": "3ff4346735c0f0b3574de6052715f261ed578ece4b0813570e5f0b10ad1976d2",
+      "upstream_path": "src/hotspot/share/oops/arrayKlass.inline.hpp"
+    },
+    {
+      "bytes": 13459,
+      "path": "src/hotspot/share/oops/fieldInfo.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/fieldInfo.cpp",
+      "sha256": "39cc0f9ffe0444b0c7161743d2c4b203b79020d38c95d070dbd6ef81be39da12",
+      "upstream_path": "src/hotspot/share/oops/fieldInfo.cpp"
+    },
+    {
+      "bytes": 15069,
+      "path": "src/hotspot/share/oops/fieldInfo.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/fieldInfo.hpp",
+      "sha256": "090635238ca16353e2bba95804c02771bf6be5072c5e984242a1074d91dce686",
+      "upstream_path": "src/hotspot/share/oops/fieldInfo.hpp"
+    },
+    {
+      "bytes": 7677,
+      "path": "src/hotspot/share/oops/fieldInfo.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/fieldInfo.inline.hpp",
+      "sha256": "e288953d86516766ab723b91f80984bb5918d7705c2052a739a45d6e38451e58",
+      "upstream_path": "src/hotspot/share/oops/fieldInfo.inline.hpp"
+    },
+    {
+      "bytes": 12573,
+      "path": "src/hotspot/share/oops/fieldStreams.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/fieldStreams.hpp",
+      "sha256": "23cc83d0dd822bc8c6225b9148e23437abe09ef899b42a6342eb748cb019578b",
+      "upstream_path": "src/hotspot/share/oops/fieldStreams.hpp"
+    },
+    {
+      "bytes": 2849,
+      "path": "src/hotspot/share/oops/fieldStreams.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/fieldStreams.inline.hpp",
+      "sha256": "be728f21c915f79f92263ee052af986c3663e40fdd812d8b89ddcab7fbb80007",
+      "upstream_path": "src/hotspot/share/oops/fieldStreams.inline.hpp"
+    },
+    {
+      "bytes": 18012,
+      "path": "src/hotspot/share/oops/flatArrayKlass.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/flatArrayKlass.cpp",
+      "sha256": "d9ed84c3a9b9235150b6254008ca590bb0333439b7642b5d9b8436fdc8277788",
+      "upstream_path": "src/hotspot/share/oops/flatArrayKlass.cpp"
+    },
+    {
+      "bytes": 5494,
+      "path": "src/hotspot/share/oops/flatArrayKlass.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/flatArrayKlass.hpp",
+      "sha256": "5bc3f57e100f617e237527b42243d78eecc3ca469b27cd4da17da40327ceb40e",
+      "upstream_path": "src/hotspot/share/oops/flatArrayKlass.hpp"
+    },
+    {
+      "bytes": 5400,
+      "path": "src/hotspot/share/oops/flatArrayKlass.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/flatArrayKlass.inline.hpp",
+      "sha256": "2a7b2ce1f660e48e884c03476b34a4fd13ee93323d4fd83ee289a4a40c6d8ce3",
+      "upstream_path": "src/hotspot/share/oops/flatArrayKlass.inline.hpp"
+    },
+    {
+      "bytes": 1061,
+      "path": "src/hotspot/share/oops/flatArrayOop.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/flatArrayOop.cpp",
+      "sha256": "a613a81e3ee6aee7ef7b1572c2d121624be949fcb4edca502ed75bdcd0ee2a72",
+      "upstream_path": "src/hotspot/share/oops/flatArrayOop.cpp"
+    },
+    {
+      "bytes": 3239,
+      "path": "src/hotspot/share/oops/flatArrayOop.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/flatArrayOop.hpp",
+      "sha256": "8c1006725cab16a96eb24c1b04721d83c05fc923242355c7a02abd1f525b7de0",
+      "upstream_path": "src/hotspot/share/oops/flatArrayOop.hpp"
+    },
+    {
+      "bytes": 5070,
+      "path": "src/hotspot/share/oops/flatArrayOop.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/flatArrayOop.inline.hpp",
+      "sha256": "5e208ae853df12660188749d46dd5b3f053d2082e13fd27eb378606783a59d39",
+      "upstream_path": "src/hotspot/share/oops/flatArrayOop.inline.hpp"
+    },
+    {
+      "bytes": 22942,
+      "path": "src/hotspot/share/oops/inlineKlass.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/inlineKlass.cpp",
+      "sha256": "d2949a7cdf4f81e3ce15518f4e902a9627fa1095075a6f0fd1700f98e2bfc25e",
+      "upstream_path": "src/hotspot/share/oops/inlineKlass.cpp"
+    },
+    {
+      "bytes": 14963,
+      "path": "src/hotspot/share/oops/inlineKlass.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/inlineKlass.hpp",
+      "sha256": "46d0c7fbcbb34bc13e97053cd7cc0e1405e8c401fb856571b7947f014284a1e1",
+      "upstream_path": "src/hotspot/share/oops/inlineKlass.hpp"
+    },
+    {
+      "bytes": 5246,
+      "path": "src/hotspot/share/oops/inlineKlass.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/inlineKlass.inline.hpp",
+      "sha256": "c285fe8f7881f1f85dbb8b3f2c3f264ab9a9f387ce68028e8db480e9a07dad86",
+      "upstream_path": "src/hotspot/share/oops/inlineKlass.inline.hpp"
+    },
+    {
+      "bytes": 1437,
+      "path": "src/hotspot/share/oops/inlineOop.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/inlineOop.hpp",
+      "sha256": "3997f51aa073b94cc4fac8c39cbf91ca002907796b81c99ed253d31eba561770",
+      "upstream_path": "src/hotspot/share/oops/inlineOop.hpp"
+    },
+    {
+      "bytes": 193161,
+      "path": "src/hotspot/share/oops/instanceKlass.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/instanceKlass.cpp",
+      "sha256": "8df7ccb034ead39514b6d9322205e43a12d252ad212c4dd1304742aff31a7d45",
+      "upstream_path": "src/hotspot/share/oops/instanceKlass.cpp"
+    },
+    {
+      "bytes": 62484,
+      "path": "src/hotspot/share/oops/instanceKlass.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/instanceKlass.hpp",
+      "sha256": "5786188287f362fbbe81c9599985f51e1e7bf4adb8f15e183c62be5b51ba8474",
+      "upstream_path": "src/hotspot/share/oops/instanceKlass.hpp"
+    },
+    {
+      "bytes": 7657,
+      "path": "src/hotspot/share/oops/instanceKlass.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/instanceKlass.inline.hpp",
+      "sha256": "055309a25a47b64975a8aa6c834dd3eb2d6558dff036d849f682eaf5eabb20f9",
+      "upstream_path": "src/hotspot/share/oops/instanceKlass.inline.hpp"
+    },
+    {
+      "bytes": 48660,
+      "path": "src/hotspot/share/oops/klass.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/klass.cpp",
+      "sha256": "3325b5e94d70047b99b346eda1e6f1cbe6c340a31e0af349538d7b7c43ee4848",
+      "upstream_path": "src/hotspot/share/oops/klass.cpp"
+    },
+    {
+      "bytes": 34774,
+      "path": "src/hotspot/share/oops/klass.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/klass.hpp",
+      "sha256": "4f1e01d780ea7e74c55eb1b2f6e9deda9eae39029ed148b6134fc0ab9628bdcd",
+      "upstream_path": "src/hotspot/share/oops/klass.hpp"
+    },
+    {
+      "bytes": 6868,
+      "path": "src/hotspot/share/oops/klass.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/klass.inline.hpp",
+      "sha256": "9f752b8523b544e9ba90aae00b2d4616c6a6225a9f625c81a9635b3f3bf221f5",
+      "upstream_path": "src/hotspot/share/oops/klass.inline.hpp"
+    },
+    {
+      "bytes": 1925,
+      "path": "src/hotspot/share/oops/layoutKind.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/layoutKind.cpp",
+      "sha256": "5beaad001dc82b43e5e0551d78faa01b7397fd6d9b534531c28e31118e5dcfe2",
+      "upstream_path": "src/hotspot/share/oops/layoutKind.cpp"
+    },
+    {
+      "bytes": 8848,
+      "path": "src/hotspot/share/oops/layoutKind.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/layoutKind.hpp",
+      "sha256": "7ff56c162fa278642a8fa725bb7bc5c7a25ce12065676449f91c8f4a9f9af41b",
+      "upstream_path": "src/hotspot/share/oops/layoutKind.hpp"
+    },
+    {
+      "bytes": 3708,
+      "path": "src/hotspot/share/oops/markWord.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/markWord.cpp",
+      "sha256": "97c80d47ec0ae790242fc23b2fd8925cda092d6da014548f334eab2f199f22f7",
+      "upstream_path": "src/hotspot/share/oops/markWord.cpp"
+    },
+    {
+      "bytes": 16092,
+      "path": "src/hotspot/share/oops/markWord.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/markWord.hpp",
+      "sha256": "0c6ae1906a0d672b4c338a0c1cc2e0e7a3c049018d2cc0f46c54fc838c9841dd",
+      "upstream_path": "src/hotspot/share/oops/markWord.hpp"
+    },
+    {
+      "bytes": 2556,
+      "path": "src/hotspot/share/oops/markWord.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/markWord.inline.hpp",
+      "sha256": "ed0085d0a8a48af2f36476b97029963a8609ce2fefa4f0bd1bad2fa4fb423d86",
+      "upstream_path": "src/hotspot/share/oops/markWord.inline.hpp"
+    },
+    {
+      "bytes": 9586,
+      "path": "src/hotspot/share/oops/oop.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/oop.cpp",
+      "sha256": "77c89e00122bda07718a3943498e5935e2e98f97f8ddc1499442888707bf25aa",
+      "upstream_path": "src/hotspot/share/oops/oop.cpp"
+    },
+    {
+      "bytes": 13078,
+      "path": "src/hotspot/share/oops/oop.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/oop.hpp",
+      "sha256": "727b0caafd62ac85740e271c9e85aa92118c8d201d07cab15cd25aafe1435038",
+      "upstream_path": "src/hotspot/share/oops/oop.hpp"
+    },
+    {
+      "bytes": 17047,
+      "path": "src/hotspot/share/oops/oop.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/oop.inline.hpp",
+      "sha256": "a59c265a06e4f0e552f7e9283b0571112dabba9cb7985349bccfe54a1c236e80",
+      "upstream_path": "src/hotspot/share/oops/oop.inline.hpp"
+    },
+    {
+      "bytes": 12390,
+      "path": "src/hotspot/share/oops/valuePayload.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/valuePayload.hpp",
+      "sha256": "360265177d17e3ea1ec0acabfa335850425e88be9ba5ef2a7eb949fe16721301",
+      "upstream_path": "src/hotspot/share/oops/valuePayload.hpp"
+    },
+    {
+      "bytes": 32304,
+      "path": "src/hotspot/share/oops/valuePayload.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/oops/valuePayload.inline.hpp",
+      "sha256": "99ec350977617cd4bae1840efd68293104337cabcca3322f1cb3479a448e548d",
+      "upstream_path": "src/hotspot/share/oops/valuePayload.inline.hpp"
+    },
+    {
+      "bytes": 71272,
+      "path": "src/hotspot/share/interpreter/interpreterRuntime.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/interpreter/interpreterRuntime.cpp",
+      "sha256": "081f24282cda0cab68f581b30438f711b33a742980c2efd8208b1609fe011db9",
+      "upstream_path": "src/hotspot/share/interpreter/interpreterRuntime.cpp"
+    },
+    {
+      "bytes": 25349,
+      "path": "src/hotspot/share/memory/heapInspection.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/memory/heapInspection.cpp",
+      "sha256": "5280c62fa7ea59d58411b328d4f2563d929ddfe303f609a3c0970097f70c3fb9",
+      "upstream_path": "src/hotspot/share/memory/heapInspection.cpp"
+    },
+    {
+      "bytes": 5928,
+      "path": "src/hotspot/share/memory/oopFactory.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/memory/oopFactory.cpp",
+      "sha256": "7911e0305332ca365b098b20270b137bbc5752bef92ceb5f03edb2604887a040",
+      "upstream_path": "src/hotspot/share/memory/oopFactory.cpp"
+    },
+    {
+      "bytes": 3040,
+      "path": "src/hotspot/share/memory/oopFactory.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/memory/oopFactory.hpp",
+      "sha256": "d3b3643e6c046a02e31510469f39f0b0d50e8c39a4f4200ea3e52e359b88b988",
+      "upstream_path": "src/hotspot/share/memory/oopFactory.hpp"
+    },
+    {
+      "bytes": 165737,
+      "path": "src/hotspot/share/prims/jni.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/prims/jni.cpp",
+      "sha256": "c814fedca4c76e9ffd6ddbddad2b5a90331935d084e8d6ba71a7dfa5287700a6",
+      "upstream_path": "src/hotspot/share/prims/jni.cpp"
+    },
+    {
+      "bytes": 156216,
+      "path": "src/hotspot/share/prims/jvm.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/prims/jvm.cpp",
+      "sha256": "67d5e736d008d55e7a9274f58ac05a6a6ddaf8a8d5263dbd616778ee9aa9b0ce",
+      "upstream_path": "src/hotspot/share/prims/jvm.cpp"
+    },
+    {
+      "bytes": 62617,
+      "path": "src/hotspot/share/prims/methodHandles.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/prims/methodHandles.cpp",
+      "sha256": "dadaa5c0dac8d118ed5bc91a75dbaa5533f91e622b8cec5135a7700b733a904e",
+      "upstream_path": "src/hotspot/share/prims/methodHandles.cpp"
+    },
+    {
+      "bytes": 8142,
+      "path": "src/hotspot/share/prims/methodHandles.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/prims/methodHandles.hpp",
+      "sha256": "9fe1798b5c5d9f4e3920bf49fa2af6b9ea0083dfaca8444bda25fc505597a660",
+      "upstream_path": "src/hotspot/share/prims/methodHandles.hpp"
+    },
+    {
+      "bytes": 46531,
+      "path": "src/hotspot/share/prims/unsafe.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "b19ac6cd6b969e49c79dece3b0a1cce04f19c1af1ae16d1b6df5f213b9182285",
+      "upstream_path": "src/hotspot/share/prims/unsafe.cpp"
+    },
+    {
+      "bytes": 1407,
+      "path": "src/hotspot/share/prims/unsafe.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/prims/unsafe.hpp",
+      "sha256": "77c1f242c05dc9cfe47555eb27cc439f73f62e1dff907afbee3e44aaeea3977a",
+      "upstream_path": "src/hotspot/share/prims/unsafe.hpp"
+    },
+    {
+      "bytes": 130547,
+      "path": "src/hotspot/share/runtime/deoptimization.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/deoptimization.cpp",
+      "sha256": "2dd01e13494fad4ceb546ad28e1c10b067d3f7d1d0df48449749f068fff11653",
+      "upstream_path": "src/hotspot/share/runtime/deoptimization.cpp"
+    },
+    {
+      "bytes": 23999,
+      "path": "src/hotspot/share/runtime/deoptimization.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/deoptimization.hpp",
+      "sha256": "d303f7b1f531b576f46437924e1999760f477d0d27374ba3739f2968a5b1f8ef",
+      "upstream_path": "src/hotspot/share/runtime/deoptimization.hpp"
+    },
+    {
+      "bytes": 9895,
+      "path": "src/hotspot/share/runtime/fieldDescriptor.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/fieldDescriptor.cpp",
+      "sha256": "9f04221fa5c6b0f8a294938c824ab80914a3e54fca10096a831978c6a38984ce",
+      "upstream_path": "src/hotspot/share/runtime/fieldDescriptor.cpp"
+    },
+    {
+      "bytes": 5382,
+      "path": "src/hotspot/share/runtime/fieldDescriptor.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/fieldDescriptor.hpp",
+      "sha256": "d8d6b60a565b71cf5b3e3bc48b8dbdded9649f4145e5975e5f5b51d83096a73e",
+      "upstream_path": "src/hotspot/share/runtime/fieldDescriptor.hpp"
+    },
+    {
+      "bytes": 3206,
+      "path": "src/hotspot/share/runtime/fieldDescriptor.inline.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/fieldDescriptor.inline.hpp",
+      "sha256": "e4998241046fd49b003c5dda5a204bc829772399748545115f05853a8c0f09a9",
+      "upstream_path": "src/hotspot/share/runtime/fieldDescriptor.inline.hpp"
+    },
+    {
+      "bytes": 45944,
+      "path": "src/hotspot/share/runtime/reflection.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/reflection.cpp",
+      "sha256": "b134349c84e83eca69b1d2cd0b845b9e77cecef16208965490a35d1a6f1dc37d",
+      "upstream_path": "src/hotspot/share/runtime/reflection.cpp"
+    },
+    {
+      "bytes": 6023,
+      "path": "src/hotspot/share/runtime/reflection.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/reflection.hpp",
+      "sha256": "6352a6c81376ca068c57b9a6e0a2f687c77d9afe28a23946f805264b0def45e6",
+      "upstream_path": "src/hotspot/share/runtime/reflection.hpp"
+    },
+    {
+      "bytes": 171263,
+      "path": "src/hotspot/share/runtime/sharedRuntime.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/sharedRuntime.cpp",
+      "sha256": "b7e63eff36e830ddc3a43133a003cd975f3f1ae6061ccb0f232eeffb3678232f",
+      "upstream_path": "src/hotspot/share/runtime/sharedRuntime.cpp"
+    },
+    {
+      "bytes": 42411,
+      "path": "src/hotspot/share/runtime/sharedRuntime.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/sharedRuntime.hpp",
+      "sha256": "615bc63dbe62f90e9c0022f152cfd239f7e3e820abd548c55561824d4682bb76",
+      "upstream_path": "src/hotspot/share/runtime/sharedRuntime.hpp"
+    },
+    {
+      "bytes": 25301,
+      "path": "src/hotspot/share/runtime/signature.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/signature.cpp",
+      "sha256": "fbdc02f20a5c6109eccea7db94e8c8f129393113ff104626f54314c8a3834bbd",
+      "upstream_path": "src/hotspot/share/runtime/signature.cpp"
+    },
+    {
+      "bytes": 25251,
+      "path": "src/hotspot/share/runtime/signature.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/signature.hpp",
+      "sha256": "ee7d4108c332569e38ad34e608120d7790ee1a6381589a23dff13e09efc99e23",
+      "upstream_path": "src/hotspot/share/runtime/signature.hpp"
+    },
+    {
+      "bytes": 90514,
+      "path": "src/hotspot/share/runtime/synchronizer.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/synchronizer.cpp",
+      "sha256": "dd2d1ef9632bf88863efcf60762f49682bfbe7e8cd960a1c1cac1c7f1848c54f",
+      "upstream_path": "src/hotspot/share/runtime/synchronizer.cpp"
+    },
+    {
+      "bytes": 10803,
+      "path": "src/hotspot/share/runtime/synchronizer.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/synchronizer.hpp",
+      "sha256": "3e56549e1c76e76ac369302c1c5a1ff9e68160a8f1ca9f1e3b99697529268093",
+      "upstream_path": "src/hotspot/share/runtime/synchronizer.hpp"
+    },
+    {
+      "bytes": 183338,
+      "path": "src/hotspot/share/runtime/vmStructs.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/vmStructs.cpp",
+      "sha256": "5f816e4a37e3e33994168ee57f11fe55c1693122a3c85ddff2e86f07745cca94",
+      "upstream_path": "src/hotspot/share/runtime/vmStructs.cpp"
+    },
+    {
+      "bytes": 13415,
+      "path": "src/hotspot/share/runtime/vmStructs.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/runtime/vmStructs.hpp",
+      "sha256": "3fbc0fbf7c1f3a3f30b904bdb81e3a95e527e9e01c3e5806e3232b5429bb0a43",
+      "upstream_path": "src/hotspot/share/runtime/vmStructs.hpp"
+    },
+    {
+      "bytes": 27390,
+      "path": "src/hotspot/share/services/diagnosticCommand.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/services/diagnosticCommand.hpp",
+      "sha256": "d48756eda566d8de96fecf8a48d970c4c52e6e57404f7a0e077a6c3d573c1f09",
+      "upstream_path": "src/hotspot/share/services/diagnosticCommand.hpp"
+    },
+    {
+      "bytes": 105550,
+      "path": "src/hotspot/share/services/heapDumper.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/services/heapDumper.cpp",
+      "sha256": "0a7f5adea6be84c927923929aa9d5d9dc9c3402724b76810fe718fdfd1c31857",
+      "upstream_path": "src/hotspot/share/services/heapDumper.cpp"
+    },
+    {
+      "bytes": 22149,
+      "path": "src/hotspot/share/ci/ciField.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/ci/ciField.cpp",
+      "sha256": "24cab353d6c47fa4053ca34be33737a42000bcf65193faa53bed789c387ff6d1",
+      "upstream_path": "src/hotspot/share/ci/ciField.cpp"
+    },
+    {
+      "bytes": 9217,
+      "path": "src/hotspot/share/ci/ciField.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/ci/ciField.hpp",
+      "sha256": "e0e62f7048bfe3dc9c59b505308e055533ce5d21a0cb52ad3b92ac5d6383ae80",
+      "upstream_path": "src/hotspot/share/ci/ciField.hpp"
+    },
+    {
+      "bytes": 4911,
+      "path": "src/hotspot/share/ci/ciFlatArray.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/ci/ciFlatArray.cpp",
+      "sha256": "fb7fbfc6de1d02488bd6870be5db2b819b4bfe9de15e98ba017955bfa503effb",
+      "upstream_path": "src/hotspot/share/ci/ciFlatArray.cpp"
+    },
+    {
+      "bytes": 2055,
+      "path": "src/hotspot/share/ci/ciFlatArray.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/ci/ciFlatArray.hpp",
+      "sha256": "6efd8438e9e0312775b3f730862003de8f7f428238263ca3e8916d81c814b45b",
+      "upstream_path": "src/hotspot/share/ci/ciFlatArray.hpp"
+    },
+    {
+      "bytes": 2340,
+      "path": "src/hotspot/share/ci/ciFlatArrayKlass.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/ci/ciFlatArrayKlass.hpp",
+      "sha256": "4f1d2c3abf08ba196ce1cfaad9afd2254453e478ab845d75300e3276210fece1",
+      "upstream_path": "src/hotspot/share/ci/ciFlatArrayKlass.hpp"
+    },
+    {
+      "bytes": 6008,
+      "path": "src/hotspot/share/ci/ciInlineKlass.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/ci/ciInlineKlass.cpp",
+      "sha256": "88ff013093ce36b0615a456581316358805cb3991e18aadd40da1c4e8ba0126f",
+      "upstream_path": "src/hotspot/share/ci/ciInlineKlass.cpp"
+    },
+    {
+      "bytes": 2928,
+      "path": "src/hotspot/share/ci/ciInlineKlass.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/ci/ciInlineKlass.hpp",
+      "sha256": "e4bf6350e5fb63150d2e1f3d7a854613c4cb36d94bff55e757c56c1f3ad0dc76",
+      "upstream_path": "src/hotspot/share/ci/ciInlineKlass.hpp"
+    },
+    {
+      "bytes": 33952,
+      "path": "src/hotspot/share/ci/ciInstanceKlass.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/ci/ciInstanceKlass.cpp",
+      "sha256": "2638ed88dcbb714e6876408168b6bfd6f38734cc884c0b22c9b09195f0bd1fd2",
+      "upstream_path": "src/hotspot/share/ci/ciInstanceKlass.cpp"
+    },
+    {
+      "bytes": 11557,
+      "path": "src/hotspot/share/ci/ciInstanceKlass.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/ci/ciInstanceKlass.hpp",
+      "sha256": "dca5bf1fce270e2765242b23c887b6ef5fa3e34d5d573abf0cde62cef9425208",
+      "upstream_path": "src/hotspot/share/ci/ciInstanceKlass.hpp"
+    },
+    {
+      "bytes": 36867,
+      "path": "src/hotspot/share/opto/arraycopynode.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/arraycopynode.cpp",
+      "sha256": "a0986b36504c4c5813bcc118cbb0742086f92c8ceff75e78b97ff49bcba945bf",
+      "upstream_path": "src/hotspot/share/opto/arraycopynode.cpp"
+    },
+    {
+      "bytes": 61467,
+      "path": "src/hotspot/share/opto/callGenerator.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/callGenerator.cpp",
+      "sha256": "9c790d7c40b72a5a30bf0a70abcd3905855fec0d891b734c09fdd32bcfc9f5e2",
+      "upstream_path": "src/hotspot/share/opto/callGenerator.cpp"
+    },
+    {
+      "bytes": 9816,
+      "path": "src/hotspot/share/opto/callGenerator.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/callGenerator.hpp",
+      "sha256": "4e2999dbada2d1bc656d705443bec9474b240edbb7fdd327cf8e66023a9773a7",
+      "upstream_path": "src/hotspot/share/opto/callGenerator.hpp"
+    },
+    {
+      "bytes": 104580,
+      "path": "src/hotspot/share/opto/callnode.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/callnode.cpp",
+      "sha256": "5a63c8b5236a0d86968beb41c5a65cf475a3e51be548a4ae049bcdbd1a05c3de",
+      "upstream_path": "src/hotspot/share/opto/callnode.cpp"
+    },
+    {
+      "bytes": 10431,
+      "path": "src/hotspot/share/opto/classes.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/classes.hpp",
+      "sha256": "be4dbe80f9df33f4c8db202c924aa4d8d1351cc890521ecdd1f8c5de0c60bea8",
+      "upstream_path": "src/hotspot/share/opto/classes.hpp"
+    },
+    {
+      "bytes": 227014,
+      "path": "src/hotspot/share/opto/compile.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/compile.cpp",
+      "sha256": "979aebfa12e3f553a5b2a270135f210d435a056c0881fc2a195aca59f1398994",
+      "upstream_path": "src/hotspot/share/opto/compile.cpp"
+    },
+    {
+      "bytes": 69609,
+      "path": "src/hotspot/share/opto/compile.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/compile.hpp",
+      "sha256": "5b0516d953bbe626c77009864a23119d091488e46c3522c2e864feb0b325a5ce",
+      "upstream_path": "src/hotspot/share/opto/compile.hpp"
+    },
+    {
+      "bytes": 209459,
+      "path": "src/hotspot/share/opto/graphKit.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/graphKit.cpp",
+      "sha256": "80d00a89f065957c49a9d2020dad9013bcf03874c0fbe07f4473321ea6cd3042",
+      "upstream_path": "src/hotspot/share/opto/graphKit.cpp"
+    },
+    {
+      "bytes": 43926,
+      "path": "src/hotspot/share/opto/graphKit.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/graphKit.hpp",
+      "sha256": "1d3fda38c0fc279b682b5647fa5f610f6405bacdd68be9a0fdfe3c4a61e2a05a",
+      "upstream_path": "src/hotspot/share/opto/graphKit.hpp"
+    },
+    {
+      "bytes": 95821,
+      "path": "src/hotspot/share/opto/inlinetypenode.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/inlinetypenode.cpp",
+      "sha256": "e2bb6b6e60f2e61e7ae7c0fe51d9ec322813da16d15422057f5cbcddd0055260",
+      "upstream_path": "src/hotspot/share/opto/inlinetypenode.cpp"
+    },
+    {
+      "bytes": 13457,
+      "path": "src/hotspot/share/opto/inlinetypenode.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/inlinetypenode.hpp",
+      "sha256": "26918cc5d73041f49e642f7fd86e3fe66abb1f37a8ed284d5b722c7ea3e5db6e",
+      "upstream_path": "src/hotspot/share/opto/inlinetypenode.hpp"
+    },
+    {
+      "bytes": 421734,
+      "path": "src/hotspot/share/opto/library_call.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/library_call.cpp",
+      "sha256": "7918f112b1da030ea799b3ee88a4dcade4fb527aaa4355127c0d627d170b74d5",
+      "upstream_path": "src/hotspot/share/opto/library_call.cpp"
+    },
+    {
+      "bytes": 21211,
+      "path": "src/hotspot/share/opto/library_call.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/library_call.hpp",
+      "sha256": "d356b0610351bc2f89d1189cf495c9f1acc54384ed3e5f600092ee40d499942b",
+      "upstream_path": "src/hotspot/share/opto/library_call.hpp"
+    },
+    {
+      "bytes": 151927,
+      "path": "src/hotspot/share/opto/macro.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/macro.cpp",
+      "sha256": "955d0c8618be109bc2528c455080949eb97e2cd94aecaa14abea945d763546c2",
+      "upstream_path": "src/hotspot/share/opto/macro.cpp"
+    },
+    {
+      "bytes": 13917,
+      "path": "src/hotspot/share/opto/macro.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/macro.hpp",
+      "sha256": "064dab423ea51762ca28cdc13aca50ddad5ddbf97cedb05b1665ccf1c2539eb0",
+      "upstream_path": "src/hotspot/share/opto/macro.hpp"
+    },
+    {
+      "bytes": 73129,
+      "path": "src/hotspot/share/opto/macroArrayCopy.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/macroArrayCopy.cpp",
+      "sha256": "17668aa5da849cd03c400406b581a7dd85ce92b82a83403d00a3804f33d42317",
+      "upstream_path": "src/hotspot/share/opto/macroArrayCopy.cpp"
+    },
+    {
+      "bytes": 29131,
+      "path": "src/hotspot/share/opto/parse.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/parse.hpp",
+      "sha256": "12e880d921b86aff3f2eb98db381e2a54c68b2a947236ed9392256a7c041ca5a",
+      "upstream_path": "src/hotspot/share/opto/parse.hpp"
+    },
+    {
+      "bytes": 106821,
+      "path": "src/hotspot/share/opto/parse1.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/parse1.cpp",
+      "sha256": "099d2172cdcd4e8c09d83f6e46d4adc7534b794f38d12cd5bb26edb0fbc9d05e",
+      "upstream_path": "src/hotspot/share/opto/parse1.cpp"
+    },
+    {
+      "bytes": 137484,
+      "path": "src/hotspot/share/opto/parse2.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/parse2.cpp",
+      "sha256": "a181f349b6066b14312b0222e4c3b3d3472c1855614a9b6424293de40b2ca680",
+      "upstream_path": "src/hotspot/share/opto/parse2.cpp"
+    },
+    {
+      "bytes": 22310,
+      "path": "src/hotspot/share/opto/parse3.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/parse3.cpp",
+      "sha256": "ceb978b40a14e55a4157b7e3f4a2d77b8fe1afc5c9af7a3e441ea8c17c0b6600",
+      "upstream_path": "src/hotspot/share/opto/parse3.cpp"
+    },
+    {
+      "bytes": 14914,
+      "path": "src/hotspot/share/opto/parseHelper.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/parseHelper.cpp",
+      "sha256": "ffb9a941c2fd2630307ca0a39febebcbea5fc282ec9161ba172306b997512c17",
+      "upstream_path": "src/hotspot/share/opto/parseHelper.cpp"
+    },
+    {
+      "bytes": 101706,
+      "path": "src/hotspot/share/opto/runtime.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/runtime.cpp",
+      "sha256": "cd54e41041f05d314ecceb8255d2537ac9627b16a5f7f16a989881850c60519e",
+      "upstream_path": "src/hotspot/share/opto/runtime.cpp"
+    },
+    {
+      "bytes": 11071,
+      "path": "src/hotspot/share/opto/subtypenode.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/subtypenode.cpp",
+      "sha256": "7e0deb21b07bdb0ffe2511703f909ddacdf2bed1fdc066271e322f08c397524d",
+      "upstream_path": "src/hotspot/share/opto/subtypenode.cpp"
+    },
+    {
+      "bytes": 2469,
+      "path": "src/hotspot/share/opto/subtypenode.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/subtypenode.hpp",
+      "sha256": "1544d577a9a1fe8ce1dd65ea92579d505046d25a0e9ca710c9703ae185003d25",
+      "upstream_path": "src/hotspot/share/opto/subtypenode.hpp"
+    },
+    {
+      "bytes": 288240,
+      "path": "src/hotspot/share/opto/type.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/type.cpp",
+      "sha256": "b58cf80e017ef584c298d57eed01873726927ae20c93537910c94e58cf9692af",
+      "upstream_path": "src/hotspot/share/opto/type.cpp"
+    },
+    {
+      "bytes": 112393,
+      "path": "src/hotspot/share/opto/type.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/share/opto/type.hpp",
+      "sha256": "d86d311085a4dbfd13c94248b9a7cbfddb951880668bc13ed5f3d08b5d38b3a6",
+      "upstream_path": "src/hotspot/share/opto/type.hpp"
+    },
+    {
+      "bytes": 7651,
+      "path": "src/hotspot/cpu/aarch64/globals_aarch64.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/cpu/aarch64/globals_aarch64.hpp",
+      "sha256": "f8c177bb8f6f6632e926d8b5c36dbb3546dbc16bcbdb86a204372ba82c1ec347",
+      "upstream_path": "src/hotspot/cpu/aarch64/globals_aarch64.hpp"
+    },
+    {
+      "bytes": 124757,
+      "path": "src/hotspot/cpu/aarch64/sharedRuntime_aarch64.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/cpu/aarch64/sharedRuntime_aarch64.cpp",
+      "sha256": "10e4fafc8120692c84f8df9b71b63ca11a356a3ab6ce306181843271044b5d3b",
+      "upstream_path": "src/hotspot/cpu/aarch64/sharedRuntime_aarch64.cpp"
+    },
+    {
+      "bytes": 12950,
+      "path": "src/hotspot/cpu/x86/globals_x86.hpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/cpu/x86/globals_x86.hpp",
+      "sha256": "8592684999c1d51baeefa2d9e77f8dbe77d56950406f78a0cd323e973a8c75b5",
+      "upstream_path": "src/hotspot/cpu/x86/globals_x86.hpp"
+    },
+    {
+      "bytes": 151905,
+      "path": "src/hotspot/cpu/x86/sharedRuntime_x86_64.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/hotspot/cpu/x86/sharedRuntime_x86_64.cpp",
+      "sha256": "8e108972f66084c44cbc39fa64cfec97948c05949b8824a4a504e8c79abadd42",
+      "upstream_path": "src/hotspot/cpu/x86/sharedRuntime_x86_64.cpp"
+    },
+    {
+      "bytes": 174896,
+      "path": "src/java.base/share/classes/java/lang/Class.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/java/lang/Class.java",
+      "sha256": "eed7b82cb68a5ee3fae02666b1d2cd09e36b83a5185a8aa318c88558181b70a5",
+      "upstream_path": "src/java.base/share/classes/java/lang/Class.java"
+    },
+    {
+      "bytes": 3003,
+      "path": "src/java.base/share/classes/java/lang/IdentityException.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/java/lang/IdentityException.java",
+      "sha256": "a42e990677c3766f3cd649068b6dba38317caafb49aac3573aba5ec8304f38d8",
+      "upstream_path": "src/java.base/share/classes/java/lang/IdentityException.java"
+    },
+    {
+      "bytes": 32031,
+      "path": "src/java.base/share/classes/java/lang/Object.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/java/lang/Object.java",
+      "sha256": "f6b509a484ecd3098589a59b730f337995d09349768091ef1aa0038e037c2358",
+      "upstream_path": "src/java.base/share/classes/java/lang/Object.java"
+    },
+    {
+      "bytes": 6850,
+      "path": "src/java.base/share/classes/java/lang/runtime/ValueObjectMethods.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/java/lang/runtime/ValueObjectMethods.java",
+      "sha256": "cc6818007ede18093fce24494033065a1facaec6cdd8a2387a6d84b841fe40a4",
+      "upstream_path": "src/java.base/share/classes/java/lang/runtime/ValueObjectMethods.java"
+    },
+    {
+      "bytes": 22749,
+      "path": "src/java.base/share/classes/java/util/Objects.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/java/util/Objects.java",
+      "sha256": "47e73704e0b805caf02b958092f50227e6818a6980efd0e66c89d0b5c29a8d7f",
+      "upstream_path": "src/java.base/share/classes/java/util/Objects.java"
+    },
+    {
+      "bytes": 1959,
+      "path": "src/java.base/share/classes/jdk/internal/MigratedValueClass.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/jdk/internal/MigratedValueClass.java",
+      "sha256": "a91d4686b6265a0ce3bcf2f49691985dddbd5a8471ffab2012a4e27bf39605c2",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/MigratedValueClass.java"
+    },
+    {
+      "bytes": 2271,
+      "path": "src/java.base/share/classes/jdk/internal/RequiresIdentity.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/jdk/internal/RequiresIdentity.java",
+      "sha256": "9dbb00f7f01e0df66a41cd7d1f19c7ea0af31506a9c4faf81e9fe375f352931b",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/RequiresIdentity.java"
+    },
+    {
+      "bytes": 5872,
+      "path": "src/java.base/share/classes/jdk/internal/value/ValueClass.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/jdk/internal/value/ValueClass.java",
+      "sha256": "4feb5018013973f149f3c19d2456c7583fab745cf5908a9b9e0515ac7a0c2c33",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/value/ValueClass.java"
+    },
+    {
+      "bytes": 2235,
+      "path": "src/java.base/share/classes/jdk/internal/vm/annotation/LooselyConsistentValue.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/jdk/internal/vm/annotation/LooselyConsistentValue.java",
+      "sha256": "6663297c38c2d174889f3385501ea9b652fdfe9d6f199d280f29641efaa109b9",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/vm/annotation/LooselyConsistentValue.java"
+    },
+    {
+      "bytes": 2159,
+      "path": "src/java.base/share/classes/jdk/internal/vm/annotation/NullRestricted.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/classes/jdk/internal/vm/annotation/NullRestricted.java",
+      "sha256": "55ac3e798accb47edc19e946a5c6f1553a13dd6f4747f3206cc7fff173607201",
+      "upstream_path": "src/java.base/share/classes/jdk/internal/vm/annotation/NullRestricted.java"
+    },
+    {
+      "bytes": 2859,
+      "path": "src/java.base/share/native/libjava/ValueClass.c",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/java.base/share/native/libjava/ValueClass.c",
+      "sha256": "d95d428e7bb5102bf0a514ce5cde75bccb32d22f3c97a720f506443a2c57eba3",
+      "upstream_path": "src/java.base/share/native/libjava/ValueClass.c"
+    },
+    {
+      "bytes": 24712,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Flags.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Flags.java",
+      "sha256": "9e7a93ac7604dddade70e52af163086bd682e2f16dd09ad7f49b3fa9a9e65034",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Flags.java"
+    },
+    {
+      "bytes": 95535,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Symbol.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Symbol.java",
+      "sha256": "6f3a71eff99cba7c67243a4c75622582a2c48de04c4facb790d9b764a3c54c0d",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Symbol.java"
+    },
+    {
+      "bytes": 39634,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Symtab.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Symtab.java",
+      "sha256": "1076684bdd125be7e4f2a031d071a66569b227ee9eaba88481573de9094e33c8",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Symtab.java"
+    },
+    {
+      "bytes": 80631,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Type.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Type.java",
+      "sha256": "89b8a3df245f620e7e8115c5bf6ad82c2358dd8d844aa3f6d1120da9ca618d2c",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Type.java"
+    },
+    {
+      "bytes": 212238,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Types.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Types.java",
+      "sha256": "bd99e0603d49ad0a82e8957dcc8c484debb9634b80c556087f3cd572f7b68cff",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/code/Types.java"
+    },
+    {
+      "bytes": 299692,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Attr.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Attr.java",
+      "sha256": "c56ad4fda146b5cac207e1c1cb4cdb93f2a51aec4f652346ce022cceb7d14d0e",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Attr.java"
+    },
+    {
+      "bytes": 262701,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Check.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Check.java",
+      "sha256": "816c6ccab1d5a43f0c08327c4d7e7bffe58fd7863b954da617872c4ea0de9bb3",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Check.java"
+    },
+    {
+      "bytes": 191463,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Lower.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Lower.java",
+      "sha256": "e5efcdb1d7b46c502e255a9ed6e3a7cf0c5af49814b22ecf536cf7a1f29e9850",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Lower.java"
+    },
+    {
+      "bytes": 226874,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Resolve.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Resolve.java",
+      "sha256": "d2f82774bc9ee666b1c3ca8194dfc60edffeb80e8a25f024239af374495aebcf",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Resolve.java"
+    },
+    {
+      "bytes": 147246,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/ClassReader.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/ClassReader.java",
+      "sha256": "683447a9a7bf421411ca657ef022b48758b4b4466b04359163f31dbade744e28",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/ClassReader.java"
+    },
+    {
+      "bytes": 70851,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/ClassWriter.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/ClassWriter.java",
+      "sha256": "946b3a397f63b744914f30133bfa8a13f1cceb9c92d291c5754d11c61cda25ba",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/ClassWriter.java"
+    },
+    {
+      "bytes": 109699,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/Gen.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/Gen.java",
+      "sha256": "3b5a4481f7f2e5d6ef452043232f05522e7cc423cb53d063d619488bfdbea7ee",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/Gen.java"
+    },
+    {
+      "bytes": 18273,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/PoolWriter.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/PoolWriter.java",
+      "sha256": "523abf328645a01c29b8159da517c535081229bc94445810a99d0a2015afa67e",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/PoolWriter.java"
+    },
+    {
+      "bytes": 7333,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/Target.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/Target.java",
+      "sha256": "812f50bd307a0af60074306dd0ece980d96081a6da1150ece054c9857c13314d",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/jvm/Target.java"
+    },
+    {
+      "bytes": 225530,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java",
+      "sha256": "6f4768ec734c2e5ac985d9d01fad823608ce329c21b0c1527fe3194a5b2c69e0",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java"
+    },
+    {
+      "bytes": 133294,
+      "path": "src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties",
+      "sha256": "9fa016514910ec4807b2c7a0fa4a8f29fbe9b8178635611463e80679baae014c",
+      "upstream_path": "src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties"
+    },
+    {
+      "bytes": 2673,
+      "path": "test/hotspot/gtest/oops/test_flatArrayOop.cpp",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/gtest/oops/test_flatArrayOop.cpp",
+      "sha256": "1d2c642614934c18f2b49916a30ba7442415cc1101ac79c4207a8ce5f382fd94",
+      "upstream_path": "test/hotspot/gtest/oops/test_flatArrayOop.cpp"
+    },
+    {
+      "bytes": 1766,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/AbstractValueClassTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/AbstractValueClassTest.java",
+      "sha256": "dd32af7f5c077276ea4717149f593c10d481a223552701afaedc5ddf1331f84d",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/AbstractValueClassTest.java"
+    },
+    {
+      "bytes": 6264,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/AcmpTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/AcmpTest.java",
+      "sha256": "f48697e3ecc2b8dac5ca34ae905ebca3d7bf6261bbc602cca14cba5868d0840a",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/AcmpTest.java"
+    },
+    {
+      "bytes": 4860,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/ArrayQueryTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/ArrayQueryTest.java",
+      "sha256": "79d75e61ce9056ed785238a42686600bac6d915bdc473299bc2d1e4b8e1937d5",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/ArrayQueryTest.java"
+    },
+    {
+      "bytes": 3217,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/ClassPrintLayoutDcmd.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/ClassPrintLayoutDcmd.java",
+      "sha256": "910189503667f819c85b9d58d2e8d60fc6ebc36058f3f49a532d907abf51bfe3",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/ClassPrintLayoutDcmd.java"
+    },
+    {
+      "bytes": 4702,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatArrayCopyingTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatArrayCopyingTest.java",
+      "sha256": "8430476446f7fde73544fb952b8966552d1812511c2917aa2f3cbf18a7ba67ee",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatArrayCopyingTest.java"
+    },
+    {
+      "bytes": 2487,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatArrayLargePrimitiveOnly.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatArrayLargePrimitiveOnly.java",
+      "sha256": "ff872ff3f140987462f7eb58e77125f8cd56aba8baed0dc69de891366c2ced57",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatArrayLargePrimitiveOnly.java"
+    },
+    {
+      "bytes": 22013,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatArraysTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatArraysTest.java",
+      "sha256": "8320c5289dcfe022efecb277c51e602c340b609353b8acbc4324effa9671557e",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatArraysTest.java"
+    },
+    {
+      "bytes": 3767,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatFieldAccessorMethods.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatFieldAccessorMethods.java",
+      "sha256": "0a3cd108abb94b53932fe218c5440716d9af389ed49687a807b6fa6a6deafbff",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlatFieldAccessorMethods.java"
+    },
+    {
+      "bytes": 6531,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlattenableSemanticTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlattenableSemanticTest.java",
+      "sha256": "d428714b9cda583ec1c61aa03bc258d62ba1f87ded33ddb5e9ebafb70953503e",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/FlattenableSemanticTest.java"
+    },
+    {
+      "bytes": 3758,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/InheritedFlatFieldTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/InheritedFlatFieldTest.java",
+      "sha256": "3126ee5b234d12bfb5624243167b7fb45546955c6f57a8ab50068ecc4ba3a189",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/InheritedFlatFieldTest.java"
+    },
+    {
+      "bytes": 3681,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/MonitorEnterTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/MonitorEnterTest.java",
+      "sha256": "b22c7884fe788a4990ca2f942c525a3a648d5fde82836e50ac1d8f4a4b694bc8",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/MonitorEnterTest.java"
+    },
+    {
+      "bytes": 5027,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/NullRestrictedArrayTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/NullRestrictedArrayTest.java",
+      "sha256": "0349130fe6fd0f95e35f782aeb602dbecf12a77514fa0aa9f20e4a9e47cca133",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/NullRestrictedArrayTest.java"
+    },
+    {
+      "bytes": 7522,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/NullableFlatFieldTest.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/NullableFlatFieldTest.java",
+      "sha256": "306f1c079d33354cc460bb72f20421f4c7eaab856f8463fa2eff7d310392b9c5",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/NullableFlatFieldTest.java"
+    },
+    {
+      "bytes": 4551,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/TestFlatArrayElementMaxOops.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/TestFlatArrayElementMaxOops.java",
+      "sha256": "2cf1ce61b64a2f37ec916b49c9b2dc6bd39625147cfcae74cf3e60b2b23df37d",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/TestFlatArrayElementMaxOops.java"
+    },
+    {
+      "bytes": 1925,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/TestJNIHasIdentity.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/TestJNIHasIdentity.java",
+      "sha256": "c7f5e3fd6cea92f7f0eb37ffa0080651d5fb3d8a641f86dd064aa094dd5c786e",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/TestJNIHasIdentity.java"
+    },
+    {
+      "bytes": 2395,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/libInheritedFlatFieldTest.c",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/libInheritedFlatFieldTest.c",
+      "sha256": "1e83adace223c5c81abd7132cb6c714f01d2f85a64eed0e6c0c68d0fc698ed10",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/libInheritedFlatFieldTest.c"
+    },
+    {
+      "bytes": 1252,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/libJNIHasIdentity.c",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/libJNIHasIdentity.c",
+      "sha256": "2344eea4efc3681dbfe15bd86fef6906850b0b7d44d300cb6dcec2a5e4c1a575",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/libJNIHasIdentity.c"
+    },
+    {
+      "bytes": 1417,
+      "path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/libMonitorEnterTest.c",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/runtime/valhalla/inlinetypes/libMonitorEnterTest.c",
+      "sha256": "8b76181700eb0a6fcdef43529173db9da4d2c91baef8e88c858384fd0e802455",
+      "upstream_path": "test/hotspot/jtreg/runtime/valhalla/inlinetypes/libMonitorEnterTest.c"
+    },
+    {
+      "bytes": 4266,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/InlineTypeIRNode.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/InlineTypeIRNode.java",
+      "sha256": "795272eb89d8b2a7da014f470bea83a49cd86e739b1dfeb88ff3683f8566ffdb",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/InlineTypeIRNode.java"
+    },
+    {
+      "bytes": 8698,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/InlineTypes.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/InlineTypes.java",
+      "sha256": "6db9afcb6c1da00d915691b2ffc906bb20ff0fb0d28c71276cc1f702a44c3285",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/InlineTypes.java"
+    },
+    {
+      "bytes": 6593,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/MyValue1.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/MyValue1.java",
+      "sha256": "06471a6f7bb64873778c83422a249efa81ea5e43dc022ae3a2deb65fc1204cf6",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/MyValue1.java"
+    },
+    {
+      "bytes": 4232,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/MyValue2.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/MyValue2.java",
+      "sha256": "6d52e99e3a2043aa5ef17e664c5b7635764d105f8f830f823bd34ffc7c9ecb02",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/MyValue2.java"
+    },
+    {
+      "bytes": 21927,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestAcmpFastPath.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestAcmpFastPath.java",
+      "sha256": "ba695c7a37f4a2480aaa04758a0f3bc1f1f1ff8ed34c554b5604b249aa3f3c30",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestAcmpFastPath.java"
+    },
+    {
+      "bytes": 141047,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestArrays.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestArrays.java",
+      "sha256": "6d86bcb4d4245fac1d97c29d597c2ef8ea8ba1ce305b6836732d070b3c26b773",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestArrays.java"
+    },
+    {
+      "bytes": 45839,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestBasicFunctionality.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestBasicFunctionality.java",
+      "sha256": "2c4b30a8a3465c86d758bcd9ced0351b032dbc89d2366db39182954bfc8485df",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestBasicFunctionality.java"
+    },
+    {
+      "bytes": 50483,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestCallingConvention.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestCallingConvention.java",
+      "sha256": "e69f584a386146504c1a83af65df9954df3047a425e1252e45efa19fd5def829",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestCallingConvention.java"
+    },
+    {
+      "bytes": 6341,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestFlatArrayThreshold.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestFlatArrayThreshold.java",
+      "sha256": "b4fb57a91d8cd7f3d9ca3f69f126c3fd506959beb63b6fde3abb65607b8f929d",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestFlatArrayThreshold.java"
+    },
+    {
+      "bytes": 6154,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestJNICalls.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestJNICalls.java",
+      "sha256": "5acf1a4720b3936fd1e4e70aec490e5b92876ac97c98a73ebd49eb90fc0acc50",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestJNICalls.java"
+    },
+    {
+      "bytes": 105017,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestNullableInlineTypes.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestNullableInlineTypes.java",
+      "sha256": "08810fc97f91631a2d49129947078ebd4123cb48f67af3f54b7afff9a57622c5",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestNullableInlineTypes.java"
+    },
+    {
+      "bytes": 2489,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestSubstitutabilityWithCOH.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestSubstitutabilityWithCOH.java",
+      "sha256": "00bda98b3b90f8e984c1690335bb5e15a22fd110214561fe2047a52204151740",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestSubstitutabilityWithCOH.java"
+    },
+    {
+      "bytes": 36348,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestValueClasses.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestValueClasses.java",
+      "sha256": "be9034867bfb3033f0badc468a12567943e2cabb620c59446bb4f606cb607bf6",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestValueClasses.java"
+    },
+    {
+      "bytes": 59632,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestValueConstruction.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestValueConstruction.java",
+      "sha256": "62ea00a3634581b9000b8c08dd1576325be1e57d5ed41f71b71008b7a17619b2",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestValueConstruction.java"
+    },
+    {
+      "bytes": 3457,
+      "path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestWrongFlatArrayCopyStubWithZGC.java",
+      "raw_url": "https://raw.githubusercontent.com/openjdk/valhalla/b13d505a7be19e4c5348ef91b9517bcaafd56649/test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestWrongFlatArrayCopyStubWithZGC.java",
+      "sha256": "5794e50f651a0a15fdf0c3ae0a3f0e9c208a31112ee81a36618c52f7b78cc7ea",
+      "upstream_path": "test/hotspot/jtreg/compiler/valhalla/inlinetypes/TestWrongFlatArrayCopyStubWithZGC.java"
+    }
+  ]
+}

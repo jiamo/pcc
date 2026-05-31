@@ -1,0 +1,1861 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head id="htmx-head">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    
+    <meta name="description" content="Understanding the Garbage Collector, excerpt from Real World OCaml
+">
+    
+    <meta name="twitter:title" content="Understanding the Garbage Collector · OCaml Documentation">
+    
+    <meta name="twitter:description" content="Understanding the Garbage Collector, excerpt from Real World OCaml
+">
+    
+    <meta name="twitter:image" content="https://ocaml.org/_/MWIyY2ZmMWM5YzdkYWNmYWI4NGQ0MDBjOGFiZTYxOTg/ocaml_org_social_media.png">
+    <meta property="og:site_name" content="OCaml">
+    <meta property="og:type" content="object">
+    <meta property="og:title" content="Understanding the Garbage Collector · OCaml Documentation">
+    
+    <meta property="og:description" content="Understanding the Garbage Collector, excerpt from Real World OCaml
+">
+    
+    <meta name="og:image" content="https://ocaml.org/_/MWIyY2ZmMWM5YzdkYWNmYWI4NGQ0MDBjOGFiZTYxOTg/ocaml_org_social_media.png">
+    <meta name="theme-color" content="#fff" >
+    <meta name="color-scheme" content="white">
+    
+    <meta name="ahrefs-site-verification" content="6ff715b377cdcd566334b44ae8888791189ce24640c8a403eacdc3bcbaa9449b">
+    <link rel="canonical" href="https://ocaml.org/docs/garbage-collector">
+    
+    <link rel="icon" type="image/x-icon" href="/_/ZDJmMjgzN2NkZmJlMzgxNGQxMTMxNGVlMzk1NzZkN2I/favicon.ico">
+    <link rel="manifest" href="/manifest.json">
+    
+    <link rel="stylesheet" href="/_/ZDBlYzBjZTdmOGJmMGE2YmY3YjNmOGNkNGZkMmQ5ZWU/css/main.css">
+    
+    <link rel="stylesheet" href="/_/NmFjYjY5ZmIxYWRhMWQxMTQxODM4ZDEwYTgwMDcwNmI/vendors/font-files/inter.css">
+    <link rel="stylesheet" href="/_/YjM3OGY4YzIwN2E2ZmUxZTczOWVkNDQwZWRhMDU0MGM/vendors/font-files/roboto-mono.css">
+    <script defer src="/_/OWYyZDQyZjg4MTFlNWEzZjE4ZGY0YWM0OTU1NGEzYTI/vendors/alpine-clipboard.js"></script>
+    <script defer src="/_/NGI1NjQzZjdkODY0MTY2MmViNThhM2VlZTYwMDk3NTI/vendors/alpine.min.js"></script>
+    <script defer src="/_/YTNhODI2Yzg0Yzk4M2ZiNDcxYmRiYzdhY2FiN2Y0OWQ/vendors/htmx.min.js"></script>
+    <script defer data-domain="ocaml.org" src="https://plausible.ci.dev/js/script.js"></script>
+    
+    <link rel="search" href="/opensearch.xml" type="application/opensearchdescription+xml" title="OCaml">
+    <title>Understanding the Garbage Collector · OCaml Documentation</title>
+  </head>
+
+  <body>
+    <script>
+      if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+        document.body.classList.add("dark");
+      } else {
+        document.body.classList.remove("dark");
+      }
+    </script>
+    
+
+    <header
+  class="h-20 flex items-center bg-sand dark:bg-dark-background_navigation"
+  x-data="{ open: false }">
+  <nav class="container-fluid wide header flex justify-between items-center gap-5 xl:gap-8">
+    <ul class="order-0 space space-x-5 xl:space-x-8 items-center flex text-content font-medium dark:text-title dark:text-opacity-60 dark:font-semibold">
+      <li style="width:132px">
+        <a href="/" class="block pb-2">
+          <img src="/_/MDBjN2M4YjIxY2Y1YWExZWE3Njk4M2FiZTg1NWZjNTM/logo-with-name.svg" width="132" alt="OCaml logo" class="dark:hidden">
+          <img src="/_/MTE3YWE5YzJlZmExNmYyMmI3ZmEwYjliMDEwNDBkMDY/logo-with-name-white.svg" width="132" alt="OCaml logo" class="hidden dark:inline">
+        </a>
+      </li>
+    </ul>
+    <ul class="order-2 hidden lg:flex items-center">
+      <li>
+        <form
+           x-data="{ row: null, col: 0, max: 0, total: 0 }"
+       @submit="if (row !== null) { window.location = document.getElementById('package-autocomplete-'+row+'-'+col).getAttribute('href'); $event.stopPropagation(); $event.preventDefault(); return false }" 
+          action="/packages/search" method="GET">
+          <div class="dropdown-container flex items-center justify-center h-10 rounded-md focus-within:outline-primary_25 dark:focus-within:outline-dark-primary_40 focus-within:outline focus-within:outline-2 lg:w-56 xl:w-80" tabindex="0">
+  <label for="q" class="sr-only">Search OCaml packages</label>
+  <input
+      type="search"
+      name="q"
+      placeholder="Search OCaml packages"
+      @keydown.escape="$event.target.blur()"
+      class="bg-white dark:bg-dark-card text-title dark:text-dark-title h-full w-full font-normal focus:border-primary dark:focus:border-dark-primary focus:ring-0 border-primary dark:border-dark-primary rounded-md rounded-r-none px-3 py-1 placeholder-text-content dark:placeholder:text-dark-content appearance-none focus:outline-none"
+      @keydown.stop   @keyup.down="if (row === null) { row = 0; col = 0; } else { row +=1; if (row > max) { row = max } }"
+        @keyup.up="if (row !== null) { row -=1; if (row < 0) { row = null } }"
+        @keyup.right="if (col < 1) col++"
+        @keyup.left="if (col >= 1) col--"
+        :aria-activedescendant="row !== null ? 'package-autocomplete-'+row+'-'+col : null"
+
+        hx-get="/packages/autocomplete"
+        hx-params="q"
+        hx-trigger="keyup changed, search"
+        hx-target="#header-search-results"
+        hx-indicator="#header-search-indicator"
+        autocomplete="off"
+        
+  >
+  
+  <button
+      aria-label="search"
+      class="h-full flex items-center justify-center rounded-r-md bg-primary dark:bg-dark-primary text-white dark:text-dark-white px-4"
+      type="submit"
+  ><svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+</svg>
+
+</button>
+
+  <div class="dropdown w-full lg:w-[32rem] xl:w-[32rem] z-10 absolute rounded-md mt-12 shadow-2xl top-1 p-2 bg-background dark:bg-dark-background shadow-3xl dark:outline dark:outline-1 dark:outline-primary">
+    <div id="header-search-results" aria-live="polite"></div>
+<a class="flex py-2 px-2 mx-2 gap-4 hover:bg-primary_nav_block_hover_10 dark:hover:bg-dark-primary_nav_block_hover_10 font-normal rounded-md text-primary dark:text-dark-primary" href="/api">
+  Standard Library API
+  <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path>
+</svg>
+
+
+</a>
+
+</div>
+
+</div>
+
+
+        </form>
+      </li>
+    </ul>
+    <ul class="order-1 mr-auto items-center hidden lg:flex font-medium dark:text-white dark:text-opacity-60 dark:font-semibold">
+      
+      <li><a href="/docs" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primary text-primary dark:text-dark-primary underline">Learn</a>
+
+
+</li>
+      
+      <li><a href="/tools" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primary text-title dark:text-dark-title">Tools</a>
+
+
+</li>
+      
+      <li><a href="/packages" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primary text-title dark:text-dark-title">Packages</a>
+
+
+</li>
+      
+      <li><a href="/community" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primary text-title dark:text-dark-title">Community</a>
+
+
+</li>
+      
+      <li><a href="/changelog" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primary text-title dark:text-dark-title">News</a>
+
+
+</li>
+      
+      <li><a href="/play" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primary text-title dark:text-dark-title">Play</a>
+
+
+</li>
+      
+    </ul>
+    
+    <ul class="order-3 hidden lg:flex items-center">
+      <li><a href="/docs/get-started" class="border border-primary dark:border-dark-primary text-primary dark:text-dark-primary font-bold py-2.5 px-7 whitespace-nowrap rounded">Get Started</a></li>
+    </ul>
+    
+    <ul class="order-1 lg:hidden flex items-center">
+      <li
+        class="h-12 w-12 hover:bg-primary_25 dark:hover:bg-primary_20 flex items-center justify-center rounded-full text-content dark:text-dark-title">
+        <button aria-label="open menu" @click="open = ! open">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+</svg>
+
+
+        </button>
+      </li>
+    </ul>
+  </nav>
+
+  <div class="bg-black fixed w-full h-full left-0 top-0 opacity-60 z-40" x-show='open' x-cloak></div>
+
+  <nav class="z-50 h-full fixed right-0 top-0 max-w-full w-96 bg-background dark:bg-dark-background shadow-lg" x-show="open" x-cloak
+    @click.away="open = false" x-transition:enter="transition duration-200 ease-out"
+    x-transition:enter-start="translate-x-full" x-transition:leave="transition duration-100 ease-in"
+    x-transition:leave-end="translate-x-full">
+    <ul class="text-content p-6 font-semibold">
+      <li class="flex justify-between items-center">
+        <a href="/">
+          <img src="/_/MDBjN2M4YjIxY2Y1YWExZWE3Njk4M2FiZTg1NWZjNTM/logo-with-name.svg" width="132" alt="OCaml logo" class="dark:hidden">
+          <img src="/_/MTE3YWE5YzJlZmExNmYyMmI3ZmEwYjliMDEwNDBkMDY/logo-with-name-white.svg" width="132" alt="OCaml logo" class="hidden dark:inline">
+        </a>
+
+        <div class=""
+          x-on:click="open = false">
+          <button aria-label="close" class="text-content dark:text-dark-title">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+</svg>
+
+
+          </button>
+        </div>
+      </li>
+      <li class="mt-6 mb-3">
+        <form action="/packages/search" method="GET">
+          <div class="dropdown-container flex items-center justify-center h-10 rounded-md focus-within:outline-primary_25 dark:focus-within:outline-dark-primary_40 focus-within:outline focus-within:outline-2 " tabindex="0">
+  <label for="q" class="sr-only">Search OCaml packages</label>
+  <input
+      type="search"
+      name="q"
+      placeholder="Search OCaml packages"
+      @keydown.escape="$event.target.blur()"
+      class="bg-white dark:bg-dark-card text-title dark:text-dark-title h-full w-full font-normal focus:border-primary dark:focus:border-dark-primary focus:ring-0 border-primary dark:border-dark-primary rounded-md rounded-r-none px-3 py-1 placeholder-text-content dark:placeholder:text-dark-content appearance-none focus:outline-none"
+      
+  >
+  
+  <button
+      aria-label="search"
+      class="h-full flex items-center justify-center rounded-r-md bg-primary dark:bg-dark-primary text-white dark:text-dark-white px-4"
+      type="submit"
+  ><svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+</svg>
+
+</button>
+
+  
+</div>
+
+
+        </form>
+      </li>
+
+      
+      <li><a href="/docs" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primaryblock text-primary dark:text-dark-primary underline">Learn</a>
+
+
+</li>
+      
+      <li><a href="/tools" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primaryblock text-title dark:text-dark-title">Tools</a>
+
+
+</li>
+      
+      <li><a href="/packages" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primaryblock text-title dark:text-dark-title">Packages</a>
+
+
+</li>
+      
+      <li><a href="/community" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primaryblock text-title dark:text-dark-title">Community</a>
+
+
+</li>
+      
+      <li><a href="/changelog" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primaryblock text-title dark:text-dark-title">News</a>
+
+
+</li>
+      
+      <li><a href="/play" class="block font-normal py-3 mg:py-4 px-1 lg:px-3 hover:text-primary dark:hover:text-dark-primaryblock text-title dark:text-dark-title">Play</a>
+
+
+</li>
+      
+      <li>
+        <a href="/api" class="flex py-3 px-1 gap-4 font-semibold text-primary dark:text-dark-primary">Standard Library API<svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path>
+</svg>
+
+</a>
+      </li>
+      <li class="mt-3 mb-6">
+        <a href="/docs/get-started" class="w-full rounded font-normal py-3 px-7 flex items-center justify-center bg-primary dark:bg-dark-primary text-white dark:text-dark-title">Get started</a>
+      </li>
+      <li>
+        <div class="space-x-6 text-2xl flex items-center">
+          <a aria-label="OCaml's Discord" href="https://discord.gg/cCYQbqN" class="opacity-60 hover:opacity-100 text-content dark:text-dark-title hover:text-primary dark:hover:text-dark-primary">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+  <path fill-rule="evenodd" d="M18.9419 5.29661C17.6473 4.69088 16.263 4.25066 14.8157 4C14.638 4.32134 14.4304 4.75355 14.2872 5.09738C12.7487 4.86601 11.2245 4.86601 9.7143 5.09738C9.57116 4.75355 9.3588 4.32134 9.17947 4C7.73067 4.25066 6.3448 4.6925 5.05016 5.29982C2.43887 9.24582 1.73099 13.0938 2.08493 16.8872C3.81688 18.1805 5.49534 18.9662 7.14548 19.4804C7.55291 18.9196 7.91628 18.3235 8.22931 17.6953C7.63313 17.4688 7.06211 17.1892 6.52256 16.8647C6.6657 16.7586 6.80571 16.6478 6.94098 16.5337C10.2318 18.0729 13.8074 18.0729 17.0589 16.5337C17.1958 16.6478 17.3358 16.7586 17.4774 16.8647C16.9362 17.1908 16.3637 17.4704 15.7675 17.697C16.0805 18.3235 16.4423 18.9212 16.8513 19.4819C18.503 18.9678 20.183 18.1822 21.915 16.8872C22.3303 12.4897 21.2056 8.67705 18.9419 5.29661ZM8.67765 14.5543C7.68977 14.5543 6.87963 13.632 6.87963 12.509C6.87963 11.3859 7.67247 10.4621 8.67765 10.4621C9.68285 10.4621 10.493 11.3843 10.4757 12.509C10.4772 13.632 9.68285 14.5543 8.67765 14.5543ZM15.3223 14.5543C14.3344 14.5543 13.5243 13.632 13.5243 12.509C13.5243 11.3859 14.3171 10.4621 15.3223 10.4621C16.3275 10.4621 17.1376 11.3843 17.1203 12.509C17.1203 13.632 16.3275 14.5543 15.3223 14.5543Z" clip-rule="evenodd" />
+</svg>
+
+
+          </a>
+          <a aria-label="The OCaml Compiler on GitHub" href="https://github.com/ocaml/ocaml" class="opacity-60 hover:opacity-100 text-content dark:text-dark-title hover:text-primary dark:hover:text-dark-primary">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+  <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd" />
+</svg>
+
+
+          </a>
+          <a aria-label="The OCaml Language Twitter Account" href="https://twitter.com/ocaml_org" class="opacity-60 hover:opacity-100 text-content dark:text-dark-title hover:text-primary dark:hover:text-dark-primary">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+  <path d="M8.29 20.251c7.547 0 11.675-6.253 11.675-11.675 0-.178 0-.355-.012-.53A8.348 8.348 0 0022 5.92a8.19 8.19 0 01-2.357.646 4.118 4.118 0 001.804-2.27 8.224 8.224 0 01-2.605.996 4.107 4.107 0 00-6.993 3.743 11.65 11.65 0 01-8.457-4.287 4.106 4.106 0 001.27 5.477A4.072 4.072 0 012.8 9.713v.052a4.105 4.105 0 003.292 4.022 4.095 4.095 0 01-1.853.07 4.108 4.108 0 003.834 2.85A8.233 8.233 0 012 18.407a11.616 11.616 0 006.29 1.84" />
+</svg>
+
+
+          </a>
+        </div>
+      </li>
+    </ul>
+  </nav>
+</header>
+<script>
+  window.addEventListener('keydown', function(event) { 
+    if (event.key === "/") {
+      // Check if the focused element is inside #editor1
+      if (document.activeElement.closest("#editor1")) {
+        return;
+      }
+
+      event.preventDefault(); 
+      document.querySelector("input[type='search']").focus()
+    }
+  });
+</script>
+
+
+    <main class="bg-background dark:bg-dark-background"><nav aria-label="breadcrumbs" class="px-4 flex bg-title dark:bg-[#111827] text-white dark:text-dark-title md:hidden">
+  <ul>
+    <li class="inline-block">
+        <a href="/docs" class="flex items-center px-2 py-2 border-transparent border-2 border-b-4"> Learn
+          <span> <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 ml-2" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" aria-hidden="true">
+  <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+</svg>
+
+ </span> </a>
+    </li>
+    <li class="inline-block">
+        <select onchange="location = this.value;" class="appearance-none border-2 border-b-4 bg-transparent bg-none font-bold border-none w-auto p-0 m-0 cursor-pointer focus:outline-none focus:ring-0">
+         <option value="/docs" >
+  Overview
+</option>
+<option value="/docs/get-started" >
+  Get Started
+</option>
+<option value="/docs/language" selected>
+  Language
+</option>
+<option value="/docs/tools" >
+  Platform
+</option>
+<option value="/docs/guides" >
+  Guides
+</option>
+<option value="/cookbook" >
+  Cookbook
+</option>
+<option value="/exercises" >
+  Exercises
+</option>
+<option value="/books" >
+  Books
+</option>
+
+        </select>
+        <span class="text-primary dark:text-dark-primary cursor-pointer">&#x25BE;</span>
+    </li>
+  </ul>
+</nav>
+
+<div class="bg-title dark:bg-[#111827] hidden md:flex">
+  <nav class="container-fluid wide flex flex-wrap">
+    <a href="/docs" class="justify-start px-4 py-2 text-white dark:text-dark-title items-center font-normal border-2 border-b-4 border-transparent rounded opacity-80 hover:text-primary dark:hover:text-dark-primary">
+  Overview
+</a>
+<a href="/docs/get-started" class="justify-start px-4 py-2 text-white dark:text-dark-title items-center font-normal border-2 border-b-4 border-transparent rounded opacity-80 hover:text-primary dark:hover:text-dark-primary">
+  Get Started
+</a>
+<a href="/docs/language" class="justify-start px-4 py-2 text-white dark:text-dark-title items-center font-normal border-2 border-b-4 border-transparent rounded border-b-primary dark:border-b-dark-primary">
+  Language
+</a>
+<a href="/docs/tools" class="justify-start px-4 py-2 text-white dark:text-dark-title items-center font-normal border-2 border-b-4 border-transparent rounded opacity-80 hover:text-primary dark:hover:text-dark-primary">
+  Platform
+</a>
+<a href="/docs/guides" class="justify-start px-4 py-2 text-white dark:text-dark-title items-center font-normal border-2 border-b-4 border-transparent rounded opacity-80 hover:text-primary dark:hover:text-dark-primary">
+  Guides
+</a>
+<a href="/cookbook" class="justify-start px-4 py-2 text-white dark:text-dark-title items-center font-normal border-2 border-b-4 border-transparent rounded opacity-80 hover:text-primary dark:hover:text-dark-primary">
+  Cookbook
+</a>
+<a href="/exercises" class="justify-start px-4 py-2 text-white dark:text-dark-title items-center font-normal border-2 border-b-4 border-transparent rounded opacity-80 hover:text-primary dark:hover:text-dark-primary">
+  Exercises
+</a>
+<a href="/books" class="justify-start px-4 py-2 text-white dark:text-dark-title items-center font-normal border-2 border-b-4 border-transparent rounded opacity-80 hover:text-primary dark:hover:text-dark-primary">
+  Books
+</a>
+
+  </nav>
+</div>
+
+
+<div class="bg-background dark:bg-dark-background" x-data="{ sidebar: window.matchMedia('(min-width: 64em)').matches, showOnMobile: false}" @resize.window="sidebar = window.matchMedia('(min-width: 64em)').matches"  x-on:close-sidebar="sidebar=window.matchMedia('(min-width: 64em)').matches">
+  
+  <button :title='(sidebar? "close" : "open")+" sidebar"' class="flex items-center bg-[#D54000] p-4 z-30 rounded-full text-white shadow-custom bottom-24 md:bottom-36 fixed lg:hidden right-10"
+    x-on:click="sidebar = ! sidebar">
+    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="currentColor" viewBox="0 0 24 24" >
+  <path d="M14.25 14.375H19.875C20.4962 14.375 21 13.8712 21 13.25V9.875C21 9.25377 20.4962 8.75 19.875 8.75H14.25C13.6288 8.75 13.125 9.25377 13.125 9.875V11H7.5V7.625H9.75C10.3712 7.625 10.875 7.12122 10.875 6.5V3.125C10.875 2.50378 10.3712 2 9.75 2H4.125C3.50378 2 3 2.50378 3 3.125V6.5C3 7.12122 3.50378 7.625 4.125 7.625H6.375V19.4375C6.375 19.7482 6.62677 20 6.9375 20H13.125V21.125C13.125 21.7462 13.6288 22.25 14.25 22.25H19.875C20.4962 22.25 21 21.7462 21 21.125V17.75C21 17.1288 20.4962 16.625 19.875 16.625H14.25C13.6288 16.625 13.125 17.1288 13.125 17.75V18.875H7.5V12.125H13.125V13.25C13.125 13.8712 13.6288 14.375 14.25 14.375ZM14.25 9.875H19.875V13.25H14.25V9.875ZM4.125 6.5V3.125H9.75V6.5H4.125ZM14.25 17.75H19.875V21.125H14.25V17.75Z"/>
+</svg>
+
+
+  </button>
+  <div class="fixed z-10 inset-0 bg-tertiary_25 backdrop-blur-sm lg:hidden"
+    :class='sidebar ? "" : "hidden"' aria-hidden="true" x-on:click="sidebar = ! sidebar"></div>
+
+  <div class="container-fluid wide pt-10">
+  <div class="flex flex-col lg:flex-row lg:gap-6 xl:gap-12">
+    <div
+      class="z-20 bg-background dark:bg-dark-background flex-col fixed h-screen overflow-auto lg:flex left-0 top-0 lg:sticky p-6 lg:px-0 w-80 lg:w-72 lg:px-0 lg:pt-6 lg:pb-72"
+      x-show="sidebar" x-transition:enter="transition duration-200 ease-out"
+      x-transition:enter-start="-translate-x-full" x-transition:leave="transition duration-100 ease-in"
+      x-transition:leave-end="-translate-x-full">
+      <div class="flex flex-col gap-5">
+  
+  <div class="pl-2 pr-8 flex flex-col">
+  <div class="text-lg font-normal text-title dark:text-dark-title leading-10 flex py-1 uppercase">Introduction</div>
+  <a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/values-and-functions">
+  
+  Values and Functions
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/basic-data-types">
+  
+  Basic Data Types and Pattern Matching
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/loops-recursion">
+  
+  Loops and Recursions
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/lists">
+  
+  Lists
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/higher-order-functions">
+  
+  Higher Order Functions
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/labels">
+  
+  Labelled and Optional Arguments
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/mutability-imperative-control-flow">
+  
+  Mutability and Imperative Control Flow
+</a>
+
+  
+</div>
+
+
+  <div class="pl-2 pr-8 flex flex-col">
+  <div class="text-lg font-normal text-title dark:text-dark-title leading-10 flex py-1 uppercase">Module System</div>
+  <a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/modules">
+  
+  Modules
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/functors">
+  
+  Functors
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/first-class-modules">
+  
+  First-Class Modules
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/libraries-dune">
+  
+  Libraries With Dune
+</a>
+
+  
+</div>
+
+
+  <div class="pl-2 pr-8 flex flex-col">
+  <div class="text-lg font-normal text-title dark:text-dark-title leading-10 flex py-1 uppercase">Data Structures</div>
+  <a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/options">
+  
+  Options
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/arrays">
+  
+  Arrays
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/maps">
+  
+  Maps
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/sets">
+  
+  Sets
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/hash-tables">
+  
+  Hash Tables
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/sequences">
+  
+  Sequences
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/memoization">
+  <span class="inline-block px-1 bg-primary text-white rounded-md mr-1">
+  CS3110
+</span>
+
+  Memoization
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/monads">
+  <span class="inline-block px-1 bg-primary text-white rounded-md mr-1">
+  CS3110
+</span>
+
+  Monads
+</a>
+
+  
+</div>
+
+
+  <div class="pl-2 pr-8 flex flex-col">
+  <div class="text-lg font-normal text-title dark:text-dark-title leading-10 flex py-1 uppercase">Advanced Topics</div>
+  <a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/metaprogramming">
+  
+  Preprocessors and PPXs
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/operators">
+  
+  Operators
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/objects">
+  
+  Objects
+</a>
+
+  
+</div>
+
+
+  <div class="pl-2 pr-8 flex flex-col">
+  <div class="text-lg font-normal text-title dark:text-dark-title leading-10 flex py-1 uppercase">Runtime &amp; Compiler</div>
+  <a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/memory-representation">
+  <span class="inline-block px-1 bg-primary text-white rounded-md mr-1">
+  RWO
+</span>
+
+  Memory Representation of Values
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10 border-primary dark:border-dark-primary" href="/docs/garbage-collector">
+  <span class="inline-block px-1 bg-primary text-white rounded-md mr-1">
+  RWO
+</span>
+
+  Understanding the Garbage Collector
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/compiler-frontend">
+  <span class="inline-block px-1 bg-primary text-white rounded-md mr-1">
+  RWO
+</span>
+
+  Compiler Frontend
+</a>
+
+<a class="border-l-2 py-2 px-3 rounded-sm leading-6 font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary border-transparent" href="/docs/compiler-backend">
+  <span class="inline-block px-1 bg-primary text-white rounded-md mr-1">
+  RWO
+</span>
+
+  Compiler Backend
+</a>
+
+  
+</div>
+
+
+
+
+
+
+</div>
+
+
+    </div>
+
+    <div class="flex-1 z-0 z- min-w-0 lg:pt-6 lg:max-w-3xl">
+      <div class="prose prose-orange dark:prose-invert max-w-full">
+  <a href="https://dev.realworldocaml.org/" target="_blank">
+  <img src="/media/_/OWJiNTc3ZDUxMzE1YTk4ZmQ3ZGM3MGRlZGU2ZjdmNTE/tutorials/rwo_banner.png" alt="Real World OCaml">
+</a>
+
+  <h1 id="garbage-collector" ><a class="anchor" aria-hidden="true" href="#garbage-collector"></a>Understanding the Garbage Collector</h1>
+
+
+  
+  <p>This is an adaptation of the chapter <a href="https://dev.realworldocaml.org/garbage-collector.html">Understanding the Garbage Collector</a> from the book <a href="https://dev.realworldocaml.org/">Real World OCaml</a>, reproduced here with permission.</p>
+<p><em>This chapter includes contributions from Stephen Weeks and Sadiq Jaffer.</em></p>
+<p>We've described the runtime format of individual OCaml variables earlier, in
+<a href="/docs/memory-representation">Memory Representation Of Values</a>.
+When you execute your program, OCaml manages the lifecycle of these variables
+by regularly scanning allocated values and freeing them when they're no
+longer needed. This in turn means that your applications don't need to
+manually implement memory management, and it greatly reduces the likelihood
+of memory leaks creeping into your code.</p>
+<p>The OCaml runtime is a C library that provides routines that can be called
+from running OCaml programs. The runtime manages a <em>heap</em>, which is a
+collection of memory regions that it obtains from the operating system. The
+runtime uses this memory to hold <em>heap blocks</em> that it fills up with OCaml
+values in response to allocation requests by the OCaml program.</p>
+<h2 id="mark-and-sweep-garbage-collection"><a class="anchor" aria-hidden="true" href="#mark-and-sweep-garbage-collection"></a>Mark and Sweep Garbage Collection</h2>
+<p>When there isn't enough memory available to satisfy an allocation request
+from the pool of allocated heap blocks, the runtime system invokes the
+garbage collector (GC). An OCaml program can't explicitly free a value when
+it is done with it. Instead, the GC regularly determines which values are
+<em>live</em> and which values are <em>dead</em>, i.e., no longer in use. Dead values are
+collected and their memory made available for reuse by the application.</p>
+<p>The GC doesn't keep constant track of values as they are allocated and used.
+Instead, it regularly scans them by starting from a set of <em>root</em> values that
+the application always has access to (such as the stack). The GC maintains a
+directed graph in which heap blocks are nodes, and there is an edge from heap
+block <code>b1</code> to heap block <code>b2</code> if some field of <code>b1</code> is a pointer to <code>b2</code>.</p>
+<p>All blocks reachable from the roots by following edges in the graph must be
+retained, and unreachable blocks can be reused by the application. The
+algorithm used by OCaml to perform this heap traversal is commonly known as
+<em>mark and sweep</em> garbage collection, and we'll explain it further now.</p>
+<h2 id="generational-garbage-collection"><a class="anchor" aria-hidden="true" href="#generational-garbage-collection"></a>Generational Garbage Collection</h2>
+<p>The usual OCaml programming style involves allocating many small
+values that are used for a short period of time and then never
+accessed again. OCaml takes advantage of this fact to improve
+performance by using a <em>generational</em> GC.</p>
+<p>A generational GC maintains separate memory regions to hold blocks based on
+how long the blocks have been live. OCaml's heap is split into two such
+regions:</p>
+<ul>
+<li>
+<p>A small, fixed-size <em>minor heap</em> where most blocks are initially allocated</p>
+</li>
+<li>
+<p>A larger, variable-size <em>major heap</em> for blocks that have been live longer</p>
+</li>
+</ul>
+<p>A typical functional programming style means that young blocks tend to
+die young and old blocks tend to stay around for longer than young
+ones. This is often referred to as the <em>generational
+hypothesis</em>.</p>
+<p>OCaml uses different memory layouts and garbage-collection algorithms for the
+major and minor heaps to account for this generational difference. We'll
+explain how they differ in more detail next.</p>
+<div class="note">
+<h3 id="the-gc-module-and-ocamlrunparam"><a class="anchor" aria-hidden="true" href="#the-gc-module-and-ocamlrunparam"></a>The Gc Module and OCAMLRUNPARAM</h3>
+<p>OCaml provides several mechanisms to query and alter the behavior of
+the runtime system. The <code>Gc</code> module provides this functionality from
+within OCaml code, and we'll frequently refer to it in the rest of the
+chapter. As with several other standard library modules, Core alters
+the <code>Gc</code> interface from the standard OCaml library. We'll assume that
+you've opened <code>Core</code> in our explanations.</p>
+<p>You can also control the behavior of OCaml programs by setting the
+<code>OCAMLRUNPARAM</code> environment variable before launching your application. This
+lets you set GC parameters without recompiling, for example to benchmark the
+effects of different settings. The format of <code>OCAMLRUNPARAM</code> is documented in
+the
+<a href="https://ocaml.org/manual/runtime.html">OCaml manual</a>.</p>
+</div>
+<h2 id="the-fast-minor-heap"><a class="anchor" aria-hidden="true" href="#the-fast-minor-heap"></a>The Fast Minor Heap</h2>
+<p>The minor heap is where most of your short-lived values are held. It consists
+of one contiguous chunk of virtual memory containing a sequence of OCaml
+blocks. If there is space, allocating a new block is a fast, constant-time
+operation that requires just a couple of CPU instructions.</p>
+<p>To garbage-collect the minor heap, OCaml uses <em>copying collection</em> to
+move all live blocks in the minor heap to the major heap. This takes
+work proportional to the number of live blocks in the minor heap,
+which is typically small according to the generational hypothesis. In
+general, the garbage collector <em>stops the world</em> (that is, halts the
+application) while it runs, which is why it's so important that it
+complete quickly to let the application resume running with minimal
+interruption.</p>
+<h3 id="allocating-on-the-minor-heap"><a class="anchor" aria-hidden="true" href="#allocating-on-the-minor-heap"></a>Allocating on the Minor Heap</h3>
+<p>The minor heap is a contiguous chunk of virtual memory that is usually a few
+megabytes in size so that it can be scanned quickly.</p>
+<p><img src="/media/tutorials/language/garbage-collector/minor_heap.png" alt="Minor GC heap layout" title="Minor GC heap" ></p>
+<p>The runtime stores the boundaries of the minor heap in two pointers that
+delimit the start and end of the heap region (<code>caml_young_start</code> and
+<code>caml_young_end</code>, but we will drop the <code>caml_young</code> prefix for brevity). The
+<code>base</code> is the memory address returned by the system <code>malloc</code>, and <code>start</code> is
+aligned against the next nearest word boundary from <code>base</code> to make it easier
+to store OCaml values.</p>
+<p>In a fresh minor heap, the <code>limit</code> equals the <code>start</code>, and the current
+<code>ptr</code> will equal the <code>end</code>. <code>ptr</code> decreases as blocks are allocated until it
+reaches <code>limit</code>, at which point a minor garbage collection is triggered.</p>
+<p>Allocating a block in the minor heap just requires <code>ptr</code> to be decremented by
+the size of the block (including the header) and a check that it's not less
+than <code>limit</code>. If there isn't enough space left for the block without
+decrementing past <code>limit</code>, a minor garbage collection is triggered. This is a
+very fast check (with no branching) on most CPU architectures.</p>
+<h4 id="understanding-allocation"><a class="anchor" aria-hidden="true" href="#understanding-allocation"></a>Understanding Allocation</h4>
+<p>You may wonder why <code>limit</code> is required at all, since it always seems
+to equal <code>start</code>. It's because the easiest way for the runtime to
+schedule a minor heap collection is by setting <code>limit</code> to equal
+<code>end</code>. The next allocation will never have enough space after this is
+done and will always trigger a garbage collection. There are various
+internal reasons for such early collections, such as handling pending
+UNIX signals, but they don't ordinarily matter for application code.</p>
+<p>It is possible to write loops or recurse in a way that may take a long time
+to do an allocation - if at all. To ensure that UNIX signals and other
+internal bookkeeping that require interrupting the running OCaml program
+still happen the compiler introduces <em>poll points</em> into generated native code.</p>
+<p>These poll points check <code>ptr</code> against <code>limit</code> and developers should expect
+them to be placed at the start of every function and the back edge of loops.
+The compiler includes a dataflow pass that removes all but the minimum set
+of points necessary to ensure these checks happen in a bounded amount of time.</p>
+<div class="note">
+<h4 id="setting-the-size-of-the-minor-heap"><a class="anchor" aria-hidden="true" href="#setting-the-size-of-the-minor-heap"></a>Setting the Size of the Minor Heap</h4>
+<p>The default minor heap size in OCaml is normally 2 MB on 64-bit platforms,
+but this is increased to 8 MB if you use Core (which generally prefers
+default settings that improve performance, but at the cost of a bigger memory
+profile). This setting can be overridden via the <code>s=&lt;words&gt;</code> argument to
+<code>OCAMLRUNPARAM</code>. You can change it after the program has started by calling
+the <code>Gc.set</code> function:</p>
+<pre><code><span class='ocaml-mdx-hash'>#</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other'>open</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Core</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-mdx-hash'>#</span><span class='ocaml-source'> </span><span class='ocaml-keyword'>let</span><span class='ocaml-source'> </span><span class='ocaml-entity-name-function-binding'>c</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>get</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>val</span><span class='ocaml-source'> </span><span class='ocaml-source'>c</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-constant-language-capital-identifier'>Control</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>t</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-source'>{</span><span class='ocaml-constant-language-capital-identifier'>Core</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-constant-language-capital-identifier'>Control</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>minor_heap_size</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>262144</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>major_heap_increment</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>15</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>   </span><span class='ocaml-source'>space_overhead</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>120</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>verbose</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>0</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>max_overhead</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>500</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>   </span><span class='ocaml-source'>stack_limit</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>1048576</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>allocation_policy</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>2</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>window_size</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>1</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>   </span><span class='ocaml-source'>custom_major_ratio</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>44</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>custom_minor_ratio</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>100</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>   </span><span class='ocaml-source'>custom_minor_max_size</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>8192</span><span class='ocaml-source'>}</span><span class='ocaml-source'>
+</span><span class='ocaml-mdx-hash'>#</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>tune</span><span class='ocaml-source'> ~</span><span class='ocaml-source'>minor_heap_size</span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'>(</span><span class='ocaml-constant-numeric-decimal-integer'>262144</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>*</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>2</span><span class='ocaml-source'>)</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-operator'>-</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>unit</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'>
+</span></code></pre>
+<p>Changing the GC size dynamically will trigger an immediate minor heap
+collection. Note that Core increases the default minor heap size from the
+standard OCaml installation quite significantly, and you'll want to reduce
+this if running in very memory-constrained environments.</p>
+</div>
+<h2 id="the-long-lived-major-heap"><a class="anchor" aria-hidden="true" href="#the-long-lived-major-heap"></a>The Long-Lived Major Heap</h2>
+<p>The major heap is where the bulk of the longer-lived and larger values in
+your program are stored. It consists of any number of noncontiguous chunks of
+virtual memory, each containing live blocks interspersed with regions of free
+memory. The runtime system maintains a free-list data structure that indexes
+all the free memory that it has allocated, and uses it to satisfy allocation
+requests for OCaml blocks.</p>
+<p>The major heap is typically much larger than the minor heap and can scale to
+gigabytes in size. It is cleaned via a mark-and-sweep garbage collection
+algorithm that operates in several phases:</p>
+<ul>
+<li>
+<p>The <em>mark</em> phase scans the block graph and marks all live blocks by setting
+a bit in the tag of the block header (known as the <em>color</em> tag).</p>
+</li>
+<li>
+<p>The <em>sweep</em> phase sequentially scans the heap chunks and identifies dead
+blocks that weren't marked earlier.</p>
+</li>
+<li>
+<p>The <em>compact</em> phase relocates live blocks into a freshly allocated heap to
+eliminate gaps in the free list. This prevents the fragmentation of heap
+blocks in long-running programs and normally occurs much less frequently
+than the mark and sweep phases.</p>
+</li>
+</ul>
+<p>A major garbage collection must also stop the world to ensure that blocks can
+be moved around without this being observed by the live application. The
+mark-and-sweep phases run incrementally over slices of the heap to avoid
+pausing the application for long periods
+of time, and also precede each slice with a fast minor collection. Only the
+compaction phase touches all the memory in one go, and is a relatively rare
+operation.</p>
+<h3 id="allocating-on-the-major-heap"><a class="anchor" aria-hidden="true" href="#allocating-on-the-major-heap"></a>Allocating on the Major Heap</h3>
+<p>The major heap consists of a singly linked list of contiguous memory chunks
+sorted in increasing order of virtual address. Each chunk is a single memory
+region allocated via <em>malloc(3)</em> and consists of a header and data area which
+contains OCaml heap chunks. A heap chunk header contains:</p>
+<ul>
+<li>
+<p>The <em>malloc</em>ed virtual address of the memory region containing the chunk</p>
+</li>
+<li>
+<p>The size in bytes of the data area</p>
+</li>
+<li>
+<p>An allocation size in bytes used during heap compaction to merge small
+blocks to defragment the heap</p>
+</li>
+<li>
+<p>A link to the next heap chunk in the list</p>
+</li>
+<li>
+<p>A pointer to the start and end of the range of blocks that may contain
+unexamined fields and need to be scanned later. Only used after mark stack
+overflow.</p>
+</li>
+</ul>
+<p>Each chunk's data area starts on a page boundary, and its size is a multiple
+of the page size (4 KB). It contains a contiguous sequence of heap blocks
+that can be as small as one or two 4 KB pages, but are usually allocated in 1
+MB chunks (or 512 KB on 32-bit architectures).</p>
+<h4 id="controlling-the-major-heap-increment"><a class="anchor" aria-hidden="true" href="#controlling-the-major-heap-increment"></a>Controlling the Major Heap Increment</h4>
+<p>The <code>Gc</code> module uses the <code>major_heap_increment</code> value to control the
+major heap growth. This defines the number of words to add to the
+major heap per expansion and is the only memory allocation operation
+that the operating system observes from the OCaml runtime after
+initial startup (since the minor is fixed in size).</p>
+<p>Allocating an OCaml value on the major heap first checks the free list
+of blocks for a suitable region to place it. If there isn't enough
+room on the free list, the runtime expands the major heap by
+allocating a fresh heap chunk that will be large enough. That chunk is
+then added to the free list, and the free list is checked again (and
+this time will definitely succeed).</p>
+<p>Older versions of OCaml required setting a fixed number of bytes for
+the major heap increment.  That was a value that was tricky to get
+right: too small of a value could lead to lots of smaller heap chunks
+spread across different regions of virtual memory that require more
+housekeeping in the OCaml runtime to keep track of them; too large of
+a value can waste memory for programs with small heaps.</p>
+<p>You can use <code>Gc.tune</code> to set that value, but the values are a little
+counter-intuitive, for backwards-compatibility reasons.  Values under
+1000 are interpreted as percentages, and the default is 15%.  Values
+1000 and over are treated as a raw number of bytes.  But most of the
+time, you won't set the value at all.</p>
+<h3 id="memory-allocation-strategies"><a class="anchor" aria-hidden="true" href="#memory-allocation-strategies"></a>Memory Allocation Strategies</h3>
+<p>The major heap does its best to manage memory allocation as efficiently as
+possible and relies on heap compaction to ensure that memory stays contiguous
+and unfragmented. The default allocation policy normally works fine for most
+applications, but it's worth bearing in mind that there are other options,
+too.</p>
+<p>The free list of blocks is always checked first when allocating a new block
+in the major heap. The default free list search is called
+<em>best-fit allocation</em>, with alternatives <em>next-fit</em> and <em>first-fit</em> algorithms
+also available.</p>
+<h4 id="best-fit-allocation"><a class="anchor" aria-hidden="true" href="#best-fit-allocation"></a>Best-Fit Allocation</h4>
+<p>The best-fit allocator is a combination of two strategies. The first,
+size-segregated free lists, is based on the observation that nearly all
+major heap allocations in OCaml are small (consider list elements and tuples
+which are only a couple of machine words). Best fit keeps separate free lists
+for sizes up to and including 16 words which gives a fast path for most
+allocations. Allocations for these sizes can be serviced from their segregated
+free lists or, if they are empty, from the next size with a space.</p>
+<p>The second strategy, for larger allocations, is the use of a specialized data
+structure known as a <em>splay tree</em> for the free list. This is a type of search
+tree that adapts to recent access patterns. For our use this means that the
+most commonly requested allocation sizes are the quickest to access.</p>
+<p>Small allocations, when there are no larger sizes available in the segregated
+free lists, and large allocations greater than sixteen words are serviced from
+the main free list. The free list is queried for the smallest block that is
+at least as large as the allocation requested.</p>
+<p>Best-fit allocation is the default allocation mechanism. It represents a good
+trade-off between the allocation cost (in terms of CPU work) and heap
+fragmentation.</p>
+<h4 id="next-fit-allocation"><a class="anchor" aria-hidden="true" href="#next-fit-allocation"></a>Next-Fit Allocation</h4>
+<p>Next-fit allocation keeps a pointer to the block in the free list that was
+most recently used to satisfy a request. When a new request comes in, the
+allocator searches from the next block to the end of the free list, and then
+from the beginning of the free list up to that block.</p>
+<p>Next-fit allocation is quite a cheap
+allocation mechanism, since the same heap chunk can be reused across
+allocation requests until it runs out. This in turn means that there is good
+memory locality to use CPU caches better. The big downside of next-fit is
+that since most allocations are small, large blocks at the start of the
+free list become heavily fragmented.</p>
+<h4 id="first-fit-allocation"><a class="anchor" aria-hidden="true" href="#first-fit-allocation"></a>First-Fit Allocation</h4>
+<p>If your program allocates values of many varied sizes, you may sometimes find
+that your free list becomes fragmented. In this situation, the GC is forced
+to perform an expensive compaction despite there being free chunks, since
+none of the chunks alone are big enough to satisfy the request.</p>
+<p>First-fit allocation focuses on reducing memory fragmentation (and hence the
+number of compactions), but at the expense of slower memory allocation. Every
+allocation scans the free list from the beginning for a suitable free chunk,
+instead of reusing the most recent heap chunk as the next-fit allocator does.</p>
+<p>For some workloads that need more real-time behavior under load, the
+reduction in the frequency of heap compaction will outweigh the extra
+allocation cost.</p>
+<h4 id="controlling-the-heap-allocation-policy"><a class="anchor" aria-hidden="true" href="#controlling-the-heap-allocation-policy"></a>Controlling the Heap Allocation Policy</h4>
+<p>You can set the heap allocation policy by calling <code>Gc.tune</code>:</p>
+<pre><code><span class='ocaml-mdx-hash'>#</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>tune</span><span class='ocaml-source'> ~</span><span class='ocaml-source'>allocation_policy</span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-constant-language-capital-identifier'>First_fit</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-operator'>-</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>unit</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'>
+</span></code></pre>
+<p>The same behavior can be controlled via an environment variable by
+setting <code>OCAMLRUNPARAM</code> to <code>a=0</code> for next-fit, <code>a=1</code> for first-fit, or
+<code>a=2</code> for best-fit.</p>
+<h3 id="marking-and-scanning-the-heap"><a class="anchor" aria-hidden="true" href="#marking-and-scanning-the-heap"></a>Marking and Scanning the Heap</h3>
+<p>The marking process can take a long time to run over the complete major heap
+and has to pause the main application while it's active. It therefore runs
+incrementally by marking the heap in <em>slices</em>. Each value in the heap has a
+2-bit <em>color</em> field in its header that is used to store information about
+whether the value has been marked so that the GC can resume easily between
+slices.</p>
+<ul>
+<li>Blue:  On the free list and not currently in use</li>
+<li>White (during marking): Not reached yet, but possibly reachable</li>
+<li>White (during sweeping): Unreachable and can be freed</li>
+<li>Black:  Reachable, and its fields have been scanned</li>
+</ul>
+<p>The color tags in the value headers store most of the state of the marking
+process, allowing it to be paused and resumed later. On allocation, all heap
+values are initially given the color white indicating they are possibly
+reachable but haven't been scanned yet. The GC and application alternate
+between marking a slice of the major heap and actually getting on with
+executing the program logic. The OCaml runtime calculates a sensible value
+for the size of each major heap slice based on the rate of allocation and
+available memory.</p>
+<p>The marking process starts with a set of <em>root</em> values that are always live
+(such as the application stack and globals). These root values have their
+color set to black and are pushed on to a specialized data structure known as
+the <em>mark</em> stack. Marking proceeds by popping a value from the stack and
+examining its fields. Any fields containing white-colored blocks are changed
+to black and pushed onto the mark stack.</p>
+<p>This process is repeated until the mark stack is empty and there are no further
+values to mark. There's one important edge case in this process, though. The
+mark stack can only grow to a certain size, after which the GC can no longer
+recurse into intermediate values since it has nowhere to store them while it
+follows their fields. This is known as mark stack <em>overflow</em> and a process
+called <em>pruning</em> begins. Pruning empties the mark stack entirely, summarizing
+the addresses of each block as start and end ranges in each heap chunk header.</p>
+<p>Later in the marking process when the mark stack is empty it is replenished by
+<em>redarkening</em> the heap. This starts at the first heap chunk (by address) that
+has blocks needing redarkening (i.e were removed from the mark stack during
+a prune) and entries from the redarkening range are added to the mark stack
+until it is a quarter full. The emptying and replenishing cycle continues
+until there are no heap chunks with ranges left to redarken.</p>
+<h4 id="controlling-major-heap-collections"><a class="anchor" aria-hidden="true" href="#controlling-major-heap-collections"></a>Controlling Major Heap Collections</h4>
+<p>You can trigger a single slice of the major GC via the <code>major_slice</code> call.
+This performs a minor collection first, and then a single slice. The size of
+the slice is normally automatically computed by the GC to an appropriate
+value and returns this value so that you can modify it in future calls if
+necessary:</p>
+<pre><code><span class='ocaml-mdx-hash'>#</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>major_slice</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>0</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-operator'>-</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>int</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>0</span><span class='ocaml-source'>
+</span><span class='ocaml-mdx-hash'>#</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>full_major</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-operator'>-</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>unit</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'>
+</span></code></pre>
+<p>The <code>space_overhead</code> setting controls how aggressive the GC is about setting
+the slice size to a large size. This represents the proportion of memory used
+for live data that will be &quot;wasted&quot; because the GC doesn't immediately
+collect unreachable blocks. Core defaults this to <code>100</code> to reflect a typical
+system that isn't overly memory-constrained. Set this even higher if you have
+lots of memory, or lower to cause the GC to work harder and collect blocks
+faster at the expense of using more CPU time.</p>
+<h3 id="heap-compaction"><a class="anchor" aria-hidden="true" href="#heap-compaction"></a>Heap Compaction</h3>
+<p>After a certain number of major GC cycles have completed, the heap may begin
+to be fragmented due to values being deallocated out of order from how they
+were allocated. This makes it harder for the GC to find a contiguous block of
+memory for fresh allocations, which in turn would require the heap to be
+grown unnecessarily.</p>
+<p>The heap compaction cycle avoids this by relocating all the values in the
+major heap into a fresh heap that places them all contiguously in memory
+again. A naive implementation of the algorithm would require extra memory to
+store the new heap, but OCaml performs the compaction in place within the
+existing heap.</p>
+<div class="note">
+<h4 id="controlling-frequency-of-compactions"><a class="anchor" aria-hidden="true" href="#controlling-frequency-of-compactions"></a>Controlling Frequency of Compactions</h4>
+<p>The <code>max_overhead</code> setting in the <code>Gc</code> module defines the connection between
+free memory and allocated memory after which compaction is activated.</p>
+<p>A value of <code>0</code> triggers a compaction after every major garbage collection
+cycle, whereas the maximum value of <code>1000000</code> disables heap compaction
+completely. The default settings should be fine unless you have unusual
+allocation patterns that are causing a higher-than-usual rate of compactions:</p>
+</div>
+<pre><code><span class='ocaml-mdx-hash'>#</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>tune</span><span class='ocaml-source'> ~</span><span class='ocaml-source'>max_overhead</span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-constant-numeric-decimal-integer'>0</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-operator'>-</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>unit</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'>
+</span></code></pre>
+<h3 id="intergenerational-pointers"><a class="anchor" aria-hidden="true" href="#intergenerational-pointers"></a>Intergenerational Pointers <a name="inter-generational-pointers"></a></h3>
+<p>One complexity of generational collection arises from the fact that minor
+heap sweeps are much more frequent than major heap collections. In order to
+know which blocks in the minor heap are live, the collector must track which
+minor-heap blocks are directly pointed to by major-heap blocks. Without this
+information, each minor collection would also require scanning the much
+larger major heap.</p>
+<p>OCaml maintains a set of such <em>intergenerational pointers</em> to avoid this
+dependency between a major and minor heap collection. The compiler introduces
+a write barrier to update this so-called <em>remembered set</em> whenever a
+major-heap block is modified to point at a minor-heap block.</p>
+<h4 id="the-mutable-write-barrier"><a class="anchor" aria-hidden="true" href="#the-mutable-write-barrier"></a>The Mutable Write Barrier</h4>
+<p>The write barrier can have profound implications for the structure of your
+code. It's one of the reasons using immutable data structures and allocating
+a fresh copy with changes can sometimes be faster than mutating a record in
+place.</p>
+<p>The OCaml compiler keeps track of any mutable types and adds a call to the
+runtime <code>caml_modify</code> function before making the change. This checks the
+location of the target write and the value it's being changed to, and ensures
+that the remembered set is consistent. Although the write barrier is
+reasonably efficient, it can sometimes be slower than simply allocating a
+fresh value on the fast minor heap and doing some extra minor collections.</p>
+<p>Let's see this for ourselves with a simple test program. You'll need to
+install the Core benchmarking suite via <code>opam install core_bench</code> before you
+compile this code:</p>
+<pre><code><span class='ocaml-keyword-other'>open</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Core</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>open</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Core_bench</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>module</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Mutable</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other'>struct</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword-other'>type</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-source'>{</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other'>mutable</span><span class='ocaml-source'> </span><span class='ocaml-source'>iters</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>int</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other'>mutable</span><span class='ocaml-source'> </span><span class='ocaml-source'>count</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>float</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-source'>}</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword'>let</span><span class='ocaml-source'> </span><span class='ocaml-keyword'>rec </span><span class='ocaml-entity-name-function-binding'>test</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword-other'>if</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>iters</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>0</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword-other'>then</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword-other'>else</span><span class='ocaml-source'> </span><span class='ocaml-source'>(</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>      </span><span class='ocaml-source'>t</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>iters</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>&lt;-</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>iters</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>-</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>1</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>      </span><span class='ocaml-source'>t</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>count</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>&lt;-</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>count</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>+.</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-float'>1.0</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>      </span><span class='ocaml-source'>test</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-source'>)</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>end</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>module</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Immutable</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other'>struct</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword-other'>type</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-source'>{</span><span class='ocaml-source'> </span><span class='ocaml-source'>iters</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>int</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>count</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>float</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-source'>}</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword'>let</span><span class='ocaml-source'> </span><span class='ocaml-keyword'>rec </span><span class='ocaml-entity-name-function-binding'>test</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword-other'>if</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>iters</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>0</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword-other'>then</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword-other'>else</span><span class='ocaml-source'> </span><span class='ocaml-source'>test</span><span class='ocaml-source'> </span><span class='ocaml-source'>{</span><span class='ocaml-source'> </span><span class='ocaml-source'>iters</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>iters</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>-</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>1</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>count</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>count</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>+.</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-float'>1.0</span><span class='ocaml-source'> </span><span class='ocaml-source'>}</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>end</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>let</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword'>let</span><span class='ocaml-source'> </span><span class='ocaml-entity-name-function-binding'>iters</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>1_000_000</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other'>in</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword'>let</span><span class='ocaml-source'> </span><span class='ocaml-entity-name-function-binding'>count</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-float'>0.0</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other'>in</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword'>let</span><span class='ocaml-source'> </span><span class='ocaml-entity-name-function-binding'>tests</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-source'>[</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Bench</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-constant-language-capital-identifier'>Test</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>create</span><span class='ocaml-source'> ~</span><span class='ocaml-source'>name</span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-string-quoted-double'>mutable</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-source'> </span><span class='ocaml-source'>(</span><span class='ocaml-keyword-other'>fun</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>-&gt;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>          </span><span class='ocaml-constant-language-capital-identifier'>Mutable</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>test</span><span class='ocaml-source'> </span><span class='ocaml-source'>{</span><span class='ocaml-source'> </span><span class='ocaml-source'>iters</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>count</span><span class='ocaml-source'> </span><span class='ocaml-source'>}</span><span class='ocaml-source'>)</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Bench</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-constant-language-capital-identifier'>Test</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>create</span><span class='ocaml-source'> ~</span><span class='ocaml-source'>name</span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-string-quoted-double'>immutable</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-source'> </span><span class='ocaml-source'>(</span><span class='ocaml-keyword-other'>fun</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>-&gt;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>          </span><span class='ocaml-constant-language-capital-identifier'>Immutable</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>test</span><span class='ocaml-source'> </span><span class='ocaml-source'>{</span><span class='ocaml-source'> </span><span class='ocaml-source'>iters</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'> </span><span class='ocaml-source'>count</span><span class='ocaml-source'> </span><span class='ocaml-source'>}</span><span class='ocaml-source'>)</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-source'>]</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword-other'>in</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-constant-language-capital-identifier'>Bench</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>make_command</span><span class='ocaml-source'> </span><span class='ocaml-source'>tests</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>|&gt;</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Command_unix</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>run</span><span class='ocaml-source'>
+</span></code></pre>
+<p>This program defines a type <code>t1</code> that is mutable and <code>t2</code> that is immutable.
+The benchmark loop iterates over both fields and increments a counter.
+Compile and execute this with some extra options to show the amount of
+garbage collection occurring:</p>
+<pre><code><span class='sh-source'>$ opam </span><span class='sh-support-function-builtin'>exec</span><span class='sh-source'> -- dune </span><span class='sh-support-function-builtin'>exec</span><span class='sh-source'> -- ./barrier_bench.exe -ascii alloc -quota 1
+</span><span class='sh-source'>Estimated testing </span><span class='sh-keyword-other'>time</span><span class='sh-source'> 2s </span><span class='sh-punctuation-definition-subshell'>(</span><span class='sh-meta-scope-subshell'>2 benchmarks x 1s</span><span class='sh-punctuation-definition-subshell'>)</span><span class='sh-source'>. Change using </span><span class='sh-punctuation-definition-string-begin'>'</span><span class='sh-string-quoted-single'>-quota</span><span class='sh-punctuation-definition-string-end'>'</span><span class='sh-source'>.
+</span><span class='sh-source'>
+</span><span class='sh-source'>  Name        Time/Run   mWd/Run   mjWd/Run   Prom/Run   Percentage
+</span><span class='sh-source'> ----------- ---------- --------- ---------- ---------- ------------
+</span><span class='sh-source'>  mutable       5.06ms    2.00Mw     20.61w     20.61w      100.00%
+</span><span class='sh-source'>  immutable     3.95ms    5.00Mw     95.64w     95.64w       77.98%
+</span><span class='sh-source'>
+</span></code></pre>
+<p>There is a space/time trade-off here. The mutable version takes longer
+to complete than the immutable one but allocates many fewer minor-heap
+words than the immutable version.  Minor allocation in OCaml is very
+fast, and so it is often better to use immutable data structures in
+preference to the more conventional mutable versions. On the other
+hand, if you only rarely mutate a value, it can be faster to take the
+write-barrier hit and not allocate at all.</p>
+<p>The only way to know for sure is to benchmark your program under real-world
+scenarios using <code>Core_bench</code> and experiment with the trade-offs. The
+command-line benchmark binaries have a number of useful options that affect
+garbage collection behavior and the output format:</p>
+<pre><code><span class='sh-source'>$ opam </span><span class='sh-support-function-builtin'>exec</span><span class='sh-source'> -- dune </span><span class='sh-support-function-builtin'>exec</span><span class='sh-source'> -- ./barrier_bench.exe -help
+</span><span class='sh-source'>Benchmark </span><span class='sh-keyword-control'>for</span><span class='sh-meta-scope-for-in-loop'> </span><span class='sh-variable-other-loop'>mutable,</span><span class='sh-meta-scope-for-in-loop'> immutable
+</span><span class='sh-meta-scope-for-in-loop'>
+</span><span class='sh-meta-scope-for-in-loop'>  barrier_bench.exe [COLUMN ...]
+</span><span class='sh-meta-scope-for-in-loop'>
+</span><span class='sh-meta-scope-for-in-loop'>Columns that can be specified are:
+</span><span class='sh-meta-scope-for-in-loop'> </span><span class='sh-keyword-other'>time</span><span class='sh-meta-scope-for-in-loop'>       - Number of nano secs taken.
+</span><span class='sh-meta-scope-for-in-loop'> cycles     - Number of CPU cycles </span><span class='sh-punctuation-definition-subshell'>(</span><span class='sh-meta-scope-subshell'>RDTSC</span><span class='sh-punctuation-definition-subshell'>)</span><span class='sh-meta-scope-for-in-loop'> taken.
+</span><span class='sh-meta-scope-for-in-loop'> alloc      - Allocation of major, minor and promoted words.
+</span><span class='sh-meta-scope-for-in-loop'> gc         - Show major and minor collections per 1000 runs.
+</span><span class='sh-meta-scope-for-in-loop'> percentage - Relative execution </span><span class='sh-keyword-other'>time</span><span class='sh-meta-scope-for-in-loop'> as a percentage.
+</span><span class='sh-meta-scope-for-in-loop'> speedup    - Relative execution cost as a speedup.
+</span><span class='sh-meta-scope-for-in-loop'> samples    - Number of samples collected </span><span class='sh-keyword-control'>for</span><span class='sh-meta-scope-for-in-loop'> </span><span class='sh-variable-other-loop'>profiling.</span><span class='sh-meta-scope-for-in-loop'>
+</span><span class='sh-meta-scope-for-in-loop'>...
+</span></code></pre>
+<h2 id="attaching-finalizer-functions-to-values"><a class="anchor" aria-hidden="true" href="#attaching-finalizer-functions-to-values"></a>Attaching Finalizer Functions to Values</h2>
+<p>OCaml's automatic memory management guarantees that a value will eventually
+be freed when it's no longer in use, either via the GC sweeping it or the
+program terminating. It's sometimes useful to run extra code just before a
+value is freed by the GC, for example, to check that a file descriptor has
+been closed, or that a log message is recorded.</p>
+<div class="note">
+<h3 id="what-values-can-be-finalized"><a class="anchor" aria-hidden="true" href="#what-values-can-be-finalized"></a>What Values Can Be Finalized?</h3>
+<p>Various values cannot have finalizers attached since they aren't
+heap-allocated. Some examples of values that are not heap-allocated are
+integers, constant constructors, Booleans, the empty array, the empty list,
+and the unit value. The exact list of what is heap-allocated or not is
+implementation-dependent, which is why Core provides the <code>Heap_block</code> module
+to explicitly check before attaching the finalizer.</p>
+<p>Some constant values can be heap-allocated but never deallocated during the
+lifetime of the program, for example, a list of integer constants.
+<code>Heap_block</code> explicitly checks to see if the value is in the major or minor
+heap, and rejects most constant values. Compiler optimizations may also
+duplicate some immutable values such as floating-point values in arrays.
+These may be finalized while another duplicate copy is being used by the
+program.</p>
+</div>
+<p>Core provides a <code>Heap_block</code> module that dynamically checks if a given
+value is suitable for finalizing.  Core keeps the functions for
+registering finalizers in the <code>Core.Gc.Expert</code> module. Finalizers
+can run at any time in any thread, so they can be pretty hard to reason
+about in multi-threaded contexts.
+Async, which we discussed in <a href="https://dev.realworldocaml.org/concurrent-programming.html#concurrent-programming-with-async">Concurrent Programming with
+Async</a>,
+shadows the <code>Gc</code> module with its own module that contains a function,
+<code>Gc.add_finalizer</code>, which is concurrency-safe.  In particular,
+finalizers are scheduled in their own Async job, and care is taken by
+Async to capture exceptions and raise them to the appropriate monitor
+for error-handling.</p>
+<p>Let's explore this with a small example that finalizes values of
+different types, all of which are heap-allocated.</p>
+<pre><code><span class='ocaml-keyword-other'>open</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Core</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>open</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Async</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword'>let</span><span class='ocaml-source'> </span><span class='ocaml-entity-name-function-binding'>attach_finalizer</span><span class='ocaml-source'> </span><span class='ocaml-source'>n</span><span class='ocaml-source'> </span><span class='ocaml-source'>v</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword-other'>match</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Heap_block</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>create</span><span class='ocaml-source'> </span><span class='ocaml-source'>v</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other'>with</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword-other'>|</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>None</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>-&gt;</span><span class='ocaml-source'> </span><span class='ocaml-source'>printf</span><span class='ocaml-source'> </span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-constant-character-printf'>%20s</span><span class='ocaml-string-quoted-double'>: FAIL</span><span class='ocaml-constant-character-escape'>\n</span><span class='ocaml-constant-character-printf'>%!</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-source'> </span><span class='ocaml-source'>n</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword-other'>|</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Some</span><span class='ocaml-source'> </span><span class='ocaml-source'>hb</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>-&gt;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-keyword'>let</span><span class='ocaml-source'> </span><span class='ocaml-entity-name-function-binding'>final</span><span class='ocaml-source'> </span><span class='ocaml-constant-language'>_</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-source'>printf</span><span class='ocaml-source'> </span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-constant-character-printf'>%20s</span><span class='ocaml-string-quoted-double'>: OK</span><span class='ocaml-constant-character-escape'>\n</span><span class='ocaml-constant-character-printf'>%!</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-source'> </span><span class='ocaml-source'>n</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other'>in</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>add_finalizer</span><span class='ocaml-source'> </span><span class='ocaml-source'>hb</span><span class='ocaml-source'> </span><span class='ocaml-source'>final</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>type</span><span class='ocaml-source'> </span><span class='ocaml-source'>t</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-source'>{</span><span class='ocaml-source'> </span><span class='ocaml-source'>foo</span><span class='ocaml-source'> </span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-source'> </span><span class='ocaml-support-type'>bool</span><span class='ocaml-source'> </span><span class='ocaml-source'>}</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword'>let</span><span class='ocaml-source'> </span><span class='ocaml-entity-name-function-binding'>main</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-source'>attach_finalizer</span><span class='ocaml-source'> </span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-string-quoted-double'>allocated variant</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-source'> </span><span class='ocaml-source'>(</span><span class='ocaml-constant-language-polymorphic-variant'>`Foo</span><span class='ocaml-source'> </span><span class='ocaml-source'>(</span><span class='ocaml-constant-language-capital-identifier'>Random</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-support-type'>bool</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'>)</span><span class='ocaml-source'>)</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-source'>attach_finalizer</span><span class='ocaml-source'> </span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-string-quoted-double'>allocated string</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-source'> </span><span class='ocaml-source'>(</span><span class='ocaml-constant-language-capital-identifier'>Bytes</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>create</span><span class='ocaml-source'> </span><span class='ocaml-constant-numeric-decimal-integer'>4</span><span class='ocaml-source'>)</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-source'>attach_finalizer</span><span class='ocaml-source'> </span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-string-quoted-double'>allocated record</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-source'> </span><span class='ocaml-source'>{</span><span class='ocaml-source'> </span><span class='ocaml-source'>foo</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Random</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-support-type'>bool</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'> </span><span class='ocaml-source'>}</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-constant-language-capital-identifier'>Gc</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>compact</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-keyword-other-ocaml punctuation-separator-terminator punctuation-separator'>;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-source'>return</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>
+</span><span class='ocaml-keyword-other'>let</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-unit'>()</span><span class='ocaml-source'> </span><span class='ocaml-keyword-operator'>=</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-constant-language-capital-identifier'>Command</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>async</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    ~</span><span class='ocaml-source'>summary</span><span class='ocaml-keyword-other-ocaml punctuation-other-colon punctuation'>:</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-string-quoted-double'>Testing finalizers</span><span class='ocaml-string-quoted-double'>&quot;</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>    </span><span class='ocaml-source'>(</span><span class='ocaml-constant-language-capital-identifier'>Command</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-constant-language-capital-identifier'>Param</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>return</span><span class='ocaml-source'> </span><span class='ocaml-source'>main</span><span class='ocaml-source'>)</span><span class='ocaml-source'>
+</span><span class='ocaml-source'>  </span><span class='ocaml-keyword-operator'>|&gt;</span><span class='ocaml-source'> </span><span class='ocaml-constant-language-capital-identifier'>Command_unix</span><span class='ocaml-keyword-other-ocaml punctuation-other-period punctuation-separator'>.</span><span class='ocaml-source'>run</span><span class='ocaml-source'>
+</span></code></pre>
+<p>Building and running this should show the following output:</p>
+<pre><code><span class='sh-source'>$ opam </span><span class='sh-support-function-builtin'>exec</span><span class='sh-source'> -- dune </span><span class='sh-support-function-builtin'>exec</span><span class='sh-source'> -- ./finalizer.exe
+</span><span class='sh-source'>    allocated record: OK
+</span><span class='sh-source'>    allocated string: OK
+</span><span class='sh-source'>   allocated variant: OK
+</span></code></pre>
+<p>The GC calls the finalization functions in the order of the deallocation. If
+several values become unreachable during the same GC cycle, the finalization
+functions will be called in the reverse order of the corresponding calls to
+<code>add_finalizer</code>. Each call to <code>add_finalizer</code> adds to the set of functions,
+which are run when the value becomes unreachable. You can have many
+finalizers all pointing to the same heap block if you wish.</p>
+<p>After a garbage collection determines that a heap block <code>b</code> is unreachable,
+it removes from the set of finalizers all the functions associated with
+<code>b</code>, and serially applies each of those functions to <code>b</code>. Thus, every
+finalizer function attached to <code>b</code> will run at most once. However, program
+termination will not cause all the finalizers to be run before the runtime
+exits.</p>
+<p>The finalizer can use all features of OCaml, including assignments that make
+the value reachable again and thus prevent it from being garbage-collected.
+It can also loop forever, which will cause other finalizers to be interleaved
+with it.</p>
+
+  
+  <div class="my-5 pt-5">
+  
+  <div class="grid-cols-2 gap-4 border-t border-gray-200 md:grid">
+    <div class="border-b border-gray-200 px-6 pb-3 md:border-b-0 md:border-r">
+      <h2 class="mb-2 text-lg font-bold leading-6">Still need help?</h2>
+      <div class="mb-2 text-sm">
+        <a href="https://discuss.ocaml.org/" class="flex items-center gap-2 font-normal sm:text-lg no-underline bg-transparent cursor-pointer hover:underline">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+  <path stroke-linecap="round" stroke-linejoin="round" d="M18 18.72a9.094 9.094 0 003.741-.479 3 3 0 00-4.682-2.72m.94 3.198l.001.031c0 .225-.012.447-.037.666A11.944 11.944 0 0112 21c-2.17 0-4.207-.576-5.963-1.584A6.062 6.062 0 016 18.719m12 0a5.971 5.971 0 00-.941-3.197m0 0A5.995 5.995 0 0012 12.75a5.995 5.995 0 00-5.058 2.772m0 0a3 3 0 00-4.681 2.72 8.986 8.986 0 003.74.477m.94-3.197a5.971 5.971 0 00-.94 3.197M15 6.75a3 3 0 11-6 0 3 3 0 016 0zm6 3a2.25 2.25 0 11-4.5 0 2.25 2.25 0 014.5 0zm-13.5 0a2.25 2.25 0 11-4.5 0 2.25 2.25 0 014.5 0z" />
+</svg>
+
+
+          Ask the OCaml Community</a
+        >
+      </div>
+      <div class="mb-2 text-sm">
+        <a href="https://github.com/ocaml/ocaml.org/issues/new" class="flex items-center gap-3 font-normal sm:text-lg no-underline bg-transparent cursor-pointer hover:underline">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true">
+  <path d="M8 9.5a1.5 1.5 0 100-3 1.5 1.5 0 000 3z"></path>
+  <path fill-rule="evenodd" d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8a6.5 6.5 0 1113 0 6.5 6.5 0 01-13 0z"></path>
+</svg>
+
+
+          Open an Issue</a
+        >
+      </div>
+    </div>
+    <div class="px-6 pb-3">
+      <h2 class="mb-2 text-lg font-bold leading-6">Help Improve Our Documentation</h2>
+      <p class="text-sm text-lighter leading-relaxed mb-0">You are encouraged to contribute to the original sources of this page at the Real World OCaml GitHub repository.</p>
+      <div class="mb-5 text-sm">
+        <a href="https://github.com/realworldocaml/book/blob/master/book/garbage-collector/README.md" class="flex items-center gap-2 bg-transparent font-normal sm:text-lg no-underline hover:underline">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+  <path stroke-linecap="round" stroke-linejoin="round" d="M10.05 4.575a1.575 1.575 0 10-3.15 0v3m3.15-3v-1.5a1.575 1.575 0 013.15 0v1.5m-3.15 0l.075 5.925m3.075.75V4.575m0 0a1.575 1.575 0 013.15 0V15M6.9 7.575a1.575 1.575 0 10-3.15 0v8.175a6.75 6.75 0 006.75 6.75h2.018a5.25 5.25 0 003.712-1.538l1.732-1.732a5.25 5.25 0 001.538-3.712l.003-2.024a.668.668 0 01.198-.471 1.575 1.575 0 10-2.228-2.228 3.818 3.818 0 00-1.12 2.687M6.9 7.575V12m6.27 4.318A4.49 4.49 0 0116.35 15m.002 0h-.002" />
+</svg>
+
+
+          Contribute</a
+        >
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+      <footer x-data class="flex flex-col gap-3 md:gap-5 pt-5 mt-6 border-separator_20 dark:border-dark-separator_30 border-t">
+  <div class="flex w-full items-center justify-between">
+    <a href="/">
+      <img class="h-8 dark:hidden" src="/_/MDBjN2M4YjIxY2Y1YWExZWE3Njk4M2FiZTg1NWZjNTM/logo-with-name.svg" alt="OCaml">
+      <img src="/_/MTE3YWE5YzJlZmExNmYyMmI3ZmEwYjliMDEwNDBkMDY/logo-with-name-white.svg" width="132" alt="OCaml logo" class="h-8 hidden dark:inline">
+    </a>
+    <div class="hidden md:flex">
+      <button class="flex grow basis-0 justify-center items-center py-2 px-4 text-sm border rounded-l rounded-l-full border-r-0" :class='$store.themeSettings.preference === "light" ? "bg-gradient-to-r from-[#FFA932] to-[#C24F1E] text-white dark:text-dark-title outline-none" : "bg-white text-content outline-2 outline-card_border dark:outline-dark-separator_30"'
+  @click='$store.themeSettings.setPreference("light")'
+>
+  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14" fill="none" class="mr-2">
+  <path d="M7 0.5V2.125M11.5962 2.40378L10.4472 3.55283M13.5 7H11.875M11.5962 11.5962L10.4472 10.4472M7 11.875V13.5M3.55283 10.4472L2.40378 11.5962M2.125 7H0.5M3.55283 3.55283L2.40378 2.40378M9.70833 7C9.70833 7.71829 9.42299 8.40717 8.91508 8.91508C8.40717 9.42299 7.71829 9.70833 7 9.70833C6.28171 9.70833 5.59283 9.42299 5.08492 8.91508C4.57701 8.40717 4.29167 7.71829 4.29167 7C4.29167 6.28171 4.57701 5.59283 5.08492 5.08492C5.59283 4.57701 6.28171 4.29167 7 4.29167C7.71829 4.29167 8.40717 4.57701 8.91508 5.08492C9.42299 5.59283 9.70833 6.28171 9.70833 7Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+
+
+  Light
+</button>
+
+
+<button class="flex grow basis-0 justify-center items-center py-2 px-4 text-sm border border-r-0" :class='$store.themeSettings.preference === "dark" ? "bg-gradient-to-r from-[#0F254F] to-[#0B1228] text-white dark:text-dark-title outline-none" : "bg-white text-content outline-2 outline-card_border dark:outline-dark-separator_30"'
+  @click='$store.themeSettings.setPreference("dark")'
+>
+  <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="none" class="mr-2">
+  <path d="M11.1573 7.90842C10.5134 8.17678 9.8226 8.3145 9.125 8.31358C6.20812 8.31358 3.84375 5.94921 3.84375 3.03233C3.84375 2.31192 3.98783 1.62562 4.24892 1C3.28663 1.40144 2.46465 2.07865 1.88651 2.94635C1.30836 3.81404 0.999911 4.83342 1 5.87608C1 8.79296 3.36437 11.1573 6.28125 11.1573C7.32391 11.1574 8.34329 10.849 9.21099 10.2708C10.0787 9.69268 10.7559 8.8707 11.1573 7.90842Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+
+
+  Dark
+</button>
+
+
+<button class="flex grow basis-0 justify-center items-center py-2 px-4 text-sm border rounded-r rounded-r-full" :class='$store.themeSettings.preference === "system" ? "bg-gradient-to-r from-[#2B7866] to-[#004039] text-white dark:text-dark-title outline-none" : "bg-white text-content outline-2 outline-card_border dark:outline-dark-separator_30"'
+  @click='$store.themeSettings.setPreference("system")'
+>
+  <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18" fill="none" class="mr-2">
+  <path d="M7.19553 2.955C7.26303 2.5485 7.61553 2.25 8.02803 2.25H9.97278C10.3853 2.25 10.7378 2.5485 10.8053 2.955L10.965 3.91575C11.0123 4.19625 11.1998 4.43025 11.4488 4.56825C11.5043 4.59825 11.559 4.6305 11.6138 4.6635C11.8575 4.8105 12.1538 4.85625 12.42 4.7565L13.3328 4.4145C13.5198 4.34416 13.7258 4.34248 13.9139 4.40978C14.1021 4.47708 14.2603 4.60899 14.3603 4.782L15.3323 6.46725C15.4321 6.64028 15.4672 6.8431 15.4315 7.03962C15.3958 7.23615 15.2916 7.41363 15.1373 7.5405L14.385 8.16075C14.1653 8.3415 14.0565 8.6205 14.0625 8.90475C14.0636 8.9685 14.0636 9.03225 14.0625 9.096C14.0565 9.3795 14.1653 9.6585 14.385 9.83925L15.138 10.4595C15.456 10.722 15.5385 11.1758 15.333 11.532L14.3595 13.2172C14.2597 13.3902 14.1017 13.5222 13.9137 13.5896C13.7257 13.657 13.5198 13.6556 13.3328 13.5855L12.42 13.2435C12.1538 13.1438 11.8575 13.1895 11.613 13.3365C11.5587 13.3696 11.5037 13.4016 11.448 13.4325C11.1998 13.5697 11.0123 13.8037 10.965 14.0842L10.8053 15.045C10.7378 15.4523 10.3853 15.75 9.97278 15.75H8.02728C7.61478 15.75 7.26303 15.4515 7.19478 15.045L7.03503 14.0842C6.98853 13.8037 6.80103 13.5698 6.55203 13.4318C6.49642 13.4011 6.44141 13.3693 6.38703 13.3365C6.14328 13.1895 5.84703 13.1438 5.58003 13.2435L4.66728 13.5855C4.48033 13.6556 4.27456 13.6572 4.08656 13.5899C3.89856 13.5226 3.74051 13.3908 3.64053 13.218L2.66778 11.5328C2.56799 11.3597 2.53282 11.1569 2.56852 10.9604C2.60423 10.7639 2.7085 10.5864 2.86278 10.4595L3.61578 9.83925C3.83478 9.65925 3.94353 9.3795 3.93828 9.096C3.93711 9.03226 3.93711 8.96849 3.93828 8.90475C3.94353 8.61975 3.83478 8.3415 3.61578 8.16075L2.86278 7.5405C2.70869 7.41367 2.60454 7.23633 2.56884 7.03997C2.53314 6.84361 2.56819 6.64095 2.66778 6.468L3.64053 4.78275C3.74042 4.6096 3.89854 4.47754 4.08672 4.4101C4.27489 4.34266 4.4809 4.34422 4.66803 4.4145L5.58003 4.7565C5.84703 4.85625 6.14328 4.8105 6.38703 4.6635C6.44103 4.6305 6.49653 4.599 6.55203 4.5675C6.80103 4.43025 6.98853 4.19625 7.03503 3.91575L7.19553 2.955Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M11.25 9C11.25 9.59674 11.0129 10.169 10.591 10.591C10.169 11.0129 9.59674 11.25 9 11.25C8.40326 11.25 7.83097 11.0129 7.40901 10.591C6.98705 10.169 6.75 9.59674 6.75 9C6.75 8.40326 6.98705 7.83097 7.40901 7.40901C7.83097 6.98705 8.40326 6.75 9 6.75C9.59674 6.75 10.169 6.98705 10.591 7.40901C11.0129 7.83097 11.25 8.40326 11.25 9Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+
+
+  System
+</button>
+
+
+
+    </div>
+  </div>
+  <section class="flex flex-col gap-6 md:gap-0 md:flex-row md:justify-between md:items-end">
+    <div>
+      <p class="text-base font-normal leading-6 text-content dark:text-dark-content mt-2">Innovation. Community. Security.</p>
+    </div>
+    <div class="flex items-center gap-4 pr-4">
+      
+      <a href="https://github.com/ocaml" class="text-title dark:text-dark-title hover:text-primary dark:hover:text-dark-primary">
+  <span class="sr-only">GitHub</span>
+  <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+  <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd" />
+</svg>
+
+
+</a>
+
+      
+      <a href="https://discord.gg/cCYQbqN" class="text-title dark:text-dark-title hover:text-primary dark:hover:text-dark-primary">
+  <span class="sr-only">Discord</span>
+  <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+  <path fill-rule="evenodd" d="M18.9419 5.29661C17.6473 4.69088 16.263 4.25066 14.8157 4C14.638 4.32134 14.4304 4.75355 14.2872 5.09738C12.7487 4.86601 11.2245 4.86601 9.7143 5.09738C9.57116 4.75355 9.3588 4.32134 9.17947 4C7.73067 4.25066 6.3448 4.6925 5.05016 5.29982C2.43887 9.24582 1.73099 13.0938 2.08493 16.8872C3.81688 18.1805 5.49534 18.9662 7.14548 19.4804C7.55291 18.9196 7.91628 18.3235 8.22931 17.6953C7.63313 17.4688 7.06211 17.1892 6.52256 16.8647C6.6657 16.7586 6.80571 16.6478 6.94098 16.5337C10.2318 18.0729 13.8074 18.0729 17.0589 16.5337C17.1958 16.6478 17.3358 16.7586 17.4774 16.8647C16.9362 17.1908 16.3637 17.4704 15.7675 17.697C16.0805 18.3235 16.4423 18.9212 16.8513 19.4819C18.503 18.9678 20.183 18.1822 21.915 16.8872C22.3303 12.4897 21.2056 8.67705 18.9419 5.29661ZM8.67765 14.5543C7.68977 14.5543 6.87963 13.632 6.87963 12.509C6.87963 11.3859 7.67247 10.4621 8.67765 10.4621C9.68285 10.4621 10.493 11.3843 10.4757 12.509C10.4772 13.632 9.68285 14.5543 8.67765 14.5543ZM15.3223 14.5543C14.3344 14.5543 13.5243 13.632 13.5243 12.509C13.5243 11.3859 14.3171 10.4621 15.3223 10.4621C16.3275 10.4621 17.1376 11.3843 17.1203 12.509C17.1203 13.632 16.3275 14.5543 15.3223 14.5543Z" clip-rule="evenodd" />
+</svg>
+
+
+</a>
+
+      
+      <a href="https://twitter.com/ocaml_org" class="text-title dark:text-dark-title hover:text-primary dark:hover:text-dark-primary">
+  <span class="sr-only">Twitter</span>
+  <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+  <path d="M8.29 20.251c7.547 0 11.675-6.253 11.675-11.675 0-.178 0-.355-.012-.53A8.348 8.348 0 0022 5.92a8.19 8.19 0 01-2.357.646 4.118 4.118 0 001.804-2.27 8.224 8.224 0 01-2.605.996 4.107 4.107 0 00-6.993 3.743 11.65 11.65 0 01-8.457-4.287 4.106 4.106 0 001.27 5.477A4.072 4.072 0 012.8 9.713v.052a4.105 4.105 0 003.292 4.022 4.095 4.095 0 01-1.853.07 4.108 4.108 0 003.834 2.85A8.233 8.233 0 012 18.407a11.616 11.616 0 006.29 1.84" />
+</svg>
+
+
+</a>
+
+      
+      <a href="https://watch.ocaml.org/" class="text-title dark:text-dark-title hover:text-primary dark:hover:text-dark-primary">
+  <span class="sr-only">Peertube</span>
+  <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+  <path fill-rule="evenodd" d="M5 2V12L12.4998 7.00047" clip-rule="evenodd" />
+  <path fill-rule="evenodd" d="M5 12V22L12.4998 17.0005" clip-rule="evenodd" />
+  <path fill-rule="evenodd" d="M12.4998 6.99951V16.9995L19.9995 12" clip-rule="evenodd" />
+</svg>
+
+
+</a>
+
+      
+      <a href="/planet.xml" class="text-title dark:text-dark-title hover:text-primary dark:hover:text-dark-primary">
+  <span class="sr-only">RSS</span>
+  <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+  <path fill-rule="evenodd" d="M15.2692 22H11.3846C11.3846 16.8462 7.11538 12.6154 2 12.6154V8.73077C9.26923 8.73077 15.2692 14.7308 15.2692 22ZM18 22C18 13.2308 10.7692 6 2 6V2C12.9615 2 22 11.0385 22 22H18Z" clip-rule="evenodd" />
+  <path fill-rule="evenodd" d="M4.73077 22C6.23893 22 7.46154 20.7774 7.46154 19.2692C7.46154 17.7611 6.23893 16.5385 4.73077 16.5385C3.22261 16.5385 2 17.7611 2 19.2692C2 20.7774 3.22261 22 4.73077 22Z" clip-rule="evenodd" />
+</svg>
+
+
+</a>
+
+      
+    </div>
+    <div class="flex w-full md:hidden">
+      <button class="flex grow basis-0 justify-center items-center py-2 px-4 text-sm border rounded-l rounded-l-full border-r-0" :class='$store.themeSettings.preference === "light" ? "bg-gradient-to-r from-[#FFA932] to-[#C24F1E] text-white dark:text-dark-title outline-none" : "bg-white text-content outline-2 outline-card_border dark:outline-dark-separator_30"'
+  @click='$store.themeSettings.setPreference("light")'
+>
+  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14" fill="none" class="mr-2">
+  <path d="M7 0.5V2.125M11.5962 2.40378L10.4472 3.55283M13.5 7H11.875M11.5962 11.5962L10.4472 10.4472M7 11.875V13.5M3.55283 10.4472L2.40378 11.5962M2.125 7H0.5M3.55283 3.55283L2.40378 2.40378M9.70833 7C9.70833 7.71829 9.42299 8.40717 8.91508 8.91508C8.40717 9.42299 7.71829 9.70833 7 9.70833C6.28171 9.70833 5.59283 9.42299 5.08492 8.91508C4.57701 8.40717 4.29167 7.71829 4.29167 7C4.29167 6.28171 4.57701 5.59283 5.08492 5.08492C5.59283 4.57701 6.28171 4.29167 7 4.29167C7.71829 4.29167 8.40717 4.57701 8.91508 5.08492C9.42299 5.59283 9.70833 6.28171 9.70833 7Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+
+
+  Light
+</button>
+
+
+<button class="flex grow basis-0 justify-center items-center py-2 px-4 text-sm border border-r-0" :class='$store.themeSettings.preference === "dark" ? "bg-gradient-to-r from-[#0F254F] to-[#0B1228] text-white dark:text-dark-title outline-none" : "bg-white text-content outline-2 outline-card_border dark:outline-dark-separator_30"'
+  @click='$store.themeSettings.setPreference("dark")'
+>
+  <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="none" class="mr-2">
+  <path d="M11.1573 7.90842C10.5134 8.17678 9.8226 8.3145 9.125 8.31358C6.20812 8.31358 3.84375 5.94921 3.84375 3.03233C3.84375 2.31192 3.98783 1.62562 4.24892 1C3.28663 1.40144 2.46465 2.07865 1.88651 2.94635C1.30836 3.81404 0.999911 4.83342 1 5.87608C1 8.79296 3.36437 11.1573 6.28125 11.1573C7.32391 11.1574 8.34329 10.849 9.21099 10.2708C10.0787 9.69268 10.7559 8.8707 11.1573 7.90842Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+
+
+  Dark
+</button>
+
+
+<button class="flex grow basis-0 justify-center items-center py-2 px-4 text-sm border rounded-r rounded-r-full" :class='$store.themeSettings.preference === "system" ? "bg-gradient-to-r from-[#2B7866] to-[#004039] text-white dark:text-dark-title outline-none" : "bg-white text-content outline-2 outline-card_border dark:outline-dark-separator_30"'
+  @click='$store.themeSettings.setPreference("system")'
+>
+  <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18" fill="none" class="mr-2">
+  <path d="M7.19553 2.955C7.26303 2.5485 7.61553 2.25 8.02803 2.25H9.97278C10.3853 2.25 10.7378 2.5485 10.8053 2.955L10.965 3.91575C11.0123 4.19625 11.1998 4.43025 11.4488 4.56825C11.5043 4.59825 11.559 4.6305 11.6138 4.6635C11.8575 4.8105 12.1538 4.85625 12.42 4.7565L13.3328 4.4145C13.5198 4.34416 13.7258 4.34248 13.9139 4.40978C14.1021 4.47708 14.2603 4.60899 14.3603 4.782L15.3323 6.46725C15.4321 6.64028 15.4672 6.8431 15.4315 7.03962C15.3958 7.23615 15.2916 7.41363 15.1373 7.5405L14.385 8.16075C14.1653 8.3415 14.0565 8.6205 14.0625 8.90475C14.0636 8.9685 14.0636 9.03225 14.0625 9.096C14.0565 9.3795 14.1653 9.6585 14.385 9.83925L15.138 10.4595C15.456 10.722 15.5385 11.1758 15.333 11.532L14.3595 13.2172C14.2597 13.3902 14.1017 13.5222 13.9137 13.5896C13.7257 13.657 13.5198 13.6556 13.3328 13.5855L12.42 13.2435C12.1538 13.1438 11.8575 13.1895 11.613 13.3365C11.5587 13.3696 11.5037 13.4016 11.448 13.4325C11.1998 13.5697 11.0123 13.8037 10.965 14.0842L10.8053 15.045C10.7378 15.4523 10.3853 15.75 9.97278 15.75H8.02728C7.61478 15.75 7.26303 15.4515 7.19478 15.045L7.03503 14.0842C6.98853 13.8037 6.80103 13.5698 6.55203 13.4318C6.49642 13.4011 6.44141 13.3693 6.38703 13.3365C6.14328 13.1895 5.84703 13.1438 5.58003 13.2435L4.66728 13.5855C4.48033 13.6556 4.27456 13.6572 4.08656 13.5899C3.89856 13.5226 3.74051 13.3908 3.64053 13.218L2.66778 11.5328C2.56799 11.3597 2.53282 11.1569 2.56852 10.9604C2.60423 10.7639 2.7085 10.5864 2.86278 10.4595L3.61578 9.83925C3.83478 9.65925 3.94353 9.3795 3.93828 9.096C3.93711 9.03226 3.93711 8.96849 3.93828 8.90475C3.94353 8.61975 3.83478 8.3415 3.61578 8.16075L2.86278 7.5405C2.70869 7.41367 2.60454 7.23633 2.56884 7.03997C2.53314 6.84361 2.56819 6.64095 2.66778 6.468L3.64053 4.78275C3.74042 4.6096 3.89854 4.47754 4.08672 4.4101C4.27489 4.34266 4.4809 4.34422 4.66803 4.4145L5.58003 4.7565C5.84703 4.85625 6.14328 4.8105 6.38703 4.6635C6.44103 4.6305 6.49653 4.599 6.55203 4.5675C6.80103 4.43025 6.98853 4.19625 7.03503 3.91575L7.19553 2.955Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M11.25 9C11.25 9.59674 11.0129 10.169 10.591 10.591C10.169 11.0129 9.59674 11.25 9 11.25C8.40326 11.25 7.83097 11.0129 7.40901 10.591C6.98705 10.169 6.75 9.59674 6.75 9C6.75 8.40326 6.98705 7.83097 7.40901 7.40901C7.83097 6.98705 8.40326 6.75 9 6.75C9.59674 6.75 10.169 6.98705 10.591 7.40901C11.0129 7.83097 11.25 8.40326 11.25 9Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+
+
+  System
+</button>
+
+
+
+    </div>
+  </section>
+
+  <section class="mt-4 grid grid-cols-2">
+    <div class="flex flex-col gap-1">
+      <div class="flex flex-col">
+        <h5 class="font-bold text-base leading-7 py-2.5 text-title dark:text-dark-title">About</h5>
+        
+        <a href="/changelog" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Changelog</a>
+
+        
+        <a href="/releases" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Releases</a>
+
+        
+        <a href="/industrial-users" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Industrial Users</a>
+
+        
+        <a href="/academic-users" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Academic Users</a>
+
+        
+        <a href="/about" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Why OCaml</a>
+
+        
+      </div>
+
+      <div class="flex flex-col">
+        <h5 class="font-bold text-base leading-7 py-2.5 text-title dark:text-dark-title">
+          Ecosystem
+        </h5>
+        
+        <a href="/packages" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Packages</a>
+
+        
+        <a href="/community" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Community</a>
+
+        
+        <a href="/events" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Events</a>
+
+        
+        <a href="/ocaml-planet" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">OCaml Planet</a>
+
+        
+        <a href="/jobs" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Jobs</a>
+
+        
+      </div>
+    </div>
+
+    <div class="flex flex-col">
+      <h5 class="font-bold text-base leading-7 py-2.5 text-title dark:text-dark-title">Resources</h5>
+      
+      <a href="/install" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Install OCaml</a>
+
+      
+      <a href="/docs/get-started" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Get Started</a>
+
+      
+      <a href="/docs/tools" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Platform Tools</a>
+
+      
+      <a href="/manual" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Language Manual</a>
+
+      
+      <a href="/api" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Standard Library API</a>
+
+      
+      <a href="/books" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Books</a>
+
+      
+      <a href="/exercises" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Exercises</a>
+
+      
+      <a href="/papers" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Papers</a>
+
+      
+      <a href="/play" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">OCaml Playground</a>
+
+      
+      <a href="/logo" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Logo</a>
+
+      
+    </div>
+  </section>
+
+  <div
+    class="flex flex-wrap gap-x-7 md:justify-between items-center py-2 border-solid border-t-[1px] border-separator_20 dark:border-dark-separator_30 bottom-0 bg-background dark:bg-dark-background">
+    <h5 class="font-bold text-base leading-7 py-2.5 text-title dark:text-dark-title">Policies</h5>
+    
+    <a href="/security" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Security</a>
+
+    
+    <a href="/policies/carbon-footprint" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Carbon Footprint</a>
+
+    
+    <a href="/governance" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Governance</a>
+
+    
+    <a href="/policies/privacy-policy" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Privacy</a>
+
+    
+    <a href="/policies/code-of-conduct" class="font-normal text-content dark:text-dark-content hover:text-primary dark:hover:text-dark-primary leading-7 py-2.5">Code of Conduct</a>
+
+    
+  </div>
+  <script>
+  document.addEventListener('alpine:init', () => {
+    Alpine.store('themeSettings', {
+      init() {
+        this.storageAccess = localStorage.getItem('storageAccess')
+        this.preference = localStorage.getItem('theme') || "system"
+        this.isSystemDefaultDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+      },
+      selected: '',
+      alertOpen: false,
+      storageAccess: false,
+      preference: undefined,
+      isSystemDefaultDark: false,
+      setPreference(preference) {
+        if (!this.storageAccess) {
+          if (!window.confirm("We will remember your choice in your browser's LocalStorage. Allow this?")) {
+            return;
+          }
+          localStorage.setItem('storageAccess', true)
+          storageAccess = true;
+        }
+
+        this.selected = preference;
+        this.preference = preference
+        localStorage.setItem('theme', preference)
+
+        if (preference === 'dark') {
+          document.body.classList.add("dark");
+        } 
+        if (preference === 'light') {
+          document.body.classList.remove("dark");
+        }
+        if (preference === 'system') {
+          if (this.isSystemDefaultDark) {
+            document.body.classList.add("dark");
+          } else {
+            document.body.classList.remove("dark");
+          }
+          localStorage.removeItem('theme')
+          return
+        }
+      },
+    })
+  })
+</script>
+
+
+</footer>
+
+    </div>
+    <div class="hidden xl:block top-0 sticky h-screen overflow-auto lg:pt-6">
+      <div class="w-60 lg:pb-72">
+        <div
+  x-data='toc'
+  @scroll.window="scrollY = window.scrollY"
+  @resize.window="setTimeout(() => sectionYPositions = computeSectionYPositions($el), 10)"
+  x-init="setTimeout(() => sectionYPositions = computeSectionYPositions($el), 10)"
+  >
+  
+  <div class="font-bold text-title dark:text-dark-title text-sm mb-4">On This Page</div>
+  <ol class="leading-6 text-sm border-l">
+    
+      <li>
+        <a href="#mark-and-sweep-garbage-collection" class="text-content dark:text-dark-content py-1 pl-2 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+          :class='isWithin(scrollY, "#mark-and-sweep-garbage-collection", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+          :style='isWithin(scrollY, "#mark-and-sweep-garbage-collection", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+        >
+          Mark and Sweep Garbage Collection
+        </a>
+          
+        
+      <li>
+        <a href="#generational-garbage-collection" class="text-content dark:text-dark-content py-1 pl-2 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+          :class='isWithin(scrollY, "#generational-garbage-collection", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+          :style='isWithin(scrollY, "#generational-garbage-collection", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+        >
+          Generational Garbage Collection
+        </a>
+          
+          <ol>
+            
+            <li>
+              <a href="#the-gc-module-and-ocamlrunparam" class="text-content dark:text-dark-content py-1 md:py-0 pl-5 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                :class='isWithin(scrollY, "#the-gc-module-and-ocamlrunparam", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+                :style='isWithin(scrollY, "#the-gc-module-and-ocamlrunparam", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+              >
+                The Gc Module and OCAMLRUNPARAM
+              </a>
+              
+            </li>
+            
+          </ol>
+          
+        
+      <li>
+        <a href="#the-fast-minor-heap" class="text-content dark:text-dark-content py-1 pl-2 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+          :class='isWithin(scrollY, "#the-fast-minor-heap", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+          :style='isWithin(scrollY, "#the-fast-minor-heap", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+        >
+          The Fast Minor Heap
+        </a>
+          
+          <ol>
+            
+            <li>
+              <a href="#allocating-on-the-minor-heap" class="text-content dark:text-dark-content py-1 md:py-0 pl-5 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                :class='isWithin(scrollY, "#allocating-on-the-minor-heap", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+                :style='isWithin(scrollY, "#allocating-on-the-minor-heap", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+              >
+                Allocating on the Minor Heap
+              </a>
+              
+              <ol>
+                
+                <li>
+                  <a href="#understanding-allocation" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#understanding-allocation", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#understanding-allocation", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    Understanding Allocation
+                  </a>
+                </li>
+                
+                <li>
+                  <a href="#setting-the-size-of-the-minor-heap" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#setting-the-size-of-the-minor-heap", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#setting-the-size-of-the-minor-heap", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    Setting the Size of the Minor Heap
+                  </a>
+                </li>
+                
+              </ol>
+              
+            </li>
+            
+          </ol>
+          
+        
+      <li>
+        <a href="#the-long-lived-major-heap" class="text-content dark:text-dark-content py-1 pl-2 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+          :class='isWithin(scrollY, "#the-long-lived-major-heap", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+          :style='isWithin(scrollY, "#the-long-lived-major-heap", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+        >
+          The Long-Lived Major Heap
+        </a>
+          
+          <ol>
+            
+            <li>
+              <a href="#allocating-on-the-major-heap" class="text-content dark:text-dark-content py-1 md:py-0 pl-5 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                :class='isWithin(scrollY, "#allocating-on-the-major-heap", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+                :style='isWithin(scrollY, "#allocating-on-the-major-heap", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+              >
+                Allocating on the Major Heap
+              </a>
+              
+              <ol>
+                
+                <li>
+                  <a href="#controlling-the-major-heap-increment" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#controlling-the-major-heap-increment", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#controlling-the-major-heap-increment", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    Controlling the Major Heap Increment
+                  </a>
+                </li>
+                
+              </ol>
+              
+            </li>
+            
+            <li>
+              <a href="#memory-allocation-strategies" class="text-content dark:text-dark-content py-1 md:py-0 pl-5 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                :class='isWithin(scrollY, "#memory-allocation-strategies", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+                :style='isWithin(scrollY, "#memory-allocation-strategies", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+              >
+                Memory Allocation Strategies
+              </a>
+              
+              <ol>
+                
+                <li>
+                  <a href="#best-fit-allocation" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#best-fit-allocation", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#best-fit-allocation", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    Best-Fit Allocation
+                  </a>
+                </li>
+                
+                <li>
+                  <a href="#next-fit-allocation" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#next-fit-allocation", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#next-fit-allocation", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    Next-Fit Allocation
+                  </a>
+                </li>
+                
+                <li>
+                  <a href="#first-fit-allocation" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#first-fit-allocation", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#first-fit-allocation", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    First-Fit Allocation
+                  </a>
+                </li>
+                
+                <li>
+                  <a href="#controlling-the-heap-allocation-policy" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#controlling-the-heap-allocation-policy", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#controlling-the-heap-allocation-policy", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    Controlling the Heap Allocation Policy
+                  </a>
+                </li>
+                
+              </ol>
+              
+            </li>
+            
+            <li>
+              <a href="#marking-and-scanning-the-heap" class="text-content dark:text-dark-content py-1 md:py-0 pl-5 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                :class='isWithin(scrollY, "#marking-and-scanning-the-heap", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+                :style='isWithin(scrollY, "#marking-and-scanning-the-heap", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+              >
+                Marking and Scanning the Heap
+              </a>
+              
+              <ol>
+                
+                <li>
+                  <a href="#controlling-major-heap-collections" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#controlling-major-heap-collections", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#controlling-major-heap-collections", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    Controlling Major Heap Collections
+                  </a>
+                </li>
+                
+              </ol>
+              
+            </li>
+            
+            <li>
+              <a href="#heap-compaction" class="text-content dark:text-dark-content py-1 md:py-0 pl-5 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                :class='isWithin(scrollY, "#heap-compaction", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+                :style='isWithin(scrollY, "#heap-compaction", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+              >
+                Heap Compaction
+              </a>
+              
+              <ol>
+                
+                <li>
+                  <a href="#controlling-frequency-of-compactions" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#controlling-frequency-of-compactions", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#controlling-frequency-of-compactions", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    Controlling Frequency of Compactions
+                  </a>
+                </li>
+                
+              </ol>
+              
+            </li>
+            
+            <li>
+              <a href="#intergenerational-pointers" class="text-content dark:text-dark-content py-1 md:py-0 pl-5 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                :class='isWithin(scrollY, "#intergenerational-pointers", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+                :style='isWithin(scrollY, "#intergenerational-pointers", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+              >
+                Intergenerational Pointers 
+              </a>
+              
+              <ol>
+                
+                <li>
+                  <a href="#the-mutable-write-barrier" class="text-title dark:text-dark-title py-1 md:py-0 pl-8 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                    :class='isWithin(scrollY, "#the-mutable-write-barrier", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-primary dark:text-dark-primary bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-primary dark:hover:text-dark-primary"'
+                    :style='isWithin(scrollY, "#the-mutable-write-barrier", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+                  >
+                    The Mutable Write Barrier
+                  </a>
+                </li>
+                
+              </ol>
+              
+            </li>
+            
+          </ol>
+          
+        
+      <li>
+        <a href="#attaching-finalizer-functions-to-values" class="text-content dark:text-dark-content py-1 pl-2 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+          :class='isWithin(scrollY, "#attaching-finalizer-functions-to-values", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+          :style='isWithin(scrollY, "#attaching-finalizer-functions-to-values", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+        >
+          Attaching Finalizer Functions to Values
+        </a>
+          
+          <ol>
+            
+            <li>
+              <a href="#what-values-can-be-finalized" class="text-content dark:text-dark-content py-1 md:py-0 pl-5 pr-1 block transition-colors border-l-4 border-t-2 border-b-2 border-r-2 border-transparent rounded"
+                :class='isWithin(scrollY, "#what-values-can-be-finalized", sectionYPositions) ? "font-semibold border-l-primary dark:border-l-dark-primary text-title dark:text-dark-title bg-primary_nav_block_hover_10 dark:bg-primary_nav_block_hover_10": "hover:text-title dark:hover:text-dark-title"'
+                :style='isWithin(scrollY, "#what-values-can-be-finalized", sectionYPositions) ? "letter-spacing: -0.012em;" : ""'
+              >
+                What Values Can Be Finalized?
+              </a>
+              
+            </li>
+            
+          </ol>
+          
+        
+      </li>
+  </ol>
+  
+</div>
+
+
+
+
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+  document.addEventListener('alpine:init', () => {
+
+    function computeSectionYPositions(toc_el) {
+      function get_y(href) {
+        let heading = document.getElementById(href.substring(1));
+        return heading.getBoundingClientRect().top + window.scrollY - 60;
+      }
+
+      let sections = {};
+
+      let els = toc_el.querySelectorAll("a");
+      let l = els.length;
+      for (let i=0; i<l; i++) {
+        let target_href = els[i].getAttribute("href");
+        let next_el_href = i < l-1 ? els[i+1].getAttribute("href") : null;
+
+        sections[target_href] = {
+          start: get_y(target_href),
+          end: next_el_href ? get_y(next_el_href) : null,
+        }
+      }
+
+      return sections;
+    }
+
+    function isWithin(scrollY, href, sectionYPositions) {
+      if (sectionYPositions == null) return false;
+      return scrollY > sectionYPositions[href].start
+        && (scrollY <= sectionYPositions[href].end || sectionYPositions[href].end == null)
+    }
+
+    Alpine.data('toc', () => (
+      {
+        scrollY: window.scrollY,
+        sectionYPositions: null,
+
+        isWithin,
+        computeSectionYPositions,
+      }
+    ))
+  })
+</script>
+
+</main>
+
+    <button class="fixed bottom-8 right-10 md:bottom-[5rem] lg:bottom-[8.37rem] lg:right-[6.5rem] border-0 hidden focus:outline-none z-50 rounded-full shadow-custom p-4 bg-primary dark:bg-dark-primary" onclick="scrollToTop()" id="scrollToTop" title="Scroll to top"><svg class="h-6 w-6" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+  <path d="M4.5 10.5L12 3M12 3L19.5 10.5M12 3V21" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+
+</button>
+
+    
+    <script>
+        function scrollToTop() {
+          window.scrollTo(0, 0);
+        }
+
+        window.onscroll = function() {
+          showScrollButton();
+        };
+
+        function showScrollButton() {
+          if (document.body.scrollTop > 20 || document.documentElement.scrollTop > 20) {
+            document.getElementById("scrollToTop").style.display = "block";
+          } else {
+            document.getElementById("scrollToTop").style.display = "none";
+          }
+        }
+    </script>
+  </body>
+</html>
+

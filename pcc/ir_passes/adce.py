@@ -20,12 +20,10 @@ Upstream reference:
 Staged subset here (labelled ``subset``):
 
 - steps 1–2 implemented (reverse-flow liveness from sinks),
-- a very narrow step 3 is implemented: if a conditional branch feeds
-  two empty forwarders that both jump to the same merge block, rewrite
-  it to an unconditional jump to the first successor and rerun liveness
-  so the dead condition chain is dropped.
-- wider branch removal via post-dom remains deferred — this is still
-  the main ADCE-over-DCE win left for the full implementation.
+- a narrow branch rewrite handles dead conditional regions whose arms
+  both resolve to the same successor, or where one arm is only a
+  forwarder to the other arm. Phi-bearing direct targets remain
+  protected unless their incoming edges can be repaired.
 
 For the purely value-level dead-code pattern, this subset currently
 matches DCE. The module exists separately so it can evolve
@@ -42,13 +40,25 @@ from dataclasses import dataclass
 import llvmlite.binding as llvm
 
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
+from .simplifycfg import _prune_invalid_phi_incomings
 from .ssa_utils import build_def_use_index_per_function
 
-
 _LIVE_OPCODES = {
-    "ret", "store", "call", "invoke", "br", "switch", "indirectbr",
-    "atomicrmw", "cmpxchg", "fence", "resume", "catchswitch",
-    "catchret", "cleanupret", "unreachable",
+    "ret",
+    "store",
+    "call",
+    "invoke",
+    "br",
+    "switch",
+    "indirectbr",
+    "atomicrmw",
+    "cmpxchg",
+    "fence",
+    "resume",
+    "catchswitch",
+    "catchret",
+    "cleanupret",
+    "unreachable",
 }
 
 _ATTR_GROUP_RE = re.compile(
@@ -132,9 +142,7 @@ def _collect_function_attrs(ir_text: str) -> dict[str, set[str]]:
             continue
         body = match.group("body").replace("{", " ").replace("}", " ")
         attr_groups[match.group("group")] = {
-            tok
-            for tok in body.split()
-            if tok and tok != ","
+            tok for tok in body.split() if tok and tok != ","
         }
 
     attrs_by_func: dict[str, set[str]] = {}
@@ -167,7 +175,12 @@ def _is_trivially_dead_call_line(
         return False
     attrs = attrs_by_func.get(match.group("callee"), set())
     return (
-        ("readnone" in attrs or "memory(none)" in attrs)
+        (
+            "readnone" in attrs
+            or "readonly" in attrs
+            or "memory(none)" in attrs
+            or "memory(read)" in attrs
+        )
         and "willreturn" in attrs
         and "nounwind" in attrs
     )
@@ -246,9 +259,8 @@ def _remove_dead_values(ir_text: str) -> tuple[str, bool]:
             continue
         if current_fn is None:
             continue
-        if (
-            _ASSIGN_RE.match(line) is None
-            and _is_trivially_dead_call_line(line, attrs_by_func)
+        if _ASSIGN_RE.match(line) is None and _is_trivially_dead_call_line(
+            line, attrs_by_func
         ):
             dead_void_call_present = True
             break
@@ -272,10 +284,7 @@ def _remove_dead_values(ir_text: str) -> tuple[str, bool]:
             m = assign_re.match(line)
             if m and m.group(1) in fn_to_remove.get(current_fn, set()):
                 continue
-            if (
-                m is None
-                and _is_trivially_dead_call_line(line, attrs_by_func)
-            ):
+            if m is None and _is_trivially_dead_call_line(line, attrs_by_func):
                 continue
         new_lines.append(line)
     return "".join(new_lines), True
@@ -401,8 +410,13 @@ def _rewrite_dead_conditional_branches(ir_text: str) -> tuple[str, bool]:
                 local_changed = True
                 continue
             if true_resolved == false_resolved:
+                if _block_has_phi(block_map.get(true_resolved)):
+                    continue
                 block.replace_terminator(f"  br label %{m.group('t')}\n")
                 local_changed = True
+        if local_changed:
+            blocks, phi_changed = _prune_invalid_phi_incomings(blocks)
+            local_changed = local_changed or phi_changed
         out.append(_join_function(header, blocks, footer))
         changed = changed or local_changed
     if not changed:

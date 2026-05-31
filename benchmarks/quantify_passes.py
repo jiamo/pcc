@@ -16,7 +16,7 @@ from pcc.evaluater.c_evaluator import (
 )
 
 
-BENCHMARKS_DIR = Path(__file__).resolve().parent
+BENCHMARKS_DIR = Path(__file__).resolve().parent / "c"
 DEFAULT_BENCHES = sorted(path.name for path in BENCHMARKS_DIR.glob("*.c"))
 
 

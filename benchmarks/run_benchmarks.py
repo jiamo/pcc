@@ -21,8 +21,8 @@ import time
 from pathlib import Path
 
 
-BENCHMARKS_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BENCHMARKS_DIR.parent
+BENCHMARKS_DIR = Path(__file__).resolve().parent / "c"
+PROJECT_ROOT = BENCHMARKS_DIR.parents[1]
 DEFAULT_BENCHES = sorted(path.name for path in BENCHMARKS_DIR.glob("*.c"))
 DEFAULT_OPT_LEVELS = (1, 2, 3)
 

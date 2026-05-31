@@ -55,8 +55,42 @@ class Counter(dict):
     def __init__(self, iterable=None) -> None:
         super().__init__()
         if iterable is not None:
-            for item in iterable:
-                self[item] = self.get(item, 0) + 1
+            self.update(iterable)
+
+    def __missing__(self, key):
+        return 0
+
+    def __getitem__(self, key):
+        return self.get(key, 0)
+
+    def update(self, iterable=None, **kwargs) -> None:
+        if iterable is not None:
+            if hasattr(iterable, "items"):
+                for key, value in iterable.items():
+                    self[key] = self.get(key, 0) + value
+            else:
+                for item in iterable:
+                    self[item] = self.get(item, 0) + 1
+        for key, value in kwargs.items():
+            self[key] = self.get(key, 0) + value
+
+    def subtract(self, iterable=None, **kwargs) -> None:
+        if iterable is not None:
+            if hasattr(iterable, "items"):
+                for key, value in iterable.items():
+                    self[key] = self.get(key, 0) - value
+            else:
+                for item in iterable:
+                    self[item] = self.get(item, 0) - 1
+        for key, value in kwargs.items():
+            self[key] = self.get(key, 0) - value
+
+    def elements(self):
+        for key, value in self.items():
+            i = 0
+            while i < value:
+                yield key
+                i += 1
 
     def most_common(self, n=None):
         items = sorted(self.items(), key=lambda kv: -kv[1])
@@ -91,6 +125,35 @@ class deque:
 
     def __len__(self) -> int:
         return len(self._data)
+
+    def rotate(self, n: int = 1) -> None:
+        length = len(self._data)
+        if length == 0:
+            return
+        n = n % length
+        if n:
+            self._data[:] = self._data[-n:] + self._data[:-n]
+
+
+class ChainMap:
+    def __init__(self, *maps) -> None:
+        self.maps = list(maps) if maps else [{}]
+
+    def __getitem__(self, key):
+        for mapping in self.maps:
+            if key in mapping:
+                return mapping[key]
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def new_child(self, m=None):
+        child = {} if m is None else m
+        return ChainMap(child, *self.maps)
 
 
 def namedtuple(name, field_spec):

@@ -1,7 +1,23 @@
 # Python data-model gaps — descriptor / generator / context-manager / etc.
 
-**Status:** open. Filed 2026-04-29 alongside
-`docs/issues/python-semantics-preservation.md`.
+**Status:** mostly resolved for D2-D8 as of 2026-05-17. Filed 2026-04-29
+alongside `docs/issues/python-semantics-preservation.md`.
+
+Current closure gate:
+
+```bash
+bash scripts/run_goal_closure_bundle_gate.sh
+```
+
+Latest observed focused result:
+
+- B1-B6 closure: `21 passed`
+- D2-D6 closure: `47 passed`
+- final-language closure: `32 passed`
+
+D1 descriptor follow-up remains a compatibility-expansion track, but the
+generator/async/context/protocol/format/pickle/import/introspection phases no
+longer describe the current implementation as absent.
 
 ## The problem
 
@@ -23,24 +39,24 @@ A quick map of where pcc currently stands on each data-model area:
 
 | Area | Status | Where |
 |---|---|---|
-| Attribute lookup MRO | partial — `py_obj_getattr` walks class MRO; descriptor protocol incomplete | `pcc/py_runtime/src/py_class.c`, `py_obj_ops_dispatch.c` |
-| `@property` | works for the simple read-only shape; `setter` / `deleter` / docstring propagation incomplete | runtime + codegen typed-class field access |
-| `staticmethod` / `classmethod` | basic dispatch works; `__func__` introspection / subclass-call edge cases incomplete | `class_gen.py` method-kind classification |
-| `__slots__` | not implemented; `__dict__` is always present | — |
+| Attribute lookup MRO | focused D1 contract passes: data vs non-data descriptor priority is locked; broader introspection edges still open | `pcc/py_runtime/src/py_class.c`, `py_obj_ops_dispatch.c`, `tests/test_descriptor_protocol.py` |
+| `@property` | getter/setter/read-only focused contract passes; docstring/introspection edges incomplete | runtime + codegen typed-class field access |
+| `staticmethod` / `classmethod` | focused dispatch contract passes; `__func__` introspection / subclass-call edge cases incomplete | `class_gen.py` method-kind classification |
+| `__slots__` | focused storage/no-`__dict__` contract passes; inheritance and weakref slots still need coverage | `tests/test_descriptor_protocol.py` |
 | `__getattribute__` / `__getattr__` | partial (`__getattr__` fallback works, `__getattribute__` overload not honoured) | runtime |
-| Generator (`yield`) | mostly absent — frontend rejects most generator constructs | parser / type-infer / codegen |
-| `yield from` | not supported | — |
-| `async def` / `await` | not supported | — |
-| Context managers (`with`) | basic `__enter__` / `__exit__` work; exception chaining edge cases unclear | codegen |
-| `async with` | not supported | — |
-| `__format__` / format-spec mini-language | partial — `str(obj)` works, `f"{obj:spec}"` mini-language not honoured for user classes | runtime |
-| `__reduce__` / pickle support | not implemented | — |
-| `__copy__` / `__deepcopy__` | not implemented | — |
-| `importlib.import_module` dynamic | falls through to libpython | — |
-| `inspect.signature` / introspection | falls through to libpython | — |
-| Reflected operators (`__radd__` etc.) | partial — only the unreflected slot gets dispatched in many paths | `py_obj_ops_dispatch.c` |
-| Three-arg `pow(a, b, m)` | not implemented | — |
-| `iter(callable, sentinel)` 2-arg form | not implemented | — |
+| Generator (`yield`) | focused D2 contract passes: local state, `yield from`, `send`, `throw`, `close`, and return-value `StopIteration` | `generator_lowering.py`, `py_gen.c`, `tests/python/test_generator_protocol.py` |
+| `yield from` | focused delegation contract passes | `generator_lowering.py`, `tests/python/test_generator_protocol.py` |
+| `async def` / `await` | focused D3 contract passes for coroutine objects, await round trips, `asyncio.run`, `sleep(0)`, user awaitables | `native_asyncio.py`, `py_coroutine.c`, `tests/python/test_async_await.py` |
+| Context managers (`with`) | focused D4 contract passes, including multi-manager, suppression, `contextmanager`, and `async with` | `async_with_lowering.py`, `tests/python/test_context_manager_full.py` |
+| `async with` | focused contract passes | `async_with_lowering.py`, `tests/python/test_async_await.py`, `tests/python/test_context_manager_full.py` |
+| `__format__` / format-spec mini-language | focused D6 contract passes for builtin specs, user `__format__`, and default rejection | `format_lowering.py`, `py_format.c`, `tests/python/test_format_protocol.py` |
+| `__reduce__` / pickle support | focused D7 contract passes for native pickle/copy round trips | `native_modules.py`, `py_pickle_copy.c`, `tests/python/test_pickle_copy.py` |
+| `__copy__` / `__deepcopy__` | focused D7 contract passes | `native_modules.py`, `py_pickle_copy.c`, `tests/python/test_pickle_copy.py` |
+| `importlib.import_module` dynamic | focused D8 contract passes for known native modules and module exports without libpython | `native_modules.py`, `pipeline.py`, `tests/python/test_dynamic_import.py` |
+| `inspect.signature` / introspection | focused D8 contract passes for local user functions, getsource, getmro, isfunction/isclass/ismethod | `native_modules.py`, `tests/python/test_inspect_protocol.py` |
+| Reflected operators (`__radd__` etc.) | focused D5 protocol edge contract passes | `py_obj_ops_dispatch.c`, `compare_membership_lowering.py`, `tests/python/test_protocol_edges.py` |
+| Three-arg `pow(a, b, m)` | focused D5 protocol edge contract passes | `tests/python/test_protocol_edges.py` |
+| `iter(callable, sentinel)` 2-arg form | focused D5 protocol edge contract passes | `tests/python/test_protocol_edges.py` |
 
 The takeaway: the "happy path" for each protocol is wired; the
 edges aren't. That's a typical state for an in-flight runtime, but
@@ -169,6 +185,13 @@ Each phase is independently shippable; later phases assume earlier
 ones are correct.
 
 ### Phase D1 — descriptor protocol (1.5–2 weeks)
+
+**Implementation note 2026-05-02:** the focused
+`tests/test_descriptor_protocol.py` gate now passes, including
+property getter/setter/read-only, classmethod/staticmethod dispatch,
+data vs non-data descriptor lookup order, `__set_name__`, and basic
+`__slots__`. D1 remains open for CPython-level introspection and
+inheritance edge cases, but the core contract is no longer xfail.
 
 Most central single phase. Fixing this alone resolves Codex Failure
 Class 4 (`Module.globals as a property was too dynamic`) and
@@ -327,6 +350,13 @@ Scope:
 - Default `__format__(self, "")` returns `str(self)`; non-empty
   spec on a class without `__format__` raises `TypeError` (matches
   CPython 3.4+).
+
+Status 2026-05-08:
+- Builtin numeric f-string specs covered by
+  `tests/test_python_str_methods_parity.py::test_str_fstring_format_spec`
+  now pass natively: `.Nf`, `,`, and `0Nd`.
+- User-defined `__format__`, `format()` builtin dispatch, and default
+  non-empty-spec rejection remain pending.
 
 Acceptance:
 - Bug example #3 (`Money` formatter) prints `"$1,234.50"`.

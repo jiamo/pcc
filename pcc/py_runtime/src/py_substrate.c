@@ -110,6 +110,11 @@ static PyObjectHeader py_none_storage = {
     .type_tag = PY_TYPE_NONE,
     .flags    = PY_FLAG_IMMORTAL,
 };
+static PyObjectHeader py_notimplemented_storage = {
+    .refcount = 1,
+    .type_tag = PY_TYPE_NONE,
+    .flags    = PY_FLAG_IMMORTAL,
+};
 static PyObjectHeader py_true_storage = {
     .refcount = 1,
     .type_tag = PY_TYPE_BOOL,
@@ -121,6 +126,7 @@ static PyObjectHeader py_false_storage = {
     .flags    = PY_FLAG_IMMORTAL,
 };
 PyObject *const py_None  = (PyObject *)&py_none_storage;
+PyObject *const py_NotImplemented = (PyObject *)&py_notimplemented_storage;
 PyObject *const py_True  = (PyObject *)&py_true_storage;
 PyObject *const py_False = (PyObject *)&py_false_storage;
 
@@ -163,6 +169,8 @@ const char *const PY_EXC_BUILTIN_NAMES[PY_EXC_N_BUILTIN] = {
     "OSError",
     "OverflowError",
     "AssertionError",
+    "StopAsyncIteration",
+    "ReferenceError",
 };
 
 const int32_t PY_EXC_PARENT[PY_EXC_N_BUILTIN] = {
@@ -183,6 +191,8 @@ const int32_t PY_EXC_PARENT[PY_EXC_N_BUILTIN] = {
     [PY_EXC_NOTIMPLEMENTEDERROR] = PY_EXC_RUNTIMEERROR,
     [PY_EXC_OSERROR]           = PY_EXC_EXCEPTION,
     [PY_EXC_ASSERTIONERROR]    = PY_EXC_EXCEPTION,
+    [PY_EXC_STOPASYNCITERATION] = PY_EXC_EXCEPTION,
+    [PY_EXC_REFERENCEERROR]    = PY_EXC_EXCEPTION,
 };
 
 /* Per-tag class cache. Populated lazily on first access by whichever
@@ -287,7 +297,7 @@ int32_t py_subs_strcmp(const char *a, const char *b) {
 /* User-class tag allocator. Lives here so swapping py_class.c for
  * py_class.py preserves the counter across versions. Exported for
  * pcc.unsafe.global_addr access from the Python port. */
-int32_t py_next_user_tag = PY_TYPE_USER;
+int32_t py_next_user_tag = PY_TYPE_USER_CLASS_START;
 
 int32_t py_subs_alloc_user_tag(void) {
     int32_t tag = py_next_user_tag;

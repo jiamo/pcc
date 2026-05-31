@@ -27,7 +27,7 @@ static int64_t utf8_codepoint_count(const char *bytes, int64_t byte_len) {
 }
 
 static int64_t byte_find(const char *hay, int64_t hay_len,
-                          const char *need, int64_t need_len) {
+                        const char *need, int64_t need_len) {
     if (need_len == 0) return 0;
     if (need_len > hay_len) return -1;
     int64_t last = hay_len - need_len;
@@ -39,6 +39,18 @@ static int64_t byte_find(const char *hay, int64_t hay_len,
     return -1;
 }
 
+static int64_t byte_rfind(const char *hay, int64_t hay_len,
+                         const char *need, int64_t need_len) {
+    if (need_len == 0) return hay_len;
+    if (need_len > hay_len) return -1;
+    int64_t last = hay_len - need_len;
+    for (int64_t i = last; i >= 0; i--) {
+        if (hay[i] == need[0] && memcmp(hay + i, need, (size_t)need_len) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
 static int64_t byte_offset_to_cp_offset(PyStrObject *s, int64_t byte_off) {
     if (byte_off <= 0) return 0;
     if (byte_off >= s->byte_len) byte_off = s->byte_len;
@@ -103,6 +115,31 @@ static int64_t int_or_default(PyObject *o, int64_t defval) {
     if (PY_IS_TAGGED_INT(o)) return py_untag_int(o);
     if (py_type_of(o) == PY_TYPE_INT) return py_int_value_i64(o);
     return defval;
+}
+
+static const char *stringlike_bytes(PyObject *o, int64_t *len) {
+    if (o == NULL) {
+        *len = 0;
+        return NULL;
+    }
+    int32_t tag = py_type_of(o);
+    if (tag == PY_TYPE_STR) {
+        PyStrObject *s = (PyStrObject *)o;
+        *len = s->byte_len;
+        return s->data;
+    }
+    if (tag == PY_TYPE_BYTES) {
+        PyBytesObject *b = (PyBytesObject *)o;
+        *len = b->byte_len;
+        return b->data;
+    }
+    if (tag == PY_TYPE_BYTEARRAY) {
+        PyByteArrayObject *b = (PyByteArrayObject *)o;
+        *len = b->byte_len;
+        return b->data;
+    }
+    *len = 0;
+    return NULL;
 }
 
 static PyObject *str_from_range(const char *bytes, int64_t len) {
@@ -256,23 +293,57 @@ int64_t py_str_find(PyObject *s, PyObject *sub) {
     return byte_offset_to_cp_offset(ss, bo);
 }
 
+int64_t py_str_rfind(PyObject *s, PyObject *sub) {
+    if (s == NULL || sub == NULL) return -1;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *sn = (PyStrObject *)sub;
+    int64_t bo = byte_rfind(ss->data, ss->byte_len, sn->data, sn->byte_len);
+    if (bo < 0) return -1;
+    return byte_offset_to_cp_offset(ss, bo);
+}
+
 int64_t py_str_startswith(PyObject *s, PyObject *prefix) {
     if (s == NULL || prefix == NULL) return 0;
-    PyStrObject *ss = (PyStrObject *)s;
-    PyStrObject *sp = (PyStrObject *)prefix;
-    if (sp->byte_len > ss->byte_len) return 0;
-    if (sp->byte_len == 0) return 1;
-    return memcmp(ss->data, sp->data, (size_t)sp->byte_len) == 0;
+    if (py_type_of(prefix) == PY_TYPE_TUPLE) {
+        int64_t n = py_tuple_len(prefix);
+        for (int64_t i = 0; i < n; i++) {
+            PyObject *item = py_tuple_get(prefix, i);
+            int64_t ok = py_str_startswith(s, item);
+            py_decref(item);
+            if (ok) return 1;
+        }
+        return 0;
+    }
+    int64_t s_len = 0;
+    int64_t p_len = 0;
+    const char *s_data = stringlike_bytes(s, &s_len);
+    const char *p_data = stringlike_bytes(prefix, &p_len);
+    if (s_data == NULL || p_data == NULL) return 0;
+    if (p_len > s_len) return 0;
+    if (p_len == 0) return 1;
+    return memcmp(s_data, p_data, (size_t)p_len) == 0;
 }
 
 int64_t py_str_endswith(PyObject *s, PyObject *suffix) {
     if (s == NULL || suffix == NULL) return 0;
-    PyStrObject *ss = (PyStrObject *)s;
-    PyStrObject *sf = (PyStrObject *)suffix;
-    if (sf->byte_len > ss->byte_len) return 0;
-    if (sf->byte_len == 0) return 1;
-    return memcmp(ss->data + (ss->byte_len - sf->byte_len),
-                  sf->data, (size_t)sf->byte_len) == 0;
+    if (py_type_of(suffix) == PY_TYPE_TUPLE) {
+        int64_t n = py_tuple_len(suffix);
+        for (int64_t i = 0; i < n; i++) {
+            PyObject *item = py_tuple_get(suffix, i);
+            int64_t ok = py_str_endswith(s, item);
+            py_decref(item);
+            if (ok) return 1;
+        }
+        return 0;
+    }
+    int64_t s_len = 0;
+    int64_t suffix_len = 0;
+    const char *s_data = stringlike_bytes(s, &s_len);
+    const char *suffix_data = stringlike_bytes(suffix, &suffix_len);
+    if (s_data == NULL || suffix_data == NULL) return 0;
+    if (suffix_len > s_len) return 0;
+    if (suffix_len == 0) return 1;
+    return memcmp(s_data + (s_len - suffix_len), suffix_data, (size_t)suffix_len) == 0;
 }
 
 int64_t py_str_isdigit(PyObject *s) {
@@ -323,6 +394,53 @@ int64_t py_str_isalnum(PyObject *s) {
         if (!ok) return 0;
     }
     return 1;
+}
+
+/* isupper()/islower(): true iff there is at least one cased (ASCII letter)
+ * character and none of the opposite case (CPython ignores non-cased chars). */
+int64_t py_str_isupper(PyObject *s) {
+    if (s == NULL) return 0;
+    PyStrObject *ss = (PyStrObject *)s;
+    int has_upper = 0;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        if (c >= 'a' && c <= 'z') return 0;
+        if (c >= 'A' && c <= 'Z') has_upper = 1;
+    }
+    return has_upper;
+}
+
+int64_t py_str_islower(PyObject *s) {
+    if (s == NULL) return 0;
+    PyStrObject *ss = (PyStrObject *)s;
+    int has_lower = 0;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        if (c >= 'A' && c <= 'Z') return 0;
+        if (c >= 'a' && c <= 'z') has_lower = 1;
+    }
+    return has_lower;
+}
+
+/* str.index(sub): like find() but raises ValueError when sub is absent.
+ * Named *_of to avoid the existing py_str_index (s[i] subscript helper). */
+int64_t py_str_index_of(PyObject *s, PyObject *sub) {
+    int64_t idx = py_str_find(s, sub);
+    if (idx < 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
+        return -1;
+    }
+    return idx;
+}
+
+/* str.rindex(sub): like rfind() but raises ValueError when sub is absent. */
+int64_t py_str_rindex_of(PyObject *s, PyObject *sub) {
+    int64_t idx = py_str_rfind(s, sub);
+    if (idx < 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
+        return -1;
+    }
+    return idx;
 }
 
 /* ---- ASCII whitespace strip variants (byte-level) ---- */
@@ -414,12 +532,10 @@ PyObject *py_str_rstrip_chars(PyObject *s, PyObject *chars) {
  * fresh PyStrObject sized for byte_len + NUL terminator. */
 static PyStrObject *str_alloc_local(int64_t byte_len) {
     if (byte_len < 0) return NULL;
-    size_t total = sizeof(PyStrObject) + (size_t)byte_len + 1u;
-    PyStrObject *s = (PyStrObject *)malloc(total);
+    if (byte_len > INT64_MAX - (int64_t)sizeof(PyStrObject) - 1) return NULL;
+    int64_t total = (int64_t)sizeof(PyStrObject) + byte_len + 1;
+    PyStrObject *s = (PyStrObject *)pcc_gc_alloc(total, PY_TYPE_STR, 0);
     if (s == NULL) return NULL;
-    s->h.refcount = 1;
-    s->h.type_tag = PY_TYPE_STR;
-    s->h.flags    = 0;
     s->byte_len   = byte_len;
     s->cp_len     = -1;
     s->hash       = -1;
@@ -455,10 +571,87 @@ PyObject *py_str_lower(PyObject *s) {
     return (PyObject *)out;
 }
 
+PyObject *py_str_capitalize(PyObject *s) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *out = str_alloc_local(ss->byte_len);
+    if (out == NULL) return NULL;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        if (i == 0) {
+            if (c >= 'a' && c <= 'z') c = (unsigned char)(c - ('a' - 'A'));
+        } else {
+            if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + ('a' - 'A'));
+        }
+        out->data[i] = (char)c;
+    }
+    out->cp_len = ss->cp_len;
+    return (PyObject *)out;
+}
+
+/* ASCII-only case transforms, mirroring py_str_upper/lower/capitalize. */
+PyObject *py_str_swapcase(PyObject *s) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *out = str_alloc_local(ss->byte_len);
+    if (out == NULL) return NULL;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        if (c >= 'a' && c <= 'z') c = (unsigned char)(c - ('a' - 'A'));
+        else if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + ('a' - 'A'));
+        out->data[i] = (char)c;
+    }
+    out->cp_len = ss->cp_len;
+    return (PyObject *)out;
+}
+
+PyObject *py_str_title(PyObject *s) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *out = str_alloc_local(ss->byte_len);
+    if (out == NULL) return NULL;
+    int prev_alpha = 0;  /* previous char was a cased ASCII letter */
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        int is_alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        if (is_alpha) {
+            if (!prev_alpha) {
+                if (c >= 'a' && c <= 'z') c = (unsigned char)(c - ('a' - 'A'));
+            } else {
+                if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + ('a' - 'A'));
+            }
+        }
+        out->data[i] = (char)c;
+        prev_alpha = is_alpha;
+    }
+    out->cp_len = ss->cp_len;
+    return (PyObject *)out;
+}
+
+PyObject *py_str_casefold(PyObject *s) {
+    /* ASCII casefold == lower (same ASCII-only scope as the other case ops;
+     * Unicode-specific folding is not handled). */
+    return py_str_lower(s);
+}
+
 PyObject *py_str_concat(PyObject *a, PyObject *b) {
     if (a == NULL || b == NULL) return NULL;
+    int32_t tag_a = py_type_of(a);
+    int32_t tag_b = py_type_of(b);
+    if (tag_a != PY_TYPE_STR || tag_b != PY_TYPE_STR) {
+        pcc_debug_bad_str_concat(a, b, tag_a, tag_b);
+        return NULL;
+    }
     PyStrObject *sa = (PyStrObject *)a;
     PyStrObject *sb = (PyStrObject *)b;
+    if (sa->byte_len < 0 || sb->byte_len < 0) {
+        pcc_debug_bad_str_concat(a, b, tag_a, tag_b);
+        return NULL;
+    }
+    if (sa->byte_len > INT64_MAX - sb->byte_len) {
+        pcc_debug_bad_str_concat(a, b, tag_a, tag_b);
+        return NULL;
+    }
     int64_t total = sa->byte_len + sb->byte_len;
     PyStrObject *out = str_alloc_local(total);
     if (out == NULL) return NULL;
@@ -745,6 +938,403 @@ PyObject *py_str_split(PyObject *s, PyObject *sep) {
     return list;
 }
 
+static int64_t fill_byte_count(int64_t pad, PyObject *fillobj) {
+    if (fillobj == NULL) return pad;
+    return pad * ((PyStrObject *)fillobj)->byte_len;
+}
+
+static int64_t fill_pad(char *buf, int64_t pos, int64_t pad, PyObject *fillobj) {
+    if (fillobj == NULL) {
+        for (int64_t p = 0; p < pad; p++) buf[pos++] = ' ';
+        return pos;
+    }
+    PyStrObject *f = (PyStrObject *)fillobj;
+    for (int64_t q = 0; q < pad; q++) {
+        for (int64_t b = 0; b < f->byte_len; b++) buf[pos++] = f->data[b];
+    }
+    return pos;
+}
+
+PyObject *py_str_rjust(PyObject *s, int64_t width, PyObject *fillobj) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    int64_t n = py_str_len(s);                  /* codepoints */
+    if (width <= n) { py_incref(s); return s; }
+    int64_t pad = width - n;
+    int64_t pad_bytes = fill_byte_count(pad, fillobj);
+    char *buf = (char *)malloc((size_t)(ss->byte_len + pad_bytes + 1));
+    if (buf == NULL) return NULL;
+    int64_t pos = fill_pad(buf, 0, pad, fillobj);
+    memcpy(buf + pos, ss->data, (size_t)ss->byte_len);
+    pos += ss->byte_len;
+    PyObject *out = py_str_new(buf, pos);
+    free(buf);
+    return out;
+}
+
+PyObject *py_str_ljust(PyObject *s, int64_t width, PyObject *fillobj) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    int64_t n = py_str_len(s);
+    if (width <= n) { py_incref(s); return s; }
+    int64_t pad = width - n;
+    int64_t pad_bytes = fill_byte_count(pad, fillobj);
+    char *buf = (char *)malloc((size_t)(ss->byte_len + pad_bytes + 1));
+    if (buf == NULL) return NULL;
+    memcpy(buf, ss->data, (size_t)ss->byte_len);
+    int64_t pos = fill_pad(buf, ss->byte_len, pad, fillobj);
+    PyObject *out = py_str_new(buf, pos);
+    free(buf);
+    return out;
+}
+
+static int re_escape_is_special(unsigned char c) {
+    switch (c) {
+        case '(': case ')': case '[': case ']': case '{': case '}':
+        case '?': case '*': case '+': case '-': case '|': case '^':
+        case '$': case '\\': case '.': case '&': case '~': case '#':
+        case ' ': case '\t': case '\n': case '\r': case '\v': case '\f':
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+PyObject *py_re_escape(PyObject *s) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    char *buf = (char *)malloc((size_t)(ss->byte_len * 2 + 1));
+    if (buf == NULL) return NULL;
+    int64_t pos = 0;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        if (re_escape_is_special(c)) buf[pos++] = '\\';
+        buf[pos++] = (char)c;
+    }
+    PyObject *out = py_str_new(buf, pos);
+    free(buf);
+    return out;
+}
+
+PyObject *py_str_rsplit_maxsplit(PyObject *s, PyObject *sep, int64_t maxsplit) {
+    if (s == NULL) return NULL;
+    if (maxsplit < 0) return py_str_split(s, sep);
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *sp = (PyStrObject *)sep;
+    if (sp->byte_len == 0) return py_list_new(0);
+    if (maxsplit == 0) {
+        PyObject *out0 = py_list_new(1);
+        if (out0 == NULL) return NULL;
+        PyObject *whole = str_from_range(ss->data, ss->byte_len);
+        if (whole == NULL) { py_decref(out0); return NULL; }
+        py_list_append(out0, whole);
+        py_decref(whole);
+        return out0;
+    }
+    int64_t *positions = (int64_t *)malloc(sizeof(int64_t) * (size_t)maxsplit);
+    if (positions == NULL) return NULL;
+    int64_t count = 0;
+    int64_t i = ss->byte_len - sp->byte_len;
+    while (i >= 0 && count < maxsplit) {
+        if (ss->data[i] == sp->data[0]
+            && memcmp(ss->data + i, sp->data, (size_t)sp->byte_len) == 0)
+        {
+            positions[maxsplit - 1 - count] = i;
+            count++;
+            i -= sp->byte_len;
+        } else {
+            i--;
+        }
+    }
+    PyObject *out = py_list_new(count + 1);
+    if (out == NULL) { free(positions); return NULL; }
+    int64_t prev = 0;
+    for (int64_t j = maxsplit - count; j < maxsplit; j++) {
+        int64_t p = positions[j];
+        PyObject *part = str_from_range(ss->data + prev, p - prev);
+        if (part == NULL) { free(positions); py_decref(out); return NULL; }
+        py_list_append(out, part);
+        py_decref(part);
+        prev = p + sp->byte_len;
+    }
+    free(positions);
+    PyObject *tail = str_from_range(ss->data + prev, ss->byte_len - prev);
+    if (tail == NULL) { py_decref(out); return NULL; }
+    py_list_append(out, tail);
+    py_decref(tail);
+    return out;
+}
+
+PyObject *py_str_center(PyObject *s, int64_t width, PyObject *fillobj) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    int64_t n = py_str_len(s);
+    if (width <= n) { py_incref(s); return s; }
+    int64_t marg = width - n;
+    int64_t left = marg / 2 + (marg & width & 1);   /* CPython center split */
+    int64_t right = marg - left;
+    int64_t pad_l = fill_byte_count(left, fillobj);
+    int64_t pad_r = fill_byte_count(right, fillobj);
+    char *buf = (char *)malloc((size_t)(ss->byte_len + pad_l + pad_r + 1));
+    if (buf == NULL) return NULL;
+    int64_t pos = fill_pad(buf, 0, left, fillobj);
+    memcpy(buf + pos, ss->data, (size_t)ss->byte_len);
+    pos += ss->byte_len;
+    pos = fill_pad(buf, pos, right, fillobj);
+    PyObject *out = py_str_new(buf, pos);
+    free(buf);
+    return out;
+}
+
+PyObject *py_str_zfill(PyObject *s, int64_t width) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    int64_t n = py_str_len(s);
+    if (width <= n) { py_incref(s); return s; }
+    int64_t pad = width - n;
+    int sign = 0;
+    if (ss->byte_len > 0) {
+        unsigned char c0 = (unsigned char)ss->data[0];
+        if (c0 == '+' || c0 == '-') sign = 1;
+    }
+    char *buf = (char *)malloc((size_t)(ss->byte_len + pad + 1));
+    if (buf == NULL) return NULL;
+    int64_t pos = 0;
+    if (sign) { buf[0] = ss->data[0]; pos = 1; }
+    for (int64_t z = 0; z < pad; z++) buf[pos++] = '0';
+    for (int64_t k = sign; k < ss->byte_len; k++) buf[pos++] = ss->data[k];
+    PyObject *out = py_str_new(buf, pos);
+    free(buf);
+    return out;
+}
+
+/* str.expandtabs(tabsize): replace each '\t' with spaces up to the next
+ * tabsize column boundary; '\n'/'\r' reset the column. Byte/column tracking is
+ * ASCII-oriented (matches the other byte-level str helpers). */
+PyObject *py_str_expandtabs(PyObject *s, int64_t tabsize) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    int64_t mult = tabsize > 1 ? tabsize : 1;
+    char *buf = (char *)malloc((size_t)(ss->byte_len * mult + 1));
+    if (buf == NULL) return NULL;
+    int64_t pos = 0;
+    int64_t col = 0;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        char c = ss->data[i];
+        if (c == '\t') {
+            if (tabsize > 0) {
+                int64_t spaces = tabsize - (col % tabsize);
+                for (int64_t k = 0; k < spaces; k++) buf[pos++] = ' ';
+                col += spaces;
+            }
+        } else if (c == '\n' || c == '\r') {
+            buf[pos++] = c;
+            col = 0;
+        } else {
+            buf[pos++] = c;
+            col++;
+        }
+    }
+    PyObject *out = py_str_new(buf, pos);
+    free(buf);
+    return out;
+}
+
+/* str.translate(table): map each byte through table (dict {ord: ord|str|None}).
+ * Absent -> keep; None -> delete; int -> that byte; str -> its bytes. Two-pass
+ * (size then fill) so str replacements are sized correctly. Byte/ASCII-oriented
+ * like the other str helpers (non-ASCII codepoint keys are a follow-on). */
+PyObject *py_str_translate(PyObject *s, PyObject *table) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    int64_t out_len = 0;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        PyObject *key = py_int_from_i64((int64_t)c);
+        PyObject *val = py_dict_get(table, key);
+        py_decref(key);
+        if (val == NULL) {
+            out_len += 1;
+        } else if (val == py_None) {
+            py_decref(val);
+        } else if (py_type_of(val) == PY_TYPE_STR) {
+            out_len += ((PyStrObject *)val)->byte_len;
+            py_decref(val);
+        } else {
+            out_len += 1;
+            py_decref(val);
+        }
+    }
+    char *buf = (char *)malloc((size_t)out_len + 1);
+    if (buf == NULL) return NULL;
+    int64_t pos = 0;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        PyObject *key = py_int_from_i64((int64_t)c);
+        PyObject *val = py_dict_get(table, key);
+        py_decref(key);
+        if (val == NULL) {
+            buf[pos++] = (char)c;
+        } else if (val == py_None) {
+            py_decref(val);
+        } else if (py_type_of(val) == PY_TYPE_STR) {
+            PyStrObject *vs = (PyStrObject *)val;
+            for (int64_t j = 0; j < vs->byte_len; j++) buf[pos++] = vs->data[j];
+            py_decref(val);
+        } else {
+            buf[pos++] = (char)(py_int_value_i64(val) & 0xFF);
+            py_decref(val);
+        }
+    }
+    PyObject *out = py_str_new(buf, pos);
+    free(buf);
+    return out;
+}
+
+/* str.maketrans(x, y): build the translation dict {ord(x[i]): ord(y[i])} for the
+ * two-arg form (x and y must have equal length). Byte/ASCII-oriented like the
+ * other str helpers. py_dict_set increfs key+value, so the fresh ints are
+ * decref'd after. (1-arg dict / 3-arg delete forms are follow-ons.) */
+PyObject *py_str_maketrans(PyObject *x, PyObject *y) {
+    PyStrObject *sx = (PyStrObject *)x;
+    PyStrObject *sy = (PyStrObject *)y;
+    if (sx->byte_len != sy->byte_len) {
+        py_raise(py_exc_new(
+            PY_EXC_VALUEERROR,
+            "the first two maketrans arguments must have equal length"));
+        return NULL;
+    }
+    PyObject *d = py_dict_new();
+    if (d == NULL) return NULL;
+    for (int64_t i = 0; i < sx->byte_len; i++) {
+        PyObject *k = py_int_from_i64((int64_t)(unsigned char)sx->data[i]);
+        PyObject *v = py_int_from_i64((int64_t)(unsigned char)sy->data[i]);
+        py_dict_set(d, k, v);
+        py_decref(k);
+        py_decref(v);
+    }
+    return d;
+}
+
+PyObject *py_str_removeprefix(PyObject *s, PyObject *prefix) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *pp = (PyStrObject *)prefix;
+    if (pp->byte_len > 0 && pp->byte_len <= ss->byte_len
+        && memcmp(ss->data, pp->data, (size_t)pp->byte_len) == 0)
+    {
+        return str_from_range(ss->data + pp->byte_len,
+                              ss->byte_len - pp->byte_len);
+    }
+    py_incref(s);
+    return s;
+}
+
+PyObject *py_str_removesuffix(PyObject *s, PyObject *suffix) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *sf = (PyStrObject *)suffix;
+    if (sf->byte_len > 0 && sf->byte_len <= ss->byte_len
+        && memcmp(ss->data + ss->byte_len - sf->byte_len,
+                  sf->data, (size_t)sf->byte_len) == 0)
+    {
+        return str_from_range(ss->data, ss->byte_len - sf->byte_len);
+    }
+    py_incref(s);
+    return s;
+}
+
+PyObject *py_str_partition(PyObject *s, PyObject *sep) {
+    /* (before, sep, after) on first occurrence; (s, "", "") if not found.
+     * Byte-level: sep boundaries fall on codepoint boundaries for valid
+     * UTF-8.  py_tuple_set_item increfs, so we decref our created refs. */
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *sp = (PyStrObject *)sep;
+    int64_t found = -1;
+    if (sp->byte_len > 0) {
+        int64_t i = 0;
+        while (i + sp->byte_len <= ss->byte_len) {
+            if (ss->data[i] == sp->data[0]
+                && memcmp(ss->data + i, sp->data, (size_t)sp->byte_len) == 0)
+            {
+                found = i;
+                break;
+            }
+            i++;
+        }
+    }
+    PyObject *t = py_tuple_new(3);
+    if (t == NULL) return NULL;
+    if (found < 0) {
+        py_tuple_set_item(t, 0, s);             /* borrowed s; set_item increfs */
+        PyObject *e1 = str_from_range(ss->data, 0);
+        py_tuple_set_item(t, 1, e1);
+        py_decref(e1);
+        PyObject *e2 = str_from_range(ss->data, 0);
+        py_tuple_set_item(t, 2, e2);
+        py_decref(e2);
+    } else {
+        PyObject *before = str_from_range(ss->data, found);
+        py_tuple_set_item(t, 0, before);
+        py_decref(before);
+        PyObject *mid = str_from_range(ss->data + found, sp->byte_len);
+        py_tuple_set_item(t, 1, mid);
+        py_decref(mid);
+        PyObject *after = str_from_range(
+            ss->data + found + sp->byte_len,
+            ss->byte_len - found - sp->byte_len);
+        py_tuple_set_item(t, 2, after);
+        py_decref(after);
+    }
+    return t;
+}
+
+PyObject *py_str_rpartition(PyObject *s, PyObject *sep) {
+    /* (before, sep, after) on the LAST occurrence; ("", "", s) if not found
+     * (note: rpartition puts the original at the END, unlike partition). */
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *sp = (PyStrObject *)sep;
+    int64_t found = -1;
+    if (sp->byte_len > 0 && sp->byte_len <= ss->byte_len) {
+        int64_t i = ss->byte_len - sp->byte_len;
+        while (i >= 0) {
+            if (ss->data[i] == sp->data[0]
+                && memcmp(ss->data + i, sp->data, (size_t)sp->byte_len) == 0)
+            {
+                found = i;
+                break;
+            }
+            i--;
+        }
+    }
+    PyObject *t = py_tuple_new(3);
+    if (t == NULL) return NULL;
+    if (found < 0) {
+        PyObject *e0 = str_from_range(ss->data, 0);
+        py_tuple_set_item(t, 0, e0);
+        py_decref(e0);
+        PyObject *e1 = str_from_range(ss->data, 0);
+        py_tuple_set_item(t, 1, e1);
+        py_decref(e1);
+        py_tuple_set_item(t, 2, s);             /* original at the END */
+    } else {
+        PyObject *before = str_from_range(ss->data, found);
+        py_tuple_set_item(t, 0, before);
+        py_decref(before);
+        PyObject *mid = str_from_range(ss->data + found, sp->byte_len);
+        py_tuple_set_item(t, 1, mid);
+        py_decref(mid);
+        PyObject *after = str_from_range(
+            ss->data + found + sp->byte_len,
+            ss->byte_len - found - sp->byte_len);
+        py_tuple_set_item(t, 2, after);
+        py_decref(after);
+    }
+    return t;
+}
+
 static PyObject *py_str_split_whitespace_maxsplit(
     PyStrObject *ss, int64_t maxsplit
 ) {
@@ -837,7 +1427,7 @@ PyObject *py_str_join(PyObject *sep, PyObject *list) {
 
     int64_t total = 0;
     for (int64_t i = 0; i < l->length; i++) {
-        PyObject *e = l->items[i];
+        PyObject *e = pcc_gc_load_ptr(list, &l->items[i]);
         if (e == NULL || py_type_of(e) != PY_TYPE_STR) return NULL;
         if (i > 0) total += sp->byte_len;
         total += ((PyStrObject *)e)->byte_len;
@@ -848,7 +1438,7 @@ PyObject *py_str_join(PyObject *sep, PyObject *list) {
 
     int64_t off = 0;
     for (int64_t i = 0; i < l->length; i++) {
-        PyStrObject *e = (PyStrObject *)l->items[i];
+        PyStrObject *e = (PyStrObject *)pcc_gc_load_ptr(list, &l->items[i]);
         if (i > 0 && sp->byte_len > 0) {
             memcpy(out->data + off, sp->data, (size_t)sp->byte_len);
             off += sp->byte_len;

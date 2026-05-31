@@ -1,0 +1,321 @@
+"""Builtin type/attribute helpers for L1CodeGen."""
+from __future__ import annotations
+
+from typing import Optional
+
+from pcc.llvm_capi.compat import ir
+
+from ..py_ast import (
+    Attr,
+    Call,
+    DictType,
+    DynType,
+    Expr,
+    ListType,
+    Name,
+    StrLit,
+    StrType,
+    TupleExpr,
+    TupleType,
+)
+from . import marshal
+from .errors import L1CodegenError
+
+
+_I1 = ir.IntType(1)
+_I8 = ir.IntType(8)
+_I64 = ir.IntType(64)
+_CSTR = _I8.as_pointer()
+
+
+
+class BuiltinTypeAttrLoweringMixin:
+    def _emit_getattr_builtin(self, expr: Call) -> ir.Value:
+        """``getattr(obj, name)`` / ``getattr(obj, name, default)``.
+        CPython-backed receivers go through the real CPython builtin so
+        module objects and the three-arg default form keep Python
+        semantics. Native receivers use ``py_obj_getattr`` directly,
+        with a null-check fallback for the defaulted form.
+        """
+        native_module_getattr = self._maybe_emit_native_module_getattr(expr)
+        if native_module_getattr is not None:
+            return native_module_getattr
+        if self._expr_looks_cpython(expr.args[0]):
+            fn_val = self._load_cpython_builtin("getattr")
+            return self._emit_cpy_func_call(
+                fn_val,
+                "getattr",
+                tuple(expr.args),
+            )
+        obj_val = self._emit_as_object(expr.args[0])
+        name_expr = expr.args[1]
+        if isinstance(name_expr, StrLit):
+            name_ptr = self._attr_name_ptr(name_expr.value)
+        else:
+            # Dynamic name — marshal and use py_str_utf8 to grab
+            # the C string.
+            nv = self._emit_expr(name_expr)
+            n_obj = marshal.marshal_to_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                nv,
+                name_expr.ty,
+            )
+            name_ptr = self.builder.call(
+                self.runtime["py_str_utf8"],
+                [n_obj],
+                name=self._fresh("getattr.name"),
+            )
+        got = self.builder.call(
+            self.runtime["py_obj_getattr"],
+            [obj_val, name_ptr],
+            name=self._fresh("getattr"),
+        )
+        if len(expr.args) == 2:
+            return got
+        default_obj = self._emit_as_object(expr.args[2])
+        is_missing = self.builder.icmp_signed(
+            "==",
+            got,
+            ir.Constant(_CSTR, None),
+            name=self._fresh("getattr.missing"),
+        )
+        parent_fn = self.current_function
+        missing_bb = parent_fn.append_basic_block(name=self._fresh("getattr.missing"))
+        present_bb = parent_fn.append_basic_block(name=self._fresh("getattr.present"))
+        end_bb = parent_fn.append_basic_block(name=self._fresh("getattr.end"))
+        self.builder.cbranch(is_missing, missing_bb, present_bb)
+        self.builder.position_at_end(missing_bb)
+        self.builder.call(self.runtime["py_clear_exception"], [])
+        self.builder.branch(end_bb)
+        missing_exit = self.builder._block
+        self.builder.position_at_end(present_bb)
+        self.builder.branch(end_bb)
+        present_exit = self.builder._block
+        self.builder.position_at_end(end_bb)
+        phi = self.builder.phi(_CSTR, name=self._fresh("getattr.default"))
+        phi.add_incoming(default_obj, missing_exit)
+        phi.add_incoming(got, present_exit)
+        return phi
+
+
+    def _emit_attr_name_ptr_arg(self, expr: Expr, label: str) -> ir.Value:
+        if isinstance(expr, StrLit):
+            return self._attr_name_ptr(expr.value)
+        raw = self._emit_expr(expr)
+        obj = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            raw,
+            expr.ty,
+        )
+        return self.builder.call(
+            self.runtime["py_str_utf8"],
+            [obj],
+            name=self._fresh(label),
+        )
+
+
+    def _emit_setattr_builtin(self, expr: Call) -> ir.Value:
+        obj = self._emit_as_object(expr.args[0])
+        name_ptr = self._emit_attr_name_ptr_arg(
+            expr.args[1],
+            "setattr.name",
+        )
+        value = self._emit_as_object(expr.args[2])
+        status = self.builder.call(
+            self.runtime["py_obj_setattr"],
+            [obj, name_ptr, value],
+            name=self._fresh("setattr.rc"),
+        )
+        self._emit_attribute_error_if_status_failed(
+            status,
+            "attribute",
+            expr.span,
+        )
+        return self._emit_none_literal()
+
+
+    def _emit_delattr_builtin(self, expr: Call) -> ir.Value:
+        obj = self._emit_as_object(expr.args[0])
+        name_ptr = self._emit_attr_name_ptr_arg(
+            expr.args[1],
+            "delattr.name",
+        )
+        self.builder.call(
+            self.runtime["py_obj_delattr"],
+            [obj, name_ptr],
+            name=self._fresh("delattr.rc"),
+        )
+        return self._emit_none_literal()
+
+
+    def _emit_type_builtin(self, expr: Call) -> ir.Value:
+        """``type(obj)`` — returns the runtime class PyObject*.
+        Uses ``py_obj_getattr(obj, "__class__")`` which the runtime
+        resolves on any pcc-native object. For a CPython value (libpython
+        mode), native ``py_obj_getattr`` mishandles the real CPython object
+        (returns a bogus value), so route ``__class__`` through
+        ``py_cpy_getattr`` and tag the resulting CPython type as a cpy value
+        (so ``type(x).__name__`` etc. also dispatch through libpython).
+        Inert in no-libpython mode (``_cpy_values`` is empty)."""
+        obj_val = self._emit_as_object(expr.args[0])
+        if obj_val in getattr(self, "_cpy_values", ()):
+            cpy_name = self._ptr_to_cstr(
+                self._cstr_global("__class__", ".cpy.attr.__class__")
+            )
+            cls = self.builder.call(
+                self.runtime["py_cpy_getattr"],
+                [obj_val, cpy_name],
+                name=self._fresh("cpy.type"),
+            )
+            if not hasattr(self, "_cpy_values"):
+                self._cpy_values = set()
+            self._cpy_values.add(cls)
+            return cls
+        name_ptr = self._attr_name_ptr("__class__")
+        return self.builder.call(
+            self.runtime["py_obj_getattr"],
+            [obj_val, name_ptr],
+            name=self._fresh("type"),
+        )
+
+
+    def _emit_len_call(self, expr: Call) -> ir.Value:
+        """``len(x)`` → type-specialised runtime call.
+
+        For typed containers we dispatch to the type-specific runtime
+        helper (``py_list_len`` etc.); otherwise we go through the
+        generic ``py_obj_len``.
+        """
+        if len(expr.args) != 1:
+            raise L1CodegenError(f"len() takes exactly 1 arg, got {len(expr.args)}")
+        arg = expr.args[0]
+        weak_dict_kind = self._weak_dict_kind_for_expr(arg)
+        # Class-based ``__len__`` fast path.
+        dunder = self._try_dispatch_dunder_unary(arg, "__len__", ())
+        if dunder is not None:
+            return dunder
+        obj = self._emit_expr(arg)
+        # CPython-backed value: dispatch through py_cpy_len (PyObject_Length).
+        if obj in getattr(self, "_cpy_values", ()):
+            return self.builder.call(
+                self.runtime["py_cpy_len"],
+                [obj],
+                name=self._fresh("cpy.len"),
+            )
+        if weak_dict_kind == "value":
+            return self.builder.call(
+                self.runtime["py_weak_value_dict_len"],
+                [obj],
+                name=self._fresh("weak.value.dict.len"),
+            )
+        if weak_dict_kind == "key":
+            return self.builder.call(
+                self.runtime["py_weak_key_dict_len"],
+                [obj],
+                name=self._fresh("weak.key.dict.len"),
+            )
+        aty = arg.ty
+        if isinstance(aty, ListType):
+            return self.builder.call(
+                self.runtime["py_list_len"], [obj], name=self._fresh("list.len")
+            )
+        if isinstance(aty, StrType):
+            return self.builder.call(
+                self.runtime["py_str_len"], [obj], name=self._fresh("str.len")
+            )
+        if isinstance(aty, DictType):
+            return self.builder.call(
+                self.runtime["py_dict_len"], [obj], name=self._fresh("dict.len")
+            )
+        if isinstance(aty, TupleType):
+            return self.builder.call(
+                self.runtime["py_tuple_len"], [obj], name=self._fresh("tup.len")
+            )
+        # Fallback through the generic helper. Any object with a
+        # __len__ gets the right answer; non-sized types raise via the
+        # runtime.
+        boxed = marshal.marshal_to_object(
+            self.builder, self.module, self.runtime, obj, aty
+        )
+        return self.builder.call(
+            self.runtime["py_obj_len"], [boxed], name=self._fresh("obj.len")
+        )
+
+
+    def _emit_str_builtin(self, expr: Call) -> ir.Value:
+        """``str(x)`` → ``py_obj_str``; pass-through on already-str."""
+        if len(expr.args) != 1:
+            raise NotImplementedError("str() with multi-arg not supported")
+        arg = expr.args[0]
+        v = self._emit_expr(arg)
+        if v in getattr(self, "_cpy_values", ()):
+            return self.builder.call(
+                self.runtime["py_cpy_to_pcc_str"],
+                [v],
+                name=self._fresh("cpy.to_pcc_str"),
+            )
+        if isinstance(arg.ty, StrType):
+            return v
+        boxed = marshal.marshal_to_object(
+            self.builder, self.module, self.runtime, v, arg.ty
+        )
+        return self.builder.call(
+            self.runtime["py_obj_str"], [boxed], name=self._fresh("obj.str")
+        )
+
+
+    def _emit_bytes_family_builtin(
+        self,
+        expr: Call,
+        name: str,
+    ) -> Optional[ir.Value]:
+        if expr.kwargs:
+            return None
+        if name == "bytes":
+            if len(expr.args) == 1:
+                src = self._emit_as_object(expr.args[0])
+                return self.builder.call(
+                    self.runtime["py_bytes_from_obj"],
+                    [src],
+                    name=self._fresh("bytes.from"),
+                )
+            if not expr.args:
+                return self.builder.call(
+                    self.runtime["py_bytes_new"],
+                    [ir.Constant(_CSTR, None), ir.Constant(_I64, 0)],
+                    name=self._fresh("bytes.empty"),
+                )
+            return None
+        if name == "bytearray" and len(expr.args) == 1:
+            src = self._emit_as_object(expr.args[0])
+            return self.builder.call(
+                self.runtime["py_bytearray_from_obj"],
+                [src],
+                name=self._fresh("bytearray.from"),
+            )
+        if name == "bytearray" and not expr.args:
+            # bytearray() -> empty bytearray, built from an empty bytes object
+            # (mirrors the bytes() 0-arg path above). Without this the 0-arg
+            # form forced the libpython fallback.
+            empty = self.builder.call(
+                self.runtime["py_bytes_new"],
+                [ir.Constant(_CSTR, None), ir.Constant(_I64, 0)],
+                name=self._fresh("bytearray.empty.bytes"),
+            )
+            return self.builder.call(
+                self.runtime["py_bytearray_from_obj"],
+                [empty],
+                name=self._fresh("bytearray.empty"),
+            )
+        if name == "memoryview" and len(expr.args) == 1:
+            src = self._emit_as_object(expr.args[0])
+            return self.builder.call(
+                self.runtime["py_memoryview_new"],
+                [src],
+                name=self._fresh("memoryview.new"),
+            )
+        return None

@@ -54,6 +54,7 @@ def _click_entry(
     output_path,
     backend,
     python_libpython,
+    python_library,
     verbose,
     prog_args,
 ):
@@ -89,6 +90,7 @@ def _click_entry(
             output_path=output_path,
             backend=backend,
             python_libpython=python_libpython,
+            python_library=python_library,
             verbose=verbose,
             prog_args=prog_args,
         )
@@ -109,12 +111,18 @@ def _build_click_main():
     cmd = click_mod.argument("prog_args", nargs=-1, type=click_mod.UNPROCESSED)(cmd)
     cmd = click_mod.argument("path")(cmd)
     cmd = click_mod.option(
+        "--python-library",
+        is_flag=True,
+        default=False,
+        help="For .py inputs, emit a library module without synthesizing @main.",
+    )(cmd)
+    cmd = click_mod.option(
         "--python-libpython",
         type=click_mod.Choice(["auto", "on", "off"], case_sensitive=False),
         default=None,
         envvar="PCC_PYTHON_LIBPYTHON",
         metavar="MODE",
-        help="Python fallback linkage policy: auto, on, or off.",
+        help="Python fallback linkage policy: off (default), auto, or on.",
     )(cmd)
     cmd = click_mod.option(
         "--verbose",

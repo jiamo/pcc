@@ -46,11 +46,9 @@ static PyStrObject *py_str_alloc(int64_t byte_len) {
     if (byte_len < 0) return NULL;
     /* One extra byte for NUL. */
     size_t total = sizeof(PyStrObject) + (size_t)byte_len + 1u;
-    PyStrObject *s = (PyStrObject *)malloc(total);
+    PyStrObject *s = (PyStrObject *)pcc_gc_alloc(
+        (int64_t)total, PY_TYPE_STR, 0);
     if (s == NULL) return NULL;
-    s->h.refcount = 1;
-    s->h.type_tag = PY_TYPE_STR;
-    s->h.flags    = 0;
     s->byte_len   = byte_len;
     s->cp_len     = -1;
     s->hash       = -1;

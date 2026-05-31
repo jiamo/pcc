@@ -172,19 +172,22 @@ Purpose:
 Tasks:
 
 - add a `self-strict-exact` mode to
-  `scripts/run_self_backend_linux_x86_64_c_testsuite.py`,
+  `scripts/run_self_backend_linux_x86_64_c_testsuite.py` — landed
+  2026-05-02,
 - start with a small exact-success allowlist or prefix bucket,
 - assert every selected case compiles, links, runs, and exactly matches native,
 - keep `self-partial` for wider frontier scanning.
 
 Initial target:
 
-- `32` strict exact-success cases.
+- `32` strict exact-success cases — landed as an integration gate
+  2026-05-02.
 
 Next targets:
 
 - `64`,
-- `128`,
+- `128` — manually verified 2026-05-02 with
+  `--mode self-strict-exact --bucket-size 128`,
 - `256`,
 - full `c-testsuite` exact-match subset when the bucket stops exposing major
   ABI holes.
@@ -348,15 +351,26 @@ Linux x64 can be considered for default-like use only after:
 
 Recommended next tasks, in order:
 
-1. Add `self-strict-exact` mode to the Linux x64 c-testsuite harness.
-2. Add a pytest gate for a `32-case` strict exact-success bucket.
-3. Run the existing `128-case` partial bucket and record supported/unsupported
-   counts in this plan.
-4. Push strict bucket from `32` to `64`.
-5. Add stack-arg SysV ABI microtests and implementation.
-6. Add FP arg/return SysV ABI microtests and implementation.
-7. Start Docker `zlib` self system-link runtime gate.
-8. Convert first `zlib` blocker into a focused local x64 emitter regression.
+1. ✅ Add `self-strict-exact` mode to the Linux x64 c-testsuite harness.
+2. ✅ Add a pytest gate for a `32-case` strict exact-success bucket.
+3. ✅ Run the existing `128-case` partial bucket: supported=128,
+   unsupported=0.
+4. ✅ Manually verify `128-case` strict exact-success bucket in Docker.
+5. ✅ Make the bootstrap gate recognize Linux x86_64 as supported and use
+   host-qualified output dirs (`bootstrap-self-linux_x86_64`) so old macOS
+   Mach-O artifacts cannot pollute Linux results.
+6. Push the pytest strict bucket from `32` to `64` after Docker runtime stays
+   comfortably below the integration budget.
+7. Add stack-arg SysV ABI microtests and implementation.
+8. Add FP arg/return SysV ABI microtests and implementation.
+9. Start Docker `zlib` self system-link runtime gate.
+10. Convert first `zlib` blocker into a focused local x64 emitter regression.
+
+Current RM-12 note: a Linux x86_64 stage1 bootstrap probe exceeded a
+300s budget, and a 60s cold-Docker probe was dominated by container/uv
+setup. The gate now reports timeouts correctly, but three-stage
+byte-equal should remain a long-budget/manual gate until P-1/P-6/P-7
+shrinks the bootstrap wall time enough for automation.
 
 ## Commands
 

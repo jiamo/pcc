@@ -1,25 +1,32 @@
 [project]
 name = "python-cc"
-version = "0.1.2"
-description = "Pcc is a c compiler built on python and llvm."
+version = "0.1.3"
+description = "A Python-authored compiler toolchain that compiles C and Python to native code (LLVM and LLVM-free backends)."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
-keywords = ["c", "compiler", "llvm", "ply"]
+keywords = ["c", "python", "compiler", "llvm", "self-hosting", "bootstrap", "ply"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: C",
+    "Topic :: Software Development :: Compilers",
+]
 dependencies = [
+    "black>=26.3.1",
     "llvmlite==0.46.0",
 ]
 
-[project.scripts]
-pcc = "pcc.cli_core:cli_main"
-# Same compiler as `pcc`, but defaults to --python-libpython=off
-# --ir-scaffold=on so produced binaries do not link libpython.
-# Explicit --python-libpython / --ir-scaffold on the command line
-# (or PCC_PYTHON_LIBPYTHON / PCC_IR_SCAFFOLD env vars) still win.
-pcc-static = "pcc.cli_core:cli_main_strict_sys_argv_exit"
-
 [project.urls]
 Homepage = "https://github.com/jiamo/pcc"
+
+[project.scripts]
+pcc = "pcc.cli_launcher:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -41,16 +48,21 @@ include = [
     "pcc/py_runtime/Makefile",
 ]
 
-# Runtime archive is built at wheel-time by hatch_build.py using pcc
-# itself (defaults to --backend self, no cc/clang). The hook drops
-# libpy_runtime_pcc_py.a into the wheel via force_include if the build
-# succeeds; otherwise the lazy first-run path in
-# pcc.py_frontend.pipeline rebuilds it on the user's machine.
+# Wheel-build hook in hatch_build.py:
+#  - compiles pcc/py_runtime → libpy_runtime_pcc_py.a (soft-fail: lazy
+#    first-run path in pcc.py_frontend.pipeline can rebuild)
+#  - self-compiles pcc/__main__.py → native `pcc1` bootstrap helper, shipped
+#    via .data/scripts/pcc1. The public `pcc` command remains a Python launcher
+#    for the full cli_core path.
+# Defaults to --backend self (no cc/clang). The wheel becomes
+# platform-tagged because it now contains a native binary.
 [tool.hatch.build.hooks.custom]
 path = "hatch_build.py"
 
 [tool.pytest.ini_options]
-addopts = "-n auto -m 'not integration'"
+addopts = "-n auto --dist=loadgroup -m 'not integration'"
+testpaths = ["tests"]
+norecursedirs = ["projects", "build", "build_py", "build_pcc", "build_libpython", "refs_docs", "_tmp_*"]
 markers = [
     "integration: expensive end-to-end integration tests excluded from the default test run",
 ]

@@ -171,7 +171,7 @@ We need two layers of choice:
 
 - vs `all-pass-llvm-ir-1to1-master-plan`:
   - This plan does not duplicate pass translation; it only wires the already-translated passes into the optional backend interface.
-- vs `llvmcapi-wire-spike-report`:
+- vs `archive/llvmcapi-wire-spike-report`:
   - This is the productionised, long-term task track of that spike.
 - vs `self-backend-translation-plan`:
   - This plan turns the backend into an **optional capability**;

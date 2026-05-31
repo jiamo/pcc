@@ -1,6 +1,6 @@
 # β4 Implementation Backlog
 
-**Derived from:** `docs/plans/llvmlite-api-surface.md` (auto-generated trace)
+**Derived from:** `docs/plans/archive/llvmlite-api-surface.md` (auto-generated trace)
 **Status:** β4.0 complete (2026-04-21), β4.1 ready to start
 **Methodology:** live trace of pcc on py_corpus phase1+3, inline C, ir_passes tests, + one `-g` debug run
 

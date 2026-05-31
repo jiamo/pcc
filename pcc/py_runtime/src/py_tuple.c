@@ -34,15 +34,54 @@ static int tuple_is_none_or_null(PyObject *o) {
     return o == NULL || o == py_None;
 }
 
+static int py_tuple_item_can_participate_in_cycle_with_depth(PyObject *o, int depth) {
+    if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
+    if (depth < 0) depth = 0;
+    if (depth > 64) return 0;
+
+    int32_t tag = py_header(o)->type_tag;
+    if (tag >= PY_TYPE_USER) return 1;
+    switch (tag) {
+        case PY_TYPE_LIST:
+        case PY_TYPE_DICT:
+        case PY_TYPE_SET:
+        case PY_TYPE_FUNC:
+        case PY_TYPE_CLASS:
+        case PY_TYPE_INSTANCE:
+        case PY_TYPE_EXC:
+        case PY_TYPE_ITER:
+        case PY_TYPE_GEN:
+        case PY_TYPE_COROUTINE:
+        case PY_TYPE_MEMORYVIEW:
+        case PY_TYPE_WEAKREF:
+            return 1;
+        case PY_TYPE_TUPLE: {
+            PyTupleObject *t = (PyTupleObject *)o;
+            for (int64_t i = 0; i < t->len; i++) {
+                PyObject *child = pcc_gc_load_ptr(o, &t->items[i]);
+                if (py_tuple_item_can_participate_in_cycle_with_depth(child, depth + 1)) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+static int py_tuple_item_can_participate_in_cycle(PyObject *o) {
+    return py_tuple_item_can_participate_in_cycle_with_depth(o, 0);
+}
+
 PyObject *py_tuple_new(int64_t n) {
     if (n < 0) n = 0;
     /* One contiguous allocation: header + n * sizeof(PyObject*). */
     size_t bytes = sizeof(PyTupleObject) + (size_t)n * sizeof(PyObject *);
-    PyTupleObject *t = (PyTupleObject *)malloc(bytes);
+    PyTupleObject *t = (PyTupleObject *)pcc_gc_alloc(
+        (int64_t)bytes, PY_TYPE_TUPLE, 0
+    );
     if (t == NULL) return NULL;
-    t->h.refcount = 1;
-    t->h.type_tag = PY_TYPE_TUPLE;
-    t->h.flags    = 0;
     t->len        = n;
     if (n > 0) {
         memset(t->items, 0, (size_t)n * sizeof(PyObject *));
@@ -57,8 +96,13 @@ void py_tuple_set_item(PyObject *tuple, int64_t i, PyObject *item) {
     if (tuple == NULL) return;
     PyTupleObject *t = (PyTupleObject *)tuple;
     if (i < 0 || i >= t->len) return;
-    py_incref(item);
-    t->items[i] = item;
+    pcc_gc_store_ptr(tuple, &t->items[i], item);
+    if (py_tuple_item_can_participate_in_cycle(item)) {
+        int32_t flags = py_header(tuple)->flags;
+        if ((flags & PY_FLAG_GC_TRACKED) == 0) {
+            py_gc_track(tuple);
+        }
+    }
 }
 
 PyObject *py_tuple_get(PyObject *tuple, int64_t i) {
@@ -70,7 +114,7 @@ PyObject *py_tuple_get(PyObject *tuple, int64_t i) {
         /* TODO(phase3): raise IndexError. */
         return NULL;
     }
-    PyObject *v = t->items[i];
+    PyObject *v = pcc_gc_load_ptr(tuple, &t->items[i]);
     py_incref(v);
     return v;
 }
@@ -97,7 +141,8 @@ PyObject *py_tuple_slice(PyObject *tuple, PyObject *lo, PyObject *hi, PyObject *
 
     int64_t step_v = 1;
     if (!tuple_is_none_or_null(step)) {
-        step_v = py_int_value_i64(step);
+        step_v = py_obj_index_i64(step);
+        if (py_err_occurred()) return NULL;
         if (step_v == 0) {
             return NULL;
         }
@@ -105,11 +150,15 @@ PyObject *py_tuple_slice(PyObject *tuple, PyObject *lo, PyObject *hi, PyObject *
 
     int64_t lo_v, hi_v;
     if (step_v > 0) {
-        lo_v = tuple_is_none_or_null(lo) ? 0   : py_int_value_i64(lo);
-        hi_v = tuple_is_none_or_null(hi) ? len : py_int_value_i64(hi);
+        lo_v = tuple_is_none_or_null(lo) ? 0   : py_obj_index_i64(lo);
+        if (py_err_occurred()) return NULL;
+        hi_v = tuple_is_none_or_null(hi) ? len : py_obj_index_i64(hi);
+        if (py_err_occurred()) return NULL;
     } else {
-        lo_v = tuple_is_none_or_null(lo) ? len - 1 : py_int_value_i64(lo);
-        hi_v = tuple_is_none_or_null(hi) ? -1      : py_int_value_i64(hi);
+        lo_v = tuple_is_none_or_null(lo) ? len - 1 : py_obj_index_i64(lo);
+        if (py_err_occurred()) return NULL;
+        hi_v = tuple_is_none_or_null(hi) ? -1      : py_obj_index_i64(hi);
+        if (py_err_occurred()) return NULL;
     }
 
     if (step_v > 0) {
@@ -148,12 +197,14 @@ PyObject *py_tuple_slice(PyObject *tuple, PyObject *lo, PyObject *hi, PyObject *
     int64_t j = 0;
     if (step_v > 0) {
         for (int64_t i = lo_v; i < hi_v; i += step_v) {
-            py_tuple_set_item(out, j++, t->items[i]);
+            PyObject *v = pcc_gc_load_ptr(tuple, &t->items[i]);
+            py_tuple_set_item(out, j++, v);
         }
     } else {
         for (int64_t i = lo_v; i > hi_v; i += step_v) {
             if (i < 0 || i >= len) break;
-            py_tuple_set_item(out, j++, t->items[i]);
+            PyObject *v = pcc_gc_load_ptr(tuple, &t->items[i]);
+            py_tuple_set_item(out, j++, v);
         }
     }
     return out;
@@ -168,10 +219,29 @@ PyObject *py_tuple_concat(PyObject *a, PyObject *b) {
     PyObject *out = py_tuple_new(na + nb);
     if (out == NULL) return NULL;
     for (int64_t i = 0; i < na; i++) {
-        py_tuple_set_item(out, i, ta->items[i]);
+        PyObject *v = pcc_gc_load_ptr(a, &ta->items[i]);
+        py_tuple_set_item(out, i, v);
     }
     for (int64_t j = 0; j < nb; j++) {
-        py_tuple_set_item(out, na + j, tb->items[j]);
+        PyObject *v = pcc_gc_load_ptr(b, &tb->items[j]);
+        py_tuple_set_item(out, na + j, v);
+    }
+    return out;
+}
+
+PyObject *py_tuple_repeat(PyObject *tuple, int64_t count) {
+    if (tuple == NULL) return NULL;
+    PyTupleObject *t = (PyTupleObject *)tuple;
+    int64_t n = t->len;
+    int64_t repeats = count > 0 ? count : 0;
+    PyObject *out = py_tuple_new(n * repeats);
+    if (out == NULL) return NULL;
+    int64_t dst = 0;
+    for (int64_t k = 0; k < repeats; k++) {
+        for (int64_t i = 0; i < n; i++) {
+            PyObject *v = pcc_gc_load_ptr(tuple, &t->items[i]);
+            py_tuple_set_item(out, dst++, v);
+        }
     }
     return out;
 }

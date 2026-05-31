@@ -596,12 +596,7 @@ def _match_call_instruction(text: str, callee_name: str, ret_void: bool) -> dict
 
 
 def _apply_remap(body_line: str, remap: dict[str, str]) -> str:
-    def repl(m: re.Match) -> str:
-        name = m.group(1)
-        if name in remap:
-            return remap[name]
-        return f"%{name}"
-    return re.sub(r"%([\w\.]+)(?![\w\.])", repl, body_line)
+    return _replace_percent_names(body_line, remap)
 
 
 def llvm_line(text: str):
@@ -620,12 +615,19 @@ def _apply_remap_token(tok: str, remap: dict[str, str]) -> str:
 def _apply_value_replacements(text: str, replacements: dict[str, str]) -> str:
     if not replacements:
         return text
+    return _replace_percent_names(text, replacements)
 
-    def repl(m: re.Match) -> str:
-        name = m.group(1)
-        return replacements.get(name, f"%{name}")
 
-    return re.sub(r"%([\w\.]+)(?![\w\.])", repl, text)
+def _replace_percent_names(text: str, replacements: dict[str, str]) -> str:
+    out: list[str] = []
+    pos = 0
+    for match in re.finditer(r"%([\w\.]+)(?![\w\.])", text):
+        out.append(text[pos:match.start()])
+        name = match.group(1)
+        out.append(replacements.get(name, f"%{name}"))
+        pos = match.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _split_functions(ir_text: str) -> list[tuple[bool, str]]:

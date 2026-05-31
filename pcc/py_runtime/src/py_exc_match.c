@@ -16,12 +16,21 @@
 static PyClassObject *exc_to_class(PyObject *o) {
     if (o == NULL) return NULL;
     if (PY_IS_TAGGED_INT(o)) return NULL;
+    o = pcc_gc_note_relocation_read(o);
     int32_t tag = py_type_of(o);
     if (tag == PY_TYPE_CLASS) {
         return (PyClassObject *)o;
     }
     if (tag == PY_TYPE_EXC) {
-        return ((PyExceptionObject *)o)->exc_class;
+        PyExceptionObject *exc = (PyExceptionObject *)o;
+        return (PyClassObject *)pcc_gc_load_ptr(o, (PyObject **)&exc->exc_class);
+    }
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+        /* A raised user exception subclass is a PyInstanceObject; project it
+         * to its class so py_exc_matches can walk the MRO (which includes the
+         * Exception base) for ``except MyError`` / ``except Exception``. */
+        PyInstanceObject *inst = (PyInstanceObject *)o;
+        return (PyClassObject *)pcc_gc_load_ptr(o, (PyObject **)&inst->cls);
     }
     return NULL;
 }
@@ -35,7 +44,10 @@ int64_t py_exc_matches(PyObject *exc, PyObject *type) {
         return ecls == tcls;
     }
     for (int32_t i = 0; i < ecls->n_mro; i++) {
-        if (ecls->mro[i] == tcls) return 1;
+        PyClassObject *entry = (PyClassObject *)pcc_gc_load_ptr(
+            (PyObject *)ecls, (PyObject **)&ecls->mro[i]
+        );
+        if (entry == tcls) return 1;
     }
     return 0;
 }

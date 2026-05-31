@@ -2,21 +2,84 @@ from __future__ import annotations
 
 """x86_64 Linux global/data emission helpers for the self backend."""
 
+import re
+import struct
+
 from . import BackendUnavailable
 from .self_backend_ir import GlobalDef, TypeDesc, _align_to
 from .self_backend_module_symbols import PreparedModuleSymbols
 from .self_backend_parse import (
     decode_global_name,
+    decode_value_token,
     decode_llvm_c_string,
+    is_hex_literal,
     parse_constant_gep,
     split_top_level,
     strip_typed_initializer,
+)
+
+_RESERVED_ASM_SYMBOLS = frozenset(
+    {
+        "al",
+        "ah",
+        "ax",
+        "eax",
+        "rax",
+        "bl",
+        "bh",
+        "bx",
+        "ebx",
+        "rbx",
+        "cl",
+        "ch",
+        "cx",
+        "ecx",
+        "rcx",
+        "dl",
+        "dh",
+        "dx",
+        "edx",
+        "rdx",
+        "si",
+        "esi",
+        "rsi",
+        "di",
+        "edi",
+        "rdi",
+        "bp",
+        "ebp",
+        "rbp",
+        "sp",
+        "esp",
+        "rsp",
+        "fs",
+        "gs",
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "and",
+        "or",
+        "not",
+        "mod",
+        "shl",
+        "shr",
+    }
+    | {f"r{i}" for i in range(8, 16)}
+    | {f"r{i}d" for i in range(8, 16)}
+    | {f"r{i}w" for i in range(8, 16)}
+    | {f"r{i}b" for i in range(8, 16)}
+    | {f"xmm{i}" for i in range(32)}
 )
 
 
 def asm_symbol(name: str, module_symbols: PreparedModuleSymbols) -> str:
     if name in module_symbols.internal_symbols:
         return f"{module_symbols.internal_prefix}{name}"
+    if name in module_symbols.defined_symbols and name.lower() in _RESERVED_ASM_SYMBOLS:
+        return f"__pcc_sym_{name}"
     return name
 
 
@@ -26,12 +89,10 @@ def emit_scalar_initializer(
     global_name: str,
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
-    if init == "null":
+    if init in {"null", "poison", "undef", "false"}:
         init = "0"
-    if ty.is_fp:
-        if ty.width <= 32:
-            return [f"  .float {init}"]
-        return [f"  .double {init}"]
+    elif init == "true":
+        init = "1"
     if ty.is_ptr:
         if init.startswith("gep0:"):
             return [f"  .quad {asm_symbol(init.split(':', 1)[1], module_symbols)}"]
@@ -46,6 +107,15 @@ def emit_scalar_initializer(
             return [f"  .quad {asm_symbol(base, module_symbols)}{suffix}"]
         if init.startswith("@"):
             return [f"  .quad {asm_symbol(decode_global_name(init), module_symbols)}"]
+        if init.startswith("inttoptr"):
+            decoded = decode_value_token(init)
+            if decoded.startswith("inttoptrconst:"):
+                return [f"  .quad {int(decoded.split(':', 1)[1])}"]
+            raise BackendUnavailable(
+                f"x86_64 self backend does not support non-constant inttoptr global initializer for {global_name!r}: {init!r}"
+            )
+        if init.startswith("inttoptrconst:"):
+            return [f"  .quad {int(init.split(':', 1)[1])}"]
         return [f"  .quad {int(init)}"]
     if ty.is_int:
         if ty.width <= 8:
@@ -55,6 +125,18 @@ def emit_scalar_initializer(
         if ty.width <= 32:
             return [f"  .long {int(init)}"]
         return [f"  .quad {int(init)}"]
+    if ty.is_fp:
+        if is_hex_literal(init):
+            bits = int(init, 16)
+            if ty.width <= 32:
+                value = struct.unpack(">d", bits.to_bytes(8, byteorder="big", signed=False))[0]
+                fp32_bits = struct.unpack("<I", struct.pack("<f", value))[0]
+                return [f"  .long {fp32_bits}"]
+            if ty.width <= 64:
+                return [f"  .quad {bits}"]
+        if ty.width <= 32:
+            return [f"  .float {init}"]
+        return [f"  .double {init}"]
     raise BackendUnavailable(
         f"self backend does not support scalar global initializer for {global_name!r}: {ty.describe()}"
     )
@@ -83,7 +165,10 @@ def emit_typed_initializer(
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
     init = init.strip()
+    init = re.sub(r",\s*align\s+\d+$", "", init)
     if init == "zeroinitializer":
+        return emit_zero_fill(ty.slot_size)
+    if init in {"poison", "undef"} and (ty.is_array or ty.is_struct):
         return emit_zero_fill(ty.slot_size)
     if ty.is_array:
         assert ty.elem is not None

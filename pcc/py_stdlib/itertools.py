@@ -11,6 +11,13 @@ def chain(*iterables):
         for item in it:
             yield item
 
+def _chain_from_iterable(iterables):
+    for it in iterables:
+        for item in it:
+            yield item
+
+chain.from_iterable = _chain_from_iterable
+
 
 def repeat(value, times=None):
     if times is None:
@@ -80,3 +87,95 @@ def groupby(iterable, key=None):
         last_key = k
     if group:
         yield (last_key, iter(group))
+
+
+def accumulate(iterable, func=None, *, initial=None):
+    it = iter(iterable)
+    if func is None:
+        func = lambda a, b: a + b
+    if initial is None:
+        try:
+            total = next(it)
+        except StopIteration:
+            return
+    else:
+        total = initial
+    yield total
+    for item in it:
+        total = func(total, item)
+        yield total
+
+
+def takewhile(predicate, iterable):
+    for item in iterable:
+        if not predicate(item):
+            break
+        yield item
+
+
+def dropwhile(predicate, iterable):
+    it = iter(iterable)
+    for item in it:
+        if not predicate(item):
+            yield item
+            break
+    for item in it:
+        yield item
+
+
+def starmap(function, iterable):
+    for args in iterable:
+        yield function(*args)
+
+
+def compress(data, selectors):
+    for item, keep in zip(data, selectors):
+        if keep:
+            yield item
+
+
+def zip_longest(*iterables, fillvalue=None):
+    iterators = [iter(it) for it in iterables]
+    active = len(iterators)
+    while active:
+        row = []
+        active = 0
+        for it in iterators:
+            try:
+                value = next(it)
+                row.append(value)
+                active += 1
+            except StopIteration:
+                row.append(fillvalue)
+        if active:
+            yield tuple(row)
+
+
+def tee(iterable, n=2):
+    data = list(iterable)
+    return tuple(iter(data) for _ in range(n))
+
+
+def permutations(iterable, r=None):
+    pool = tuple(iterable)
+    n = len(pool)
+    if r is None:
+        r = n
+    if r > n:
+        return
+    indices = list(range(n))
+    cycles = list(range(n, n-r, -1))
+    yield tuple(pool[i] for i in indices[:r])
+    while n:
+        for i in reversed(range(r)):
+            cycles[i] -= 1
+            if cycles[i] == 0:
+                indices[i:] = indices[i+1:] + indices[i:i+1]
+                cycles[i] = n - i
+            else:
+                j = cycles[i]
+                indices[i], indices[-j] = indices[-j], indices[i]
+                yield tuple(pool[i] for i in indices[:r])
+                break
+        else:
+            return

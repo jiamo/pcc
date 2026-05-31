@@ -29,7 +29,7 @@ scope choice or a known future-phase item, not an accidental bug.
 | `@classmethod` full support | ⚠️ framework in place; blocked on class-variable reads like `Cls.count` |
 | Class-level variable read/write (`Widget.kind`) | ❌ pending |
 | Dunder `__eq__/__ne__/__lt__/__le__/__gt__/__ge__/__add__/__sub__/__mul__/__truediv__/__floordiv__/__mod__/__len__/__getitem__/__call__` | ✅ |
-| Dunder `__iter__` / `__next__` (user-class iteration) | ❌ pending |
+| Dunder `__iter__` / `__next__` (user-class iteration) | ✅ |
 | Dunder `__hash__` / `__str__` | ❌ pending |
 | `__dunder` name mangling | ❌ pending (`inherit_private_like`) |
 | `type(x)` builtin / `type(x).__name__` | ❌ pending |
@@ -51,7 +51,7 @@ scope choice or a known future-phase item, not an accidental bug.
 | `from X import Y` | ✅ |
 | `import X as Y` / `from X import Y as Z` | ✅ |
 | `module.attr` read | ✅ |
-| `module.attr = val` write | ❌ pending |
+| `module.attr = val` write | ✅ native builtin modules |
 | Chained attribute read `a.b.c` | ✅ |
 | `module.fn(args)` with 0..3 args (typed scalars) | ✅ |
 | `module.fn(args)` with 4+ args (tuple build) | ✅ |

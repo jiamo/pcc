@@ -12,9 +12,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <unistd.h>
+
+extern int py_format_try_cpy_object_into_fd(int fd, void *obj, int32_t tag);
+extern PyObject *py_exc_get_message(PyObject *exc);
+extern PyObject *py_obj_str(PyObject *o);
+extern PyObject *py_obj_repr(PyObject *o);
 
 static void py_format(FILE *fp, PyObject *o);
 static void py_format_repr(FILE *fp, PyObject *o);
+static void py_format_bytes(FILE *fp, PyObject *o);
+
+static PyObject *fmt_list_item(PyObject *owner, PyListObject *l, int64_t i) {
+    return pcc_gc_load_ptr(owner, &l->items[i]);
+}
+
+static PyObject *fmt_tuple_item(PyObject *owner, PyTupleObject *t, int64_t i) {
+    return pcc_gc_load_ptr(owner, &t->items[i]);
+}
 
 static void py_format_int(FILE *fp, PyObject *o) {
     if (PY_IS_TAGGED_INT(o)) {
@@ -35,25 +50,15 @@ static void py_format_int(FILE *fp, PyObject *o) {
 }
 
 static void py_format_float(FILE *fp, PyObject *o) {
-    PyFloatObject *f = (PyFloatObject *)o;
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%g", f->value);
-    fputs(buf, fp);
-    int needs_dot = 1;
-    for (const char *p = buf; *p != '\0'; p++) {
-        if (*p == '.' || *p == 'e' || *p == 'E') {
-            needs_dot = 0;
-            break;
-        }
+    /* CPython shortest-round-trip repr via the shared helper (mirrors the
+     * pcc-Python ports). The old path used "%g" (6 significant figures), which
+     * truncated e.g. 10/3 to "3.33333". */
+    PyObject *s = py_float_repr_shortest(o);
+    if (s == NULL) {
+        return;
     }
-    if (
-        needs_dot
-        && strcmp(buf, "nan") != 0
-        && strcmp(buf, "inf") != 0
-        && strcmp(buf, "-inf") != 0
-    ) {
-        fputs(".0", fp);
-    }
+    fwrite(py_str_utf8(s), 1, (size_t)py_str_byte_len(s), fp);
+    py_decref(s);
 }
 
 static void py_format_str(FILE *fp, PyObject *o) {
@@ -95,12 +100,57 @@ static void py_format_str_repr(FILE *fp, PyObject *o) {
     fputc('\'', fp);
 }
 
+static void py_format_bytes(FILE *fp, PyObject *o) {
+    PyBytesObject *b = (PyBytesObject *)o;
+    fputs("b'", fp);
+    for (int64_t i = 0; i < b->byte_len; i++) {
+        unsigned char c = (unsigned char)b->data[i];
+        switch (c) {
+            case '\\':
+                fputs("\\\\", fp);
+                break;
+            case '\'':
+                fputs("\\'", fp);
+                break;
+            case '\n':
+                fputs("\\n", fp);
+                break;
+            case '\r':
+                fputs("\\r", fp);
+                break;
+            case '\t':
+                fputs("\\t", fp);
+                break;
+            default:
+                /* bytes repr shows only printable ASCII (32..126) raw;
+                 * control bytes (<32), DEL (127) and all high bytes (>=128)
+                 * escape as \xNN. The old ``c == 127`` missed 128..255, so
+                 * b'\xcf\x80' printed the raw UTF-8 instead of the escapes. */
+                if (c < 32 || c >= 127) {
+                    fprintf(fp, "\\x%02x", (unsigned)c);
+                } else {
+                    fputc((int)c, fp);
+                }
+                break;
+        }
+    }
+    fputc('\'', fp);
+}
+
+/* bytearray repr: ``bytearray(b'...')`` — the byte escaping is identical to
+ * bytes (same layout: byte_len + data), wrapped in ``bytearray( ... )``. */
+static void py_format_bytearray(FILE *fp, PyObject *o) {
+    fputs("bytearray(", fp);
+    py_format_bytes(fp, o);
+    fputc(')', fp);
+}
+
 static void py_format_list(FILE *fp, PyObject *o) {
     PyListObject *l = (PyListObject *)o;
     fputc('[', fp);
     for (int64_t i = 0; i < l->length; i++) {
         if (i > 0) fputs(", ", fp);
-        py_format_repr(fp, l->items[i]);
+        py_format_repr(fp, fmt_list_item(o, l, i));
     }
     fputc(']', fp);
 }
@@ -110,10 +160,44 @@ static void py_format_tuple(FILE *fp, PyObject *o) {
     fputc('(', fp);
     for (int64_t i = 0; i < t->len; i++) {
         if (i > 0) fputs(", ", fp);
-        py_format_repr(fp, t->items[i]);
+        py_format_repr(fp, fmt_tuple_item(o, t, i));
     }
     if (t->len == 1) fputc(',', fp);
     fputc(')', fp);
+}
+
+static void py_format_dict(FILE *fp, PyObject *o) {
+    PyDictObject *d = (PyDictObject *)o;
+    fputc('{', fp);
+    int64_t emitted = 0;
+    for (int64_t i = 0; i < d->entries_used; i++) {
+        DictEntry *e = &d->entries[i];
+        if (e->key == NULL) continue;  /* dead slot from a prior delete */
+        if (emitted > 0) fputs(", ", fp);
+        py_format_repr(fp, pcc_gc_load_ptr(o, &e->key));
+        fputs(": ", fp);
+        py_format_repr(fp, pcc_gc_load_ptr(o, &e->value));
+        emitted++;
+    }
+    fputc('}', fp);
+}
+
+static void py_format_set(FILE *fp, PyObject *o) {
+    PySetObject *s = (PySetObject *)o;
+    if (s->size == 0) {
+        fputs("set()", fp);   /* empty set is set(), not {} */
+        return;
+    }
+    fputc('{', fp);
+    int64_t emitted = 0;
+    for (int64_t i = 0; i < s->capacity; i++) {
+        PyObject *key = s->entries[i].key;
+        if (key == NULL || key == py_set_dummy) continue;  /* empty/tombstone */
+        if (emitted > 0) fputs(", ", fp);
+        py_format_repr(fp, pcc_gc_load_ptr(o, &s->entries[i].key));
+        emitted++;
+    }
+    fputc('}', fp);
 }
 
 static void py_format_repr(FILE *fp, PyObject *o) {
@@ -129,6 +213,27 @@ static void py_format_repr(FILE *fp, PyObject *o) {
     if (tag == PY_TYPE_STR) {
         py_format_str_repr(fp, o);
         return;
+    }
+    if (tag == PY_TYPE_BYTES) {
+        py_format_bytes(fp, o);
+        return;
+    }
+    if (tag == PY_TYPE_BYTEARRAY) {
+        py_format_bytearray(fp, o);
+        return;
+    }
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+        /* repr() of a user instance must dispatch __repr__, not __str__.
+         * Container elements (list/tuple/dict/set) recurse through here, so a
+         * class with both __str__ and __repr__ would otherwise show __str__
+         * inside a list. Falling through to py_format would call py_obj_str.
+         * On NULL (no __repr__) fall through to py_format's default handling. */
+        PyObject *s = py_obj_repr(o);
+        if (s != NULL) {
+            py_format_str(fp, s);
+            py_decref(s);
+            return;
+        }
     }
     py_format(fp, o);
 }
@@ -159,21 +264,96 @@ static void py_format(FILE *fp, PyObject *o) {
         case PY_TYPE_STR:
             py_format_str(fp, o);
             break;
+        case PY_TYPE_BYTES:
+            py_format_bytes(fp, o);
+            break;
+        case PY_TYPE_BYTEARRAY:
+            py_format_bytearray(fp, o);
+            break;
         case PY_TYPE_LIST:
             py_format_list(fp, o);
             break;
         case PY_TYPE_TUPLE:
             py_format_tuple(fp, o);
             break;
-        default:
-            fprintf(fp, "<object tag=%d>", (int)tag);
+        case PY_TYPE_DICT:
+            py_format_dict(fp, o);
             break;
+        case PY_TYPE_SET:
+            py_format_set(fp, o);
+            break;
+        case PY_TYPE_COROUTINE:
+            fputs("<coroutine object>", fp);
+            break;
+        case PY_TYPE_CONTINUATION:
+            fputs("<continuation object>", fp);
+            break;
+        case PY_TYPE_VIRTUAL_THREAD:
+            fputs("<virtual thread object>", fp);
+            break;
+        case PY_TYPE_EXC: {
+            /* str(exc) == str of its single message value; py_exc_get_message
+             * returns a borrowed ref (no decref). An arg-less exception (NULL
+             * message) renders as the empty string. KeyError's repr-quoting of
+             * the key is a separate, pre-existing gap shared with the
+             * traceback printer. */
+            PyObject *msg = py_exc_get_message(o);
+            if (msg != NULL) {
+                py_format(fp, msg);
+            }
+            break;
+        }
+        default: {
+            /* User-class instances and other objects: str(x) via py_obj_str
+             * dispatches __str__ (then __repr__) — what print() uses in
+             * CPython. Without it print(<instance>) rendered "<object tag=N>"
+             * even when the class defines __str__. Safe from recursion: the
+             * tags py_obj_str routes back through py_format_obj_to_str
+             * (float/none/list/tuple/dict/set/bytes) are all handled above
+             * this default, so the default only reaches the py_user_str_dispatch
+             * path. NULL (no __str__/__repr__) falls back to the hook then
+             * "<object tag=N>". */
+            PyObject *s = py_obj_str(o);
+            if (s != NULL) {
+                py_format_str(fp, s);
+                py_decref(s);
+            } else {
+                int fd = fileno(fp);
+                if (fd < 0 || !py_format_try_cpy_object_into_fd(fd, o, tag)) {
+                    fprintf(fp, "<object tag=%d>", (int)tag);
+                }
+            }
+            break;
+        }
     }
 }
 
 void py_print(PyObject *o) {
     py_format(stdout, o);
     fputc('\n', stdout);
+}
+
+/* Render any object to a freshly owned PyStr using the same formatting the
+ * print path uses.  ``use_repr`` selects the repr form (quoted strings); for
+ * containers/float str and repr coincide.  Used by ``py_obj_str`` /
+ * ``py_obj_repr`` for the non-scalar types those paths do not handle inline.
+ * Returns NULL on allocation failure (caller degrades gracefully). */
+PyObject *py_format_obj_to_str(PyObject *o, int use_repr) {
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *ms = open_memstream(&buf, &len);
+    if (ms == NULL) {
+        return NULL;
+    }
+    if (use_repr) {
+        py_format_repr(ms, o);
+    } else {
+        py_format(ms, o);
+    }
+    fclose(ms);
+    PyObject *out = py_str_new(buf, (int64_t)len);
+    free(buf);
+    return out;
 }
 
 void py_print_many(PyObject *args_tuple, PyObject *sep, PyObject *end) {
@@ -201,7 +381,7 @@ void py_print_many(PyObject *args_tuple, PyObject *sep, PyObject *end) {
     PyTupleObject *t = (PyTupleObject *)args_tuple;
     for (int64_t i = 0; i < t->len; i++) {
         if (i > 0) fwrite(sep_str, 1, sep_len, stdout);
-        py_format(stdout, t->items[i]);
+        py_format(stdout, fmt_tuple_item(args_tuple, t, i));
     }
     fwrite(end_str, 1, end_len, stdout);
 }

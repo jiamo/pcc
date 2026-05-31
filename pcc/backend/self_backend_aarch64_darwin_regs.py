@@ -7,6 +7,11 @@ import struct
 from . import BackendUnavailable
 from .self_backend_ir import TypeDesc
 
+_DIRECT_FP_IMMEDIATES = {
+    1.0: "1.0",
+    2.0: "2.0",
+}
+
 
 def as_x_reg(reg: str) -> str:
     if reg.startswith("w"):
@@ -58,10 +63,16 @@ def emit_fp_hex_constant(value_type: TypeDesc, reg: str, token: str) -> list[str
         raise BackendUnavailable(f"self backend fp constant helper expects fp type, got {value_type.describe()}")
     if value_type.width <= 32:
         as_double = struct.unpack(">d", bits.to_bytes(8, byteorder="big", signed=False))[-1]
+        immediate = _DIRECT_FP_IMMEDIATES.get(float(as_double))
+        if immediate is not None:
+            return [f"  fmov {reg}, #{immediate}"]
         fp_bits = struct.unpack(">I", struct.pack(">f", float(as_double)))[0]
         lines = emit_const_to_reg(TypeDesc("int", 32), "w12", fp_bits)
         lines.append(f"  fmov {reg}, w12")
         return lines
+    immediate = _DIRECT_FP_IMMEDIATES.get(struct.unpack(">d", bits.to_bytes(8, byteorder="big", signed=False))[0])
+    if immediate is not None:
+        return [f"  fmov {reg}, #{immediate}"]
     lines = emit_const_to_reg(TypeDesc("int", 64), "x12", bits)
     lines.append(f"  fmov {reg}, x12")
     return lines
@@ -72,6 +83,9 @@ def emit_fp_constant(value_type: TypeDesc, reg: str, token: str) -> list[str]:
         return emit_fp_hex_constant(value_type, reg, token)
     if not value_type.is_fp:
         raise BackendUnavailable(f"self backend fp constant helper expects fp type, got {value_type.describe()}")
+    immediate = _DIRECT_FP_IMMEDIATES.get(float(token))
+    if immediate is not None:
+        return [f"  fmov {reg}, #{immediate}"]
     if value_type.width <= 32:
         bits = struct.unpack("<I", struct.pack("<f", float(token)))[0]
         lines = emit_const_to_reg(TypeDesc("int", 32), "w12", bits)

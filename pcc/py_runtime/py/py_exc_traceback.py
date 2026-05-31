@@ -4,7 +4,7 @@ Traceback frame growth and cold unhandled-exception formatting. Output
 matches the C runtime's stderr text, but uses pcc.unsafe.write instead
 of variadic fprintf.
 """
-from pcc.extern import c_abi_export
+from pcc.extern import c_abi_export, c_ptr, extern
 from pcc.unsafe import (
     cstr,
     free,
@@ -23,6 +23,8 @@ from pcc.unsafe import (
     strlen,
     write,
 )
+
+pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 
 
 def _type_of(obj) -> int:
@@ -82,13 +84,13 @@ def _write_i64(v: int) -> None:
 
 def _write_heading(e) -> None:
     cls_name = cstr("Exception")
-    cls = load_ptr(e, 16)
+    cls = pcc_gc_load_ptr(e, ptr_add(e, 16))
     if ptr_is_null(cls) == 0:
         name = load_ptr(cls, 16)
         if ptr_is_null(name) == 0:
             cls_name = name
 
-    msg = load_ptr(e, 24)
+    msg = pcc_gc_load_ptr(e, ptr_add(e, 24))
     none = global_load_ptr("py_None")
     if ptr_is_null(msg) == 0:
         if ptr_eq(msg, none) == 0:
@@ -148,8 +150,8 @@ def py_exc_print_unhandled(exc) -> None:
         write(2, cstr("\n"), 1)
         return
 
-    cause = load_ptr(exc, 32)
-    context = load_ptr(exc, 40)
+    cause = pcc_gc_load_ptr(exc, ptr_add(exc, 32))
+    context = pcc_gc_load_ptr(exc, ptr_add(exc, 40))
     if _is_exception(cause) != 0:
         py_exc_print_unhandled(cause)
         write(

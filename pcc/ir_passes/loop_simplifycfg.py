@@ -30,7 +30,12 @@ from .dominator_tree import CFG
 from .ir_mutator import Instruction, MutableModule
 from .loop_info import compute_loop_info
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
-from .simplifycfg import _split_functions, simplify_cfg_text
+from .simplifycfg import (
+    _function_chunk_module,
+    _module_context_for_function,
+    _split_functions,
+    simplify_cfg_text,
+)
 
 
 _RET_SSA_RE = re.compile(r"^\s*ret\s+(?P<ty>.+?)\s+%(?P<name>[\w\.]+)\s*$")
@@ -79,10 +84,18 @@ def _simplify_loop_functions_only(ir_text: str) -> tuple[str, bool]:
         if not is_function:
             out.append(chunk)
             continue
-        if not _function_has_loops(chunk):
+        context = _module_context_for_function(ir_text, chunk)
+        if not _function_has_loops(chunk, context):
             out.append(chunk)
             continue
-        new_chunk, local = simplify_cfg_text(chunk)
+        wrapped = _function_chunk_module(context, chunk)
+        rewritten, local = simplify_cfg_text(wrapped)
+        new_chunk = chunk
+        if local:
+            for rewritten_is_function, rewritten_chunk in _split_functions(rewritten):
+                if rewritten_is_function:
+                    new_chunk = rewritten_chunk
+                    break
         out.append(new_chunk)
         changed = changed or local
     if not changed:
@@ -90,8 +103,8 @@ def _simplify_loop_functions_only(ir_text: str) -> tuple[str, bool]:
     return "".join(out), True
 
 
-def _function_has_loops(fn_text: str) -> bool:
-    mod = llvm.parse_assembly(fn_text)
+def _function_has_loops(fn_text: str, module_context: str = "") -> bool:
+    mod = llvm.parse_assembly(_function_chunk_module(module_context, fn_text))
     mod.verify()
     for fn in mod.functions:
         if fn.is_declaration:

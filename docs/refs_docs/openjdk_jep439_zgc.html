@@ -1,0 +1,203 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=us-ascii" /><meta http-equiv="Content-Type" content="text/html; charset=us-ascii" /><title>JEP 439: Generational ZGC</title><link rel="shortcut icon" href="/images/nanoduke.ico" /><link rel="stylesheet" type="text/css" href="/page.css" /><script type="text/javascript" src="/page.js"><noscript></noscript></script><script src="https://cdn.usefathom.com/script.js" data-site="KCYJJPZX" defer="yes"></script><style type="text/css" xml:space="preserve">
+      TABLE { border-collapse: collapse; padding: 0px; margin: 1em 0 1em 2em; }
+      TR:first-child TH, TR:first-child TD { padding-top: 0; }
+      TH, TD { padding: 0px; padding-top: .5ex; vertical-align: baseline; text-align: left; }
+      TD + TD, TH + TH { padding-left: 1em; }
+      TD:first-child, TH:first-child, TD.jep { text-align: right; }
+      TABLE.head TD:first-child { font-style: italic; padding-left: 2em; white-space: nowrap; }
+      PRE { padding-left: 2em; margin: 1ex 0; font-size: inherit; }
+      TABLE PRE { padding-left: 0; margin: 0; }
+      TABLE.jeps TD:first-child + TD,
+      TABLE.jeps TD:first-child + TD + TD { padding-left: .5em; }
+      TABLE.jeps TD:first-child,
+      TABLE.jeps TD:first-child + TD,
+      TABLE.jeps TD:first-child + TD + TD { font-size: smaller; }
+      TABLE.jeps TD.cl { font-size: smaller; padding-right: 0; text-align: right; }
+      TABLE.jeps TD.cm { font-size: smaller; padding-left: .1em; padding-right: .1em; }
+      TABLE.jeps TD.cr { font-size: smaller; padding-left: 0; }
+      TABLE.jeps TD.z { padding-left: 0; padding-right: 0; }
+      TABLE.head TD { padding-top: 0; }
+    </style></head><body><div id="main"><h1>JEP 439: Generational ZGC</h1><table class="head"><tr><td>Owner</td><td>Stefan Karlsson</td></tr><tr><td>Type</td><td>Feature</td></tr><tr><td>Scope</td><td>JDK</td></tr><tr><td>Status</td><td>Closed&#8201;/&#8201;Delivered</td></tr><tr><td>Release</td><td>21</td></tr><tr><td>Component</td><td>hotspot&#8201;/&#8201;gc</td></tr><tr><td>Discussion</td><td>hotspot dash gc dash dev at openjdk dot org</td></tr><tr><td>Effort</td><td>XL</td></tr><tr><td>Duration</td><td>XL</td></tr><tr><td>Relates to</td><td><a href="377">JEP 377: ZGC: A Scalable Low-Latency Garbage Collector (Production)</a></td></tr><tr><td></td><td><a href="474">JEP 474: ZGC: Generational Mode by Default</a></td></tr><tr><td></td><td><a href="490">JEP 490: ZGC: Remove the Non-Generational Mode</a></td></tr><tr><td>Reviewed by</td><td>Erik Helin, Erik &#214;sterlund, Vladimir Kozlov</td></tr><tr><td>Endorsed by</td><td>Vladimir Kozlov</td></tr><tr><td>Created</td><td>2021/08/25 12:01</td></tr><tr><td>Updated</td><td>2024/10/07 17:28</td></tr><tr><td>Issue</td><td><a href="https://bugs.openjdk.org/browse/JDK-8272979">8272979</a></td></tr></table><div class="markdown"><h2 id="Summary">Summary</h2>
+<p>Improve application performance by extending the Z Garbage Collector (<a href="https://openjdk.org/jeps/377">ZGC</a>) to maintain separate <a href="https://en.wikipedia.org/wiki/Tracing_garbage_collection#Generational_GC_(ephemeral_GC)">generations</a> for young and old objects. This will allow ZGC to collect young objects &#8212; which tend to die young &#8212; more frequently.</p>
+<h2 id="Goals">Goals</h2>
+<p>Applications running with Generational ZGC should enjoy</p>
+<ul>
+<li>Lower risks of allocations stalls,</li>
+<li>Lower required heap memory overhead, and</li>
+<li>Lower garbage collection CPU overhead.</li>
+</ul>
+<p>These benefits should come without significant throughput reduction compared to non-generational ZGC. The essential properties of non-generational ZGC should be preserved:</p>
+<ul>
+<li>Pause times should not exceed 1 millisecond,</li>
+<li>Heap sizes from a few hundred megabytes up to many terabytes should be supported, and</li>
+<li>Minimal manual configuration should be needed.</li>
+</ul>
+<p>As examples of the last point, there should be no need to manually configure</p>
+<ul>
+<li>The size of the generations,</li>
+<li>The number of threads used by the garbage collector, or</li>
+<li>For how long objects should reside in the young generation.</li>
+</ul>
+<p>Finally, Generational ZGC should be a better solution for most use cases than non-generational ZGC. We should eventually be able to replace the latter with the former in order to reduce long-term maintenance costs.</p>
+<h2 id="Non-Goals">Non-Goals</h2>
+<p>It is not a goal to perform <a href="https://docs.oracle.com/en/java/javase/19/docs/api/java.base/java/lang/ref/package-summary.html">reference processing</a> in the young generation.</p>
+<h2 id="Motivation">Motivation</h2>
+<p>ZGC (<a href="https://openjdk.org/jeps/333">JEP 333</a>) is designed for low latency and high scalability. It has been available for production use since JDK 15 (<a href="https://openjdk.org/jeps/377">JEP 377</a>).</p>
+<p>ZGC does the majority of its work while application threads are running, pausing those threads only briefly. ZGC's pause times are consistently measured in microseconds; by contrast the pause times of the default garbage collector, G1, range from milliseconds to seconds. ZGC's low pause times are independent of heap size: Workloads can use heap sizes from a few hundred megabytes all the way up to multiple terabytes and still enjoy low pause times.</p>
+<p>For many workloads, simply using ZGC is enough to solve all latency problems related to garbage collection. This works well as long as there are sufficient resources (i.e., memory and CPU) available to ensure that ZGC can reclaim memory faster than the concurrently-running application threads consume it. However, ZGC currently stores all objects together, regardless of age, so it must collect all objects every time it runs.</p>
+<p>The <a href="https://docs.oracle.com/en/java/javase/17/gctuning/garbage-collector-implementation.html#GUID-71D796B3-CBAB-4D80-B5C3-2620E45F6E5D">weak generational hypothesis</a> states that young objects tend to die young, while old objects tend to stick around. Thus collecting young objects requires fewer resources and yields more memory, while collecting old objects requires more resources and yields less memory. We can thus improve the performance of applications that use ZGC by collecting young objects more frequently.</p>
+<h2 id="Description">Description</h2>
+<h3 id="Enabling-Generational-ZGC">Enabling Generational ZGC</h3>
+<p>To ensure a smooth succession, we will initially make Generational ZGC available alongside non-generational ZGC. The <code>-XX:+UseZGC</code> command-line option will select non-generational ZGC; to select Generational ZGC, add the <code>-XX:+ZGenerational</code> option:</p>
+<pre><code>$ java -XX:+UseZGC -XX:+ZGenerational ...</code></pre>
+<p>In a future release we intend to make Generational ZGC the default, at which point <code>-XX:-ZGenerational</code> will select non-generational ZGC. In an even later release we intend to remove non-generational ZGC, at which point the <code>ZGenerational</code> option will become obsolete.</p>
+<h3 id="Design">Design</h3>
+<p>Generational ZGC splits the heap into two logical <em>generations</em>: The <em>young</em> generation is for recently allocated objects while the <em>old</em> generation is for long-lived objects. Each generation is collected independently of the other, so ZGC can focus on collecting the profitable young objects.</p>
+<p>As in non-generational ZGC, all garbage collection is done concurrently while the application is running, with application pauses typically shorter than one millisecond. Since ZGC reads and modifies the object graph at the same time as the application, it must take care to give the application a consistent view of the object graph. ZGC does this via colored pointers, load barriers, and store barriers.</p>
+<ul>
+<li>
+<p>A <em>colored pointer</em> is a pointer to an object in the heap which, along with the object's memory address, includes metadata that encodes the known state of the object. The metadata describes whether the object is known to be alive, whether the address is correct, and so forth. ZGC always uses 64-bit object pointers and can therefore accommodate metadata bits and object addresses for heaps up to many terabytes. When a field in an object refers to another object, ZGC implements that reference with a colored pointer.</p>
+</li>
+<li>
+<p>A <em>load barrier</em> is a fragment of code injected by ZGC into the application wherever the application reads a field of an object that refers to another object. The load barrier interprets the metadata of the colored pointer stored in the field and potentially takes some action before the application uses the referenced object.</p>
+</li>
+</ul>
+<p>Non-generational ZGC uses both colored pointers and load barriers. Generational ZGC also uses store barriers to efficiently keep track of references from objects in one generation to objects in another generation.</p>
+<ul>
+<li>A <em>store barrier</em> is a fragment of code injected by ZGC into the application wherever the application stores references into object fields. Generational ZGC adds new metadata bits to colored pointers so that store barriers can determine if the field being written has already been recorded as potentially containing an inter-generational pointer. Colored pointers make Generational ZGC's store barriers more efficient than traditional generational store barriers.</li>
+</ul>
+<p>The addition of store barriers allows Generational ZGC to move the work of marking reachable objects from load barriers to store barriers. That is, store barriers can use the metadata bits in colored pointers to efficiently determine if the object previously referred to by the field, prior to the store, needs to be marked.</p>
+<p>Moving marking out of load barriers makes it easier to optimize them, which is important because load barriers are often more frequently executed than store barriers. Now when a load barrier interprets a colored pointer it need only update the object address, if the object was relocated, and update the metadata to indicate that the address is known to be correct. Subsequent load barriers will interpret this metadata and not check again whether the object has been relocated.</p>
+<p>Generational ZGC uses distinct sets of marking and relocation metadata bits in colored pointers, so that the generations can be collected independently.</p>
+<p>The remaining sections describe important design concepts that distinguish Generational ZGC from non-generational ZGC, and from other garbage collectors:</p>
+<ul>
+<li>No multi-mapped memory</li>
+<li>Optimized barriers</li>
+<li>Double-buffered remembered sets</li>
+<li>Relocations without additional heap memory</li>
+<li>Dense heap regions</li>
+<li>Large objects</li>
+<li>Full garbage collections</li>
+</ul>
+<h3 id="No-multi-mapped-memory">No multi-mapped memory</h3>
+<p>Non-generational ZGC uses <a href="https://wiki.openjdk.org/display/zgc/Pointer+Metadata+using+Multi-Mapped+memory">multi-mapped memory</a> to reduce the overhead of load barriers. Generational ZGC instead uses explicit code in the load and store barriers.</p>
+<p>For users, the main advantage of this change is that makes it easier to measure the amount of memory used for the heap. With multi-mapped memory the same heap memory is mapped into three separate virtual address ranges, so the heap usage reported by tools such as <code>ps</code> is around triple the amount of memory actually used.</p>
+<p>For the GC itself, this change means that the metadata bits in a colored pointer no longer need to be in the part of the pointer that corresponds to the range of accessible memory addresses for the heap. This allows more metadata bits to be added and also opens the possibility of increasing the maximum heap size beyond the 16 terabyte limit of non-generational ZGC.</p>
+<p>In Generational ZGC, object references stored in object fields are implemented as colored pointers. Object references stored in the JVM stack, however, are implemented as <em>colorless</em> pointers, without metadata bits, in the hardware stack or in CPU registers. The load and store barriers translate back and forth between colored and colorless pointers.</p>
+<p>Since colored pointers are never present on the hardware stack or in CPU registers, a more exotic colored pointer layout can be used as long as the conversion between colored and colorless pointers can be done efficiently. The colored pointer layout used by Generational ZGC puts the metadata in the low-order bits of the pointer and the object address in the high-order bits. This minimizes the number of machine instructions in the load barrier. With careful encoding of the memory address and metadata bits, a single shift instruction (on x64) can both check whether the pointer requires processing and remove the metadata bits.</p>
+<h3 id="Optimized-barriers">Optimized barriers</h3>
+<p>With the introduction of store barriers, and new responsibilities for load barriers, more GC code will be inter-mixed with compiled application code. The barriers need to be highly optimized in order to maximize throughput. Many of the key design decisions of Generational ZGC involve the colored pointer scheme and the barriers.</p>
+<p>Some of the techniques used to optimize the barriers are:</p>
+<ul>
+<li>Fast paths and slow paths</li>
+<li>Minimizing load barrier responsibilities</li>
+<li>Remembered-set barriers</li>
+<li>SATB marking barriers</li>
+<li>Fused store barrier checks</li>
+<li>Store barrier buffers</li>
+<li>Barrier patching</li>
+</ul>
+<h4 id="Fast-paths-and-slow-paths">Fast paths and slow paths</h4>
+<p>ZGC splits barriers into two parts. The <em>fast path</em> checks whether some additional GC work must be done before the referenced object is used by the application. The <em>slow path</em> does that additional work. All object accesses run the fast-path check. As the name indicates, it needs to be fast, so this code is inserted directly into just-in-time-compiled application code. The slow path is taken only a fraction of the time. When the slow path is taken, the color of the accessed object pointer is changed so that subsequent accesses to the same pointer do not trigger the slow path again for a while. Because of this, it is less important that the slow paths be highly optimized. For maintainability, they are implemented as C++ functions in the JVM.</p>
+<p>In non-generational ZGC, this is how load barriers are split. In Generational ZGC, the same scheme is applied to store barriers and their associated GC work.</p>
+<h4 id="Minimizing-load-barrier-responsibilities">Minimizing load barrier responsibilities</h4>
+<p>In non-generational ZGC the load barrier is responsible for</p>
+<ul>
+<li>Updating stale pointers to objects that the GC relocated and</li>
+<li>Marking loaded objects as being alive &#8212; the application is loading the object, so it is considered alive.</li>
+</ul>
+<p>In Generational ZGC we must keep track of two generations and translate between colored and colorless pointers. To minimize complexity, and to allow optimization of the load barrier fast path, responsibility for marking is shifted to the store barriers.</p>
+<p>In Generational ZGC the load barriers are responsible for</p>
+<ul>
+<li>Removing metadata bits from colored pointers and</li>
+<li>Updating stale pointers to objects that the GC relocated.</li>
+</ul>
+<p>The store barriers are responsible for</p>
+<ul>
+<li>Adding metadata bits to create colored pointers,</li>
+<li>Maintaining the <em>remembered set</em>, which tracks old-to-young generation object pointers, and</li>
+<li>Marking objects as being alive.</li>
+</ul>
+<h4 id="Remembered-set-barriers">Remembered-set barriers</h4>
+<p>When Generational ZGC collects the young generation, it only visits objects in the young generation. However, objects in the old generation can contain fields pointing to objects in the young generation, i.e., old-to-young generation pointers. These fields must be visited during a young-generation collection for two reasons.</p>
+<ul>
+<li>
+<p><em>GC marking roots</em> &#8212; Such a field can contain the only reference keeping part of the young-generation object graph reachable. The GC must treat these fields as roots of the object graph in order to ensure that all live objects are found and marked alive.</p>
+</li>
+<li>
+<p><em>Stale pointers in the old generation</em> &#8212; Collecting the young generation moves objects, but pointers to those objects are not eagerly updated. Instead the pointers are lazily updated, by load barriers, when the application encounters them. At some point the GC must update any stale old-to-young generation pointers that the application did not encounter.</p>
+</li>
+</ul>
+<p>The set of old-to-young generation pointers is called the <em>remembered set</em>. The remembered set contains all memory addresses in the old generation that potentially contain pointers to objects in the young generation. Store barriers add entries to the remembered set. Whenever a reference is stored into an object field, it is considered to potentially contain an old-to-young generation pointer. The store barrier slow path filters out stores to fields in the young generation, since only addresses in the old generation are of interest. The slow path does not filter based on the value written to the field, which could be a value referring to either the young or old generation. The GC checks the current value of the object field when it uses the remembered set.</p>
+<p>All of this ensures the <em>act-once property</em> of store barriers with respect to maintaining the remembered set. This means that, between the start of two consecutive young-generation marking phases, the store barrier slow path is taken just once per stored-to object field. The first time a field is written to, the following steps occur:</p>
+<ul>
+<li>The fast path checks the to-be-overwritten value of the stored-to field,</li>
+<li>The color shows that this field has not been written to since the previous young generation marking phase, so</li>
+<li>The slow path is taken,</li>
+<li>The address of the stored-to field is added to the remembered set, and</li>
+<li>The new pointer value is colored and stored in the field.</li>
+</ul>
+<p>The new pointer value is colored in such a way that subsequent fast-path checks will see that this object field has already passed the slow path.</p>
+<h4 id="SATB-marking-barriers">SATB marking barriers</h4>
+<p>Unlike non-generational ZGC, Generational ZGC uses a <em>snap shot at the beginning</em> (SATB) marking algorithm. At the beginning of the marking phase the GC takes a snapshot of the GC roots; by the end of the marking phase, all objects reachable from those roots when marking began are guaranteed to be found and marked alive.</p>
+<p>To accomplish this the GC needs to be notified when references between objects in the object graph are broken. Store barriers therefore report to-be-overwritten field values to the GC; the GC then marks the referenced object and visits and marks the objects reachable from it.</p>
+<p>Store barriers need only report a to-be-overwritten field value the first time that the field is stored to within a marking cycle. Subsequent stores to the same field will only replace values that the GC is guaranteed to find anyway, because of the SATB property. The SATB property, in turn, supports the act-once property of store barriers with respect to marking.</p>
+<h4 id="Fused-store-barrier-checks">Fused store barrier checks</h4>
+<p>There are many similarities between the remembered-set maintenance and marking functions of store barriers. Both use colored-pointer fast-path checks and their respective act-once properties. Instead of having separate fast-path checks for each condition, we fuse them into one combined fast-path check. If either of the two properties fails, the slow path is taken and the required GC work is done.</p>
+<h4 id="Store-barrier-buffers">Store barrier buffers</h4>
+<p>Splitting barriers into fast paths and slow paths, and using pointer coloring, reduces the number of calls to the C++ slow-path functions. Generational ZGC reduces overhead further by placing a JIT-compiled <em>medium path</em> between the fast path and the slow path. The medium path stores the to-be-overwritten value and the address of the object field in a <em>store barrier buffer</em> and returns to the compiled application code without taking the expensive slow path. The slow path is taken only when the store barrier buffer is full. This amortizes some of the overhead of transitioning from compiled application code to the C++ slow-path code.</p>
+<h4 id="Barrier-patching">Barrier patching</h4>
+<p>Both load barriers and store barriers perform their checks against values in global or thread-local variables which the GC changes when it transitions to a new phase. There are different ways to read these variables in barriers, and the overhead of doing so is different on different CPU architectures.</p>
+<p>In Generational ZGC we reduce this overhead by patching barrier code when possible. The global values are encoded in the machine instructions of barriers as immediate values. This removes the need to dereference a global or thread-local variable in order to fetch the current value. The immediate values are patched when methods are invoked the first time after the GC changes phase; e.g., when the GC starts the young generation marking phase. This further reduces barrier overhead.</p>
+<h3 id="Double-buffered-remembered-sets">Double-buffered remembered sets</h3>
+<p>Many GCs use a remembered-set technique called <em>card table marking</em> to keep track of inter-generational pointers. When an application thread writes to an object field it also writes (i.e., <em>dirties</em>) a byte in a large byte array called the <em>card table</em>. Typically, one byte in the table corresponds to an address range spanning 512 bytes in the heap. To find all the old-to-young generation object pointers, the GC must locate and visit all object fields within the address ranges that correspond to the dirty bytes in the card table.</p>
+<p>Generational ZGC, by contrast, records object field locations precisely by using bitmaps in which each bit represents a single potential object field address. Each old-generation region has a pair of remembered-set bitmaps. One of the bitmaps is active and populated by application threads running their store barriers, while the other bitmap is used by the GC as a read-only copy of all recorded old generation object fields that potentially point to objects in the young generation. These two bitmaps are atomically swapped each time a young generation collection starts. One benefit of this approach is that application threads don't have to wait for the bitmaps to be cleared. The GC processes and then clears one of the bitmaps while the other bitmap is concurrently being populated by application threads. Another benefit is that, since this allows application threads and GC threads to work on distinct bitmaps, it removes the need for extra memory barriers between the two types of threads. Other generational collectors that use card table marking, such as G1, require a memory fence when cards are marked, resulting in potentially worse store barrier performance.</p>
+<h3 id="Relocations-without-additional-heap-memory">Relocations without additional heap memory</h3>
+<p>Young-generation collections in other HotSpot GCs use a <em>scavenging</em> model where live objects are found and relocated in a single pass. All objects in the young generation must be relocated before the GC has complete knowledge about what objects were alive. GCs using this model can reclaim memory only after all objects have been relocated. Thus these GCs need to guess the amount of memory needed for the surviving objects and ensure that said amount of memory is available when the GC starts. If the guess is wrong then a more expensive cleanup operation is needed; e.g., in-place pinning of non-relocated objects, which leads to fragmentation, or a full GC with all application threads stopped.</p>
+<p>Generational ZGC uses two passes: The first visits and marks all reachable objects, and the second relocates marked objects. Because the GC has complete liveness information before the relocation phase starts, it can partition the relocation work on a per-region granularity. As soon as all live objects have been relocated out of a region, i.e., the region has been <em>evacuated</em>, that region can be reused as a new target region for relocations or for allocations by application threads. Even when there are no more free regions to relocate objects into, ZGC can still proceed by compacting objects into the currently relocated regions. This allows Generational ZGC to relocate and compact the young generation without using additional heap memory.</p>
+<h3 id="Dense-heap-regions">Dense heap regions</h3>
+<p>When relocating objects out of the young generation, the number of live objects and the amount of memory they occupy will differ across regions. For example, more-recently allocated regions will likely contain more live objects.</p>
+<p>ZGC analyzes the density of young-generation regions in order to determine which regions are worth evacuating and which regions are either too full or too expensive to evacuate. The regions that are not selected for evacuation are aged in place: Their objects remain at their locations and the regions are either kept in the young generation as survivor regions or promoted into the old generation. The objects in the surviving regions get a second chance to die in the hope that, by the time the next young-generation collection starts, enough objects will have died to make more of these regions eligible for evacuation.</p>
+<p>This method of aging dense regions in place decreases the effort required to collect the young generation.</p>
+<h3 id="Large-objects">Large objects</h3>
+<p>ZGC already handles large objects well. By decoupling virtual memory from physical memory and over-reserving virtual memory, ZGC can usually dodge the fragmentation problems that sometimes make it difficult to allocate large objects when using G1.</p>
+<p>In Generational ZGC we take this a step further by allowing large objects to be allocated in the young generation. Given that regions can be aged without relocating them, there is no need to allocate large objects in the old generation just to prevent expensive relocations. Instead, they can be collected in the young generation if they are short-lived or be cheaply promoted to the old generation if they are long-lived.</p>
+<h3 id="Full-garbage-collections">Full garbage collections</h3>
+<p>When the old generation is collected, there will be pointers from objects in the young generation to objects in the old generation. These pointers are considered roots of the old-generation object graph. Objects in the young generation mutate often, so young-to-old generation pointers are not tracked. Instead these pointers are found by running a young-generation collection along with the old-generation marking phase. When this young-generation collection finds pointers into the old generation it passes them to the old-generation marking process.</p>
+<p>This extra young-generation collection will still execute as a normal young-generation collection and leave live objects in the surviving regions. One effect of this is that surviving objects in the young generation will not be subject to the reference processing and class unloading done when collecting the old generation. This could be observed by an application that, for example, releases the last reference to an object graph, invokes <code>System.gc()</code>, and then expects some weak reference to be cleared or enqueued or some class to be unloaded. To mitigate this, when a GC is requested explicitly by application code then an extra young-generation collection is done first, before the old-generation collection starts, to promote all surviving objects into the old generation.</p>
+<h2 id="Alternatives">Alternatives</h2>
+<h3 id="Simpler-barrier-and-pointer-coloring-schemes">Simpler barrier and pointer-coloring schemes</h3>
+<p>The current load and store barrier implementation is non-trivial to understand. A simpler version could be easier to maintain at the cost of more expensive load and store barriers. We evaluated around ten different barrier implementations; none was as performant as the chosen shift-based load barrier. Continued investigation and analysis of this performance vs. complexity trade-off might still be worth considering.</p>
+<h3 id="Keep-using-multi-mapped-memory">Keep using multi-mapped memory</h3>
+<p>The colorless-roots scheme could be skipped by using a simpler solution that utilizes multi-mapped memory. If more metadata bits in the pointers are needed than in non-generational ZGC, then the maximum heap size would be restricted. Another approach could be to use a hybrid solution, with some bits using multi-mapped memory and other bits being removed and added by the load and store barriers.</p>
+<h2 id="Testing">Testing</h2>
+<p>The ZGC implementation uses distinct C++ types for colorless and colored pointers which ensure that no implicit conversion can be made between the two types. Colored pointers are restricted to the GC code and to barriers. As long as the runtime system uses HotSpot's access API and barriers to access object pointers, it will only ever see dereferenceable colorless pointers. The runtime-visible object pointer type will always contain colorless pointers. We inject extensive verification code into the different object-pointer types to quickly find when pointers are broken or barriers are missing.</p>
+<ul>
+<li>The standard set of tests for garbage collection algorithms will be used to demonstrate correctness.</li>
+</ul>
+<h2 id="Risks-and-Assumptions">Risks and Assumptions</h2>
+<h3 id="Implementation-complexity">Implementation complexity</h3>
+<p>The barriers and colored pointers used in Generational ZGC are more complex than those in non-generational ZGC. Generational ZGC also runs two garbage collectors concurrently; these collectors are fairly independent but they do interact in a few intricate ways, adding to the complexity of the implementation.</p>
+<p>Given the extra complexity, in the long term we intend to minimize maintenance costs by fully replacing the original, non-generational version of ZGC with Generational ZGC.</p>
+<h3 id="Generational-ZGC-will-perform-differently-than-non-generational-ZGC">Generational ZGC will perform differently than non-generational ZGC</h3>
+<p>We believe that Generational ZGC will be better suited than its predecessor to most use cases. Some workloads might even experience a throughput improvement with Generational ZGC due to lower resource usage. For example, when running an <a href="https://cassandra.apache.org/">Apache Cassandra</a> benchmark Generational ZGC requires a quarter of the heap size yet achieves four times the throughput compared to non-generational ZGC, while still keeping pause times under one millisecond.</p>
+<p>Some workloads are non-generational by nature and could see a slight performance degradation. We believe that this is a sufficiently small set of workloads that it does not justify the cost of maintaining two separate versions of ZGC over the long term.</p>
+<p>One additional source of overhead is the more capable GC barriers. We expect that most of this will be offset by the gains of not having to frequently collect objects in the old generation.</p>
+<p>Another additional source of overhead is having two garbage collectors running concurrently. We need to make sure to balance their invocation rates and CPU consumption so that they do not unduly affect the application.</p>
+<p>As is normal for GC development, future improvements and optimizations will be driven by benchmarks and user feedback. We intend to keep improving Generational ZGC even after the first release.</p>
+</div></div><div id="sidebar"><div id="openjdk-sidebar-logo"><a href="/"><img alt="OpenJDK logo" width="91" height="25" src="/images/openjdk2.svg" /></a></div><div class="links"><div class="link"><a href="/install/">Installing</a></div><div class="link"><a href="/guide/#contributing-to-an-openjdk-project">Contributing</a></div><div class="link"><a href="/guide/#reviewing-and-sponsoring-a-change">Sponsoring</a></div><div class="link"><a href="/guide/">Developers' Guide</a></div><div class="link"><a href="/groups/vulnerability/report">Vulnerabilities</a></div><div class="link"><a href="https://jdk.java.net">JDK GA/EA Builds</a></div></div><div class="links"><div class="links"><a href="https://mail.openjdk.org">Mailing lists</a></div><div class="link"><a href="https://wiki.openjdk.org">Wiki</a>
+                      &#183; <a href="/irc">IRC</a></div><div class="link"><a href="https://mastodon.social/@openjdk" rel="me">Mastodon</a></div><div class="link"><a href="https://bsky.app/profile/openjdk.org">Bluesky</a></div></div><div class="links"><div class="links"><a href="/bylaws">Bylaws</a> &#183; <a href="/census">Census</a></div><div class="link"><a href="/legal/">Legal</a> &#183; <a href="/legal/ai">AI</a></div></div><div class="links"><div class="links"><a href="/workshop"><b>Workshop</b></a></div></div><div class="links"><div class="links"><a href="/jeps/0"><b>JEP Process</b></a></div></div><div class="links"><div class="about">Source code</div><div class="link"><a href="https://github.com/openjdk/">GitHub</a></div><div class="link"><a href="https://hg.openjdk.org">Mercurial</a></div></div><div class="links"><div class="about">Tools</div><div class="link"><a href="http://git-scm.org/">Git</a></div><div class="link"><a href="/jtreg/">jtreg harness</a></div></div><div class="links"><div class="about">Groups</div><div class="link"><a href="/groups/">(overview</a>,
+      <a href="/groups/archive">archive</a>)</div><div class="link"><a href="/groups/adoption">Adoption</a></div><div class="link"><a href="/groups/build">Build</a></div><div class="link"><a href="/groups/client-libs">Client Libraries</a></div><div class="link"><a href="/groups/csr">Compatibility &amp; Specification Review</a></div><div class="link"><a href="/groups/compiler">Compiler</a></div><div class="link"><a href="/groups/conformance">Conformance</a></div><div class="link"><a href="/groups/core-libs">Core Libraries</a></div><div class="link"><a href="/groups/gb">Governing Board</a></div><div class="link"><a href="/groups/hotspot">HotSpot</a></div><div class="link"><a href="/groups/ide-support">IDE Tooling &amp; Support</a></div><div class="link"><a href="/groups/i18n">Internationalization</a></div><div class="link"><a href="/groups/members">Members</a></div><div class="link"><a href="/groups/net">Networking</a></div><div class="link"><a href="/groups/porters">Porters</a></div><div class="link"><a href="/groups/quality">Quality</a></div><div class="link"><a href="/groups/security">Security</a></div><div class="link"><a href="/groups/serviceability">Serviceability</a></div><div class="link"><a href="/groups/vulnerability">Vulnerability</a></div><div class="link"><a href="/groups/web">Web</a></div></div><div class="links"><div class="about">Projects</div><div class="link">(<a href="/projects/">overview</a>,
+      <a href="/projects/archive">archive</a>)</div><div class="link"><a href="/projects/amber">Amber</a></div><div class="link"><a href="/projects/babylon">Babylon</a></div><div class="link"><a href="/projects/brisbane">Brisbane</a></div><div class="link"><a href="/projects/crac">CRaC</a></div><div class="link"><a href="/projects/code-tools">Code Tools</a></div><div class="link"><a href="/projects/coin">Coin</a></div><div class="link"><a href="/projects/cvmi">Common VM Interface</a></div><div class="link"><a href="/projects/detroit">Detroit</a></div><div class="link"><a href="/projects/guide">Developers' Guide</a></div><div class="link"><a href="/projects/duke">Duke</a></div><div class="link"><a href="/projects/graal">Graal</a></div><div class="link"><a href="/projects/icedtea">IcedTea</a></div><div class="link"><a href="/projects/jdk8u">JDK 8 Updates</a></div><div class="link"><a href="/projects/jdk9">JDK 9</a></div><div class="link"><a href="/projects/jdk">JDK</a>
+      (&#8230;,
+       <a href="/projects/jdk/25">25</a>,
+       <a href="/projects/jdk/26">26</a>,
+       <a href="/projects/jdk/27">27</a>)</div><div class="link"><a href="/projects/jdk-updates">JDK Updates</a></div><div class="link"><a href="/projects/jmc">JMC</a></div><div class="link"><a href="/projects/jigsaw">Jigsaw</a></div><div class="link"><a href="/projects/lanai">Lanai</a></div><div class="link"><a href="/projects/leyden">Leyden</a></div><div class="link"><a href="/projects/lilliput">Lilliput</a></div><div class="link"><a href="/projects/loom">Loom</a></div><div class="link"><a href="/projects/jmm">Memory Model Update</a></div><div class="link"><a href="/projects/metropolis">Metropolis</a></div><div class="link"><a href="/projects/mlvm">Multi-Language VM</a></div><div class="link"><a href="/projects/nashorn">Nashorn</a></div><div class="link"><a href="/projects/nio">New I/O</a></div><div class="link"><a href="/projects/openjfx">OpenJFX</a></div><div class="link"><a href="/projects/panama">Panama</a></div><div class="link"><a href="/projects/aarch32-port">Port: AArch32</a></div><div class="link"><a href="/projects/aarch64-port">Port: AArch64</a></div><div class="link"><a href="/projects/bsd-port">Port: BSD</a></div><div class="link"><a href="/projects/haiku-port">Port: Haiku</a></div><div class="link"><a href="/projects/mips-port">Port: MIPS</a></div><div class="link"><a href="/projects/mobile">Port: Mobile</a></div><div class="link"><a href="/projects/ppc-aix-port">Port: PowerPC/AIX</a></div><div class="link"><a href="/projects/riscv-port">Port: RISC-V</a></div><div class="link"><a href="/projects/s390x-port">Port: s390x</a></div><div class="link"><a href="/projects/sctp">SCTP</a></div><div class="link"><a href="/projects/shenandoah">Shenandoah</a></div><div class="link"><a href="/projects/skara">Skara</a></div><div class="link"><a href="/projects/sumatra">Sumatra</a></div><div class="link"><a href="/projects/tsan">Tsan</a></div><div class="link"><a href="/projects/valhalla">Valhalla</a></div><div class="link"><a href="/projects/wakefield">Wakefield</a></div><div class="link"><a href="/projects/zero">Zero</a></div><div class="link"><a href="/projects/zgc">ZGC</a></div></div><div class="buttons"><a href="https://oracle.com"><img alt="Oracle logo" width="100" height="13" src="/images/oracle.svg" /></a></div></div><div id="footer">
+
+        &#169; 2026 Oracle Corporation and/or its affiliates
+        <br /><a href="/legal/tou/">Terms of Use</a>
+        &#183;
+        
+            License: <a href="/legal/gplv2+ce.html">GPLv2</a>
+        &#183; <a href="https://www.oracle.com/us/legal/privacy/">Privacy</a>
+        &#183; <a href="https://openjdk.org/legal/openjdk-trademark-notice.html">Trademarks</a></div><script type="text/javascript"  src="/me06ly/dMCoUH/lyuXn/ok7RV/yw/SuV3zXrmO5DrwQQ57m/eQUCVyttMg/dU/BTQB5YcG0B"></script></body></html>
