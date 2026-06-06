@@ -4,6 +4,7 @@ The scanner enforces the pcc-native no-libpython claim at the package boundary:
 link commands and produced native artifacts must not mention libpython or
 Python.framework unless the package is explicitly installed in libpython mode.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -14,11 +15,12 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+from pcc.package_schema import capability_profile
 
 _LIBPYTHON_PATTERNS = (
     re.compile(r"(?:^|[\s/:=,-])libpython\d+(?:\.\d+)*", re.IGNORECASE),
     re.compile(r"(?:^|\s)-lpython\d*(?:\.\d+)*", re.IGNORECASE),
-    re.compile(r"Python\.framework", re.IGNORECASE),
+    re.compile(r"(?:^|[\s/:=,-])Python\.framework(?:[/\s:=,-]|$)"),
     re.compile(r"python\d+(?:\.\d+)*\.dll", re.IGNORECASE),
 )
 _RUNTIME_NATIVE_SUFFIXES = (".so", ".dylib", ".pyd", ".dll")
@@ -44,7 +46,9 @@ def _libpython_edges(text: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(edges))
 
 
-def _diagnostics_for_edges(edges: tuple[str, ...], *, message: str, path: str) -> list[dict[str, object]]:
+def _diagnostics_for_edges(
+    edges: tuple[str, ...], *, message: str, path: str
+) -> list[dict[str, object]]:
     return [
         {
             "code": "PCC-PKG-003",
@@ -87,7 +91,9 @@ def scan_link_command(command: str) -> dict[str, object]:
     }
 
 
-def _archive_member_scans(source: Path, *, max_bytes: int) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+def _archive_member_scans(
+    source: Path, *, max_bytes: int
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     lower = source.name.lower()
     scans: list[dict[str, object]] = []
     diagnostics: list[dict[str, object]] = []
@@ -125,7 +131,9 @@ def _archive_member_scans(source: Path, *, max_bytes: int) -> tuple[list[dict[st
         elif lower.endswith((".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")):
             with tarfile.open(source) as tf:
                 for member in tf.getmembers():
-                    if not member.isfile() or not member.name.lower().endswith(_RUNTIME_NATIVE_SUFFIXES):
+                    if not member.isfile() or not member.name.lower().endswith(
+                        _RUNTIME_NATIVE_SUFFIXES
+                    ):
                         continue
                     extracted = tf.extractfile(member)
                     if extracted is None:
@@ -198,11 +206,17 @@ def scan_artifact(path: str | Path, *, max_bytes: int = 2_000_000) -> dict[str, 
     archive_diagnostics: list[dict[str, object]] = []
     archive_uses_cpython_abi = False
     if source.name.lower().endswith(_ARCHIVE_SUFFIXES):
-        archive_scans, archive_diagnostics = _archive_member_scans(source, max_bytes=max_bytes)
+        archive_scans, archive_diagnostics = _archive_member_scans(
+            source, max_bytes=max_bytes
+        )
         for member_scan in archive_scans:
             edges = tuple(
                 dict.fromkeys(
-                    list(edges) + [str(edge) for edge in member_scan.get("link_libpython_edges", [])]
+                    list(edges)
+                    + [
+                        str(edge)
+                        for edge in member_scan.get("link_libpython_edges", [])
+                    ]
                 )
             )
             if bool(member_scan.get("uses_cpython_extension_abi")):
@@ -232,7 +246,8 @@ def _iter_native_artifacts(root: Path) -> tuple[Path, ...]:
     if not root.exists():
         return ()
     return tuple(
-        path for path in sorted(root.rglob("*"))
+        path
+        for path in sorted(root.rglob("*"))
         if path.is_file() and path.name.lower().endswith(_RUNTIME_NATIVE_SUFFIXES)
     )
 
@@ -264,19 +279,53 @@ def linkage_report(
                 cpython_abi_paths.append(str(path))
     links_libpython = bool(edges)
     uses_cpython_extension_abi = bool(cpython_abi_paths)
+    has_scans = bool(scans)
     no_libpython_runtime = (
         not links_libpython
         and not uses_cpython_extension_abi
         and abi_mode == "pcc-native"
     )
     abi_allows_cpython_extension = abi_mode in ("libpython", "cpython-compat")
+    # PKG-P0-ABI-MODE-LABELS: every import/linkage result carries explicit
+    # execution-mode labels so an A-mode (libpython / cpython-compat)
+    # compatibility SUCCESS can never silently promote to a B-mode
+    # (no-libpython / pcc-native) package claim. These labels are additive;
+    # existing keys (abi_mode, links_libpython, diagnostics, ...) are untouched.
+    # Mapping (generic, from the abi mode -- no package name special-cases):
+    #   abi_mode in (libpython, cpython-compat) -> execution_mode=cpython-compat,
+    #       native_package_claim=False (a compat import never claims native).
+    #   abi_mode == pcc-native -> execution_mode=pcc-native; native_package_claim
+    #       is True only when the artifact actually passed the pcc-native gate
+    #       with NO cpython-abi / libpython edge (i.e. no PCC-PKG-003/004 firing).
+    execution_mode = "cpython-compat" if abi_allows_cpython_extension else "pcc-native"
+    native_package_claim = (
+        execution_mode == "pcc-native"
+        and has_scans
+        and not links_libpython
+        and not uses_cpython_extension_abi
+    )
+    profile = capability_profile(
+        abi_mode, has_scans, links_libpython, uses_cpython_extension_abi
+    )
+    for scan in scans:
+        scan_links_libpython = bool(scan.get("links_libpython"))
+        scan_uses_cpython_abi = bool(scan.get("uses_cpython_extension_abi"))
+        scan["execution_mode"] = execution_mode
+        scan["native_package_claim"] = (
+            execution_mode == "pcc-native"
+            and not scan_links_libpython
+            and not scan_uses_cpython_abi
+        )
     return {
         "ok": (
             (not links_libpython or abi_mode == "libpython")
             and (not uses_cpython_extension_abi or abi_allows_cpython_extension)
         ),
         "abi_mode": abi_mode,
+        "execution_mode": execution_mode,
         "links_libpython": links_libpython,
+        "native_package_claim": native_package_claim,
+        "capability_profile": profile,
         "uses_cpython_extension_abi": uses_cpython_extension_abi,
         "cpython_extension_abi_paths": list(dict.fromkeys(cpython_abi_paths)),
         "no_libpython_runtime": no_libpython_runtime,

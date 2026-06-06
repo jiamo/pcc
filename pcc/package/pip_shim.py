@@ -188,7 +188,7 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
         )
         for pkg in packages
     ]
-    return {
+    plan: dict[str, object] = {
         "ok": all(item.get("ok") for item in installs),
         "command": command,
         "dry_run": False,
@@ -200,6 +200,53 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
         "report_path": parsed["report_path"],
         "resolver_diagnostics": resolver_diagnostics,
         "installs": installs,
+    }
+    hint = _acquire_delegation_hint(packages, installs)
+    if hint is not None:
+        plan["error"] = hint["error"]
+        plan["acquire_hint"] = hint["acquire_hint"]
+    return plan
+
+
+def _acquire_delegation_hint(
+    packages: list[str], installs: list[dict[str, object]]
+) -> dict[str, str] | None:
+    """Explain a bare-name failure instead of leaving ``ok: false`` bare.
+
+    pcc's pip is a LOCAL installer by design (docs/design/pcc-package-model.md):
+    the acquire step — downloading from PyPI, resolving versions — is delegated
+    to host tools. A requested name that is neither an existing local path nor
+    resolvable through --find-links/cache therefore needs network acquisition,
+    which pcc deliberately does not perform. Say so, with the exact next step,
+    rather than failing silently.
+    """
+    unresolved = []
+    for pkg, item in zip(packages, installs):
+        if item.get("ok"):
+            continue
+        if item.get("source_path") or item.get("installed_path"):
+            continue  # resolved locally; failure is build/install, not acquire
+        spec = str(pkg)
+        if "/" in spec or spec.startswith(".") or spec.endswith((".whl", ".tar.gz")):
+            continue  # looks like a local path/artifact (possibly mistyped)
+        unresolved.append(spec)
+    if not unresolved:
+        return None
+    names = " ".join(unresolved)
+    return {
+        "error": (
+            "cannot resolve locally: "
+            + names
+            + " (pcc's pip is a local installer; it does not download from PyPI)"
+        ),
+        "acquire_hint": (
+            "acquire first with a host tool, then install locally: "
+            "python3 -m pip download "
+            + names
+            + " -d ./wheels && pcc -m pip install "
+            + names
+            + " --find-links ./wheels"
+        ),
     }
 
 

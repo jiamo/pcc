@@ -26,7 +26,20 @@ struct tm {
     const char *tm_zone;
 };
 
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME 0
+#endif
+#ifndef CLOCK_MONOTONIC
+#if defined(__APPLE__)
+#define CLOCK_MONOTONIC 6
+#else
+#define CLOCK_MONOTONIC 1
+#endif
+#endif
+
 clock_t clock(void);
+int clock_gettime(clockid_t clock_id, struct timespec *tp);
+int clock_getres(clockid_t clock_id, struct timespec *res);
 time_t time(time_t *timer);
 double difftime(time_t end, time_t beginning);
 time_t mktime(struct tm *timeptr);

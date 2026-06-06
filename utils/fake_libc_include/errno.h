@@ -64,6 +64,9 @@
 #ifndef EAGAIN
 #define EAGAIN 35
 #endif
+#ifndef EWOULDBLOCK
+#define EWOULDBLOCK EAGAIN
+#endif
 #ifndef ENOTSUP
 #define ENOTSUP 45
 #endif

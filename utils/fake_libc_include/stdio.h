@@ -20,6 +20,8 @@ extern FILE *stderr;
 int getc_unlocked(FILE *stream);
 void flockfile(FILE *stream);
 void funlockfile(FILE *stream);
+int printf(const char *restrict format, ...);
+int fflush(FILE *stream);
 int fileno(FILE *stream);
 int fseeko(FILE *stream, off_t offset, int whence);
 off_t ftello(FILE *stream);

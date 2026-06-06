@@ -1,4 +1,5 @@
 """Generic package test-campaign dashboard helpers."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,6 +7,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from pcc.package_schema import CAMPAIGN_PROFILES, campaign_profile
 
 VALID_STATUSES = {"fail", "pass", "selected", "skip", "xfail"}
 
@@ -36,27 +38,8 @@ class CampaignRecord:
         return data
 
 
-NUMPY_CORE_L6_PROFILE = {
-    "test_multiarray.py": ("L6.2", "shape-strides-dtype"),
-    "test_numeric.py": ("L6.2", "shape-strides-dtype"),
-    "test_shape_base.py": ("L6.2", "shape-strides-dtype"),
-    "test_dtype.py": ("L6.2", "shape-strides-dtype"),
-    "test_array_coercion.py": ("L6.3", "scalar-coercion"),
-    "test_scalarmath.py": ("L6.3", "scalar-types"),
-    "test_indexing.py": ("L6.4", "indexing-slicing-broadcast"),
-    "test_stride_tricks.py": ("L6.4", "indexing-slicing-broadcast"),
-    "test_umath.py": ("L6.5", "ufunc-add-sub-mul-div"),
-    "test_ufunc.py": ("L6.5", "ufunc-add-sub-mul-div"),
-    "test_arrayprint.py": ("L6.6", "array-repr-print"),
-}
-
-
 PROFILE_DESCRIPTIONS = {
-    "numpy-core-l6": (
-        "NumPy L6 useful core-test subset profile. It selects stable "
-        "numpy/_core/tests files that map to L6.2-L6.6 feature domains; "
-        "it does not mark those tests passing."
-    ),
+    name: data["description"] for name, data in CAMPAIGN_PROFILES.items()
 }
 
 
@@ -67,7 +50,9 @@ def select_test_files(root: str | Path, pattern: str = "test_*.py") -> tuple[str
     return tuple(str(path) for path in sorted(base.rglob(pattern)) if path.is_file())
 
 
-def _matches_filters(path: str, include: tuple[str, ...], exclude: tuple[str, ...]) -> bool:
+def _matches_filters(
+    path: str, include: tuple[str, ...], exclude: tuple[str, ...]
+) -> bool:
     if include and not any(token in path for token in include):
         return False
     if exclude and any(token in path for token in exclude):
@@ -87,16 +72,18 @@ def _parse_xfail_rule(rule: str) -> tuple[str, str]:
 
 def _profile_root(root: str | Path, profile: str) -> Path:
     base = Path(root)
-    if profile == "numpy-core-l6":
-        nested = base / "numpy" / "_core" / "tests"
+    data = campaign_profile(profile)
+    if data is not None:
+        nested = base.joinpath(*data["root_parts"])
         if nested.is_dir():
             return nested
     return base
 
 
 def _profile_metadata(path: str | Path, profile: str) -> tuple[str, str]:
-    if profile == "numpy-core-l6":
-        return NUMPY_CORE_L6_PROFILE.get(Path(path).name, ("", ""))
+    data = campaign_profile(profile)
+    if data is not None:
+        return data["files"].get(Path(path).name, ("", ""))
     return "", ""
 
 
@@ -131,9 +118,13 @@ def campaign_selection(
     exclude_tuple = tuple(exclude)
     parsed_rules = tuple(_parse_xfail_rule(rule) for rule in xfail_rules)
     scan_root = _profile_root(root, profile)
-    effective_area = "numpy-core" if profile == "numpy-core-l6" and area == "core" else area
+    profile_data = campaign_profile(profile)
+    effective_area = area
+    if profile_data is not None and area == profile_data["default_area"]:
+        effective_area = profile_data["area"]
     selected = [
-        path for path in select_test_files(scan_root, pattern)
+        path
+        for path in select_test_files(scan_root, pattern)
         if _profile_selected(path, profile)
         and _matches_filters(path, include_tuple, exclude_tuple)
     ]
@@ -166,8 +157,8 @@ def campaign_selection(
         "profile": profile,
         "profile_description": PROFILE_DESCRIPTIONS.get(profile, ""),
         "selection_rule": (
-            "fixed NumPy L6 core-test filename profile under numpy/_core/tests"
-            if profile == "numpy-core-l6"
+            profile_data["selection_rule"]
+            if profile_data is not None
             else "pattern/include/exclude"
         ),
         "include": list(include_tuple),
@@ -182,7 +173,9 @@ def campaign_selection(
     }
 
 
-def campaign_dashboard(records: tuple[CampaignRecord, ...] | list[CampaignRecord]) -> dict[str, object]:
+def campaign_dashboard(
+    records: tuple[CampaignRecord, ...] | list[CampaignRecord],
+) -> dict[str, object]:
     by_status = {status: 0 for status in sorted(VALID_STATUSES)}
     by_area: dict[str, dict[str, int]] = {}
     xfail_taxonomy: dict[str, int] = {}
@@ -190,7 +183,9 @@ def campaign_dashboard(records: tuple[CampaignRecord, ...] | list[CampaignRecord
         if record.status not in VALID_STATUSES:
             raise ValueError(f"unknown campaign status {record.status!r}")
         by_status[record.status] += 1
-        area_counts = by_area.setdefault(record.area, {status: 0 for status in sorted(VALID_STATUSES)})
+        area_counts = by_area.setdefault(
+            record.area, {status: 0 for status in sorted(VALID_STATUSES)}
+        )
         area_counts[record.status] += 1
         if record.status == "xfail":
             reason = record.reason or "unspecified"

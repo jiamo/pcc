@@ -16,6 +16,15 @@
 #define SOCK_STREAM 1
 #define SOCK_DGRAM 2
 
+#define SOL_SOCKET 0xffff
+#define SO_REUSEADDR 0x0004
+#define SO_REUSEPORT 0x0200
+#define SO_NOSIGPIPE 0x1022
+
+#define SHUT_RD 0
+#define SHUT_WR 1
+#define SHUT_RDWR 2
+
 /* netdb.h includes sys/socket.h via the platform header chain; declare
  * ``struct sockaddr`` here as well in case sys/socket.h is included
  * without netdb.h. The matching ``addrinfo`` shape lives in netdb.h. */
@@ -25,6 +34,19 @@ typedef unsigned int socklen_t;
 struct sockaddr {
     unsigned short sa_family;
     char sa_data[14];
+};
+#endif
+
+/* Darwin-layout sockaddr_storage: 128 bytes, 8-byte aligned, used as a
+ * generic address buffer (e.g. py_asyncio_io.c accept/getpeername). */
+#ifndef __PCC_FAKE_LIBC_SOCKADDR_STORAGE_DEFINED
+#define __PCC_FAKE_LIBC_SOCKADDR_STORAGE_DEFINED
+struct sockaddr_storage {
+    __uint8_t ss_len;
+    __uint8_t ss_family;
+    char      __ss_pad1[6];
+    long long __ss_align;
+    char      __ss_pad2[112];
 };
 #endif
 

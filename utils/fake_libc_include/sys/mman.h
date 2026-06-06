@@ -23,7 +23,19 @@
 #ifndef MAP_FAILED
 #define MAP_FAILED ((void *)-1)
 #endif
+#ifndef MAP_ANONYMOUS
+#if defined(__APPLE__)
+#define MAP_ANONYMOUS 0x1000
+#else
+#define MAP_ANONYMOUS 0x0020
+#endif
+#endif
+#ifndef MAP_ANON
+#define MAP_ANON MAP_ANONYMOUS
+#endif
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset);
 int munmap(void *addr, size_t len);
+int mlock(const void *addr, size_t len);
+int munlock(const void *addr, size_t len);
 void *mremap(void *addr, size_t old_size, size_t new_size, int flags, ...);

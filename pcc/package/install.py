@@ -4,6 +4,7 @@ This is a real local/cache install skeleton, not a NumPy-specific shortcut.
 It copies local source trees or extracts wheel/sdist artifacts into a pcc site
 directory and writes a manifest that future import/build steps can consume.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -21,15 +22,25 @@ import zipfile
 from pathlib import Path
 from typing import Iterable
 
+from pcc.package_schema import (
+    PACKAGE_MANIFEST_SCHEMA,
+    PACKAGE_MANIFEST_SCHEMA_VERSION,
+    capability_profile,
+    wheel_tag_fields,
+    wheel_tags,
+)
+
 from .inspect import inspect_package
 from .linkage import linkage_report
 from .metadata import inspect_artifact, pcc_native_wheel_tag
-
 
 _REQ_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+")
 _VERSION_TOKEN_RE = re.compile(r"\d+|[A-Za-z]+")
 _REPOSITORY_MANIFEST = "pcc-wheel-repository.json"
 _ARTIFACT_SUFFIXES = (".whl", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip")
+_IMPORTABLE_SOURCE_SUFFIXES = (".py", ".pyi")
+_IMPORTABLE_NATIVE_SUFFIXES = (".so", ".pyd", ".dll", ".dylib")
+_PACKAGE_METADATA_DIR_SUFFIXES = (".dist-info", ".egg-info")
 
 
 def _repo_root() -> Path:
@@ -78,11 +89,8 @@ def _artifact_version_text(path: Path) -> str:
 
 
 def _wheel_tags_from_name(name: str) -> tuple[str | None, str | None, str | None]:
-    stem = name[:-4] if name.endswith(".whl") else name
-    parts = stem.split("-")
-    if len(parts) < 5:
-        return None, None, None
-    return parts[-3], parts[-2], parts[-1]
+    fields = wheel_tag_fields(name)
+    return fields[1] or None, fields[2] or None, fields[3] or None
 
 
 def _version_key(version: str) -> tuple[tuple[int, object], ...]:
@@ -115,7 +123,9 @@ def _artifact_compatibility_reason(path: Path, *, abi: str) -> tuple[bool, str]:
     return _artifact_compatibility_reason_from_name(path.name, abi=abi)
 
 
-def _artifact_compatibility_reason_from_name(name: str, *, abi: str) -> tuple[bool, str]:
+def _artifact_compatibility_reason_from_name(
+    name: str, *, abi: str
+) -> tuple[bool, str]:
     if abi != "pcc-native":
         return True, "abi_mode_allows_artifact"
     lower = name.lower()
@@ -216,7 +226,9 @@ def artifact_requires_dist_diagnostics(path: str | Path) -> tuple[str, ...]:
         for metadata in metadata_files:
             try:
                 diagnostics.extend(
-                    _requires_dist_diagnostics_text(metadata.read_text(encoding="utf-8"))
+                    _requires_dist_diagnostics_text(
+                        metadata.read_text(encoding="utf-8")
+                    )
                 )
             except OSError:
                 continue
@@ -226,7 +238,9 @@ def artifact_requires_dist_diagnostics(path: str | Path) -> tuple[str, ...]:
         if lower.endswith(".whl") or lower.endswith(".zip"):
             with zipfile.ZipFile(source) as zf:
                 for name in zf.namelist():
-                    if name.endswith(".dist-info/METADATA") or name.endswith("PKG-INFO"):
+                    if name.endswith(".dist-info/METADATA") or name.endswith(
+                        "PKG-INFO"
+                    ):
                         diagnostics.extend(
                             _requires_dist_diagnostics_text(
                                 zf.read(name).decode("utf-8", errors="replace")
@@ -258,7 +272,9 @@ def artifact_requires_dist(path: str | Path) -> tuple[str, ...]:
         deps: list[str] = []
         for metadata in metadata_files:
             try:
-                deps.extend(_metadata_requires_dist_text(metadata.read_text(encoding="utf-8")))
+                deps.extend(
+                    _metadata_requires_dist_text(metadata.read_text(encoding="utf-8"))
+                )
             except OSError:
                 continue
         return tuple(dict.fromkeys(deps))
@@ -268,7 +284,9 @@ def artifact_requires_dist(path: str | Path) -> tuple[str, ...]:
         if lower.endswith(".whl") or lower.endswith(".zip"):
             with zipfile.ZipFile(source) as zf:
                 for name in zf.namelist():
-                    if name.endswith(".dist-info/METADATA") or name.endswith("PKG-INFO"):
+                    if name.endswith(".dist-info/METADATA") or name.endswith(
+                        "PKG-INFO"
+                    ):
                         deps.extend(
                             _metadata_requires_dist_text(
                                 zf.read(name).decode("utf-8", errors="replace")
@@ -305,7 +323,9 @@ def _find_links_artifact_with_origin(
     for link in find_links:
         root = Path(link).expanduser()
         if root.is_dir():
-            manifest_matches.extend(_repository_manifest_candidates(root, expected, abi=abi))
+            manifest_matches.extend(
+                _repository_manifest_candidates(root, expected, abi=abi)
+            )
         if root.is_file():
             candidates = [root]
         elif root.is_dir():
@@ -351,7 +371,9 @@ def _simple_index_package_url(index_url: str, package: str) -> str:
 
 def _simple_index_links(page_text: str, page_url: str) -> list[tuple[str, str]]:
     links: list[tuple[str, str]] = []
-    for match in re.finditer(r"""href\s*=\s*['"]([^'"]+)['"]""", page_text, re.IGNORECASE):
+    for match in re.finditer(
+        r"""href\s*=\s*['"]([^'"]+)['"]""", page_text, re.IGNORECASE
+    ):
         href = match.group(1)
         url = urllib.parse.urljoin(page_url, href)
         name = Path(urllib.parse.urlparse(url).path).name
@@ -379,9 +401,14 @@ def _download_index_artifact(
         for artifact_url, filename in _simple_index_links(page_text, page_url):
             if not filename.endswith(_ARTIFACT_SUFFIXES):
                 continue
-            if _normalized_package_name(_artifact_project_name(Path(filename))) != expected:
+            if (
+                _normalized_package_name(_artifact_project_name(Path(filename)))
+                != expected
+            ):
                 continue
-            allowed, reason = _artifact_compatibility_reason_from_name(filename, abi=abi)
+            allowed, reason = _artifact_compatibility_reason_from_name(
+                filename, abi=abi
+            )
             if allowed:
                 candidates.append((artifact_url, filename, reason))
     if not candidates:
@@ -409,7 +436,9 @@ def local_resolver_diagnostics(
     index_urls: list[str] | tuple[str, ...] = (),
     abi: str = "pcc-native",
 ) -> list[str]:
-    cache = Path(cache_dir).expanduser().resolve() if cache_dir else _default_cache_dir()
+    cache = (
+        Path(cache_dir).expanduser().resolve() if cache_dir else _default_cache_dir()
+    )
     diagnostics: list[str] = []
     for package in resolve_local_install_order(
         packages,
@@ -418,7 +447,9 @@ def local_resolver_diagnostics(
         index_urls=index_urls,
         abi=abi,
     ):
-        source = _resolve_spec(str(package), cache, find_links, index_urls=index_urls, abi=abi)
+        source = _resolve_spec(
+            str(package), cache, find_links, index_urls=index_urls, abi=abi
+        )
         if source is None:
             continue
         for diagnostic in artifact_requires_dist_diagnostics(source):
@@ -434,7 +465,9 @@ def resolve_local_install_order(
     index_urls: list[str] | tuple[str, ...] = (),
     abi: str = "pcc-native",
 ) -> list[str]:
-    cache = Path(cache_dir).expanduser().resolve() if cache_dir else _default_cache_dir()
+    cache = (
+        Path(cache_dir).expanduser().resolve() if cache_dir else _default_cache_dir()
+    )
     ordered: list[str] = []
     visiting: set[str] = set()
     done: set[str] = set()
@@ -447,7 +480,12 @@ def resolve_local_install_order(
         source = _resolve_spec(pkg, cache, find_links, index_urls=index_urls, abi=abi)
         if source is not None:
             for dep in artifact_requires_dist(source):
-                if _resolve_spec(dep, cache, find_links, index_urls=index_urls, abi=abi) is not None:
+                if (
+                    _resolve_spec(
+                        dep, cache, find_links, index_urls=index_urls, abi=abi
+                    )
+                    is not None
+                ):
                     visit(dep)
         visiting.remove(key)
         done.add(key)
@@ -512,11 +550,16 @@ def _resolve_spec_with_origin(
 def _iter_importable_roots(source: Path) -> Iterable[Path]:
     """Yield top-level importable package/module payloads from a source tree."""
     bases = [source, source / "src"]
-    visible_dirs = [
-        child
-        for child in sorted(source.iterdir()) if source.is_dir()
-        if child.is_dir() and not child.name.startswith(".") and child.name != "__pycache__"
-    ] if source.is_dir() else []
+    visible_dirs = (
+        [
+            child
+            for child in sorted(source.iterdir())
+            if source.is_dir()
+            if child.is_dir() and not _skip_importable_dir(child)
+        ]
+        if source.is_dir()
+        else []
+    )
     if len(visible_dirs) == 1:
         bases.append(visible_dirs[0])
         bases.append(visible_dirs[0] / "src")
@@ -525,16 +568,19 @@ def _iter_importable_roots(source: Path) -> Iterable[Path]:
     for base in bases:
         if not base.is_dir():
             continue
-        if (base / "__init__.py").is_file():
+        if (base / "__init__.py").is_file() or _has_direct_importable_payload(base):
             resolved = base.resolve()
             if resolved not in seen:
                 seen.add(resolved)
                 yield base
             continue
         for child in sorted(base.iterdir()):
-            if child.name.startswith(".") or child.name == "__pycache__":
+            if _skip_importable_dir(child):
                 continue
-            if child.is_dir() and (child / "__init__.py").is_file():
+            if child.is_dir() and (
+                (child / "__init__.py").is_file()
+                or _has_direct_importable_payload(child)
+            ):
                 resolved = child.resolve()
                 if resolved not in seen:
                     seen.add(resolved)
@@ -546,7 +592,46 @@ def _iter_importable_roots(source: Path) -> Iterable[Path]:
                     yield child
 
 
-def _copy_importable_payload(source: Path, site: Path, metadata_name: str) -> tuple[Path, list[str]]:
+def _skip_importable_dir(path: Path) -> bool:
+    name = path.name
+    if name.startswith(".") or name == "__pycache__":
+        return True
+    return _name_endswith_any(name, _PACKAGE_METADATA_DIR_SUFFIXES)
+
+
+def _has_direct_importable_payload(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    path_text = str(path)
+    try:
+        names = os.listdir(path_text)
+    except OSError:
+        return False
+    for name in names:
+        if name.startswith(".") or name == "__pycache__":
+            continue
+        if name == "setup.py":
+            continue
+        child_path = os.path.join(path_text, name)
+        if not os.path.isfile(child_path):
+            continue
+        if _name_endswith_any(name, _IMPORTABLE_SOURCE_SUFFIXES):
+            return True
+        if _name_endswith_any(name.lower(), _IMPORTABLE_NATIVE_SUFFIXES):
+            return True
+    return False
+
+
+def _name_endswith_any(name: str, suffixes: tuple[str, ...]) -> bool:
+    for suffix in suffixes:
+        if name.endswith(suffix):
+            return True
+    return False
+
+
+def _copy_importable_payload(
+    source: Path, site: Path, metadata_name: str
+) -> tuple[Path, list[str]]:
     importable = list(_iter_importable_roots(source))
     if not importable:
         install_root = site / metadata_name
@@ -577,7 +662,9 @@ def _copy_importable_payload(source: Path, site: Path, metadata_name: str) -> tu
     return install_root, payloads
 
 
-def _overlay_meson_build_payloads(source: Path, site: Path, installed: list[str]) -> list[str]:
+def _overlay_meson_build_payloads(
+    source: Path, site: Path, installed: list[str]
+) -> list[str]:
     """Overlay pcc-managed Meson build outputs onto an installed source tree.
 
     Meson build directories often contain generated Python files, headers, and
@@ -636,7 +723,9 @@ def _copy_payloads_to_site(
     return install_root, installed
 
 
-def _copy_or_extract(source: Path, site: Path, metadata_name: str) -> tuple[Path, list[str]]:
+def _copy_or_extract(
+    source: Path, site: Path, metadata_name: str
+) -> tuple[Path, list[str]]:
     site.mkdir(parents=True, exist_ok=True)
     if source.is_dir():
         install_root, installed = _copy_importable_payload(source, site, metadata_name)
@@ -676,7 +765,9 @@ def _copy_or_extract(source: Path, site: Path, metadata_name: str) -> tuple[Path
     return install_root, [str(artifact_dir / source.name)]
 
 
-def _build_requirement_tool_wrappers(requires: tuple[str, ...]) -> tempfile.TemporaryDirectory[str] | None:
+def _build_requirement_tool_wrappers(
+    requires: tuple[str, ...],
+) -> tempfile.TemporaryDirectory[str] | None:
     cython_requirement = None
     for requirement in requires:
         if requirement.lower().startswith("cython"):
@@ -688,9 +779,7 @@ def _build_requirement_tool_wrappers(requires: tuple[str, ...]) -> tempfile.Temp
     bin_dir = Path(temp_dir.name)
     script = (
         "#!/bin/sh\n"
-        "exec uv run --with "
-        + repr(cython_requirement)
-        + " cython \"$@\"\n"
+        "exec uv run --with " + repr(cython_requirement) + ' cython "$@"\n'
     )
     for name in ("cython", "cython3"):
         tool = bin_dir / name
@@ -699,7 +788,9 @@ def _build_requirement_tool_wrappers(requires: tuple[str, ...]) -> tempfile.Temp
     return temp_dir
 
 
-def _meson_setup_command(source: Path, build_dir: Path, path_env: str) -> list[str] | None:
+def _meson_setup_command(
+    source: Path, build_dir: Path, path_env: str
+) -> list[str] | None:
     meson_tool = shutil.which("meson", path=path_env)
     if meson_tool is not None:
         return [meson_tool, "setup", str(build_dir), str(source)]
@@ -709,7 +800,9 @@ def _meson_setup_command(source: Path, build_dir: Path, path_env: str) -> list[s
     return None
 
 
-def _ensure_meson_build_outputs(source: Path, requires: tuple[str, ...]) -> dict[str, object]:
+def _ensure_meson_build_outputs(
+    source: Path, requires: tuple[str, ...]
+) -> dict[str, object]:
     if not (source / "meson.build").is_file():
         return {"ok": True, "skipped": True, "reason": "no_meson_build", "actions": []}
     build_dir = source / "build" / "pcc-package" / "meson-build"
@@ -834,7 +927,9 @@ def install_package(
     use_cache: bool = True,
     build_source: bool = False,
 ) -> dict[str, object]:
-    cache = Path(cache_dir).expanduser().resolve() if cache_dir else _default_cache_dir()
+    cache = (
+        Path(cache_dir).expanduser().resolve() if cache_dir else _default_cache_dir()
+    )
     source, resolved_from = _resolve_spec_with_origin(
         spec,
         cache if use_cache else None,
@@ -851,7 +946,9 @@ def install_package(
 
     metadata_name = "" if Path(spec).expanduser().exists() else spec
     metadata = inspect_artifact(metadata_name, source)
-    inspection = inspect_package(metadata.name, str(source) if source.is_dir() else None)
+    inspection = inspect_package(
+        metadata.name, str(source) if source.is_dir() else None
+    )
     build_report: dict[str, object] = {
         "ok": True,
         "skipped": True,
@@ -860,13 +957,35 @@ def install_package(
     }
     if build_source and source.is_dir():
         build_report = _ensure_meson_build_outputs(source, metadata.pyproject_requires)
-    site = Path(target_dir).expanduser().resolve() if target_dir else _default_site_dir()
+    site = (
+        Path(target_dir).expanduser().resolve() if target_dir else _default_site_dir()
+    )
     install_root, installed_payloads = _copy_or_extract(source, site, metadata.name)
 
     cache_record = cache / metadata.name
     scan_roots = installed_payloads if installed_payloads else [str(install_root)]
     linkage = linkage_report(roots=scan_roots, abi_mode=abi)
     install_ok = bool(linkage.get("ok")) and bool(build_report.get("ok", True))
+
+    # Claim separation (PKG-P0-INSTALL-IMPORT-SEPARATION): installing an
+    # artifact (placing files + recording its wheel/ABI tags) proves nothing
+    # about import, pcc-native ABI support, or no-libpython package support.
+    # These fields are recorded as SEPARATE, honestly named facts so that an
+    # install-success reader can never mistake it for import success or a
+    # pcc-native support claim. Import is a distinct, later gate that this
+    # install flow does not run, so it is never attempted here.
+    artifact_wheel_tags = wheel_tags(source.name)
+    import_attempted = False
+    # import_success stays None precisely because import was not attempted; it
+    # is a tri-state (True/False only after a real import gate runs).
+    import_success = None
+    # Install success (even of a CPython-ABI wheel accepted in cpython-compat/
+    # libpython mode) is NEVER a pcc-native package claim. A native package
+    # claim would require a separate, proven import/ABI gate under pcc-native
+    # mode, which this flow does not perform.
+    native_package_claim = False
+    install_native_package_claim = False
+    linkage_native_package_claim = bool(linkage.get("native_package_claim"))
 
     if install_ok:
         cache.mkdir(parents=True, exist_ok=True)
@@ -881,15 +1000,25 @@ def install_package(
             cache_record.mkdir(parents=True, exist_ok=True)
 
     manifest = {
-        "schema_version": 1,
+        "manifest_schema": PACKAGE_MANIFEST_SCHEMA,
+        "schema_version": PACKAGE_MANIFEST_SCHEMA_VERSION,
         "ok": install_ok,
+        "install_success": install_ok,
+        "import_attempted": import_attempted,
+        "import_success": import_success,
+        "install_native_package_claim": install_native_package_claim,
+        "linkage_native_package_claim": linkage_native_package_claim,
+        "native_package_claim": native_package_claim,
+        "wheel_tags": artifact_wheel_tags,
         "name": metadata.name,
         "spec": spec,
         "abi_mode": abi,
         "source_path": str(source),
         "resolved_from": resolved_from or "unresolved",
         "installed_path": str(install_root),
-        "installed_payload": installed_payloads[0] if installed_payloads else str(install_root),
+        "installed_payload": (
+            installed_payloads[0] if installed_payloads else str(install_root)
+        ),
         "installed_payloads": installed_payloads,
         "cache_record": str(cache_record),
         "links_libpython": bool(linkage.get("links_libpython")),
@@ -902,9 +1031,17 @@ def install_package(
         "diagnostics": list(linkage.get("diagnostics", [])),
         "inspection": inspection.as_dict(),
         "build_report": build_report,
+        "capability_profile": capability_profile(
+            abi,
+            bool(linkage.get("scans")),
+            bool(linkage.get("links_libpython")),
+            bool(linkage.get("uses_cpython_extension_abi")),
+        ),
     }
     manifest_path = install_root / "pcc-package.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
     if install_ok:
         (cache_record / "pcc-package.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True),

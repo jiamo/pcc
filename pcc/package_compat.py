@@ -1,4 +1,5 @@
 """Package/ecosystem compatibility levels from the multi-year roadmap."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,15 +28,53 @@ class PackageTarget:
 
 
 _TARGETS = {
-    "pytest": PackageTarget("pytest", LEVEL_COMPAT_PYTHON, "test runner compatibility target"),
-    "packaging": PackageTarget("packaging", LEVEL_COMPAT_PYTHON, "pure-Python packaging metadata"),
-    "numpy": PackageTarget("numpy", LEVEL_C_EXTENSION_ABI, "unchanged import via CPython C-API/extension ABI first"),
+    "pytest": PackageTarget(
+        "pytest", LEVEL_COMPAT_PYTHON, "test runner compatibility target"
+    ),
+    "packaging": PackageTarget(
+        "packaging", LEVEL_COMPAT_PYTHON, "pure-Python packaging metadata"
+    ),
+    "numpy": PackageTarget(
+        "numpy",
+        LEVEL_C_EXTENSION_ABI,
+        "unchanged import via CPython C-API/extension ABI first",
+    ),
+    "mlx": PackageTarget(
+        "mlx",
+        LEVEL_C_EXTENSION_ABI,
+        "Apple MLX C++/Metal extension ABI and array-runtime target; cpython-compat import first",
+    ),
+    "vllm": PackageTarget(
+        "vllm",
+        LEVEL_C_EXTENSION_ABI,
+        "vLLM PyTorch/CUDA extension stack target; cpython-compat import first",
+    ),
+    "tilelang": PackageTarget(
+        "tilelang",
+        LEVEL_C_EXTENSION_ABI,
+        "TileLang TVM/GPU kernel DSL compiler stack target; cpython-compat import first",
+    ),
+    "vllm-metal": PackageTarget(
+        "vllm-metal",
+        LEVEL_C_EXTENSION_ABI,
+        "vLLM-Metal Apple Silicon extension stack on MLX/Metal; cpython-compat import first",
+    ),
     "cffi": PackageTarget("cffi", LEVEL_C_EXTENSION_ABI, "C FFI package target"),
-    "pybind11": PackageTarget("pybind11", LEVEL_C_EXTENSION_ABI, "C++ extension ABI target"),
-    "requests": PackageTarget("requests", LEVEL_NOLIBPYTHON_PYTHON, "pure-Python network stack smoke"),
-    "pandas": PackageTarget("pandas", LEVEL_C_EXTENSION_ABI, "depends on NumPy ABI progress"),
-    "scipy": PackageTarget("scipy", LEVEL_C_EXTENSION_ABI, "scientific extension stack audit target"),
-    "scikit-learn": PackageTarget("scikit-learn", LEVEL_C_EXTENSION_ABI, "C/C++ extension downstream audit target"),
+    "pybind11": PackageTarget(
+        "pybind11", LEVEL_C_EXTENSION_ABI, "C++ extension ABI target"
+    ),
+    "requests": PackageTarget(
+        "requests", LEVEL_NOLIBPYTHON_PYTHON, "pure-Python network stack smoke"
+    ),
+    "pandas": PackageTarget(
+        "pandas", LEVEL_C_EXTENSION_ABI, "depends on NumPy ABI progress"
+    ),
+    "scipy": PackageTarget(
+        "scipy", LEVEL_C_EXTENSION_ABI, "scientific extension stack audit target"
+    ),
+    "scikit-learn": PackageTarget(
+        "scikit-learn", LEVEL_C_EXTENSION_ABI, "C/C++ extension downstream audit target"
+    ),
 }
 
 

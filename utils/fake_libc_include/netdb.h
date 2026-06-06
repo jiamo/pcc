@@ -9,6 +9,10 @@
 #ifndef __PCC_FAKE_LIBC_ADDRINFO_DEFINED
 #define __PCC_FAKE_LIBC_ADDRINFO_DEFINED
 
+#ifndef AI_PASSIVE
+#define AI_PASSIVE 0x00000001
+#endif
+
 typedef unsigned int socklen_t;
 
 struct sockaddr {

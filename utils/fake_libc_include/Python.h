@@ -29,6 +29,10 @@ extern "C" {
 #define PY_SSIZE_T_CLEAN 1
 #endif
 
+#ifndef PyDoc_STRVAR
+#define PyDoc_STRVAR(name, str) static const char name[] = str
+#endif
+
 /* CPython's master include guard. numpy headers gate on it
  * (`#ifndef Py_PYTHON_H #error "Python headers needed..."`). */
 #ifndef Py_PYTHON_H
@@ -84,6 +88,9 @@ struct PyObject {
 #ifndef Py_SAFE_DOWNCAST
 #define Py_SAFE_DOWNCAST(VALUE, WIDE, NARROW) ((NARROW)(VALUE))
 #endif
+#ifndef Py_IS_FINITE
+#define Py_IS_FINITE(X) isfinite(X)
+#endif
 #ifndef PyAPI_DATA
 #define PyAPI_DATA(RTYPE) extern RTYPE
 #endif
@@ -125,6 +132,7 @@ typedef uint8_t Py_UCS1;
 typedef uint16_t Py_UCS2;
 typedef uint32_t Py_UCS4;
 typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
+typedef PyObject *(*PyCFunctionWithKeywords)(PyObject *, PyObject *, PyObject *);
 typedef void (*PyCapsule_Destructor)(PyObject *);
 typedef int PyGILState_STATE;
 
@@ -421,6 +429,24 @@ typedef struct PyType_Spec {
     PyType_Slot *slots;
 } PyType_Spec;
 
+#define Py_tp_base 48
+#define Py_tp_call 50
+#define Py_tp_clear 51
+#define Py_tp_dealloc 52
+#define Py_tp_doc 56
+#define Py_tp_hash 59
+#define Py_tp_init 60
+#define Py_tp_iter 62
+#define Py_tp_iternext 63
+#define Py_tp_methods 64
+#define Py_tp_new 65
+#define Py_tp_repr 66
+#define Py_tp_richcompare 67
+#define Py_tp_str 70
+#define Py_tp_traverse 71
+#define Py_tp_members 72
+#define Py_tp_getset 73
+
 #define METH_VARARGS 0x0001
 /* PyInit must stay EXPORTED so the no-libpython loader's dlsym finds it. numpy
  * compiles with -fvisibility=hidden, which would otherwise hide PyInit; mirror
@@ -478,19 +504,22 @@ void PyThread_release_lock(PyThread_type_lock lock);
  * type_tag -> PyTypeObject). Declarations suffice for the C-extension compile;
  * the runtime impls are the type-object-model linkage (L3.5). */
 PyTypeObject *pcc_capi_type(PyObject *o);
+PyTypeObject **pcc_capi_type_addr(PyObject *o);
 void pcc_capi_set_type(PyObject *o, PyTypeObject *t);
 int pcc_capi_typecheck(PyObject *o, PyTypeObject *t);
+Py_ssize_t pcc_capi_size(PyObject *o);
+void pcc_capi_set_size(PyObject *o, Py_ssize_t size);
 #ifndef Py_TYPE
-#define Py_TYPE(o) pcc_capi_type((PyObject *)(o))
+#define Py_TYPE(o) (*pcc_capi_type_addr((PyObject *)(o)))
 #endif
 #ifndef Py_SIZE
-#define Py_SIZE(o) (((PyVarObject *)(o))->ob_size)
+#define Py_SIZE(o) pcc_capi_size((PyObject *)(o))
 #endif
 #ifndef Py_SET_TYPE
 #define Py_SET_TYPE(o, t) pcc_capi_set_type((PyObject *)(o), (t))
 #endif
 #ifndef Py_SET_SIZE
-#define Py_SET_SIZE(o, s) (((PyVarObject *)(o))->ob_size = (s))
+#define Py_SET_SIZE(o, s) pcc_capi_set_size((PyObject *)(o), (s))
 #endif
 #ifndef Py_IS_TYPE
 #define Py_IS_TYPE(o, t) (Py_TYPE(o) == (t))
@@ -534,7 +563,7 @@ int pcc_capi_typecheck(PyObject *o, PyTypeObject *t);
 extern PyTypeObject PyType_Type, PyBaseObject_Type, PyTuple_Type, PyList_Type,
     PyDict_Type, PyUnicode_Type, PyLong_Type, PyFloat_Type, PyBool_Type,
     PyBytes_Type, PyByteArray_Type, PySet_Type, PyFrozenSet_Type, PySlice_Type,
-    PyComplex_Type, PyModule_Type, PyCFunction_Type,
+    PyComplex_Type, PyModule_Type, PyFunction_Type, PyCFunction_Type,
     PyMemberDescr_Type, PyGetSetDescr_Type, PyMethodDescr_Type,
     PyDictProxy_Type, PyMemoryView_Type;
 
@@ -554,8 +583,9 @@ PyObject *PyContextVar_New(const char *name, PyObject *def);
 PyObject *PyModuleDef_Init(PyModuleDef *def);
 double PyOS_string_to_double(const char *s, char **endptr, PyObject *overflow_exc);
 unsigned long PyType_GetFlags(PyTypeObject *type);
+void *PyType_GetSlot(PyTypeObject *type, int slot);
 int PyArg_UnpackTuple(PyObject *args, const char *name, Py_ssize_t min,
-                      Py_ssize_t max, ...);
+                       Py_ssize_t max, ...);
 PyObject *_PyObject_GC_New(PyTypeObject *type);
 void PyObject_GC_Track(void *op);
 void PyObject_GC_UnTrack(void *op);
@@ -631,6 +661,14 @@ void PyException_SetContext(PyObject *self, PyObject *context);
 int PyException_SetTraceback(PyObject *self, PyObject *tb);
 int PyObject_AsFileDescriptor(PyObject *o);
 int PyType_Ready(PyTypeObject *type);
+PyObject *PyType_FromSpec(PyType_Spec *spec);
+PyObject *PyType_FromModuleAndSpec(
+    PyObject *module,
+    PyType_Spec *spec,
+    PyObject *bases
+);
+PyObject *PyType_GetModule(PyTypeObject *type);
+PyObject *PyType_GetModuleByDef(PyTypeObject *type, PyModuleDef *def);
 PyObject *PyType_GenericNew(PyTypeObject *type, PyObject *args, PyObject *kwds);
 PyObject *PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems);
 
@@ -644,6 +682,9 @@ PyObject *PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems);
 #define Py_TPFLAGS_HAVE_VERSION_TAG (1UL << 18)
 #define Py_TPFLAGS_IS_ABSTRACT (1UL << 20)
 #define Py_TPFLAGS_LONG_SUBCLASS (1UL << 24)
+/* pcc-private: tp_dealloc only releases extension payload fields; pcc frees
+ * the object body through pcc_gc_free_object_memory after the hook returns. */
+#define PCC_TPFLAGS_MANAGED_DEALLOC (1UL << 62)
 #define Py_TPFLAGS_LIST_SUBCLASS (1UL << 25)
 #define Py_TPFLAGS_TUPLE_SUBCLASS (1UL << 26)
 #define Py_TPFLAGS_BYTES_SUBCLASS (1UL << 27)
@@ -792,8 +833,9 @@ int _PyBytes_Resize(PyObject **bytes, Py_ssize_t newsize);
 PyObject *PyDict_GetItemWithError(PyObject *dp, PyObject *key);
 PyObject *_PyDict_GetItemWithError(PyObject *dp, PyObject *key);
 int _PyObject_GC_IS_TRACKED(PyObject *op);
+int pcc_capi_visit_slot(PyObject **slot, visitproc visit, void *arg);
 #define Py_CHARMASK(c) ((unsigned char)((c) & 0xff))
-#define Py_VISIT(op) do { if (op) { int _vret = visit((PyObject *)(op), arg); if (_vret) return _vret; } } while (0)
+#define Py_VISIT(op) do { if (op) { int _vret = pcc_capi_visit_slot((PyObject **)&(op), visit, arg); if (_vret) return _vret; } } while (0)
 #define Py_TPFLAGS_HAVE_VECTORCALL (1UL << 11)
 #define Py_TPFLAGS_METHOD_DESCRIPTOR (1UL << 17)
 #define _PyObject_VAR_SIZE(typeobj, nitems) \
@@ -825,6 +867,7 @@ extern PyObject *PyExc_ZeroDivisionError;
 extern PyObject *PyExc_ReferenceError;
 extern PyObject *PyExc_BufferError;
 extern PyObject *PyExc_ImportError;
+extern PyObject *PyExc_ModuleNotFoundError;
 extern PyObject *PyExc_ModuleNotFoundError;
 extern PyObject *PyExc_ImportWarning;
 extern PyObject *PyExc_FloatingPointError;
@@ -954,6 +997,7 @@ int PyComplex_CheckExact(PyObject *obj);
 
 PyObject *PyUnicode_FromString(const char *value);
 PyObject *PyUnicode_FromStringAndSize(const char *value, Py_ssize_t len);
+PyObject *PyUnicode_New(Py_ssize_t size, Py_UCS4 maxchar);
 PyObject *PyUnicode_FromFormat(const char *format, ...);
 PyObject *PyUnicode_FromFormatV(const char *format, va_list vargs);
 PyObject *PyUnicode_InternFromString(const char *value);
@@ -962,6 +1006,17 @@ PyObject *PyUnicode_FromOrdinal(int ordinal);
 Py_UCS4 *PyUnicode_AsUCS4(PyObject *unicode, Py_UCS4 *buffer, Py_ssize_t buflen, int copy_null);
 Py_UCS4 *PyUnicode_AsUCS4Copy(PyObject *unicode);
 PyObject *PyUnicode_FromEncodedObject(PyObject *obj, const char *encoding, const char *errors);
+PyObject *PyUnicode_DecodeUTF8(
+    const char *str,
+    Py_ssize_t size,
+    const char *errors
+);
+PyObject *PyUnicode_Decode(
+    const char *str,
+    Py_ssize_t size,
+    const char *encoding,
+    const char *errors
+);
 PyObject *PyUnicode_AsEncodedString(PyObject *obj, const char *encoding, const char *errors);
 const char *PyUnicode_AsUTF8(PyObject *obj);
 const char *PyUnicode_AsUTF8AndSize(PyObject *obj, Py_ssize_t *size);
@@ -984,19 +1039,36 @@ int PyUnicode_Contains(PyObject *container, PyObject *element);
 PyObject *PyUnicode_Concat(PyObject *left, PyObject *right);
 int PyUnicode_EqualToUTF8AndSize(PyObject *unicode, const char *str, Py_ssize_t str_len);
 int PyUnicode_EqualToUTF8(PyObject *unicode, const char *str);
+typedef struct PyUnicodeWriter PyUnicodeWriter;
+PyUnicodeWriter *PyUnicodeWriter_Create(Py_ssize_t length);
+PyObject *PyUnicodeWriter_Finish(PyUnicodeWriter *writer);
+void PyUnicodeWriter_Discard(PyUnicodeWriter *writer);
+int PyUnicodeWriter_WriteChar(PyUnicodeWriter *writer, Py_UCS4 ch);
+int PyUnicodeWriter_WriteUTF8(PyUnicodeWriter *writer, const char *str, Py_ssize_t size);
+int PyUnicodeWriter_WriteStr(PyUnicodeWriter *writer, PyObject *obj);
+int PyUnicodeWriter_WriteSubstring(
+    PyUnicodeWriter *writer,
+    PyObject *str,
+    Py_ssize_t start,
+    Py_ssize_t end
+);
 #define PyUnicode_1BYTE_KIND 1
 #define PyUnicode_2BYTE_KIND 2
 #define PyUnicode_4BYTE_KIND 4
-/* pcc strings are UTF-8 (1-byte storage), so PyUnicode_KIND() is always 1 and the
- * data buffer is py_str_utf8(). 2/4BYTE_DATA never apply (KIND==1) but must be
- * defined so files that branch on KIND still compile. READ_CHAR returns the i-th
- * byte as a codepoint — correct for ASCII, which is all numpy's textreading
- * control-character use needs. */
+/* pcc strings use immutable UTF-8 storage, so PyUnicode_KIND() is always 1 and
+ * PyUnicode_DATA() exposes the UTF-8 bytes. 2/4BYTE_DATA never apply (KIND==1)
+ * but must be defined so files that branch on KIND still compile. READ and
+ * READ_CHAR route through a helper that decodes the requested codepoint, rather
+ * than treating a UTF-8 byte offset as a character index. */
 extern const char *py_str_utf8(PyObject *s);
 #define PyUnicode_1BYTE_DATA(op) ((Py_UCS1 *)py_str_utf8(op))
 #define PyUnicode_2BYTE_DATA(op) ((Py_UCS2 *)py_str_utf8(op))
 #define PyUnicode_4BYTE_DATA(op) ((Py_UCS4 *)py_str_utf8(op))
-#define PyUnicode_READ_CHAR(op, i) ((Py_UCS4)(unsigned char)(py_str_utf8(op)[(i)]))
+#define PyUnicode_DATA(op) ((void *)py_str_utf8(op))
+Py_UCS4 pcc_capi_unicode_read(int kind, const void *data, Py_ssize_t index);
+#define PyUnicode_READ(kind, data, index) pcc_capi_unicode_read((kind), (data), (index))
+#define PyUnicode_READ_CHAR(op, i) \
+    pcc_capi_unicode_read(PyUnicode_KIND(op), PyUnicode_DATA(op), (i))
 #define Py_UNICODE_ISSPACE(ch) ((ch) == ' ' || (ch) == '\t' || (ch) == '\n' || (ch) == '\r' || (ch) == '\f' || (ch) == '\v')
 #define Py_UNICODE_ISDIGIT(ch) ((ch) >= '0' && (ch) <= '9')
 #define Py_UNICODE_ISDECIMAL(ch) Py_UNICODE_ISDIGIT((ch))
@@ -1085,10 +1157,13 @@ PyObject *PyCapsule_New(void *pointer, const char *name, PyCapsule_Destructor de
 void *PyCapsule_GetPointer(PyObject *capsule, const char *name);
 const char *PyCapsule_GetName(PyObject *capsule);
 void *PyCapsule_GetContext(PyObject *capsule);
+PyCapsule_Destructor PyCapsule_GetDestructor(PyObject *capsule);
 int PyCapsule_IsValid(PyObject *capsule, const char *name);
 int PyCapsule_CheckExact(PyObject *capsule);
 int PyCapsule_SetContext(PyObject *capsule, void *context);
 int PyCapsule_SetName(PyObject *capsule, const char *name);
+int PyCapsule_SetPointer(PyObject *capsule, void *pointer);
+int PyCapsule_SetDestructor(PyObject *capsule, PyCapsule_Destructor destructor);
 void *PyCapsule_Import(const char *name, int no_block);
 
 PyObject *PyTuple_New(Py_ssize_t size);
@@ -1110,6 +1185,7 @@ int PyList_Check(PyObject *obj);
 int PyList_CheckExact(PyObject *obj);
 
 PyObject *PyDict_New(void);
+void PyDict_Clear(PyObject *dict);
 int PyDict_SetItem(PyObject *dict, PyObject *key, PyObject *value);
 int PyDict_SetItemString(PyObject *dict, const char *key, PyObject *value);
 PyObject *PyDict_GetItem(PyObject *dict, PyObject *key);
@@ -1208,6 +1284,7 @@ PyObject *PyObject_CallMethod(PyObject *obj, const char *name, const char *forma
 PyObject *PyObject_CallMethodNoArgs(PyObject *obj, PyObject *name);
 PyObject *PyObject_CallMethodOneArg(PyObject *obj, PyObject *name, PyObject *arg);
 PyObject *PyObject_CallFunctionObjArgs(PyObject *callable, ...);
+PyObject *PyObject_CallMethodObjArgs(PyObject *obj, PyObject *name, ...);
 int Py_IsInitialized(void);
 PyGILState_STATE PyGILState_Ensure(void);
 void PyGILState_Release(PyGILState_STATE state);

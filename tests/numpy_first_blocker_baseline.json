@@ -1,0 +1,134 @@
+{
+  "lanes": {
+    "numpy-core-head": {
+      "current": null,
+      "frontier": 6,
+      "mode": {
+        "backend": "self",
+        "compiler": "host-pcc-current-source",
+        "ir_scaffold": "on",
+        "libpython": "off",
+        "python_abi": "pcc-native"
+      },
+      "resolved": [
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "math"
+          },
+          "frontier": 0
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "numpy._globals"
+          },
+          "frontier": 1
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "numpy._core._exceptions"
+          },
+          "frontier": 2
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "numpy._core.printoptions"
+          },
+          "frontier": 3
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "os"
+          },
+          "frontier": 4
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "numpy.dtypes"
+          },
+          "frontier": 5
+        }
+      ],
+      "result_schema": "pcc.numpy-head-gate.v1"
+    },
+    "numpy-package-artifact": {
+      "current": null,
+      "frontier": 6,
+      "mode": {
+        "backend": "self",
+        "compiler": "host-pcc-current-source-package-executor",
+        "ir_scaffold": "on",
+        "libpython": "off",
+        "python_abi": "pcc-native"
+      },
+      "resolved": [
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "math"
+          },
+          "frontier": 0
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "numpy._globals"
+          },
+          "frontier": 1
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "numpy._core._exceptions"
+          },
+          "frontier": 2
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "numpy._core.printoptions"
+          },
+          "frontier": 3
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "os"
+          },
+          "frontier": 4
+        },
+        {
+          "blocker": {
+            "kind": "first_missing_module",
+            "phase": "Py_mod_exec",
+            "value": "numpy.dtypes"
+          },
+          "frontier": 5
+        }
+      ],
+      "result_schema": "pcc.numpy-package-artifact-gate.v1"
+    }
+  },
+  "schema": "pcc.numpy-first-blocker-baseline.v1",
+  "source": {
+    "name": "numpy",
+    "sha256": "92dea23be728ec1d084397b4b1e4bbd96845932c252d48eb771c204c3393c941",
+    "version": "2.4.4"
+  }
+}

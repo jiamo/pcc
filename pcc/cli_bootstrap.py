@@ -2,13 +2,64 @@ import os
 import subprocess
 import sys
 
+from .cli_contract import (
+    BACKEND_CHOICES,
+    DEFAULT_EMIT_LL,
+    DIAGNOSTIC_FORMAT_CHOICES,
+    IR_SCAFFOLD_CHOICES,
+    PYTHON_LIBPYTHON_CHOICES,
+)
+
+from .package_schema import (
+    PACKAGE_MANIFEST_SCHEMA,
+    PACKAGE_MANIFEST_SCHEMA_VERSION,
+    PCC_CAPI_HEADERS,
+    campaign_profile,
+    capability_profile,
+    pcc_native_extension_suffix,
+    pcc_native_wheel_tag,
+    wheel_tag_fields,
+)
+
 from .py_frontend.pipeline import compile_python as _compile_python
+from .py_frontend.pipeline import (
+    run_self_backend_emit_worker as _run_self_backend_emit_worker,
+)
+from .py_frontend.pipeline import (
+    run_self_backend_split_worker as _run_self_backend_split_worker,
+)
 from .py_frontend.pipeline import (
     run_python_multi_codegen_worker as _run_python_multi_codegen_worker,
 )
+from .cli_bootstrap_array_core import _run_native_package_array_core_from_pcc1
 
-_DEFAULT_EMIT_LL = "__PCC_DEFAULT_LL__"
-_VALID_DIAGNOSTIC_FORMATS = ("text", "json", "sarif")
+_DEFAULT_EMIT_LL = DEFAULT_EMIT_LL
+_VALID_DIAGNOSTIC_FORMATS = DIAGNOSTIC_FORMAT_CHOICES
+_DEFAULT_BOOTSTRAP_SUBPROCESS_TIMEOUT_SECONDS = 300
+
+
+def _bootstrap_subprocess_timeout_seconds() -> int:
+    raw = os.environ.get("PCC_BOOTSTRAP_SUBPROCESS_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            seconds = int(raw)
+        except Exception:
+            seconds = 0
+        if seconds > 0:
+            return seconds
+    return _DEFAULT_BOOTSTRAP_SUBPROCESS_TIMEOUT_SECONDS
+
+
+def _bootstrap_subprocess_run(args, *, check=False):
+    """Run one bootstrap child with a host- and pcc1-enforced deadline."""
+    if not check:
+        raise ValueError("bootstrap subprocess calls must use check=True")
+    subprocess.run(
+        args,
+        check=True,
+        timeout=_bootstrap_subprocess_timeout_seconds(),
+    )
+    return None
 
 _HELP_TEXT = """Usage: pcc [OPTIONS] PATH
 
@@ -20,7 +71,7 @@ entrypoint.
 
 Options:
   -h, --help                Show this help message and exit.
-  -m MODULE [ARGS...]       Run a host Python module through pcc's safe module shim.
+  -m MODULE [ARGS...]       Compile and run a Python module through pcc1.
   --backend BACKEND         Native emission backend: llvm or self.
   --python-libpython MODE   off (default), auto, or on for Python fallback linkage.
   --python-library          Emit a Python library module without @main.
@@ -34,7 +85,7 @@ Options:
   --profile-json PATH       Write compiler profile JSON.
   --explain-fallback        Include fallback routing details when known.
   --verbose                 Print Python pipeline timing.
-  --pytest [ARGS...]        Run `uv run pytest` from this pcc1 process.
+  --pytest [ARGS...]        Run the pcc1-native pytest subset.
 """
 
 
@@ -77,6 +128,227 @@ def _copy_seq(values):
     return out
 
 
+_PY_RUN_CACHE_VERSION = "pcc-py-run-cache-v46"
+
+
+def _path_list_sep() -> str:
+    return ";" if sys.platform.startswith("win") else ":"
+
+
+def _split_path_list(raw):
+    out = []
+    parts = str(raw or "").split(_path_list_sep())
+    i = 0
+    while i < len(parts):
+        item = str(parts[i] or "").strip()
+        if item:
+            out.append(os.path.abspath(item))
+        i += 1
+    return out
+
+
+def _append_unique_path(paths, path) -> None:
+    path = os.path.abspath(str(path or ""))
+    if not path:
+        return
+    i = 0
+    while i < len(paths):
+        if paths[i] == path:
+            return
+        i += 1
+    paths.append(path)
+
+
+def _inferred_package_site_roots(src_path: str):
+    roots = []
+    src_dir = os.path.dirname(os.path.abspath(src_path))
+    _append_unique_path(roots, src_dir)
+    if os.path.basename(src_dir) == "test" or os.path.basename(src_dir) == "tests":
+        _append_unique_path(roots, os.path.dirname(src_dir))
+    env_roots = _split_path_list(os.environ.get("PCC_PACKAGE_SITE", ""))
+    i = 0
+    while i < len(env_roots):
+        _append_unique_path(roots, env_roots[i])
+        i += 1
+    return roots
+
+
+def _seed_package_site_for_python_entry(src_path: str) -> None:
+    roots = _inferred_package_site_roots(src_path)
+    if len(roots) > 0:
+        os.environ["PCC_PACKAGE_SITE"] = _path_list_sep().join(roots)
+
+
+def _fnv1a_update_u64(value: int, text: str) -> int:
+    h = value & 0xFFFFFFFFFFFFFFFF
+    data = str(text or "")
+    i = 0
+    while i < len(data):
+        h = h ^ (ord(data[i]) & 0xFF)
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        i += 1
+    return h
+
+
+def _fnv1a_update_bytes_u64(value: int, data) -> int:
+    h = value & 0xFFFFFFFFFFFFFFFF
+    i = 0
+    while i < len(data):
+        h = h ^ (data[i] & 0xFF)
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        i += 1
+    return h
+
+
+def _iter_py_sources_under(root: str):
+    root = os.path.abspath(root)
+    out = []
+    if os.path.isfile(root):
+        if root.endswith(".py"):
+            out.append(root)
+        return out
+    if not os.path.isdir(root):
+        return out
+    stack = [root]
+    while len(stack) > 0:
+        cur = stack.pop()
+        try:
+            names = sorted(os.listdir(cur))
+        except OSError:
+            names = []
+        i = 0
+        while i < len(names):
+            name = names[i]
+            if name in (
+                ".git",
+                ".hg",
+                ".mypy_cache",
+                ".pytest_cache",
+                ".ruff_cache",
+                "__pycache__",
+                "build",
+                "dist",
+                ".venv",
+                "venv",
+            ):
+                i += 1
+                continue
+            full = os.path.join(cur, name)
+            if os.path.isdir(full):
+                stack.append(full)
+            elif name.endswith(".py"):
+                out.append(os.path.abspath(full))
+            i += 1
+    out.sort()
+    return out
+
+
+def _python_run_cache_key(
+    src_path: str,
+    *,
+    python_libpython: str,
+    python_library: bool,
+    ir_scaffold: str,
+    backend: str,
+):
+    roots = _inferred_package_site_roots(src_path)
+    _append_unique_path(roots, src_path)
+    h = 1469598103934665603
+    parts = (
+        _PY_RUN_CACHE_VERSION,
+        os.path.abspath(src_path),
+        str(python_libpython or ""),
+        str(bool(python_library)),
+        str(ir_scaffold or ""),
+        str(backend or ""),
+        sys.platform,
+    )
+    i = 0
+    while i < len(parts):
+        h = _fnv1a_update_u64(h, parts[i])
+        h = _fnv1a_update_u64(h, "\0")
+        i += 1
+    seen = []
+    r = 0
+    while r < len(roots):
+        root = roots[r]
+        sources = _iter_py_sources_under(root)
+        s = 0
+        while s < len(sources):
+            path = sources[s]
+            if path in seen:
+                s += 1
+                continue
+            seen.append(path)
+            try:
+                with open(path, "rb") as f:
+                    content = f.read()
+            except OSError:
+                h = _fnv1a_update_u64(h, "missing:" + path)
+                s += 1
+                continue
+            rel = path
+            r2 = 0
+            while r2 < len(roots):
+                prefix = os.path.abspath(roots[r2])
+                if not prefix.endswith(os.sep):
+                    prefix = prefix + os.sep
+                if path.startswith(prefix):
+                    rel = path[len(prefix) :]
+                    break
+                r2 += 1
+            h = _fnv1a_update_u64(h, rel)
+            h = _fnv1a_update_u64(h, str(len(content)))
+            h = _fnv1a_update_bytes_u64(h, content)
+            h = _fnv1a_update_u64(h, "\0")
+            s += 1
+        r += 1
+    return format(h, "016x")
+
+
+def _python_run_cache_path(
+    src_path: str,
+    *,
+    python_libpython: str,
+    python_library: bool,
+    ir_scaffold: str,
+    backend: str,
+):
+    disabled = str(os.environ.get("PCC_DISABLE_PY_RUN_CACHE", "") or "").strip()
+    if disabled in ("1", "true", "yes", "on"):
+        return None
+    root = os.environ.get("PCC_PY_RUN_CACHE_DIR", "")
+    if not root:
+        home = os.environ.get("HOME", "")
+        if home:
+            root = os.path.join(home, ".cache", "pcc", "py-run-cache")
+    if not root:
+        return None
+    key = _python_run_cache_key(
+        src_path,
+        python_libpython=python_libpython,
+        python_library=python_library,
+        ir_scaffold=ir_scaffold,
+        backend=backend,
+    )
+    tag = os.path.basename(src_path)
+    if tag.endswith(".py"):
+        tag = tag[:-3]
+    safe = ""
+    i = 0
+    while i < len(tag):
+        ch = tag[i]
+        if ch.isalnum() or ch == "_" or ch == "-":
+            safe += ch
+        else:
+            safe += "_"
+        i += 1
+    if not safe:
+        safe = "pcc1_run"
+    cache_dir = os.path.join(root, key)
+    return os.path.join(cache_dir, safe)
+
+
 def _is_pytest_request(argv) -> bool:
     if len(argv) == 0:
         return False
@@ -84,35 +356,340 @@ def _is_pytest_request(argv) -> bool:
     return first == "--pytest" or first == "pytest"
 
 
-def _run_pytest_from_pcc1(argv) -> int:
-    pytest_args = _copy_seq(argv[1:])
-    if len(pytest_args) == 0:
-        pytest_args.append("tests")
-
-    cmd = [
-        "env",
-        "-u",
-        "LC_ALL",
-        "PCC1_BINARY=" + sys.executable,
-        "uv",
-        "run",
-        "pytest",
-    ]
+def _pytest_marker_arg(pytest_args) -> str:
+    marker = ""
     i = 0
     while i < len(pytest_args):
-        cmd.append(pytest_args[i])
+        arg = pytest_args[i]
+        if arg == "-m":
+            if i + 1 < len(pytest_args):
+                marker = pytest_args[i + 1]
+                i += 1
+        elif arg.startswith("-m") and len(arg) > 2:
+            marker = arg[2:]
+        i += 1
+    if marker == "":
+        marker = "not integration"
+    if len(marker) >= 2:
+        first = marker[0]
+        last = marker[len(marker) - 1]
+        if (first == "'" and last == "'") or (first == '"' and last == '"'):
+            marker = marker[1 : len(marker) - 1]
+    return marker
+
+
+def _pytest_path_args(pytest_args):
+    paths = []
+    i = 0
+    while i < len(pytest_args):
+        arg = pytest_args[i]
+        if arg in ("-m", "-k", "-n", "--maxfail", "--tb"):
+            i += 2
+            continue
+        if (
+            arg == "-q"
+            or arg == "-s"
+            or arg == "-v"
+            or arg == "-n0"
+            or arg.startswith("--")
+            or arg.startswith("-m")
+            or arg.startswith("-k")
+            or arg.startswith("--tb=")
+            or arg.startswith("--maxfail=")
+        ):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        paths.append(arg)
+        i += 1
+    if len(paths) == 0:
+        paths.append("tests")
+    return paths
+
+
+def _pcc1_pytest_is_test_file(path: str) -> bool:
+    name = os.path.basename(path)
+    return name.endswith(".py") and (
+        name.startswith("test_") or name.endswith("_test.py")
+    )
+
+
+def _pcc1_pytest_collect_files_from(path: str, out) -> None:
+    if os.path.isfile(path):
+        if _pcc1_pytest_is_test_file(path):
+            out.append(path)
+        return
+    if not os.path.isdir(path):
+        return
+    try:
+        names = sorted(os.listdir(path))
+    except Exception:
+        return
+    i = 0
+    while i < len(names):
+        name = names[i]
+        child = os.path.join(path, name)
+        if (
+            name == "__pycache__"
+            or name == ".pytest_cache"
+            or name == ".git"
+            or name == "build"
+            or name == "build_py"
+            or name == "projects"
+        ):
+            i += 1
+            continue
+        if os.path.isdir(child):
+            _pcc1_pytest_collect_files_from(child, out)
+        elif _pcc1_pytest_is_test_file(child):
+            out.append(child)
         i += 1
 
+
+def _pcc1_pytest_collect_files(paths):
+    out = []
+    i = 0
+    while i < len(paths):
+        _pcc1_pytest_collect_files_from(paths[i], out)
+        i += 1
+    return out
+
+
+def _pcc1_pytest_module_is_integration(text: str) -> bool:
+    return (
+        _native_find_from(text, "pytestmark = pytest.mark.integration", 0) >= 0
+        or _native_find_from(text, "pytestmark=pytest.mark.integration", 0) >= 0
+        or _native_find_from(text, "pytestmark = [pytest.mark.integration", 0) >= 0
+        or _native_find_from(text, "pytestmark=[pytest.mark.integration", 0) >= 0
+    )
+
+
+def _pcc1_pytest_include_by_marker(is_integration: bool, marker: str) -> bool:
+    if marker == "integration":
+        return is_integration
+    if marker == "not integration":
+        return not is_integration
+    return True
+
+
+def _pcc1_pytest_skipif_literal(stripped: str):
+    prefix = "@pytest.mark.skipif("
+    if not stripped.startswith(prefix):
+        return None
+    rest = stripped[len(prefix) :]
+    if rest.startswith("True") and (len(rest) == 4 or rest[4] == "," or rest[4] == ")"):
+        return True
+    if rest.startswith("False") and (
+        len(rest) == 5 or rest[5] == "," or rest[5] == ")"
+    ):
+        return False
+    return None
+
+
+def _pcc1_pytest_is_skip_decorator(stripped: str) -> bool:
+    return stripped == "@pytest.mark.skip" or stripped.startswith("@pytest.mark.skip(")
+
+
+def _pcc1_pytest_def_name(line: str):
+    if not line.startswith("def test_"):
+        return None
+    paren = _native_find_from(line, "(", 0)
+    if paren < 0:
+        return None
+    return line[4:paren]
+
+
+def _pcc1_pytest_discover_funcs(text: str, marker: str):
+    funcs = []
+    module_integration = _pcc1_pytest_module_is_integration(text)
+    pending_integration = False
+    pending_skip = False
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+        if stripped.startswith("@pytest.mark.integration"):
+            pending_integration = True
+            i += 1
+            continue
+        if _pcc1_pytest_is_skip_decorator(stripped):
+            pending_skip = True
+            i += 1
+            continue
+        skipif = _pcc1_pytest_skipif_literal(stripped)
+        if skipif is not None:
+            if skipif:
+                pending_skip = True
+            i += 1
+            continue
+        name = None
+        if raw.startswith("def test_"):
+            name = _pcc1_pytest_def_name(raw)
+        if name is not None:
+            is_integration = module_integration or pending_integration
+            if not pending_skip and _pcc1_pytest_include_by_marker(
+                is_integration, marker
+            ):
+                funcs.append(name)
+            pending_integration = False
+            pending_skip = False
+            i += 1
+            continue
+        if stripped.startswith("@"):
+            i += 1
+            continue
+        if stripped != "" and not stripped.startswith("#"):
+            pending_integration = False
+            pending_skip = False
+        i += 1
+    return funcs
+
+
+def _pcc1_pytest_rewrite_metadata_assignments(text: str) -> str:
+    out = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+        if (
+            raw == stripped
+            and stripped.startswith("pytestmark")
+            and _native_find_from(stripped, "pytest.mark.integration", 0) >= 0
+        ):
+            out.append("pytestmark = None")
+        else:
+            out.append(raw)
+        i += 1
+    return "\n".join(out)
+
+
+def _pcc1_pytest_write_runner_source(src_path: str, dest_path: str, marker: str):
     try:
-        subprocess.run(cmd, check=True)
+        with open(src_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
     except Exception:
-        _write_text("Error: pcc1 pytest run failed", err=True)
+        _write_text("Error: pcc1 pytest could not read " + src_path, err=True)
+        return 0
+    funcs = _pcc1_pytest_discover_funcs(text, marker)
+    if len(funcs) == 0:
+        return 0
+    text = _pcc1_pytest_rewrite_metadata_assignments(text)
+    with open(dest_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        if not text.endswith("\n"):
+            fh.write("\n")
+        fh.write("\nfrom pcc.test_runner import run_tests\n")
+        fh.write('\nif __name__ == "__main__":\n')
+        fh.write("    run_tests([")
+        i = 0
+        while i < len(funcs):
+            if i > 0:
+                fh.write(", ")
+            fh.write(funcs[i])
+            i += 1
+        fh.write("])\n")
+    return len(funcs)
+
+
+def _run_pytest_from_pcc1(argv) -> int:
+    pytest_args = _copy_seq(argv[1:])
+    marker = _pytest_marker_arg(pytest_args)
+    if marker != "integration" and marker != "not integration":
+        _write_text(
+            "Error: pcc1 pytest subset supports only -m integration or "
+            "-m 'not integration'",
+            err=True,
+        )
+        return 2
+    files = _pcc1_pytest_collect_files(_pytest_path_args(pytest_args))
+    if len(files) == 0:
+        _write_text("pcc1 pytest: no tests collected")
+        return 5
+    root = os.environ.get("TMPDIR") or "/tmp"
+    scratch = os.path.join(root, "pcc1-pytest-" + str(os.getpid()))
+    try:
+        _bootstrap_subprocess_run(["mkdir", "-p", scratch], check=True)
+    except Exception:
+        _write_text("Error: pcc1 pytest could not create scratch directory", err=True)
+        return 1
+    compiled = 0
+    failed = 0
+    i = 0
+    while i < len(files):
+        src = files[i]
+        tag = _sanitize_tag(src)
+        runner_src = os.path.join(scratch, "runner_" + str(i) + "_" + tag + ".py")
+        exe = os.path.join(scratch, "runner_" + str(i) + "_" + tag + ".out")
+        count = _pcc1_pytest_write_runner_source(src, runner_src, marker)
+        if count <= 0:
+            i += 1
+            continue
+        compiled += 1
+        try:
+            _bootstrap_subprocess_run(
+                [
+                    sys.executable,
+                    runner_src,
+                    "-o",
+                    exe,
+                    "--python-libpython=off",
+                    "--ir-scaffold=on",
+                ],
+                check=True,
+            )
+            _bootstrap_subprocess_run([exe], check=True)
+        except Exception:
+            failed += 1
+        i += 1
+    if compiled == 0:
+        _write_text("pcc1 pytest: no tests selected")
+        return 5
+    _write_text(
+        str(compiled - failed)
+        + " pcc1 pytest file(s) passed, "
+        + str(failed)
+        + " failed"
+    )
+    if failed != 0:
         return 1
     return 0
 
 
 def _is_module_request(argv) -> bool:
     return len(argv) > 0 and argv[0] == "-m"
+
+
+def _is_libpython_mode(value) -> bool:
+    return value in PYTHON_LIBPYTHON_CHOICES
+
+
+def _module_request_libpython_mode(argv):
+    """Detect a module run, optionally preceded by --python-libpython=<mode>.
+
+    Returns (is_module_request, mode, module_argv) where module_argv is the
+    argv slice starting at "-m". The plain `-m ...` form (no flag) keeps the
+    strict research default mode "off", so existing behavior is unchanged.
+    Only `off`, `auto`, and `on` are accepted as leading modes.
+    """
+    if len(argv) == 0:
+        return (False, "off", [])
+    first = argv[0]
+    if first == "-m":
+        return (True, "off", _copy_seq(argv))
+    if first.startswith("--python-libpython="):
+        mode = _option_value(first)
+        if _is_libpython_mode(mode) and len(argv) > 1 and argv[1] == "-m":
+            return (True, mode, _copy_seq(argv[1:]))
+        return (False, "off", [])
+    if first == "--python-libpython":
+        if len(argv) > 2 and _is_libpython_mode(argv[1]) and argv[2] == "-m":
+            return (True, argv[1], _copy_seq(argv[2:]))
+        return (False, "off", [])
+    return (False, "off", [])
 
 
 def _json_escape(text: str) -> str:
@@ -138,6 +715,19 @@ def _json_escape(text: str) -> str:
 
 def _json_str(text: str) -> str:
     return '"' + _json_escape(text) + '"'
+
+
+def _make_bootstrap_run_tempdir(prefix: str) -> str:
+    base = os.environ.get("TMPDIR") or "/tmp"
+    pid = os.getpid()
+    path = os.path.join(base, prefix + str(pid))
+    _bootstrap_subprocess_run(["rm", "-rf", path], check=True)
+    _bootstrap_subprocess_run(["mkdir", "-p", path], check=True)
+    return path
+
+
+def _remove_bootstrap_run_tempdir(path: str) -> None:
+    _bootstrap_subprocess_run(["rm", "-rf", path], check=True)
 
 
 def _json_str_or_null(text) -> str:
@@ -170,6 +760,65 @@ def _json_int_list(items) -> str:
     return out
 
 
+def compat_runner_manifest(mode) -> dict:
+    """Describe the compatibility-runner contract for a --python-libpython mode.
+
+    `auto`/`on` run the requested module in the explicit CPython compatibility
+    subprocess. The pcc1 binary itself remains no-libpython, so links_libpython
+    stays false. `native_package_claim` is always False: this route is never a
+    pcc-native package support proof.
+    """
+    if mode == "auto" or mode == "on":
+        return {
+            "requested_execution_mode": "cpython-compat",
+            "execution_mode": "cpython-compat",
+            "python_libpython_mode": mode,
+            "allows_libpython_fallback": True,
+            "links_libpython": False,
+            "native_package_claim": False,
+        }
+    return {
+        "requested_execution_mode": "pcc-native",
+        "execution_mode": "pcc-native",
+        "python_libpython_mode": "off",
+        "allows_libpython_fallback": False,
+        "links_libpython": False,
+        "native_package_claim": False,
+    }
+
+
+def compat_runner_manifest_json(mode) -> str:
+    """Serialize compat_runner_manifest(mode) via the hand-rolled JSON helpers.
+
+    cli_bootstrap.py is compiled no-libpython into pcc1, so this must not use
+    the json module; it uses _json_str plus literal boolean tokens.
+    """
+    if mode == "auto" or mode == "on":
+        requested_execution_mode = "cpython-compat"
+        python_libpython_mode = mode
+    else:
+        requested_execution_mode = "pcc-native"
+        python_libpython_mode = "off"
+    if mode == "auto" or mode == "on":
+        execution_mode = "cpython-compat"
+        allows_libpython_fallback = "true"
+    else:
+        execution_mode = "pcc-native"
+        allows_libpython_fallback = "false"
+    return (
+        '{"requested_execution_mode": '
+        + _json_str(requested_execution_mode)
+        + ', "execution_mode": '
+        + _json_str(execution_mode)
+        + ', "python_libpython_mode": '
+        + _json_str(python_libpython_mode)
+        + ', "allows_libpython_fallback": '
+        + allows_libpython_fallback
+        + ', "links_libpython": false'
+        + ', "native_package_claim": false}'
+    )
+
+
 _PACKAGE_COMPAT_TARGETS = (
     ("pytest", "compat_python", "test runner compatibility target"),
     ("packaging", "compat_python", "pure-Python packaging metadata"),
@@ -178,6 +827,26 @@ _PACKAGE_COMPAT_TARGETS = (
         "numpy",
         "c_extension_abi",
         "unchanged import via CPython C-API/extension ABI first",
+    ),
+    (
+        "mlx",
+        "c_extension_abi",
+        "Apple MLX C++/Metal extension ABI and array-runtime target; cpython-compat import first",
+    ),
+    (
+        "vllm",
+        "c_extension_abi",
+        "vLLM PyTorch/CUDA extension stack target; cpython-compat import first",
+    ),
+    (
+        "tilelang",
+        "c_extension_abi",
+        "TileLang TVM/GPU kernel DSL compiler stack target; cpython-compat import first",
+    ),
+    (
+        "vllm-metal",
+        "c_extension_abi",
+        "vLLM-Metal Apple Silicon extension stack on MLX/Metal; cpython-compat import first",
     ),
     ("cffi", "c_extension_abi", "C FFI package target"),
     ("pybind11", "c_extension_abi", "C++ extension ABI target"),
@@ -226,11 +895,21 @@ def _native_current_platform_tag() -> str:
     env_tag = os.environ.get("PCC_PLATFORM_TAG")
     if env_tag:
         return env_tag
+    if sys.platform == "darwin":
+        return "macosx_arm64"
+    if sys.platform.startswith("linux"):
+        return "linux_x86_64"
+    if sys.platform.startswith("win"):
+        return "win_amd64"
     return "unknown"
 
 
 def _native_pcc_wheel_tag() -> str:
-    return "pcc3-pcc_native-" + _native_current_platform_tag()
+    return pcc_native_wheel_tag(_native_current_platform_tag())
+
+
+def _native_pcc_extension_suffix() -> str:
+    return pcc_native_extension_suffix(_native_current_platform_tag())
 
 
 def _native_find_from(text: str, needle: str, start: int) -> int:
@@ -620,911 +1299,1120 @@ def _native_build_plan_json(name: str, explicit_path=None) -> str:
     return out
 
 
+_NATIVE_CAPI_HEADER_BY_SYMBOL = (
+    ("Py_Initialize", "Python.h"),
+    ("Py_UNUSED", "Python.h"),
+    ("PyOS_snprintf", "Python.h"),
+    ("PyOS_vsnprintf", "Python.h"),
+    ("Py_REFCNT", "object.h"),
+    ("Py_SET_REFCNT", "object.h"),
+    ("PyMapping_Size", "abstract.h"),
+    ("PyMapping_Length", "abstract.h"),
+    ("PyMapping_Keys", "abstract.h"),
+    ("PyMapping_Values", "abstract.h"),
+    ("PyMapping_Items", "abstract.h"),
+    ("PyObject_LengthHint", "abstract.h"),
+    ("PySequence_SetItem", "abstract.h"),
+    ("PySequence_Concat", "abstract.h"),
+    ("PySequence_Repeat", "abstract.h"),
+    ("PySequence_InPlaceConcat", "abstract.h"),
+    ("PySequence_InPlaceRepeat", "abstract.h"),
+    ("PyMem_Malloc", "pymem.h"),
+    ("PyMem_Calloc", "pymem.h"),
+    ("PyMem_Realloc", "pymem.h"),
+    ("PyMem_Free", "pymem.h"),
+    ("PyMem_RawMalloc", "pymem.h"),
+    ("PyMem_RawCalloc", "pymem.h"),
+    ("PyMem_RawRealloc", "pymem.h"),
+    ("PyMem_RawFree", "pymem.h"),
+    ("PyMem_FREE", "pymem.h"),
+    ("PyModule_Create", "moduleobject.h"),
+    ("PyModule_Create2", "moduleobject.h"),
+    ("PyModule_AddObject", "moduleobject.h"),
+    ("PyModule_AddObjectRef", "moduleobject.h"),
+    ("PyModule_Add", "moduleobject.h"),
+    ("PyModule_AddIntConstant", "moduleobject.h"),
+    ("PyModule_AddStringConstant", "moduleobject.h"),
+    ("PyModule_GetDict", "moduleobject.h"),
+    ("PyArg_ParseTuple", "modsupport.h"),
+    ("PyArg_ParseTupleAndKeywords", "modsupport.h"),
+    ("Py_BuildValue", "modsupport.h"),
+    ("PyLong_FromDouble", "longobject.h"),
+    ("PyLong_AsDouble", "longobject.h"),
+    ("PyFloat_AS_DOUBLE", "floatobject.h"),
+    ("PyNumber_Check", "abstract.h"),
+    ("PyNumber_Long", "abstract.h"),
+    ("PyNumber_Float", "abstract.h"),
+    ("PyNumber_And", "abstract.h"),
+    ("PyNumber_Or", "abstract.h"),
+    ("PyNumber_Xor", "abstract.h"),
+    ("PyNumber_Invert", "abstract.h"),
+    ("PyNumber_Lshift", "abstract.h"),
+    ("PyNumber_Rshift", "abstract.h"),
+    ("PySet_New", "setobject.h"),
+    ("PySet_Add", "setobject.h"),
+    ("PySet_Contains", "setobject.h"),
+    ("PySet_Discard", "setobject.h"),
+    ("PySet_Size", "setobject.h"),
+    ("PySet_GET_SIZE", "setobject.h"),
+    ("PySet_Check", "setobject.h"),
+    ("PySet_CheckExact", "setobject.h"),
+    ("PyAnySet_Check", "setobject.h"),
+    ("PyAnySet_CheckExact", "setobject.h"),
+    ("PyList_AsTuple", "listobject.h"),
+    ("PyDict_Keys", "dictobject.h"),
+    ("PyDict_Values", "dictobject.h"),
+    ("PyDict_Items", "dictobject.h"),
+    ("PyLong_FromLong", "longobject.h"),
+    ("PyLong_FromUnsignedLong", "longobject.h"),
+    ("PyLong_AsLong", "longobject.h"),
+    ("PyLong_FromLongLong", "longobject.h"),
+    ("PyLong_FromUnsignedLongLong", "longobject.h"),
+    ("PyLong_FromInt32", "longobject.h"),
+    ("PyLong_FromInt64", "longobject.h"),
+    ("PyLong_FromUInt32", "longobject.h"),
+    ("PyLong_FromUInt64", "longobject.h"),
+    ("PyLong_FromVoidPtr", "longobject.h"),
+    ("PyLong_FromSsize_t", "longobject.h"),
+    ("PyLong_FromSize_t", "longobject.h"),
+    ("PyLong_AsLongLong", "longobject.h"),
+    ("PyLong_AsInt", "longobject.h"),
+    ("PyLong_AsInt32", "longobject.h"),
+    ("PyLong_AsInt64", "longobject.h"),
+    ("PyLong_AsUInt32", "longobject.h"),
+    ("PyLong_AsUInt64", "longobject.h"),
+    ("PyLong_AsVoidPtr", "longobject.h"),
+    ("PyLong_AsLongAndOverflow", "longobject.h"),
+    ("PyLong_AsUnsignedLong", "longobject.h"),
+    ("PyLong_AsUnsignedLongLong", "longobject.h"),
+    ("PyLong_AsUnsignedLongLongMask", "longobject.h"),
+    ("PyLong_AsSsize_t", "longobject.h"),
+    ("PyLong_AsSize_t", "longobject.h"),
+    ("PyLong_Check", "longobject.h"),
+    ("PyLong_CheckExact", "longobject.h"),
+    ("PyBool_FromLong", "boolobject.h"),
+    ("PyBool_Check", "boolobject.h"),
+    ("PyFloat_FromDouble", "floatobject.h"),
+    ("PyFloat_AsDouble", "floatobject.h"),
+    ("PyFloat_Check", "floatobject.h"),
+    ("PyFloat_CheckExact", "floatobject.h"),
+    ("Py_complex", "complexobject.h"),
+    ("PyComplex_FromDoubles", "complexobject.h"),
+    ("PyComplex_FromCComplex", "complexobject.h"),
+    ("PyComplex_AsCComplex", "complexobject.h"),
+    ("PyComplex_RealAsDouble", "complexobject.h"),
+    ("PyComplex_ImagAsDouble", "complexobject.h"),
+    ("PyComplex_Check", "complexobject.h"),
+    ("PyComplex_CheckExact", "complexobject.h"),
+    ("PyUnicode_AsUTF8String", "unicodeobject.h"),
+    ("PyUnicode_AsASCIIString", "unicodeobject.h"),
+    ("PyUnicode_AsEncodedString", "unicodeobject.h"),
+    ("PyUnicode_FromKindAndData", "unicodeobject.h"),
+    ("PyUnicode_FromOrdinal", "unicodeobject.h"),
+    ("PyUnicode_AsUCS4", "unicodeobject.h"),
+    ("PyUnicode_AsUCS4Copy", "unicodeobject.h"),
+    ("PyUnicode_Tailmatch", "unicodeobject.h"),
+    ("PyUnicode_Find", "unicodeobject.h"),
+    ("PyUnicode_ReadChar", "unicodeobject.h"),
+    ("PyUnicode_FindChar", "unicodeobject.h"),
+    ("PyUnicode_Count", "unicodeobject.h"),
+    ("PyUnicode_Replace", "unicodeobject.h"),
+    ("PyUnicode_Substring", "unicodeobject.h"),
+    ("PyUnicode_Contains", "unicodeobject.h"),
+    ("PyUnicode_Concat", "unicodeobject.h"),
+    ("Py_UCS1", "unicodeobject.h"),
+    ("Py_UCS2", "unicodeobject.h"),
+    ("PyUnicode_1BYTE_KIND", "unicodeobject.h"),
+    ("PyUnicode_2BYTE_KIND", "unicodeobject.h"),
+    ("PyUnicode_4BYTE_KIND", "unicodeobject.h"),
+    ("PyObject_SelfIter", "object.h"),
+    ("PyIter_NextItem", "abstract.h"),
+    ("PyErr_Print", "pyerrors.h"),
+    ("PyErr_CheckSignals", "pyerrors.h"),
+    ("Py_UCS4", "unicodeobject.h"),
+    ("PyUnicode_FromString", "unicodeobject.h"),
+    ("PyUnicode_FromStringAndSize", "unicodeobject.h"),
+    ("PyUnicode_FromFormat", "unicodeobject.h"),
+    ("PyUnicode_FromFormatV", "unicodeobject.h"),
+    ("PyUnicode_InternFromString", "unicodeobject.h"),
+    ("PyUnicode_FromEncodedObject", "unicodeobject.h"),
+    ("PyUnicode_AsUTF8", "unicodeobject.h"),
+    ("PyUnicode_AsUTF8AndSize", "unicodeobject.h"),
+    ("PyUnicode_Check", "unicodeobject.h"),
+    ("PyUnicode_CheckExact", "unicodeobject.h"),
+    ("PyUnicode_GetLength", "unicodeobject.h"),
+    ("PyUnicode_GET_LENGTH", "unicodeobject.h"),
+    ("PyUnicode_Compare", "unicodeobject.h"),
+    ("PyUnicode_CompareWithASCIIString", "unicodeobject.h"),
+    ("PyUnicode_EqualToUTF8", "unicodeobject.h"),
+    ("PyUnicode_EqualToUTF8AndSize", "unicodeobject.h"),
+    ("Py_UNICODE_ISSPACE", "unicodeobject.h"),
+    ("Py_UNICODE_ISDIGIT", "unicodeobject.h"),
+    ("Py_UNICODE_ISDECIMAL", "unicodeobject.h"),
+    ("Py_UNICODE_ISNUMERIC", "unicodeobject.h"),
+    ("Py_UNICODE_ISLOWER", "unicodeobject.h"),
+    ("Py_UNICODE_ISUPPER", "unicodeobject.h"),
+    ("Py_UNICODE_ISTITLE", "unicodeobject.h"),
+    ("Py_UNICODE_ISALPHA", "unicodeobject.h"),
+    ("Py_UNICODE_ISALNUM", "unicodeobject.h"),
+    ("PyErr_SetString", "pyerrors.h"),
+    ("PyErr_SetNone", "pyerrors.h"),
+    ("PyErr_SetObject", "pyerrors.h"),
+    ("PyErr_Format", "pyerrors.h"),
+    ("PyErr_FormatV", "pyerrors.h"),
+    ("PyErr_NoMemory", "pyerrors.h"),
+    ("PyErr_SetFromErrno", "pyerrors.h"),
+    ("PyErr_SetFromErrnoWithFilenameObject", "pyerrors.h"),
+    ("PyErr_NewException", "pyerrors.h"),
+    ("PyErr_BadInternalCall", "pyerrors.h"),
+    ("PyErr_WarnEx", "pyerrors.h"),
+    ("PyErr_WarnFormat", "pyerrors.h"),
+    ("PyErr_WriteUnraisable", "pyerrors.h"),
+    ("PyErr_Occurred", "pyerrors.h"),
+    ("PyErr_Clear", "pyerrors.h"),
+    ("PyErr_GivenExceptionMatches", "pyerrors.h"),
+    ("PyErr_ExceptionMatches", "pyerrors.h"),
+    ("PyErr_Fetch", "pyerrors.h"),
+    ("PyErr_Restore", "pyerrors.h"),
+    ("PyExc_BaseException", "pyerrors.h"),
+    ("PyExc_Exception", "pyerrors.h"),
+    ("PyExc_ValueError", "pyerrors.h"),
+    ("PyExc_TypeError", "pyerrors.h"),
+    ("PyExc_RuntimeError", "pyerrors.h"),
+    ("PyExc_KeyError", "pyerrors.h"),
+    ("PyExc_IndexError", "pyerrors.h"),
+    ("PyExc_AttributeError", "pyerrors.h"),
+    ("PyExc_MemoryError", "pyerrors.h"),
+    ("PyExc_OverflowError", "pyerrors.h"),
+    ("PyExc_SystemError", "pyerrors.h"),
+    ("PyExc_NameError", "pyerrors.h"),
+    ("PyExc_NotImplementedError", "pyerrors.h"),
+    ("PyExc_ArithmeticError", "pyerrors.h"),
+    ("PyExc_LookupError", "pyerrors.h"),
+    ("PyExc_OSError", "pyerrors.h"),
+    ("PyExc_IOError", "pyerrors.h"),
+    ("PyExc_AssertionError", "pyerrors.h"),
+    ("PyExc_StopIteration", "pyerrors.h"),
+    ("PyExc_StopAsyncIteration", "pyerrors.h"),
+    ("PyExc_ZeroDivisionError", "pyerrors.h"),
+    ("PyExc_ReferenceError", "pyerrors.h"),
+    ("PyExc_BufferError", "pyerrors.h"),
+    ("PyExc_ImportError", "pyerrors.h"),
+    ("PyExc_ImportWarning", "pyerrors.h"),
+    ("PyExc_FloatingPointError", "pyerrors.h"),
+    ("PyExc_RecursionError", "pyerrors.h"),
+    ("PyExc_UnicodeDecodeError", "pyerrors.h"),
+    ("PyExc_Warning", "pyerrors.h"),
+    ("PyExc_UserWarning", "pyerrors.h"),
+    ("PyExc_RuntimeWarning", "pyerrors.h"),
+    ("PyExc_DeprecationWarning", "pyerrors.h"),
+    ("PyExc_FutureWarning", "pyerrors.h"),
+    ("PyObject_Call", "abstract.h"),
+    ("PyObject_CallObject", "abstract.h"),
+    ("PyObject_CallNoArgs", "abstract.h"),
+    ("PyObject_CallOneArg", "abstract.h"),
+    ("PyObject_Vectorcall", "abstract.h"),
+    ("PyObject_VectorcallMethod", "abstract.h"),
+    ("PyObject_CallFunction", "abstract.h"),
+    ("PyObject_CallMethod", "abstract.h"),
+    ("PyObject_CallMethodNoArgs", "abstract.h"),
+    ("PyObject_CallMethodOneArg", "abstract.h"),
+    ("PyObject_CallFunctionObjArgs", "abstract.h"),
+    ("PyObject_GetIter", "abstract.h"),
+    ("PyIter_Next", "abstract.h"),
+    ("PyIter_Check", "abstract.h"),
+    ("PyNumber_Add", "abstract.h"),
+    ("PyNumber_Subtract", "abstract.h"),
+    ("PyNumber_Multiply", "abstract.h"),
+    ("PyNumber_TrueDivide", "abstract.h"),
+    ("PyNumber_FloorDivide", "abstract.h"),
+    ("PyNumber_Remainder", "abstract.h"),
+    ("PyNumber_Power", "abstract.h"),
+    ("PyNumber_Negative", "abstract.h"),
+    ("PyNumber_Positive", "abstract.h"),
+    ("PyNumber_Absolute", "abstract.h"),
+    ("PyNumber_Index", "abstract.h"),
+    ("PyNumber_AsSsize_t", "abstract.h"),
+    ("PyIndex_Check", "abstract.h"),
+    ("PyObject_GetBuffer", "abstract.h"),
+    ("PyObject_CheckBuffer", "abstract.h"),
+    ("PyBuffer_Release", "abstract.h"),
+    ("PySequence_Check", "abstract.h"),
+    ("PyMapping_Check", "abstract.h"),
+    ("PyMapping_GetItemString", "abstract.h"),
+    ("PyMapping_SetItemString", "abstract.h"),
+    ("PyMapping_HasKey", "abstract.h"),
+    ("PyMapping_HasKeyString", "abstract.h"),
+    ("PyMapping_GetOptionalItem", "abstract.h"),
+    ("PyMapping_GetOptionalItemString", "abstract.h"),
+    ("PyMapping_HasKeyWithError", "abstract.h"),
+    ("PyMapping_HasKeyStringWithError", "abstract.h"),
+    ("PySequence_Size", "abstract.h"),
+    ("PySequence_Length", "abstract.h"),
+    ("PySequence_GetItem", "abstract.h"),
+    ("PySequence_Contains", "abstract.h"),
+    ("PySequence_Fast", "abstract.h"),
+    ("PySequence_Fast_GET_SIZE", "abstract.h"),
+    ("PySequence_Fast_ITEMS", "abstract.h"),
+    ("PySequence_Fast_GET_ITEM", "abstract.h"),
+    ("PySequence_List", "abstract.h"),
+    ("PySequence_Tuple", "abstract.h"),
+    ("Py_Is", "object.h"),
+    ("Py_IsNone", "object.h"),
+    ("Py_IsTrue", "object.h"),
+    ("Py_IsFalse", "object.h"),
+    ("Py_PRINT_RAW", "object.h"),
+    ("PyObject_Print", "object.h"),
+    ("Py_INCREF", "object.h"),
+    ("Py_DECREF", "object.h"),
+    ("Py_XINCREF", "object.h"),
+    ("Py_XDECREF", "object.h"),
+    ("Py_NewRef", "object.h"),
+    ("Py_XNewRef", "object.h"),
+    ("Py_CLEAR", "object.h"),
+    ("Py_SETREF", "object.h"),
+    ("Py_XSETREF", "object.h"),
+    ("Py_None", "object.h"),
+    ("Py_True", "object.h"),
+    ("Py_False", "object.h"),
+    ("Py_NotImplemented", "object.h"),
+    ("Py_RETURN_NONE", "object.h"),
+    ("Py_RETURN_TRUE", "object.h"),
+    ("Py_RETURN_FALSE", "object.h"),
+    ("Py_RETURN_NOTIMPLEMENTED", "object.h"),
+    ("Py_UNUSED", "object.h"),
+    ("PyOS_snprintf", "object.h"),
+    ("PyOS_vsnprintf", "object.h"),
+    ("PyObject_GetAttrString", "object.h"),
+    ("PyObject_GetAttr", "object.h"),
+    ("PyObject_GetOptionalAttr", "object.h"),
+    ("PyObject_GetOptionalAttrString", "object.h"),
+    ("PyObject_SetAttrString", "object.h"),
+    ("PyObject_SetAttr", "object.h"),
+    ("PyObject_HasAttr", "object.h"),
+    ("PyObject_HasAttrString", "object.h"),
+    ("PyObject_HasAttrWithError", "object.h"),
+    ("PyObject_HasAttrStringWithError", "object.h"),
+    ("PyObject_IsTrue", "object.h"),
+    ("PyObject_Not", "object.h"),
+    ("PyObject_Hash", "object.h"),
+    ("PyCallable_Check", "object.h"),
+    ("PyObject_Str", "object.h"),
+    ("PyObject_Repr", "object.h"),
+    ("PyObject_Bytes", "object.h"),
+    ("PyObject_Format", "object.h"),
+    ("PyObject_Type", "object.h"),
+    ("PyObject_IsInstance", "object.h"),
+    ("PyObject_RichCompare", "object.h"),
+    ("PyObject_RichCompareBool", "object.h"),
+    ("PyObject_GetItem", "object.h"),
+    ("PyObject_SetItem", "object.h"),
+    ("PyObject_DelItem", "object.h"),
+    ("PyObject_Size", "object.h"),
+    ("PyObject_Length", "object.h"),
+    ("PyObject_Malloc", "object.h"),
+    ("PyObject_Calloc", "object.h"),
+    ("PyObject_Realloc", "object.h"),
+    ("PyObject_Free", "object.h"),
+    ("PyObject_MALLOC", "object.h"),
+    ("PyObject_REALLOC", "object.h"),
+    ("PyObject_FREE", "object.h"),
+    ("PyObject_Del", "object.h"),
+    ("PyObject_DEL", "object.h"),
+    ("PyTuple_New", "tupleobject.h"),
+    ("PyTuple_SetItem", "tupleobject.h"),
+    ("PyTuple_GetItem", "tupleobject.h"),
+    ("PyTuple_Size", "tupleobject.h"),
+    ("PyTuple_GET_ITEM", "tupleobject.h"),
+    ("PyTuple_GET_SIZE", "tupleobject.h"),
+    ("PyTuple_SET_ITEM", "tupleobject.h"),
+    ("PyTuple_Pack", "tupleobject.h"),
+    ("PyTuple_Check", "tupleobject.h"),
+    ("PyTuple_CheckExact", "tupleobject.h"),
+    ("PyList_New", "listobject.h"),
+    ("PyList_SetItem", "listobject.h"),
+    ("PyList_GetItem", "listobject.h"),
+    ("PyList_GetItemRef", "listobject.h"),
+    ("PyList_Size", "listobject.h"),
+    ("PyList_GET_ITEM", "listobject.h"),
+    ("PyList_GET_SIZE", "listobject.h"),
+    ("PyList_SET_ITEM", "listobject.h"),
+    ("PyList_Append", "listobject.h"),
+    ("PyList_Check", "listobject.h"),
+    ("PyList_CheckExact", "listobject.h"),
+    ("PyDict_New", "dictobject.h"),
+    ("PyDict_SetItem", "dictobject.h"),
+    ("PyDict_SetItemString", "dictobject.h"),
+    ("PyDict_GetItem", "dictobject.h"),
+    ("PyDict_GetItemString", "dictobject.h"),
+    ("PyDict_GetItemWithError", "dictobject.h"),
+    ("PyDict_GetItemRef", "dictobject.h"),
+    ("PyDict_GetItemStringRef", "dictobject.h"),
+    ("PyDict_SetDefaultRef", "dictobject.h"),
+    ("PyDict_Pop", "dictobject.h"),
+    ("PyDict_PopString", "dictobject.h"),
+    ("PyDict_DelItem", "dictobject.h"),
+    ("PyDict_DelItemString", "dictobject.h"),
+    ("PyDict_Size", "dictobject.h"),
+    ("PyDict_Contains", "dictobject.h"),
+    ("PyDict_ContainsString", "dictobject.h"),
+    ("PyDict_Next", "dictobject.h"),
+    ("PyDict_Check", "dictobject.h"),
+    ("PyDict_CheckExact", "dictobject.h"),
+    ("PyBytes_FromString", "bytesobject.h"),
+    ("PyBytes_FromStringAndSize", "bytesobject.h"),
+    ("PyBytes_AsString", "bytesobject.h"),
+    ("PyBytes_AsStringAndSize", "bytesobject.h"),
+    ("PyBytes_AS_STRING", "bytesobject.h"),
+    ("PyBytes_Size", "bytesobject.h"),
+    ("PyBytes_GET_SIZE", "bytesobject.h"),
+    ("PyBytes_Check", "bytesobject.h"),
+    ("PyBytes_CheckExact", "bytesobject.h"),
+    ("PyImport_ImportModule", "import.h"),
+    ("PyCapsule_New", "pycapsule.h"),
+    ("PyCapsule_GetPointer", "pycapsule.h"),
+    ("PyCapsule_GetName", "pycapsule.h"),
+    ("PyCapsule_GetContext", "pycapsule.h"),
+    ("PyCapsule_IsValid", "pycapsule.h"),
+    ("PyCapsule_CheckExact", "pycapsule.h"),
+    ("PyCapsule_SetContext", "pycapsule.h"),
+    ("PyCapsule_SetName", "pycapsule.h"),
+    ("PyCapsule_SetPointer", "pycapsule.h"),
+    ("PyCapsule_GetDestructor", "pycapsule.h"),
+    ("PyCapsule_SetDestructor", "pycapsule.h"),
+    ("PyCapsule_Import", "pycapsule.h"),
+    ("PyMemoryView_FromObject", "memoryobject.h"),
+    ("PyMemoryView_FromMemory", "memoryobject.h"),
+    ("PyMemoryView_Check", "memoryobject.h"),
+    ("PyMemoryView_GET_BUFFER", "memoryobject.h"),
+    ("PyMemoryView_GET_BASE", "memoryobject.h"),
+    ("Py_IsInitialized", "pylifecycle.h"),
+    ("PyGILState_Ensure", "pystate.h"),
+    ("PyGILState_Release", "pystate.h"),
+    ("PyGILState_Check", "pystate.h"),
+    ("PyArray_API", "numpy/arrayobject.h"),
+    ("PyDimMem_NEW", "numpy/arrayobject.h"),
+    ("PyDimMem_FREE", "numpy/arrayobject.h"),
+    ("PyDimMem_RENEW", "numpy/arrayobject.h"),
+    ("PyArray_Type", "numpy/arrayobject.h"),
+    ("PyArrayDescr_Type", "numpy/arrayobject.h"),
+)
+
+_NATIVE_CAPI_HEADER_PREFIXES = (
+    ("PyArray_", "numpy/arrayobject.h"),
+    ("PyDimMem_", "numpy/arrayobject.h"),
+    ("PyDataMem_", "numpy/arrayobject.h"),
+    ("PyDataType_", "numpy/arrayobject.h"),
+    ("PyTypeNum_", "numpy/arrayobject.h"),
+    ("PyUFunc_", "numpy/ufuncobject.h"),
+)
+
+_NATIVE_CAPI_IMPLEMENTED_SYMBOLS = (
+    "Py_Is",
+    "Py_IsNone",
+    "Py_IsTrue",
+    "Py_IsFalse",
+    "Py_PRINT_RAW",
+    "PyObject_Print",
+    "PyLong_FromDouble",
+    "PyErr_Print",
+    "PyErr_CheckSignals",
+    "PyUnicode_AsUTF8String",
+    "PyUnicode_AsASCIIString",
+    "PyUnicode_AsEncodedString",
+    "PyUnicode_FromKindAndData",
+    "PyUnicode_FromOrdinal",
+    "PyUnicode_AsUCS4",
+    "PyUnicode_AsUCS4Copy",
+    "PyUnicode_Tailmatch",
+    "PyUnicode_Find",
+    "PyUnicode_ReadChar",
+    "PyUnicode_FindChar",
+    "PyUnicode_Count",
+    "PyUnicode_Replace",
+    "PyUnicode_Substring",
+    "PyUnicode_Contains",
+    "PyUnicode_Concat",
+    "Py_UCS1",
+    "Py_UCS2",
+    "PyUnicode_1BYTE_KIND",
+    "PyUnicode_2BYTE_KIND",
+    "PyUnicode_4BYTE_KIND",
+    "Py_REFCNT",
+    "Py_SET_REFCNT",
+    "PyMapping_Size",
+    "PyMapping_Length",
+    "PyMapping_Keys",
+    "PyMapping_Values",
+    "PyMapping_Items",
+    "PyObject_LengthHint",
+    "PyObject_SelfIter",
+    "PyIter_NextItem",
+    "PySequence_SetItem",
+    "PySequence_Concat",
+    "PySequence_Repeat",
+    "PySequence_InPlaceConcat",
+    "PySequence_InPlaceRepeat",
+    "PyLong_AsDouble",
+    "PyFloat_AS_DOUBLE",
+    "PyNumber_Check",
+    "PyNumber_Long",
+    "PyNumber_Float",
+    "PyNumber_And",
+    "PyNumber_Or",
+    "PyNumber_Xor",
+    "PyNumber_Invert",
+    "PyNumber_Lshift",
+    "PyNumber_Rshift",
+    "PySet_New",
+    "PySet_Add",
+    "PySet_Contains",
+    "PySet_Discard",
+    "PySet_Size",
+    "PySet_GET_SIZE",
+    "PySet_Check",
+    "PySet_CheckExact",
+    "PyAnySet_Check",
+    "PyAnySet_CheckExact",
+    "PyList_AsTuple",
+    "PyDict_Keys",
+    "PyDict_Values",
+    "PyDict_Items",
+    "Py_Initialize",
+    "Py_INCREF",
+    "Py_DECREF",
+    "Py_XINCREF",
+    "Py_XDECREF",
+    "Py_NewRef",
+    "Py_XNewRef",
+    "Py_CLEAR",
+    "Py_SETREF",
+    "Py_XSETREF",
+    "Py_None",
+    "Py_True",
+    "Py_False",
+    "Py_NotImplemented",
+    "Py_RETURN_NONE",
+    "Py_RETURN_TRUE",
+    "Py_RETURN_FALSE",
+    "Py_RETURN_NOTIMPLEMENTED",
+    "Py_UNUSED",
+    "PyOS_snprintf",
+    "PyOS_vsnprintf",
+    "PyMem_Malloc",
+    "PyMem_Calloc",
+    "PyMem_Realloc",
+    "PyMem_Free",
+    "PyMem_RawMalloc",
+    "PyMem_RawCalloc",
+    "PyMem_RawRealloc",
+    "PyMem_RawFree",
+    "PyMem_FREE",
+    "PyObject_Malloc",
+    "PyObject_Calloc",
+    "PyObject_Realloc",
+    "PyObject_Free",
+    "PyObject_MALLOC",
+    "PyObject_REALLOC",
+    "PyObject_FREE",
+    "PyObject_Del",
+    "PyObject_DEL",
+    "PyModule_Create",
+    "PyModule_Create2",
+    "PyModule_AddObject",
+    "PyModule_AddObjectRef",
+    "PyModule_Add",
+    "PyModule_AddIntConstant",
+    "PyModule_AddStringConstant",
+    "PyModule_GetDict",
+    "PyArg_ParseTuple",
+    "PyArg_ParseTupleAndKeywords",
+    "Py_BuildValue",
+    "PyLong_FromLong",
+    "PyLong_FromUnsignedLong",
+    "PyLong_AsLong",
+    "PyLong_FromLongLong",
+    "PyLong_FromUnsignedLongLong",
+    "PyLong_FromInt32",
+    "PyLong_FromInt64",
+    "PyLong_FromUInt32",
+    "PyLong_FromUInt64",
+    "PyLong_FromVoidPtr",
+    "PyLong_FromSsize_t",
+    "PyLong_FromSize_t",
+    "PyLong_AsLongLong",
+    "PyLong_AsInt",
+    "PyLong_AsInt32",
+    "PyLong_AsInt64",
+    "PyLong_AsUInt32",
+    "PyLong_AsUInt64",
+    "PyLong_AsVoidPtr",
+    "PyLong_AsLongAndOverflow",
+    "PyLong_AsUnsignedLong",
+    "PyLong_AsUnsignedLongLong",
+    "PyLong_AsUnsignedLongLongMask",
+    "PyLong_AsSsize_t",
+    "PyLong_AsSize_t",
+    "PyLong_Check",
+    "PyLong_CheckExact",
+    "PyBool_FromLong",
+    "PyBool_Check",
+    "PyFloat_FromDouble",
+    "PyFloat_AsDouble",
+    "PyFloat_Check",
+    "PyFloat_CheckExact",
+    "Py_complex",
+    "PyComplex_FromDoubles",
+    "PyComplex_FromCComplex",
+    "PyComplex_AsCComplex",
+    "PyComplex_RealAsDouble",
+    "PyComplex_ImagAsDouble",
+    "PyComplex_Check",
+    "PyComplex_CheckExact",
+    "Py_UCS4",
+    "PyUnicode_FromString",
+    "PyUnicode_FromStringAndSize",
+    "PyUnicode_FromFormat",
+    "PyUnicode_FromFormatV",
+    "PyUnicode_InternFromString",
+    "PyUnicode_FromEncodedObject",
+    "PyUnicode_AsUTF8",
+    "PyUnicode_AsUTF8AndSize",
+    "PyUnicode_Check",
+    "PyUnicode_CheckExact",
+    "PyUnicode_GetLength",
+    "PyUnicode_GET_LENGTH",
+    "PyUnicode_Compare",
+    "PyUnicode_CompareWithASCIIString",
+    "PyUnicode_EqualToUTF8",
+    "PyUnicode_EqualToUTF8AndSize",
+    "Py_UNICODE_ISSPACE",
+    "Py_UNICODE_ISDIGIT",
+    "Py_UNICODE_ISDECIMAL",
+    "Py_UNICODE_ISNUMERIC",
+    "Py_UNICODE_ISLOWER",
+    "Py_UNICODE_ISUPPER",
+    "Py_UNICODE_ISTITLE",
+    "Py_UNICODE_ISALPHA",
+    "Py_UNICODE_ISALNUM",
+    "PyErr_SetString",
+    "PyErr_SetNone",
+    "PyErr_SetObject",
+    "PyErr_Format",
+    "PyErr_FormatV",
+    "PyErr_NoMemory",
+    "PyErr_SetFromErrno",
+    "PyErr_SetFromErrnoWithFilenameObject",
+    "PyErr_NewException",
+    "PyErr_BadInternalCall",
+    "PyErr_WarnEx",
+    "PyErr_WarnFormat",
+    "PyErr_WriteUnraisable",
+    "PyErr_Occurred",
+    "PyErr_Clear",
+    "PyErr_GivenExceptionMatches",
+    "PyErr_ExceptionMatches",
+    "PyErr_Fetch",
+    "PyErr_Restore",
+    "PyExc_BaseException",
+    "PyExc_Exception",
+    "PyExc_ValueError",
+    "PyExc_TypeError",
+    "PyExc_RuntimeError",
+    "PyExc_KeyError",
+    "PyExc_IndexError",
+    "PyExc_AttributeError",
+    "PyExc_MemoryError",
+    "PyExc_OverflowError",
+    "PyExc_SystemError",
+    "PyExc_NameError",
+    "PyExc_NotImplementedError",
+    "PyExc_ArithmeticError",
+    "PyExc_LookupError",
+    "PyExc_OSError",
+    "PyExc_IOError",
+    "PyExc_AssertionError",
+    "PyExc_StopIteration",
+    "PyExc_StopAsyncIteration",
+    "PyExc_ZeroDivisionError",
+    "PyExc_ReferenceError",
+    "PyExc_BufferError",
+    "PyExc_ImportError",
+    "PyExc_ImportWarning",
+    "PyExc_FloatingPointError",
+    "PyExc_RecursionError",
+    "PyExc_UnicodeDecodeError",
+    "PyExc_Warning",
+    "PyExc_UserWarning",
+    "PyExc_RuntimeWarning",
+    "PyExc_DeprecationWarning",
+    "PyExc_FutureWarning",
+    "PyObject_Call",
+    "PyObject_CallObject",
+    "PyObject_CallNoArgs",
+    "PyObject_CallOneArg",
+    "PyObject_Vectorcall",
+    "PyObject_VectorcallMethod",
+    "PyObject_CallFunction",
+    "PyObject_CallMethod",
+    "PyObject_CallMethodNoArgs",
+    "PyObject_CallMethodOneArg",
+    "PyObject_CallFunctionObjArgs",
+    "PyObject_GetIter",
+    "PyIter_Next",
+    "PyIter_Check",
+    "PyNumber_Add",
+    "PyNumber_Subtract",
+    "PyNumber_Multiply",
+    "PyNumber_TrueDivide",
+    "PyNumber_FloorDivide",
+    "PyNumber_Remainder",
+    "PyNumber_Power",
+    "PyNumber_Negative",
+    "PyNumber_Positive",
+    "PyNumber_Absolute",
+    "PyNumber_Index",
+    "PyNumber_AsSsize_t",
+    "PyIndex_Check",
+    "PyObject_GetAttrString",
+    "PyObject_GetAttr",
+    "PyObject_GetOptionalAttr",
+    "PyObject_GetOptionalAttrString",
+    "PyObject_SetAttrString",
+    "PyObject_SetAttr",
+    "PyObject_HasAttr",
+    "PyObject_HasAttrString",
+    "PyObject_HasAttrWithError",
+    "PyObject_HasAttrStringWithError",
+    "PyObject_IsTrue",
+    "PyObject_Not",
+    "PyObject_Hash",
+    "PyCallable_Check",
+    "PyObject_Str",
+    "PyObject_Repr",
+    "PyObject_Bytes",
+    "PyObject_Format",
+    "PyObject_Type",
+    "PyObject_IsInstance",
+    "PyObject_RichCompare",
+    "PyObject_RichCompareBool",
+    "PyObject_GetItem",
+    "PyObject_SetItem",
+    "PyObject_DelItem",
+    "PyObject_Size",
+    "PyObject_Length",
+    "PyTuple_New",
+    "PyTuple_SetItem",
+    "PyTuple_GetItem",
+    "PyTuple_Size",
+    "PyTuple_GET_ITEM",
+    "PyTuple_GET_SIZE",
+    "PyTuple_SET_ITEM",
+    "PyTuple_Pack",
+    "PyTuple_Check",
+    "PyTuple_CheckExact",
+    "PyList_New",
+    "PyList_SetItem",
+    "PyList_GetItem",
+    "PyList_GetItemRef",
+    "PyList_Size",
+    "PyList_GET_ITEM",
+    "PyList_GET_SIZE",
+    "PyList_SET_ITEM",
+    "PyList_Append",
+    "PyList_Check",
+    "PyList_CheckExact",
+    "PyDict_New",
+    "PyDict_SetItem",
+    "PyDict_SetItemString",
+    "PyDict_GetItem",
+    "PyDict_GetItemString",
+    "PyDict_GetItemWithError",
+    "PyDict_GetItemRef",
+    "PyDict_GetItemStringRef",
+    "PyDict_SetDefaultRef",
+    "PyDict_Pop",
+    "PyDict_PopString",
+    "PyDict_DelItem",
+    "PyDict_DelItemString",
+    "PyDict_Size",
+    "PyDict_Contains",
+    "PyDict_ContainsString",
+    "PyDict_Next",
+    "PyDict_Check",
+    "PyDict_CheckExact",
+    "PyBytes_FromString",
+    "PyBytes_FromStringAndSize",
+    "PyBytes_AsString",
+    "PyBytes_AsStringAndSize",
+    "PyBytes_AS_STRING",
+    "PyBytes_Size",
+    "PyBytes_GET_SIZE",
+    "PyBytes_Check",
+    "PyBytes_CheckExact",
+    "PyCapsule_New",
+    "PyCapsule_GetPointer",
+    "PyCapsule_GetName",
+    "PyCapsule_GetContext",
+    "PyCapsule_IsValid",
+    "PyCapsule_CheckExact",
+    "PyCapsule_SetContext",
+    "PyCapsule_SetName",
+    "PyCapsule_SetPointer",
+    "PyCapsule_GetDestructor",
+    "PyCapsule_SetDestructor",
+    "PyCapsule_Import",
+    "PyObject_GetBuffer",
+    "PyObject_CheckBuffer",
+    "PyBuffer_Release",
+    "PyMemoryView_FromObject",
+    "PyMemoryView_FromMemory",
+    "PyMemoryView_Check",
+    "PyMemoryView_GET_BUFFER",
+    "PyMemoryView_GET_BASE",
+    "Py_IsInitialized",
+    "PyGILState_Ensure",
+    "PyGILState_Release",
+    "PyGILState_Check",
+    "PyImport_ImportModule",
+    "PySequence_Check",
+    "PyMapping_Check",
+    "PyMapping_GetItemString",
+    "PyMapping_SetItemString",
+    "PyMapping_HasKey",
+    "PyMapping_HasKeyString",
+    "PyMapping_GetOptionalItem",
+    "PyMapping_GetOptionalItemString",
+    "PyMapping_HasKeyWithError",
+    "PyMapping_HasKeyStringWithError",
+    "PySequence_Size",
+    "PySequence_Length",
+    "PySequence_GetItem",
+    "PySequence_Contains",
+    "PySequence_Fast",
+    "PySequence_Fast_GET_SIZE",
+    "PySequence_Fast_ITEMS",
+    "PySequence_Fast_GET_ITEM",
+    "PySequence_List",
+    "PySequence_Tuple",
+    "PyArray_API",
+    "PyArray_malloc",
+    "PyArray_free",
+    "PyArray_realloc",
+    "PyDimMem_NEW",
+    "PyDimMem_FREE",
+    "PyDimMem_RENEW",
+    "PyArray_Type",
+    "PyArrayDescr_Type",
+    "PyArray_DescrCheck",
+    "PyArray_DescrFromType",
+    "PyArray_TypeObjectFromType",
+    "PyArray_DescrNewFromType",
+    "PyArray_DescrNew",
+    "PyArray_DescrNewByteorder",
+    "PyArray_CanCastSafely",
+    "PyArray_CanCastTo",
+    "PyArray_CanCastTypeTo",
+    "PyArray_CanCastArrayTo",
+    "PyArray_CastingConverter",
+    "PyArray_Zero",
+    "PyArray_One",
+    "PyArray_ObjectType",
+    "PyArray_DescrFromObject",
+    "PyArray_Size",
+    "PyArray_DescrFromScalar",
+    "PyArray_DescrFromTypeObject",
+    "PyArray_Scalar",
+    "PyArray_ScalarAsCtype",
+    "PyArray_FromScalar",
+    "PyArray_CastScalarToCtype",
+    "PyArray_CastScalarDirect",
+    "PyArray_Pack",
+    "PyArray_CastToType",
+    "PyArray_Cast",
+    "PyArray_FillWithScalar",
+    "PyArray_ToList",
+    "PyArray_ToString",
+    "PyArray_Byteswap",
+    "PyArray_FromString",
+    "PyArray_FromBuffer",
+    "PyArray_FromIter",
+    "PyArray_Converter",
+    "PyArray_IterNew",
+    "PyArray_BroadcastToShape",
+    "PyArray_Broadcast",
+    "PyArray_Concatenate",
+    "PyArray_Arange",
+    "PyArray_ArangeObj",
+    "PyArray_LexSort",
+    "PyArray_InnerProduct",
+    "PyArray_MatrixProduct",
+    "PyArray_MatrixProduct2",
+    "PyArray_CountNonzero",
+    "PyArray_MinScalarType",
+    "PyArray_CreateSortedStridePerm",
+    "PyArray_RemoveAxesInPlace",
+    "PyArray_DebugPrint",
+    "PyArray_EinsteinSum",
+    "PyArray_Partition",
+    "PyArray_ArgPartition",
+    "PyArray_CheckAnyScalarExact",
+    "PyArray_Correlate",
+    "PyArray_Correlate2",
+    "PyArray_RemoveSmallest",
+    "PyArray_IterAllButAxis",
+    "PyArray_PyIntAsInt",
+    "PyArray_PyIntAsIntp",
+    "PyArray_PythonPyIntFromInt",
+    "PyArray_IntpFromSequence",
+    "PyArray_IntpConverter",
+    "PyArray_BufferConverter",
+    "PyArray_OptionalIntpConverter",
+    "PyArray_Free",
+    "PyArray_AsCArray",
+    "PyArray_FailUnlessWriteable",
+    "PyArray_CheckStrides",
+    "PyArray_GetPriority",
+    "PyArray_ITER_RESET",
+    "PyArray_ITER_NEXT",
+    "PyArray_ITER_DATA",
+    "PyArray_ITER_NOTDONE",
+    "PyArray_CopyObject",
+    "PyArray_Resize",
+    "PyArray_NewLikeArray",
+    "PyArray_View",
+    "PyArray_Squeeze",
+    "PyArray_Transpose",
+    "PyArray_Ravel",
+    "PyArray_Flatten",
+    "PyArray_TakeFrom",
+    "PyArray_PutTo",
+    "PyArray_PutMask",
+    "PyArray_Repeat",
+    "PyArray_Choose",
+    "PyArray_Sort",
+    "PyArray_ArgSort",
+    "PyArray_SearchSorted",
+    "PyArray_Nonzero",
+    "PyArray_Where",
+    "PyArray_Compress",
+    "PyArray_Diagonal",
+    "PyArray_Trace",
+    "PyArray_Clip",
+    "PyArray_Conjugate",
+    "PyArray_Std",
+    "PyArray_Round",
+    "PyArray_EquivTypenums",
+    "PyArray_ScalarKind",
+    "PyArray_CanCoerceScalar",
+    "PyArray_CanCastScalar",
+    "PyArray_PromoteTypes",
+    "PyArray_ResultType",
+    "PyArray_ConvertToCommonType",
+    "PyArray_IntTupleFromIntp",
+    "PyArray_ClipmodeConverter",
+    "PyArray_ConvertClipmodeSequence",
+    "PyArray_OutputConverter",
+    "PyArray_SearchsideConverter",
+    "PyArray_OrderConverter",
+    "PyArray_BoolConverter",
+    "PyArray_OptionalBoolConverter",
+    "PyArray_AxisConverter",
+    "PyArray_GetNDArrayCVersion",
+    "PyArray_ByteorderConverter",
+    "PyArray_SortkindConverter",
+    "PyArray_SelectkindConverter",
+    "PyArray_OverflowMultiplyList",
+    "PyArray_GetEndianness",
+    "PyArray_GetNDArrayCFeatureVersion",
+    "PyArray_CheckAxis",
+    "PyArray_DescrAlignConverter",
+    "PyArray_DescrAlignConverter2",
+    "PyArray_DescrConverter",
+    "PyArray_DescrConverter2",
+    "PyArray_Sum",
+    "PyArray_CumSum",
+    "PyArray_Prod",
+    "PyArray_CumProd",
+    "PyArray_Max",
+    "PyArray_Min",
+    "PyArray_Ptp",
+    "PyArray_Mean",
+    "PyArray_Any",
+    "PyArray_All",
+    "PyArray_ArgMax",
+    "PyArray_ArgMin",
+    "PyArray_Reshape",
+    "PyArray_Newshape",
+    "PyArray_SwapAxes",
+    "PyArray_CheckFromAny",
+    "PyArray_FromArray",
+    "PyArray_MultiplyList",
+    "PyArray_MultiplyIntList",
+    "PyArray_GetPtr",
+    "PyArray_ElementStrides",
+    "PyArray_ValidType",
+    "PyArray_Item_INCREF",
+    "PyArray_Item_XDECREF",
+    "PyArray_NewCopy",
+    "PyArray_INCREF",
+    "PyArray_XDECREF",
+    "PyArray_FromAny",
+    "PyArray_SimpleNew",
+    "PyArray_SimpleNewFromData",
+    "PyArray_NDIM",
+    "PyArray_DIMS",
+    "PyArray_STRIDES",
+    "PyArray_DATA",
+    "PyArray_DESCR",
+    "PyArray_DTYPE",
+    "PyArray_TYPE",
+    "PyDataType_TYPE",
+    "PyDataType_KIND",
+    "PyDataType_ELSIZE",
+    "PyDataType_ALIGNMENT",
+    "PyTypeNum_ISBOOL",
+    "PyTypeNum_ISUNSIGNED",
+    "PyTypeNum_ISSIGNED",
+    "PyTypeNum_ISINTEGER",
+    "PyTypeNum_ISFLOAT",
+    "PyTypeNum_ISNUMBER",
+    "PyTypeNum_ISSTRING",
+    "PyTypeNum_ISCOMPLEX",
+    "PyTypeNum_ISFLEXIBLE",
+    "PyTypeNum_ISOBJECT",
+    "PyDataType_ISBOOL",
+    "PyDataType_ISUNSIGNED",
+    "PyDataType_ISSIGNED",
+    "PyDataType_ISINTEGER",
+    "PyDataType_ISFLOAT",
+    "PyDataType_ISNUMBER",
+    "PyDataType_ISSTRING",
+    "PyDataType_ISCOMPLEX",
+    "PyDataType_ISFLEXIBLE",
+    "PyDataType_ISOBJECT",
+    "PyArray_GETITEM",
+    "PyArray_SETITEM",
+    "PyArray_NBYTES",
+    "PyArray_FILLWBYTE",
+    "PyArray_EquivByteorders",
+    "PyArray_SHAPE",
+    "PyArray_FLAGS",
+    "PyArray_CompareLists",
+    "PyArray_Empty",
+    "PyArray_Zeros",
+    "PyArray_EMPTY",
+    "PyArray_ZEROS",
+    "PyArray_EquivTypes",
+    "PyArray_EquivArrTypes",
+    "PyArray_NewFromDescr",
+    "PyArray_New",
+    "PyArray_MultiIterNew",
+    "PyArray_MultiIterFromObjects",
+    "PyArray_SimpleNewFromDescr",
+    "PyArray_BASE",
+    "PyArray_SetBaseObject",
+    "PyArray_SetUpdateIfCopyBase",
+    "PyArray_SetWritebackIfCopyBase",
+    "PyArray_ResolveWritebackIfCopy",
+    "PyArray_DiscardWritebackIfCopy",
+    "PyDataMem_NEW",
+    "PyDataMem_FREE",
+    "PyDataMem_RENEW",
+    "PyDataMem_NEW_ZEROED",
+    "PyDataMem_GetHandler",
+    "PyDataMem_UserNEW",
+    "PyDataMem_UserFREE",
+    "PyDataMem_UserRENEW",
+    "PyDataMem_UserNEW_ZEROED",
+    "PyArray_Return",
+    "PyArray_ENABLEFLAGS",
+    "PyArray_CLEARFLAGS",
+    "PyArray_UpdateFlags",
+    "PyArray_CopyInto",
+    "PyArray_CopyAnyInto",
+    "PyArray_ToScalar",
+    "PyArray_Copy",
+    "PyArray_EnsureArray",
+    "PyArray_EnsureAnyArray",
+    "PyArray_SAMESHAPE",
+    "PyArray_CHKFLAGS",
+    "PyArray_FROM_O",
+    "PyArray_FROM_OF",
+    "PyArray_FROM_OT",
+    "PyArray_FROM_OTF",
+    "PyArray_FROMANY",
+    "PyArray_ContiguousFromAny",
+    "PyArray_FromObject",
+    "PyArray_ContiguousFromObject",
+    "PyArray_CopyFromObject",
+    "PyArray_ISCONTIGUOUS",
+    "PyArray_IS_C_CONTIGUOUS",
+    "PyArray_ISALIGNED",
+    "PyArray_ISWRITEABLE",
+    "PyArray_ISCARRAY",
+    "PyArray_IS_F_CONTIGUOUS",
+    "PyArray_ISONESEGMENT",
+    "PyArray_ISFORTRAN",
+    "PyArray_FORTRAN_IF",
+    "PyArray_ISNBO",
+    "PyArray_IsNativeByteOrder",
+    "PyArray_ISNOTSWAPPED",
+    "PyArray_ISBYTESWAPPED",
+    "PyArray_FLAGSWAP",
+    "PyArray_ISCARRAY_RO",
+    "PyArray_ISFARRAY",
+    "PyArray_ISFARRAY_RO",
+    "PyArray_ISBEHAVED",
+    "PyArray_ISBEHAVED_RO",
+    "PyDataType_ISNOTSWAPPED",
+    "PyDataType_ISBYTESWAPPED",
+    "PyArray_ISVARIABLE",
+    "PyArray_SAFEALIGNEDCOPY",
+    "PyArray_ISBOOL",
+    "PyArray_ISUNSIGNED",
+    "PyArray_ISSIGNED",
+    "PyArray_ISINTEGER",
+    "PyArray_ISFLOAT",
+    "PyArray_ISNUMBER",
+    "PyArray_ISSTRING",
+    "PyArray_ISCOMPLEX",
+    "PyArray_ISFLEXIBLE",
+    "PyArray_ISOBJECT",
+    "PyArray_DIM",
+    "PyArray_BYTES",
+    "PyArray_SIZE",
+    "PyArray_ITEMSIZE",
+    "PyArray_Check",
+    "PyArray_CheckExact",
+    "PyArray_STRIDE",
+    "PyArray_GETPTR1",
+    "PyArray_GETPTR2",
+    "PyArray_GETPTR3",
+    "PyArray_GETPTR4",
+    "PyUFunc_API",
+    "PyUFunc_FromFuncAndData",
+)
+
+
 def _native_known_capi_header(symbol: str):
-    if (
-        symbol == "Py_Initialize"
-        or symbol == "Py_UNUSED"
-        or symbol == "PyOS_snprintf"
-        or symbol == "PyOS_vsnprintf"
-    ):
-        return "Python.h"
-    if symbol == "Py_REFCNT" or symbol == "Py_SET_REFCNT":
-        return "object.h"
-    if symbol == "PyMapping_Size" or symbol == "PyMapping_Length":
-        return "abstract.h"
-    if (
-        symbol == "PyMapping_Keys"
-        or symbol == "PyMapping_Values"
-        or symbol == "PyMapping_Items"
-    ):
-        return "abstract.h"
-    if symbol == "PyObject_LengthHint":
-        return "abstract.h"
-    if (
-        symbol == "PySequence_SetItem"
-        or symbol == "PySequence_Concat"
-        or symbol == "PySequence_Repeat"
-        or symbol == "PySequence_InPlaceConcat"
-        or symbol == "PySequence_InPlaceRepeat"
-    ):
-        return "abstract.h"
-    if (
-        symbol == "PyMem_Malloc"
-        or symbol == "PyMem_Calloc"
-        or symbol == "PyMem_Realloc"
-        or symbol == "PyMem_Free"
-        or symbol == "PyMem_RawMalloc"
-        or symbol == "PyMem_RawCalloc"
-        or symbol == "PyMem_RawRealloc"
-        or symbol == "PyMem_RawFree"
-        or symbol == "PyMem_FREE"
-    ):
-        return "pymem.h"
-    if (
-        symbol == "PyModule_Create"
-        or symbol == "PyModule_Create2"
-        or symbol == "PyModule_AddObject"
-        or symbol == "PyModule_AddObjectRef"
-        or symbol == "PyModule_Add"
-        or symbol == "PyModule_AddIntConstant"
-        or symbol == "PyModule_AddStringConstant"
-        or symbol == "PyModule_GetDict"
-    ):
-        return "moduleobject.h"
-    if (
-        symbol == "PyArg_ParseTuple"
-        or symbol == "PyArg_ParseTupleAndKeywords"
-        or symbol == "Py_BuildValue"
-    ):
-        return "modsupport.h"
-    if symbol == "PyLong_FromDouble" or symbol == "PyLong_AsDouble":
-        return "longobject.h"
-    if symbol == "PyFloat_AS_DOUBLE":
-        return "floatobject.h"
-    if (
-        symbol == "PyNumber_Check"
-        or symbol == "PyNumber_Long"
-        or symbol == "PyNumber_Float"
-        or symbol == "PyNumber_And"
-        or symbol == "PyNumber_Or"
-    ):
-        return "abstract.h"
-    if (
-        symbol == "PyNumber_Xor"
-        or symbol == "PyNumber_Invert"
-        or symbol == "PyNumber_Lshift"
-        or symbol == "PyNumber_Rshift"
-    ):
-        return "abstract.h"
-    if (
-        symbol == "PySet_New"
-        or symbol == "PySet_Add"
-        or symbol == "PySet_Contains"
-        or symbol == "PySet_Discard"
-        or symbol == "PySet_Size"
-    ):
-        return "setobject.h"
-    if (
-        symbol == "PySet_GET_SIZE"
-        or symbol == "PySet_Check"
-        or symbol == "PySet_CheckExact"
-        or symbol == "PyAnySet_Check"
-        or symbol == "PyAnySet_CheckExact"
-    ):
-        return "setobject.h"
-    if symbol == "PyList_AsTuple":
-        return "listobject.h"
-    if symbol == "PyDict_Keys" or symbol == "PyDict_Values" or symbol == "PyDict_Items":
-        return "dictobject.h"
-    if (
-        symbol == "PyLong_FromLong"
-        or symbol == "PyLong_FromUnsignedLong"
-        or symbol == "PyLong_AsLong"
-        or symbol == "PyLong_FromLongLong"
-        or symbol == "PyLong_FromUnsignedLongLong"
-        or symbol == "PyLong_FromInt32"
-        or symbol == "PyLong_FromInt64"
-        or symbol == "PyLong_FromUInt32"
-        or symbol == "PyLong_FromUInt64"
-        or symbol == "PyLong_FromVoidPtr"
-        or symbol == "PyLong_FromSsize_t"
-        or symbol == "PyLong_FromSize_t"
-        or symbol == "PyLong_AsLongLong"
-        or symbol == "PyLong_AsInt"
-        or symbol == "PyLong_AsInt32"
-        or symbol == "PyLong_AsInt64"
-        or symbol == "PyLong_AsUInt32"
-        or symbol == "PyLong_AsUInt64"
-        or symbol == "PyLong_AsVoidPtr"
-        or symbol == "PyLong_AsLongAndOverflow"
-        or symbol == "PyLong_AsUnsignedLong"
-        or symbol == "PyLong_AsUnsignedLongLong"
-        or symbol == "PyLong_AsUnsignedLongLongMask"
-        or symbol == "PyLong_AsSsize_t"
-        or symbol == "PyLong_AsSize_t"
-        or symbol == "PyLong_Check"
-        or symbol == "PyLong_CheckExact"
-    ):
-        return "longobject.h"
-    if symbol == "PyBool_FromLong" or symbol == "PyBool_Check":
-        return "boolobject.h"
-    if (
-        symbol == "PyFloat_FromDouble"
-        or symbol == "PyFloat_AsDouble"
-        or symbol == "PyFloat_Check"
-        or symbol == "PyFloat_CheckExact"
-    ):
-        return "floatobject.h"
-    if (
-        symbol == "Py_complex"
-        or symbol == "PyComplex_FromDoubles"
-        or symbol == "PyComplex_FromCComplex"
-        or symbol == "PyComplex_AsCComplex"
-        or symbol == "PyComplex_RealAsDouble"
-        or symbol == "PyComplex_ImagAsDouble"
-        or symbol == "PyComplex_Check"
-        or symbol == "PyComplex_CheckExact"
-    ):
-        return "complexobject.h"
-    if (
-        symbol == "PyUnicode_AsUTF8String"
-        or symbol == "PyUnicode_AsASCIIString"
-        or symbol == "PyUnicode_AsEncodedString"
-        or symbol == "PyUnicode_FromKindAndData"
-        or symbol == "PyUnicode_FromOrdinal"
-        or symbol == "PyUnicode_AsUCS4"
-        or symbol == "PyUnicode_AsUCS4Copy"
-        or symbol == "PyUnicode_Tailmatch"
-        or symbol == "PyUnicode_Find"
-        or symbol == "PyUnicode_ReadChar"
-        or symbol == "PyUnicode_FindChar"
-        or symbol == "PyUnicode_Count"
-        or symbol == "PyUnicode_Replace"
-        or symbol == "PyUnicode_Substring"
-        or symbol == "PyUnicode_Contains"
-        or symbol == "PyUnicode_Concat"
-    ):
-        return "unicodeobject.h"
-    if (
-        symbol == "Py_UCS1"
-        or symbol == "Py_UCS2"
-        or symbol == "PyUnicode_1BYTE_KIND"
-        or symbol == "PyUnicode_2BYTE_KIND"
-        or symbol == "PyUnicode_4BYTE_KIND"
-    ):
-        return "unicodeobject.h"
-    if symbol == "PyObject_SelfIter":
-        return "object.h"
-    if symbol == "PyIter_NextItem":
-        return "abstract.h"
-    if symbol == "PyErr_Print" or symbol == "PyErr_CheckSignals":
-        return "pyerrors.h"
-    if (
-        symbol == "Py_UCS4"
-        or symbol == "PyUnicode_FromString"
-        or symbol == "PyUnicode_FromStringAndSize"
-        or symbol == "PyUnicode_FromFormat"
-        or symbol == "PyUnicode_FromFormatV"
-        or symbol == "PyUnicode_InternFromString"
-        or symbol == "PyUnicode_FromEncodedObject"
-        or symbol == "PyUnicode_AsUTF8"
-        or symbol == "PyUnicode_AsUTF8AndSize"
-        or symbol == "PyUnicode_Check"
-        or symbol == "PyUnicode_CheckExact"
-        or symbol == "PyUnicode_GetLength"
-        or symbol == "PyUnicode_GET_LENGTH"
-        or symbol == "PyUnicode_Compare"
-        or symbol == "PyUnicode_CompareWithASCIIString"
-        or symbol == "PyUnicode_EqualToUTF8"
-        or symbol == "PyUnicode_EqualToUTF8AndSize"
-        or symbol == "Py_UNICODE_ISSPACE"
-        or symbol == "Py_UNICODE_ISDIGIT"
-        or symbol == "Py_UNICODE_ISDECIMAL"
-        or symbol == "Py_UNICODE_ISNUMERIC"
-        or symbol == "Py_UNICODE_ISLOWER"
-        or symbol == "Py_UNICODE_ISUPPER"
-        or symbol == "Py_UNICODE_ISTITLE"
-        or symbol == "Py_UNICODE_ISALPHA"
-        or symbol == "Py_UNICODE_ISALNUM"
-    ):
-        return "unicodeobject.h"
-    if (
-        symbol == "PyErr_SetString"
-        or symbol == "PyErr_SetNone"
-        or symbol == "PyErr_SetObject"
-        or symbol == "PyErr_Format"
-        or symbol == "PyErr_FormatV"
-        or symbol == "PyErr_NoMemory"
-        or symbol == "PyErr_SetFromErrno"
-        or symbol == "PyErr_SetFromErrnoWithFilenameObject"
-        or symbol == "PyErr_NewException"
-        or symbol == "PyErr_BadInternalCall"
-        or symbol == "PyErr_WarnEx"
-        or symbol == "PyErr_WarnFormat"
-        or symbol == "PyErr_WriteUnraisable"
-        or symbol == "PyErr_Occurred"
-        or symbol == "PyErr_Clear"
-        or symbol == "PyErr_GivenExceptionMatches"
-        or symbol == "PyErr_ExceptionMatches"
-        or symbol == "PyErr_Fetch"
-        or symbol == "PyErr_Restore"
-        or symbol == "PyExc_BaseException"
-        or symbol == "PyExc_Exception"
-        or symbol == "PyExc_ValueError"
-        or symbol == "PyExc_TypeError"
-        or symbol == "PyExc_RuntimeError"
-        or symbol == "PyExc_KeyError"
-        or symbol == "PyExc_IndexError"
-        or symbol == "PyExc_AttributeError"
-        or symbol == "PyExc_MemoryError"
-        or symbol == "PyExc_OverflowError"
-        or symbol == "PyExc_SystemError"
-        or symbol == "PyExc_NameError"
-        or symbol == "PyExc_NotImplementedError"
-        or symbol == "PyExc_ArithmeticError"
-        or symbol == "PyExc_LookupError"
-        or symbol == "PyExc_OSError"
-        or symbol == "PyExc_IOError"
-        or symbol == "PyExc_AssertionError"
-        or symbol == "PyExc_StopIteration"
-        or symbol == "PyExc_StopAsyncIteration"
-        or symbol == "PyExc_ZeroDivisionError"
-        or symbol == "PyExc_ReferenceError"
-        or symbol == "PyExc_BufferError"
-        or symbol == "PyExc_ImportError"
-        or symbol == "PyExc_ImportWarning"
-        or symbol == "PyExc_FloatingPointError"
-        or symbol == "PyExc_RecursionError"
-        or symbol == "PyExc_UnicodeDecodeError"
-        or symbol == "PyExc_Warning"
-        or symbol == "PyExc_UserWarning"
-        or symbol == "PyExc_RuntimeWarning"
-        or symbol == "PyExc_DeprecationWarning"
-        or symbol == "PyExc_FutureWarning"
-    ):
-        return "pyerrors.h"
-    if (
-        symbol == "PyObject_Call"
-        or symbol == "PyObject_CallObject"
-        or symbol == "PyObject_CallNoArgs"
-        or symbol == "PyObject_CallOneArg"
-        or symbol == "PyObject_Vectorcall"
-        or symbol == "PyObject_VectorcallMethod"
-        or symbol == "PyObject_CallFunction"
-        or symbol == "PyObject_CallMethod"
-        or symbol == "PyObject_CallMethodNoArgs"
-        or symbol == "PyObject_CallMethodOneArg"
-        or symbol == "PyObject_CallFunctionObjArgs"
-        or symbol == "PyObject_GetIter"
-        or symbol == "PyIter_Next"
-        or symbol == "PyIter_Check"
-        or symbol == "PyNumber_Add"
-        or symbol == "PyNumber_Subtract"
-        or symbol == "PyNumber_Multiply"
-        or symbol == "PyNumber_TrueDivide"
-        or symbol == "PyNumber_FloorDivide"
-        or symbol == "PyNumber_Remainder"
-        or symbol == "PyNumber_Power"
-        or symbol == "PyNumber_Negative"
-        or symbol == "PyNumber_Positive"
-        or symbol == "PyNumber_Absolute"
-        or symbol == "PyNumber_Index"
-        or symbol == "PyNumber_AsSsize_t"
-        or symbol == "PyIndex_Check"
-        or symbol == "PyObject_GetBuffer"
-        or symbol == "PyObject_CheckBuffer"
-        or symbol == "PyBuffer_Release"
-        or symbol == "PySequence_Check"
-        or symbol == "PyMapping_Check"
-        or symbol == "PyMapping_GetItemString"
-        or symbol == "PyMapping_SetItemString"
-        or symbol == "PyMapping_HasKey"
-        or symbol == "PyMapping_HasKeyString"
-        or symbol == "PyMapping_GetOptionalItem"
-        or symbol == "PyMapping_GetOptionalItemString"
-        or symbol == "PyMapping_HasKeyWithError"
-        or symbol == "PyMapping_HasKeyStringWithError"
-        or symbol == "PySequence_Size"
-        or symbol == "PySequence_Length"
-        or symbol == "PySequence_GetItem"
-        or symbol == "PySequence_Contains"
-        or symbol == "PySequence_Fast"
-        or symbol == "PySequence_Fast_GET_SIZE"
-        or symbol == "PySequence_Fast_ITEMS"
-        or symbol == "PySequence_Fast_GET_ITEM"
-        or symbol == "PySequence_List"
-        or symbol == "PySequence_Tuple"
-    ):
-        return "abstract.h"
-    if (
-        symbol == "Py_Is"
-        or symbol == "Py_IsNone"
-        or symbol == "Py_IsTrue"
-        or symbol == "Py_IsFalse"
-        or symbol == "Py_PRINT_RAW"
-        or symbol == "PyObject_Print"
-    ):
-        return "object.h"
-    if (
-        symbol == "Py_INCREF"
-        or symbol == "Py_DECREF"
-        or symbol == "Py_XINCREF"
-        or symbol == "Py_XDECREF"
-        or symbol == "Py_NewRef"
-        or symbol == "Py_XNewRef"
-        or symbol == "Py_CLEAR"
-        or symbol == "Py_SETREF"
-        or symbol == "Py_XSETREF"
-        or symbol == "Py_None"
-        or symbol == "Py_True"
-        or symbol == "Py_False"
-        or symbol == "Py_NotImplemented"
-        or symbol == "Py_RETURN_NONE"
-        or symbol == "Py_RETURN_TRUE"
-        or symbol == "Py_RETURN_FALSE"
-        or symbol == "Py_RETURN_NOTIMPLEMENTED"
-        or symbol == "Py_UNUSED"
-        or symbol == "PyOS_snprintf"
-        or symbol == "PyOS_vsnprintf"
-        or symbol == "PyObject_GetAttrString"
-        or symbol == "PyObject_GetAttr"
-        or symbol == "PyObject_GetOptionalAttr"
-        or symbol == "PyObject_GetOptionalAttrString"
-        or symbol == "PyObject_SetAttrString"
-        or symbol == "PyObject_SetAttr"
-        or symbol == "PyObject_HasAttr"
-        or symbol == "PyObject_HasAttrString"
-        or symbol == "PyObject_HasAttrWithError"
-        or symbol == "PyObject_HasAttrStringWithError"
-        or symbol == "PyObject_IsTrue"
-        or symbol == "PyObject_Not"
-        or symbol == "PyObject_Hash"
-        or symbol == "PyCallable_Check"
-        or symbol == "PyObject_Str"
-        or symbol == "PyObject_Repr"
-        or symbol == "PyObject_Bytes"
-        or symbol == "PyObject_Format"
-        or symbol == "PyObject_Type"
-        or symbol == "PyObject_IsInstance"
-        or symbol == "PyObject_RichCompare"
-        or symbol == "PyObject_RichCompareBool"
-        or symbol == "PyObject_GetItem"
-        or symbol == "PyObject_SetItem"
-        or symbol == "PyObject_DelItem"
-        or symbol == "PyObject_Size"
-        or symbol == "PyObject_Length"
-        or symbol == "PyObject_Malloc"
-        or symbol == "PyObject_Calloc"
-        or symbol == "PyObject_Realloc"
-        or symbol == "PyObject_Free"
-        or symbol == "PyObject_MALLOC"
-        or symbol == "PyObject_REALLOC"
-        or symbol == "PyObject_FREE"
-        or symbol == "PyObject_Del"
-        or symbol == "PyObject_DEL"
-    ):
-        return "object.h"
-    if (
-        symbol == "PyTuple_New"
-        or symbol == "PyTuple_SetItem"
-        or symbol == "PyTuple_GetItem"
-        or symbol == "PyTuple_Size"
-        or symbol == "PyTuple_GET_ITEM"
-        or symbol == "PyTuple_GET_SIZE"
-        or symbol == "PyTuple_SET_ITEM"
-        or symbol == "PyTuple_Pack"
-        or symbol == "PyTuple_Check"
-        or symbol == "PyTuple_CheckExact"
-    ):
-        return "tupleobject.h"
-    if (
-        symbol == "PyList_New"
-        or symbol == "PyList_SetItem"
-        or symbol == "PyList_GetItem"
-        or symbol == "PyList_GetItemRef"
-        or symbol == "PyList_Size"
-        or symbol == "PyList_GET_ITEM"
-        or symbol == "PyList_GET_SIZE"
-        or symbol == "PyList_SET_ITEM"
-        or symbol == "PyList_Append"
-        or symbol == "PyList_Check"
-        or symbol == "PyList_CheckExact"
-    ):
-        return "listobject.h"
-    if (
-        symbol == "PyDict_New"
-        or symbol == "PyDict_SetItem"
-        or symbol == "PyDict_SetItemString"
-        or symbol == "PyDict_GetItem"
-        or symbol == "PyDict_GetItemString"
-        or symbol == "PyDict_GetItemWithError"
-        or symbol == "PyDict_GetItemRef"
-        or symbol == "PyDict_GetItemStringRef"
-        or symbol == "PyDict_SetDefaultRef"
-        or symbol == "PyDict_Pop"
-        or symbol == "PyDict_PopString"
-        or symbol == "PyDict_DelItem"
-        or symbol == "PyDict_DelItemString"
-        or symbol == "PyDict_Size"
-        or symbol == "PyDict_Contains"
-        or symbol == "PyDict_ContainsString"
-        or symbol == "PyDict_Next"
-        or symbol == "PyDict_Check"
-        or symbol == "PyDict_CheckExact"
-    ):
-        return "dictobject.h"
-    if (
-        symbol == "PyBytes_FromString"
-        or symbol == "PyBytes_FromStringAndSize"
-        or symbol == "PyBytes_AsString"
-        or symbol == "PyBytes_AsStringAndSize"
-        or symbol == "PyBytes_AS_STRING"
-        or symbol == "PyBytes_Size"
-        or symbol == "PyBytes_GET_SIZE"
-        or symbol == "PyBytes_Check"
-        or symbol == "PyBytes_CheckExact"
-    ):
-        return "bytesobject.h"
-    if symbol == "PyImport_ImportModule":
-        return "import.h"
-    if (
-        symbol == "PyCapsule_New"
-        or symbol == "PyCapsule_GetPointer"
-        or symbol == "PyCapsule_GetName"
-        or symbol == "PyCapsule_GetContext"
-        or symbol == "PyCapsule_IsValid"
-        or symbol == "PyCapsule_CheckExact"
-        or symbol == "PyCapsule_SetContext"
-        or symbol == "PyCapsule_SetName"
-        or symbol == "PyCapsule_Import"
-    ):
-        return "pycapsule.h"
-    if (
-        symbol == "PyMemoryView_FromObject"
-        or symbol == "PyMemoryView_FromMemory"
-        or symbol == "PyMemoryView_Check"
-        or symbol == "PyMemoryView_GET_BUFFER"
-        or symbol == "PyMemoryView_GET_BASE"
-    ):
-        return "memoryobject.h"
-    if symbol == "Py_IsInitialized":
-        return "pylifecycle.h"
-    if (
-        symbol == "PyGILState_Ensure"
-        or symbol == "PyGILState_Release"
-        or symbol == "PyGILState_Check"
-    ):
-        return "pystate.h"
-    if (
-        symbol.startswith("PyArray_")
-        or symbol == "PyArray_API"
-        or symbol == "PyArray_Type"
-        or symbol == "PyArrayDescr_Type"
-    ):
-        return "numpy/arrayobject.h"
-    if symbol.startswith("PyUFunc_"):
-        return "numpy/ufuncobject.h"
+    i = 0
+    while i < len(_NATIVE_CAPI_HEADER_BY_SYMBOL):
+        row = _NATIVE_CAPI_HEADER_BY_SYMBOL[i]
+        if symbol == row[0]:
+            return row[1]
+        i += 1
+    i = 0
+    while i < len(_NATIVE_CAPI_HEADER_PREFIXES):
+        row = _NATIVE_CAPI_HEADER_PREFIXES[i]
+        if symbol.startswith(row[0]):
+            return row[1]
+        i += 1
     return None
 
 
 def _native_capi_implemented(symbol: str) -> bool:
-    if (
-        symbol == "Py_Is"
-        or symbol == "Py_IsNone"
-        or symbol == "Py_IsTrue"
-        or symbol == "Py_IsFalse"
-        or symbol == "Py_PRINT_RAW"
-        or symbol == "PyObject_Print"
-    ):
-        return True
-    if symbol == "PyLong_FromDouble":
-        return True
-    if symbol == "PyErr_Print" or symbol == "PyErr_CheckSignals":
-        return True
-    if (
-        symbol == "PyUnicode_AsUTF8String"
-        or symbol == "PyUnicode_AsASCIIString"
-        or symbol == "PyUnicode_AsEncodedString"
-        or symbol == "PyUnicode_FromKindAndData"
-        or symbol == "PyUnicode_FromOrdinal"
-        or symbol == "PyUnicode_AsUCS4"
-        or symbol == "PyUnicode_AsUCS4Copy"
-        or symbol == "PyUnicode_Tailmatch"
-        or symbol == "PyUnicode_Find"
-        or symbol == "PyUnicode_ReadChar"
-        or symbol == "PyUnicode_FindChar"
-        or symbol == "PyUnicode_Count"
-        or symbol == "PyUnicode_Replace"
-        or symbol == "PyUnicode_Substring"
-        or symbol == "PyUnicode_Contains"
-        or symbol == "PyUnicode_Concat"
-    ):
-        return True
-    if (
-        symbol == "Py_UCS1"
-        or symbol == "Py_UCS2"
-        or symbol == "PyUnicode_1BYTE_KIND"
-        or symbol == "PyUnicode_2BYTE_KIND"
-        or symbol == "PyUnicode_4BYTE_KIND"
-    ):
-        return True
-    if symbol == "Py_REFCNT" or symbol == "Py_SET_REFCNT":
-        return True
-    if symbol == "PyMapping_Size" or symbol == "PyMapping_Length":
-        return True
-    if (
-        symbol == "PyMapping_Keys"
-        or symbol == "PyMapping_Values"
-        or symbol == "PyMapping_Items"
-    ):
-        return True
-    if symbol == "PyObject_LengthHint":
-        return True
-    if symbol == "PyObject_SelfIter":
-        return True
-    if symbol == "PyIter_NextItem":
-        return True
-    if (
-        symbol == "PySequence_SetItem"
-        or symbol == "PySequence_Concat"
-        or symbol == "PySequence_Repeat"
-        or symbol == "PySequence_InPlaceConcat"
-        or symbol == "PySequence_InPlaceRepeat"
-    ):
-        return True
-    if (
-        symbol == "PyLong_AsDouble"
-        or symbol == "PyFloat_AS_DOUBLE"
-        or symbol == "PyNumber_Check"
-        or symbol == "PyNumber_Long"
-        or symbol == "PyNumber_Float"
-    ):
-        return True
-    if (
-        symbol == "PyNumber_And"
-        or symbol == "PyNumber_Or"
-        or symbol == "PyNumber_Xor"
-        or symbol == "PyNumber_Invert"
-        or symbol == "PyNumber_Lshift"
-        or symbol == "PyNumber_Rshift"
-    ):
-        return True
-    if (
-        symbol == "PySet_New"
-        or symbol == "PySet_Add"
-        or symbol == "PySet_Contains"
-        or symbol == "PySet_Discard"
-        or symbol == "PySet_Size"
-    ):
-        return True
-    if (
-        symbol == "PySet_GET_SIZE"
-        or symbol == "PySet_Check"
-        or symbol == "PySet_CheckExact"
-        or symbol == "PyAnySet_Check"
-        or symbol == "PyAnySet_CheckExact"
-    ):
-        return True
-    if symbol == "PyList_AsTuple":
-        return True
-    if symbol == "PyDict_Keys" or symbol == "PyDict_Values" or symbol == "PyDict_Items":
-        return True
-    return (
-        symbol == "Py_Initialize"
-        or symbol == "Py_INCREF"
-        or symbol == "Py_DECREF"
-        or symbol == "Py_XINCREF"
-        or symbol == "Py_XDECREF"
-        or symbol == "Py_NewRef"
-        or symbol == "Py_XNewRef"
-        or symbol == "Py_CLEAR"
-        or symbol == "Py_SETREF"
-        or symbol == "Py_XSETREF"
-        or symbol == "Py_None"
-        or symbol == "Py_True"
-        or symbol == "Py_False"
-        or symbol == "Py_NotImplemented"
-        or symbol == "Py_RETURN_NONE"
-        or symbol == "Py_RETURN_TRUE"
-        or symbol == "Py_RETURN_FALSE"
-        or symbol == "Py_RETURN_NOTIMPLEMENTED"
-        or symbol == "Py_UNUSED"
-        or symbol == "PyOS_snprintf"
-        or symbol == "PyOS_vsnprintf"
-        or symbol == "PyMem_Malloc"
-        or symbol == "PyMem_Calloc"
-        or symbol == "PyMem_Realloc"
-        or symbol == "PyMem_Free"
-        or symbol == "PyMem_RawMalloc"
-        or symbol == "PyMem_RawCalloc"
-        or symbol == "PyMem_RawRealloc"
-        or symbol == "PyMem_RawFree"
-        or symbol == "PyMem_FREE"
-        or symbol == "PyObject_Malloc"
-        or symbol == "PyObject_Calloc"
-        or symbol == "PyObject_Realloc"
-        or symbol == "PyObject_Free"
-        or symbol == "PyObject_MALLOC"
-        or symbol == "PyObject_REALLOC"
-        or symbol == "PyObject_FREE"
-        or symbol == "PyObject_Del"
-        or symbol == "PyObject_DEL"
-        or symbol == "PyModule_Create"
-        or symbol == "PyModule_Create2"
-        or symbol == "PyModule_AddObject"
-        or symbol == "PyModule_AddObjectRef"
-        or symbol == "PyModule_Add"
-        or symbol == "PyModule_AddIntConstant"
-        or symbol == "PyModule_AddStringConstant"
-        or symbol == "PyModule_GetDict"
-        or symbol == "PyArg_ParseTuple"
-        or symbol == "PyArg_ParseTupleAndKeywords"
-        or symbol == "Py_BuildValue"
-        or symbol == "PyLong_FromLong"
-        or symbol == "PyLong_FromUnsignedLong"
-        or symbol == "PyLong_AsLong"
-        or symbol == "PyLong_FromLongLong"
-        or symbol == "PyLong_FromUnsignedLongLong"
-        or symbol == "PyLong_FromInt32"
-        or symbol == "PyLong_FromInt64"
-        or symbol == "PyLong_FromUInt32"
-        or symbol == "PyLong_FromUInt64"
-        or symbol == "PyLong_FromVoidPtr"
-        or symbol == "PyLong_FromSsize_t"
-        or symbol == "PyLong_FromSize_t"
-        or symbol == "PyLong_AsLongLong"
-        or symbol == "PyLong_AsInt"
-        or symbol == "PyLong_AsInt32"
-        or symbol == "PyLong_AsInt64"
-        or symbol == "PyLong_AsUInt32"
-        or symbol == "PyLong_AsUInt64"
-        or symbol == "PyLong_AsVoidPtr"
-        or symbol == "PyLong_AsLongAndOverflow"
-        or symbol == "PyLong_AsUnsignedLong"
-        or symbol == "PyLong_AsUnsignedLongLong"
-        or symbol == "PyLong_AsUnsignedLongLongMask"
-        or symbol == "PyLong_AsSsize_t"
-        or symbol == "PyLong_AsSize_t"
-        or symbol == "PyLong_Check"
-        or symbol == "PyLong_CheckExact"
-        or symbol == "PyBool_FromLong"
-        or symbol == "PyBool_Check"
-        or symbol == "PyFloat_FromDouble"
-        or symbol == "PyFloat_AsDouble"
-        or symbol == "PyFloat_Check"
-        or symbol == "PyFloat_CheckExact"
-        or symbol == "Py_complex"
-        or symbol == "PyComplex_FromDoubles"
-        or symbol == "PyComplex_FromCComplex"
-        or symbol == "PyComplex_AsCComplex"
-        or symbol == "PyComplex_RealAsDouble"
-        or symbol == "PyComplex_ImagAsDouble"
-        or symbol == "PyComplex_Check"
-        or symbol == "PyComplex_CheckExact"
-        or symbol == "Py_UCS4"
-        or symbol == "PyUnicode_FromString"
-        or symbol == "PyUnicode_FromStringAndSize"
-        or symbol == "PyUnicode_FromFormat"
-        or symbol == "PyUnicode_FromFormatV"
-        or symbol == "PyUnicode_InternFromString"
-        or symbol == "PyUnicode_FromEncodedObject"
-        or symbol == "PyUnicode_AsUTF8"
-        or symbol == "PyUnicode_AsUTF8AndSize"
-        or symbol == "PyUnicode_Check"
-        or symbol == "PyUnicode_CheckExact"
-        or symbol == "PyUnicode_GetLength"
-        or symbol == "PyUnicode_GET_LENGTH"
-        or symbol == "PyUnicode_Compare"
-        or symbol == "PyUnicode_CompareWithASCIIString"
-        or symbol == "PyUnicode_EqualToUTF8"
-        or symbol == "PyUnicode_EqualToUTF8AndSize"
-        or symbol == "Py_UNICODE_ISSPACE"
-        or symbol == "Py_UNICODE_ISDIGIT"
-        or symbol == "Py_UNICODE_ISDECIMAL"
-        or symbol == "Py_UNICODE_ISNUMERIC"
-        or symbol == "Py_UNICODE_ISLOWER"
-        or symbol == "Py_UNICODE_ISUPPER"
-        or symbol == "Py_UNICODE_ISTITLE"
-        or symbol == "Py_UNICODE_ISALPHA"
-        or symbol == "Py_UNICODE_ISALNUM"
-        or symbol == "PyErr_SetString"
-        or symbol == "PyErr_SetNone"
-        or symbol == "PyErr_SetObject"
-        or symbol == "PyErr_Format"
-        or symbol == "PyErr_FormatV"
-        or symbol == "PyErr_NoMemory"
-        or symbol == "PyErr_SetFromErrno"
-        or symbol == "PyErr_SetFromErrnoWithFilenameObject"
-        or symbol == "PyErr_NewException"
-        or symbol == "PyErr_BadInternalCall"
-        or symbol == "PyErr_WarnEx"
-        or symbol == "PyErr_WarnFormat"
-        or symbol == "PyErr_WriteUnraisable"
-        or symbol == "PyErr_Occurred"
-        or symbol == "PyErr_Clear"
-        or symbol == "PyErr_GivenExceptionMatches"
-        or symbol == "PyErr_ExceptionMatches"
-        or symbol == "PyErr_Fetch"
-        or symbol == "PyErr_Restore"
-        or symbol == "PyExc_BaseException"
-        or symbol == "PyExc_Exception"
-        or symbol == "PyExc_ValueError"
-        or symbol == "PyExc_TypeError"
-        or symbol == "PyExc_RuntimeError"
-        or symbol == "PyExc_KeyError"
-        or symbol == "PyExc_IndexError"
-        or symbol == "PyExc_AttributeError"
-        or symbol == "PyExc_MemoryError"
-        or symbol == "PyExc_OverflowError"
-        or symbol == "PyExc_SystemError"
-        or symbol == "PyExc_NameError"
-        or symbol == "PyExc_NotImplementedError"
-        or symbol == "PyExc_ArithmeticError"
-        or symbol == "PyExc_LookupError"
-        or symbol == "PyExc_OSError"
-        or symbol == "PyExc_IOError"
-        or symbol == "PyExc_AssertionError"
-        or symbol == "PyExc_StopIteration"
-        or symbol == "PyExc_StopAsyncIteration"
-        or symbol == "PyExc_ZeroDivisionError"
-        or symbol == "PyExc_ReferenceError"
-        or symbol == "PyExc_BufferError"
-        or symbol == "PyExc_ImportError"
-        or symbol == "PyExc_ImportWarning"
-        or symbol == "PyExc_FloatingPointError"
-        or symbol == "PyExc_RecursionError"
-        or symbol == "PyExc_UnicodeDecodeError"
-        or symbol == "PyExc_Warning"
-        or symbol == "PyExc_UserWarning"
-        or symbol == "PyExc_RuntimeWarning"
-        or symbol == "PyExc_DeprecationWarning"
-        or symbol == "PyExc_FutureWarning"
-        or symbol == "PyObject_Call"
-        or symbol == "PyObject_CallObject"
-        or symbol == "PyObject_CallNoArgs"
-        or symbol == "PyObject_CallOneArg"
-        or symbol == "PyObject_Vectorcall"
-        or symbol == "PyObject_VectorcallMethod"
-        or symbol == "PyObject_CallFunction"
-        or symbol == "PyObject_CallMethod"
-        or symbol == "PyObject_CallMethodNoArgs"
-        or symbol == "PyObject_CallMethodOneArg"
-        or symbol == "PyObject_CallFunctionObjArgs"
-        or symbol == "PyObject_GetIter"
-        or symbol == "PyIter_Next"
-        or symbol == "PyIter_Check"
-        or symbol == "PyNumber_Add"
-        or symbol == "PyNumber_Subtract"
-        or symbol == "PyNumber_Multiply"
-        or symbol == "PyNumber_TrueDivide"
-        or symbol == "PyNumber_FloorDivide"
-        or symbol == "PyNumber_Remainder"
-        or symbol == "PyNumber_Power"
-        or symbol == "PyNumber_Negative"
-        or symbol == "PyNumber_Positive"
-        or symbol == "PyNumber_Absolute"
-        or symbol == "PyNumber_Index"
-        or symbol == "PyNumber_AsSsize_t"
-        or symbol == "PyIndex_Check"
-        or symbol == "PyObject_GetAttrString"
-        or symbol == "PyObject_GetAttr"
-        or symbol == "PyObject_GetOptionalAttr"
-        or symbol == "PyObject_GetOptionalAttrString"
-        or symbol == "PyObject_SetAttrString"
-        or symbol == "PyObject_SetAttr"
-        or symbol == "PyObject_HasAttr"
-        or symbol == "PyObject_HasAttrString"
-        or symbol == "PyObject_HasAttrWithError"
-        or symbol == "PyObject_HasAttrStringWithError"
-        or symbol == "PyObject_IsTrue"
-        or symbol == "PyObject_Not"
-        or symbol == "PyObject_Hash"
-        or symbol == "PyCallable_Check"
-        or symbol == "PyObject_Str"
-        or symbol == "PyObject_Repr"
-        or symbol == "PyObject_Bytes"
-        or symbol == "PyObject_Format"
-        or symbol == "PyObject_Type"
-        or symbol == "PyObject_IsInstance"
-        or symbol == "PyObject_RichCompare"
-        or symbol == "PyObject_RichCompareBool"
-        or symbol == "PyObject_GetItem"
-        or symbol == "PyObject_SetItem"
-        or symbol == "PyObject_DelItem"
-        or symbol == "PyObject_Size"
-        or symbol == "PyObject_Length"
-        or symbol == "PyTuple_New"
-        or symbol == "PyTuple_SetItem"
-        or symbol == "PyTuple_GetItem"
-        or symbol == "PyTuple_Size"
-        or symbol == "PyTuple_GET_ITEM"
-        or symbol == "PyTuple_GET_SIZE"
-        or symbol == "PyTuple_SET_ITEM"
-        or symbol == "PyTuple_Pack"
-        or symbol == "PyTuple_Check"
-        or symbol == "PyTuple_CheckExact"
-        or symbol == "PyList_New"
-        or symbol == "PyList_SetItem"
-        or symbol == "PyList_GetItem"
-        or symbol == "PyList_GetItemRef"
-        or symbol == "PyList_Size"
-        or symbol == "PyList_GET_ITEM"
-        or symbol == "PyList_GET_SIZE"
-        or symbol == "PyList_SET_ITEM"
-        or symbol == "PyList_Append"
-        or symbol == "PyList_Check"
-        or symbol == "PyList_CheckExact"
-        or symbol == "PyDict_New"
-        or symbol == "PyDict_SetItem"
-        or symbol == "PyDict_SetItemString"
-        or symbol == "PyDict_GetItem"
-        or symbol == "PyDict_GetItemString"
-        or symbol == "PyDict_GetItemWithError"
-        or symbol == "PyDict_GetItemRef"
-        or symbol == "PyDict_GetItemStringRef"
-        or symbol == "PyDict_SetDefaultRef"
-        or symbol == "PyDict_Pop"
-        or symbol == "PyDict_PopString"
-        or symbol == "PyDict_DelItem"
-        or symbol == "PyDict_DelItemString"
-        or symbol == "PyDict_Size"
-        or symbol == "PyDict_Contains"
-        or symbol == "PyDict_ContainsString"
-        or symbol == "PyDict_Next"
-        or symbol == "PyDict_Check"
-        or symbol == "PyDict_CheckExact"
-        or symbol == "PyBytes_FromString"
-        or symbol == "PyBytes_FromStringAndSize"
-        or symbol == "PyBytes_AsString"
-        or symbol == "PyBytes_AsStringAndSize"
-        or symbol == "PyBytes_AS_STRING"
-        or symbol == "PyBytes_Size"
-        or symbol == "PyBytes_GET_SIZE"
-        or symbol == "PyBytes_Check"
-        or symbol == "PyBytes_CheckExact"
-        or symbol == "PyCapsule_New"
-        or symbol == "PyCapsule_GetPointer"
-        or symbol == "PyCapsule_GetName"
-        or symbol == "PyCapsule_GetContext"
-        or symbol == "PyCapsule_IsValid"
-        or symbol == "PyCapsule_CheckExact"
-        or symbol == "PyCapsule_SetContext"
-        or symbol == "PyCapsule_SetName"
-        or symbol == "PyCapsule_Import"
-        or symbol == "PyObject_GetBuffer"
-        or symbol == "PyObject_CheckBuffer"
-        or symbol == "PyBuffer_Release"
-        or symbol == "PyMemoryView_FromObject"
-        or symbol == "PyMemoryView_FromMemory"
-        or symbol == "PyMemoryView_Check"
-        or symbol == "PyMemoryView_GET_BUFFER"
-        or symbol == "PyMemoryView_GET_BASE"
-        or symbol == "Py_IsInitialized"
-        or symbol == "PyGILState_Ensure"
-        or symbol == "PyGILState_Release"
-        or symbol == "PyGILState_Check"
-        or symbol == "PyImport_ImportModule"
-        or symbol == "PySequence_Check"
-        or symbol == "PyMapping_Check"
-        or symbol == "PyMapping_GetItemString"
-        or symbol == "PyMapping_SetItemString"
-        or symbol == "PyMapping_HasKey"
-        or symbol == "PyMapping_HasKeyString"
-        or symbol == "PyMapping_GetOptionalItem"
-        or symbol == "PyMapping_GetOptionalItemString"
-        or symbol == "PyMapping_HasKeyWithError"
-        or symbol == "PyMapping_HasKeyStringWithError"
-        or symbol == "PySequence_Size"
-        or symbol == "PySequence_Length"
-        or symbol == "PySequence_GetItem"
-        or symbol == "PySequence_Contains"
-        or symbol == "PySequence_Fast"
-        or symbol == "PySequence_Fast_GET_SIZE"
-        or symbol == "PySequence_Fast_ITEMS"
-        or symbol == "PySequence_Fast_GET_ITEM"
-        or symbol == "PySequence_List"
-        or symbol == "PySequence_Tuple"
-    )
+    return _native_list_contains(_NATIVE_CAPI_IMPLEMENTED_SYMBOLS, symbol)
 
 
 def _native_list_contains(items, value) -> bool:
@@ -1541,9 +2429,16 @@ def _native_numpy_capi_family(symbol: str):
         return "ufunc_api"
     if (
         symbol == "PyArray_API"
+        or symbol == "PyArray_malloc"
+        or symbol == "PyArray_free"
+        or symbol == "PyArray_realloc"
         or symbol == "PyArray_Type"
         or symbol == "PyArrayDescr_Type"
         or symbol.startswith("PyArray_")
+        or symbol.startswith("PyDimMem_")
+        or symbol.startswith("PyDataMem_")
+        or symbol.startswith("PyDataType_")
+        or symbol.startswith("PyTypeNum_")
     ):
         return "array_api"
     return None
@@ -1584,6 +2479,366 @@ def _native_numpy_capi_slot(symbol: str):
         return 15
     if symbol == "PyArray_CheckExact":
         return 16
+    if symbol == "PyArray_FLAGS":
+        return 17
+    if symbol == "PyArray_CompareLists":
+        return 18
+    if symbol == "PyArray_Empty":
+        return 19
+    if symbol == "PyArray_Zeros":
+        return 20
+    if symbol == "PyArray_EquivTypes":
+        return 21
+    if symbol == "PyArray_NewFromDescr":
+        return 22
+    if symbol == "PyArray_New":
+        return 172
+    if symbol == "PyArray_MultiIterNew":
+        return 173
+    if symbol == "PyArray_MultiIterFromObjects":
+        return 177
+    if symbol == "PyArray_BASE":
+        return 23
+    if symbol == "PyArray_SetBaseObject":
+        return 24
+    if symbol == "PyArray_SetUpdateIfCopyBase":
+        return 152
+    if symbol == "PyArray_SetWritebackIfCopyBase":
+        return 153
+    if symbol == "PyArray_ResolveWritebackIfCopy":
+        return 154
+    if symbol == "PyArray_DiscardWritebackIfCopy":
+        return 155
+    if symbol == "PyDataMem_NEW":
+        return 156
+    if symbol == "PyDataMem_FREE":
+        return 157
+    if symbol == "PyDataMem_RENEW":
+        return 158
+    if symbol == "PyDataMem_NEW_ZEROED":
+        return 159
+    if symbol == "PyDataMem_GetHandler":
+        return 160
+    if symbol == "PyDataMem_UserNEW":
+        return 161
+    if symbol == "PyDataMem_UserFREE":
+        return 162
+    if symbol == "PyDataMem_UserRENEW":
+        return 163
+    if symbol == "PyDataMem_UserNEW_ZEROED":
+        return 164
+    if symbol == "PyArray_Return":
+        return 25
+    if symbol == "PyArray_ENABLEFLAGS":
+        return 26
+    if symbol == "PyArray_CLEARFLAGS":
+        return 27
+    if symbol == "PyArray_UpdateFlags":
+        return 28
+    if symbol == "PyArray_CopyInto":
+        return 29
+    if symbol == "PyArray_CopyAnyInto":
+        return 30
+    if symbol == "PyArray_ToScalar":
+        return 31
+    if symbol == "PyArray_Copy":
+        return 32
+    if symbol == "PyArray_EnsureArray":
+        return 33
+    if symbol == "PyArray_EnsureAnyArray":
+        return 34
+    if symbol == "PyArray_DescrNewFromType":
+        return 35
+    if symbol == "PyArray_DescrNew":
+        return 36
+    if symbol == "PyArray_DescrNewByteorder":
+        return 37
+    if symbol == "PyArray_CanCastSafely":
+        return 38
+    if symbol == "PyArray_ObjectType":
+        return 39
+    if symbol == "PyArray_CheckFromAny":
+        return 40
+    if symbol == "PyArray_FromArray":
+        return 41
+    if symbol == "PyArray_MultiplyList":
+        return 42
+    if symbol == "PyArray_MultiplyIntList":
+        return 43
+    if symbol == "PyArray_GetPtr":
+        return 44
+    if symbol == "PyArray_ElementStrides":
+        return 45
+    if symbol == "PyArray_ValidType":
+        return 46
+    if symbol == "PyArray_Item_INCREF":
+        return 47
+    if symbol == "PyArray_Item_XDECREF":
+        return 48
+    if symbol == "PyArray_NewCopy":
+        return 49
+    if symbol == "PyArray_INCREF":
+        return 50
+    if symbol == "PyArray_XDECREF":
+        return 51
+    if symbol == "PyArray_CanCastTo":
+        return 52
+    if symbol == "PyArray_CanCastTypeTo":
+        return 165
+    if symbol == "PyArray_CanCastArrayTo":
+        return 166
+    if symbol == "PyArray_CastingConverter":
+        return 168
+    if symbol == "PyArray_Zero":
+        return 53
+    if symbol == "PyArray_One":
+        return 54
+    if symbol == "PyArray_TypeObjectFromType":
+        return 55
+    if symbol == "PyArray_DescrFromObject":
+        return 56
+    if symbol == "PyArray_Size":
+        return 57
+    if symbol == "PyArray_DescrFromScalar":
+        return 58
+    if symbol == "PyArray_DescrFromTypeObject":
+        return 59
+    if symbol == "PyArray_Scalar":
+        return 169
+    if symbol == "PyArray_ScalarAsCtype":
+        return 60
+    if symbol == "PyArray_FromScalar":
+        return 61
+    if symbol == "PyArray_CastScalarToCtype":
+        return 62
+    if symbol == "PyArray_Pack":
+        return 63
+    if symbol == "PyArray_CastScalarDirect":
+        return 64
+    if symbol == "PyArray_CastToType":
+        return 65
+    if symbol == "PyArray_FillWithScalar":
+        return 66
+    if symbol == "PyArray_ToList":
+        return 67
+    if symbol == "PyArray_ToString":
+        return 68
+    if symbol == "PyArray_Byteswap":
+        return 69
+    if symbol == "PyArray_FromString":
+        return 70
+    if symbol == "PyArray_FromBuffer":
+        return 71
+    if symbol == "PyArray_FromIter":
+        return 72
+    if symbol == "PyArray_Converter":
+        return 144
+    if symbol == "PyArray_IterNew":
+        return 127
+    if symbol == "PyArray_BroadcastToShape":
+        return 128
+    if symbol == "PyArray_Broadcast":
+        return 176
+    if symbol == "PyArray_Concatenate":
+        return 180
+    if symbol == "PyArray_Arange":
+        return 181
+    if symbol == "PyArray_ArangeObj":
+        return 182
+    if symbol == "PyArray_LexSort":
+        return 183
+    if symbol == "PyArray_InnerProduct":
+        return 184
+    if symbol == "PyArray_MatrixProduct":
+        return 185
+    if symbol == "PyArray_MatrixProduct2":
+        return 188
+    if symbol == "PyArray_CountNonzero":
+        return 189
+    if symbol == "PyArray_MinScalarType":
+        return 190
+    if symbol == "PyArray_CreateSortedStridePerm":
+        return 191
+    if symbol == "PyArray_RemoveAxesInPlace":
+        return 192
+    if symbol == "PyArray_DebugPrint":
+        return 193
+    if symbol == "PyArray_EinsteinSum":
+        return 194
+    if symbol == "PyArray_Partition":
+        return 195
+    if symbol == "PyArray_ArgPartition":
+        return 196
+    if symbol == "PyArray_CheckAnyScalarExact":
+        return 197
+    if symbol == "PyArray_Correlate":
+        return 186
+    if symbol == "PyArray_Correlate2":
+        return 187
+    if symbol == "PyArray_RemoveSmallest":
+        return 178
+    if symbol == "PyArray_IterAllButAxis":
+        return 129
+    if symbol == "PyArray_PyIntAsInt":
+        return 130
+    if symbol == "PyArray_PyIntAsIntp":
+        return 131
+    if symbol == "PyArray_PythonPyIntFromInt":
+        return 167
+    if symbol == "PyArray_IntpFromSequence":
+        return 143
+    if symbol == "PyArray_IntpConverter":
+        return 145
+    if symbol == "PyArray_BufferConverter":
+        return 179
+    if symbol == "PyArray_OptionalIntpConverter":
+        return 146
+    if symbol == "PyArray_Free":
+        return 147
+    if symbol == "PyArray_AsCArray":
+        return 148
+    if symbol == "PyArray_FailUnlessWriteable":
+        return 149
+    if symbol == "PyArray_CheckStrides":
+        return 132
+    if symbol == "PyArray_GetPriority":
+        return 133
+    if symbol == "PyArray_CopyObject":
+        return 73
+    if symbol == "PyArray_Resize":
+        return 74
+    if symbol == "PyArray_NewLikeArray":
+        return 75
+    if symbol == "PyArray_View":
+        return 76
+    if symbol == "PyArray_Squeeze":
+        return 77
+    if symbol == "PyArray_Transpose":
+        return 78
+    if symbol == "PyArray_Ravel":
+        return 79
+    if symbol == "PyArray_Flatten":
+        return 80
+    if symbol == "PyArray_TakeFrom":
+        return 81
+    if symbol == "PyArray_PutTo":
+        return 82
+    if symbol == "PyArray_PutMask":
+        return 83
+    if symbol == "PyArray_Repeat":
+        return 84
+    if symbol == "PyArray_Choose":
+        return 85
+    if symbol == "PyArray_Sort":
+        return 86
+    if symbol == "PyArray_ArgSort":
+        return 87
+    if symbol == "PyArray_SearchSorted":
+        return 88
+    if symbol == "PyArray_Nonzero":
+        return 89
+    if symbol == "PyArray_Where":
+        return 90
+    if symbol == "PyArray_Compress":
+        return 91
+    if symbol == "PyArray_Diagonal":
+        return 92
+    if symbol == "PyArray_Trace":
+        return 93
+    if symbol == "PyArray_Clip":
+        return 94
+    if symbol == "PyArray_Conjugate":
+        return 95
+    if symbol == "PyArray_Sum":
+        return 96
+    if symbol == "PyArray_CumSum":
+        return 109
+    if symbol == "PyArray_Prod":
+        return 97
+    if symbol == "PyArray_CumProd":
+        return 110
+    if symbol == "PyArray_Std":
+        return 111
+    if symbol == "PyArray_Round":
+        return 112
+    if symbol == "PyArray_EquivTypenums":
+        return 113
+    if symbol == "PyArray_ScalarKind":
+        return 170
+    if symbol == "PyArray_CanCoerceScalar":
+        return 114
+    if symbol == "PyArray_CanCastScalar":
+        return 116
+    if symbol == "PyArray_PromoteTypes":
+        return 174
+    if symbol == "PyArray_ResultType":
+        return 175
+    if symbol == "PyArray_ConvertToCommonType":
+        return 171
+    if symbol == "PyArray_IntTupleFromIntp":
+        return 117
+    if symbol == "PyArray_ClipmodeConverter":
+        return 118
+    if symbol == "PyArray_ConvertClipmodeSequence":
+        return 141
+    if symbol == "PyArray_OutputConverter":
+        return 119
+    if symbol == "PyArray_SearchsideConverter":
+        return 120
+    if symbol == "PyArray_OrderConverter":
+        return 134
+    if symbol == "PyArray_BoolConverter":
+        return 135
+    if symbol == "PyArray_OptionalBoolConverter":
+        return 142
+    if symbol == "PyArray_AxisConverter":
+        return 136
+    if symbol == "PyArray_GetNDArrayCVersion":
+        return 137
+    if symbol == "PyArray_ByteorderConverter":
+        return 138
+    if symbol == "PyArray_SortkindConverter":
+        return 139
+    if symbol == "PyArray_SelectkindConverter":
+        return 140
+    if symbol == "PyArray_OverflowMultiplyList":
+        return 121
+    if symbol == "PyArray_GetEndianness":
+        return 122
+    if symbol == "PyArray_GetNDArrayCFeatureVersion":
+        return 123
+    if symbol == "PyArray_CheckAxis":
+        return 124
+    if symbol == "PyArray_DescrAlignConverter":
+        return 125
+    if symbol == "PyArray_DescrAlignConverter2":
+        return 126
+    if symbol == "PyArray_DescrConverter":
+        return 150
+    if symbol == "PyArray_DescrConverter2":
+        return 151
+    if symbol == "PyArray_Max":
+        return 98
+    if symbol == "PyArray_Min":
+        return 99
+    if symbol == "PyArray_Ptp":
+        return 105
+    if symbol == "PyArray_Mean":
+        return 106
+    if symbol == "PyArray_Any":
+        return 107
+    if symbol == "PyArray_All":
+        return 108
+    if symbol == "PyArray_ArgMax":
+        return 100
+    if symbol == "PyArray_ArgMin":
+        return 101
+    if symbol == "PyArray_Reshape":
+        return 102
+    if symbol == "PyArray_Newshape":
+        return 103
+    if symbol == "PyArray_SwapAxes":
+        return 104
     if symbol == "PyArray_DIM":
         return 7
     if symbol == "PyArray_BYTES":
@@ -1595,11 +2850,290 @@ def _native_numpy_capi_slot(symbol: str):
 
 def _native_numpy_capi_failure_mode(symbol: str) -> str:
     if symbol == "PyArray_API" or symbol == "PyUFunc_API":
-        return "missing_capsule_provider"
-    if symbol == "PyArray_Type":
-        return "missing_array_type_object"
-    if symbol == "PyArrayDescr_Type":
-        return "missing_dtype_type_object"
+        return "implemented_provider_table"
+    if symbol == "PyArray_Type" or symbol == "PyArrayDescr_Type":
+        return "implemented_provider_type_object"
+    if (
+        symbol == "PyArray_TYPE"
+        or symbol == "PyArray_malloc"
+        or symbol == "PyArray_free"
+        or symbol == "PyArray_realloc"
+        or symbol == "PyDimMem_NEW"
+        or symbol == "PyDimMem_FREE"
+        or symbol == "PyDimMem_RENEW"
+        or symbol == "PyArray_DTYPE"
+        or symbol == "PyDataType_TYPE"
+        or symbol == "PyDataType_KIND"
+        or symbol == "PyDataType_ELSIZE"
+        or symbol == "PyDataType_ALIGNMENT"
+        or symbol.startswith("PyTypeNum_")
+        or symbol.startswith("PyDataType_IS")
+        or symbol == "PyArray_ISBOOL"
+        or symbol == "PyArray_ISUNSIGNED"
+        or symbol == "PyArray_ISSIGNED"
+        or symbol == "PyArray_ISINTEGER"
+        or symbol == "PyArray_ISFLOAT"
+        or symbol == "PyArray_ISNUMBER"
+        or symbol == "PyArray_ISSTRING"
+        or symbol == "PyArray_ISCOMPLEX"
+        or symbol == "PyArray_ISFLEXIBLE"
+        or symbol == "PyArray_ISOBJECT"
+        or symbol == "PyArray_NBYTES"
+        or symbol == "PyArray_FILLWBYTE"
+        or symbol == "PyArray_EquivByteorders"
+        or symbol == "PyArray_SHAPE"
+        or symbol == "PyArray_EMPTY"
+        or symbol == "PyArray_ZEROS"
+        or symbol == "PyArray_EquivArrTypes"
+        or symbol == "PyArray_SimpleNewFromDescr"
+        or symbol == "PyArray_BASE"
+        or symbol == "PyArray_DescrCheck"
+        or symbol == "PyArray_SAMESHAPE"
+        or symbol == "PyArray_DIM"
+        or symbol == "PyArray_BYTES"
+        or symbol == "PyArray_CHKFLAGS"
+        or symbol == "PyArray_FROM_O"
+        or symbol == "PyArray_FROM_OF"
+        or symbol == "PyArray_FROM_OT"
+        or symbol == "PyArray_FROM_OTF"
+        or symbol == "PyArray_FROMANY"
+        or symbol == "PyArray_ContiguousFromAny"
+        or symbol == "PyArray_FromObject"
+        or symbol == "PyArray_ContiguousFromObject"
+        or symbol == "PyArray_CopyFromObject"
+        or symbol == "PyArray_ISCONTIGUOUS"
+        or symbol == "PyArray_IS_C_CONTIGUOUS"
+        or symbol == "PyArray_ISALIGNED"
+        or symbol == "PyArray_ISWRITEABLE"
+        or symbol == "PyArray_ISCARRAY"
+        or symbol == "PyArray_IS_F_CONTIGUOUS"
+        or symbol == "PyArray_ISONESEGMENT"
+        or symbol == "PyArray_ISFORTRAN"
+        or symbol == "PyArray_FORTRAN_IF"
+        or symbol == "PyArray_ISNBO"
+        or symbol == "PyArray_IsNativeByteOrder"
+        or symbol == "PyArray_ISNOTSWAPPED"
+        or symbol == "PyArray_ISBYTESWAPPED"
+        or symbol == "PyArray_FLAGSWAP"
+        or symbol == "PyArray_ISCARRAY_RO"
+        or symbol == "PyArray_ISFARRAY"
+        or symbol == "PyArray_ISFARRAY_RO"
+        or symbol == "PyArray_ISBEHAVED"
+        or symbol == "PyArray_ISBEHAVED_RO"
+        or symbol == "PyDataType_ISNOTSWAPPED"
+        or symbol == "PyDataType_ISBYTESWAPPED"
+        or symbol == "PyArray_ISVARIABLE"
+        or symbol == "PyArray_SAFEALIGNEDCOPY"
+        or symbol == "PyArray_STRIDE"
+        or symbol == "PyArray_GETPTR1"
+        or symbol == "PyArray_GETPTR2"
+        or symbol == "PyArray_GETPTR3"
+        or symbol == "PyArray_GETPTR4"
+        or symbol == "PyArray_Cast"
+        or symbol == "PyArray_ITER_RESET"
+        or symbol == "PyArray_ITER_NEXT"
+        or symbol == "PyArray_ITER_DATA"
+        or symbol == "PyArray_ITER_NOTDONE"
+    ):
+        return "implemented_header_macro"
+    if (
+        symbol == "PyArray_DescrFromType"
+        or symbol == "PyArray_FromAny"
+        or symbol == "PyArray_SimpleNew"
+        or symbol == "PyArray_SimpleNewFromData"
+        or symbol == "PyArray_GETITEM"
+        or symbol == "PyArray_SETITEM"
+        or symbol == "PyArray_NDIM"
+        or symbol == "PyArray_DIMS"
+        or symbol == "PyArray_STRIDES"
+        or symbol == "PyArray_DATA"
+        or symbol == "PyArray_DESCR"
+        or symbol == "PyArray_FLAGS"
+        or symbol == "PyArray_CompareLists"
+        or symbol == "PyArray_Empty"
+        or symbol == "PyArray_Zeros"
+        or symbol == "PyArray_EquivTypes"
+        or symbol == "PyArray_NewFromDescr"
+        or symbol == "PyArray_New"
+        or symbol == "PyArray_MultiIterNew"
+        or symbol == "PyArray_MultiIterFromObjects"
+        or symbol == "PyArray_SetBaseObject"
+        or symbol == "PyArray_SetUpdateIfCopyBase"
+        or symbol == "PyArray_SetWritebackIfCopyBase"
+        or symbol == "PyArray_ResolveWritebackIfCopy"
+        or symbol == "PyArray_DiscardWritebackIfCopy"
+        or symbol == "PyDataMem_NEW"
+        or symbol == "PyDataMem_FREE"
+        or symbol == "PyDataMem_RENEW"
+        or symbol == "PyDataMem_NEW_ZEROED"
+        or symbol == "PyDataMem_GetHandler"
+        or symbol == "PyDataMem_UserNEW"
+        or symbol == "PyDataMem_UserFREE"
+        or symbol == "PyDataMem_UserRENEW"
+        or symbol == "PyDataMem_UserNEW_ZEROED"
+        or symbol == "PyArray_Return"
+        or symbol == "PyArray_ENABLEFLAGS"
+        or symbol == "PyArray_CLEARFLAGS"
+        or symbol == "PyArray_UpdateFlags"
+        or symbol == "PyArray_CopyInto"
+        or symbol == "PyArray_CopyAnyInto"
+        or symbol == "PyArray_ToScalar"
+        or symbol == "PyArray_Copy"
+        or symbol == "PyArray_EnsureArray"
+        or symbol == "PyArray_EnsureAnyArray"
+        or symbol == "PyArray_DescrNewFromType"
+        or symbol == "PyArray_DescrNew"
+        or symbol == "PyArray_DescrNewByteorder"
+        or symbol == "PyArray_CanCastSafely"
+        or symbol == "PyArray_ObjectType"
+        or symbol == "PyArray_CheckFromAny"
+        or symbol == "PyArray_FromArray"
+        or symbol == "PyArray_MultiplyList"
+        or symbol == "PyArray_MultiplyIntList"
+        or symbol == "PyArray_GetPtr"
+        or symbol == "PyArray_ElementStrides"
+        or symbol == "PyArray_ValidType"
+        or symbol == "PyArray_Item_INCREF"
+        or symbol == "PyArray_Item_XDECREF"
+        or symbol == "PyArray_NewCopy"
+        or symbol == "PyArray_INCREF"
+        or symbol == "PyArray_XDECREF"
+        or symbol == "PyArray_CanCastTo"
+        or symbol == "PyArray_CanCastTypeTo"
+        or symbol == "PyArray_CanCastArrayTo"
+        or symbol == "PyArray_CastingConverter"
+        or symbol == "PyArray_Zero"
+        or symbol == "PyArray_One"
+        or symbol == "PyArray_TypeObjectFromType"
+        or symbol == "PyArray_DescrFromObject"
+        or symbol == "PyArray_Size"
+        or symbol == "PyArray_DescrFromScalar"
+        or symbol == "PyArray_DescrFromTypeObject"
+        or symbol == "PyArray_Scalar"
+        or symbol == "PyArray_ScalarAsCtype"
+        or symbol == "PyArray_FromScalar"
+        or symbol == "PyArray_CastScalarToCtype"
+        or symbol == "PyArray_CastScalarDirect"
+        or symbol == "PyArray_Pack"
+        or symbol == "PyArray_CastToType"
+        or symbol == "PyArray_FillWithScalar"
+        or symbol == "PyArray_ToList"
+        or symbol == "PyArray_ToString"
+        or symbol == "PyArray_Byteswap"
+        or symbol == "PyArray_FromString"
+        or symbol == "PyArray_FromBuffer"
+        or symbol == "PyArray_FromIter"
+        or symbol == "PyArray_Converter"
+        or symbol == "PyArray_IterNew"
+        or symbol == "PyArray_BroadcastToShape"
+        or symbol == "PyArray_Broadcast"
+        or symbol == "PyArray_Concatenate"
+        or symbol == "PyArray_Arange"
+        or symbol == "PyArray_ArangeObj"
+        or symbol == "PyArray_LexSort"
+        or symbol == "PyArray_InnerProduct"
+        or symbol == "PyArray_MatrixProduct"
+        or symbol == "PyArray_MatrixProduct2"
+        or symbol == "PyArray_CountNonzero"
+        or symbol == "PyArray_MinScalarType"
+        or symbol == "PyArray_CreateSortedStridePerm"
+        or symbol == "PyArray_RemoveAxesInPlace"
+        or symbol == "PyArray_DebugPrint"
+        or symbol == "PyArray_EinsteinSum"
+        or symbol == "PyArray_Partition"
+        or symbol == "PyArray_ArgPartition"
+        or symbol == "PyArray_CheckAnyScalarExact"
+        or symbol == "PyArray_Correlate"
+        or symbol == "PyArray_Correlate2"
+        or symbol == "PyArray_RemoveSmallest"
+        or symbol == "PyArray_IterAllButAxis"
+        or symbol == "PyArray_PyIntAsInt"
+        or symbol == "PyArray_PyIntAsIntp"
+        or symbol == "PyArray_PythonPyIntFromInt"
+        or symbol == "PyArray_IntpFromSequence"
+        or symbol == "PyArray_IntpConverter"
+        or symbol == "PyArray_BufferConverter"
+        or symbol == "PyArray_OptionalIntpConverter"
+        or symbol == "PyArray_Free"
+        or symbol == "PyArray_AsCArray"
+        or symbol == "PyArray_FailUnlessWriteable"
+        or symbol == "PyArray_CheckStrides"
+        or symbol == "PyArray_GetPriority"
+        or symbol == "PyArray_CopyObject"
+        or symbol == "PyArray_Resize"
+        or symbol == "PyArray_NewLikeArray"
+        or symbol == "PyArray_View"
+        or symbol == "PyArray_Squeeze"
+        or symbol == "PyArray_Transpose"
+        or symbol == "PyArray_Ravel"
+        or symbol == "PyArray_Flatten"
+        or symbol == "PyArray_TakeFrom"
+        or symbol == "PyArray_PutTo"
+        or symbol == "PyArray_PutMask"
+        or symbol == "PyArray_Repeat"
+        or symbol == "PyArray_Choose"
+        or symbol == "PyArray_Sort"
+        or symbol == "PyArray_ArgSort"
+        or symbol == "PyArray_SearchSorted"
+        or symbol == "PyArray_Nonzero"
+        or symbol == "PyArray_Where"
+        or symbol == "PyArray_Compress"
+        or symbol == "PyArray_Diagonal"
+        or symbol == "PyArray_Trace"
+        or symbol == "PyArray_Clip"
+        or symbol == "PyArray_Conjugate"
+        or symbol == "PyArray_Std"
+        or symbol == "PyArray_Round"
+        or symbol == "PyArray_EquivTypenums"
+        or symbol == "PyArray_ScalarKind"
+        or symbol == "PyArray_CanCoerceScalar"
+        or symbol == "PyArray_CanCastScalar"
+        or symbol == "PyArray_PromoteTypes"
+        or symbol == "PyArray_ResultType"
+        or symbol == "PyArray_ConvertToCommonType"
+        or symbol == "PyArray_IntTupleFromIntp"
+        or symbol == "PyArray_ClipmodeConverter"
+        or symbol == "PyArray_ConvertClipmodeSequence"
+        or symbol == "PyArray_OutputConverter"
+        or symbol == "PyArray_SearchsideConverter"
+        or symbol == "PyArray_OrderConverter"
+        or symbol == "PyArray_BoolConverter"
+        or symbol == "PyArray_OptionalBoolConverter"
+        or symbol == "PyArray_AxisConverter"
+        or symbol == "PyArray_GetNDArrayCVersion"
+        or symbol == "PyArray_ByteorderConverter"
+        or symbol == "PyArray_SortkindConverter"
+        or symbol == "PyArray_SelectkindConverter"
+        or symbol == "PyArray_OverflowMultiplyList"
+        or symbol == "PyArray_GetEndianness"
+        or symbol == "PyArray_GetNDArrayCFeatureVersion"
+        or symbol == "PyArray_CheckAxis"
+        or symbol == "PyArray_DescrAlignConverter"
+        or symbol == "PyArray_DescrAlignConverter2"
+        or symbol == "PyArray_DescrConverter"
+        or symbol == "PyArray_DescrConverter2"
+        or symbol == "PyArray_Sum"
+        or symbol == "PyArray_CumSum"
+        or symbol == "PyArray_Prod"
+        or symbol == "PyArray_CumProd"
+        or symbol == "PyArray_Max"
+        or symbol == "PyArray_Min"
+        or symbol == "PyArray_Ptp"
+        or symbol == "PyArray_Mean"
+        or symbol == "PyArray_Any"
+        or symbol == "PyArray_All"
+        or symbol == "PyArray_ArgMax"
+        or symbol == "PyArray_ArgMin"
+        or symbol == "PyArray_Reshape"
+        or symbol == "PyArray_Newshape"
+        or symbol == "PyArray_SwapAxes"
+        or symbol == "PyArray_SIZE"
+        or symbol == "PyArray_ITEMSIZE"
+        or symbol == "PyArray_Check"
+        or symbol == "PyArray_CheckExact"
+        or symbol == "PyUFunc_FromFuncAndData"
+    ):
+        return "implemented_provider_slot"
     return "unsupported_stub"
 
 
@@ -1654,6 +3188,9 @@ def _native_extension_abi_json(
         add_symbol("PyCapsule_CheckExact")
         add_symbol("PyCapsule_SetContext")
         add_symbol("PyCapsule_SetName")
+        add_symbol("PyCapsule_SetPointer")
+        add_symbol("PyCapsule_GetDestructor")
+        add_symbol("PyCapsule_SetDestructor")
         add_symbol("PyCapsule_Import")
     if require_buffer:
         add_symbol("PyObject_GetBuffer")
@@ -1667,9 +3204,167 @@ def _native_extension_abi_json(
         add_symbol("PyMemoryView_GET_BASE")
     if require_numpy_capi:
         add_symbol("PyArray_API")
+        add_symbol("PyArray_malloc")
+        add_symbol("PyArray_free")
+        add_symbol("PyArray_realloc")
+        add_symbol("PyDimMem_NEW")
+        add_symbol("PyDimMem_FREE")
+        add_symbol("PyDimMem_RENEW")
         add_symbol("PyArray_Type")
         add_symbol("PyArrayDescr_Type")
+        add_symbol("PyArray_DescrCheck")
         add_symbol("PyArray_DescrFromType")
+        add_symbol("PyArray_TypeObjectFromType")
+        add_symbol("PyArray_DescrNewFromType")
+        add_symbol("PyArray_DescrNew")
+        add_symbol("PyArray_DescrNewByteorder")
+        add_symbol("PyArray_CanCastSafely")
+        add_symbol("PyArray_CanCastTo")
+        add_symbol("PyArray_CanCastTypeTo")
+        add_symbol("PyArray_CanCastArrayTo")
+        add_symbol("PyArray_CastingConverter")
+        add_symbol("PyArray_Zero")
+        add_symbol("PyArray_One")
+        add_symbol("PyArray_ObjectType")
+        add_symbol("PyArray_DescrFromObject")
+        add_symbol("PyArray_Size")
+        add_symbol("PyArray_DescrFromScalar")
+        add_symbol("PyArray_DescrFromTypeObject")
+        add_symbol("PyArray_Scalar")
+        add_symbol("PyArray_ScalarAsCtype")
+        add_symbol("PyArray_FromScalar")
+        add_symbol("PyArray_CastScalarToCtype")
+        add_symbol("PyArray_CastScalarDirect")
+        add_symbol("PyArray_Pack")
+        add_symbol("PyArray_CastToType")
+        add_symbol("PyArray_Cast")
+        add_symbol("PyArray_FillWithScalar")
+        add_symbol("PyArray_ToList")
+        add_symbol("PyArray_ToString")
+        add_symbol("PyArray_Byteswap")
+        add_symbol("PyArray_FromString")
+        add_symbol("PyArray_FromBuffer")
+        add_symbol("PyArray_FromIter")
+        add_symbol("PyArray_Converter")
+        add_symbol("PyArray_IterNew")
+        add_symbol("PyArray_BroadcastToShape")
+        add_symbol("PyArray_Broadcast")
+        add_symbol("PyArray_Concatenate")
+        add_symbol("PyArray_Arange")
+        add_symbol("PyArray_ArangeObj")
+        add_symbol("PyArray_LexSort")
+        add_symbol("PyArray_InnerProduct")
+        add_symbol("PyArray_MatrixProduct")
+        add_symbol("PyArray_MatrixProduct2")
+        add_symbol("PyArray_CountNonzero")
+        add_symbol("PyArray_MinScalarType")
+        add_symbol("PyArray_CreateSortedStridePerm")
+        add_symbol("PyArray_RemoveAxesInPlace")
+        add_symbol("PyArray_DebugPrint")
+        add_symbol("PyArray_EinsteinSum")
+        add_symbol("PyArray_Partition")
+        add_symbol("PyArray_ArgPartition")
+        add_symbol("PyArray_CheckAnyScalarExact")
+        add_symbol("PyArray_Correlate")
+        add_symbol("PyArray_Correlate2")
+        add_symbol("PyArray_RemoveSmallest")
+        add_symbol("PyArray_IterAllButAxis")
+        add_symbol("PyArray_PyIntAsInt")
+        add_symbol("PyArray_PyIntAsIntp")
+        add_symbol("PyArray_PythonPyIntFromInt")
+        add_symbol("PyArray_IntpFromSequence")
+        add_symbol("PyArray_IntpConverter")
+        add_symbol("PyArray_BufferConverter")
+        add_symbol("PyArray_OptionalIntpConverter")
+        add_symbol("PyArray_Free")
+        add_symbol("PyArray_AsCArray")
+        add_symbol("PyArray_FailUnlessWriteable")
+        add_symbol("PyArray_CheckStrides")
+        add_symbol("PyArray_GetPriority")
+        add_symbol("PyArray_ITER_RESET")
+        add_symbol("PyArray_ITER_NEXT")
+        add_symbol("PyArray_ITER_DATA")
+        add_symbol("PyArray_ITER_NOTDONE")
+        add_symbol("PyArray_CopyObject")
+        add_symbol("PyArray_Resize")
+        add_symbol("PyArray_NewLikeArray")
+        add_symbol("PyArray_View")
+        add_symbol("PyArray_Squeeze")
+        add_symbol("PyArray_Transpose")
+        add_symbol("PyArray_Ravel")
+        add_symbol("PyArray_Flatten")
+        add_symbol("PyArray_TakeFrom")
+        add_symbol("PyArray_PutTo")
+        add_symbol("PyArray_PutMask")
+        add_symbol("PyArray_Repeat")
+        add_symbol("PyArray_Choose")
+        add_symbol("PyArray_Sort")
+        add_symbol("PyArray_ArgSort")
+        add_symbol("PyArray_SearchSorted")
+        add_symbol("PyArray_Nonzero")
+        add_symbol("PyArray_Where")
+        add_symbol("PyArray_Compress")
+        add_symbol("PyArray_Diagonal")
+        add_symbol("PyArray_Trace")
+        add_symbol("PyArray_Clip")
+        add_symbol("PyArray_Conjugate")
+        add_symbol("PyArray_Std")
+        add_symbol("PyArray_Round")
+        add_symbol("PyArray_EquivTypenums")
+        add_symbol("PyArray_ScalarKind")
+        add_symbol("PyArray_CanCoerceScalar")
+        add_symbol("PyArray_CanCastScalar")
+        add_symbol("PyArray_PromoteTypes")
+        add_symbol("PyArray_ResultType")
+        add_symbol("PyArray_ConvertToCommonType")
+        add_symbol("PyArray_IntTupleFromIntp")
+        add_symbol("PyArray_ClipmodeConverter")
+        add_symbol("PyArray_ConvertClipmodeSequence")
+        add_symbol("PyArray_OutputConverter")
+        add_symbol("PyArray_SearchsideConverter")
+        add_symbol("PyArray_OrderConverter")
+        add_symbol("PyArray_BoolConverter")
+        add_symbol("PyArray_OptionalBoolConverter")
+        add_symbol("PyArray_AxisConverter")
+        add_symbol("PyArray_GetNDArrayCVersion")
+        add_symbol("PyArray_ByteorderConverter")
+        add_symbol("PyArray_SortkindConverter")
+        add_symbol("PyArray_SelectkindConverter")
+        add_symbol("PyArray_OverflowMultiplyList")
+        add_symbol("PyArray_GetEndianness")
+        add_symbol("PyArray_GetNDArrayCFeatureVersion")
+        add_symbol("PyArray_CheckAxis")
+        add_symbol("PyArray_DescrAlignConverter")
+        add_symbol("PyArray_DescrAlignConverter2")
+        add_symbol("PyArray_DescrConverter")
+        add_symbol("PyArray_DescrConverter2")
+        add_symbol("PyArray_Sum")
+        add_symbol("PyArray_CumSum")
+        add_symbol("PyArray_Prod")
+        add_symbol("PyArray_CumProd")
+        add_symbol("PyArray_Max")
+        add_symbol("PyArray_Min")
+        add_symbol("PyArray_Ptp")
+        add_symbol("PyArray_Mean")
+        add_symbol("PyArray_Any")
+        add_symbol("PyArray_All")
+        add_symbol("PyArray_ArgMax")
+        add_symbol("PyArray_ArgMin")
+        add_symbol("PyArray_Reshape")
+        add_symbol("PyArray_Newshape")
+        add_symbol("PyArray_SwapAxes")
+        add_symbol("PyArray_CheckFromAny")
+        add_symbol("PyArray_FromArray")
+        add_symbol("PyArray_MultiplyList")
+        add_symbol("PyArray_MultiplyIntList")
+        add_symbol("PyArray_GetPtr")
+        add_symbol("PyArray_ElementStrides")
+        add_symbol("PyArray_ValidType")
+        add_symbol("PyArray_Item_INCREF")
+        add_symbol("PyArray_Item_XDECREF")
+        add_symbol("PyArray_NewCopy")
+        add_symbol("PyArray_INCREF")
+        add_symbol("PyArray_XDECREF")
         add_symbol("PyArray_FromAny")
         add_symbol("PyArray_SimpleNew")
         add_symbol("PyArray_SimpleNewFromData")
@@ -1678,14 +3373,131 @@ def _native_extension_abi_json(
         add_symbol("PyArray_STRIDES")
         add_symbol("PyArray_DATA")
         add_symbol("PyArray_DESCR")
+        add_symbol("PyArray_DTYPE")
+        add_symbol("PyArray_TYPE")
+        add_symbol("PyDataType_TYPE")
+        add_symbol("PyDataType_KIND")
+        add_symbol("PyDataType_ELSIZE")
+        add_symbol("PyDataType_ALIGNMENT")
+        add_symbol("PyTypeNum_ISBOOL")
+        add_symbol("PyTypeNum_ISUNSIGNED")
+        add_symbol("PyTypeNum_ISSIGNED")
+        add_symbol("PyTypeNum_ISINTEGER")
+        add_symbol("PyTypeNum_ISFLOAT")
+        add_symbol("PyTypeNum_ISNUMBER")
+        add_symbol("PyTypeNum_ISSTRING")
+        add_symbol("PyTypeNum_ISCOMPLEX")
+        add_symbol("PyTypeNum_ISFLEXIBLE")
+        add_symbol("PyTypeNum_ISOBJECT")
+        add_symbol("PyDataType_ISBOOL")
+        add_symbol("PyDataType_ISUNSIGNED")
+        add_symbol("PyDataType_ISSIGNED")
+        add_symbol("PyDataType_ISINTEGER")
+        add_symbol("PyDataType_ISFLOAT")
+        add_symbol("PyDataType_ISNUMBER")
+        add_symbol("PyDataType_ISSTRING")
+        add_symbol("PyDataType_ISCOMPLEX")
+        add_symbol("PyDataType_ISFLEXIBLE")
+        add_symbol("PyDataType_ISOBJECT")
         add_symbol("PyArray_GETITEM")
         add_symbol("PyArray_SETITEM")
         add_symbol("PyArray_SIZE")
         add_symbol("PyArray_ITEMSIZE")
+        add_symbol("PyArray_NBYTES")
+        add_symbol("PyArray_FILLWBYTE")
+        add_symbol("PyArray_EquivByteorders")
+        add_symbol("PyArray_SHAPE")
+        add_symbol("PyArray_FLAGS")
+        add_symbol("PyArray_CompareLists")
+        add_symbol("PyArray_Empty")
+        add_symbol("PyArray_Zeros")
+        add_symbol("PyArray_EMPTY")
+        add_symbol("PyArray_ZEROS")
+        add_symbol("PyArray_EquivTypes")
+        add_symbol("PyArray_EquivArrTypes")
+        add_symbol("PyArray_NewFromDescr")
+        add_symbol("PyArray_New")
+        add_symbol("PyArray_MultiIterNew")
+        add_symbol("PyArray_MultiIterFromObjects")
+        add_symbol("PyArray_SimpleNewFromDescr")
+        add_symbol("PyArray_BASE")
+        add_symbol("PyArray_SetBaseObject")
+        add_symbol("PyArray_SetUpdateIfCopyBase")
+        add_symbol("PyArray_SetWritebackIfCopyBase")
+        add_symbol("PyArray_ResolveWritebackIfCopy")
+        add_symbol("PyArray_DiscardWritebackIfCopy")
+        add_symbol("PyDataMem_NEW")
+        add_symbol("PyDataMem_FREE")
+        add_symbol("PyDataMem_RENEW")
+        add_symbol("PyDataMem_NEW_ZEROED")
+        add_symbol("PyDataMem_GetHandler")
+        add_symbol("PyDataMem_UserNEW")
+        add_symbol("PyDataMem_UserFREE")
+        add_symbol("PyDataMem_UserRENEW")
+        add_symbol("PyDataMem_UserNEW_ZEROED")
+        add_symbol("PyArray_Return")
+        add_symbol("PyArray_ENABLEFLAGS")
+        add_symbol("PyArray_CLEARFLAGS")
+        add_symbol("PyArray_UpdateFlags")
+        add_symbol("PyArray_CopyInto")
+        add_symbol("PyArray_CopyAnyInto")
+        add_symbol("PyArray_ToScalar")
+        add_symbol("PyArray_Copy")
+        add_symbol("PyArray_EnsureArray")
+        add_symbol("PyArray_EnsureAnyArray")
+        add_symbol("PyArray_SAMESHAPE")
+        add_symbol("PyArray_CHKFLAGS")
+        add_symbol("PyArray_FROM_O")
+        add_symbol("PyArray_FROM_OF")
+        add_symbol("PyArray_FROM_OT")
+        add_symbol("PyArray_FROM_OTF")
+        add_symbol("PyArray_FROMANY")
+        add_symbol("PyArray_ContiguousFromAny")
+        add_symbol("PyArray_FromObject")
+        add_symbol("PyArray_ContiguousFromObject")
+        add_symbol("PyArray_CopyFromObject")
+        add_symbol("PyArray_ISCONTIGUOUS")
+        add_symbol("PyArray_IS_C_CONTIGUOUS")
+        add_symbol("PyArray_ISALIGNED")
+        add_symbol("PyArray_ISWRITEABLE")
+        add_symbol("PyArray_ISCARRAY")
+        add_symbol("PyArray_IS_F_CONTIGUOUS")
+        add_symbol("PyArray_ISONESEGMENT")
+        add_symbol("PyArray_ISFORTRAN")
+        add_symbol("PyArray_FORTRAN_IF")
+        add_symbol("PyArray_ISNBO")
+        add_symbol("PyArray_IsNativeByteOrder")
+        add_symbol("PyArray_ISNOTSWAPPED")
+        add_symbol("PyArray_ISBYTESWAPPED")
+        add_symbol("PyArray_FLAGSWAP")
+        add_symbol("PyArray_ISCARRAY_RO")
+        add_symbol("PyArray_ISFARRAY")
+        add_symbol("PyArray_ISFARRAY_RO")
+        add_symbol("PyArray_ISBEHAVED")
+        add_symbol("PyArray_ISBEHAVED_RO")
+        add_symbol("PyDataType_ISNOTSWAPPED")
+        add_symbol("PyDataType_ISBYTESWAPPED")
+        add_symbol("PyArray_ISVARIABLE")
+        add_symbol("PyArray_SAFEALIGNEDCOPY")
+        add_symbol("PyArray_ISBOOL")
+        add_symbol("PyArray_ISUNSIGNED")
+        add_symbol("PyArray_ISSIGNED")
+        add_symbol("PyArray_ISINTEGER")
+        add_symbol("PyArray_ISFLOAT")
+        add_symbol("PyArray_ISNUMBER")
+        add_symbol("PyArray_ISSTRING")
+        add_symbol("PyArray_ISCOMPLEX")
+        add_symbol("PyArray_ISFLEXIBLE")
+        add_symbol("PyArray_ISOBJECT")
         add_symbol("PyArray_Check")
         add_symbol("PyArray_CheckExact")
         add_symbol("PyArray_DIM")
         add_symbol("PyArray_BYTES")
+        add_symbol("PyArray_STRIDE")
+        add_symbol("PyArray_GETPTR1")
+        add_symbol("PyArray_GETPTR2")
+        add_symbol("PyArray_GETPTR3")
+        add_symbol("PyArray_GETPTR4")
         add_symbol("PyUFunc_API")
         add_symbol("PyUFunc_FromFuncAndData")
 
@@ -1895,6 +3707,9 @@ def _native_extension_abi_ok(
         add_symbol("PyCapsule_CheckExact")
         add_symbol("PyCapsule_SetContext")
         add_symbol("PyCapsule_SetName")
+        add_symbol("PyCapsule_SetPointer")
+        add_symbol("PyCapsule_GetDestructor")
+        add_symbol("PyCapsule_SetDestructor")
         add_symbol("PyCapsule_Import")
     if require_buffer:
         add_symbol("PyObject_GetBuffer")
@@ -1908,21 +3723,302 @@ def _native_extension_abi_ok(
         add_symbol("PyMemoryView_GET_BASE")
     if require_numpy_capi:
         add_symbol("PyArray_API")
+        add_symbol("PyArray_malloc")
+        add_symbol("PyArray_free")
+        add_symbol("PyArray_realloc")
+        add_symbol("PyDimMem_NEW")
+        add_symbol("PyDimMem_FREE")
+        add_symbol("PyDimMem_RENEW")
         add_symbol("PyArray_Type")
+        add_symbol("PyArrayDescr_Type")
+        add_symbol("PyArray_DescrCheck")
         add_symbol("PyArray_DescrFromType")
+        add_symbol("PyArray_TypeObjectFromType")
+        add_symbol("PyArray_DescrNewFromType")
+        add_symbol("PyArray_DescrNew")
+        add_symbol("PyArray_DescrNewByteorder")
+        add_symbol("PyArray_CanCastSafely")
+        add_symbol("PyArray_CanCastTo")
+        add_symbol("PyArray_CanCastTypeTo")
+        add_symbol("PyArray_CanCastArrayTo")
+        add_symbol("PyArray_CastingConverter")
+        add_symbol("PyArray_Zero")
+        add_symbol("PyArray_One")
+        add_symbol("PyArray_ObjectType")
+        add_symbol("PyArray_DescrFromObject")
+        add_symbol("PyArray_Size")
+        add_symbol("PyArray_DescrFromScalar")
+        add_symbol("PyArray_DescrFromTypeObject")
+        add_symbol("PyArray_Scalar")
+        add_symbol("PyArray_ScalarAsCtype")
+        add_symbol("PyArray_FromScalar")
+        add_symbol("PyArray_CastScalarToCtype")
+        add_symbol("PyArray_CastScalarDirect")
+        add_symbol("PyArray_Pack")
+        add_symbol("PyArray_CastToType")
+        add_symbol("PyArray_Cast")
+        add_symbol("PyArray_FillWithScalar")
+        add_symbol("PyArray_ToList")
+        add_symbol("PyArray_ToString")
+        add_symbol("PyArray_Byteswap")
+        add_symbol("PyArray_FromString")
+        add_symbol("PyArray_FromBuffer")
+        add_symbol("PyArray_FromIter")
+        add_symbol("PyArray_Converter")
+        add_symbol("PyArray_IterNew")
+        add_symbol("PyArray_BroadcastToShape")
+        add_symbol("PyArray_Broadcast")
+        add_symbol("PyArray_Concatenate")
+        add_symbol("PyArray_Arange")
+        add_symbol("PyArray_ArangeObj")
+        add_symbol("PyArray_LexSort")
+        add_symbol("PyArray_InnerProduct")
+        add_symbol("PyArray_MatrixProduct")
+        add_symbol("PyArray_MatrixProduct2")
+        add_symbol("PyArray_CountNonzero")
+        add_symbol("PyArray_MinScalarType")
+        add_symbol("PyArray_CreateSortedStridePerm")
+        add_symbol("PyArray_RemoveAxesInPlace")
+        add_symbol("PyArray_DebugPrint")
+        add_symbol("PyArray_EinsteinSum")
+        add_symbol("PyArray_Partition")
+        add_symbol("PyArray_ArgPartition")
+        add_symbol("PyArray_CheckAnyScalarExact")
+        add_symbol("PyArray_Correlate")
+        add_symbol("PyArray_Correlate2")
+        add_symbol("PyArray_RemoveSmallest")
+        add_symbol("PyArray_IterAllButAxis")
+        add_symbol("PyArray_PyIntAsInt")
+        add_symbol("PyArray_PyIntAsIntp")
+        add_symbol("PyArray_PythonPyIntFromInt")
+        add_symbol("PyArray_IntpFromSequence")
+        add_symbol("PyArray_IntpConverter")
+        add_symbol("PyArray_BufferConverter")
+        add_symbol("PyArray_OptionalIntpConverter")
+        add_symbol("PyArray_Free")
+        add_symbol("PyArray_AsCArray")
+        add_symbol("PyArray_FailUnlessWriteable")
+        add_symbol("PyArray_CheckStrides")
+        add_symbol("PyArray_GetPriority")
+        add_symbol("PyArray_ITER_RESET")
+        add_symbol("PyArray_ITER_NEXT")
+        add_symbol("PyArray_ITER_DATA")
+        add_symbol("PyArray_ITER_NOTDONE")
+        add_symbol("PyArray_CopyObject")
+        add_symbol("PyArray_Resize")
+        add_symbol("PyArray_NewLikeArray")
+        add_symbol("PyArray_View")
+        add_symbol("PyArray_Squeeze")
+        add_symbol("PyArray_Transpose")
+        add_symbol("PyArray_Ravel")
+        add_symbol("PyArray_Flatten")
+        add_symbol("PyArray_TakeFrom")
+        add_symbol("PyArray_PutTo")
+        add_symbol("PyArray_PutMask")
+        add_symbol("PyArray_Repeat")
+        add_symbol("PyArray_Choose")
+        add_symbol("PyArray_Sort")
+        add_symbol("PyArray_ArgSort")
+        add_symbol("PyArray_SearchSorted")
+        add_symbol("PyArray_Nonzero")
+        add_symbol("PyArray_Where")
+        add_symbol("PyArray_Compress")
+        add_symbol("PyArray_Diagonal")
+        add_symbol("PyArray_Trace")
+        add_symbol("PyArray_Clip")
+        add_symbol("PyArray_Conjugate")
+        add_symbol("PyArray_Std")
+        add_symbol("PyArray_Round")
+        add_symbol("PyArray_EquivTypenums")
+        add_symbol("PyArray_ScalarKind")
+        add_symbol("PyArray_CanCoerceScalar")
+        add_symbol("PyArray_CanCastScalar")
+        add_symbol("PyArray_PromoteTypes")
+        add_symbol("PyArray_ResultType")
+        add_symbol("PyArray_ConvertToCommonType")
+        add_symbol("PyArray_IntTupleFromIntp")
+        add_symbol("PyArray_ClipmodeConverter")
+        add_symbol("PyArray_ConvertClipmodeSequence")
+        add_symbol("PyArray_OutputConverter")
+        add_symbol("PyArray_SearchsideConverter")
+        add_symbol("PyArray_OrderConverter")
+        add_symbol("PyArray_BoolConverter")
+        add_symbol("PyArray_OptionalBoolConverter")
+        add_symbol("PyArray_AxisConverter")
+        add_symbol("PyArray_GetNDArrayCVersion")
+        add_symbol("PyArray_ByteorderConverter")
+        add_symbol("PyArray_SortkindConverter")
+        add_symbol("PyArray_SelectkindConverter")
+        add_symbol("PyArray_OverflowMultiplyList")
+        add_symbol("PyArray_GetEndianness")
+        add_symbol("PyArray_GetNDArrayCFeatureVersion")
+        add_symbol("PyArray_CheckAxis")
+        add_symbol("PyArray_DescrAlignConverter")
+        add_symbol("PyArray_DescrAlignConverter2")
+        add_symbol("PyArray_DescrConverter")
+        add_symbol("PyArray_DescrConverter2")
+        add_symbol("PyArray_Sum")
+        add_symbol("PyArray_CumSum")
+        add_symbol("PyArray_Prod")
+        add_symbol("PyArray_CumProd")
+        add_symbol("PyArray_Max")
+        add_symbol("PyArray_Min")
+        add_symbol("PyArray_Ptp")
+        add_symbol("PyArray_Mean")
+        add_symbol("PyArray_Any")
+        add_symbol("PyArray_All")
+        add_symbol("PyArray_ArgMax")
+        add_symbol("PyArray_ArgMin")
+        add_symbol("PyArray_Reshape")
+        add_symbol("PyArray_Newshape")
+        add_symbol("PyArray_SwapAxes")
+        add_symbol("PyArray_CheckFromAny")
+        add_symbol("PyArray_FromArray")
+        add_symbol("PyArray_MultiplyList")
+        add_symbol("PyArray_MultiplyIntList")
+        add_symbol("PyArray_GetPtr")
+        add_symbol("PyArray_ElementStrides")
+        add_symbol("PyArray_ValidType")
+        add_symbol("PyArray_Item_INCREF")
+        add_symbol("PyArray_Item_XDECREF")
+        add_symbol("PyArray_NewCopy")
+        add_symbol("PyArray_INCREF")
+        add_symbol("PyArray_XDECREF")
         add_symbol("PyArray_FromAny")
+        add_symbol("PyArray_SimpleNew")
+        add_symbol("PyArray_SimpleNewFromData")
         add_symbol("PyArray_NDIM")
         add_symbol("PyArray_DIMS")
         add_symbol("PyArray_STRIDES")
         add_symbol("PyArray_DATA")
         add_symbol("PyArray_DESCR")
+        add_symbol("PyArray_DTYPE")
+        add_symbol("PyArray_TYPE")
+        add_symbol("PyDataType_TYPE")
+        add_symbol("PyDataType_KIND")
+        add_symbol("PyDataType_ELSIZE")
+        add_symbol("PyDataType_ALIGNMENT")
+        add_symbol("PyTypeNum_ISBOOL")
+        add_symbol("PyTypeNum_ISUNSIGNED")
+        add_symbol("PyTypeNum_ISSIGNED")
+        add_symbol("PyTypeNum_ISINTEGER")
+        add_symbol("PyTypeNum_ISFLOAT")
+        add_symbol("PyTypeNum_ISNUMBER")
+        add_symbol("PyTypeNum_ISSTRING")
+        add_symbol("PyTypeNum_ISCOMPLEX")
+        add_symbol("PyTypeNum_ISFLEXIBLE")
+        add_symbol("PyTypeNum_ISOBJECT")
+        add_symbol("PyDataType_ISBOOL")
+        add_symbol("PyDataType_ISUNSIGNED")
+        add_symbol("PyDataType_ISSIGNED")
+        add_symbol("PyDataType_ISINTEGER")
+        add_symbol("PyDataType_ISFLOAT")
+        add_symbol("PyDataType_ISNUMBER")
+        add_symbol("PyDataType_ISSTRING")
+        add_symbol("PyDataType_ISCOMPLEX")
+        add_symbol("PyDataType_ISFLEXIBLE")
+        add_symbol("PyDataType_ISOBJECT")
+        add_symbol("PyArray_GETITEM")
+        add_symbol("PyArray_SETITEM")
         add_symbol("PyArray_SIZE")
         add_symbol("PyArray_ITEMSIZE")
+        add_symbol("PyArray_NBYTES")
+        add_symbol("PyArray_FILLWBYTE")
+        add_symbol("PyArray_EquivByteorders")
+        add_symbol("PyArray_SHAPE")
+        add_symbol("PyArray_FLAGS")
+        add_symbol("PyArray_CompareLists")
+        add_symbol("PyArray_Empty")
+        add_symbol("PyArray_Zeros")
+        add_symbol("PyArray_EMPTY")
+        add_symbol("PyArray_ZEROS")
+        add_symbol("PyArray_EquivTypes")
+        add_symbol("PyArray_EquivArrTypes")
+        add_symbol("PyArray_NewFromDescr")
+        add_symbol("PyArray_New")
+        add_symbol("PyArray_MultiIterNew")
+        add_symbol("PyArray_MultiIterFromObjects")
+        add_symbol("PyArray_SimpleNewFromDescr")
+        add_symbol("PyArray_BASE")
+        add_symbol("PyArray_SetBaseObject")
+        add_symbol("PyArray_SetUpdateIfCopyBase")
+        add_symbol("PyArray_SetWritebackIfCopyBase")
+        add_symbol("PyArray_ResolveWritebackIfCopy")
+        add_symbol("PyArray_DiscardWritebackIfCopy")
+        add_symbol("PyDataMem_NEW")
+        add_symbol("PyDataMem_FREE")
+        add_symbol("PyDataMem_RENEW")
+        add_symbol("PyDataMem_NEW_ZEROED")
+        add_symbol("PyDataMem_GetHandler")
+        add_symbol("PyDataMem_UserNEW")
+        add_symbol("PyDataMem_UserFREE")
+        add_symbol("PyDataMem_UserRENEW")
+        add_symbol("PyDataMem_UserNEW_ZEROED")
+        add_symbol("PyArray_Return")
+        add_symbol("PyArray_ENABLEFLAGS")
+        add_symbol("PyArray_CLEARFLAGS")
+        add_symbol("PyArray_UpdateFlags")
+        add_symbol("PyArray_CopyInto")
+        add_symbol("PyArray_CopyAnyInto")
+        add_symbol("PyArray_ToScalar")
+        add_symbol("PyArray_Copy")
+        add_symbol("PyArray_EnsureArray")
+        add_symbol("PyArray_EnsureAnyArray")
+        add_symbol("PyArray_SAMESHAPE")
+        add_symbol("PyArray_CHKFLAGS")
+        add_symbol("PyArray_FROM_O")
+        add_symbol("PyArray_FROM_OF")
+        add_symbol("PyArray_FROM_OT")
+        add_symbol("PyArray_FROM_OTF")
+        add_symbol("PyArray_FROMANY")
+        add_symbol("PyArray_ContiguousFromAny")
+        add_symbol("PyArray_FromObject")
+        add_symbol("PyArray_ContiguousFromObject")
+        add_symbol("PyArray_CopyFromObject")
+        add_symbol("PyArray_ISCONTIGUOUS")
+        add_symbol("PyArray_IS_C_CONTIGUOUS")
+        add_symbol("PyArray_ISALIGNED")
+        add_symbol("PyArray_ISWRITEABLE")
+        add_symbol("PyArray_ISCARRAY")
+        add_symbol("PyArray_IS_F_CONTIGUOUS")
+        add_symbol("PyArray_ISONESEGMENT")
+        add_symbol("PyArray_ISFORTRAN")
+        add_symbol("PyArray_FORTRAN_IF")
+        add_symbol("PyArray_ISNBO")
+        add_symbol("PyArray_IsNativeByteOrder")
+        add_symbol("PyArray_ISNOTSWAPPED")
+        add_symbol("PyArray_ISBYTESWAPPED")
+        add_symbol("PyArray_FLAGSWAP")
+        add_symbol("PyArray_ISCARRAY_RO")
+        add_symbol("PyArray_ISFARRAY")
+        add_symbol("PyArray_ISFARRAY_RO")
+        add_symbol("PyArray_ISBEHAVED")
+        add_symbol("PyArray_ISBEHAVED_RO")
+        add_symbol("PyDataType_ISNOTSWAPPED")
+        add_symbol("PyDataType_ISBYTESWAPPED")
+        add_symbol("PyArray_ISVARIABLE")
+        add_symbol("PyArray_SAFEALIGNEDCOPY")
+        add_symbol("PyArray_ISBOOL")
+        add_symbol("PyArray_ISUNSIGNED")
+        add_symbol("PyArray_ISSIGNED")
+        add_symbol("PyArray_ISINTEGER")
+        add_symbol("PyArray_ISFLOAT")
+        add_symbol("PyArray_ISNUMBER")
+        add_symbol("PyArray_ISSTRING")
+        add_symbol("PyArray_ISCOMPLEX")
+        add_symbol("PyArray_ISFLEXIBLE")
+        add_symbol("PyArray_ISOBJECT")
         add_symbol("PyArray_Check")
         add_symbol("PyArray_CheckExact")
         add_symbol("PyArray_DIM")
         add_symbol("PyArray_BYTES")
+        add_symbol("PyArray_STRIDE")
+        add_symbol("PyArray_GETPTR1")
+        add_symbol("PyArray_GETPTR2")
+        add_symbol("PyArray_GETPTR3")
+        add_symbol("PyArray_GETPTR4")
         add_symbol("PyUFunc_API")
+        add_symbol("PyUFunc_FromFuncAndData")
     i = 0
     while i < len(requested):
         if _native_known_capi_header(requested[i]) is None:
@@ -2105,6 +4201,65 @@ def _native_shell_quote(text: str) -> str:
     return "'" + text.replace("'", "'\"'\"'") + "'"
 
 
+def _native_path_search_dirs():
+    raw = os.environ.get("PATH") or ""
+    parts = raw.split(_path_list_sep())
+    out = []
+    i = 0
+    while i < len(parts):
+        item = parts[i].strip()
+        if item != "" and not _native_list_contains(out, item):
+            out.append(item)
+        i += 1
+    return out
+
+
+def _native_pcc_header_roots():
+    candidates = []
+    explicit = os.environ.get("PCC_REPO_ROOT")
+    if explicit:
+        candidates.append(os.path.abspath(explicit))
+    candidates.append(os.path.abspath(os.getcwd()))
+    try:
+        candidates.append(
+            os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        )
+    except Exception:
+        pass
+    i = 0
+    while i < len(candidates):
+        root = candidates[i]
+        capi = os.path.join(root, "utils", "fake_libc_include")
+        runtime = os.path.join(root, "pcc", "py_runtime", "include")
+        if os.path.isfile(os.path.join(capi, "Python.h")) and os.path.isdir(runtime):
+            return [capi, runtime]
+        i += 1
+    return [None, None]
+
+
+def _native_materialize_pcc_capi_include(root: str, execute: bool):
+    roots = _native_pcc_header_roots()
+    source = roots[0]
+    runtime = roots[1]
+    if source is None or runtime is None:
+        return [None, None]
+    dest = os.path.join(root, "build", "pcc-package", "pcc-capi-include")
+    if execute:
+        try:
+            _bootstrap_subprocess_run(["mkdir", "-p", dest], check=True)
+            i = 0
+            while i < len(PCC_CAPI_HEADERS):
+                header = PCC_CAPI_HEADERS[i]
+                header_source = os.path.join(source, header)
+                if not os.path.isfile(header_source):
+                    return [None, None]
+                _bootstrap_subprocess_run(["cp", header_source, dest], check=True)
+                i += 1
+        except Exception:
+            return [None, None]
+    return [dest, runtime]
+
+
 def _native_generated_target_suffix_ok(path: str) -> bool:
     lower = path.lower()
     return (
@@ -2177,7 +4332,7 @@ def _native_ninja_custom_targets(root: str, search_paths):
         + " 2>/dev/null"
     )
     try:
-        subprocess.run(["/bin/sh", "-c", command], check=True)
+        _bootstrap_subprocess_run(["/bin/sh", "-c", command], check=True)
     except Exception:
         return []
     try:
@@ -2186,7 +4341,7 @@ def _native_ninja_custom_targets(root: str, search_paths):
     except Exception:
         text = ""
     try:
-        subprocess.run(["rm", "-f", output_path], check=True)
+        _bootstrap_subprocess_run(["rm", "-f", output_path], check=True)
     except Exception:
         pass
     targets = []
@@ -2319,6 +4474,7 @@ def _native_build_exec_json(
     linkage = "null"
     generated_c_provenance = "[]"
     ok = True
+    effective_include_dirs = _copy_seq(include_dirs)
 
     def add_action(kind: str, source, output, command, status: str, returncode) -> None:
         nonlocal actions, ok
@@ -2343,7 +4499,7 @@ def _native_build_exec_json(
     else:
         if execute:
             try:
-                subprocess.run(["mkdir", "-p", root + "/build/pcc-package"], check=True)
+                _bootstrap_subprocess_run(["mkdir", "-p", root + "/build/pcc-package"], check=True)
             except Exception:
                 diagnostics.append("PCC-PKG-BUILD-DIR-FAILED")
                 ok = False
@@ -2355,6 +4511,22 @@ def _native_build_exec_json(
             [".f", ".for", ".f77", ".f90", ".f95", ".f03", ".f08"],
             True,
         )
+
+        if (
+            abi_mode == "pcc-native"
+            and len(c_files) > 0
+            and not from_compile_commands
+            and not from_meson_introspection
+        ):
+            pcc_includes = _native_materialize_pcc_capi_include(root, execute)
+            if pcc_includes[0] is None or pcc_includes[1] is None:
+                diagnostics.append("PCC-PKG-CAPI-INCLUDE-MISSING")
+                ok = False
+            else:
+                if not _native_list_contains(effective_include_dirs, pcc_includes[0]):
+                    effective_include_dirs.append(pcc_includes[0])
+                if not _native_list_contains(effective_include_dirs, pcc_includes[1]):
+                    effective_include_dirs.append(pcc_includes[1])
 
         if (
             len(pyx_files) > 0
@@ -2378,7 +4550,7 @@ def _native_build_exec_json(
                     diagnostics.append("PCC-PKG-MISSING-CYTHON")
                 elif execute:
                     try:
-                        subprocess.run(command, check=True)
+                        _bootstrap_subprocess_run(command, check=True)
                         add_action(
                             "cython_regenerate",
                             source,
@@ -2414,7 +4586,7 @@ def _native_build_exec_json(
                     diagnostics.append("PCC-PKG-MISSING-F2PY")
                 elif execute:
                     try:
-                        subprocess.run(command, check=True)
+                        _bootstrap_subprocess_run(command, check=True)
                         add_action(
                             "f2py_build",
                             source,
@@ -2447,7 +4619,7 @@ def _native_build_exec_json(
                     object_outputs.append(output)
                 if execute:
                     try:
-                        subprocess.run(command, check=True)
+                        _bootstrap_subprocess_run(command, check=True)
                         add_action(
                             "compile_command", None, output, command, "passed", 0
                         )
@@ -2472,7 +4644,7 @@ def _native_build_exec_json(
                         diagnostics.append("PCC-PKG-MISSING-MESON")
                 elif execute:
                     try:
-                        subprocess.run(command, check=True)
+                        _bootstrap_subprocess_run(command, check=True)
                         add_action("meson_setup", None, setup_dir, command, "passed", 0)
                         rows = _native_meson_command_rows(root)
                     except Exception:
@@ -2497,7 +4669,7 @@ def _native_build_exec_json(
                     command.append(generated_targets[g])
                     g += 1
                 try:
-                    subprocess.run(command, check=True)
+                    _bootstrap_subprocess_run(command, check=True)
                     add_action(
                         "meson_generated_targets", None, None, command, "passed", 0
                     )
@@ -2532,7 +4704,7 @@ def _native_build_exec_json(
                         diagnostics.append(missing_diag)
                 elif execute:
                     try:
-                        subprocess.run(command, check=True)
+                        _bootstrap_subprocess_run(command, check=True)
                         add_action(kind, source, output, command, "passed", 0)
                     except Exception:
                         add_action(kind, source, output, command, "failed", 127)
@@ -2547,9 +4719,11 @@ def _native_build_exec_json(
                 output = root + "/build/pcc-package/" + base + ".o"
                 object_outputs.append(output)
                 command = [cc or "cc", "-c"]
+                if link_output is not None:
+                    command.append("-fPIC")
                 j = 0
-                while j < len(include_dirs):
-                    command.append("-I" + include_dirs[j])
+                while j < len(effective_include_dirs):
+                    command.append("-I" + effective_include_dirs[j])
                     j += 1
                 command.append(source)
                 command.append("-o")
@@ -2559,7 +4733,7 @@ def _native_build_exec_json(
                     diagnostics.append("PCC-PKG-MISSING-C-COMPILER")
                 elif execute:
                     try:
-                        subprocess.run(command, check=True)
+                        _bootstrap_subprocess_run(command, check=True)
                         add_action(
                             "c_compile",
                             source,
@@ -2588,7 +4762,7 @@ def _native_build_exec_json(
                     diagnostics.append("PCC-PKG-MISSING-FORTRAN")
                 elif execute:
                     try:
-                        subprocess.run(command, check=True)
+                        _bootstrap_subprocess_run(command, check=True)
                         add_action(
                             "fortran_compile",
                             source,
@@ -2617,6 +4791,9 @@ def _native_build_exec_json(
             else:
                 link_path = root + "/" + link_output
             command = [cc or "cc", "-shared"]
+            if sys.platform == "darwin":
+                command.append("-undefined")
+                command.append("dynamic_lookup")
             i = 0
             while i < len(object_outputs):
                 command.append(object_outputs[i])
@@ -2641,7 +4818,7 @@ def _native_build_exec_json(
                 add_action("native_link", None, link_path, command, "blocked", None)
             elif execute:
                 try:
-                    subprocess.run(command, check=True)
+                    _bootstrap_subprocess_run(command, check=True)
                     add_action("native_link", None, link_path, command, "passed", 0)
                 except Exception:
                     add_action("native_link", None, link_path, command, "failed", 127)
@@ -2669,7 +4846,11 @@ def _native_build_exec_json(
     out += ', "build_plan": ' + _native_build_plan_json(pkg_name, root)
     out += ', "diagnostics": ' + _json_str_list(diagnostics)
     out += ', "execute": ' + ("true" if execute else "false")
-    out += ', "include_dirs": ' + _json_str_list(include_dirs)
+    # Host contract (build_exec.py): the report echoes the CALLER's include
+    # dirs; internally materialized pcc-capi include dirs stay internal to the
+    # compile commands (they are visible there), so host and pcc1 reports stay
+    # byte-comparable.
+    out += ', "include_dirs": ' + _json_str_list(_copy_seq(include_dirs))
     out += ', "from_compile_commands": ' + (
         "true" if from_compile_commands else "false"
     )
@@ -2952,51 +5133,35 @@ def _native_campaign_xfail_reason(path: str, xfails):
 
 
 def _native_campaign_profile_root(root: str, profile: str) -> str:
-    if profile == "numpy-core-l6":
-        nested = root + "/numpy/_core/tests"
+    data = campaign_profile(profile)
+    if data is not None:
+        nested = root
+        i = 0
+        parts = data["root_parts"]
+        while i < len(parts):
+            nested += "/" + parts[i]
+            i += 1
         if os.path.isdir(nested):
             return nested
     return root
 
 
 def _native_campaign_profile_task(path: str, profile: str) -> str:
-    if profile != "numpy-core-l6":
+    data = campaign_profile(profile)
+    if data is None:
         return ""
     name = _native_basename(path)
-    if (
-        name == "test_multiarray.py"
-        or name == "test_numeric.py"
-        or name == "test_shape_base.py"
-        or name == "test_dtype.py"
-    ):
-        return "L6.2"
-    if name == "test_array_coercion.py" or name == "test_scalarmath.py":
-        return "L6.3"
-    if name == "test_indexing.py" or name == "test_stride_tricks.py":
-        return "L6.4"
-    if name == "test_umath.py" or name == "test_ufunc.py":
-        return "L6.5"
-    if name == "test_arrayprint.py":
-        return "L6.6"
-    return ""
+    metadata = data["files"].get(name)
+    return metadata[0] if metadata is not None else ""
 
 
 def _native_campaign_profile_feature(path: str, profile: str) -> str:
-    task = _native_campaign_profile_task(path, profile)
+    data = campaign_profile(profile)
+    if data is None:
+        return ""
     name = _native_basename(path)
-    if task == "L6.2":
-        return "shape-strides-dtype"
-    if name == "test_array_coercion.py":
-        return "scalar-coercion"
-    if task == "L6.3":
-        return "scalar-types"
-    if task == "L6.4":
-        return "indexing-slicing-broadcast"
-    if task == "L6.5":
-        return "ufunc-add-sub-mul-div"
-    if task == "L6.6":
-        return "array-repr-print"
-    return ""
+    metadata = data["files"].get(name)
+    return metadata[1] if metadata is not None else ""
 
 
 def _native_campaign_profile_selected(path: str, profile: str) -> bool:
@@ -3010,8 +5175,9 @@ def _native_campaign_json(
 ) -> str:
     scan_root = _native_campaign_profile_root(root, profile)
     effective_area = area
-    if profile == "numpy-core-l6" and area == "core":
-        effective_area = "numpy-core"
+    profile_data = campaign_profile(profile)
+    if profile_data is not None and area == profile_data["default_area"]:
+        effective_area = profile_data["area"]
     selected = []
     stack = [scan_root]
     while len(stack) > 0:
@@ -3126,13 +5292,9 @@ def _native_campaign_json(
     out += ', "include": ' + _json_str_list(includes)
     out += ', "pattern": ' + _json_str(pattern)
     out += ', "profile": ' + _json_str(profile)
-    if profile == "numpy-core-l6":
-        out += ', "profile_description": ' + _json_str(
-            "NumPy L6 useful core-test subset profile. It selects stable numpy/_core/tests files that map to L6.2-L6.6 feature domains; it does not mark those tests passing."
-        )
-        out += ', "selection_rule": ' + _json_str(
-            "fixed NumPy L6 core-test filename profile under numpy/_core/tests"
-        )
+    if profile_data is not None:
+        out += ', "profile_description": ' + _json_str(profile_data["description"])
+        out += ', "selection_rule": ' + _json_str(profile_data["selection_rule"])
     else:
         out += ', "profile_description": ""'
         out += ', "selection_rule": ' + _json_str("pattern/include/exclude")
@@ -3228,7 +5390,7 @@ def _run_native_package_campaign_from_pcc1(module_args) -> int:
     if root is None:
         _write_text('{"error": "missing --root", "ok": false}')
         return 2
-    if profile != "" and profile != "numpy-core-l6":
+    if profile != "" and campaign_profile(profile) is None:
         _write_text('{"error": "unknown campaign profile", "ok": false}')
         return 2
     report = _native_campaign_json(
@@ -3243,4752 +5405,6 @@ def _run_native_package_campaign_from_pcc1(module_args) -> int:
             return 2
     _write_text(report)
     return 0
-
-
-def _native_array_dtype_itemsize(dtype: str) -> int:
-    if dtype == "bool" or dtype == "int8" or dtype == "uint8":
-        return 1
-    if dtype == "int16" or dtype == "uint16":
-        return 2
-    if dtype == "int32" or dtype == "uint32" or dtype == "float32":
-        return 4
-    if dtype == "int64" or dtype == "uint64" or dtype == "float64" or dtype == "object":
-        return 8
-    return 8
-
-
-def _native_array_dtype_format(dtype: str) -> str:
-    if dtype == "bool":
-        return "?"
-    if dtype == "int8":
-        return "b"
-    if dtype == "int16":
-        return "h"
-    if dtype == "int32":
-        return "i"
-    if dtype == "int64":
-        return "q"
-    if dtype == "uint8":
-        return "B"
-    if dtype == "uint16":
-        return "H"
-    if dtype == "uint32":
-        return "I"
-    if dtype == "uint64":
-        return "Q"
-    if dtype == "float32":
-        return "f"
-    if dtype == "float64":
-        return "d"
-    return "O"
-
-
-def _native_array_normalize_dtype(dtype: str) -> str:
-    d = (dtype or "auto").lower()
-    if d == "auto" or d == "":
-        return "object"
-    if d == "bool" or d == "bool_" or d == "boolean":
-        return "bool"
-    if d == "int8" or d == "byte":
-        return "int8"
-    if d == "int16" or d == "short":
-        return "int16"
-    if d == "int32" or d == "intc":
-        return "int32"
-    if d == "int" or d == "int_" or d == "long" or d == "longlong" or d == "int64":
-        return "int64"
-    if d == "uint8":
-        return "uint8"
-    if d == "uint16":
-        return "uint16"
-    if d == "uint32":
-        return "uint32"
-    if d == "uint" or d == "uint_" or d == "ulong" or d == "uint64":
-        return "uint64"
-    if d == "float32" or d == "single":
-        return "float32"
-    if d == "float" or d == "float_" or d == "double" or d == "float64":
-        return "float64"
-    if d == "object" or d == "object_" or d == "pyobject":
-        return "object"
-    return "object"
-
-
-def _native_array_is_integer_dtype(dtype: str) -> bool:
-    return (
-        dtype == "int8"
-        or dtype == "int16"
-        or dtype == "int32"
-        or dtype == "int64"
-        or dtype == "uint8"
-        or dtype == "uint16"
-        or dtype == "uint32"
-        or dtype == "uint64"
-    )
-
-
-def _native_array_integer_bits(dtype: str) -> int:
-    if dtype == "int8" or dtype == "uint8":
-        return 8
-    if dtype == "int16" or dtype == "uint16":
-        return 16
-    if dtype == "int32" or dtype == "uint32":
-        return 32
-    return 64
-
-
-def _native_array_integer_signed(dtype: str) -> bool:
-    return dtype == "int8" or dtype == "int16" or dtype == "int32" or dtype == "int64"
-
-
-def _native_array_int_pow2(bits: int) -> int:
-    value = 1
-    i = 0
-    while i < bits:
-        value *= 2
-        i += 1
-    return value
-
-
-def _native_array_wrap_integer(value: int, dtype: str) -> int:
-    bits = _native_array_integer_bits(dtype)
-    modulo = _native_array_int_pow2(bits)
-    wrapped = value % modulo
-    if _native_array_integer_signed(dtype):
-        sign = _native_array_int_pow2(bits - 1)
-        if wrapped >= sign:
-            wrapped -= modulo
-    return wrapped
-
-
-def _native_array_dtype_range_json(dtype: str) -> str:
-    if dtype == "bool":
-        return "[0, 1]"
-    if not _native_array_is_integer_dtype(dtype):
-        return "null"
-    bits = _native_array_integer_bits(dtype)
-    if _native_array_integer_signed(dtype):
-        low = -_native_array_int_pow2(bits - 1)
-        high = _native_array_int_pow2(bits - 1) - 1
-        return "[" + str(low) + ", " + str(high) + "]"
-    high = _native_array_int_pow2(bits) - 1
-    return "[0, " + str(high) + "]"
-
-
-def _native_array_parse_shape(text: str):
-    dims = []
-    token = ""
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch == ",":
-            if token.strip() != "":
-                try:
-                    dims.append(int(token.strip()))
-                except Exception:
-                    dims.append(-1)
-            token = ""
-        else:
-            token += ch
-        i += 1
-    if token.strip() != "":
-        try:
-            dims.append(int(token.strip()))
-        except Exception:
-            dims.append(-1)
-    return dims
-
-
-def _native_array_split_commas(text: str):
-    parts = []
-    token = ""
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch == ",":
-            if token.strip() != "":
-                parts.append(token.strip())
-            token = ""
-        else:
-            token += ch
-        i += 1
-    if token.strip() != "":
-        parts.append(token.strip())
-    return parts
-
-
-def _native_array_size(shape) -> int:
-    if len(shape) == 0:
-        return 1
-    total = 1
-    i = 0
-    while i < len(shape):
-        dim = shape[i]
-        if dim == 0:
-            return 0
-        total *= dim
-        i += 1
-    return total
-
-
-def _native_array_strides(shape, itemsize: int):
-    strides = []
-    i = 0
-    while i < len(shape):
-        strides.append(0)
-        i += 1
-    stride = itemsize
-    i = len(shape) - 1
-    while i >= 0:
-        strides[i] = stride
-        dim = shape[i]
-        if dim > 0:
-            stride *= dim
-        i -= 1
-    return strides
-
-
-def _native_array_literal_dtype(text: str) -> str:
-    has_quote = False
-    has_float = False
-    has_int = False
-    has_bool = False
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch == '"' or ch == "'":
-            has_quote = True
-        if ch == ".":
-            has_float = True
-        if "0" <= ch <= "9":
-            has_int = True
-        i += 1
-    if (
-        _native_find_from(text, "True", 0) >= 0
-        or _native_find_from(text, "False", 0) >= 0
-    ):
-        has_bool = True
-    if has_quote:
-        return "object"
-    if has_float:
-        return "float64"
-    if has_int:
-        return "int64"
-    if has_bool:
-        return "bool"
-    return "object"
-
-
-def _native_array_literal_shape_and_diagnostics(text: str):
-    stripped = text.strip()
-    diagnostics = []
-    if stripped == "" or stripped == "[]":
-        diagnostics.append("PCC-ARRAY-EMPTY-DTYPE")
-        return [[0], diagnostics]
-    if not stripped.startswith("["):
-        return [[], diagnostics]
-    is_2d = stripped.startswith("[[")
-    if is_2d:
-        row_counts = []
-        depth = 0
-        cols = 0
-        token = False
-        i = 0
-        while i < len(stripped):
-            ch = stripped[i]
-            if ch == "[":
-                if depth == 1:
-                    cols = 0
-                    token = False
-                depth += 1
-            elif ch == "]":
-                if depth == 2:
-                    if token:
-                        cols += 1
-                    row_counts.append(cols)
-                    token = False
-                depth -= 1
-            elif ch == ",":
-                if depth == 2 and token:
-                    cols += 1
-                    token = False
-            elif depth == 2 and ch != " " and ch != "\n" and ch != "\t":
-                token = True
-            i += 1
-        if len(row_counts) == 0:
-            diagnostics.append("PCC-ARRAY-LITERAL-PARSE-FAILED")
-            return [[], diagnostics]
-        first = row_counts[0]
-        j = 0
-        while j < len(row_counts):
-            if row_counts[j] != first:
-                diagnostics.append("PCC-ARRAY-RAGGED")
-                return [[len(row_counts)], diagnostics]
-            j += 1
-        return [[len(row_counts), first], diagnostics]
-    count = 0
-    depth = 0
-    token = False
-    i = 0
-    while i < len(stripped):
-        ch = stripped[i]
-        if ch == "[":
-            depth += 1
-        elif ch == "]":
-            if depth == 1 and token:
-                count += 1
-                token = False
-            depth -= 1
-        elif ch == ",":
-            if depth == 1 and token:
-                count += 1
-                token = False
-        elif depth == 1 and ch != " " and ch != "\n" and ch != "\t":
-            token = True
-        i += 1
-    return [[count], diagnostics]
-
-
-def _native_array_literal_values(text: str):
-    stripped = text.strip()
-    if stripped == "":
-        return []
-    if not stripped.startswith("["):
-        return [stripped]
-    values = []
-    token = ""
-    quote = ""
-    i = 0
-    while i < len(stripped):
-        ch = stripped[i]
-        if quote != "":
-            token += ch
-            if ch == quote:
-                values.append(token.strip())
-                token = ""
-                quote = ""
-        elif ch == '"' or ch == "'":
-            quote = ch
-            token = ch
-        elif (
-            ch == "[" or ch == "]" or ch == "," or ch == " " or ch == "\n" or ch == "\t"
-        ):
-            if token.strip() != "":
-                values.append(token.strip())
-                token = ""
-        else:
-            token += ch
-        i += 1
-    if token.strip() != "":
-        values.append(token.strip())
-    return values
-
-
-def _native_array_token_json(token: str) -> str:
-    stripped = token.strip()
-    if stripped == "True":
-        return "true"
-    if stripped == "False":
-        return "false"
-    if stripped.startswith('"') or stripped.startswith("'"):
-        inner = stripped[1:]
-        if len(inner) > 0 and (inner.endswith('"') or inner.endswith("'")):
-            inner = inner[:-1]
-        return _json_str(inner)
-    return stripped
-
-
-def _native_array_values_json(values) -> str:
-    out = "["
-    i = 0
-    while i < len(values):
-        if i > 0:
-            out += ", "
-        out += _native_array_token_json(values[i])
-        i += 1
-    out += "]"
-    return out
-
-
-def _native_array_data_json(shape, values) -> str:
-    if len(shape) > 0 and len(values) != _native_array_size(shape):
-        return _native_array_values_json(values)
-    if len(shape) == 0:
-        if len(values) == 0:
-            return "null"
-        return _native_array_token_json(values[0])
-    if len(shape) == 1:
-        return _native_array_values_json(values)
-    if len(shape) == 2:
-        rows = shape[0]
-        cols = shape[1]
-        out = "["
-        r = 0
-        while r < rows:
-            if r > 0:
-                out += ", "
-            row = []
-            c = 0
-            while c < cols:
-                pos = r * cols + c
-                if pos < len(values):
-                    row.append(values[pos])
-                c += 1
-            out += _native_array_values_json(row)
-            r += 1
-        out += "]"
-        return out
-    return _native_array_values_json(values)
-
-
-def _native_array_repr(shape, values) -> str:
-    return "array(" + _native_array_data_json(shape, values) + ")"
-
-
-def _native_array_is_float_token(token: str) -> bool:
-    return (
-        _native_find_from(token, ".", 0) >= 0
-        or _native_find_from(token, "e", 0) >= 0
-        or _native_find_from(token, "E", 0) >= 0
-    )
-
-
-def _native_array_op_dtype(op: str, left_dtype: str, right_dtype: str) -> str:
-    if left_dtype == "object" or right_dtype == "object":
-        return "object"
-    if op == "div":
-        return "float64"
-    if left_dtype == right_dtype:
-        return left_dtype
-    if left_dtype == "float64" or right_dtype == "float64":
-        return "float64"
-    if left_dtype == "float32" or right_dtype == "float32":
-        return "float32"
-    if left_dtype != "bool" or right_dtype != "bool":
-        return "int64"
-    return "bool"
-
-
-def _native_array_token_to_scaled(token: str) -> int:
-    if token == "True":
-        return 1000000
-    if token == "False":
-        return 0
-    stripped = token.strip()
-    negative = False
-    if stripped.startswith("-"):
-        negative = True
-        stripped = stripped[1:]
-    whole = stripped
-    frac = ""
-    dot = _native_find_from(stripped, ".", 0)
-    if dot >= 0:
-        whole = stripped[:dot]
-        frac = stripped[dot + 1 :]
-    if whole == "":
-        whole_value = 0
-    else:
-        whole_value = int(whole)
-    value = whole_value * 1000000
-    scale = 100000
-    i = 0
-    while i < len(frac) and i < 6:
-        ch = frac[i]
-        if "0" <= ch <= "9":
-            value += int(ch) * scale
-        scale //= 10
-        i += 1
-    if negative:
-        return -value
-    return value
-
-
-def _native_array_scaled_to_token(value: int, dtype: str) -> str:
-    if dtype == "float32" or dtype == "float64":
-        negative = value < 0
-        if negative:
-            value = -value
-        whole = value // 1000000
-        frac = value % 1000000
-        text = str(whole) + "."
-        scale = 100000
-        while scale > 0:
-            digit = frac // scale
-            text += str(digit)
-            frac = frac - digit * scale
-            scale //= 10
-        while len(text) > 0 and text.endswith("0"):
-            text = text[:-1]
-        if text.endswith("."):
-            text += "0"
-        if negative:
-            text = "-" + text
-        return text
-    if dtype == "bool":
-        return "True" if value != 0 else "False"
-    if value < 0:
-        integer = -((-value) // 1000000)
-    else:
-        integer = value // 1000000
-    if _native_array_is_integer_dtype(dtype):
-        integer = _native_array_wrap_integer(integer, dtype)
-    return str(integer)
-
-
-def _native_array_token_is_scaled_number(token: str) -> bool:
-    stripped = token.strip()
-    if stripped == "":
-        return False
-    i = 0
-    if stripped[0] == "-" or stripped[0] == "+":
-        i = 1
-    if i >= len(stripped):
-        return False
-    saw_digit = False
-    saw_dot = False
-    while i < len(stripped):
-        ch = stripped[i]
-        if "0" <= ch <= "9":
-            saw_digit = True
-        elif ch == "." and not saw_dot:
-            saw_dot = True
-        else:
-            return False
-        i += 1
-    return saw_digit
-
-
-def _native_array_arange_uses_float(arange_text: str) -> bool:
-    parts = _native_array_split_commas(arange_text)
-    i = 0
-    while i < len(parts):
-        if _native_find_from(parts[i], ".", 0) >= 0:
-            return True
-        i += 1
-    return False
-
-
-def _native_array_cast_values(values, dtype: str):
-    out = []
-    i = 0
-    while i < len(values):
-        if dtype == "object":
-            out.append(values[i])
-        else:
-            out.append(
-                _native_array_scaled_to_token(
-                    _native_array_token_to_scaled(values[i]), dtype
-                )
-            )
-        i += 1
-    return out
-
-
-def _native_array_apply_op(left: str, right: str, op: str, dtype: str) -> str:
-    lv = _native_array_token_to_scaled(left)
-    rv = _native_array_token_to_scaled(right)
-    if op == "add":
-        result = lv + rv
-    elif op == "sub":
-        result = lv - rv
-    elif op == "mul":
-        result = (lv * rv) // 1000000
-    else:
-        result = (lv * 1000000) // rv
-    return _native_array_scaled_to_token(result, dtype)
-
-
-def _native_array_unary_op_name(op: str) -> str:
-    if op == "negative":
-        return "neg"
-    if op == "absolute":
-        return "abs"
-    if op == "not":
-        return "logical_not"
-    return op
-
-
-def _native_array_unary_op(shape, values, dtype: str, op: str, diagnostics):
-    op_name = _native_array_unary_op_name(op)
-    if not (op_name == "neg" or op_name == "abs" or op_name == "logical_not"):
-        diagnostics.append("PCC-ARRAY-UNARY-UNSUPPORTED")
-        return [shape, [], dtype]
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-OBJECT-UNARY-UNSUPPORTED")
-        return [shape, [], dtype]
-    if dtype == "bool" and op_name == "neg":
-        diagnostics.append("PCC-ARRAY-UNARY-DTYPE-UNSUPPORTED")
-        return [shape, [], dtype]
-    out_dtype = dtype
-    if op_name == "logical_not":
-        out_dtype = "bool"
-    out = []
-    i = 0
-    while i < len(values):
-        scaled = _native_array_token_to_scaled(values[i])
-        if op_name == "neg":
-            result = -scaled
-        elif op_name == "abs":
-            if scaled < 0:
-                result = -scaled
-            else:
-                result = scaled
-        else:
-            result = 0
-            if scaled == 0:
-                result = 1000000
-        out.append(_native_array_scaled_to_token(result, out_dtype))
-        i += 1
-    return [shape, out, out_dtype]
-
-
-def _native_array_clip(shape, values, dtype: str, clip_text: str, diagnostics):
-    comma = _native_find_from(clip_text, ",", 0)
-    if comma < 0:
-        diagnostics.append("PCC-ARRAY-CLIP-PARSE-FAILED")
-        return [shape, [], dtype]
-    lower_text = clip_text[:comma].strip()
-    upper_text = clip_text[comma + 1 :].strip()
-    if lower_text == "" or upper_text == "":
-        diagnostics.append("PCC-ARRAY-CLIP-PARSE-FAILED")
-        return [shape, [], dtype]
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-OBJECT-CLIP-UNSUPPORTED")
-        return [shape, [], dtype]
-    lower = _native_array_token_to_scaled(lower_text)
-    upper = _native_array_token_to_scaled(upper_text)
-    out_dtype = dtype
-    if _native_array_is_float_token(lower_text) or _native_array_is_float_token(
-        upper_text
-    ):
-        out_dtype = "float64"
-    out = []
-    i = 0
-    while i < len(values):
-        current = _native_array_token_to_scaled(values[i])
-        if current < lower:
-            current = lower
-        if current > upper:
-            current = upper
-        out.append(_native_array_scaled_to_token(current, out_dtype))
-        i += 1
-    return [shape, out, out_dtype]
-
-
-def _native_array_broadcast_shape(left_shape, right_shape, diagnostics):
-    reversed_out = []
-    max_rank = len(left_shape)
-    if len(right_shape) > max_rank:
-        max_rank = len(right_shape)
-    offset = 1
-    while offset <= max_rank:
-        ldim = 1
-        rdim = 1
-        if offset <= len(left_shape):
-            ldim = left_shape[len(left_shape) - offset]
-        if offset <= len(right_shape):
-            rdim = right_shape[len(right_shape) - offset]
-        if ldim == rdim:
-            reversed_out.append(ldim)
-        elif ldim == 1:
-            reversed_out.append(rdim)
-        elif rdim == 1:
-            reversed_out.append(ldim)
-        else:
-            diagnostics.append("PCC-ARRAY-BROADCAST-INCOMPATIBLE")
-            return []
-        offset += 1
-    out = []
-    i = len(reversed_out) - 1
-    while i >= 0:
-        out.append(reversed_out[i])
-        i -= 1
-    return out
-
-
-def _native_array_flat_index(shape, indices) -> int:
-    if len(shape) == 0:
-        return 0
-    flat = 0
-    stride = 1
-    axis = len(shape) - 1
-    while axis >= 0:
-        flat += indices[axis] * stride
-        stride *= shape[axis]
-        axis -= 1
-    return flat
-
-
-def _native_array_broadcast_flat_index(shape, out_index) -> int:
-    if len(shape) == 0:
-        return 0
-    source = []
-    offset = len(out_index) - len(shape)
-    i = 0
-    while i < len(shape):
-        value = out_index[offset + i]
-        if shape[i] == 1:
-            source.append(0)
-        else:
-            source.append(value)
-        i += 1
-    return _native_array_flat_index(shape, source)
-
-
-def _native_array_broadcast_to_strides(shape, dtype: str, target_shape):
-    if len(shape) > len(target_shape):
-        return []
-    source_strides = _native_array_strides(shape, _native_array_dtype_itemsize(dtype))
-    offset = len(target_shape) - len(shape)
-    out = []
-    axis = 0
-    while axis < len(target_shape):
-        if axis < offset:
-            out.append(0)
-        else:
-            source_axis = axis - offset
-            source_dim = shape[source_axis]
-            target_dim = target_shape[axis]
-            if source_dim == target_dim:
-                out.append(source_strides[source_axis])
-            elif source_dim == 1:
-                out.append(0)
-            else:
-                return []
-        axis += 1
-    return out
-
-
-def _native_array_broadcast_to(
-    shape, values, dtype: str, target_text: str, diagnostics
-):
-    target_shape = _native_array_parse_shape(target_text)
-    local_diags = []
-    out_shape = _native_array_broadcast_shape(shape, target_shape, local_diags)
-    strides = _native_array_broadcast_to_strides(shape, dtype, target_shape)
-    if (
-        len(local_diags) > 0
-        or out_shape != target_shape
-        or len(strides) != len(target_shape)
-    ):
-        diagnostics.append("PCC-ARRAY-BROADCAST-TO-SHAPE-MISMATCH")
-        return [
-            target_shape,
-            [],
-            dtype,
-            _native_array_strides(target_shape, _native_array_dtype_itemsize(dtype)),
-            True,
-        ]
-    out = []
-    if len(target_shape) == 0:
-        out.append(values[0])
-    elif len(target_shape) == 1:
-        i = 0
-        while i < target_shape[0]:
-            out_index = [i]
-            out.append(values[_native_array_broadcast_flat_index(shape, out_index)])
-            i += 1
-    elif len(target_shape) == 2:
-        r = 0
-        while r < target_shape[0]:
-            c = 0
-            while c < target_shape[1]:
-                out_index = [r, c]
-                out.append(values[_native_array_broadcast_flat_index(shape, out_index)])
-                c += 1
-            r += 1
-    else:
-        diagnostics.append("PCC-ARRAY-RANK-UNSUPPORTED")
-        return [
-            target_shape,
-            [],
-            dtype,
-            _native_array_strides(target_shape, _native_array_dtype_itemsize(dtype)),
-            False,
-        ]
-    c_contiguous = shape == target_shape
-    return [target_shape, out, dtype, strides, c_contiguous]
-
-
-def _native_array_repeat(
-    shape, values, dtype: str, repeats_text: str, axis_text: str, diagnostics
-):
-    repeats = int(repeats_text)
-    if repeats < 0:
-        diagnostics.append("PCC-ARRAY-REPEAT-NEGATIVE")
-        return [[], [], dtype]
-    out = []
-    if axis_text == "":
-        i = 0
-        while i < len(values):
-            j = 0
-            while j < repeats:
-                out.append(values[i])
-                j += 1
-            i += 1
-        return [[len(out)], out, dtype]
-    axis = int(axis_text)
-    if axis < 0:
-        axis += len(shape)
-    if axis < 0 or axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    if len(shape) == 1:
-        return _native_array_repeat(shape, values, dtype, repeats_text, "", diagnostics)
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-REPEAT-RANK-UNSUPPORTED")
-        return [[], [], dtype]
-    rows = shape[0]
-    cols = shape[1]
-    if axis == 0:
-        r = 0
-        while r < rows:
-            j = 0
-            while j < repeats:
-                c = 0
-                while c < cols:
-                    out.append(values[r * cols + c])
-                    c += 1
-                j += 1
-            r += 1
-        return [[rows * repeats, cols], out, dtype]
-    r = 0
-    while r < rows:
-        c = 0
-        while c < cols:
-            j = 0
-            while j < repeats:
-                out.append(values[r * cols + c])
-                j += 1
-            c += 1
-        r += 1
-    return [[rows, cols * repeats], out, dtype]
-
-
-def _native_array_tile_reps(shape, values, dtype: str, reps, diagnostics):
-    if len(reps) == 0:
-        diagnostics.append("PCC-ARRAY-TILE-REPS-EMPTY")
-        return [[], [], dtype]
-    i = 0
-    while i < len(reps):
-        if reps[i] < 0:
-            diagnostics.append("PCC-ARRAY-TILE-REPS-NEGATIVE")
-            return [[], [], dtype]
-        i += 1
-    out = []
-    if len(shape) == 0:
-        size = _native_array_size(reps)
-        i = 0
-        while i < size:
-            out.append(values[0])
-            i += 1
-        return [reps, out, dtype]
-    if len(shape) == 1:
-        if len(reps) == 1:
-            r = 0
-            while r < reps[0]:
-                i = 0
-                while i < len(values):
-                    out.append(values[i])
-                    i += 1
-                r += 1
-            return [[len(out)], out, dtype]
-        if len(reps) == 2:
-            row_reps = reps[0]
-            col_reps = reps[1]
-            r = 0
-            while r < row_reps:
-                c = 0
-                while c < col_reps:
-                    i = 0
-                    while i < len(values):
-                        out.append(values[i])
-                        i += 1
-                    c += 1
-                r += 1
-            return [[row_reps, shape[0] * col_reps], out, dtype]
-    if len(shape) == 2 and (len(reps) == 1 or len(reps) == 2):
-        row_reps = 1
-        col_reps = reps[0]
-        if len(reps) == 2:
-            row_reps = reps[0]
-            col_reps = reps[1]
-        rows = shape[0]
-        cols = shape[1]
-        rr = 0
-        while rr < row_reps:
-            r = 0
-            while r < rows:
-                cc = 0
-                while cc < col_reps:
-                    c = 0
-                    while c < cols:
-                        out.append(values[r * cols + c])
-                        c += 1
-                    cc += 1
-                r += 1
-            rr += 1
-        return [[rows * row_reps, cols * col_reps], out, dtype]
-    diagnostics.append("PCC-ARRAY-TILE-RANK-UNSUPPORTED")
-    return [[], [], dtype]
-
-
-def _native_array_tile(shape, values, dtype: str, tile_text: str, diagnostics):
-    return _native_array_tile_reps(
-        shape,
-        values,
-        dtype,
-        _native_array_parse_shape(tile_text),
-        diagnostics,
-    )
-
-
-def _native_array_roll(
-    shape, values, dtype: str, shift_text: str, axis_text: str, diagnostics
-):
-    shift = int(shift_text)
-    if _native_array_size(shape) == 0:
-        return [shape, [], dtype]
-    out = []
-    axis = _native_array_axis_value(axis_text)
-    if axis == -999999:
-        offset = shift % len(values)
-        i = 0
-        while i < len(values):
-            source = (i - offset) % len(values)
-            out.append(values[source])
-            i += 1
-        return [shape, out, dtype]
-    normalized_axis = _native_array_axis_normalize(axis, len(shape))
-    if normalized_axis < 0 or normalized_axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [shape, [], dtype]
-    if len(shape) == 0:
-        return [shape, _native_array_copy_values(values), dtype]
-    if len(shape) == 1:
-        return _native_array_roll(shape, values, dtype, shift_text, "", diagnostics)
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-ROLL-RANK-UNSUPPORTED")
-        return [shape, [], dtype]
-    rows = shape[0]
-    cols = shape[1]
-    if normalized_axis == 0:
-        offset = shift % rows if rows > 0 else 0
-        r = 0
-        while r < rows:
-            source_row = (r - offset) % rows
-            c = 0
-            while c < cols:
-                out.append(values[source_row * cols + c])
-                c += 1
-            r += 1
-    else:
-        offset = shift % cols if cols > 0 else 0
-        r = 0
-        while r < rows:
-            c = 0
-            while c < cols:
-                source_col = (c - offset) % cols
-                out.append(values[r * cols + source_col])
-                c += 1
-            r += 1
-    return [shape, out, dtype]
-
-
-def _native_array_binary_op(
-    left_shape, left_values, left_dtype: str, right_text: str, op: str, diagnostics
-):
-    right_shape = []
-    if right_text.strip().startswith("["):
-        parsed = _native_array_literal_shape_and_diagnostics(right_text)
-        right_shape = parsed[0]
-        right_diags = parsed[1]
-        i = 0
-        while i < len(right_diags):
-            diagnostics.append(right_diags[i])
-            i += 1
-    right_values = _native_array_literal_values(right_text)
-    right_dtype = _native_array_literal_dtype(right_text)
-    op_name = op
-    if op_name == "subtract":
-        op_name = "sub"
-    elif op_name == "multiply":
-        op_name = "mul"
-    elif op_name == "divide":
-        op_name = "div"
-    if not (
-        op_name == "add" or op_name == "sub" or op_name == "mul" or op_name == "div"
-    ):
-        diagnostics.append("PCC-ARRAY-UFUNC-UNSUPPORTED")
-        return [[], [], "object"]
-    out_shape = _native_array_broadcast_shape(left_shape, right_shape, diagnostics)
-    dtype = _native_array_op_dtype(op_name, left_dtype, right_dtype)
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-OBJECT-UFUNC-UNSUPPORTED")
-    if len(diagnostics) > 0:
-        return [out_shape, [], dtype]
-    out_values = []
-    if len(out_shape) == 0:
-        out_values.append(
-            _native_array_apply_op(left_values[0], right_values[0], op_name, dtype)
-        )
-    elif len(out_shape) == 1:
-        i = 0
-        while i < out_shape[0]:
-            out_index = [i]
-            lv = left_values[_native_array_broadcast_flat_index(left_shape, out_index)]
-            rv = right_values[
-                _native_array_broadcast_flat_index(right_shape, out_index)
-            ]
-            out_values.append(_native_array_apply_op(lv, rv, op_name, dtype))
-            i += 1
-    elif len(out_shape) == 2:
-        r = 0
-        while r < out_shape[0]:
-            c = 0
-            while c < out_shape[1]:
-                out_index = [r, c]
-                lv = left_values[
-                    _native_array_broadcast_flat_index(left_shape, out_index)
-                ]
-                rv = right_values[
-                    _native_array_broadcast_flat_index(right_shape, out_index)
-                ]
-                out_values.append(_native_array_apply_op(lv, rv, op_name, dtype))
-                c += 1
-            r += 1
-    else:
-        diagnostics.append("PCC-ARRAY-RANK-UNSUPPORTED")
-        return [out_shape, [], dtype]
-    return [out_shape, out_values, dtype]
-
-
-def _native_array_matmul_dtype(left_dtype: str, right_dtype: str) -> str:
-    dtype = _native_array_op_dtype("mul", left_dtype, right_dtype)
-    if dtype == "bool":
-        return "int64"
-    return dtype
-
-
-def _native_array_matmul_token_sum(total: int, left: str, right: str) -> int:
-    return (
-        total
-        + (_native_array_token_to_scaled(left) * _native_array_token_to_scaled(right))
-        // 1000000
-    )
-
-
-def _native_array_matmul(
-    left_shape, left_values, left_dtype: str, right_text: str, diagnostics
-):
-    right_shape = []
-    if right_text.strip().startswith("["):
-        parsed = _native_array_literal_shape_and_diagnostics(right_text)
-        right_shape = parsed[0]
-        right_diags = parsed[1]
-        i = 0
-        while i < len(right_diags):
-            diagnostics.append(right_diags[i])
-            i += 1
-    right_values = _native_array_literal_values(right_text)
-    right_dtype = _native_array_literal_dtype(right_text)
-    dtype = _native_array_matmul_dtype(left_dtype, right_dtype)
-    if left_dtype == "object" or right_dtype == "object":
-        diagnostics.append("PCC-ARRAY-MATMUL-OBJECT-UNSUPPORTED")
-    out_shape = []
-    left_rank = len(left_shape)
-    right_rank = len(right_shape)
-    if not (
-        (left_rank == 1 or left_rank == 2) and (right_rank == 1 or right_rank == 2)
-    ):
-        diagnostics.append("PCC-ARRAY-MATMUL-RANK-UNSUPPORTED")
-    elif left_rank == 1 and right_rank == 1:
-        if left_shape[0] != right_shape[0]:
-            diagnostics.append("PCC-ARRAY-MATMUL-SHAPE-MISMATCH")
-    elif left_rank == 2 and right_rank == 1:
-        if left_shape[1] != right_shape[0]:
-            diagnostics.append("PCC-ARRAY-MATMUL-SHAPE-MISMATCH")
-        out_shape = [left_shape[0]]
-    elif left_rank == 1 and right_rank == 2:
-        if left_shape[0] != right_shape[0]:
-            diagnostics.append("PCC-ARRAY-MATMUL-SHAPE-MISMATCH")
-        out_shape = [right_shape[1]]
-    else:
-        if left_shape[1] != right_shape[0]:
-            diagnostics.append("PCC-ARRAY-MATMUL-SHAPE-MISMATCH")
-        out_shape = [left_shape[0], right_shape[1]]
-    if len(diagnostics) > 0:
-        return [out_shape, [], dtype]
-    out = []
-    if left_rank == 1 and right_rank == 1:
-        total = 0
-        i = 0
-        while i < left_shape[0]:
-            total = _native_array_matmul_token_sum(
-                total, left_values[i], right_values[i]
-            )
-            i += 1
-        out.append(_native_array_scaled_to_token(total, dtype))
-        return [[], out, dtype]
-    if left_rank == 2 and right_rank == 1:
-        rows = left_shape[0]
-        inner = left_shape[1]
-        r = 0
-        while r < rows:
-            total = 0
-            i = 0
-            while i < inner:
-                total = _native_array_matmul_token_sum(
-                    total, left_values[r * inner + i], right_values[i]
-                )
-                i += 1
-            out.append(_native_array_scaled_to_token(total, dtype))
-            r += 1
-        return [out_shape, out, dtype]
-    if left_rank == 1 and right_rank == 2:
-        inner = right_shape[0]
-        cols = right_shape[1]
-        c = 0
-        while c < cols:
-            total = 0
-            i = 0
-            while i < inner:
-                total = _native_array_matmul_token_sum(
-                    total, left_values[i], right_values[i * cols + c]
-                )
-                i += 1
-            out.append(_native_array_scaled_to_token(total, dtype))
-            c += 1
-        return [out_shape, out, dtype]
-    rows = left_shape[0]
-    inner = left_shape[1]
-    cols = right_shape[1]
-    r = 0
-    while r < rows:
-        c = 0
-        while c < cols:
-            total = 0
-            i = 0
-            while i < inner:
-                total = _native_array_matmul_token_sum(
-                    total, left_values[r * inner + i], right_values[i * cols + c]
-                )
-                i += 1
-            out.append(_native_array_scaled_to_token(total, dtype))
-            c += 1
-        r += 1
-    return [out_shape, out, dtype]
-
-
-def _native_array_concat(
-    left_shape,
-    left_values,
-    left_dtype: str,
-    right_text: str,
-    axis_text: str,
-    diagnostics,
-):
-    right_shape = []
-    if right_text.strip().startswith("["):
-        parsed = _native_array_literal_shape_and_diagnostics(right_text)
-        right_shape = parsed[0]
-        right_diags = parsed[1]
-        i = 0
-        while i < len(right_diags):
-            diagnostics.append(right_diags[i])
-            i += 1
-    right_values = _native_array_literal_values(right_text)
-    right_dtype = _native_array_literal_dtype(right_text)
-    dtype = _native_array_op_dtype("add", left_dtype, right_dtype)
-    if len(left_shape) != len(right_shape):
-        diagnostics.append("PCC-ARRAY-CONCAT-RANK-MISMATCH")
-        return [[], [], dtype]
-    axis = 0
-    if axis_text != "":
-        axis = int(axis_text)
-    if axis < 0:
-        axis += len(left_shape)
-    if axis < 0 or axis >= len(left_shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    out = []
-    if len(left_shape) == 1:
-        if axis != 0:
-            diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-            return [[], [], dtype]
-        i = 0
-        while i < len(left_values):
-            out.append(left_values[i])
-            i += 1
-        i = 0
-        while i < len(right_values):
-            out.append(right_values[i])
-            i += 1
-        return [
-            [left_shape[0] + right_shape[0]],
-            _native_array_cast_values(out, dtype),
-            dtype,
-        ]
-    if len(left_shape) != 2:
-        diagnostics.append("PCC-ARRAY-CONCAT-RANK-UNSUPPORTED")
-        return [[], [], dtype]
-    left_rows = left_shape[0]
-    left_cols = left_shape[1]
-    right_rows = right_shape[0]
-    right_cols = right_shape[1]
-    if axis == 0:
-        if left_cols != right_cols:
-            diagnostics.append("PCC-ARRAY-CONCAT-SHAPE-MISMATCH")
-            return [[left_rows + right_rows, left_cols], [], dtype]
-        i = 0
-        while i < len(left_values):
-            out.append(left_values[i])
-            i += 1
-        i = 0
-        while i < len(right_values):
-            out.append(right_values[i])
-            i += 1
-        return [
-            [left_rows + right_rows, left_cols],
-            _native_array_cast_values(out, dtype),
-            dtype,
-        ]
-    if left_rows != right_rows:
-        diagnostics.append("PCC-ARRAY-CONCAT-SHAPE-MISMATCH")
-        return [[left_rows, left_cols + right_cols], [], dtype]
-    r = 0
-    while r < left_rows:
-        c = 0
-        while c < left_cols:
-            out.append(left_values[r * left_cols + c])
-            c += 1
-        c = 0
-        while c < right_cols:
-            out.append(right_values[r * right_cols + c])
-            c += 1
-        r += 1
-    return [
-        [left_rows, left_cols + right_cols],
-        _native_array_cast_values(out, dtype),
-        dtype,
-    ]
-
-
-def _native_array_stack(
-    left_shape,
-    left_values,
-    left_dtype: str,
-    right_text: str,
-    axis_text: str,
-    diagnostics,
-):
-    right_shape = []
-    if right_text.strip().startswith("["):
-        parsed = _native_array_literal_shape_and_diagnostics(right_text)
-        right_shape = parsed[0]
-        right_diags = parsed[1]
-        i = 0
-        while i < len(right_diags):
-            diagnostics.append(right_diags[i])
-            i += 1
-    right_values = _native_array_literal_values(right_text)
-    right_dtype = _native_array_literal_dtype(right_text)
-    dtype = _native_array_op_dtype("add", left_dtype, right_dtype)
-    if len(left_shape) != 1 or len(right_shape) != 1:
-        diagnostics.append("PCC-ARRAY-STACK-RANK-UNSUPPORTED")
-        return [[], [], dtype]
-    if left_shape[0] != right_shape[0]:
-        diagnostics.append("PCC-ARRAY-STACK-SHAPE-MISMATCH")
-        return [[], [], dtype]
-    axis = 0
-    if axis_text != "":
-        axis = int(axis_text)
-    if axis < 0:
-        axis += 2
-    out = []
-    if axis == 0:
-        i = 0
-        while i < len(left_values):
-            out.append(left_values[i])
-            i += 1
-        i = 0
-        while i < len(right_values):
-            out.append(right_values[i])
-            i += 1
-        return [[2, left_shape[0]], _native_array_cast_values(out, dtype), dtype]
-    if axis == 1:
-        i = 0
-        while i < left_shape[0]:
-            out.append(left_values[i])
-            out.append(right_values[i])
-            i += 1
-        return [[left_shape[0], 2], _native_array_cast_values(out, dtype), dtype]
-    diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-    return [[], [], dtype]
-
-
-def _native_array_compare_token(
-    left: str, right: str, op: str, left_dtype: str, right_dtype: str
-) -> str:
-    if left_dtype == "object" or right_dtype == "object":
-        if op == "eq":
-            return "True" if left == right else "False"
-        if op == "ne":
-            return "True" if left != right else "False"
-        return "False"
-    lv = _native_array_token_to_scaled(left)
-    rv = _native_array_token_to_scaled(right)
-    if op == "eq":
-        ok = lv == rv
-    elif op == "ne":
-        ok = lv != rv
-    elif op == "lt":
-        ok = lv < rv
-    elif op == "le":
-        ok = lv <= rv
-    elif op == "gt":
-        ok = lv > rv
-    else:
-        ok = lv >= rv
-    return "True" if ok else "False"
-
-
-def _native_array_compare(
-    left_shape, left_values, left_dtype: str, right_text: str, op: str, diagnostics
-):
-    op_name = op
-    if op_name == "==":
-        op_name = "eq"
-    elif op_name == "!=":
-        op_name = "ne"
-    elif op_name == "<":
-        op_name = "lt"
-    elif op_name == "<=":
-        op_name = "le"
-    elif op_name == ">":
-        op_name = "gt"
-    elif op_name == ">=":
-        op_name = "ge"
-    if not (
-        op_name == "eq"
-        or op_name == "ne"
-        or op_name == "lt"
-        or op_name == "le"
-        or op_name == "gt"
-        or op_name == "ge"
-    ):
-        diagnostics.append("PCC-ARRAY-COMPARE-UNSUPPORTED")
-        return [[], [], "bool"]
-    right_shape = []
-    if right_text.strip().startswith("["):
-        parsed = _native_array_literal_shape_and_diagnostics(right_text)
-        right_shape = parsed[0]
-        right_diags = parsed[1]
-        i = 0
-        while i < len(right_diags):
-            diagnostics.append(right_diags[i])
-            i += 1
-    right_values = _native_array_literal_values(right_text)
-    right_dtype = _native_array_literal_dtype(right_text)
-    if (left_dtype == "object" or right_dtype == "object") and not (
-        op_name == "eq" or op_name == "ne"
-    ):
-        diagnostics.append("PCC-ARRAY-OBJECT-COMPARE-UNSUPPORTED")
-    out_shape = _native_array_broadcast_shape(left_shape, right_shape, diagnostics)
-    if len(diagnostics) > 0:
-        return [out_shape, [], "bool"]
-    out_values = []
-    if len(out_shape) == 0:
-        out_values.append(
-            _native_array_compare_token(
-                left_values[0], right_values[0], op_name, left_dtype, right_dtype
-            )
-        )
-    elif len(out_shape) == 1:
-        i = 0
-        while i < out_shape[0]:
-            out_index = [i]
-            lv = left_values[_native_array_broadcast_flat_index(left_shape, out_index)]
-            rv = right_values[
-                _native_array_broadcast_flat_index(right_shape, out_index)
-            ]
-            out_values.append(
-                _native_array_compare_token(lv, rv, op_name, left_dtype, right_dtype)
-            )
-            i += 1
-    elif len(out_shape) == 2:
-        r = 0
-        while r < out_shape[0]:
-            c = 0
-            while c < out_shape[1]:
-                out_index = [r, c]
-                lv = left_values[
-                    _native_array_broadcast_flat_index(left_shape, out_index)
-                ]
-                rv = right_values[
-                    _native_array_broadcast_flat_index(right_shape, out_index)
-                ]
-                out_values.append(
-                    _native_array_compare_token(
-                        lv, rv, op_name, left_dtype, right_dtype
-                    )
-                )
-                c += 1
-            r += 1
-    else:
-        diagnostics.append("PCC-ARRAY-RANK-UNSUPPORTED")
-        return [out_shape, [], "bool"]
-    return [out_shape, out_values, "bool"]
-
-
-def _native_array_parse_slice_indices(text: str, dim: int, diagnostics):
-    token = text.strip()
-    parts = []
-    current = ""
-    i = 0
-    while i < len(token):
-        ch = token[i]
-        if ch == ":":
-            parts.append(current.strip())
-            current = ""
-        else:
-            current += ch
-        i += 1
-    parts.append(current.strip())
-    if len(parts) == 1:
-        if parts[0] == "":
-            diagnostics.append("PCC-ARRAY-INDEX-PARSE-FAILED")
-            return [[], True]
-        index = int(token)
-        if index < 0:
-            index += dim
-        if index < 0 or index >= dim:
-            diagnostics.append("PCC-ARRAY-INDEX-OUT-OF-BOUNDS")
-            return [[], True]
-        return [[index], True]
-    if len(parts) > 3:
-        diagnostics.append("PCC-ARRAY-INDEX-PARSE-FAILED")
-        return [[], False]
-    step = 1
-    if len(parts) == 3 and parts[2] != "":
-        step = int(parts[2])
-    if step == 0:
-        diagnostics.append("PCC-ARRAY-INDEX-PARSE-FAILED")
-        return [[], False]
-    out = []
-    if step > 0:
-        start = 0 if parts[0] == "" else int(parts[0])
-        stop = dim if len(parts) < 2 or parts[1] == "" else int(parts[1])
-        if start < 0:
-            start += dim
-        if stop < 0:
-            stop += dim
-        if start < 0:
-            start = 0
-        if start > dim:
-            start = dim
-        if stop < 0:
-            stop = 0
-        if stop > dim:
-            stop = dim
-        i = start
-        while i < stop:
-            out.append(i)
-            i += step
-    else:
-        start = dim - 1 if parts[0] == "" else int(parts[0])
-        stop = -1
-        if len(parts) >= 2 and parts[1] != "":
-            stop = int(parts[1])
-            if stop < 0:
-                stop += dim
-        if start < 0:
-            start += dim
-        if start >= dim:
-            start = dim - 1
-        if start < -1:
-            start = -1
-        if stop >= dim:
-            stop = dim - 1
-        if stop < -1:
-            stop = -1
-        i = start
-        while i > stop:
-            out.append(i)
-            i += step
-    return [out, False]
-
-
-def _native_array_is_newaxis_token(text: str) -> bool:
-    token = text.strip()
-    return token == "None" or token == "none" or token == "newaxis"
-
-
-def _native_array_index(shape, values, dtype: str, index_spec: str, diagnostics):
-    parts = []
-    token = ""
-    i = 0
-    while i < len(index_spec):
-        ch = index_spec[i]
-        if ch == ",":
-            parts.append(token.strip())
-            token = ""
-        else:
-            token += ch
-        i += 1
-    if token.strip() != "":
-        parts.append(token.strip())
-    ellipsis_count = 0
-    consumed = 0
-    i = 0
-    while i < len(parts):
-        part = parts[i]
-        if part == "...":
-            ellipsis_count += 1
-        elif _native_array_is_newaxis_token(part):
-            pass
-        else:
-            consumed += 1
-        i += 1
-    if ellipsis_count > 1:
-        diagnostics.append("PCC-ARRAY-INDEX-PARSE-FAILED")
-        return [[], [], dtype]
-    if ellipsis_count == 0:
-        if consumed != len(shape):
-            diagnostics.append("PCC-ARRAY-INDEX-RANK-MISMATCH")
-            return [[], [], dtype]
-    else:
-        fill = len(shape) - consumed
-        if fill < 0:
-            diagnostics.append("PCC-ARRAY-INDEX-RANK-MISMATCH")
-            return [[], [], dtype]
-        expanded = []
-        i = 0
-        while i < len(parts):
-            part = parts[i]
-            if part == "...":
-                j = 0
-                while j < fill:
-                    expanded.append(":")
-                    j += 1
-            else:
-                expanded.append(part)
-            i += 1
-        parts = expanded
-    if len(shape) > 2:
-        diagnostics.append("PCC-ARRAY-RANK-UNSUPPORTED")
-        return [[], [], dtype]
-    source_axes = []
-    output_shape = []
-    source_axis = 0
-    i = 0
-    while i < len(parts):
-        part = parts[i]
-        if _native_array_is_newaxis_token(part):
-            output_shape.append(1)
-        else:
-            if source_axis >= len(shape):
-                diagnostics.append("PCC-ARRAY-INDEX-RANK-MISMATCH")
-                return [[], [], dtype]
-            parsed = _native_array_parse_slice_indices(
-                part, shape[source_axis], diagnostics
-            )
-            if len(diagnostics) > 0:
-                return [output_shape, [], dtype]
-            indices = parsed[0]
-            scalar = parsed[1]
-            source_axes.append(indices)
-            if not scalar:
-                output_shape.append(len(indices))
-            source_axis += 1
-        i += 1
-    if source_axis != len(shape):
-        diagnostics.append("PCC-ARRAY-INDEX-RANK-MISMATCH")
-        return [output_shape, [], dtype]
-    out_values = []
-    if len(shape) == 0:
-        out_values = _native_array_copy_values(values)
-    elif len(shape) == 1:
-        i = 0
-        while i < len(source_axes[0]):
-            out_values.append(values[source_axes[0][i]])
-            i += 1
-    else:
-        ri = 0
-        while ri < len(source_axes[0]):
-            ci = 0
-            while ci < len(source_axes[1]):
-                out_values.append(
-                    values[source_axes[0][ri] * shape[1] + source_axes[1][ci]]
-                )
-                ci += 1
-            ri += 1
-    return [output_shape, out_values, dtype]
-
-
-def _native_array_diagonal(shape, values, dtype: str, diagonal_text: str, diagnostics):
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-DIAGONAL-RANK-UNSUPPORTED")
-        return [[], [], dtype]
-    offset = 0
-    if diagonal_text != "":
-        offset = int(diagonal_text)
-    rows = shape[0]
-    cols = shape[1]
-    start_row = 0
-    start_col = 0
-    if offset >= 0:
-        start_col = offset
-    else:
-        start_row = -offset
-    length = rows - start_row
-    col_length = cols - start_col
-    if col_length < length:
-        length = col_length
-    if length < 0:
-        length = 0
-    out = []
-    i = 0
-    while i < length:
-        out.append(values[(start_row + i) * cols + start_col + i])
-        i += 1
-    return [[length], out, dtype]
-
-
-def _native_array_copy_values(values):
-    out = []
-    i = 0
-    while i < len(values):
-        out.append(values[i])
-        i += 1
-    return out
-
-
-def _native_array_reshape(shape, values, dtype: str, reshape_text: str, diagnostics):
-    target = _native_array_parse_shape(reshape_text)
-    if _native_array_size(target) != _native_array_size(shape):
-        diagnostics.append("PCC-ARRAY-RESHAPE-SIZE-MISMATCH")
-        return [target, [], dtype]
-    return [target, _native_array_copy_values(values), dtype]
-
-
-def _native_array_ravel(shape, values, dtype: str, diagnostics):
-    return [[_native_array_size(shape)], _native_array_copy_values(values), dtype]
-
-
-def _native_array_transpose(shape, values, dtype: str, diagnostics):
-    if len(shape) == 1:
-        return [shape, _native_array_copy_values(values), dtype]
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-TRANSPOSE-RANK-UNSUPPORTED")
-        return [shape, [], dtype]
-    rows = shape[0]
-    cols = shape[1]
-    out = []
-    c = 0
-    while c < cols:
-        r = 0
-        while r < rows:
-            out.append(values[r * cols + c])
-            r += 1
-        c += 1
-    return [[cols, rows], out, dtype]
-
-
-def _native_array_swapaxes(shape, values, dtype: str, axes_text: str, diagnostics):
-    axes = _native_array_parse_shape(axes_text)
-    if len(axes) != 2:
-        diagnostics.append("PCC-ARRAY-SWAPAXES-AXES-INVALID")
-        return [shape, [], dtype]
-    axis0 = _native_array_axis_normalize(axes[0], len(shape))
-    axis1 = _native_array_axis_normalize(axes[1], len(shape))
-    if axis0 < 0 or axis0 >= len(shape) or axis1 < 0 or axis1 >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [shape, [], dtype]
-    if len(shape) > 2:
-        diagnostics.append("PCC-ARRAY-SWAPAXES-RANK-UNSUPPORTED")
-        return [shape, [], dtype]
-    if axis0 == axis1 or len(shape) == 1:
-        return [shape, _native_array_copy_values(values), dtype]
-    return _native_array_transpose(shape, values, dtype, diagnostics)
-
-
-def _native_array_moveaxis(shape, values, dtype: str, axes_text: str, diagnostics):
-    axes = _native_array_parse_shape(axes_text)
-    if len(axes) != 2:
-        diagnostics.append("PCC-ARRAY-MOVEAXIS-AXES-INVALID")
-        return [shape, [], dtype]
-    source = _native_array_axis_normalize(axes[0], len(shape))
-    destination = _native_array_axis_normalize(axes[1], len(shape))
-    if (
-        source < 0
-        or source >= len(shape)
-        or destination < 0
-        or destination >= len(shape)
-    ):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [shape, [], dtype]
-    if len(shape) > 2:
-        diagnostics.append("PCC-ARRAY-MOVEAXIS-RANK-UNSUPPORTED")
-        return [shape, [], dtype]
-    if source == destination or len(shape) == 1:
-        return [shape, _native_array_copy_values(values), dtype]
-    return _native_array_transpose(shape, values, dtype, diagnostics)
-
-
-def _native_array_rot90(shape, values, dtype: str, k_text: str, diagnostics):
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-ROT90-RANK-UNSUPPORTED")
-        return [shape, [], dtype]
-    turns = int(k_text) % 4
-    if turns == 0:
-        return [shape, _native_array_copy_values(values), dtype]
-    rows = shape[0]
-    cols = shape[1]
-    out = []
-    if turns == 1:
-        c = cols - 1
-        while c >= 0:
-            r = 0
-            while r < rows:
-                out.append(values[r * cols + c])
-                r += 1
-            c -= 1
-        return [[cols, rows], out, dtype]
-    if turns == 2:
-        i = len(values) - 1
-        while i >= 0:
-            out.append(values[i])
-            i -= 1
-        return [shape, out, dtype]
-    c = 0
-    while c < cols:
-        r = rows - 1
-        while r >= 0:
-            out.append(values[r * cols + c])
-            r -= 1
-        c += 1
-    return [[cols, rows], out, dtype]
-
-
-def _native_array_flip(shape, values, dtype: str, axis_text: str, diagnostics):
-    if len(shape) == 0:
-        return [shape, _native_array_copy_values(values), dtype]
-    if len(shape) > 2:
-        diagnostics.append("PCC-ARRAY-FLIP-RANK-UNSUPPORTED")
-        return [shape, [], dtype]
-    axis = _native_array_axis_value(axis_text)
-    flip_axis0 = False
-    flip_axis1 = False
-    if axis == -999999:
-        flip_axis0 = True
-        if len(shape) == 2:
-            flip_axis1 = True
-    else:
-        normalized_axis = _native_array_axis_normalize(axis, len(shape))
-        if normalized_axis < 0 or normalized_axis >= len(shape):
-            diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-            return [shape, [], dtype]
-        if normalized_axis == 0:
-            flip_axis0 = True
-        else:
-            flip_axis1 = True
-    out = []
-    if len(shape) == 1:
-        i = shape[0] - 1
-        while i >= 0:
-            out.append(values[i])
-            i -= 1
-        return [shape, out, dtype]
-    rows = shape[0]
-    cols = shape[1]
-    r = rows - 1 if flip_axis0 else 0
-    while r >= 0 if flip_axis0 else r < rows:
-        c = cols - 1 if flip_axis1 else 0
-        while c >= 0 if flip_axis1 else c < cols:
-            out.append(values[r * cols + c])
-            if flip_axis1:
-                c -= 1
-            else:
-                c += 1
-        if flip_axis0:
-            r -= 1
-        else:
-            r += 1
-    return [shape, out, dtype]
-
-
-def _native_array_squeeze(shape, values, dtype: str, axis_text: str, diagnostics):
-    out_shape = []
-    if axis_text == "":
-        i = 0
-        while i < len(shape):
-            if shape[i] != 1:
-                out_shape.append(shape[i])
-            i += 1
-        return [out_shape, _native_array_copy_values(values), dtype]
-    axis = int(axis_text)
-    if axis < 0:
-        axis += len(shape)
-    if axis < 0 or axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    if shape[axis] != 1:
-        diagnostics.append("PCC-ARRAY-SQUEEZE-AXIS-NOT-ONE")
-        return [shape, [], dtype]
-    i = 0
-    while i < len(shape):
-        if i != axis:
-            out_shape.append(shape[i])
-        i += 1
-    return [out_shape, _native_array_copy_values(values), dtype]
-
-
-def _native_array_expand_dims(shape, values, dtype: str, axis_text: str, diagnostics):
-    axis = int(axis_text)
-    if axis < 0:
-        axis += len(shape) + 1
-    if axis < 0 or axis > len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    out_shape = []
-    i = 0
-    while i < axis:
-        out_shape.append(shape[i])
-        i += 1
-    out_shape.append(1)
-    while i < len(shape):
-        out_shape.append(shape[i])
-        i += 1
-    return [out_shape, _native_array_copy_values(values), dtype]
-
-
-def _native_array_sort_values(values):
-    out = _native_array_copy_values(values)
-    i = 1
-    while i < len(out):
-        current = out[i]
-        current_scaled = _native_array_token_to_scaled(current)
-        j = i - 1
-        while j >= 0 and _native_array_token_to_scaled(out[j]) > current_scaled:
-            out[j + 1] = out[j]
-            j -= 1
-        out[j + 1] = current
-        i += 1
-    return out
-
-
-def _native_array_argsort_values(values):
-    indices = []
-    i = 0
-    while i < len(values):
-        indices.append(i)
-        i += 1
-    i = 1
-    while i < len(indices):
-        current_index = indices[i]
-        current_scaled = _native_array_token_to_scaled(values[current_index])
-        j = i - 1
-        while (
-            j >= 0
-            and _native_array_token_to_scaled(values[indices[j]]) > current_scaled
-        ):
-            indices[j + 1] = indices[j]
-            j -= 1
-        indices[j + 1] = current_index
-        i += 1
-    out = []
-    i = 0
-    while i < len(indices):
-        out.append(str(indices[i]))
-        i += 1
-    return out
-
-
-def _native_array_sort(shape, values, dtype: str, axis_text: str, diagnostics):
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-SORT-UNSUPPORTED")
-        return [shape, [], dtype]
-    if len(shape) == 0:
-        return [shape, _native_array_copy_values(values), dtype]
-    axis = -1
-    if axis_text != "":
-        axis = int(axis_text)
-    if axis < 0:
-        axis += len(shape)
-    if axis < 0 or axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    if len(shape) == 1:
-        return [shape, _native_array_sort_values(values), dtype]
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-SORT-RANK-UNSUPPORTED")
-        return [shape, [], dtype]
-    rows = shape[0]
-    cols = shape[1]
-    out = _native_array_copy_values(values)
-    if axis == 0:
-        c = 0
-        while c < cols:
-            col_values = []
-            r = 0
-            while r < rows:
-                col_values.append(values[r * cols + c])
-                r += 1
-            col_values = _native_array_sort_values(col_values)
-            r = 0
-            while r < rows:
-                out[r * cols + c] = col_values[r]
-                r += 1
-            c += 1
-    else:
-        r = 0
-        while r < rows:
-            row_values = []
-            c = 0
-            while c < cols:
-                row_values.append(values[r * cols + c])
-                c += 1
-            row_values = _native_array_sort_values(row_values)
-            c = 0
-            while c < cols:
-                out[r * cols + c] = row_values[c]
-                c += 1
-            r += 1
-    return [shape, out, dtype]
-
-
-def _native_array_argsort(shape, values, dtype: str, axis_text: str, diagnostics):
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-ARGSORT-UNSUPPORTED")
-        return [shape, [], "int64"]
-    if len(shape) == 0:
-        return [shape, ["0"], "int64"]
-    axis = -1
-    if axis_text != "":
-        axis = int(axis_text)
-    if axis < 0:
-        axis += len(shape)
-    if axis < 0 or axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], "int64"]
-    if len(shape) == 1:
-        return [shape, _native_array_argsort_values(values), "int64"]
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-ARGSORT-RANK-UNSUPPORTED")
-        return [shape, [], "int64"]
-    rows = shape[0]
-    cols = shape[1]
-    out = []
-    i = 0
-    while i < len(values):
-        out.append("0")
-        i += 1
-    if axis == 0:
-        c = 0
-        while c < cols:
-            col_values = []
-            r = 0
-            while r < rows:
-                col_values.append(values[r * cols + c])
-                r += 1
-            col_indices = _native_array_argsort_values(col_values)
-            r = 0
-            while r < rows:
-                out[r * cols + c] = col_indices[r]
-                r += 1
-            c += 1
-    else:
-        r = 0
-        while r < rows:
-            row_values = []
-            c = 0
-            while c < cols:
-                row_values.append(values[r * cols + c])
-                c += 1
-            row_indices = _native_array_argsort_values(row_values)
-            c = 0
-            while c < cols:
-                out[r * cols + c] = row_indices[c]
-                c += 1
-            r += 1
-    return [shape, out, "int64"]
-
-
-def _native_array_searchsorted(
-    shape, values, dtype: str, query_text: str, side: str, diagnostics
-):
-    if side != "left" and side != "right":
-        diagnostics.append("PCC-ARRAY-SEARCHSORTED-SIDE-UNSUPPORTED")
-        return [[], [], "int64"]
-    query_parsed = _native_array_literal_shape_and_diagnostics(query_text)
-    query_shape = query_parsed[0]
-    query_diagnostics = query_parsed[1]
-    i = 0
-    while i < len(query_diagnostics):
-        diagnostics.append(query_diagnostics[i])
-        i += 1
-    query_dtype = _native_array_literal_dtype(query_text)
-    if dtype == "object" or query_dtype == "object":
-        diagnostics.append("PCC-ARRAY-SEARCHSORTED-UNSUPPORTED")
-        return [query_shape, [], "int64"]
-    if len(shape) != 1:
-        diagnostics.append("PCC-ARRAY-SEARCHSORTED-RANK-UNSUPPORTED")
-        return [query_shape, [], "int64"]
-    query_values = _native_array_literal_values(query_text)
-    out = []
-    q = 0
-    while q < len(query_values):
-        query_scaled = _native_array_token_to_scaled(query_values[q])
-        pos = 0
-        while pos < len(values):
-            current_scaled = _native_array_token_to_scaled(values[pos])
-            if side == "left":
-                if current_scaled >= query_scaled:
-                    break
-            elif current_scaled > query_scaled:
-                break
-            pos += 1
-        out.append(str(pos))
-        q += 1
-    return [query_shape, out, "int64"]
-
-
-def _native_array_normalize_kth(kth_text: str, axis_len: int):
-    kth = int(kth_text)
-    if kth < 0:
-        kth += axis_len
-    return kth
-
-
-def _native_array_partition(
-    shape, values, dtype: str, kth_text: str, axis_text: str, diagnostics
-):
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-PARTITION-UNSUPPORTED")
-        return [shape, [], dtype]
-    if len(shape) == 0:
-        kth = _native_array_normalize_kth(kth_text, 1)
-        if kth != 0:
-            diagnostics.append("PCC-ARRAY-PARTITION-KTH-OUT-OF-BOUNDS")
-            return [shape, [], dtype]
-        return [shape, _native_array_copy_values(values), dtype]
-    axis = -1
-    if axis_text != "":
-        axis = int(axis_text)
-    if axis < 0:
-        axis += len(shape)
-    if axis < 0 or axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    kth = _native_array_normalize_kth(kth_text, shape[axis])
-    if kth < 0 or kth >= shape[axis]:
-        diagnostics.append("PCC-ARRAY-PARTITION-KTH-OUT-OF-BOUNDS")
-        return [shape, [], dtype]
-    if len(shape) == 1 or len(shape) == 2:
-        return _native_array_sort(shape, values, dtype, axis_text, diagnostics)
-    diagnostics.append("PCC-ARRAY-PARTITION-RANK-UNSUPPORTED")
-    return [shape, [], dtype]
-
-
-def _native_array_argpartition(
-    shape, values, dtype: str, kth_text: str, axis_text: str, diagnostics
-):
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-ARGPARTITION-UNSUPPORTED")
-        return [shape, [], "int64"]
-    if len(shape) == 0:
-        kth = _native_array_normalize_kth(kth_text, 1)
-        if kth != 0:
-            diagnostics.append("PCC-ARRAY-ARGPARTITION-KTH-OUT-OF-BOUNDS")
-            return [shape, [], "int64"]
-        return [shape, ["0"], "int64"]
-    axis = -1
-    if axis_text != "":
-        axis = int(axis_text)
-    if axis < 0:
-        axis += len(shape)
-    if axis < 0 or axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], "int64"]
-    kth = _native_array_normalize_kth(kth_text, shape[axis])
-    if kth < 0 or kth >= shape[axis]:
-        diagnostics.append("PCC-ARRAY-ARGPARTITION-KTH-OUT-OF-BOUNDS")
-        return [shape, [], "int64"]
-    if len(shape) == 1 or len(shape) == 2:
-        return _native_array_argsort(shape, values, dtype, axis_text, diagnostics)
-    diagnostics.append("PCC-ARRAY-ARGPARTITION-RANK-UNSUPPORTED")
-    return [shape, [], "int64"]
-
-
-def _native_array_full(shape, fill_text: str, dtype: str, diagnostics):
-    values = []
-    token = _native_array_cast_values([fill_text], dtype)[0]
-    size = _native_array_size(shape)
-    i = 0
-    while i < size:
-        values.append(token)
-        i += 1
-    return [shape, values, dtype]
-
-
-def _native_array_arange(arange_text: str, dtype: str, diagnostics):
-    parts = _native_array_split_commas(arange_text)
-    if len(parts) == 1:
-        start = "0"
-        stop = parts[0]
-        step = "1"
-    elif len(parts) == 2:
-        start = parts[0]
-        stop = parts[1]
-        step = "1"
-    elif len(parts) == 3:
-        start = parts[0]
-        stop = parts[1]
-        step = parts[2]
-    else:
-        diagnostics.append("PCC-ARRAY-ARANGE-PARSE-FAILED")
-        return [[], [], dtype]
-    if (
-        not _native_array_token_is_scaled_number(start)
-        or not _native_array_token_is_scaled_number(stop)
-        or not _native_array_token_is_scaled_number(step)
-    ):
-        diagnostics.append("PCC-ARRAY-ARANGE-PARSE-FAILED")
-        return [[], [], dtype]
-    start_value = _native_array_token_to_scaled(start)
-    stop_value = _native_array_token_to_scaled(stop)
-    step_value = _native_array_token_to_scaled(step)
-    if step_value == 0:
-        diagnostics.append("PCC-ARRAY-ARANGE-PARSE-FAILED")
-        return [[], [], dtype]
-    values = []
-    current = start_value
-    if step_value > 0:
-        while current < stop_value:
-            values.append(_native_array_scaled_to_token(current, dtype))
-            current += step_value
-    else:
-        while current > stop_value:
-            values.append(_native_array_scaled_to_token(current, dtype))
-            current += step_value
-    return [[len(values)], values, dtype]
-
-
-def _native_array_eye(eye_text: str, dtype: str, diagnostics):
-    parts = _native_array_parse_shape(eye_text)
-    if len(parts) == 1:
-        rows = parts[0]
-        cols = parts[0]
-        diagonal = 0
-    elif len(parts) == 2:
-        rows = parts[0]
-        cols = parts[1]
-        diagonal = 0
-    elif len(parts) == 3:
-        rows = parts[0]
-        cols = parts[1]
-        diagonal = parts[2]
-    else:
-        diagnostics.append("PCC-ARRAY-EYE-PARSE-FAILED")
-        return [[], [], dtype]
-    shape = [rows, cols]
-    values = []
-    r = 0
-    while r < rows:
-        c = 0
-        while c < cols:
-            if c - r == diagonal:
-                values.append(_native_array_scaled_to_token(1000000, dtype))
-            else:
-                values.append(_native_array_scaled_to_token(0, dtype))
-            c += 1
-        r += 1
-    return [shape, values, dtype]
-
-
-def _native_array_linspace(linspace_text: str, dtype: str, diagnostics):
-    parts = _native_array_split_commas(linspace_text)
-    if len(parts) == 2:
-        start = _native_array_token_to_scaled(parts[0])
-        stop = _native_array_token_to_scaled(parts[1])
-        count = 50
-    elif len(parts) == 3:
-        start = _native_array_token_to_scaled(parts[0])
-        stop = _native_array_token_to_scaled(parts[1])
-        count = int(parts[2])
-    else:
-        diagnostics.append("PCC-ARRAY-LINSPACE-PARSE-FAILED")
-        return [[], [], dtype]
-    if count < 0:
-        diagnostics.append("PCC-ARRAY-LINSPACE-PARSE-FAILED")
-        return [[], [], dtype]
-    values = []
-    if count == 0:
-        return [[0], values, dtype]
-    if count == 1:
-        values.append(_native_array_scaled_to_token(start, dtype))
-        return [[1], values, dtype]
-    step = (stop - start) // (count - 1)
-    i = 0
-    while i < count:
-        values.append(_native_array_scaled_to_token(start + step * i, dtype))
-        i += 1
-    return [[count], values, dtype]
-
-
-def _native_array_axis_value(axis_text: str) -> int:
-    if axis_text == "":
-        return -999999
-    return int(axis_text)
-
-
-def _native_array_axis_normalize(axis: int, ndim: int) -> int:
-    if axis < 0:
-        return axis + ndim
-    return axis
-
-
-def _native_array_reduce_scaled(values, kind: str) -> int:
-    result = _native_array_token_to_scaled(values[0])
-    if kind == "sum":
-        result = 0
-        i = 0
-        while i < len(values):
-            result += _native_array_token_to_scaled(values[i])
-            i += 1
-        return result
-    if kind == "prod":
-        result = 1000000
-        i = 0
-        while i < len(values):
-            result = (result * _native_array_token_to_scaled(values[i])) // 1000000
-            i += 1
-        return result
-    if kind == "any":
-        i = 0
-        while i < len(values):
-            if _native_array_token_to_scaled(values[i]) != 0:
-                return 1000000
-            i += 1
-        return 0
-    if kind == "all":
-        i = 0
-        while i < len(values):
-            if _native_array_token_to_scaled(values[i]) == 0:
-                return 0
-            i += 1
-        return 1000000
-    if kind == "mean":
-        result = 0
-        i = 0
-        while i < len(values):
-            result += _native_array_token_to_scaled(values[i])
-            i += 1
-        return result // len(values)
-    i = 1
-    while i < len(values):
-        current = _native_array_token_to_scaled(values[i])
-        if kind == "min" and current < result:
-            result = current
-        if kind == "max" and current > result:
-            result = current
-        i += 1
-    return result
-
-
-def _native_array_reduce(
-    shape, values, dtype: str, kind: str, axis_text: str, keepdims: bool, diagnostics
-):
-    if not (
-        kind == "sum"
-        or kind == "prod"
-        or kind == "min"
-        or kind == "max"
-        or kind == "mean"
-        or kind == "any"
-        or kind == "all"
-    ):
-        diagnostics.append("PCC-ARRAY-REDUCE-UNSUPPORTED")
-        return [[], [], dtype]
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-REDUCE-UNSUPPORTED")
-        return [[], [], dtype]
-    if len(values) == 0:
-        diagnostics.append("PCC-ARRAY-REDUCE-EMPTY")
-        return [[], [], dtype]
-    if kind == "any" or kind == "all":
-        dtype = "bool"
-    elif kind == "mean":
-        dtype = "float64"
-    elif (
-        (kind == "sum" or kind == "prod") and dtype != "float32" and dtype != "float64"
-    ):
-        dtype = "int64"
-    axis = _native_array_axis_value(axis_text)
-    if axis == -999999:
-        result = _native_array_reduce_scaled(values, kind)
-        out_shape = []
-        if keepdims:
-            i = 0
-            while i < len(shape):
-                out_shape.append(1)
-                i += 1
-        return [out_shape, [_native_array_scaled_to_token(result, dtype)], dtype]
-    normalized_axis = _native_array_axis_normalize(axis, len(shape))
-    if normalized_axis < 0 or normalized_axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    if len(shape) == 1:
-        result = _native_array_reduce_scaled(values, kind)
-        if keepdims:
-            return [[1], [_native_array_scaled_to_token(result, dtype)], dtype]
-        return [[], [_native_array_scaled_to_token(result, dtype)], dtype]
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-AXIS-REDUCE-RANK-UNSUPPORTED")
-        return [[], [], dtype]
-    rows = shape[0]
-    cols = shape[1]
-    out = []
-    if normalized_axis == 0:
-        c = 0
-        while c < cols:
-            slice_values = []
-            r = 0
-            while r < rows:
-                slice_values.append(values[r * cols + c])
-                r += 1
-            out.append(
-                _native_array_scaled_to_token(
-                    _native_array_reduce_scaled(slice_values, kind), dtype
-                )
-            )
-            c += 1
-        if keepdims:
-            return [[1, cols], out, dtype]
-        return [[cols], out, dtype]
-    r = 0
-    while r < rows:
-        slice_values = []
-        c = 0
-        while c < cols:
-            slice_values.append(values[r * cols + c])
-            c += 1
-        out.append(
-            _native_array_scaled_to_token(
-                _native_array_reduce_scaled(slice_values, kind), dtype
-            )
-        )
-        r += 1
-    if keepdims:
-        return [[rows, 1], out, dtype]
-    return [[rows], out, dtype]
-
-
-def _native_array_arg_reduce_scaled(values, kind: str) -> int:
-    best_index = 0
-    best_value = _native_array_token_to_scaled(values[0])
-    i = 1
-    while i < len(values):
-        current = _native_array_token_to_scaled(values[i])
-        if kind == "argmin" and current < best_value:
-            best_index = i
-            best_value = current
-        if kind == "argmax" and current > best_value:
-            best_index = i
-            best_value = current
-        i += 1
-    return best_index
-
-
-def _native_array_arg_reduce(
-    shape, values, dtype: str, kind: str, axis_text: str, keepdims: bool, diagnostics
-):
-    if not (kind == "argmin" or kind == "argmax"):
-        diagnostics.append("PCC-ARRAY-ARGREDUCE-UNSUPPORTED")
-        return [[], [], "int64"]
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-ARGREDUCE-UNSUPPORTED")
-        return [[], [], "int64"]
-    if len(values) == 0:
-        diagnostics.append("PCC-ARRAY-ARGREDUCE-EMPTY")
-        return [[], [], "int64"]
-    axis = _native_array_axis_value(axis_text)
-    if axis == -999999:
-        result = _native_array_arg_reduce_scaled(values, kind)
-        out_shape = []
-        if keepdims:
-            i = 0
-            while i < len(shape):
-                out_shape.append(1)
-                i += 1
-        return [out_shape, [str(result)], "int64"]
-    normalized_axis = _native_array_axis_normalize(axis, len(shape))
-    if normalized_axis < 0 or normalized_axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], "int64"]
-    if len(shape) == 1:
-        result = _native_array_arg_reduce_scaled(values, kind)
-        if keepdims:
-            return [[1], [str(result)], "int64"]
-        return [[], [str(result)], "int64"]
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-AXIS-ARGREDUCE-RANK-UNSUPPORTED")
-        return [[], [], "int64"]
-    rows = shape[0]
-    cols = shape[1]
-    out = []
-    if normalized_axis == 0:
-        c = 0
-        while c < cols:
-            slice_values = []
-            r = 0
-            while r < rows:
-                slice_values.append(values[r * cols + c])
-                r += 1
-            out.append(str(_native_array_arg_reduce_scaled(slice_values, kind)))
-            c += 1
-        if keepdims:
-            return [[1, cols], out, "int64"]
-        return [[cols], out, "int64"]
-    r = 0
-    while r < rows:
-        slice_values = []
-        c = 0
-        while c < cols:
-            slice_values.append(values[r * cols + c])
-            c += 1
-        out.append(str(_native_array_arg_reduce_scaled(slice_values, kind)))
-        r += 1
-    if keepdims:
-        return [[rows, 1], out, "int64"]
-    return [[rows], out, "int64"]
-
-
-def _native_array_count_nonzero_values(values) -> int:
-    count = 0
-    i = 0
-    while i < len(values):
-        if _native_array_token_to_scaled(values[i]) != 0:
-            count += 1
-        i += 1
-    return count
-
-
-def _native_array_count_nonzero(
-    shape, values, dtype: str, axis_text: str, keepdims: bool, diagnostics
-):
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-COUNT-NONZERO-UNSUPPORTED")
-        return [[], [], "int64"]
-    axis = _native_array_axis_value(axis_text)
-    if axis == -999999:
-        result = _native_array_count_nonzero_values(values)
-        out_shape = []
-        if keepdims:
-            i = 0
-            while i < len(shape):
-                out_shape.append(1)
-                i += 1
-        return [out_shape, [str(result)], "int64"]
-    normalized_axis = _native_array_axis_normalize(axis, len(shape))
-    if normalized_axis < 0 or normalized_axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], "int64"]
-    if len(shape) == 1:
-        result = _native_array_count_nonzero_values(values)
-        if keepdims:
-            return [[1], [str(result)], "int64"]
-        return [[], [str(result)], "int64"]
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-AXIS-COUNT-NONZERO-RANK-UNSUPPORTED")
-        return [[], [], "int64"]
-    rows = shape[0]
-    cols = shape[1]
-    out = []
-    if normalized_axis == 0:
-        c = 0
-        while c < cols:
-            slice_values = []
-            r = 0
-            while r < rows:
-                slice_values.append(values[r * cols + c])
-                r += 1
-            out.append(str(_native_array_count_nonzero_values(slice_values)))
-            c += 1
-        if keepdims:
-            return [[1, cols], out, "int64"]
-        return [[cols], out, "int64"]
-    r = 0
-    while r < rows:
-        slice_values = []
-        c = 0
-        while c < cols:
-            slice_values.append(values[r * cols + c])
-            c += 1
-        out.append(str(_native_array_count_nonzero_values(slice_values)))
-        r += 1
-    if keepdims:
-        return [[rows, 1], out, "int64"]
-    return [[rows], out, "int64"]
-
-
-def _native_array_nonzero(shape, values, dtype: str, diagnostics):
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-NONZERO-UNSUPPORTED")
-        return [[len(shape), 0], [], "int64"]
-    if len(shape) == 0:
-        if len(values) > 0 and _native_array_token_to_scaled(values[0]) != 0:
-            return [[1, 1], ["0"], "int64"]
-        return [[1, 0], [], "int64"]
-    if len(shape) == 1:
-        out = []
-        i = 0
-        while i < len(values):
-            if _native_array_token_to_scaled(values[i]) != 0:
-                out.append(str(i))
-            i += 1
-        return [[1, len(out)], out, "int64"]
-    if len(shape) == 2:
-        rows = shape[0]
-        cols = shape[1]
-        row_indices = []
-        col_indices = []
-        r = 0
-        while r < rows:
-            c = 0
-            while c < cols:
-                if _native_array_token_to_scaled(values[r * cols + c]) != 0:
-                    row_indices.append(str(r))
-                    col_indices.append(str(c))
-                c += 1
-            r += 1
-        out = []
-        i = 0
-        while i < len(row_indices):
-            out.append(row_indices[i])
-            i += 1
-        i = 0
-        while i < len(col_indices):
-            out.append(col_indices[i])
-            i += 1
-        return [[2, len(row_indices)], out, "int64"]
-    diagnostics.append("PCC-ARRAY-NONZERO-RANK-UNSUPPORTED")
-    return [[len(shape), 0], [], "int64"]
-
-
-def _native_array_argwhere(shape, values, dtype: str, diagnostics):
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-ARGWHERE-UNSUPPORTED")
-        return [[0, len(shape)], [], "int64"]
-    if len(shape) == 0:
-        if len(values) > 0 and _native_array_token_to_scaled(values[0]) != 0:
-            return [[1, 0], [], "int64"]
-        return [[0, 0], [], "int64"]
-    if len(shape) == 1:
-        out = []
-        i = 0
-        while i < len(values):
-            if _native_array_token_to_scaled(values[i]) != 0:
-                out.append(str(i))
-            i += 1
-        return [[len(out), 1], out, "int64"]
-    if len(shape) == 2:
-        rows = shape[0]
-        cols = shape[1]
-        out = []
-        count = 0
-        r = 0
-        while r < rows:
-            c = 0
-            while c < cols:
-                if _native_array_token_to_scaled(values[r * cols + c]) != 0:
-                    out.append(str(r))
-                    out.append(str(c))
-                    count += 1
-                c += 1
-            r += 1
-        return [[count, 2], out, "int64"]
-    diagnostics.append("PCC-ARRAY-ARGWHERE-RANK-UNSUPPORTED")
-    return [[0, len(shape)], [], "int64"]
-
-
-def _native_array_flatnonzero(shape, values, dtype: str, diagnostics):
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-FLATNONZERO-UNSUPPORTED")
-        return [[0], [], "int64"]
-    out = []
-    i = 0
-    while i < len(values):
-        if _native_array_token_to_scaled(values[i]) != 0:
-            out.append(str(i))
-        i += 1
-    return [[len(out)], out, "int64"]
-
-
-def _native_array_cumulative_dtype(dtype: str) -> str:
-    if dtype == "float32" or dtype == "float64":
-        return dtype
-    return "int64"
-
-
-def _native_array_cumulative_values(values, kind: str, dtype: str):
-    out = []
-    if kind == "cumsum":
-        total = 0
-        i = 0
-        while i < len(values):
-            total += _native_array_token_to_scaled(values[i])
-            out.append(_native_array_scaled_to_token(total, dtype))
-            i += 1
-        return out
-    total = 1000000
-    i = 0
-    while i < len(values):
-        total = (total * _native_array_token_to_scaled(values[i])) // 1000000
-        out.append(_native_array_scaled_to_token(total, dtype))
-        i += 1
-    return out
-
-
-def _native_array_cumulative(
-    shape, values, dtype: str, kind: str, axis_text: str, diagnostics
-):
-    if not (kind == "cumsum" or kind == "cumprod"):
-        diagnostics.append("PCC-ARRAY-CUMULATIVE-UNSUPPORTED")
-        return [[], [], dtype]
-    if dtype == "object":
-        diagnostics.append("PCC-ARRAY-CUMULATIVE-UNSUPPORTED")
-        return [[], [], dtype]
-    dtype = _native_array_cumulative_dtype(dtype)
-    axis = _native_array_axis_value(axis_text)
-    if axis == -999999:
-        out = _native_array_cumulative_values(values, kind, dtype)
-        return [[len(out)], out, dtype]
-    normalized_axis = _native_array_axis_normalize(axis, len(shape))
-    if normalized_axis < 0 or normalized_axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    if len(shape) == 1:
-        return [shape, _native_array_cumulative_values(values, kind, dtype), dtype]
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-AXIS-CUMULATIVE-RANK-UNSUPPORTED")
-        return [[], [], dtype]
-    rows = shape[0]
-    cols = shape[1]
-    out = []
-    i = 0
-    while i < len(values):
-        out.append("0")
-        i += 1
-    if normalized_axis == 0:
-        c = 0
-        while c < cols:
-            slice_values = []
-            r = 0
-            while r < rows:
-                slice_values.append(values[r * cols + c])
-                r += 1
-            slice_out = _native_array_cumulative_values(slice_values, kind, dtype)
-            r = 0
-            while r < rows:
-                out[r * cols + c] = slice_out[r]
-                r += 1
-            c += 1
-    else:
-        r = 0
-        while r < rows:
-            slice_values = []
-            c = 0
-            while c < cols:
-                slice_values.append(values[r * cols + c])
-                c += 1
-            slice_out = _native_array_cumulative_values(slice_values, kind, dtype)
-            c = 0
-            while c < cols:
-                out[r * cols + c] = slice_out[c]
-                c += 1
-            r += 1
-    return [shape, out, dtype]
-
-
-def _native_array_take(
-    shape, values, dtype: str, take_text: str, axis_text: str, diagnostics
-):
-    indices = _native_array_parse_shape(take_text)
-    axis = _native_array_axis_value(axis_text)
-    out = []
-    if axis == -999999:
-        i = 0
-        while i < len(indices):
-            actual = indices[i]
-            if actual < 0:
-                actual += _native_array_size(shape)
-            if actual < 0 or actual >= _native_array_size(shape):
-                diagnostics.append("PCC-ARRAY-INDEX-OUT-OF-BOUNDS")
-                return [[len(indices)], [], dtype]
-            out.append(values[actual])
-            i += 1
-        return [[len(indices)], out, dtype]
-    normalized_axis = _native_array_axis_normalize(axis, len(shape))
-    if normalized_axis < 0 or normalized_axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    if len(shape) == 1:
-        return _native_array_take(shape, values, dtype, take_text, "", diagnostics)
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-TAKE-RANK-UNSUPPORTED")
-        return [[], [], dtype]
-    rows = shape[0]
-    cols = shape[1]
-    if normalized_axis == 0:
-        i = 0
-        while i < len(indices):
-            actual = indices[i]
-            if actual < 0:
-                actual += rows
-            if actual < 0 or actual >= rows:
-                diagnostics.append("PCC-ARRAY-INDEX-OUT-OF-BOUNDS")
-                return [[len(indices), cols], [], dtype]
-            c = 0
-            while c < cols:
-                out.append(values[actual * cols + c])
-                c += 1
-            i += 1
-        return [[len(indices), cols], out, dtype]
-    r = 0
-    while r < rows:
-        i = 0
-        while i < len(indices):
-            actual = indices[i]
-            if actual < 0:
-                actual += cols
-            if actual < 0 or actual >= cols:
-                diagnostics.append("PCC-ARRAY-INDEX-OUT-OF-BOUNDS")
-                return [[rows, len(indices)], [], dtype]
-            out.append(values[r * cols + actual])
-            i += 1
-        r += 1
-    return [[rows, len(indices)], out, dtype]
-
-
-def _native_array_put(
-    shape, values, dtype: str, put_text: str, put_values_text: str, diagnostics
-):
-    indices = _native_array_parse_shape(put_text)
-    replacement_text = put_values_text
-    if replacement_text == "":
-        replacement_text = "0"
-    replacement_values = _native_array_literal_values(replacement_text)
-    if len(replacement_values) == 0:
-        diagnostics.append("PCC-ARRAY-PUT-VALUES-EMPTY")
-        return [shape, [], dtype]
-    replacement_values = _native_array_cast_values(replacement_values, dtype)
-    out = _native_array_copy_values(values)
-    size = _native_array_size(shape)
-    i = 0
-    while i < len(indices):
-        actual = indices[i]
-        if actual < 0:
-            actual += size
-        if actual < 0 or actual >= size:
-            diagnostics.append("PCC-ARRAY-INDEX-OUT-OF-BOUNDS")
-            return [shape, [], dtype]
-        out[actual] = replacement_values[i % len(replacement_values)]
-        i += 1
-    return [shape, out, dtype]
-
-
-def _native_array_putmask(
-    shape, values, dtype: str, mask_text: str, putmask_values_text: str, diagnostics
-):
-    parsed = _native_array_literal_shape_and_diagnostics(mask_text)
-    mask_shape = parsed[0]
-    mask_diagnostics = parsed[1]
-    i = 0
-    while i < len(mask_diagnostics):
-        diagnostics.append(mask_diagnostics[i])
-        i += 1
-    mask_dtype = _native_array_literal_dtype(mask_text)
-    if mask_dtype != "bool":
-        diagnostics.append("PCC-ARRAY-PUTMASK-MASK-DTYPE-UNSUPPORTED")
-        return [shape, [], dtype]
-    if len(mask_shape) != len(shape):
-        diagnostics.append("PCC-ARRAY-PUTMASK-SHAPE-MISMATCH")
-        return [shape, [], dtype]
-    i = 0
-    while i < len(shape):
-        if shape[i] != mask_shape[i]:
-            diagnostics.append("PCC-ARRAY-PUTMASK-SHAPE-MISMATCH")
-            return [shape, [], dtype]
-        i += 1
-    replacement_text = putmask_values_text
-    if replacement_text == "":
-        replacement_text = "0"
-    replacement_values = _native_array_literal_values(replacement_text)
-    if len(replacement_values) == 0:
-        diagnostics.append("PCC-ARRAY-PUTMASK-VALUES-EMPTY")
-        return [shape, [], dtype]
-    replacement_values = _native_array_cast_values(replacement_values, dtype)
-    mask_values = _native_array_literal_values(mask_text)
-    out = _native_array_copy_values(values)
-    selected = 0
-    i = 0
-    while i < len(out) and i < len(mask_values):
-        if mask_values[i] == "True":
-            out[i] = replacement_values[selected % len(replacement_values)]
-            selected += 1
-        i += 1
-    return [shape, out, dtype]
-
-
-def _native_array_mask(shape, values, dtype: str, mask_text: str, diagnostics):
-    parsed = _native_array_literal_shape_and_diagnostics(mask_text)
-    mask_shape = parsed[0]
-    mask_diagnostics = parsed[1]
-    i = 0
-    while i < len(mask_diagnostics):
-        diagnostics.append(mask_diagnostics[i])
-        i += 1
-    mask_dtype = _native_array_literal_dtype(mask_text)
-    if mask_dtype != "bool":
-        diagnostics.append("PCC-ARRAY-MASK-DTYPE-UNSUPPORTED")
-        return [[], [], dtype]
-    mask_values = _native_array_literal_values(mask_text)
-    out = []
-    if len(mask_shape) == len(shape):
-        same = True
-        i = 0
-        while i < len(shape):
-            if shape[i] != mask_shape[i]:
-                same = False
-            i += 1
-        if same:
-            i = 0
-            while i < len(values) and i < len(mask_values):
-                if mask_values[i] == "True":
-                    out.append(values[i])
-                i += 1
-            return [[len(out)], out, dtype]
-    if len(shape) == 2 and len(mask_shape) == 1 and mask_shape[0] == shape[0]:
-        rows = shape[0]
-        cols = shape[1]
-        selected_rows = 0
-        r = 0
-        while r < rows:
-            if mask_values[r] == "True":
-                selected_rows += 1
-                c = 0
-                while c < cols:
-                    out.append(values[r * cols + c])
-                    c += 1
-            r += 1
-        return [[selected_rows, cols], out, dtype]
-    diagnostics.append("PCC-ARRAY-MASK-SHAPE-MISMATCH")
-    return [[], [], dtype]
-
-
-def _native_array_compress(
-    shape, values, dtype: str, condition_text: str, axis_text: str, diagnostics
-):
-    parsed = _native_array_literal_shape_and_diagnostics(condition_text)
-    condition_shape = parsed[0]
-    condition_diagnostics = parsed[1]
-    i = 0
-    while i < len(condition_diagnostics):
-        diagnostics.append(condition_diagnostics[i])
-        i += 1
-    condition_dtype = _native_array_literal_dtype(condition_text)
-    if condition_dtype != "bool":
-        diagnostics.append("PCC-ARRAY-COMPRESS-MASK-DTYPE-UNSUPPORTED")
-        return [[], [], dtype]
-    if len(condition_shape) != 1:
-        diagnostics.append("PCC-ARRAY-COMPRESS-SHAPE-MISMATCH")
-        return [[], [], dtype]
-    condition_values = _native_array_literal_values(condition_text)
-    axis = _native_array_axis_value(axis_text)
-    out = []
-    if axis == -999999:
-        if condition_shape[0] != len(values):
-            diagnostics.append("PCC-ARRAY-COMPRESS-SHAPE-MISMATCH")
-            return [[], [], dtype]
-        i = 0
-        while i < len(values):
-            if condition_values[i] == "True":
-                out.append(values[i])
-            i += 1
-        return [[len(out)], out, dtype]
-    normalized_axis = _native_array_axis_normalize(axis, len(shape))
-    if normalized_axis < 0 or normalized_axis >= len(shape):
-        diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
-        return [[], [], dtype]
-    if condition_shape[0] != shape[normalized_axis]:
-        diagnostics.append("PCC-ARRAY-COMPRESS-SHAPE-MISMATCH")
-        return [shape, [], dtype]
-    if len(shape) == 1:
-        i = 0
-        while i < len(values):
-            if condition_values[i] == "True":
-                out.append(values[i])
-            i += 1
-        return [[len(out)], out, dtype]
-    if len(shape) != 2:
-        diagnostics.append("PCC-ARRAY-COMPRESS-RANK-UNSUPPORTED")
-        return [shape, [], dtype]
-    rows = shape[0]
-    cols = shape[1]
-    if normalized_axis == 0:
-        selected_rows = 0
-        r = 0
-        while r < rows:
-            if condition_values[r] == "True":
-                selected_rows += 1
-                c = 0
-                while c < cols:
-                    out.append(values[r * cols + c])
-                    c += 1
-            r += 1
-        return [[selected_rows, cols], out, dtype]
-    selected_cols = 0
-    c = 0
-    while c < cols:
-        if condition_values[c] == "True":
-            selected_cols += 1
-        c += 1
-    r = 0
-    while r < rows:
-        c = 0
-        while c < cols:
-            if condition_values[c] == "True":
-                out.append(values[r * cols + c])
-            c += 1
-        r += 1
-    return [[rows, selected_cols], out, dtype]
-
-
-def _native_array_where(
-    mask_text: str,
-    true_shape,
-    true_values,
-    true_dtype: str,
-    false_text: str,
-    diagnostics,
-):
-    parsed = _native_array_literal_shape_and_diagnostics(mask_text)
-    mask_shape = parsed[0]
-    mask_diagnostics = parsed[1]
-    i = 0
-    while i < len(mask_diagnostics):
-        diagnostics.append(mask_diagnostics[i])
-        i += 1
-    mask_dtype = _native_array_literal_dtype(mask_text)
-    if mask_dtype != "bool":
-        diagnostics.append("PCC-ARRAY-WHERE-MASK-DTYPE-UNSUPPORTED")
-    mask_values = _native_array_literal_values(mask_text)
-    false_shape = []
-    if false_text.strip().startswith("["):
-        parsed_false = _native_array_literal_shape_and_diagnostics(false_text)
-        false_shape = parsed_false[0]
-        false_diagnostics = parsed_false[1]
-        i = 0
-        while i < len(false_diagnostics):
-            diagnostics.append(false_diagnostics[i])
-            i += 1
-    false_values = _native_array_literal_values(false_text)
-    false_dtype = _native_array_literal_dtype(false_text)
-    value_shape = _native_array_broadcast_shape(true_shape, false_shape, diagnostics)
-    out_shape = _native_array_broadcast_shape(value_shape, mask_shape, diagnostics)
-    dtype = _native_array_op_dtype("add", true_dtype, false_dtype)
-    if true_dtype == "object" or false_dtype == "object":
-        dtype = "object"
-    if len(diagnostics) > 0:
-        return [out_shape, [], dtype]
-    out = []
-    if len(out_shape) == 0:
-        chosen = true_values[0] if mask_values[0] == "True" else false_values[0]
-        out.append(chosen)
-    elif len(out_shape) == 1:
-        i = 0
-        while i < out_shape[0]:
-            out_index = [i]
-            mv = mask_values[_native_array_broadcast_flat_index(mask_shape, out_index)]
-            if mv == "True":
-                out.append(
-                    true_values[
-                        _native_array_broadcast_flat_index(true_shape, out_index)
-                    ]
-                )
-            else:
-                out.append(
-                    false_values[
-                        _native_array_broadcast_flat_index(false_shape, out_index)
-                    ]
-                )
-            i += 1
-    elif len(out_shape) == 2:
-        r = 0
-        while r < out_shape[0]:
-            c = 0
-            while c < out_shape[1]:
-                out_index = [r, c]
-                mv = mask_values[
-                    _native_array_broadcast_flat_index(mask_shape, out_index)
-                ]
-                if mv == "True":
-                    out.append(
-                        true_values[
-                            _native_array_broadcast_flat_index(true_shape, out_index)
-                        ]
-                    )
-                else:
-                    out.append(
-                        false_values[
-                            _native_array_broadcast_flat_index(false_shape, out_index)
-                        ]
-                    )
-                c += 1
-            r += 1
-    else:
-        diagnostics.append("PCC-ARRAY-RANK-UNSUPPORTED")
-        return [out_shape, [], dtype]
-    return [out_shape, out, dtype]
-
-
-def _native_array_astype(shape, values, dtype: str, target_dtype: str, diagnostics):
-    dtype = _native_array_normalize_dtype(target_dtype)
-    out = []
-    i = 0
-    while i < len(values):
-        if dtype == "object":
-            out.append(values[i])
-        else:
-            out.append(
-                _native_array_scaled_to_token(
-                    _native_array_token_to_scaled(values[i]), dtype
-                )
-            )
-        i += 1
-    return [shape, out, dtype]
-
-
-def _native_array_diagnostics_json(codes) -> str:
-    out = "["
-    i = 0
-    while i < len(codes):
-        if i > 0:
-            out += ", "
-        code = codes[i]
-        out += "{"
-        out += '"code": ' + _json_str(code)
-        if code == "PCC-ARRAY-RAGGED":
-            out += ', "message": ' + _json_str(
-                "array literal is ragged; pcc cannot claim rectangular ndarray layout"
-            )
-        elif code == "PCC-ARRAY-EMPTY-DTYPE":
-            out += ', "message": ' + _json_str(
-                "empty array literal needs an explicit dtype for a precise layout"
-            )
-        elif code == "PCC-ARRAY-NEGATIVE-DIMENSION":
-            out += ', "message": ' + _json_str(
-                "array shape dimensions must be non-negative"
-            )
-        elif code == "PCC-ARRAY-ARANGE-PARSE-FAILED":
-            out += ', "message": ' + _json_str(
-                "arange expects stop, start,stop, or start,stop,step with a nonzero step"
-            )
-        elif code == "PCC-ARRAY-EYE-PARSE-FAILED":
-            out += ', "message": ' + _json_str("eye expects n, n,m, or n,m,k")
-        elif code == "PCC-ARRAY-LINSPACE-PARSE-FAILED":
-            out += ', "message": ' + _json_str(
-                "linspace expects start,stop or start,stop,num with non-negative num"
-            )
-        elif code == "PCC-ARRAY-REQUIRES-RECTANGULAR":
-            out += ', "message": ' + _json_str(
-                "rectangular layout was required but the input is ragged"
-            )
-        elif code == "PCC-ARRAY-BROADCAST-INCOMPATIBLE":
-            out += ', "message": ' + _json_str(
-                "array operands cannot be broadcast together"
-            )
-        elif code == "PCC-ARRAY-BROADCAST-TO-SHAPE-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "array cannot be broadcast to the requested shape"
-            )
-        elif code == "PCC-ARRAY-REPEAT-NEGATIVE":
-            out += ', "message": ' + _json_str("repeat count must be non-negative")
-        elif code == "PCC-ARRAY-REPEAT-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "repeat currently supports 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-TILE-REPS-EMPTY":
-            out += ', "message": ' + _json_str(
-                "tile requires at least one repeat dimension"
-            )
-        elif code == "PCC-ARRAY-TILE-REPS-NEGATIVE":
-            out += ', "message": ' + _json_str(
-                "tile repeat dimensions must be non-negative"
-            )
-        elif code == "PCC-ARRAY-TILE-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "tile currently supports scalar/1D/2D arrays with one or two repeat dimensions"
-            )
-        elif code == "PCC-ARRAY-ROLL-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "roll currently supports scalar/1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-UFUNC-UNSUPPORTED":
-            out += ', "message": ' + _json_str("unsupported array-core ufunc")
-        elif code == "PCC-ARRAY-OBJECT-UFUNC-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array numeric ufuncs are not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-UNARY-UNSUPPORTED":
-            out += ', "message": ' + _json_str("unsupported array-core unary ufunc")
-        elif code == "PCC-ARRAY-OBJECT-UNARY-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array unary ufuncs are not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-UNARY-DTYPE-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "unary ufunc is not supported for this dtype by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-UNARY-FAILED":
-            out += ', "message": ' + _json_str("array-core unary ufunc failed")
-        elif code == "PCC-ARRAY-CLIP-PARSE-FAILED":
-            out += ', "message": ' + _json_str("clip expects min,max scalar bounds")
-        elif code == "PCC-ARRAY-OBJECT-CLIP-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array clip is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-CLIP-FAILED":
-            out += ', "message": ' + _json_str("array-core clip failed")
-        elif code == "PCC-ARRAY-MATMUL-OBJECT-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array matrix multiplication is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-MATMUL-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "array-core matmul supports 1D/2D operands only"
-            )
-        elif code == "PCC-ARRAY-MATMUL-SHAPE-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "array-core matmul operands have incompatible shapes"
-            )
-        elif code == "PCC-ARRAY-CONCAT-RANK-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "concatenate operands must have the same rank"
-            )
-        elif code == "PCC-ARRAY-CONCAT-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "the current concatenate subset supports 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-CONCAT-SHAPE-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "concatenate operands have incompatible shapes"
-            )
-        elif code == "PCC-ARRAY-STACK-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "the current stack subset supports 1D arrays only"
-            )
-        elif code == "PCC-ARRAY-STACK-SHAPE-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "stack operands must have identical shapes"
-            )
-        elif code == "PCC-ARRAY-COMPARE-UNSUPPORTED":
-            out += ', "message": ' + _json_str("unsupported array-core comparison")
-        elif code == "PCC-ARRAY-COMPARE-FAILED":
-            out += ', "message": ' + _json_str("array-core comparison failed")
-        elif code == "PCC-ARRAY-OBJECT-COMPARE-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array ordered comparisons are not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-INDEX-PARSE-FAILED":
-            out += ', "message": ' + _json_str("array index parse failed")
-        elif code == "PCC-ARRAY-INDEX-RANK-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "index rank must match array rank for the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-INDEX-OUT-OF-BOUNDS":
-            out += ', "message": ' + _json_str("array index is out of bounds")
-        elif code == "PCC-ARRAY-DIAGONAL-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "diagonal currently supports 2D arrays only"
-            )
-        elif code == "PCC-ARRAY-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "array rank is unsupported by the native bootstrap array-core subset"
-            )
-        elif code == "PCC-ARRAY-RESHAPE-SIZE-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "reshape target must have the same number of elements"
-            )
-        elif code == "PCC-ARRAY-TRANSPOSE-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "the current array-core transpose subset supports 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-SWAPAXES-AXES-INVALID":
-            out += ', "message": ' + _json_str("swapaxes expects exactly two axes")
-        elif code == "PCC-ARRAY-SWAPAXES-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "swapaxes currently supports 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-MOVEAXIS-AXES-INVALID":
-            out += ', "message": ' + _json_str(
-                "moveaxis expects source,destination axes"
-            )
-        elif code == "PCC-ARRAY-MOVEAXIS-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "moveaxis currently supports 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-ROT90-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "rot90 currently supports 2D arrays only"
-            )
-        elif code == "PCC-ARRAY-FLIP-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "flip currently supports scalar/1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-SQUEEZE-AXIS-NOT-ONE":
-            out += ', "message": ' + _json_str("squeeze axis must have length one")
-        elif code == "PCC-ARRAY-REDUCE-UNSUPPORTED":
-            out += ', "message": ' + _json_str("unsupported array-core reduction")
-        elif code == "PCC-ARRAY-REDUCE-EMPTY":
-            out += ', "message": ' + _json_str(
-                "cannot reduce an empty array in the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-AXIS-OUT-OF-BOUNDS":
-            out += ', "message": ' + _json_str("axis is out of bounds for array")
-        elif code == "PCC-ARRAY-AXIS-REDUCE-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "axis reductions currently support 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-ARGREDUCE-UNSUPPORTED":
-            out += ', "message": ' + _json_str("unsupported array-core arg reduction")
-        elif code == "PCC-ARRAY-ARGREDUCE-EMPTY":
-            out += ', "message": ' + _json_str(
-                "cannot arg-reduce an empty array in the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-AXIS-ARGREDUCE-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "axis arg reductions currently support 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-COUNT-NONZERO-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array count_nonzero is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-AXIS-COUNT-NONZERO-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "axis count_nonzero currently supports 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-NONZERO-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array nonzero is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-NONZERO-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "nonzero currently supports scalar/1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-ARGWHERE-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array argwhere is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-ARGWHERE-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "argwhere currently supports scalar/1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-FLATNONZERO-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array flatnonzero is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-CUMULATIVE-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "unsupported array-core cumulative operation"
-            )
-        elif code == "PCC-ARRAY-AXIS-CUMULATIVE-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "axis cumulative operations currently support 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-TAKE-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "take currently supports 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-PUT-VALUES-EMPTY":
-            out += ', "message": ' + _json_str(
-                "put requires at least one replacement value"
-            )
-        elif code == "PCC-ARRAY-PUT-FAILED":
-            out += ', "message": ' + _json_str("array-core put failed")
-        elif code == "PCC-ARRAY-PUTMASK-MASK-DTYPE-UNSUPPORTED":
-            out += ', "message": ' + _json_str("putmask requires a bool mask")
-        elif code == "PCC-ARRAY-PUTMASK-SHAPE-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "putmask mask shape must match the array shape"
-            )
-        elif code == "PCC-ARRAY-PUTMASK-VALUES-EMPTY":
-            out += ', "message": ' + _json_str(
-                "putmask requires at least one replacement value"
-            )
-        elif code == "PCC-ARRAY-PUTMASK-FAILED":
-            out += ', "message": ' + _json_str("array-core putmask failed")
-        elif code == "PCC-ARRAY-MASK-DTYPE-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "boolean mask selection requires a bool mask"
-            )
-        elif code == "PCC-ARRAY-MASK-SHAPE-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "boolean mask shape must match the array shape or the leading axis for 2D arrays"
-            )
-        elif code == "PCC-ARRAY-COMPRESS-MASK-DTYPE-UNSUPPORTED":
-            out += ', "message": ' + _json_str("compress requires a bool condition")
-        elif code == "PCC-ARRAY-COMPRESS-SHAPE-MISMATCH":
-            out += ', "message": ' + _json_str(
-                "compress condition length must match the selected array extent"
-            )
-        elif code == "PCC-ARRAY-COMPRESS-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "compress currently supports 1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-WHERE-MASK-DTYPE-UNSUPPORTED":
-            out += ', "message": ' + _json_str("where selection requires a bool mask")
-        elif code == "PCC-ARRAY-SORT-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array sort is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-SORT-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "sort currently supports scalar/1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-ARGSORT-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array argsort is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-ARGSORT-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "argsort currently supports scalar/1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-SEARCHSORTED-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array searchsorted is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-SEARCHSORTED-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "searchsorted currently supports 1D sorted arrays only"
-            )
-        elif code == "PCC-ARRAY-SEARCHSORTED-SIDE-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "searchsorted side must be left or right"
-            )
-        elif code == "PCC-ARRAY-PARTITION-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array partition is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-PARTITION-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "partition currently supports scalar/1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-PARTITION-KTH-OUT-OF-BOUNDS":
-            out += ', "message": ' + _json_str(
-                "partition kth is out of bounds for the selected axis"
-            )
-        elif code == "PCC-ARRAY-ARGPARTITION-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "object-array argpartition is not supported by the current array-core subset"
-            )
-        elif code == "PCC-ARRAY-ARGPARTITION-RANK-UNSUPPORTED":
-            out += ', "message": ' + _json_str(
-                "argpartition currently supports scalar/1D/2D arrays only"
-            )
-        elif code == "PCC-ARRAY-ARGPARTITION-KTH-OUT-OF-BOUNDS":
-            out += ', "message": ' + _json_str(
-                "argpartition kth is out of bounds for the selected axis"
-            )
-        else:
-            out += ', "message": ' + _json_str("array-core layout diagnostic")
-        out += "}"
-        i += 1
-    out += "]"
-    return out
-
-
-def _native_array_core_json(
-    shape,
-    dtype: str,
-    source: str,
-    diagnostics,
-    values,
-    fill,
-    arange: str,
-    zeros: str,
-    ones: str,
-    zeros_like: bool,
-    ones_like: bool,
-    full_like,
-    eye: str,
-    linspace: str,
-    op: str,
-    rhs,
-    matmul,
-    concat,
-    stack,
-    unary: str,
-    clip: str,
-    broadcast_to: str,
-    repeat,
-    tile,
-    roll: str,
-    rot90: str,
-    compare: str,
-    index: str,
-    diagonal: str,
-    reshape: str,
-    ravel: bool,
-    flatten: bool,
-    flip: bool,
-    transpose: bool,
-    swapaxes: str,
-    moveaxis: str,
-    squeeze: bool,
-    squeeze_axis_text: str,
-    expand_dims_text: str,
-    reduce_name: str,
-    argreduce_name: str,
-    count_nonzero: bool,
-    nonzero: bool,
-    argwhere: bool,
-    flatnonzero: bool,
-    cumulative: str,
-    sort_value: bool,
-    argsort_value: bool,
-    searchsorted: str,
-    search_side: str,
-    partition: str,
-    argpartition: str,
-    axis_text: str,
-    keepdims: bool,
-    take: str,
-    put: str,
-    put_values: str,
-    putmask: str,
-    putmask_values: str,
-    mask: str,
-    compress: str,
-    where: str,
-    otherwise,
-    astype: str,
-    copy_value: bool,
-    view: bool,
-    owns_data: bool,
-    base_shape,
-    strides_override,
-    c_contiguous: bool,
-) -> str:
-    i = 0
-    while i < len(shape):
-        if shape[i] < 0 and not _native_list_contains(
-            diagnostics, "PCC-ARRAY-NEGATIVE-DIMENSION"
-        ):
-            diagnostics.append("PCC-ARRAY-NEGATIVE-DIMENSION")
-        i += 1
-    itemsize = _native_array_dtype_itemsize(dtype)
-    strides = _native_array_strides(shape, itemsize)
-    if strides_override is not None:
-        strides = strides_override
-    size = _native_array_size(shape)
-    out = "{"
-    out += '"c_contiguous": ' + ("true" if c_contiguous else "false")
-    out += ', "diagnostics": ' + _native_array_diagnostics_json(diagnostics)
-    if values is not None:
-        out += ', "data": ' + _native_array_data_json(shape, values)
-    out += ', "dtype": ' + _json_str(dtype)
-    out += ', "dtype_format": ' + _json_str(_native_array_dtype_format(dtype))
-    if dtype == "bool" or _native_array_is_integer_dtype(dtype):
-        out += ', "dtype_range": ' + _native_array_dtype_range_json(dtype)
-        out += ', "dtype_signed": ' + (
-            "true" if _native_array_integer_signed(dtype) else "false"
-        )
-    if values is not None:
-        out += ', "flat_data": ' + _native_array_values_json(values)
-    if fill is not None:
-        out += ', "fill": ' + _json_str(fill)
-    if arange != "":
-        out += ', "arange": ' + _json_str(arange)
-    if zeros != "":
-        out += ', "zeros": ' + _json_str(zeros)
-    if ones != "":
-        out += ', "ones": ' + _json_str(ones)
-    if zeros_like:
-        out += ', "zeros_like": true'
-    if ones_like:
-        out += ', "ones_like": true'
-    if full_like != "":
-        out += ', "full_like": ' + _json_str(full_like)
-    if eye != "":
-        out += ', "eye": ' + _json_str(eye)
-    if linspace != "":
-        out += ', "linspace": ' + _json_str(linspace)
-    out += ', "itemsize": ' + str(itemsize)
-    out += ', "nbytes": ' + str(size * itemsize)
-    out += ', "ndim": ' + str(len(shape))
-    out += ', "ok": ' + ("true" if len(diagnostics) == 0 else "false")
-    if op != "":
-        out += ', "op": ' + _json_str(op)
-    if matmul != "":
-        out += ', "matmul": ' + _json_str(matmul)
-    if concat != "":
-        out += ', "concat": ' + _json_str(concat)
-    if stack != "":
-        out += ', "stack": ' + _json_str(stack)
-    if unary != "":
-        out += ', "unary": ' + _json_str(unary)
-    if clip != "":
-        out += ', "clip": ' + _json_str(clip)
-    if broadcast_to != "":
-        out += ', "broadcast_to": ' + _json_str(broadcast_to)
-    if repeat != "":
-        out += ', "repeat": ' + str(repeat)
-    if tile != "":
-        out += ', "tile": ' + _json_str(tile)
-    if roll != "":
-        out += ', "roll": ' + roll
-    if rot90 != "":
-        out += ', "rot90": ' + rot90
-    if index != "":
-        out += ', "index": ' + _json_str(index)
-    if diagonal != "":
-        out += ', "diagonal": ' + diagonal
-    if compare != "":
-        out += ', "compare": ' + _json_str(compare)
-    out += ', "owns_data": ' + ("true" if owns_data else "false")
-    if dtype == "object":
-        out += ', "object_policy": {"allowed": ["storage", "index", "take", "put", "putmask", "compress", "roll", "flip", "transpose", "swapaxes", "moveaxis", "rot90", "reshape", "ravel", "flatten", "copy", "repr"], "unsupported": ["numeric_ufunc", "numeric_reduce", "typed_memoryview"]}'
-    if values is not None:
-        out += ', "repr": ' + _json_str(_native_array_repr(shape, values))
-    if rhs != "":
-        out += ', "rhs": ' + _json_str(rhs)
-    if reshape != "":
-        out += ', "reshape": ' + _json_str(reshape)
-    if ravel:
-        out += ', "ravel": true'
-    if flatten:
-        out += ', "flatten": true'
-    if flip:
-        out += ', "flip": true'
-    if transpose:
-        out += ', "transpose": true'
-    if swapaxes != "":
-        out += ', "swapaxes": ' + _json_str(swapaxes)
-    if moveaxis != "":
-        out += ', "moveaxis": ' + _json_str(moveaxis)
-    if squeeze:
-        out += ', "squeeze": true'
-    if squeeze_axis_text != "":
-        out += ', "squeeze_axis": ' + squeeze_axis_text
-    if expand_dims_text != "":
-        out += ', "expand_dims": ' + expand_dims_text
-    if reduce_name != "":
-        out += ', "reduce": ' + _json_str(reduce_name)
-    if argreduce_name != "":
-        out += ', "argreduce": ' + _json_str(argreduce_name)
-    if count_nonzero:
-        out += ', "count_nonzero": true'
-    if nonzero:
-        out += ', "nonzero": true'
-    if argwhere:
-        out += ', "argwhere": true'
-    if flatnonzero:
-        out += ', "flatnonzero": true'
-    if cumulative != "":
-        out += ', "cumulative": ' + _json_str(cumulative)
-    if sort_value:
-        out += ', "sort": true'
-    if argsort_value:
-        out += ', "argsort": true'
-    if searchsorted != "":
-        out += ', "searchsorted": ' + _json_str(searchsorted)
-        out += ', "side": ' + _json_str(search_side)
-    if partition != "":
-        out += ', "partition": ' + partition
-    if argpartition != "":
-        out += ', "argpartition": ' + argpartition
-    if axis_text != "":
-        out += ', "axis": ' + axis_text
-    if keepdims:
-        out += ', "keepdims": true'
-    if take != "":
-        out += ', "take": ' + _json_str(take)
-    if put != "":
-        out += ', "put": ' + _json_str(put)
-        out += ', "put_values": ' + _json_str(put_values)
-    if putmask != "":
-        out += ', "putmask": ' + _json_str(putmask)
-        out += ', "putmask_values": ' + _json_str(putmask_values)
-    if mask != "":
-        out += ', "mask": ' + _json_str(mask)
-    if compress != "":
-        out += ', "compress": ' + _json_str(compress)
-    if where != "":
-        out += ', "where": ' + _json_str(where)
-    if otherwise != "":
-        out += ', "otherwise": ' + _json_str(otherwise)
-    if astype != "":
-        out += ', "astype": ' + _json_str(astype)
-    if copy_value:
-        out += ', "copy": true'
-    out += ', "view": ' + ("true" if view else "false")
-    if base_shape is not None:
-        out += ', "base_shape": ' + _json_int_list(base_shape)
-    out += ', "schema": "pcc.array-core.v1"'
-    out += ', "shape": ' + _json_int_list(shape)
-    out += ', "size": ' + str(size)
-    out += ', "source": ' + _json_str(source)
-    out += ', "strides": ' + _json_int_list(strides)
-    out += "}"
-    return out
-
-
-def _run_native_package_array_core_from_pcc1(module_args) -> int:
-    shape_text = ""
-    literal = ""
-    dtype = "auto"
-    require_rectangular = False
-    fill = None
-    arange = ""
-    zeros = ""
-    ones = ""
-    zeros_like = False
-    ones_like = False
-    full_like = ""
-    eye = ""
-    linspace = ""
-    op = ""
-    rhs = ""
-    matmul = ""
-    concat = ""
-    stack = ""
-    unary = ""
-    clip = ""
-    broadcast_to = ""
-    repeat = ""
-    tile = ""
-    roll = ""
-    rot90 = ""
-    compare = ""
-    index = ""
-    diagonal = ""
-    reshape = ""
-    ravel = False
-    flatten = False
-    flip = False
-    transpose = False
-    swapaxes = ""
-    moveaxis = ""
-    squeeze = False
-    squeeze_axis_text = ""
-    expand_dims_text = ""
-    reduce_name = ""
-    argreduce_name = ""
-    count_nonzero = False
-    nonzero = False
-    argwhere = False
-    flatnonzero = False
-    cumulative = ""
-    sort_value = False
-    argsort_value = False
-    searchsorted = ""
-    search_side = "left"
-    partition = ""
-    argpartition = ""
-    axis_text = ""
-    keepdims = False
-    take = ""
-    put = ""
-    put_values = ""
-    putmask = ""
-    putmask_values = ""
-    mask = ""
-    compress = ""
-    where = ""
-    otherwise = ""
-    astype = ""
-    copy_value = False
-    i = 0
-    while i < len(module_args):
-        arg = module_args[i]
-        if arg == "--shape":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--shape requires a value", "ok": false}')
-                return 2
-            shape_text = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--shape="):
-            shape_text = arg.split("=", 1)[1]
-        elif arg == "--literal":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--literal requires a value", "ok": false}')
-                return 2
-            literal = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--literal="):
-            literal = arg.split("=", 1)[1]
-        elif arg == "--dtype":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--dtype requires a value", "ok": false}')
-                return 2
-            dtype = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--dtype="):
-            dtype = arg.split("=", 1)[1]
-        elif arg == "--require-rectangular":
-            require_rectangular = True
-        elif arg == "--fill":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--fill requires a value", "ok": false}')
-                return 2
-            fill = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--fill="):
-            fill = arg.split("=", 1)[1]
-        elif arg == "--arange":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--arange requires a value", "ok": false}')
-                return 2
-            arange = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--arange="):
-            arange = arg.split("=", 1)[1]
-        elif arg == "--zeros":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--zeros requires a value", "ok": false}')
-                return 2
-            zeros = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--zeros="):
-            zeros = arg.split("=", 1)[1]
-        elif arg == "--ones":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--ones requires a value", "ok": false}')
-                return 2
-            ones = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--ones="):
-            ones = arg.split("=", 1)[1]
-        elif arg == "--zeros-like":
-            zeros_like = True
-        elif arg == "--ones-like":
-            ones_like = True
-        elif arg == "--full-like":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--full-like requires a value", "ok": false}')
-                return 2
-            full_like = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--full-like="):
-            full_like = arg.split("=", 1)[1]
-        elif arg == "--eye":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--eye requires a value", "ok": false}')
-                return 2
-            eye = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--eye="):
-            eye = arg.split("=", 1)[1]
-        elif arg == "--linspace":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--linspace requires a value", "ok": false}')
-                return 2
-            linspace = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--linspace="):
-            linspace = arg.split("=", 1)[1]
-        elif arg == "--op":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--op requires a value", "ok": false}')
-                return 2
-            op = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--op="):
-            op = arg.split("=", 1)[1]
-        elif arg == "--rhs":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--rhs requires a value", "ok": false}')
-                return 2
-            rhs = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--rhs="):
-            rhs = arg.split("=", 1)[1]
-        elif arg == "--matmul":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--matmul requires a value", "ok": false}')
-                return 2
-            matmul = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--matmul="):
-            matmul = arg.split("=", 1)[1]
-        elif arg == "--concat":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--concat requires a value", "ok": false}')
-                return 2
-            concat = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--concat="):
-            concat = arg.split("=", 1)[1]
-        elif arg == "--stack":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--stack requires a value", "ok": false}')
-                return 2
-            stack = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--stack="):
-            stack = arg.split("=", 1)[1]
-        elif arg == "--unary":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--unary requires a value", "ok": false}')
-                return 2
-            unary = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--unary="):
-            unary = arg.split("=", 1)[1]
-        elif arg == "--clip":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--clip requires a value", "ok": false}')
-                return 2
-            clip = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--clip="):
-            clip = arg.split("=", 1)[1]
-        elif arg == "--broadcast-to":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--broadcast-to requires a value", "ok": false}')
-                return 2
-            broadcast_to = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--broadcast-to="):
-            broadcast_to = arg.split("=", 1)[1]
-        elif arg == "--repeat":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--repeat requires a value", "ok": false}')
-                return 2
-            repeat = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--repeat="):
-            repeat = arg.split("=", 1)[1]
-        elif arg == "--tile":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--tile requires a value", "ok": false}')
-                return 2
-            tile = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--tile="):
-            tile = arg.split("=", 1)[1]
-        elif arg == "--roll":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--roll requires a value", "ok": false}')
-                return 2
-            roll = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--roll="):
-            roll = arg.split("=", 1)[1]
-        elif arg == "--rot90":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--rot90 requires a value", "ok": false}')
-                return 2
-            rot90 = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--rot90="):
-            rot90 = arg.split("=", 1)[1]
-        elif arg == "--compare":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--compare requires a value", "ok": false}')
-                return 2
-            compare = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--compare="):
-            compare = arg.split("=", 1)[1]
-        elif arg == "--index":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--index requires a value", "ok": false}')
-                return 2
-            index = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--index="):
-            index = arg.split("=", 1)[1]
-        elif arg == "--diagonal":
-            diagonal = "0"
-            if i + 1 < len(module_args) and not module_args[i + 1].startswith("--"):
-                diagonal = module_args[i + 1]
-                i += 1
-        elif arg.startswith("--diagonal="):
-            diagonal = arg.split("=", 1)[1]
-        elif arg == "--reshape":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--reshape requires a value", "ok": false}')
-                return 2
-            reshape = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--reshape="):
-            reshape = arg.split("=", 1)[1]
-        elif arg == "--ravel":
-            ravel = True
-        elif arg == "--flatten":
-            flatten = True
-        elif arg == "--flip":
-            flip = True
-        elif arg == "--transpose":
-            transpose = True
-        elif arg == "--swapaxes":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--swapaxes requires a value", "ok": false}')
-                return 2
-            swapaxes = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--swapaxes="):
-            swapaxes = arg.split("=", 1)[1]
-        elif arg == "--moveaxis":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--moveaxis requires a value", "ok": false}')
-                return 2
-            moveaxis = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--moveaxis="):
-            moveaxis = arg.split("=", 1)[1]
-        elif arg == "--squeeze":
-            squeeze = True
-        elif arg == "--squeeze-axis":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--squeeze-axis requires a value", "ok": false}')
-                return 2
-            squeeze_axis_text = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--squeeze-axis="):
-            squeeze_axis_text = arg.split("=", 1)[1]
-        elif arg == "--expand-dims":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--expand-dims requires a value", "ok": false}')
-                return 2
-            expand_dims_text = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--expand-dims="):
-            expand_dims_text = arg.split("=", 1)[1]
-        elif arg == "--reduce":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--reduce requires a value", "ok": false}')
-                return 2
-            reduce_name = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--reduce="):
-            reduce_name = arg.split("=", 1)[1]
-        elif arg == "--argreduce":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--argreduce requires a value", "ok": false}')
-                return 2
-            argreduce_name = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--argreduce="):
-            argreduce_name = arg.split("=", 1)[1]
-        elif arg == "--count-nonzero":
-            count_nonzero = True
-        elif arg == "--nonzero":
-            nonzero = True
-        elif arg == "--argwhere":
-            argwhere = True
-        elif arg == "--flatnonzero":
-            flatnonzero = True
-        elif arg == "--cumulative":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--cumulative requires a value", "ok": false}')
-                return 2
-            cumulative = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--cumulative="):
-            cumulative = arg.split("=", 1)[1]
-        elif arg == "--sort":
-            sort_value = True
-        elif arg == "--argsort":
-            argsort_value = True
-        elif arg == "--searchsorted":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--searchsorted requires a value", "ok": false}')
-                return 2
-            searchsorted = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--searchsorted="):
-            searchsorted = arg.split("=", 1)[1]
-        elif arg == "--side":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--side requires a value", "ok": false}')
-                return 2
-            search_side = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--side="):
-            search_side = arg.split("=", 1)[1]
-        elif arg == "--partition":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--partition requires a value", "ok": false}')
-                return 2
-            partition = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--partition="):
-            partition = arg.split("=", 1)[1]
-        elif arg == "--argpartition":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--argpartition requires a value", "ok": false}')
-                return 2
-            argpartition = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--argpartition="):
-            argpartition = arg.split("=", 1)[1]
-        elif arg == "--axis":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--axis requires a value", "ok": false}')
-                return 2
-            axis_text = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--axis="):
-            axis_text = arg.split("=", 1)[1]
-        elif arg == "--keepdims":
-            keepdims = True
-        elif arg == "--take":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--take requires a value", "ok": false}')
-                return 2
-            take = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--take="):
-            take = arg.split("=", 1)[1]
-        elif arg == "--put":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--put requires a value", "ok": false}')
-                return 2
-            put = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--put="):
-            put = arg.split("=", 1)[1]
-        elif arg == "--put-values":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--put-values requires a value", "ok": false}')
-                return 2
-            put_values = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--put-values="):
-            put_values = arg.split("=", 1)[1]
-        elif arg == "--putmask":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--putmask requires a value", "ok": false}')
-                return 2
-            putmask = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--putmask="):
-            putmask = arg.split("=", 1)[1]
-        elif arg == "--putmask-values":
-            if i + 1 >= len(module_args):
-                _write_text(
-                    '{"error": "--putmask-values requires a value", "ok": false}'
-                )
-                return 2
-            putmask_values = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--putmask-values="):
-            putmask_values = arg.split("=", 1)[1]
-        elif arg == "--mask":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--mask requires a value", "ok": false}')
-                return 2
-            mask = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--mask="):
-            mask = arg.split("=", 1)[1]
-        elif arg == "--compress":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--compress requires a value", "ok": false}')
-                return 2
-            compress = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--compress="):
-            compress = arg.split("=", 1)[1]
-        elif arg == "--where":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--where requires a value", "ok": false}')
-                return 2
-            where = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--where="):
-            where = arg.split("=", 1)[1]
-        elif arg == "--otherwise":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--otherwise requires a value", "ok": false}')
-                return 2
-            otherwise = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--otherwise="):
-            otherwise = arg.split("=", 1)[1]
-        elif arg == "--astype":
-            if i + 1 >= len(module_args):
-                _write_text('{"error": "--astype requires a value", "ok": false}')
-                return 2
-            astype = module_args[i + 1]
-            i += 1
-        elif arg.startswith("--astype="):
-            astype = arg.split("=", 1)[1]
-        elif arg == "--copy":
-            copy_value = True
-        elif arg == "--json":
-            pass
-        i += 1
-    diagnostics = []
-    source = "shape"
-    values = None
-    view = False
-    owns_data = True
-    base_shape = None
-    strides_override = None
-    c_contiguous = True
-    if linspace != "":
-        source = "linspace"
-        if dtype == "auto" or dtype == "":
-            dtype = "float64"
-        dtype = _native_array_normalize_dtype(dtype)
-        result = _native_array_linspace(linspace, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    elif eye != "":
-        source = "eye"
-        if dtype == "auto" or dtype == "":
-            dtype = "float64"
-        dtype = _native_array_normalize_dtype(dtype)
-        result = _native_array_eye(eye, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    elif zeros != "":
-        source = "zeros"
-        if dtype == "auto" or dtype == "":
-            dtype = "float64"
-        dtype = _native_array_normalize_dtype(dtype)
-        shape = _native_array_parse_shape(zeros)
-        result = _native_array_full(shape, "0", dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    elif ones != "":
-        source = "ones"
-        if dtype == "auto" or dtype == "":
-            dtype = "float64"
-        dtype = _native_array_normalize_dtype(dtype)
-        shape = _native_array_parse_shape(ones)
-        result = _native_array_full(shape, "1", dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    elif arange != "":
-        source = "arange"
-        if dtype == "auto" or dtype == "":
-            if _native_array_arange_uses_float(arange):
-                dtype = "float64"
-            else:
-                dtype = "int64"
-        dtype = _native_array_normalize_dtype(dtype)
-        result = _native_array_arange(arange, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    elif literal != "":
-        parsed = _native_array_literal_shape_and_diagnostics(literal)
-        shape = parsed[0]
-        diagnostics = parsed[1]
-        values = _native_array_literal_values(literal)
-        source = "literal"
-        if dtype == "auto" or dtype == "":
-            if _native_list_contains(diagnostics, "PCC-ARRAY-RAGGED"):
-                dtype = "object"
-            else:
-                dtype = _native_array_literal_dtype(literal)
-    else:
-        shape = _native_array_parse_shape(shape_text)
-    if require_rectangular and _native_list_contains(diagnostics, "PCC-ARRAY-RAGGED"):
-        diagnostics.append("PCC-ARRAY-REQUIRES-RECTANGULAR")
-    fill_dtype_auto = dtype == "auto" or dtype == ""
-    dtype = _native_array_normalize_dtype(dtype)
-    if literal == "" and arange == "" and fill is not None:
-        if fill_dtype_auto:
-            dtype = _native_array_literal_dtype(fill)
-        dtype = _native_array_normalize_dtype(dtype)
-        result = _native_array_full(shape, fill, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and values is not None:
-        values = _native_array_cast_values(values, dtype)
-    if literal != "" and zeros_like:
-        result = _native_array_full(shape, "0", dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and ones_like:
-        result = _native_array_full(shape, "1", dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and full_like != "":
-        result = _native_array_full(shape, full_like, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and unary != "":
-        result = _native_array_unary_op(shape, values, dtype, unary, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and clip != "":
-        result = _native_array_clip(shape, values, dtype, clip, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and broadcast_to != "":
-        base_shape = shape
-        result = _native_array_broadcast_to(
-            shape, values, dtype, broadcast_to, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        strides_override = result[3]
-        c_contiguous = result[4]
-        view = True
-        owns_data = False
-    if literal != "" and repeat != "":
-        result = _native_array_repeat(
-            shape, values, dtype, repeat, axis_text, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and tile != "":
-        tile_reps = _native_array_parse_shape(tile)
-        result = _native_array_tile_reps(shape, values, dtype, tile_reps, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and roll != "":
-        result = _native_array_roll(shape, values, dtype, roll, axis_text, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and rot90 != "":
-        old_shape = shape
-        old_dtype = dtype
-        result = _native_array_rot90(shape, values, dtype, rot90, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        base_shape = old_shape
-        strides_override = None
-        c_contiguous = True
-        if len(old_shape) == 2:
-            turns = int(rot90) % 4
-            itemsize = _native_array_dtype_itemsize(old_dtype)
-            stride0 = old_shape[1] * itemsize
-            stride1 = itemsize
-            if turns == 1:
-                strides_override = [-stride1, stride0]
-                c_contiguous = False
-            elif turns == 2:
-                strides_override = [-stride0, -stride1]
-                c_contiguous = False
-            elif turns == 3:
-                strides_override = [stride1, -stride0]
-                c_contiguous = False
-    if literal != "" and op != "":
-        if rhs == "":
-            rhs = "0"
-        result = _native_array_binary_op(shape, values, dtype, rhs, op, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and matmul != "":
-        result = _native_array_matmul(shape, values, dtype, matmul, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and concat != "":
-        result = _native_array_concat(
-            shape, values, dtype, concat, axis_text, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and stack != "":
-        result = _native_array_stack(
-            shape, values, dtype, stack, axis_text, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and compare != "":
-        if rhs == "":
-            rhs = "0"
-        result = _native_array_compare(shape, values, dtype, rhs, compare, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and index != "":
-        result = _native_array_index(shape, values, dtype, index, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and diagonal != "":
-        base_shape = shape
-        result = _native_array_diagonal(shape, values, dtype, diagonal, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        if len(base_shape) == 2:
-            itemsize = _native_array_dtype_itemsize(dtype)
-            strides_override = [(base_shape[1] + 1) * itemsize]
-            c_contiguous = len(shape) == 0 or shape[0] <= 1
-    if literal != "" and reshape != "":
-        base_shape = shape
-        result = _native_array_reshape(shape, values, dtype, reshape, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and ravel:
-        base_shape = shape
-        result = _native_array_ravel(shape, values, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and flatten:
-        result = _native_array_ravel(shape, values, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and flip:
-        old_shape = shape
-        result = _native_array_flip(shape, values, dtype, axis_text, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        base_shape = old_shape
-        itemsize = _native_array_dtype_itemsize(dtype)
-        if len(old_shape) == 1:
-            strides_override = [-itemsize]
-        elif len(old_shape) == 2:
-            stride0 = old_shape[1] * itemsize
-            stride1 = itemsize
-            axis_value_for_stride = _native_array_axis_value(axis_text)
-            if axis_value_for_stride == -999999:
-                stride0 = -stride0
-                stride1 = -stride1
-            else:
-                normalized_axis_for_stride = _native_array_axis_normalize(
-                    axis_value_for_stride, len(old_shape)
-                )
-                if normalized_axis_for_stride == 0:
-                    stride0 = -stride0
-                elif normalized_axis_for_stride == 1:
-                    stride1 = -stride1
-            strides_override = [stride0, stride1]
-        else:
-            strides_override = None
-        c_contiguous = len(old_shape) == 0
-    if literal != "" and transpose:
-        base_shape = shape
-        old_shape = shape
-        old_dtype = dtype
-        result = _native_array_transpose(shape, values, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        if len(old_shape) == 2:
-            itemsize = _native_array_dtype_itemsize(old_dtype)
-            strides_override = [itemsize, old_shape[1] * itemsize]
-            c_contiguous = False
-    if literal != "" and swapaxes != "":
-        base_shape = shape
-        old_shape = shape
-        old_dtype = dtype
-        result = _native_array_swapaxes(shape, values, dtype, swapaxes, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        strides_override = None
-        c_contiguous = True
-        if len(old_shape) == 2 and shape != old_shape:
-            itemsize = _native_array_dtype_itemsize(old_dtype)
-            strides_override = [itemsize, old_shape[1] * itemsize]
-            c_contiguous = False
-    if literal != "" and moveaxis != "":
-        base_shape = shape
-        old_shape = shape
-        old_dtype = dtype
-        result = _native_array_moveaxis(shape, values, dtype, moveaxis, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        strides_override = None
-        c_contiguous = True
-        if len(old_shape) == 2 and shape != old_shape:
-            itemsize = _native_array_dtype_itemsize(old_dtype)
-            strides_override = [itemsize, old_shape[1] * itemsize]
-            c_contiguous = False
-    if literal != "" and squeeze:
-        base_shape = shape
-        result = _native_array_squeeze(
-            shape, values, dtype, squeeze_axis_text, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and expand_dims_text != "":
-        base_shape = shape
-        result = _native_array_expand_dims(
-            shape, values, dtype, expand_dims_text, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = True
-        owns_data = False
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and reduce_name != "":
-        result = _native_array_reduce(
-            shape, values, dtype, reduce_name, axis_text, keepdims, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and argreduce_name != "":
-        result = _native_array_arg_reduce(
-            shape, values, dtype, argreduce_name, axis_text, keepdims, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and count_nonzero:
-        result = _native_array_count_nonzero(
-            shape, values, dtype, axis_text, keepdims, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-    if literal != "" and nonzero:
-        result = _native_array_nonzero(shape, values, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and argwhere:
-        result = _native_array_argwhere(shape, values, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and flatnonzero:
-        result = _native_array_flatnonzero(shape, values, dtype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and cumulative != "":
-        result = _native_array_cumulative(
-            shape, values, dtype, cumulative, axis_text, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and sort_value:
-        result = _native_array_sort(shape, values, dtype, axis_text, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and argsort_value:
-        result = _native_array_argsort(shape, values, dtype, axis_text, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and searchsorted != "":
-        result = _native_array_searchsorted(
-            shape, values, dtype, searchsorted, search_side, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and partition != "":
-        result = _native_array_partition(
-            shape, values, dtype, partition, axis_text, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and argpartition != "":
-        result = _native_array_argpartition(
-            shape, values, dtype, argpartition, axis_text, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and take != "":
-        result = _native_array_take(shape, values, dtype, take, axis_text, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and put != "":
-        result = _native_array_put(shape, values, dtype, put, put_values, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and putmask != "":
-        result = _native_array_putmask(
-            shape, values, dtype, putmask, putmask_values, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and mask != "":
-        result = _native_array_mask(shape, values, dtype, mask, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and compress != "":
-        result = _native_array_compress(
-            shape, values, dtype, compress, axis_text, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and where != "":
-        if otherwise == "":
-            otherwise = "0"
-        result = _native_array_where(
-            where, shape, values, dtype, otherwise, diagnostics
-        )
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and astype != "":
-        result = _native_array_astype(shape, values, dtype, astype, diagnostics)
-        shape = result[0]
-        values = result[1]
-        dtype = result[2]
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    if literal != "" and copy_value:
-        values = _native_array_copy_values(values)
-        view = False
-        owns_data = True
-        base_shape = None
-        strides_override = None
-        c_contiguous = True
-    report = _native_array_core_json(
-        shape,
-        dtype,
-        source,
-        diagnostics,
-        values,
-        fill,
-        arange,
-        zeros,
-        ones,
-        zeros_like,
-        ones_like,
-        full_like,
-        eye,
-        linspace,
-        op,
-        rhs,
-        matmul,
-        concat,
-        stack,
-        unary,
-        clip,
-        broadcast_to,
-        repeat,
-        tile,
-        roll,
-        rot90,
-        compare,
-        index,
-        diagonal,
-        reshape,
-        ravel,
-        flatten,
-        flip,
-        transpose,
-        swapaxes,
-        moveaxis,
-        squeeze,
-        squeeze_axis_text,
-        expand_dims_text,
-        reduce_name,
-        argreduce_name,
-        count_nonzero,
-        nonzero,
-        argwhere,
-        flatnonzero,
-        cumulative,
-        sort_value,
-        argsort_value,
-        searchsorted,
-        search_side,
-        partition,
-        argpartition,
-        axis_text,
-        keepdims,
-        take,
-        put,
-        put_values,
-        putmask,
-        putmask_values,
-        mask,
-        compress,
-        where,
-        otherwise,
-        astype,
-        copy_value,
-        view,
-        owns_data,
-        base_shape,
-        strides_override,
-        c_contiguous,
-    )
-    _write_text(report)
-    return 2 if _native_find_from(report, '"ok": false', 0) >= 0 else 0
 
 
 def _native_find_tool_json(names, search_paths):
@@ -8039,7 +5455,7 @@ def _native_probe_tool(path: str, name: str):
     )
     ok = True
     try:
-        subprocess.run(["/bin/sh", "-c", command], check=True)
+        _bootstrap_subprocess_run(["/bin/sh", "-c", command], check=True)
     except Exception as exc:
         ok = False
     try:
@@ -8048,7 +5464,7 @@ def _native_probe_tool(path: str, name: str):
     except Exception:
         output = ""
     try:
-        subprocess.run(["rm", "-f", output_path], check=True)
+        _bootstrap_subprocess_run(["rm", "-f", output_path], check=True)
     except Exception:
         pass
     return [ok, output.strip()]
@@ -8442,41 +5858,140 @@ def _run_native_package_toolchain_from_pcc1(module_args) -> int:
     return 0
 
 
-def _native_text_has_libpython(text: str) -> bool:
-    lower = text.lower()
+def _native_ascii_digit(ch: str) -> bool:
+    return "0" <= ch and ch <= "9"
+
+
+def _native_libpython_sep_char(ch: str) -> bool:
+    # The host separator class [\s/:=,-] from linkage._LIBPYTHON_PATTERNS
+    # (\v/\f omitted: platform tool output never contains them).
     return (
-        _native_find_from(lower, "libpython", 0) >= 0
-        or _native_find_from(lower, "-lpython", 0) >= 0
-        or _native_find_from(lower, "python.framework", 0) >= 0
-        or _native_find_from(lower, ".dll", 0) >= 0
-        and _native_find_from(lower, "python", 0) >= 0
+        ch == " "
+        or ch == "\t"
+        or ch == "\n"
+        or ch == "\r"
+        or ch == "/"
+        or ch == ":"
+        or ch == "="
+        or ch == ","
+        or ch == "-"
     )
 
 
-def _native_libpython_edge(text: str) -> str:
+def _native_version_digits_end(text: str, start: int) -> int:
+    """Consume the host version-suffix shape ``\\d*(\\.\\d+)*`` from start."""
+    end = start
+    n = len(text)
+    while end < n and _native_ascii_digit(text[end]):
+        end += 1
+    while end + 1 < n and text[end] == "." and _native_ascii_digit(text[end + 1]):
+        end += 2
+        while end < n and _native_ascii_digit(text[end]):
+            end += 1
+    return end
+
+
+def _native_libpython_match_span(text: str):
+    """First host-parity libpython edge as ``[start, end]``, or ``[-1, -1]``.
+
+    Detection mirrors linkage._LIBPYTHON_PATTERNS exactly:
+      1. ``libpython`` must be preceded by start-or-separator AND followed by
+         a version digit. pcc's own runtime diagnostic literal
+         ``[pcc-native/no-libpython]`` is embedded in every artifact that
+         links libpy_runtime.a, so the previous bare-substring match flagged
+         every pcc-native artifact as libpython-linked (false PCC-PKG-003).
+      2. ``-lpython`` is a linker flag: start-or-whitespace before, version
+         digits optional.
+      3. ``Python.framework`` is case-sensitive with separator boundaries on
+         both sides.
+      4. ``python<digits>.dll`` for Windows probe lines.
+    The edge slice starts at the marker itself (the host regex group may keep
+    one leading separator character; the gates compare detection, not the
+    edge spelling).
+    """
     lower = text.lower()
-    for marker in ("libpython", "-lpython", "python.framework", "python"):
-        idx = _native_find_from(lower, marker, 0)
-        if idx >= 0:
-            end = idx
-            while end < len(text):
-                ch = text[end]
-                if ch == " " or ch == "\n" or ch == "\t" or ch == '"' or ch == "'":
-                    break
-                end += 1
-            return text[idx:end]
-    return "libpython"
+    n = len(text)
+    idx = _native_find_from(lower, "libpython", 0)
+    while idx >= 0:
+        if idx == 0 or _native_libpython_sep_char(text[idx - 1]):
+            digits = idx + 9
+            if digits < n and _native_ascii_digit(text[digits]):
+                return [idx, _native_version_digits_end(text, digits)]
+        idx = _native_find_from(lower, "libpython", idx + 1)
+    idx = _native_find_from(lower, "-lpython", 0)
+    while idx >= 0:
+        prev_ok = idx == 0
+        if idx > 0:
+            ch = text[idx - 1]
+            prev_ok = ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+        if prev_ok:
+            return [idx, _native_version_digits_end(text, idx + 8)]
+        idx = _native_find_from(lower, "-lpython", idx + 1)
+    pos = _native_find_from(text, "Python.framework", 0)
+    while pos >= 0:
+        lead_ok = pos == 0 or _native_libpython_sep_char(text[pos - 1])
+        end = pos + 16
+        tail_ok = end >= n
+        if not tail_ok:
+            ch = text[end]
+            tail_ok = (
+                ch == "/"
+                or ch == " "
+                or ch == "\t"
+                or ch == "\n"
+                or ch == "\r"
+                or ch == ":"
+                or ch == "="
+                or ch == ","
+                or ch == "-"
+            )
+        if lead_ok and tail_ok:
+            return [pos, end]
+        pos = _native_find_from(text, "Python.framework", pos + 1)
+    idx = _native_find_from(lower, "python", 0)
+    while idx >= 0:
+        digits = idx + 6
+        if digits < n and _native_ascii_digit(text[digits]):
+            end = _native_version_digits_end(text, digits)
+            if (
+                end + 4 <= n
+                and lower[end] == "."
+                and lower[end + 1] == "d"
+                and lower[end + 2] == "l"
+                and lower[end + 3] == "l"
+            ):
+                return [idx, end + 4]
+        idx = _native_find_from(lower, "python", idx + 1)
+    return [-1, -1]
+
+
+def _native_text_has_libpython(text: str) -> bool:
+    span = _native_libpython_match_span(text)
+    return span[0] >= 0
+
+
+def _native_libpython_edge(text: str) -> str:
+    span = _native_libpython_match_span(text)
+    if span[0] >= 0:
+        return text[span[0] : span[1]]
+    return ""
 
 
 def _native_libpython_grep_pattern() -> str:
-    return "libpython|-lpython|Python[.]framework|python[0-9.]*[.]dll"
+    # Digit-aware prefilter so ``grep -m 1`` surfaces a real edge line rather
+    # than pcc's own "[pcc-native/no-libpython]" diagnostic;
+    # _native_libpython_match_span stays the authoritative check on the line.
+    return (
+        "libpython[0-9]|-lpython|Python[.]framework([/[:space:]:=,-]|$)"
+        "|python[0-9][0-9.]*[.]dll"
+    )
 
 
 def _native_command_output_line(command: str, label: str) -> str:
     output_path = "/tmp/pcc_" + label + "_" + str(os.getpid())
     redirected = command + " > " + _native_shell_quote(output_path) + " 2>/dev/null"
     try:
-        subprocess.run(["/bin/sh", "-c", redirected], check=True)
+        _bootstrap_subprocess_run(["/bin/sh", "-c", redirected], check=True)
     except Exception:
         pass
     try:
@@ -8485,7 +6000,7 @@ def _native_command_output_line(command: str, label: str) -> str:
     except Exception:
         text = ""
     try:
-        subprocess.run(["rm", "-f", output_path], check=True)
+        _bootstrap_subprocess_run(["rm", "-f", output_path], check=True)
     except Exception:
         pass
     pos = _native_find_from(text, "\n", 0)
@@ -8551,25 +6066,25 @@ def _native_archive_mentions_libpython(path: str) -> str:
         "/tmp/pcc-linkage-scan-" + _native_basename(path) + "." + str(os.getpid())
     )
     try:
-        subprocess.run(["rm", "-rf", extract_root], check=True)
-        subprocess.run(["mkdir", "-p", extract_root], check=True)
+        _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", extract_root], check=True)
         if lower.endswith(".whl") or lower.endswith(".zip"):
-            subprocess.run(
+            _bootstrap_subprocess_run(
                 ["env", "LC_ALL=C", "LANG=C", "unzip", "-q", path, "-d", extract_root],
                 check=True,
             )
         else:
-            subprocess.run(
+            _bootstrap_subprocess_run(
                 ["env", "LC_ALL=C", "LANG=C", "tar", "-xf", path, "-C", extract_root],
                 check=True,
             )
         edges = _native_linkage_edges_for_root(extract_root)
-        subprocess.run(["rm", "-rf", extract_root], check=True)
+        _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
         if len(edges) > 0:
             return edges[0]
     except Exception:
         try:
-            subprocess.run(["rm", "-rf", extract_root], check=True)
+            _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
         except Exception:
             pass
     return ""
@@ -8623,15 +6138,15 @@ def _native_archive_uses_cpython_extension_abi(path: str) -> bool:
         "/tmp/pcc-linkage-abi-scan-" + _native_basename(path) + "." + str(os.getpid())
     )
     try:
-        subprocess.run(["rm", "-rf", extract_root], check=True)
-        subprocess.run(["mkdir", "-p", extract_root], check=True)
+        _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", extract_root], check=True)
         if lower.endswith(".whl") or lower.endswith(".zip"):
-            subprocess.run(
+            _bootstrap_subprocess_run(
                 ["env", "LC_ALL=C", "LANG=C", "unzip", "-q", path, "-d", extract_root],
                 check=True,
             )
         else:
-            subprocess.run(
+            _bootstrap_subprocess_run(
                 ["env", "LC_ALL=C", "LANG=C", "tar", "-xf", path, "-C", extract_root],
                 check=True,
             )
@@ -8639,13 +6154,13 @@ def _native_archive_uses_cpython_extension_abi(path: str) -> bool:
         i = 0
         while i < len(artifacts):
             if _native_name_uses_cpython_extension_abi(artifacts[i]):
-                subprocess.run(["rm", "-rf", extract_root], check=True)
+                _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
                 return True
             i += 1
-        subprocess.run(["rm", "-rf", extract_root], check=True)
+        _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
     except Exception:
         try:
-            subprocess.run(["rm", "-rf", extract_root], check=True)
+            _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
         except Exception:
             pass
     return False
@@ -8749,20 +6264,65 @@ def _native_linkage_diagnostics_json(edges, cpython_abi_paths=None) -> str:
     return diagnostics
 
 
+def _native_capability_profile_json(
+    abi_mode: str,
+    has_artifact_scan: bool,
+    links_libpython: bool,
+    uses_cpython_extension_abi: bool,
+) -> str:
+    profile = capability_profile(
+        abi_mode,
+        has_artifact_scan,
+        links_libpython,
+        uses_cpython_extension_abi,
+    )
+    out = "{"
+    out += '"execution_mode": ' + _json_str(profile["execution_mode"])
+    out += ', "native_package_claim": ' + (
+        "true" if profile["native_package_claim"] else "false"
+    )
+    out += ', "no_libpython_runtime": ' + (
+        "true" if profile["no_libpython_runtime"] else "false"
+    )
+    out += "}"
+    return out
+
+
 def _native_linkage_json(artifacts, roots, commands, abi_mode: str) -> str:
     edges = []
     cpython_abi_paths = []
     scans = "["
+    scan_count = 0
 
     def add_scan(kind: str, path, edge: str, uses_cpython_abi: bool) -> None:
-        nonlocal scans
+        nonlocal scans, scan_count
+        scan_count += 1
+        # PKG-P0-ABI-MODE-LABELS: mirror linkage_report's per-scan labels so a
+        # pcc1 no-libpython linkage result carries the same explicit
+        # execution-mode labels as the in-process report. Generic mapping from
+        # abi_mode only (no package-name special cases): libpython /
+        # cpython-compat -> cpython-compat, otherwise pcc-native. A single scan
+        # earns native_package_claim only under pcc-native with no libpython
+        # edge and no CPython-ABI usage.
+        scan_execution_mode = (
+            "cpython-compat"
+            if (abi_mode == "libpython" or abi_mode == "cpython-compat")
+            else "pcc-native"
+        )
+        scan_native_package_claim = (
+            abi_mode == "pcc-native" and not edge and not uses_cpython_abi
+        )
         if scans != "[":
             scans += ", "
         scans += "{"
-        scans += '"kind": ' + _json_str(kind)
+        scans += '"execution_mode": ' + _json_str(scan_execution_mode)
+        scans += ', "kind": ' + _json_str(kind)
         scans += ', "link_libpython_edges": '
         scans += _json_str_list([edge] if edge else [])
         scans += ', "links_libpython": ' + ("true" if edge else "false")
+        scans += ', "native_package_claim": ' + (
+            "true" if scan_native_package_claim else "false"
+        )
         scans += ', "path": ' + _json_str_or_null(path)
         scans += ', "uses_cpython_extension_abi": ' + (
             "true" if uses_cpython_abi else "false"
@@ -8819,6 +6379,22 @@ def _native_linkage_json(artifacts, roots, commands, abi_mode: str) -> str:
 
     links = len(edges) > 0
     uses_cpython_abi = len(cpython_abi_paths) > 0
+    # PKG-P0-ABI-MODE-LABELS: additive top-level execution-mode labels that
+    # mirror the in-process linkage_report. execution_mode is derived from
+    # abi_mode alone; native_package_claim is True only when a pcc-native scan
+    # produced no libpython edge and no CPython-ABI usage (a PCC-PKG-003/004
+    # finding keeps it False). No existing key is renamed or removed.
+    execution_mode = (
+        "cpython-compat"
+        if (abi_mode == "libpython" or abi_mode == "cpython-compat")
+        else "pcc-native"
+    )
+    native_package_claim = (
+        abi_mode == "pcc-native"
+        and scan_count > 0
+        and not links
+        and not uses_cpython_abi
+    )
     ok = ((not links) or abi_mode == "libpython") and (
         (not uses_cpython_abi)
         or abi_mode == "libpython"
@@ -8826,10 +6402,15 @@ def _native_linkage_json(artifacts, roots, commands, abi_mode: str) -> str:
     )
     out = "{"
     out += '"abi_mode": ' + _json_str(abi_mode)
+    out += ', "capability_profile": ' + _native_capability_profile_json(
+        abi_mode, scan_count > 0, links, uses_cpython_abi
+    )
     out += ', "cpython_extension_abi_paths": ' + _json_str_list(cpython_abi_paths)
     out += ', "diagnostics": ' + diagnostics
+    out += ', "execution_mode": ' + _json_str(execution_mode)
     out += ', "link_libpython_edges": ' + _json_str_list(edges)
     out += ', "links_libpython": ' + ("true" if links else "false")
+    out += ', "native_package_claim": ' + ("true" if native_package_claim else "false")
     out += ', "no_libpython_runtime": ' + (
         "true"
         if (not links and not uses_cpython_abi and abi_mode == "pcc-native")
@@ -8910,18 +6491,30 @@ def _native_str_equal(left: str, right: str) -> bool:
 
 
 def _native_wheel_tag_fields(path: str):
-    base = _native_basename(path)
-    stem = _native_strip_repo_suffix(base)
-    parts = stem.split("-")
-    if len(parts) >= 5 and path.lower().endswith(".whl"):
-        return [
-            parts[0],
-            parts[len(parts) - 3],
-            parts[len(parts) - 2],
-            parts[len(parts) - 1],
-        ]
-    name = parts[0] if len(parts) > 0 else stem
-    return [name, "", "", ""]
+    return wheel_tag_fields(path)
+
+
+def _native_wheel_tags_json(path) -> str:
+    # Honest wheel-tag object for an install manifest. Derived from the
+    # resolved artifact name via the existing wheel-tag splitter; a non-wheel
+    # (package name / sdist / short filename) yields explicit ``null`` tags
+    # rather than an invented tag triple.
+    if path is None:
+        return '{"abi_tag": null, "platform_tag": null, "python_tag": null}'
+    fields = _native_wheel_tag_fields(path)
+    python_tag = fields[1]
+    abi_tag = fields[2]
+    platform_tag = fields[3]
+    out = "{"
+    out += '"abi_tag": ' + _json_str_or_null(abi_tag if abi_tag != "" else None)
+    out += ', "platform_tag": ' + _json_str_or_null(
+        platform_tag if platform_tag != "" else None
+    )
+    out += ', "python_tag": ' + _json_str_or_null(
+        python_tag if python_tag != "" else None
+    )
+    out += "}"
+    return out
 
 
 def _native_collect_repo_artifacts(root: str):
@@ -8977,7 +6570,7 @@ def _native_wheel_repository_json(
     copied = []
     if len(add_artifacts) > 0:
         try:
-            subprocess.run(["mkdir", "-p", repo_root], check=True)
+            _bootstrap_subprocess_run(["mkdir", "-p", repo_root], check=True)
         except Exception:
             pass
         i = 0
@@ -8987,7 +6580,7 @@ def _native_wheel_repository_json(
             if os.path.isfile(source):
                 try:
                     if not _native_str_equal(source, dest):
-                        subprocess.run(["cp", source, dest], check=True)
+                        _bootstrap_subprocess_run(["cp", source, dest], check=True)
                     copied.append(dest)
                 except Exception:
                     pass
@@ -9074,7 +6667,7 @@ def _native_wheel_repository_json(
     manifest_path = None
     if write_manifest:
         try:
-            subprocess.run(["mkdir", "-p", repo_root], check=True)
+            _bootstrap_subprocess_run(["mkdir", "-p", repo_root], check=True)
             manifest_path = repo_root + "/pcc-wheel-repository.json"
             out_preview = "{"
             out_preview += '"artifact_count": ' + str(artifact_count)
@@ -9323,6 +6916,7 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
     if dry_run == 0:
         installs = "["
         all_ok = True
+        unresolved_bare = []
         k = 0
         while k < len(packages):
             if k > 0:
@@ -9337,13 +6931,49 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
             )
             if _native_find_from(install_json, '"ok": false', 0) >= 0:
                 all_ok = False
+                # A failed bare requirement name that never resolved to a
+                # local source/artifact (no "source_path" in the manifest)
+                # means the package needed network acquisition, which pcc's
+                # local-installer pip deliberately does not perform. A
+                # resolved-but-failed build must NOT get this hint. Mirrors
+                # pip_shim._acquire_delegation_hint; see
+                # docs/design/pcc-package-model.md.
+                spec = packages[k]
+                looks_local = False
+                if _native_find_from(spec, "/", 0) >= 0:
+                    looks_local = True
+                if spec.startswith("."):
+                    looks_local = True
+                if spec.endswith(".whl") or spec.endswith(".tar.gz"):
+                    looks_local = True
+                if _native_find_from(install_json, '"source_path"', 0) >= 0:
+                    looks_local = True
+                if not looks_local:
+                    unresolved_bare.append(spec)
             installs += install_json
             k += 1
         installs += "]"
         out = "{"
         out += '"command": "install"'
         out += ', "abi": ' + _json_str(abi)
+        if len(unresolved_bare) > 0:
+            names = " ".join(unresolved_bare)
+            out += ', "acquire_hint": ' + _json_str(
+                "acquire first with a host tool, then install locally: "
+                + "python3 -m pip download "
+                + names
+                + " -d ./wheels && pcc -m pip install "
+                + names
+                + " --find-links ./wheels"
+            )
         out += ', "dry_run": false'
+        if len(unresolved_bare) > 0:
+            out += ', "error": ' + _json_str(
+                "cannot resolve locally: "
+                + " ".join(unresolved_bare)
+                + " (pcc's pip is a local installer; it does not download"
+                + " from PyPI)"
+            )
         out += ', "find_links": ' + _json_str_list(find_links)
         out += ', "index_urls": ' + _json_str_list(index_urls)
         out += ', "installs": ' + installs
@@ -9410,7 +7040,7 @@ def _native_package_basename(spec: str) -> str:
         if base.endswith(suffix):
             base = base[: -len(suffix)]
     if "-" in base:
-        return base.split("-")[0]
+        base = base.split("-")[0]
     return base or "package"
 
 
@@ -9424,8 +7054,8 @@ def _native_artifact_project_name(path: str) -> str:
         if base.endswith(suffix):
             base = base[: -len(suffix)]
     if "-" in base:
-        return base.split("-")[0]
-    return base
+        base = base.split("-")[0]
+    return _native_normalized_package_name(base)
 
 
 def _native_artifact_version_text(path: str) -> str:
@@ -9808,8 +7438,8 @@ def _native_find_index_artifact_result(spec: str, cache_dir, index_urls, abi: st
     best_name = ""
     best_reason = ""
     try:
-        subprocess.run(["mkdir", "-p", scratch], check=True)
-        subprocess.run(["mkdir", "-p", downloads], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", scratch], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", downloads], check=True)
     except Exception:
         return [None, None]
     i = 0
@@ -9982,10 +7612,10 @@ def _native_artifact_requires_dist(source, scratch_root: str):
         return []
     extract_root = scratch_root + "/" + _native_package_basename(source) + ".deps"
     try:
-        subprocess.run(["rm", "-rf", extract_root], check=True)
-        subprocess.run(["mkdir", "-p", extract_root], check=True)
+        _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", extract_root], check=True)
         if is_zip:
-            subprocess.run(
+            _bootstrap_subprocess_run(
                 [
                     "env",
                     "LC_ALL=C",
@@ -9999,16 +7629,16 @@ def _native_artifact_requires_dist(source, scratch_root: str):
                 check=True,
             )
         else:
-            subprocess.run(
+            _bootstrap_subprocess_run(
                 ["env", "LC_ALL=C", "LANG=C", "tar", "-xf", source, "-C", extract_root],
                 check=True,
             )
         deps = _native_requires_from_tree(extract_root)
-        subprocess.run(["rm", "-rf", extract_root], check=True)
+        _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
         return deps
     except Exception:
         try:
-            subprocess.run(["rm", "-rf", extract_root], check=True)
+            _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
         except Exception:
             pass
         return []
@@ -10162,8 +7792,8 @@ def _native_prepare_build_tools(root: str) -> str:
         return ""
     tool_dir = "/tmp/pcc_build_tools_" + str(os.getpid())
     try:
-        subprocess.run(["rm", "-rf", tool_dir], check=True)
-        subprocess.run(["mkdir", "-p", tool_dir], check=True)
+        _bootstrap_subprocess_run(["rm", "-rf", tool_dir], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", tool_dir], check=True)
         script = "#!/bin/sh\n"
         script += "exec uv run --with " + _native_shell_quote(requirement)
         script += ' cython "$@"\n'
@@ -10171,7 +7801,7 @@ def _native_prepare_build_tools(root: str) -> str:
             path = tool_dir + "/" + name
             with open(path, "w") as fh:
                 fh.write(script)
-            subprocess.run(["chmod", "+x", path], check=True)
+            _bootstrap_subprocess_run(["chmod", "+x", path], check=True)
     except Exception:
         return ""
     return tool_dir
@@ -10185,7 +7815,7 @@ def _native_path_prefix(tool_dir: str) -> str:
 
 def _native_shell_command_succeeds(command: str) -> bool:
     try:
-        subprocess.run(["/bin/sh", "-c", command], check=True)
+        _bootstrap_subprocess_run(["/bin/sh", "-c", command], check=True)
         return True
     except Exception:
         return False
@@ -10273,13 +7903,13 @@ def _native_ensure_meson_build_outputs_json(source) -> str:
                     setup_command, "meson_setup"
                 )
                 try:
-                    subprocess.run(["mkdir", "-p", build_dir], check=True)
-                    subprocess.run(["/bin/sh", "-c", redirected[0]], check=True)
+                    _bootstrap_subprocess_run(["mkdir", "-p", build_dir], check=True)
+                    _bootstrap_subprocess_run(["/bin/sh", "-c", redirected[0]], check=True)
                     add_action("meson_setup", setup_command, "passed", 0)
                 except Exception:
                     add_action("meson_setup", setup_command, "failed", 127)
                 try:
-                    subprocess.run(["rm", "-f", redirected[1]], check=True)
+                    _bootstrap_subprocess_run(["rm", "-f", redirected[1]], check=True)
                 except Exception:
                     pass
         if ok and not skipped:
@@ -10290,18 +7920,18 @@ def _native_ensure_meson_build_outputs_json(source) -> str:
             )
             redirected = _native_redirected_shell_command(ninja_command, "meson_build")
             try:
-                subprocess.run(["/bin/sh", "-c", redirected[0]], check=True)
+                _bootstrap_subprocess_run(["/bin/sh", "-c", redirected[0]], check=True)
                 add_action("meson_build", ninja_command, "passed", 0)
             except Exception:
                 add_action("meson_build", ninja_command, "failed", 127)
             try:
-                subprocess.run(["rm", "-f", redirected[1]], check=True)
+                _bootstrap_subprocess_run(["rm", "-f", redirected[1]], check=True)
             except Exception:
                 pass
     finally:
         if tool_dir != "":
             try:
-                subprocess.run(["rm", "-rf", tool_dir], check=True)
+                _bootstrap_subprocess_run(["rm", "-rf", tool_dir], check=True)
             except Exception:
                 pass
 
@@ -10313,6 +7943,51 @@ def _native_ensure_meson_build_outputs_json(source) -> str:
     out += ', "skipped": ' + ("true" if skipped else "false")
     out += "}"
     return out
+
+
+def _native_name_endswith_any(name: str, suffixes) -> bool:
+    i = 0
+    while i < len(suffixes):
+        if name.endswith(suffixes[i]):
+            return True
+        i += 1
+    return False
+
+
+def _native_skip_importable_dir_name(name: str) -> bool:
+    if name.startswith(".") or name == "__pycache__":
+        return True
+    return _native_name_endswith_any(name, [".dist-info", ".egg-info"])
+
+
+def _native_has_direct_importable_payload(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    try:
+        names = sorted(os.listdir(path))
+    except Exception:
+        names = []
+    i = 0
+    while i < len(names):
+        child_name = names[i]
+        if (
+            not child_name.startswith(".")
+            and child_name != "__pycache__"
+            and child_name != "setup.py"
+        ):
+            child = os.path.join(path, child_name)
+            lower = child_name.lower()
+            if os.path.isfile(child) and (
+                lower.endswith(".py")
+                or lower.endswith(".pyi")
+                or lower.endswith(".so")
+                or lower.endswith(".pyd")
+                or lower.endswith(".dll")
+                or lower.endswith(".dylib")
+            ):
+                return True
+        i += 1
+    return False
 
 
 def _native_install_importable_payload(source, target: str, name: str) -> str:
@@ -10330,10 +8005,10 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
             extract_root = os.path.abspath(
                 os.path.join(target, "." + name + ".extract")
             )
-            subprocess.run(["rm", "-rf", extract_root], check=True)
-            subprocess.run(["mkdir", "-p", extract_root], check=True)
+            _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
+            _bootstrap_subprocess_run(["mkdir", "-p", extract_root], check=True)
             if is_zip:
-                subprocess.run(
+                _bootstrap_subprocess_run(
                     [
                         "env",
                         "LC_ALL=C",
@@ -10347,7 +8022,7 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
                     check=True,
                 )
             else:
-                subprocess.run(
+                _bootstrap_subprocess_run(
                     [
                         "env",
                         "LC_ALL=C",
@@ -10363,26 +8038,50 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
             install_root = _native_install_importable_payload(
                 extract_root, target, name
             )
-            subprocess.run(["rm", "-rf", extract_root], check=True)
+            _bootstrap_subprocess_run(["rm", "-rf", extract_root], check=True)
             return install_root
     if source is None or not os.path.isdir(source):
-        subprocess.run(["mkdir", "-p", install_root], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", install_root], check=True)
         return install_root
 
-    subprocess.run(["mkdir", "-p", target], check=True)
+    _bootstrap_subprocess_run(["mkdir", "-p", target], check=True)
     copied = False
+    first_install_root = ""
+
+    def remember_install_root(dest: str) -> None:
+        nonlocal first_install_root
+        # ``installed_path`` is also the manifest directory.  A source project
+        # may ship top-level helper modules (for example a docs ``conf.py``)
+        # alongside its real package directory; never select a copied file as
+        # that directory.
+        if first_install_root == "" and os.path.isdir(dest):
+            first_install_root = os.path.abspath(dest)
 
     def copy_payload(path: str) -> None:
         dest = os.path.join(target, os.path.basename(path))
-        subprocess.run(["rm", "-rf", dest], check=True)
-        subprocess.run(["cp", "-R", path, target], check=True)
+        if os.path.abspath(dest) == os.path.abspath(path):
+            # Payload already lives at the destination (e.g. re-recording a
+            # cache-resolved source into the same cache root). The ``rm -rf``
+            # below would delete the source itself before ``cp`` runs.
+            remember_install_root(dest)
+            return
+        _bootstrap_subprocess_run(["rm", "-rf", dest], check=True)
+        _bootstrap_subprocess_run(["cp", "-R", path, target], check=True)
+        remember_install_root(dest)
 
     def overlay_payload(path: str) -> None:
         dest = os.path.join(target, os.path.basename(path))
-        subprocess.run(["mkdir", "-p", dest], check=True)
-        subprocess.run(["cp", "-R", path + "/.", dest], check=True)
+        if os.path.abspath(dest) == os.path.abspath(path):
+            remember_install_root(dest)
+            return
+        _bootstrap_subprocess_run(["mkdir", "-p", dest], check=True)
+        _bootstrap_subprocess_run(["cp", "-R", path + "/.", dest], check=True)
+        remember_install_root(dest)
 
-    if os.path.isfile(os.path.join(source, "__init__.py")):
+    if os.path.isfile(os.path.join(source, "__init__.py")) or (
+        _native_has_direct_importable_payload(source)
+        and not _native_has_source_project_marker(source)
+    ):
         copy_payload(source)
         copied = True
     else:
@@ -10396,10 +8095,8 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
         while j < len(top_names):
             top_name = top_names[j]
             top_child = os.path.join(source, top_name)
-            if (
-                os.path.isdir(top_child)
-                and not top_name.startswith(".")
-                and top_name != "__pycache__"
+            if os.path.isdir(top_child) and not _native_skip_importable_dir_name(
+                top_name
             ):
                 visible_dirs.append(top_child)
             j += 1
@@ -10414,11 +8111,12 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
             except Exception:
                 names = []
             for child_name in names:
-                if child_name.startswith(".") or child_name == "__pycache__":
+                if _native_skip_importable_dir_name(child_name):
                     continue
                 child = os.path.join(base, child_name)
-                if os.path.isdir(child) and os.path.isfile(
-                    os.path.join(child, "__init__.py")
+                if os.path.isdir(child) and (
+                    os.path.isfile(os.path.join(child, "__init__.py"))
+                    or _native_has_direct_importable_payload(child)
                 ):
                     copy_payload(child)
                     copied = True
@@ -10428,8 +8126,9 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
                     and child_name != "setup.py"
                 ):
                     dest = os.path.join(target, child_name)
-                    subprocess.run(["rm", "-f", dest], check=True)
-                    subprocess.run(["cp", child, dest], check=True)
+                    _bootstrap_subprocess_run(["rm", "-f", dest], check=True)
+                    _bootstrap_subprocess_run(["cp", child, dest], check=True)
+                    remember_install_root(dest)
                     copied = True
     build_root = os.path.join(source, "build", "pcc-package", "meson-build")
     if os.path.isdir(build_root):
@@ -10443,18 +8142,156 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
             build_child = os.path.join(build_root, build_name)
             if (
                 os.path.isdir(build_child)
-                and not build_name.startswith(".")
-                and build_name != "__pycache__"
-                and os.path.isfile(os.path.join(build_child, "__init__.py"))
+                and not _native_skip_importable_dir_name(build_name)
+                and (
+                    os.path.isfile(os.path.join(build_child, "__init__.py"))
+                    or _native_has_direct_importable_payload(build_child)
+                )
             ):
                 overlay_payload(build_child)
                 copied = True
             b += 1
     if not copied:
-        subprocess.run(["mkdir", "-p", install_root], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", install_root], check=True)
+    elif first_install_root != "":
+        install_root = first_install_root
     elif not os.path.exists(install_root):
-        subprocess.run(["mkdir", "-p", install_root], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", install_root], check=True)
     return install_root
+
+
+def _native_is_source_archive(path) -> bool:
+    if path is None or os.path.isdir(path):
+        return False
+    lower = path.lower()
+    return (
+        lower.endswith(".tar.gz")
+        or lower.endswith(".tar.bz2")
+        or lower.endswith(".tar.xz")
+        or lower.endswith(".tgz")
+        or lower.endswith(".zip")
+    )
+
+
+def _native_has_source_project_marker(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, "pyproject.toml")) or os.path.isfile(
+        os.path.join(path, "setup.py")
+    )
+
+
+def _native_select_extracted_source_root(extract_root: str) -> str:
+    if _native_has_source_project_marker(extract_root):
+        return extract_root
+    try:
+        names = sorted(os.listdir(extract_root))
+    except Exception:
+        names = []
+    candidates = []
+    i = 0
+    while i < len(names):
+        path = os.path.join(extract_root, names[i])
+        if os.path.isdir(path) and _native_has_source_project_marker(path):
+            candidates.append(path)
+        i += 1
+    if len(candidates) == 1:
+        return candidates[0]
+    return extract_root
+
+
+def _native_prepare_install_source_tree(source, cache_root: str, name: str):
+    if source is None or os.path.isdir(source) or not _native_is_source_archive(source):
+        return [source, None]
+    staging = os.path.join(
+        os.path.abspath(cache_root),
+        ".pcc-source-build-" + _sanitize_tag(name) + "-" + str(os.getpid()),
+    )
+    try:
+        _bootstrap_subprocess_run(["rm", "-rf", staging], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", staging], check=True)
+        if source.lower().endswith(".zip"):
+            _bootstrap_subprocess_run(["unzip", "-q", source, "-d", staging], check=True)
+        else:
+            _bootstrap_subprocess_run(["tar", "-xf", source, "-C", staging], check=True)
+    except Exception:
+        return [source, None]
+    return [_native_select_extracted_source_root(staging), staging]
+
+
+def _native_cleanup_prepared_source(staging) -> None:
+    if staging is None or staging == "":
+        return
+    try:
+        _bootstrap_subprocess_run(["rm", "-rf", staging], check=True)
+    except Exception:
+        pass
+
+
+def _native_single_package_extension_target(root: str):
+    c_files = _native_collect_suffix_files(root, [".c"], True)
+    candidates = []
+    root_prefix = os.path.abspath(root)
+    if not root_prefix.endswith("/"):
+        root_prefix += "/"
+    i = 0
+    while i < len(c_files):
+        source = os.path.abspath(c_files[i])
+        parent = os.path.dirname(source)
+        while parent.startswith(root_prefix):
+            if os.path.isfile(os.path.join(parent, "__init__.py")):
+                relative_parent = parent[len(root_prefix) :]
+                stem = os.path.basename(source)
+                dot = stem.rfind(".")
+                if dot > 0:
+                    stem = stem[:dot]
+                output = stem + _native_pcc_extension_suffix()
+                if relative_parent != "":
+                    output = relative_parent + "/" + output
+                candidates.append([source, output])
+                break
+            next_parent = os.path.dirname(parent)
+            if next_parent == parent:
+                break
+            parent = next_parent
+        i += 1
+    if len(candidates) == 1 and len(c_files) == 1:
+        return candidates[0]
+    return None
+
+
+def _native_build_install_source_json(name: str, source, abi: str) -> str:
+    if source is None or not os.path.isdir(source):
+        return (
+            '{"actions": [], "ok": true, "reason": "not_source_tree", "skipped": true}'
+        )
+    if os.path.isfile(os.path.join(source, "meson.build")):
+        return _native_ensure_meson_build_outputs_json(source)
+    c_files = _native_collect_suffix_files(source, [".c"], True)
+    if len(c_files) == 0:
+        return '{"actions": [], "ok": true, "reason": "no_native_sources", "skipped": true}'
+    target = _native_single_package_extension_target(source)
+    if target is None:
+        return (
+            '{"actions": [], "diagnostics": '
+            '["PCC-PKG-EXTENSION-TARGET-AMBIGUOUS"], '
+            '"ok": false, "reason": "extension_target_ambiguous", "skipped": false}'
+        )
+    return _native_build_exec_json(
+        name,
+        source,
+        _native_path_search_dirs(),
+        [],
+        [],
+        True,
+        False,
+        False,
+        target[1],
+        [],
+        abi,
+        False,
+        False,
+        False,
+        False,
+    )
 
 
 def _native_install_manifest_json(
@@ -10472,7 +8309,23 @@ def _native_install_manifest_json(
     )
     source = resolved[0]
     resolved_from = resolved[1]
-    name = _native_package_basename(source if source is not None else spec)
+    if source is None and not os.path.exists(spec):
+        # Nothing resolved locally (not a path, not in find-links/cache).
+        # Mirror the host installer's not-found failure instead of
+        # fabricating an empty phantom install with ok:true — creating a
+        # bare site directory for an unresolved name was a fake success.
+        # See docs/design/pcc-package-model.md (acquire is delegated).
+        return (
+            '{"error": '
+            + _json_str("package artifact not found locally or in pcc cache")
+            + ', "ok": false, "spec": '
+            + _json_str(spec)
+            + "}"
+        )
+    if os.path.exists(spec):
+        name = _native_package_basename(source if source is not None else spec)
+    else:
+        name = _native_normalized_package_name(spec)
     target = (
         target_dir or os.environ.get("PCC_PACKAGE_SITE") or "/tmp/pcc-site-packages"
     )
@@ -10480,16 +8333,29 @@ def _native_install_manifest_json(
         cache_dir or os.environ.get("PCC_PACKAGE_CACHE") or "/tmp/pcc-package-cache"
     )
     cache_record = os.path.abspath(os.path.join(cache_root, name))
+    prepared_source = [source, None]
     try:
-        build_report = _native_ensure_meson_build_outputs_json(source)
+        prepared_source = _native_prepare_install_source_tree(source, cache_root, name)
+        install_source = prepared_source[0]
+        build_report = _native_build_install_source_json(name, install_source, abi)
         build_ok = _native_find_from(build_report, '"ok": false', 0) < 0
         install_root = _native_install_importable_payload(
-            source, os.path.abspath(target), name
+            install_source, os.path.abspath(target), name
         )
         link_edges = _native_linkage_edges_for_root(install_root)
         links_libpython = len(link_edges) > 0
         cpython_abi_paths = _native_cpython_extension_abi_paths_for_root(install_root)
         uses_cpython_abi = len(cpython_abi_paths) > 0
+        # Package repositories contain archives; installed package roots contain
+        # native libraries.  Use the linkage artifact scanner here so a built
+        # ``.so``/``.dylib``/``.dll`` can earn the linkage-only native claim.
+        native_artifact_count = len(_native_collect_artifacts(install_root))
+        linkage_native_package_claim = (
+            abi == "pcc-native"
+            and native_artifact_count > 0
+            and not links_libpython
+            and not uses_cpython_abi
+        )
         install_ok = (
             ((not links_libpython) or abi == "libpython")
             and (
@@ -10498,14 +8364,36 @@ def _native_install_manifest_json(
             and build_ok
         )
         if install_ok:
-            if source is not None and os.path.abspath(source) != cache_record:
+            # Re-record the payload into the cache only when the resolved
+            # source lives OUTSIDE the cache root. A cache-resolved source
+            # (spec name install, e.g. ``install demo_pkg`` after a direct
+            # install cached ``cache_root/demo_pkg``) must not be re-copied:
+            # ``copy_payload`` computes its destination from the payload
+            # BASENAME while ``cache_record`` uses the PEP-503 normalized
+            # name (``demo_pkg`` -> ``demo-pkg``), so the old
+            # ``source != cache_record`` guard let the copy run with
+            # dest == source and the ``rm -rf dest`` step deleted the
+            # cache entry before ``cp`` could read it.
+            source_in_cache_root = False
+            if install_source is not None:
+                source_parent = os.path.dirname(os.path.abspath(install_source))
+                if source_parent == os.path.abspath(cache_root):
+                    source_in_cache_root = True
+            if (
+                install_source is not None
+                and not source_in_cache_root
+                and os.path.abspath(install_source) != cache_record
+            ):
                 _native_install_importable_payload(
-                    source, os.path.abspath(cache_root), name
+                    install_source, os.path.abspath(cache_root), name
                 )
-            subprocess.run(["mkdir", "-p", cache_record], check=True)
+            _bootstrap_subprocess_run(["mkdir", "-p", cache_record], check=True)
         manifest_path = os.path.join(install_root, "pcc-package.json")
         manifest = "{"
         manifest += '"abi_mode": ' + _json_str(abi)
+        manifest += ', "capability_profile": ' + _native_capability_profile_json(
+            abi, native_artifact_count > 0, links_libpython, uses_cpython_abi
+        )
         manifest += ', "build_report": ' + build_report
         manifest += ', "cache_record": ' + _json_str(cache_record)
         manifest += ', "cpython_extension_abi_paths": ' + _json_str_list(
@@ -10514,25 +8402,40 @@ def _native_install_manifest_json(
         manifest += ', "diagnostics": ' + _native_linkage_diagnostics_json(
             link_edges, cpython_abi_paths
         )
+        manifest += ', "import_attempted": false'
+        manifest += ', "import_success": null'
+        manifest += ', "install_native_package_claim": false'
+        manifest += ', "install_success": ' + ("true" if install_ok else "false")
         manifest += ', "installed_path": ' + _json_str(install_root)
         manifest += ', "index_urls": ' + _json_str_list(index_urls)
         manifest += ', "link_libpython_edges": ' + _json_str_list(link_edges)
+        manifest += ', "linkage_native_package_claim": ' + (
+            "true" if linkage_native_package_claim else "false"
+        )
         manifest += ', "links_libpython": ' + ("true" if links_libpython else "false")
         manifest += ', "metadata": ' + _native_package_metadata_json(name, source)
         manifest += ', "name": ' + _json_str(name)
+        manifest += ', "native_package_claim": false'
         manifest += ', "no_libpython_runtime": ' + (
             "true"
             if (abi == "pcc-native" and not links_libpython and not uses_cpython_abi)
             else "false"
         )
         manifest += ', "ok": ' + ("true" if install_ok else "false")
+        manifest += ', "pcc_native_extension_suffix": ' + _json_str(
+            _native_pcc_extension_suffix()
+        )
         manifest += ', "pcc_native_wheel_tag": ' + _json_str(_native_pcc_wheel_tag())
-        manifest += ', "schema_version": 1'
+        manifest += ', "manifest_schema": ' + _json_str(PACKAGE_MANIFEST_SCHEMA)
+        manifest += ', "schema_version": ' + str(PACKAGE_MANIFEST_SCHEMA_VERSION)
         manifest += ', "source_path": ' + _json_str_or_null(source)
         manifest += ', "resolved_from": ' + _json_str_or_null(resolved_from)
         manifest += ', "spec": ' + _json_str(spec)
         manifest += ', "uses_cpython_extension_abi": ' + (
             "true" if uses_cpython_abi else "false"
+        )
+        manifest += ', "wheel_tags": ' + _native_wheel_tags_json(
+            source if source is not None else spec
         )
         manifest += "}"
         with open(manifest_path, "w", encoding="utf-8") as fh:
@@ -10542,16 +8445,31 @@ def _native_install_manifest_json(
                 os.path.join(cache_record, "pcc-package.json"), "w", encoding="utf-8"
             ) as fh:
                 fh.write(manifest)
+        _native_cleanup_prepared_source(prepared_source[1])
     except Exception:
+        _native_cleanup_prepared_source(prepared_source[1])
         return (
-            '{"error": "pcc1 package install failed", "name": '
+            '{"error": "pcc1 package install failed"'
+            + ', "import_attempted": false'
+            + ', "import_success": null'
+            + ', "install_native_package_claim": false'
+            + ', "install_success": false'
+            + ', "linkage_native_package_claim": false'
+            + ', "name": '
             + _json_str(name)
-            + ', "ok": false, "spec": '
+            + ', "native_package_claim": false'
+            + ', "ok": false'
+            + ', "spec": '
             + _json_str(spec)
+            + ', "wheel_tags": '
+            + _native_wheel_tags_json(source if source is not None else spec)
             + "}"
         )
     out = "{"
     out += '"abi_mode": ' + _json_str(abi)
+    out += ', "capability_profile": ' + _native_capability_profile_json(
+        abi, native_artifact_count > 0, links_libpython, uses_cpython_abi
+    )
     out += ', "build_report": ' + build_report
     out += ', "cache_record": ' + _json_str(cache_record)
     cpython_abi_paths = _native_cpython_extension_abi_paths_for_root(install_root)
@@ -10560,25 +8478,41 @@ def _native_install_manifest_json(
     out += ', "diagnostics": ' + _native_linkage_diagnostics_json(
         link_edges, cpython_abi_paths
     )
+    out += ', "import_attempted": false'
+    out += ', "import_success": null'
+    out += ', "install_native_package_claim": false'
+    out += ', "install_success": ' + ("true" if install_ok else "false")
     out += ', "installed_path": ' + _json_str(install_root)
     out += ', "index_urls": ' + _json_str_list(index_urls)
     out += ', "link_libpython_edges": ' + _json_str_list(link_edges)
+    out += ', "linkage_native_package_claim": ' + (
+        "true" if linkage_native_package_claim else "false"
+    )
     out += ', "links_libpython": ' + ("true" if links_libpython else "false")
     out += ', "manifest_path": ' + _json_str(
         os.path.join(install_root, "pcc-package.json")
     )
     out += ', "name": ' + _json_str(name)
+    out += ', "native_package_claim": false'
     out += ', "no_libpython_runtime": ' + (
         "true"
         if (abi == "pcc-native" and not links_libpython and not uses_cpython_abi)
         else "false"
     )
     out += ', "ok": ' + ("true" if install_ok else "false")
+    out += ', "manifest_schema": ' + _json_str(PACKAGE_MANIFEST_SCHEMA)
+    out += ', "schema_version": ' + str(PACKAGE_MANIFEST_SCHEMA_VERSION)
+    out += ', "pcc_native_extension_suffix": ' + _json_str(
+        _native_pcc_extension_suffix()
+    )
     out += ', "resolved_from": ' + _json_str_or_null(resolved_from)
     out += ', "source_path": ' + _json_str_or_null(source)
     out += ', "spec": ' + _json_str(spec)
     out += ', "uses_cpython_extension_abi": ' + (
         "true" if uses_cpython_abi else "false"
+    )
+    out += ', "wheel_tags": ' + _native_wheel_tags_json(
+        source if source is not None else spec
     )
     out += "}"
     return out
@@ -10656,7 +8590,144 @@ def _run_native_package_install_from_pcc1(module_args) -> int:
     return 2 if _native_find_from(result, '"ok": false', 0) >= 0 else 0
 
 
-def _run_host_python_module_from_pcc1(argv) -> int:
+def _split_module_name(module_name: str):
+    parts = []
+    current = ""
+    i = 0
+    while i < len(module_name):
+        ch = module_name[i]
+        if ch == ".":
+            if current == "":
+                return []
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+        i += 1
+    if current == "":
+        return []
+    parts.append(current)
+    return parts
+
+
+def _module_search_roots():
+    roots = []
+    cwd = os.getcwd()
+    roots.append(cwd)
+    env_path = os.environ.get("PYTHONPATH") or ""
+    item = ""
+    i = 0
+    while i <= len(env_path):
+        ch = env_path[i] if i < len(env_path) else os.pathsep
+        if ch == os.pathsep:
+            if item == "":
+                item = cwd
+            roots.append(item)
+            item = ""
+        else:
+            item += ch
+        i += 1
+    i = 0
+    while i < len(sys.path):
+        root = sys.path[i]
+        if root is None or root == "":
+            root = cwd
+        roots.append(str(root))
+        i += 1
+    return roots
+
+
+def _join_module_parts(root, parts):
+    path = root
+    i = 0
+    while i < len(parts):
+        path = os.path.join(path, parts[i])
+        i += 1
+    return path
+
+
+def _find_module_entry_source(module_name: str):
+    parts = _split_module_name(module_name)
+    if len(parts) == 0:
+        return (None, "invalid module name: " + module_name)
+    roots = _module_search_roots()
+    saw_package = False
+    i = 0
+    while i < len(roots):
+        root = roots[i]
+        base = _join_module_parts(root, parts)
+        package_main = os.path.join(base, "__main__.py")
+        if os.path.isfile(package_main):
+            return (package_main, None)
+        package_init = os.path.join(base, "__init__.py")
+        if os.path.isfile(package_init):
+            saw_package = True
+        module_file = base + ".py"
+        if os.path.isfile(module_file):
+            return (module_file, None)
+        i += 1
+    if saw_package:
+        return (None, "package has no __main__.py: " + module_name)
+    return (None, "module not found: " + module_name)
+
+
+def _run_compiled_python_module_from_pcc1(module_name: str, module_args) -> int:
+    src, err = _find_module_entry_source(module_name)
+    if src is None:
+        _write_text("Error: " + str(err), err=True)
+        return 1
+    root = os.environ.get("TMPDIR") or "/tmp"
+    scratch = os.path.join(root, "pcc1-module-" + str(os.getpid()))
+    try:
+        _bootstrap_subprocess_run(["mkdir", "-p", scratch], check=True)
+    except Exception:
+        _write_text(
+            "Error: pcc1 module runner could not create scratch directory", err=True
+        )
+        return 1
+    tag = _sanitize_tag(module_name)
+    exe = os.path.join(scratch, tag + ".out")
+    try:
+        observability = ObservabilityOptions(
+            diagnostic_format="text",
+            profile_json=None,
+            explain_fallback=False,
+            phase="python-module",
+            entry="pcc1 -m",
+        )
+    except ValueError:
+        _write_text(
+            "Error: pcc1 module runner failed to configure diagnostics", err=True
+        )
+        return 1
+    formatted_error = _observed_compile_python(
+        src,
+        exe,
+        options=observability,
+        metadata={"emit_llvm": False, "output_path": exe, "module": module_name},
+        verbose=False,
+        emit_llvm_only=False,
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+        backend="self",
+        python_library=False,
+    )
+    if formatted_error is not None:
+        return 1
+    cmd = [exe]
+    i = 0
+    while i < len(module_args):
+        cmd.append(module_args[i])
+        i += 1
+    try:
+        _bootstrap_subprocess_run(cmd, check=True)
+    except Exception:
+        _write_text("Error: pcc1 compiled module run failed", err=True)
+        return 1
+    return 0
+
+
+def _run_python_module_from_pcc1(argv) -> int:
     if len(argv) < 2:
         _write_text("Error: -m requires a module name", err=True)
         return 2
@@ -10708,27 +8779,43 @@ def _run_host_python_module_from_pcc1(argv) -> int:
         if len(module_args) > 0 and module_args[0] == "inspect":
             return _run_native_package_inspect_from_pcc1(module_args[1:])
         return _run_native_package_inspect_from_pcc1(module_args)
-    host = os.environ.get("PCC_HOST_PYTHON") or "python3"
-    # Keep this in the statement-only subprocess.run(check=True) shape that
-    # the self-host lowering handles natively; keyword env= reintroduces
-    # libpython fallback in the stage1 closure.
-    cmd = [
-        "env",
-        "PYTHONPATH=" + os.getcwd(),
-        host,
-        "-m",
-        module_name,
-    ]
-    i = 2
-    while i < len(argv):
-        cmd.append(argv[i])
-        i += 1
-    try:
-        subprocess.run(cmd, check=True)
-    except Exception:
-        _write_text("Error: pcc1 host python module run failed", err=True)
-        return 1
-    return 0
+    return _run_compiled_python_module_from_pcc1(module_name, module_args)
+
+
+def _run_python_module_from_pcc1_with_mode(argv, mode) -> int:
+    """Run a module request through its explicitly selected execution owner.
+
+    `auto`/`on` delegate to a generic CPython module subprocess. The pcc1
+    process remains no-libpython and the manifest does not claim otherwise.
+    `off` (including plain `-m`) keeps the native module runner unchanged.
+    """
+    if mode == "auto" or mode == "on":
+        _write_text(
+            "PCC1_COMPAT_RUNNER_MANIFEST: " + compat_runner_manifest_json(mode),
+            err=True,
+        )
+        compat_python = os.environ.get("PCC_COMPAT_PYTHON")
+        if not compat_python:
+            compat_python = os.environ.get("PCC_HOST_PYTHON") or "python3"
+        if compat_python == sys.executable:
+            _write_text(
+                "Error: compatibility Python points at this pcc1 binary; "
+                "refusing recursive module delegation",
+                err=True,
+            )
+            return 2
+        command = [compat_python]
+        i = 0
+        while i < len(argv):
+            command.append(argv[i])
+            i += 1
+        try:
+            _bootstrap_subprocess_run(command, check=True)
+        except Exception:
+            _write_text("Error: pcc1 CPython compatibility runner failed", err=True)
+            return 1
+        return 0
+    return _run_python_module_from_pcc1(argv)
 
 
 def _is_host_cli_c_indicator(arg) -> bool:
@@ -10797,7 +8884,7 @@ def _run_host_pcc_from_pcc1(argv) -> int:
         i += 1
 
     try:
-        subprocess.run(cmd, check=True)
+        _bootstrap_subprocess_run(cmd, check=True)
     except Exception:
         _write_text("Error: pcc1 host pcc delegation failed", err=True)
         return 1
@@ -10920,6 +9007,15 @@ def _json_seconds_from_ms(value) -> str:
 
 
 def _format_compile_error(exc, *, options, metadata):
+    diagnostic_span = None
+    original_exception_type = ""
+    if os.environ.get("PCC_DEBUG_CODEGEN_PHASES"):
+        try:
+            diagnostic_span = exc.diagnostic_span
+            original_exception_type = exc.original_exception_type
+        except Exception:
+            diagnostic_span = None
+            original_exception_type = ""
     if str(os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE", "") or "").strip().lower() in (
         "1",
         "true",
@@ -10949,7 +9045,10 @@ def _format_compile_error(exc, *, options, metadata):
         _write_text("debug: compile exception type=" + str(type(exc).__name__))
         _write_text("debug: compile exception args=" + repr(getattr(exc, "args", None)))
         _write_text("debug: compile exception repr=" + repr(exc))
-        _write_text("debug: compile traceback=" + ("; ".join(tb_lines) if tb_lines else "<none>"))
+        _write_text(
+            "debug: compile traceback="
+            + ("; ".join(tb_lines) if tb_lines else "<none>")
+        )
         cause = getattr(exc, "__cause__", None)
         if cause is not None:
             _write_text("debug: cause=" + repr(cause))
@@ -10975,11 +9074,32 @@ def _format_compile_error(exc, *, options, metadata):
     # runs this path inside the pcc-py runtime after arbitrary compiler
     # exceptions; probing type(exc).__name__ or repr(metadata) can itself
     # require dynamic attribute/dict formatting and mask the original error.
-    note = "exception_type=Exception"
+    note = "exception_type=" + (
+        str(original_exception_type) if original_exception_type else "Exception"
+    )
     if options.explain_fallback:
         note += (
             "; fallback_explain=libpython fallback is controlled by "
             "--python-libpython/PCC_PYTHON_LIBPYTHON"
+        )
+    span_json = ""
+    location = ""
+    if diagnostic_span is not None:
+        span_file = str(diagnostic_span.file)
+        span_line = int(diagnostic_span.line)
+        span_col = int(diagnostic_span.col)
+        span_end_line = int(diagnostic_span.end_line)
+        span_end_col = int(diagnostic_span.end_col)
+        location = span_file + ":" + str(span_line) + ":" + str(span_col) + ": "
+        span_json = (
+            ",\n"
+            '      "span": {\n'
+            '        "file": ' + _observability_json_str(span_file) + ",\n"
+            '        "line": ' + str(span_line) + ",\n"
+            '        "col": ' + str(span_col) + ",\n"
+            '        "end_line": ' + str(span_end_line) + ",\n"
+            '        "end_col": ' + str(span_end_col) + "\n"
+            "      }"
         )
     if options.diagnostic_format == "json" or options.diagnostic_format == "sarif":
         return (
@@ -10992,14 +9112,15 @@ def _format_compile_error(exc, *, options, metadata):
             '      "phase": ' + _observability_json_str(options.phase) + ",\n"
             '      "message": ' + _observability_json_str(message) + ",\n"
             '      "notes": [' + _observability_json_str(note) + "],\n"
-            '      "metadata": {}\n'
+            '      "metadata": {}' + span_json + "\n"
             "    }\n"
             "  ],\n"
             '  "has_errors": true\n'
             "}"
         )
     return (
-        "error: PCC-PY-COMPILE-001: ["
+        location
+        + "error: PCC-PY-COMPILE-001: ["
         + options.phase
         + "] "
         + message
@@ -11185,7 +9306,9 @@ def _observed_compile_python(
         )
         return None
     except Exception as exc:
-        if str(os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE", "") or "").strip().lower() in (
+        if str(
+            os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE", "") or ""
+        ).strip().lower() in (
             "1",
             "true",
             "yes",
@@ -11218,9 +9341,13 @@ def _observed_compile_python(
                 + ("; ".join(tb_lines) if tb_lines else "<unavailable>")
             )
             _write_text("debug: raw_exception_type=" + str(type(exc).__name__))
-            _write_text("debug: raw_exception_message=" + str(getattr(exc, "message", "")))
+            _write_text(
+                "debug: raw_exception_message=" + str(getattr(exc, "message", ""))
+            )
             try:
-                _write_text("debug: raw_exception_hint=" + repr(getattr(exc, "hint", None)))
+                _write_text(
+                    "debug: raw_exception_hint=" + repr(getattr(exc, "hint", None))
+                )
             except Exception:
                 pass
             _write_text("debug: raw_exception_args=" + repr(getattr(exc, "args", None)))
@@ -11249,7 +9376,7 @@ def _observed_compile_python(
 
 def _parse_python_libpython(value):
     lowered = (value or "").strip().lower()
-    if lowered not in ("auto", "on", "off"):
+    if lowered not in PYTHON_LIBPYTHON_CHOICES:
         raise ValueError(
             "invalid --python-libpython " f"{value!r}; expected auto, on, or off"
         )
@@ -11258,7 +9385,7 @@ def _parse_python_libpython(value):
 
 def _parse_ir_scaffold(value):
     lowered = (value or "").strip().lower()
-    if lowered not in ("auto", "on", "off"):
+    if lowered not in IR_SCAFFOLD_CHOICES:
         raise ValueError(
             "invalid --ir-scaffold " f"{value!r}; expected off, on, or auto"
         )
@@ -11476,10 +9603,39 @@ def bootstrap_cli_main(argv=None) -> int:
             )
             return 2
         return _run_python_multi_codegen_worker(raw_argv[1])
+    if len(raw_argv) > 0 and raw_argv[0] == "--pcc-self-backend-emit-worker":
+        if len(raw_argv) not in (3, 5):
+            _write_text(
+                "Error: --pcc-self-backend-emit-worker requires IR/result paths and optional object/compiler paths",
+                err=True,
+            )
+            return 2
+        if len(raw_argv) == 5:
+            return _run_self_backend_emit_worker(
+                raw_argv[1], raw_argv[2], raw_argv[3], raw_argv[4]
+            )
+        return _run_self_backend_emit_worker(raw_argv[1], raw_argv[2])
+    if len(raw_argv) > 0 and raw_argv[0] == "--pcc-self-backend-split-worker":
+        if len(raw_argv) != 6:
+            _write_text(
+                "Error: --pcc-self-backend-split-worker requires IR/result/output-prefix/export-prefix/shard-bytes arguments",
+                err=True,
+            )
+            return 2
+        return _run_self_backend_split_worker(
+            raw_argv[1],
+            raw_argv[2],
+            raw_argv[3],
+            raw_argv[4],
+            raw_argv[5],
+        )
     if _is_pytest_request(raw_argv):
         return _run_pytest_from_pcc1(raw_argv)
-    if _is_module_request(raw_argv):
-        return _run_host_python_module_from_pcc1(raw_argv)
+    module_is_request, module_mode, module_argv = _module_request_libpython_mode(
+        raw_argv
+    )
+    if module_is_request:
+        return _run_python_module_from_pcc1_with_mode(module_argv, module_mode)
     if _should_delegate_to_host_cli(raw_argv):
         return _run_host_pcc_from_pcc1(raw_argv)
 
@@ -11540,12 +9696,80 @@ def bootstrap_cli_main(argv=None) -> int:
         _write_text("Error: input file not found: " + path, err=True)
         return 1
 
+    _seed_package_site_for_python_entry(path)
+
     if output_path is None and emit_llvm is None:
-        _write_text(
-            "Error: bootstrap entry requires -o PATH or --emit-llvm for Python inputs",
-            err=True,
+        cache_path = _python_run_cache_path(
+            path,
+            python_libpython=python_libpython,
+            python_library=python_library,
+            ir_scaffold=ir_scaffold,
+            backend=backend,
         )
-        return 1
+        if cache_path is not None and os.path.isfile(cache_path):
+            try:
+                _bootstrap_subprocess_run([cache_path], check=True)
+                return 0
+            except subprocess.CalledProcessError as exc:
+                return exc.returncode
+            except Exception:
+                _write_text("Error: pcc1 cached program run failed", err=True)
+                return 1
+        if cache_path is not None:
+            try:
+                _bootstrap_subprocess_run(["mkdir", "-p", os.path.dirname(cache_path)], check=True)
+            except Exception:
+                cache_path = None
+        if cache_path is not None:
+            exe_path = cache_path + ".tmp." + str(os.getpid())
+            formatted_error = _observed_compile_python(
+                path,
+                exe_path,
+                options=observability,
+                metadata={"emit_llvm": False, "output_path": exe_path},
+                verbose=verbose,
+                emit_llvm_only=False,
+                libpython_mode=python_libpython,
+                ir_scaffold_mode=ir_scaffold,
+                backend=backend,
+                python_library=python_library,
+            )
+            if formatted_error is not None:
+                return 1
+            try:
+                _bootstrap_subprocess_run(["mv", "-f", exe_path, cache_path], check=True)
+            except Exception:
+                cache_path = exe_path
+            try:
+                _bootstrap_subprocess_run([cache_path], check=True)
+                return 0
+            except subprocess.CalledProcessError as exc:
+                return exc.returncode
+            except Exception:
+                _write_text("Error: pcc1 compiled program run failed", err=True)
+                return 1
+
+        td = _make_bootstrap_run_tempdir("pcc1_py_run_")
+        try:
+            exe_path = os.path.join(td, os.path.basename(path)[:-3] or "pcc1_run")
+            formatted_error = _observed_compile_python(
+                path,
+                exe_path,
+                options=observability,
+                metadata={"emit_llvm": False, "output_path": exe_path},
+                verbose=verbose,
+                emit_llvm_only=False,
+                libpython_mode=python_libpython,
+                ir_scaffold_mode=ir_scaffold,
+                backend=backend,
+                python_library=python_library,
+            )
+            if formatted_error is not None:
+                return 1
+            _bootstrap_subprocess_run([exe_path], check=True)
+            return 0
+        finally:
+            _remove_bootstrap_run_tempdir(td)
 
     if emit_llvm is not None:
         if emit_llvm == _DEFAULT_EMIT_LL:
