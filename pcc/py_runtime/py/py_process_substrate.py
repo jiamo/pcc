@@ -37,7 +37,6 @@ from pcc.unsafe import (
     strlen,
 )
 
-
 fgetc = extern("fgetc", (c_ptr,), c_int32)
 fread = extern("fread", (c_ptr, c_size_t, c_size_t, c_ptr), c_size_t)
 mkdtemp = extern("mkdtemp", (c_ptr,), c_ptr)
@@ -54,6 +53,7 @@ py_obj_getitem = extern("py_obj_getitem", (c_ptr, c_ptr), c_ptr)
 py_obj_len = extern("py_obj_len", (c_ptr,), c_int64)
 py_obj_str = extern("py_obj_str", (c_ptr,), c_ptr)
 py_program_argv = extern("py_program_argv", (c_int64,), c_ptr)
+py_bytes_new = extern("py_bytes_new", (c_ptr, c_int64), c_ptr)
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
@@ -66,6 +66,10 @@ def _none():
 
 def _empty_str():
     return py_str_new(cstr(""), 0)
+
+
+def _empty_bytes():
+    return py_bytes_new(cstr(""), 0)
 
 
 def _buf_new():
@@ -175,11 +179,11 @@ def _build_shell_command(argv):
 def py_subprocess_check_output(argv):
     cmd = _build_shell_command(argv)
     if ptr_is_null(cmd):
-        return _empty_str()
+        return _empty_bytes()
     fp = popen(cmd, cstr("r"))
     free(cmd)
     if ptr_is_null(fp):
-        return _empty_str()
+        return _empty_bytes()
 
     st = _buf_new()
     tmp = malloc(4096)
@@ -187,7 +191,7 @@ def py_subprocess_check_output(argv):
         free(tmp)
         _buf_free(st)
         pclose(fp)
-        return _empty_str()
+        return _empty_bytes()
     while True:
         n: int = fread(tmp, 1, 4096, fp)
         if n > 0:
@@ -195,12 +199,12 @@ def py_subprocess_check_output(argv):
                 free(tmp)
                 _buf_free(st)
                 pclose(fp)
-                return _empty_str()
+                return _empty_bytes()
         if n < 4096:
             break
     status: int = pclose(fp)
     if status != 0:
-        py_raise(py_exc_new(14, cstr("subprocess failed"))) # PY_EXC_OSERROR = 14
+        py_raise(py_exc_new(14, cstr("subprocess failed")))  # PY_EXC_OSERROR = 14
         free(tmp)
         _buf_free(st)
         return null()
@@ -208,7 +212,7 @@ def py_subprocess_check_output(argv):
     length: int = _buf_len(st)
     if ptr_is_null(data):
         data = cstr("")
-    result = py_str_new(data, length)
+    result = py_bytes_new(data, length)
     free(tmp)
     _buf_free(st)
     return result

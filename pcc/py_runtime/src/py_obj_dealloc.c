@@ -15,7 +15,39 @@
 #include "py_internal.h"
 #include <stdlib.h>
 
+extern void pcc_debug_bad_dict_slot(
+    void *dict,
+    int64_t index,
+    int64_t offset,
+    void *obj,
+    int64_t tag
+);
+
+static void pcc_debug_check_dict_dealloc_slot(
+    PyObject *dict,
+    int64_t index,
+    int64_t offset,
+    PyObject *obj
+) {
+    if (obj == NULL || PY_IS_TAGGED_INT(obj)) return;
+    PyObjectHeader *h = py_header(obj);
+    if ((py_header_flags_load(h) & PY_FLAG_IMMORTAL) != 0) return;
+    int32_t flags = py_header_flags_load(h);
+    if (
+        pcc_gc_backend() == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        && (flags & PY_FLAG_GC_MINOR_ARENA) != 0
+        && (flags & PY_FLAG_GC_OLD) != 0
+        && pcc_refcount_load(&h->refcount) <= 0
+    ) {
+        return;
+    }
+    if (pcc_refcount_load(&h->refcount) <= 0) {
+        pcc_debug_bad_dict_slot(dict, index, offset, obj, h->type_tag);
+    }
+}
+
 static int pcc_dealloc_should_defer(int32_t type_tag) {
+    if (pcc_capi_is_cext_type_tag((int64_t)type_tag) != 0) return 0;
     switch (type_tag) {
         case PY_TYPE_LIST:
         case PY_TYPE_TUPLE:
@@ -29,6 +61,7 @@ static int pcc_dealloc_should_defer(int32_t type_tag) {
         case PY_TYPE_CONTINUATION:
         case PY_TYPE_TASK:
         case PY_TYPE_VIRTUAL_THREAD:
+            return 1;
         default:
             return type_tag >= PY_TYPE_USER;
     }
@@ -63,6 +96,7 @@ static void pcc_dealloc_dispatch(PyObject *o, int32_t type_tag) {
         case PY_TYPE_TASK: py_dealloc_task(o); break;
         case PY_TYPE_VIRTUAL_THREAD: py_dealloc_virtual_thread(o); break;
         default:
+            if (pcc_capi_dealloc_cext_object(o, (int64_t)type_tag) != 0) break;
             if (type_tag >= PY_TYPE_USER) py_instance_dealloc(o);
             else py_dealloc_generic(o);
             break;
@@ -75,9 +109,12 @@ typedef struct PccDeallocTrashNode {
     struct PccDeallocTrashNode *next;
 } PccDeallocTrashNode;
 
-static int pcc_dealloc_depth = 0;
-static PccDeallocTrashNode *pcc_dealloc_trash_head = NULL;
-static PccDeallocTrashNode *pcc_dealloc_trash_tail = NULL;
+/* Deallocation cascades are mutator-local.  Sharing this depth/queue between
+ * pthreads lets one thread drain another thread's nodes and can double-free a
+ * container payload while explicit GC is parking the other mutators. */
+static _Thread_local int pcc_dealloc_depth = 0;
+static _Thread_local PccDeallocTrashNode *pcc_dealloc_trash_head = NULL;
+static _Thread_local PccDeallocTrashNode *pcc_dealloc_trash_tail = NULL;
 
 static int pcc_dealloc_trash_enqueue(PyObject *o, int32_t type_tag) {
     PccDeallocTrashNode *node = (PccDeallocTrashNode *)malloc(
@@ -112,9 +149,13 @@ static void pcc_dealloc_trash_drain(void) {
 
 void pcc_dealloc_with_trash(PyObject *o, int64_t type_tag) {
     int32_t tag = (int32_t)type_tag;
+    /* zpage-resident objects must dealloc IMMEDIATELY (see py_obj.c
+     * py_decref: deferred dealloc can read fields after a same-cascade
+     * page recycle memsets the span). */
     if (
         pcc_dealloc_depth > 0
         && pcc_dealloc_should_defer(tag)
+        && (py_header(o)->flags & PY_FLAG_GC_ZPAGE_ALLOC) == 0
         && pcc_dealloc_trash_enqueue(o, tag)
     ) {
         return;
@@ -180,6 +221,8 @@ void py_dealloc_dict(PyObject *o) {
             if (e->key != NULL) {
                 PyObject *key = pcc_gc_load_ptr(o, &e->key);
                 PyObject *value = pcc_gc_load_ptr(o, &e->value);
+                pcc_debug_check_dict_dealloc_slot(o, i, 8, key);
+                pcc_debug_check_dict_dealloc_slot(o, i, 16, value);
                 if (key != NULL) py_decref(key);
                 if (value != NULL) py_decref(value);
             }

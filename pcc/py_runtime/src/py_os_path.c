@@ -8,6 +8,7 @@
 
 #include "py_internal.h"
 
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -48,6 +49,58 @@ static PyObject *path_seq_borrow(PyObject *parts, int64_t i) {
         default:
             return NULL;
     }
+}
+
+PyObject *py_os_makedirs(PyObject *path, int32_t exist_ok) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "path must be string-like"));
+        return NULL;
+    }
+    const char *raw = py_str_utf8(item);
+    int64_t raw_len = py_str_byte_len(item);
+    if (raw == NULL || raw_len <= 0) {
+        py_decref(owned);
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "cannot create empty path"));
+        return NULL;
+    }
+
+    char *buf = (char *)malloc((size_t)raw_len + 1);
+    if (buf == NULL) {
+        py_decref(owned);
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "could not allocate path"));
+        return NULL;
+    }
+    memcpy(buf, raw, (size_t)raw_len);
+    buf[raw_len] = '\0';
+
+    int64_t end = raw_len;
+    while (end > 1 && buf[end - 1] == '/') end--;
+    buf[end] = '\0';
+
+    for (int64_t i = 1; i <= end; i++) {
+        if (i != end && buf[i] != '/') continue;
+        char saved = buf[i];
+        buf[i] = '\0';
+        if (mkdir(buf, 0777) != 0) {
+            int32_t kind = py_path_stat_kind(buf);
+            int final_component = (i == end);
+            if (kind != 2 || (final_component && !exist_ok)) {
+                buf[i] = saved;
+                free(buf);
+                py_decref(owned);
+                py_raise_owned(py_exc_new(PY_EXC_OSERROR, "could not create directory"));
+                return NULL;
+            }
+        }
+        buf[i] = saved;
+    }
+
+    free(buf);
+    py_decref(owned);
+    return py_None;
 }
 
 static int buf_reserve(char **buf, int64_t *cap, int64_t want) {

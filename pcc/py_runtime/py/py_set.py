@@ -24,6 +24,7 @@ next: perturb >>= 5; j = (j*5 + perturb + 1) & mask).
 """
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
+    cstr,
     free,
     global_load_ptr,
     ptr_add,
@@ -43,11 +44,21 @@ from pcc.unsafe import (
 
 py_incref            = extern("py_incref",            (c_ptr,),                     c_void)
 py_decref            = extern("py_decref",            (c_ptr,),                     c_void)
+pcc_gc_backend4_zpage_register_owner_payload_span = extern(
+    "pcc_gc_backend4_zpage_register_owner_payload_span",
+    (c_ptr, c_ptr, c_int64),
+    c_int64,
+)
 py_obj_hash          = extern("py_obj_hash",          (c_ptr,),                     c_int64)
 py_obj_eq            = extern("py_obj_eq",            (c_ptr, c_ptr),               c_int32)
+py_exc_new           = extern("py_exc_new",           (c_int64, c_ptr),             c_ptr)
+py_raise             = extern("py_raise",             (c_ptr,),                     c_void)
 py_gc_track          = extern("py_gc_track",          (c_ptr,),                     c_void)
 pcc_gc_store_ptr     = extern("pcc_gc_store_ptr",     (c_ptr, c_ptr, c_ptr),        c_void)
 pcc_gc_load_ptr      = extern("pcc_gc_load_ptr",      (c_ptr, c_ptr),               c_ptr)
+pcc_gc_note_slot_write_barrier = extern(
+    "pcc_gc_note_slot_write_barrier", (c_ptr, c_ptr, c_ptr), c_void,
+)
 pcc_gc_alloc         = extern("pcc_gc_alloc",         (c_int64, c_int32, c_int32),  c_ptr)
 py_list_new          = extern("py_list_new",          (c_int64,),                   c_ptr)
 py_list_append       = extern("py_list_append",       (c_ptr, c_ptr),               c_void)
@@ -86,20 +97,28 @@ def _entry_key(s, entries, slot_off: int):
     return pcc_gc_load_ptr(s, ptr_add(entries, slot_off + 8))
 
 
+def _perturb_shift5(perturb: int) -> int:
+    # Mirror ``(uint64_t)perturb >> 5`` while the pcc-Python runtime exposes
+    # only signed i64 arithmetic.  Arithmetic shift differs from logical
+    # shift by exactly 2**59 when the input's high bit is set.
+    shifted: int = perturb >> 5
+    if perturb < 0:
+        shifted = shifted + 576460752303423488
+    return shifted
+
+
 def _lookup_slot(s, entries, capacity: int, hash_val: int, key) -> int:
     # Returns slot index (>=0) if key is found, or -(slot+1) for the
     # insert target if not found (negative encoding).
     mask: int = capacity - 1
-    # C uses uint64_t perturb. pcc-Python integers are signed i64 today, so
-    # right-shifting a negative hash would be arithmetic and could keep
-    # perturb negative forever, trapping the probe sequence in a small cycle.
-    perturb: int = hash_val & 9223372036854775807
+    perturb: int = hash_val
     j: int = hash_val & mask
     first_tombstone: int = -1
     dummy = global_load_ptr("py_set_dummy")
     probes: int = 0
+    limit: int = capacity * 2
 
-    while True:
+    while probes < limit:
         slot_off: int = j * 16
         k = _entry_key(s, entries, slot_off)
         if ptr_is_null(k) != 0:
@@ -116,13 +135,14 @@ def _lookup_slot(s, entries, capacity: int, hash_val: int, key) -> int:
                     return j
                 if py_obj_eq(k, key) != 0:
                     return j
-        perturb = perturb >> 5
+        perturb = _perturb_shift5(perturb)
         j = (j * 5 + perturb + 1) & mask
         probes = probes + 1
-        if probes > capacity:
-            if first_tombstone >= 0:
-                return -(first_tombstone + 1)
-            return -(j + 1)
+
+    fallback_slot: int = 0
+    if first_tombstone >= 0:
+        fallback_slot = first_tombstone
+    return -(fallback_slot + 1)
 
 
 def _rehash(s, new_capacity: int) -> int:
@@ -137,6 +157,9 @@ def _rehash(s, new_capacity: int) -> int:
     store_i64(s, 24, new_capacity)
     store_i64(s, 16, 0)   # size
     store_i64(s, 32, 0)   # fill
+    pcc_gc_backend4_zpage_register_owner_payload_span(
+        s, new_entries, new_capacity * 16
+    )
 
     dummy = global_load_ptr("py_set_dummy")
     i: int = 0
@@ -152,6 +175,11 @@ def _rehash(s, new_capacity: int) -> int:
                 dest_off: int = dest * 16
                 store_i64(new_entries, dest_off, h)
                 store_ptr(new_entries, dest_off + 8, k)
+                # Move (no incref/decref): route the migrated key through
+                # the slot write barrier so backend #3 (generational) and
+                # backend #4 (relocating) observe the new slot. Mirrors the
+                # C py_set_rehash and py_dict.py _rehash decomposed move.
+                pcc_gc_note_slot_write_barrier(s, ptr_add(new_entries, dest_off + 8), k)
                 # size++
                 sz: int = load_i64(s, 16)
                 store_i64(s, 16, sz + 1)
@@ -191,6 +219,7 @@ def py_set_new():
         return null()
     store_ptr(s, 40, entries)
     store_i64(s, 24, 8)
+    pcc_gc_backend4_zpage_register_owner_payload_span(s, entries, 8 * 16)
     py_gc_track(s)
     return s
 
@@ -333,6 +362,57 @@ def py_set_symmetric_difference(a, b):
     return out
 
 
+def _replace_contents(dst, result) -> None:
+    # Drop every live key in `dst` (decref + tombstone) without freeing the
+    # entries array, then re-add every live key of `result`. Preserves the
+    # receiver object identity while replacing its contents.
+    if not _ptr_is_set(dst):
+        return
+    entries = load_ptr(dst, 40)
+    capacity: int = load_i64(dst, 24)
+    dummy = global_load_ptr("py_set_dummy")
+    i: int = 0
+    while i < capacity:
+        slot_off: int = i * 16
+        k = _entry_key(dst, entries, slot_off)
+        if ptr_is_null(k) == 0:
+            if ptr_eq(k, dummy) == 0:
+                py_decref(k)
+                store_ptr(entries, slot_off + 8, dummy)   # tombstone
+                sz: int = load_i64(dst, 16)
+                store_i64(dst, 16, sz - 1)
+        i = i + 1
+    # py_set_update re-adds each live key of `result`.
+    py_set_update(dst, result)
+
+
+@c_abi_export("py_set_intersection_update")
+def py_set_intersection_update(dst, other) -> None:
+    result = py_set_intersection(dst, other)
+    if ptr_is_null(result) != 0:
+        return
+    _replace_contents(dst, result)
+    py_decref(result)
+
+
+@c_abi_export("py_set_difference_update")
+def py_set_difference_update(dst, other) -> None:
+    result = py_set_difference(dst, other)
+    if ptr_is_null(result) != 0:
+        return
+    _replace_contents(dst, result)
+    py_decref(result)
+
+
+@c_abi_export("py_set_symmetric_difference_update")
+def py_set_symmetric_difference_update(dst, other) -> None:
+    result = py_set_symmetric_difference(dst, other)
+    if ptr_is_null(result) != 0:
+        return
+    _replace_contents(dst, result)
+    py_decref(result)
+
+
 @c_abi_export("py_set_issubset")
 def py_set_issubset(a, b) -> int:
     if not _ptr_is_set(a):
@@ -384,6 +464,31 @@ def py_set_items(s):
                 py_list_append(out, key)
         i = i + 1
     return out
+
+
+@c_abi_export("py_set_pop")
+def py_set_pop(s):
+    if not _ptr_is_set(s):
+        return null()
+    size: int = load_i64(s, 16)
+    if size <= 0:
+        py_raise(py_exc_new(4, cstr("pop from an empty set")))
+        return null()
+    entries = load_ptr(s, 40)
+    capacity: int = load_i64(s, 24)
+    dummy = global_load_ptr("py_set_dummy")
+    i: int = 0
+    while i < capacity:
+        slot_off: int = i * 16
+        key = _entry_key(s, entries, slot_off)
+        if ptr_is_null(key) == 0:
+            if ptr_eq(key, dummy) == 0:
+                store_ptr(entries, slot_off + 8, dummy)
+                store_i64(s, 16, size - 1)
+                return key
+        i = i + 1
+    py_raise(py_exc_new(4, cstr("pop from an empty set")))
+    return null()
 
 
 @c_abi_export("py_set_contains")

@@ -11,10 +11,102 @@
 #include <stdlib.h>
 #include <stdint.h>
 
+#ifndef PCC_WITH_THREADS
+#define PCC_WITH_THREADS 0
+#endif
+
+#if PCC_WITH_THREADS
+#include <pthread.h>
+#endif
+
 typedef struct PyThreadVThreadWaiter {
     PyObject *vthread;
     struct PyThreadVThreadWaiter *next;
+    void *root_handle;
+    int pool_entry;
 } PyThreadVThreadWaiter;
+
+/* Bounded slab/freelist pool for vthread waiter nodes.
+ *
+ * This mirrors PCC_VTHREAD_READY_ENTRY_POOL_LIMIT in pcc_threads.c: hot
+ * lock/event/condition/semaphore contention repeatedly enqueues and pops
+ * waiter nodes, and raw calloc/free per park churns the allocator.  Recycling
+ * nodes through a bounded freelist removes that churn while keeping the same
+ * observable semantics (mutual exclusion, wake order, no node leaks).
+ *
+ * Unlike the ready-entry pool -- which is protected by the single scheduler
+ * lock (pcc_vthread_lock) -- waiter nodes are enqueued/popped while a
+ * per-object mutex is held, and different lock/event objects hold different
+ * mutexes.  The shared freelist therefore needs its own dedicated guard so
+ * concurrent operations on distinct sync objects cannot corrupt it.  Under
+ * PCC_WITH_THREADS=0 the guard compiles to nothing. */
+#define PCC_VTHREAD_WAITER_POOL_LIMIT 4096
+
+static PyThreadVThreadWaiter *pcc_vthread_waiter_free_head = NULL;
+static int64_t pcc_vthread_waiter_free_count = 0;
+
+#if PCC_WITH_THREADS
+static pthread_mutex_t pcc_vthread_waiter_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static inline void pcc_vthread_waiter_pool_lock_acquire(void) {
+    pthread_mutex_lock(&pcc_vthread_waiter_pool_lock);
+}
+static inline void pcc_vthread_waiter_pool_lock_release(void) {
+    pthread_mutex_unlock(&pcc_vthread_waiter_pool_lock);
+}
+#else
+static inline void pcc_vthread_waiter_pool_lock_acquire(void) {}
+static inline void pcc_vthread_waiter_pool_lock_release(void) {}
+#endif
+
+static void pcc_vthread_waiter_clear(PyThreadVThreadWaiter *entry) {
+    if (entry == NULL) return;
+    entry->vthread = NULL;
+    entry->next = NULL;
+    entry->root_handle = NULL;
+    entry->pool_entry = 0;
+}
+
+/* Take a zeroed waiter node, reusing a pooled one when available. */
+static PyThreadVThreadWaiter *pcc_vthread_waiter_alloc(void) {
+    PyThreadVThreadWaiter *entry = NULL;
+    pcc_vthread_waiter_pool_lock_acquire();
+    if (pcc_vthread_waiter_free_head != NULL) {
+        entry = pcc_vthread_waiter_free_head;
+        pcc_vthread_waiter_free_head = entry->next;
+        pcc_vthread_waiter_pool_note_reuse();
+        if (pcc_vthread_waiter_free_count > 0) {
+            pcc_vthread_waiter_free_count--;
+        }
+        pcc_vthread_waiter_pool_note_cached(pcc_vthread_waiter_free_count);
+    }
+    pcc_vthread_waiter_pool_lock_release();
+    if (entry == NULL) {
+        entry = (PyThreadVThreadWaiter *)malloc(
+            sizeof(PyThreadVThreadWaiter)
+        );
+        if (entry != NULL) pcc_vthread_waiter_pool_note_allocation();
+    }
+    pcc_vthread_waiter_clear(entry);
+    return entry;
+}
+
+/* Return a waiter node to the pool, or free it when the pool is full. */
+static void pcc_vthread_waiter_recycle(PyThreadVThreadWaiter *entry) {
+    if (entry == NULL) return;
+    pcc_vthread_waiter_clear(entry);
+    pcc_vthread_waiter_pool_lock_acquire();
+    if (pcc_vthread_waiter_free_count >= PCC_VTHREAD_WAITER_POOL_LIMIT) {
+        pcc_vthread_waiter_pool_lock_release();
+        free(entry);
+        return;
+    }
+    entry->pool_entry = 1;
+    entry->next = pcc_vthread_waiter_free_head;
+    pcc_vthread_waiter_free_head = entry;
+    pcc_vthread_waiter_free_count++;
+    pcc_vthread_waiter_pool_note_cached(pcc_vthread_waiter_free_count);
+    pcc_vthread_waiter_pool_lock_release();
+}
 
 typedef struct {
     PyObjectHeader h;
@@ -75,11 +167,14 @@ static int py_threading_vthread_waiter_enqueue(
     PyObject *vthread
 ) {
     if (vthread == NULL || vthread == py_None) return -1;
-    PyThreadVThreadWaiter *entry = (
-        PyThreadVThreadWaiter *
-    )calloc(1, sizeof(PyThreadVThreadWaiter));
+    PyThreadVThreadWaiter *entry = pcc_vthread_waiter_alloc();
     if (entry == NULL) return -1;
-    pcc_gc_scheduler_root_register(&entry->vthread);
+    entry->root_handle = pcc_gc_scheduler_root_register_handle(&entry->vthread);
+    if (entry->root_handle == NULL) {
+        pcc_vthread_waiter_recycle(entry);
+        return -1;
+    }
+    pcc_vthread_effect_note_waiter_root_enter();
     pcc_gc_store_root(&entry->vthread, vthread);
     if (*tail == NULL) {
         *head = entry;
@@ -101,9 +196,11 @@ static PyObject *py_threading_vthread_waiter_pop(
         if (*head == NULL) *tail = NULL;
         PyObject *vthread = pcc_gc_load_ptr(NULL, &entry->vthread);
         py_incref(vthread);
-        pcc_gc_scheduler_root_unregister(&entry->vthread);
+        pcc_gc_scheduler_root_unregister_handle(entry->root_handle);
+        pcc_vthread_effect_note_waiter_root_leave();
+        entry->root_handle = NULL;
         pcc_gc_store_root(&entry->vthread, NULL);
-        free(entry);
+        pcc_vthread_waiter_recycle(entry);
         if (vthread != NULL && vthread != py_None) return vthread;
         py_decref(vthread);
     }

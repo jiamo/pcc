@@ -26,6 +26,8 @@ FNV-1a constants (verified to work in pcc-Python signed-i64):
 """
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void, c_double
 from pcc.unsafe import (
+    cstr,
+    global_addr,
     global_load_ptr,
     is_tagged_int,
     load_i8,
@@ -37,13 +39,19 @@ from pcc.unsafe import (
     ptr_eq,
     ptr_is_null,
     store_i64,
+    untag_int,
 )
 
 py_int_value_i64     = extern("py_int_value_i64",     (c_ptr,),                    c_int64)
 py_int_from_i64      = extern("py_int_from_i64",      (c_int64,),                  c_ptr)
 py_int_cmp           = extern("py_int_cmp",           (c_ptr, c_ptr),              c_int32)
+py_int_neg           = extern("py_int_neg",           (c_ptr,),                    c_ptr)
+py_float_from_f64    = extern("py_float_from_f64",    (c_double,),                 c_ptr)
 py_float_to_f64      = extern("py_float_to_f64",      (c_ptr,),                    c_double)
 
+py_set_issubset      = extern("py_set_issubset",      (c_ptr, c_ptr),              c_int64)
+py_set_issuperset    = extern("py_set_issuperset",    (c_ptr, c_ptr),              c_int64)
+py_set_len           = extern("py_set_len",           (c_ptr,),                    c_int64)
 py_str_eq            = extern("py_str_eq",            (c_ptr, c_ptr),              c_int32)
 py_str_contains      = extern("py_str_contains",      (c_ptr, c_ptr),              c_int32)
 py_str_len           = extern("py_str_len",           (c_ptr,),                    c_int64)
@@ -78,6 +86,16 @@ py_user_contains_dispatch = extern("py_user_contains_dispatch", (c_ptr, c_ptr, c
 py_user_eq_dispatch = extern("py_user_eq_dispatch", (c_ptr, c_ptr),               c_int64)
 
 pcc_gc_load_ptr      = extern("pcc_gc_load_ptr",      (c_ptr, c_ptr),              c_ptr)
+py_exc_new           = extern("py_exc_new",           (c_int64, c_ptr),            c_ptr)
+py_raise             = extern("py_raise",             (c_ptr,),                    c_void)
+py_user_abs_dispatch = extern("py_user_abs_dispatch", (c_ptr,),                    c_ptr)
+pcc_capi_is_cext_type_tag = extern("pcc_capi_is_cext_type_tag", (c_int64,),       c_int64)
+pcc_capi_cext_absolute = extern("pcc_capi_cext_absolute", (c_ptr,),               c_ptr)
+pcc_capi_cext_richcompare_bool = extern(
+    "pcc_capi_cext_richcompare_bool", (c_ptr, c_ptr, c_int64), c_int64
+)
+py_err_occurred      = extern("py_err_occurred",      (),                          c_int64)
+py_incref            = extern("py_incref",            (c_ptr,),                    c_void)
 py_decref            = extern("py_decref",            (c_ptr,),                    c_void)
 
 
@@ -308,7 +326,13 @@ def _cmp_threeway(a, b) -> int:
 
     if ta == 4:                       # STR
         if tb == 4:
-            # Use byte-by-byte cmp via load_i8 over min(len_a, len_b).
+            # memcmp byte semantics over min(len_a, len_b), scanned a
+            # 64-bit word at a time (both data blocks start at offset
+            # 40, so 8-step i64 loads stay aligned). i64 words cannot
+            # be ordered directly on a little-endian host, so the first
+            # differing word falls back to byte order inside it. The
+            # old byte-by-byte loop dominated codegen-worker profiles
+            # (sorted symbol names share long prefixes).
             la: int = load_i64(a, 16)
             lb: int = load_i64(b, 16)
             n: int = la
@@ -317,6 +341,22 @@ def _cmp_threeway(a, b) -> int:
             da = ptr_add(a, 40)
             db = ptr_add(b, 40)
             i: int = 0
+            w_end: int = n - 7
+            while i < w_end:
+                wa: int = load_i64(da, i)
+                wb: int = load_i64(db, i)
+                if wa != wb:
+                    j: int = i
+                    stop: int = i + 8
+                    while j < stop:
+                        wba: int = load_i8(da, j) & 0xFF
+                        wbb: int = load_i8(db, j) & 0xFF
+                        if wba < wbb:
+                            return -1
+                        if wba > wbb:
+                            return 1
+                        j = j + 1
+                i = i + 8
             while i < n:
                 ba: int = load_i8(da, i) & 0xFF
                 bb: int = load_i8(db, i) & 0xFF
@@ -386,6 +426,41 @@ def _cmp_threeway(a, b) -> int:
     return 0
 
 
+@c_abi_export("py_obj_abs")
+def py_obj_abs(o):
+    if ptr_is_null(o) != 0:
+        py_raise(py_exc_new(3, cstr("bad operand type for abs()")))
+        return null()
+    if is_tagged_int(o) != 0:
+        ivalue: int = py_int_value_i64(o)
+        if ivalue < 0:
+            return py_int_neg(o)
+        return py_int_from_i64(ivalue)
+    tag: int = _type_of(o)
+    if tag == 1:                      # BOOL
+        return py_int_from_i64(_bool_as_i64(o))
+    if tag == 2:                      # INT
+        if load_i32(o, 16) < 0:
+            return py_int_neg(o)
+        py_incref(o)
+        return o
+    if tag == 3:                      # FLOAT
+        fvalue: float = py_float_to_f64(o)
+        if fvalue < 0.0:
+            return py_float_from_f64(0.0 - fvalue)
+        return py_float_from_f64(fvalue)
+    if pcc_capi_is_cext_type_tag(tag) != 0:
+        return pcc_capi_cext_absolute(o)
+    if tag == 11 or tag >= 100:       # INSTANCE / user class: __abs__
+        r = py_user_abs_dispatch(o)
+        if ptr_is_null(r) == 0:
+            return r
+        if py_err_occurred() != 0:
+            return null()
+    py_raise(py_exc_new(3, cstr("bad operand type for abs()")))
+    return null()
+
+
 # ---- Equality -------------------------------------------------------
 
 @c_abi_export("py_obj_eq")
@@ -400,12 +475,37 @@ def py_obj_eq(a, b) -> int:
     ta: int = _type_of(a)
     tb: int = _type_of(b)
 
+    # numpy / C-extension scalar ==: drive its tp_richcompare (Py_EQ=2), same as
+    # py_obj_lt/le/gt/ge already do. Without this a[i] == 3 fell through to the
+    # default not-equal and returned False even when the values matched.
+    if pcc_capi_is_cext_type_tag(ta) != 0:
+        if pcc_capi_cext_richcompare_bool(a, b, 2) > 0:
+            return 1
+        return 0
+    if pcc_capi_is_cext_type_tag(tb) != 0:
+        if pcc_capi_cext_richcompare_bool(a, b, 2) > 0:
+            return 1
+        return 0
+
     if ta == 1:                       # BOOL ↔ BOOL: distinct singletons
         if tb == 1:
             return 0
 
-    if _is_int_like_tag(ta) != 0:
-        if _is_int_like_tag(tb) != 0:
+    if ta == 4:                       # STR
+        if tb == 4:
+            if py_str_eq(a, b) != 0:
+                return 1
+            return 0
+
+    a_int: int = 0
+    if ta == 1 or ta == 2:
+        a_int = 1
+    b_int: int = 0
+    if tb == 1 or tb == 2:
+        b_int = 1
+
+    if a_int != 0:
+        if b_int != 0:
             if ta == 2:
                 if tb == 2:
                     if py_int_cmp(a, b) == 0:
@@ -415,11 +515,24 @@ def py_obj_eq(a, b) -> int:
                 return 1
             return 0
 
-    if ta == 4:                       # STR
-        if tb == 4:
-            if py_str_eq(a, b) != 0:
-                return 1
+    # Numeric with at least one float (pure int/int handled above): compare as
+    # doubles. py_obj_eq had no FLOAT (tag 3) branch, so float==float and
+    # float==int fell through to the default ``return 0`` (not-equal) — e.g.
+    # ``(c.v / c.w) == 2.5`` was False. Mirrors the float arm of _py_obj_cmp.
+    a_num: int = a_int
+    if ta == 3:
+        a_num = 1
+    b_num: int = b_int
+    if tb == 3:
+        b_num = 1
+    if a_num != 0 and b_num != 0:
+        fa: float = py_float_to_f64(a)
+        fb: float = py_float_to_f64(b)
+        if fa < fb:
             return 0
+        if fa > fb:
+            return 0
+        return 1
 
     if _is_bytes_like_tag(ta) != 0:
         if _is_bytes_like_tag(tb) != 0:
@@ -429,16 +542,31 @@ def py_obj_eq(a, b) -> int:
 
     if ta == 7:                       # TUPLE
         if tb == 7:
-            la: int = py_tuple_len(a)
-            lb: int = py_tuple_len(b)
+            la: int = load_i64(a, 16)
+            lb: int = load_i64(b, 16)
             if la != lb:
                 return 0
             i: int = 0
             while i < la:
-                ea = py_tuple_get(a, i)
-                eb = py_tuple_get(b, i)
-                if py_obj_eq(ea, eb) == 0:
-                    return 0
+                ea = pcc_gc_load_ptr(a, ptr_add(a, 24 + i * 8))
+                eb = pcc_gc_load_ptr(b, ptr_add(b, 24 + i * 8))
+                if ptr_eq(ea, eb) == 0:
+                    if is_tagged_int(ea) != 0 and is_tagged_int(eb) != 0:
+                        return 0
+                    if is_tagged_int(ea) == 0 and is_tagged_int(eb) == 0:
+                        if ptr_is_null(ea) != 0:
+                            return 0
+                        if ptr_is_null(eb) != 0:
+                            return 0
+                        if load_i32(ea, 8) == 4 and load_i32(eb, 8) == 4:
+                            if py_str_eq(ea, eb) == 0:
+                                return 0
+                        else:
+                            if py_obj_eq(ea, eb) == 0:
+                                return 0
+                    else:
+                        if py_obj_eq(ea, eb) == 0:
+                            return 0
                 i = i + 1
             return 1
 
@@ -541,7 +669,7 @@ def py_obj_hash(o) -> int:
     if ptr_is_null(o) != 0:
         return 0
     if is_tagged_int(o) != 0:
-        v: int = py_int_value_i64(o)
+        v: int = untag_int(o)
         if v == -1:
             return -2
         return v
@@ -596,13 +724,59 @@ def py_obj_hash(o) -> int:
         data_ptr = ptr_add(o, 24)
         return _fnv1a(data_ptr, bl)
     if tag == 7:                      # TUPLE
-        n: int = py_tuple_len(o)
-        h: int = 0
+        n: int = load_i64(o, 16)
+        h: int = 3527539
+        mult: int = 1000003
+        read_barrier_enabled: int = load_i32(
+            global_addr("pcc_gc_read_barrier_enabled"), 0
+        )
         i: int = 0
         while i < n:
-            el = py_tuple_get(o, i)
-            h = h ^ py_obj_hash(el)
+            slot = ptr_add(o, 24 + i * 8)
+            el = load_ptr(slot, 0)
+            if read_barrier_enabled != 0:
+                el = pcc_gc_load_ptr(o, slot)
+            el_hash: int = 0
+            handled: int = 0
+            if ptr_is_null(el) != 0:
+                handled = 1
+            else:
+                if is_tagged_int(el) != 0:
+                    v: int = untag_int(el)
+                    el_hash = v
+                    if v == -1:
+                        el_hash = -2
+                    handled = 1
+                else:
+                    el_tag: int = load_i32(el, 8)
+                    if el_tag == 0:
+                        handled = 1
+                    elif el_tag == 1:
+                        if ptr_eq(el, global_load_ptr("py_True")) != 0:
+                            el_hash = 1
+                        handled = 1
+                    elif el_tag == 2:
+                        v2: int = py_int_value_i64(el)
+                        el_hash = v2
+                        if v2 == -1:
+                            el_hash = -2
+                        handled = 1
+                    elif el_tag == 4:
+                        cached: int = load_i64(el, 32)
+                        if cached != -1:
+                            el_hash = cached
+                        else:
+                            bl: int = load_i64(el, 16)
+                            data_ptr = ptr_add(el, 40)
+                            el_hash = _fnv1a(data_ptr, bl)
+                            store_i64(el, 32, el_hash)
+                        handled = 1
+            if handled == 0:
+                el_hash = py_obj_hash(el)
+            h = ((h ^ el_hash) * mult + 82520 + i + i) & 9223372036854775807
+            mult = mult + 82520 + i + i
             i = i + 1
+        h = h + 97531
         if h == -1:
             return -2
         return h
@@ -613,8 +787,27 @@ def py_obj_hash(o) -> int:
 
 # ---- Comparison ops -------------------------------------------------
 
+# Sets order by subset/superset (a PARTIAL order), not the total 3-way
+# compare: ``a <= b`` is a.issubset(b), ``a < b`` is proper subset, etc.
+def _both_sets(a, b) -> int:
+    if _type_of(a) == 8 and _type_of(b) == 8:  # PY_TYPE_SET
+        return 1
+    return 0
+
+
 @c_abi_export("py_obj_lt")
 def py_obj_lt(a, b) -> int:
+    if (
+        pcc_capi_is_cext_type_tag(_type_of(a)) != 0
+        or pcc_capi_is_cext_type_tag(_type_of(b)) != 0
+    ):
+        if pcc_capi_cext_richcompare_bool(a, b, 0) > 0:
+            return 1
+        return 0
+    if _both_sets(a, b) != 0:
+        if py_set_issubset(a, b) != 0 and py_set_len(a) < py_set_len(b):
+            return 1
+        return 0
     if _cmp_threeway(a, b) < 0:
         return 1
     return 0
@@ -622,6 +815,15 @@ def py_obj_lt(a, b) -> int:
 
 @c_abi_export("py_obj_le")
 def py_obj_le(a, b) -> int:
+    if (
+        pcc_capi_is_cext_type_tag(_type_of(a)) != 0
+        or pcc_capi_is_cext_type_tag(_type_of(b)) != 0
+    ):
+        if pcc_capi_cext_richcompare_bool(a, b, 1) > 0:
+            return 1
+        return 0
+    if _both_sets(a, b) != 0:
+        return py_set_issubset(a, b)
     if _cmp_threeway(a, b) <= 0:
         return 1
     return 0
@@ -629,6 +831,17 @@ def py_obj_le(a, b) -> int:
 
 @c_abi_export("py_obj_gt")
 def py_obj_gt(a, b) -> int:
+    if (
+        pcc_capi_is_cext_type_tag(_type_of(a)) != 0
+        or pcc_capi_is_cext_type_tag(_type_of(b)) != 0
+    ):
+        if pcc_capi_cext_richcompare_bool(a, b, 4) > 0:
+            return 1
+        return 0
+    if _both_sets(a, b) != 0:
+        if py_set_issuperset(a, b) != 0 and py_set_len(a) > py_set_len(b):
+            return 1
+        return 0
     if _cmp_threeway(a, b) > 0:
         return 1
     return 0
@@ -636,6 +849,15 @@ def py_obj_gt(a, b) -> int:
 
 @c_abi_export("py_obj_ge")
 def py_obj_ge(a, b) -> int:
+    if (
+        pcc_capi_is_cext_type_tag(_type_of(a)) != 0
+        or pcc_capi_is_cext_type_tag(_type_of(b)) != 0
+    ):
+        if pcc_capi_cext_richcompare_bool(a, b, 5) > 0:
+            return 1
+        return 0
+    if _both_sets(a, b) != 0:
+        return py_set_issuperset(a, b)
     if _cmp_threeway(a, b) >= 0:
         return 1
     return 0
@@ -706,27 +928,129 @@ def py_obj_sorted(x):
                     py_decref(el)
             py_decref(it)
     m: int = py_list_len(out)
-    j: int = 1
-    while j < m:
-        cur = py_list_get(out, j)
-        k: int = j
-        # Walk leftward shifting larger-than-cur elements one slot right.
-        # Use a `done` flag in the loop condition (NOT mutating k=0)
-        # — earlier port mutated k=0 to "break" then unconditionally
-        # wrote cur to out[k], causing [a,b,c,d] → [d,b,c,d].
-        done: int = 0
-        while k > 0 and done == 0:
-            prev = py_list_get(out, k - 1)
-            if _cmp_threeway(prev, cur) <= 0:
-                py_decref(prev)
-                done = 1
-            else:
-                py_list_set(out, k, prev)
-                py_decref(prev)
-                k = k - 1
-        py_list_set(out, k, cur)
-        py_decref(cur)
-        j = j + 1
+    if m > 1:
+        # Bottom-up stable merge sort, mirroring the C runtime (was
+        # insertion sort — O(n^2) comparisons dominated codegen-worker
+        # profiles via sorted symbol lists). Ping-pong between ``out``
+        # and a scratch py_list: elements are MOVED borrowed (raw
+        # barrier loads, py_list_append stores without incref), every
+        # element stays GC-visible in at least one list slot, and the
+        # scratch is emptied by resetting its length field before
+        # release so aliasing slots never trigger element decrefs.
+        # Stability: the right run only wins when strictly smaller.
+        scratch = py_list_new(m)
+        if ptr_is_null(scratch) == 0:
+            src_list = out
+            dst_list = scratch
+            width: int = 1
+            while width < m:
+                # Reset dst through the BALANCED slot store (py_list_set
+                # -> pcc_gc_store_ptr increfs new / decrefs old): a bare
+                # length=0 write would leak one reference per element
+                # per pass. Every element stays alive via its other
+                # list's slot.
+                dlen: int = py_list_len(dst_list)
+                di: int = 0
+                while di < dlen:
+                    py_list_set(dst_list, di, null())
+                    di = di + 1
+                store_i64(dst_list, 16, 0)
+                src_items = load_ptr(src_list, 32)
+                lo: int = 0
+                while lo < m:
+                    mid: int = lo + width
+                    if mid > m:
+                        mid = m
+                    hi: int = mid + width
+                    if hi > m:
+                        hi = m
+                    mi: int = lo
+                    mj: int = mid
+                    while mi < mid and mj < hi:
+                        ea = pcc_gc_load_ptr(
+                            src_list, ptr_add(src_items, mi * 8)
+                        )
+                        eb = pcc_gc_load_ptr(
+                            src_list, ptr_add(src_items, mj * 8)
+                        )
+                        if _cmp_threeway(eb, ea) < 0:
+                            py_list_append(dst_list, eb)
+                            mj = mj + 1
+                        else:
+                            py_list_append(dst_list, ea)
+                            mi = mi + 1
+                    while mi < mid:
+                        py_list_append(
+                            dst_list,
+                            pcc_gc_load_ptr(
+                                src_list, ptr_add(src_items, mi * 8)
+                            ),
+                        )
+                        mi = mi + 1
+                    while mj < hi:
+                        py_list_append(
+                            dst_list,
+                            pcc_gc_load_ptr(
+                                src_list, ptr_add(src_items, mj * 8)
+                            ),
+                        )
+                        mj = mj + 1
+                    lo = lo + 2 * width
+                tmp = src_list
+                src_list = dst_list
+                dst_list = tmp
+                width = width * 2
+            if ptr_eq(src_list, out) == 0:
+                # Final ordering ended in the scratch: move it back
+                # (balanced: clear out's stale aliases first — each
+                # element stays held by the scratch slot).
+                olen: int = py_list_len(out)
+                oi: int = 0
+                while oi < olen:
+                    py_list_set(out, oi, null())
+                    oi = oi + 1
+                store_i64(out, 16, 0)
+                back_items = load_ptr(src_list, 32)
+                bi: int = 0
+                while bi < m:
+                    py_list_append(
+                        out,
+                        pcc_gc_load_ptr(
+                            src_list, ptr_add(back_items, bi * 8)
+                        ),
+                    )
+                    bi = bi + 1
+            # Release the scratch's element references (balanced) and
+            # the scratch itself; out's slots keep the elements.
+            slen: int = py_list_len(scratch)
+            si: int = 0
+            while si < slen:
+                py_list_set(scratch, si, null())
+                si = si + 1
+            store_i64(scratch, 16, 0)
+            py_decref(scratch)
+            return out
+        # malloc-failure fallback: original insertion sort.
+        j: int = 1
+        while j < m:
+            cur = py_list_get(out, j)
+            k: int = j
+            # Use a `done` flag in the loop condition (NOT mutating
+            # k=0) — earlier port mutated k=0 to "break" then
+            # unconditionally wrote cur to out[k].
+            done: int = 0
+            while k > 0 and done == 0:
+                prev = py_list_get(out, k - 1)
+                if _cmp_threeway(prev, cur) <= 0:
+                    py_decref(prev)
+                    done = 1
+                else:
+                    py_list_set(out, k, prev)
+                    py_decref(prev)
+                    k = k - 1
+            py_list_set(out, k, cur)
+            py_decref(cur)
+            j = j + 1
     return out
 
 

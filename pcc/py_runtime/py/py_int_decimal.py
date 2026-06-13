@@ -121,6 +121,48 @@ def py_bigint_to_cstr(b):
     return buf
 
 
+@c_abi_export("py_bigint_to_base_cstr")
+def py_bigint_to_base_cstr(b, base: int, prefix_ch: int):
+    # Full base-{2,8,16} string for a bignum: "[-]0<prefix_ch><digits>"
+    # (lowercase a-f). Mirrors py_bigint_to_base_cstr in py_int_decimal.c:
+    # repeated divmod by the small base, one digit per iteration.
+    neg: int = 0
+    if load_i32(b, 16) < 0:
+        neg = 1
+    ndigits: int = load_i32(b, 20)
+    bufsz: int = ndigits * 32 + 8   # base 2 is widest: <=32 bits per limb
+    buf = malloc(bufsz)
+    if ptr_is_null(buf):
+        return buf
+    tmp = _bigint_copy(b)
+    if ptr_is_null(tmp):
+        free(buf)
+        return null()
+    store_i32(tmp, 16, 1)           # work on the magnitude (b is nonzero here)
+    pos: int = bufsz - 1
+    store_i8(buf, pos, 0)           # NUL
+    done: int = 0
+    while done == 0:
+        rem: int = _divmod_small_inplace(tmp, base)
+        pos = pos - 1
+        ch: int = 48 + rem          # '0' + rem
+        if rem >= 10:
+            ch = 97 + rem - 10      # 'a' + (rem - 10)
+        store_i8(buf, pos, ch)
+        if load_i32(tmp, 20) == 0:
+            done = 1
+    free(tmp)
+    pos = pos - 1
+    store_i8(buf, pos, prefix_ch)
+    pos = pos - 1
+    store_i8(buf, pos, 48)          # '0'
+    if neg != 0:
+        pos = pos - 1
+        store_i8(buf, pos, 45)      # '-'
+    memmove(buf, ptr_add(buf, pos), bufsz - pos)
+    return buf
+
+
 @c_abi_export("py_bigint_from_cstr")
 def py_bigint_from_cstr(s):
     if ptr_is_null(s):

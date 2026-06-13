@@ -60,6 +60,19 @@ pcc_threads_enabled = extern("pcc_threads_enabled", (), c_int64)
 pcc_stop_the_world = extern("pcc_stop_the_world", (), c_int64)
 pcc_resume_world = extern("pcc_resume_world", (), c_int64)
 pcc_gc_trace_continuation_roots = extern("pcc_gc_trace_continuation_roots", (), c_int64)
+pcc_gc_load_ptr_extern = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+pcc_capi_is_cext_type_tag = extern("pcc_capi_is_cext_type_tag", (c_int64,), c_int64)
+pcc_capi_dealloc_cext_object = extern(
+    "pcc_capi_dealloc_cext_object",
+    (c_ptr, c_int64),
+    c_int64,
+)
+pcc_capi_visit_cext_object_slots_i64 = extern(
+    "pcc_capi_visit_cext_object_slots_i64",
+    (c_ptr, c_ptr, c_ptr),
+    c_int32,
+)
+abort_extern = extern("abort", (), c_void)
 py_list_new = extern("py_list_new", (c_int64,), c_ptr)
 py_list_append = extern("py_list_append", (c_ptr, c_ptr), c_void)
 
@@ -128,128 +141,60 @@ def _continuation_slot_count(o) -> int:
     return load_i64(chunk, 8)
 
 
-def _visit_subtract(o) -> None:
-    if ptr_is_null(o) or is_tagged_int(o):
-        return
-    tag: int = load_i32(o, 8)
-    if tag == 5:                         # list
-        length: int = load_i64(o, 16)
-        items = load_ptr(o, 32)
-        i: int = 0
-        while i < length:
-            _subtract_child(load_ptr(items, i * 8))
-            i = i + 1
-        return
-    if tag == 7:                         # tuple
-        length: int = load_i64(o, 16)
-        i: int = 0
-        while i < length:
-            _subtract_child(load_ptr(o, 24 + i * 8))
-            i = i + 1
-        return
-    if tag == 6:                         # dict
-        entries = load_ptr(o, 40)
-        if ptr_is_null(entries) == 0:
-            used: int = load_i64(o, 48)
-            i: int = 0
-            while i < used:
-                off: int = i * 24
-                key = load_ptr(entries, off + 8)
-                if ptr_is_null(key) == 0:
-                    _subtract_child(key)
-                    _subtract_child(load_ptr(entries, off + 16))
-                i = i + 1
-        return
-    if tag == 8:                         # set
-        entries = load_ptr(o, 40)
-        if ptr_is_null(entries) == 0:
-            dummy = global_load_ptr("py_set_dummy")
-            capacity: int = load_i64(o, 24)
-            i: int = 0
-            while i < capacity:
-                key = load_ptr(entries, i * 16 + 8)
-                if ptr_is_null(key) == 0:
-                    if ptr_eq(key, dummy) == 0:
-                        _subtract_child(key)
-                i = i + 1
-        return
-    if tag == 9:                         # func
-        _subtract_child(load_ptr(o, 24))
-        return
-    if tag == 14:                        # iter
-        _subtract_child(load_ptr(o, 16))
-        return
-    if tag == 15:                        # gen
-        _subtract_child(load_ptr(o, 24))
-        _subtract_child(load_ptr(o, 48))
-        return
-    if tag == 20:                        # coroutine
-        _subtract_child(load_ptr(o, 32))
-        _subtract_child(load_ptr(o, 40))
-        _subtract_child(load_ptr(o, 48))
-        return
-    if tag == 29:                        # continuation
-        slots = _continuation_slots(o)
-        count: int = _continuation_slot_count(o)
-        i: int = 0
-        while i < count:
-            _subtract_child(load_ptr(slots, i * 8))
-            i = i + 1
-        return
-    if tag == 28:                        # task
-        _subtract_child(load_ptr(o, 16))
-        _subtract_child(load_ptr(o, 24))
-        _subtract_child(load_ptr(o, 32))
-        return
-    if tag == 30:                        # virtual thread
-        _subtract_child(load_ptr(o, 16))
-        _subtract_child(load_ptr(o, 24))
-        return
-    if tag == 12:                        # exception
-        _subtract_child(load_ptr(o, 24))
-        _subtract_child(load_ptr(o, 32))
-        _subtract_child(load_ptr(o, 40))
-        return
-    if tag == 11 or tag >= 100:          # instance / user-tagged instance
-        cls = load_ptr(o, 16)
-        if ptr_is_null(cls) == 0:
-            n_fields: int = load_i32(cls, 72)
-            if n_fields < 0:
-                n_fields = 0
-            i: int = 0
-            while i < n_fields:
-                _subtract_child(load_ptr(o, 24 + i * 8))
-                i = i + 1
-            flags: int = load_i32(cls, 12)
-            if (flags & 2) == 0:
-                _subtract_child(load_ptr(o, 24 + n_fields * 8))
-
-
 def _append_referent(out, child) -> None:
     if ptr_is_null(child):
         return
     py_list_append(out, child)
 
 
-def _append_referents_to(o, out) -> None:
-    if ptr_is_null(o) or is_tagged_int(o):
+def _py_obj_gc_visit_slot(
+    slot_base,
+    slot_offset: int,
+    role: int,
+    mode: int,
+    out,
+) -> None:
+    if mode == 1:  # subtract cycle ref
+        if role != 3:  # update-only borrowed metadata
+            child = pcc_gc_load_ptr_extern(null(), ptr_add(slot_base, slot_offset))
+            _subtract_child(child)
         return
+    if mode == 2:  # append get_referents result
+        if role != 3:
+            child = pcc_gc_load_ptr_extern(null(), ptr_add(slot_base, slot_offset))
+            _append_referent(out, child)
+        return
+    if mode == 3:  # mark reachable
+        if role != 3:
+            child = pcc_gc_load_ptr_extern(null(), ptr_add(slot_base, slot_offset))
+            _mark_reachable(child)
+        return
+    if mode == 4:  # clear owned references only
+        if role == 1:
+            _clear_slot(ptr_add(slot_base, slot_offset))
+        return
+
+
+def _py_obj_gc_visit_core_container_owner_slots(o, mode: int, out) -> int:
+    if ptr_is_null(o) or is_tagged_int(o):
+        return 0
     tag: int = load_i32(o, 8)
     if tag == 5:                         # list
         length: int = load_i64(o, 16)
         items = load_ptr(o, 32)
-        i: int = 0
-        while i < length:
-            _append_referent(out, load_ptr(items, i * 8))
-            i = i + 1
-        return
+        if ptr_is_null(items) == 0:
+            i: int = 0
+            while i < length:
+                _py_obj_gc_visit_slot(items, i * 8, 1, mode, out)
+                i = i + 1
+        return 1
     if tag == 7:                         # tuple
         length: int = load_i64(o, 16)
         i: int = 0
         while i < length:
-            _append_referent(out, load_ptr(o, 24 + i * 8))
+            _py_obj_gc_visit_slot(o, 24 + i * 8, 1, mode, out)
             i = i + 1
-        return
+        return 1
     if tag == 6:                         # dict
         entries = load_ptr(o, 40)
         if ptr_is_null(entries) == 0:
@@ -259,10 +204,10 @@ def _append_referents_to(o, out) -> None:
                 off: int = i * 24
                 key = load_ptr(entries, off + 8)
                 if ptr_is_null(key) == 0:
-                    _append_referent(out, key)
-                    _append_referent(out, load_ptr(entries, off + 16))
+                    _py_obj_gc_visit_slot(entries, off + 8, 1, mode, out)
+                    _py_obj_gc_visit_slot(entries, off + 16, 1, mode, out)
                 i = i + 1
-        return
+        return 1
     if tag == 8:                         # set
         entries = load_ptr(o, 40)
         if ptr_is_null(entries) == 0:
@@ -273,59 +218,230 @@ def _append_referents_to(o, out) -> None:
                 key = load_ptr(entries, i * 16 + 8)
                 if ptr_is_null(key) == 0:
                     if ptr_eq(key, dummy) == 0:
-                        _append_referent(out, key)
+                        _py_obj_gc_visit_slot(entries, i * 16 + 8, 1, mode, out)
                 i = i + 1
-        return
+        return 1
+    return 0
+
+
+def _py_obj_gc_visit_fixed_owner_slots(o, mode: int, out) -> int:
+    if ptr_is_null(o) or is_tagged_int(o):
+        return 0
+    tag: int = load_i32(o, 8)
     if tag == 9:                         # func
-        _append_referent(out, load_ptr(o, 24))
-        return
+        _py_obj_gc_visit_slot(o, 24, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 32, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 40, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 64, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 80, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 88, 1, mode, out)
+        return 1
     if tag == 14:                        # iter
-        _append_referent(out, load_ptr(o, 16))
-        return
+        _py_obj_gc_visit_slot(o, 16, 1, mode, out)
+        return 1
     if tag == 15:                        # gen
-        _append_referent(out, load_ptr(o, 24))
-        _append_referent(out, load_ptr(o, 48))
-        return
+        _py_obj_gc_visit_slot(o, 24, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 48, 1, mode, out)
+        return 1
     if tag == 20:                        # coroutine
-        _append_referent(out, load_ptr(o, 32))
-        _append_referent(out, load_ptr(o, 40))
-        _append_referent(out, load_ptr(o, 48))
-        return
-    if tag == 29:                        # continuation
-        slots = _continuation_slots(o)
-        count: int = _continuation_slot_count(o)
-        i: int = 0
-        while i < count:
-            _append_referent(out, load_ptr(slots, i * 8))
-            i = i + 1
-        return
+        _py_obj_gc_visit_slot(o, 32, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 40, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 48, 1, mode, out)
+        return 1
     if tag == 28:                        # task
-        _append_referent(out, load_ptr(o, 16))
-        _append_referent(out, load_ptr(o, 24))
-        _append_referent(out, load_ptr(o, 32))
-        return
+        _py_obj_gc_visit_slot(o, 16, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 24, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 32, 1, mode, out)
+        return 1
     if tag == 30:                        # virtual thread
-        _append_referent(out, load_ptr(o, 16))
-        _append_referent(out, load_ptr(o, 24))
-        return
+        _py_obj_gc_visit_slot(o, 16, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 24, 1, mode, out)
+        return 1
     if tag == 12:                        # exception
-        _append_referent(out, load_ptr(o, 24))
-        _append_referent(out, load_ptr(o, 32))
-        _append_referent(out, load_ptr(o, 40))
+        _py_obj_gc_visit_slot(o, 16, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 24, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 32, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 40, 1, mode, out)
+        return 1
+    if tag == 101:                       # property
+        _py_obj_gc_visit_slot(o, 16, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 24, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 32, 1, mode, out)
+        return 1
+    if tag == 102:                       # classmethod
+        _py_obj_gc_visit_slot(o, 16, 1, mode, out)
+        return 1
+    if tag == 103:                       # staticmethod
+        _py_obj_gc_visit_slot(o, 16, 1, mode, out)
+        return 1
+    if tag == 19:                        # memoryview
+        _py_obj_gc_visit_slot(o, 16, 1, mode, out)
+        return 1
+    if tag == 27:                        # thread
+        _py_obj_gc_visit_slot(o, 24, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 32, 1, mode, out)
+        _py_obj_gc_visit_slot(o, 40, 1, mode, out)
+        return 1
+    return 0
+
+
+def _py_obj_gc_visit_weakref_slots(o, mode: int, out) -> int:
+    if ptr_is_null(o) or is_tagged_int(o):
+        return 0
+    tag: int = load_i32(o, 8)
+    if tag != 21:                        # weakref
+        return 0
+    _py_obj_gc_visit_slot(o, 16, 3, mode, out)
+    _py_obj_gc_visit_slot(o, 24, 1, mode, out)
+    return 1
+
+
+def _py_obj_gc_visit_continuation_owner_slots(o, mode: int, out) -> int:
+    if ptr_is_null(o) or is_tagged_int(o):
+        return 0
+    tag: int = load_i32(o, 8)
+    if tag != 29:                        # continuation
+        return 0
+    slots = _continuation_slots(o)
+    if ptr_is_null(slots) != 0:
+        return 1
+    count: int = _continuation_slot_count(o)
+    i: int = 0
+    while i < count:
+        _py_obj_gc_visit_slot(slots, i * 8, 1, mode, out)
+        i = i + 1
+    return 1
+
+
+def _py_obj_gc_visit_class_slots(o, mode: int, out) -> int:
+    if ptr_is_null(o) or is_tagged_int(o):
+        return 0
+    tag: int = load_i32(o, 8)
+    if tag != 10:                        # class
+        return 0
+    n_bases: int = load_i32(o, 24)
+    bases = load_ptr(o, 32)
+    if ptr_is_null(bases) == 0:
+        i: int = 0
+        while i < n_bases:
+            _py_obj_gc_visit_slot(bases, i * 8, 2, mode, out)
+            i = i + 1
+    n_mro: int = load_i32(o, 40)
+    mro = load_ptr(o, 48)
+    if ptr_is_null(mro) == 0:
+        j: int = 0
+        while j < n_mro:
+            _py_obj_gc_visit_slot(mro, j * 8, 2, mode, out)
+            j = j + 1
+    n_methods: int = load_i32(o, 56)
+    methods = load_ptr(o, 64)
+    if ptr_is_null(methods) == 0:
+        k: int = 0
+        while k < n_methods:
+            _py_obj_gc_visit_slot(methods, k * 16 + 8, 3, mode, out)
+            k = k + 1
+    _py_obj_gc_visit_slot(o, 96, 3, mode, out)
+    _py_obj_gc_visit_slot(o, 104, 1, mode, out)
+    _py_obj_gc_visit_slot(o, 112, 2, mode, out)
+    return 1
+
+
+def _py_obj_gc_visit_cext_object_slot(slot, role: int, ctx) -> None:
+    if ptr_is_null(ctx):
         return
-    if tag == 11 or tag >= 100:          # instance / user-tagged instance
-        cls = load_ptr(o, 16)
-        if ptr_is_null(cls) == 0:
-            n_fields: int = load_i32(cls, 72)
-            if n_fields < 0:
-                n_fields = 0
-            i: int = 0
-            while i < n_fields:
-                _append_referent(out, load_ptr(o, 24 + i * 8))
-                i = i + 1
-            flags: int = load_i32(cls, 12)
-            if (flags & 2) == 0:
-                _append_referent(out, load_ptr(o, 24 + n_fields * 8))
+    mode: int = load_i32(ctx, 0)
+    out = load_ptr(ctx, 8)
+    _py_obj_gc_visit_slot(slot, 0, role, mode, out)
+
+
+def _py_obj_gc_visit_cext_object_slots(o, mode: int, out) -> int:
+    if ptr_is_null(o) or is_tagged_int(o):
+        return 0
+    ctx = malloc(16)
+    if ptr_is_null(ctx):
+        abort_extern()
+        return 0
+    store_i32(ctx, 0, mode)
+    store_ptr(ctx, 8, out)
+    handled: int = pcc_capi_visit_cext_object_slots_i64(
+        o,
+        _py_obj_gc_visit_cext_object_slot,
+        ctx,
+    )
+    free(ctx)
+    return handled
+
+
+def _py_obj_gc_visit_instance_owner_slots(o, mode: int, out) -> int:
+    if ptr_is_null(o) or is_tagged_int(o):
+        return 0
+    tag: int = load_i32(o, 8)
+    if pcc_capi_is_cext_type_tag(tag) != 0:
+        return 0
+    if tag != 11 and tag != 200 and tag < 104:
+        return 0
+    cls = load_ptr(o, 16)
+    if ptr_is_null(cls) != 0:
+        return 1
+    _py_obj_gc_visit_slot(o, 16, 2, mode, out)
+    cls = load_ptr(o, 16)
+    if ptr_is_null(cls) != 0:
+        return 1
+    n_fields: int = load_i32(cls, 72)
+    if n_fields < 0:
+        n_fields = 0
+    i: int = 0
+    while i < n_fields:
+        _py_obj_gc_visit_slot(o, 24 + i * 8, 1, mode, out)
+        i = i + 1
+    flags: int = load_i32(cls, 12)
+    if (flags & 2) == 0:
+        _py_obj_gc_visit_slot(o, 24 + n_fields * 8, 1, mode, out)
+    return 1
+
+
+def _py_obj_gc_has_no_pointer_slots(o) -> int:
+    if ptr_is_null(o) or is_tagged_int(o):
+        return 0
+    tag: int = load_i32(o, 8)
+    if tag == 0 or tag == 1 or tag == 2 or tag == 3:
+        return 1
+    if tag == 4 or tag == 16 or tag == 17 or tag == 18:
+        return 1
+    if tag == 13 or tag == 32:
+        return 1
+    if tag == 22 or tag == 23 or tag == 24 or tag == 25 or tag == 26:
+        return 1
+    return 0
+
+
+def _py_obj_gc_visit_covered_slots(o, mode: int, out) -> int:
+    if ptr_is_null(o) or is_tagged_int(o):
+        return 0
+    if _py_obj_gc_has_no_pointer_slots(o) != 0:
+        return 1
+    handled: int = _py_obj_gc_visit_core_container_owner_slots(o, mode, out)
+    if handled == 0:
+        handled = _py_obj_gc_visit_fixed_owner_slots(o, mode, out)
+    if handled == 0:
+        handled = _py_obj_gc_visit_weakref_slots(o, mode, out)
+    if handled == 0:
+        handled = _py_obj_gc_visit_continuation_owner_slots(o, mode, out)
+    if handled == 0:
+        handled = _py_obj_gc_visit_class_slots(o, mode, out)
+    if handled == 0:
+        handled = _py_obj_gc_visit_cext_object_slots(o, mode, out)
+    if handled == 0:
+        handled = _py_obj_gc_visit_instance_owner_slots(o, mode, out)
+    return handled
+
+
+def _visit_subtract(o) -> None:
+    _py_obj_gc_visit_covered_slots(o, 1, null())
+
+
+def _append_referents_to(o, out) -> None:
+    _py_obj_gc_visit_covered_slots(o, 2, out)
 
 
 @c_abi_export("py_gc_get_referents")
@@ -384,15 +500,53 @@ def _mark_reachable(o) -> None:
     _visit_mark(o)
 
 
-def _mark_root_slots(root_slots, root_count: int) -> None:
+def _py_obj_gc_mapped_root_count(frame_map) -> int:
+    if ptr_is_null(frame_map) != 0:
+        return 0
+    root_count: int = load_i32(frame_map, 0)
+    if root_count == -2147483648:
+        return 0
+    if root_count < 0:
+        root_count = 0 - root_count
+    if root_count > 100000:
+        return 0
+    return root_count
+
+
+def _py_obj_gc_mark_root_slot(slot_base, slot_offset: int) -> None:
+    if ptr_is_null(slot_base) != 0:
+        return
+    child = pcc_gc_load_ptr_extern(null(), ptr_add(slot_base, slot_offset))
+    _mark_reachable(child)
+
+
+def _py_obj_gc_mark_root_slots(root_slots, root_count: int) -> int:
     if ptr_is_null(root_slots) != 0:
-        return
-    if root_count < 0 or root_count > 100000:
-        return
+        return 0
+    if root_count <= 0 or root_count > 100000:
+        return 0
     i: int = 0
     while i < root_count:
-        _mark_reachable(load_ptr(root_slots, i * 8))
+        _py_obj_gc_mark_root_slot(root_slots, i * 8)
         i = i + 1
+    return root_count
+
+
+def _py_obj_gc_visit_mapped_root_slots(frame_map, root_slots) -> int:
+    root_count: int = _py_obj_gc_mapped_root_count(frame_map)
+    return _py_obj_gc_mark_root_slots(root_slots, root_count)
+
+
+def _py_obj_gc_visit_scheduler_root_slots() -> int:
+    visited: int = 0
+    node = global_load_ptr("pcc_gc_scheduler_root_head")
+    while ptr_is_null(node) == 0:
+        slot = load_ptr(node, 0)
+        if ptr_is_null(slot) == 0:
+            _py_obj_gc_mark_root_slot(slot, 0)
+            visited = visited + 1
+        node = load_ptr(node, 8)
+    return visited
 
 
 def _mark_runtime_roots() -> None:
@@ -408,14 +562,14 @@ def _mark_runtime_roots() -> None:
 
     root_slots = global_load_ptr("pcc_gc_root_slots")
     if ptr_is_null(root_slots) == 0:
-        _mark_root_slots(root_slots, load_i32(global_addr("pcc_gc_root_count"), 0))
+        _py_obj_gc_mark_root_slots(root_slots, load_i32(global_addr("pcc_gc_root_count"), 0))
 
     frame = global_load_ptr("pcc_gc_frame_head")
     while ptr_is_null(frame) == 0:
         frame_map = load_ptr(frame, 0)
         slots = load_ptr(frame, 8)
         if ptr_is_null(frame_map) == 0:
-            _mark_root_slots(slots, load_i32(frame_map, 0))
+            _py_obj_gc_visit_mapped_root_slots(frame_map, slots)
         frame = load_ptr(frame, 16)
 
     cont = global_load_ptr("pcc_gc_continuation_root_head")
@@ -423,17 +577,12 @@ def _mark_runtime_roots() -> None:
         frame_map = load_ptr(cont, 0)
         slots = load_ptr(cont, 8)
         if ptr_is_null(frame_map) == 0:
-            _mark_root_slots(slots, load_i32(frame_map, 0))
+            _py_obj_gc_visit_mapped_root_slots(frame_map, slots)
         cont = load_ptr(cont, 16)
 
     pcc_gc_trace_continuation_roots()
 
-    sched = global_load_ptr("pcc_gc_scheduler_root_head")
-    while ptr_is_null(sched) == 0:
-        slot = load_ptr(sched, 0)
-        if ptr_is_null(slot) == 0:
-            _mark_reachable(load_ptr(slot, 0))
-        sched = load_ptr(sched, 8)
+    _py_obj_gc_visit_scheduler_root_slots()
 
 
 def _recompute_reachability() -> None:
@@ -466,7 +615,7 @@ def _maybe_finalize_unreachable(unreachable, count: int) -> int:
         if ptr_is_null(obj) == 0:
             if is_tagged_int(obj) == 0:
                 tag: int = load_i32(obj, 8)
-                if tag == 11 or tag >= 100:
+                if (tag == 11 or tag >= 100) and pcc_capi_is_cext_type_tag(tag) == 0:
                     flags_before: int = load_i32(obj, 12)
                     py_user_del_dispatch(obj)
                     flags_after: int = load_i32(obj, 12)
@@ -478,100 +627,7 @@ def _maybe_finalize_unreachable(unreachable, count: int) -> int:
 
 
 def _visit_mark(o) -> None:
-    if ptr_is_null(o) or is_tagged_int(o):
-        return
-    tag: int = load_i32(o, 8)
-    if tag == 5:
-        length: int = load_i64(o, 16)
-        items = load_ptr(o, 32)
-        i: int = 0
-        while i < length:
-            _mark_reachable(load_ptr(items, i * 8))
-            i = i + 1
-        return
-    if tag == 7:
-        length: int = load_i64(o, 16)
-        i: int = 0
-        while i < length:
-            _mark_reachable(load_ptr(o, 24 + i * 8))
-            i = i + 1
-        return
-    if tag == 6:
-        entries = load_ptr(o, 40)
-        if ptr_is_null(entries) == 0:
-            used: int = load_i64(o, 48)
-            i: int = 0
-            while i < used:
-                off: int = i * 24
-                key = load_ptr(entries, off + 8)
-                if ptr_is_null(key) == 0:
-                    _mark_reachable(key)
-                    _mark_reachable(load_ptr(entries, off + 16))
-                i = i + 1
-        return
-    if tag == 8:
-        entries = load_ptr(o, 40)
-        if ptr_is_null(entries) == 0:
-            dummy = global_load_ptr("py_set_dummy")
-            capacity: int = load_i64(o, 24)
-            i: int = 0
-            while i < capacity:
-                key = load_ptr(entries, i * 16 + 8)
-                if ptr_is_null(key) == 0:
-                    if ptr_eq(key, dummy) == 0:
-                        _mark_reachable(key)
-                i = i + 1
-        return
-    if tag == 9:
-        _mark_reachable(load_ptr(o, 24))
-        return
-    if tag == 14:
-        _mark_reachable(load_ptr(o, 16))
-        return
-    if tag == 15:
-        _mark_reachable(load_ptr(o, 24))
-        _mark_reachable(load_ptr(o, 48))
-        return
-    if tag == 20:
-        _mark_reachable(load_ptr(o, 32))
-        _mark_reachable(load_ptr(o, 40))
-        _mark_reachable(load_ptr(o, 48))
-        return
-    if tag == 29:
-        slots = _continuation_slots(o)
-        count: int = _continuation_slot_count(o)
-        i: int = 0
-        while i < count:
-            _mark_reachable(load_ptr(slots, i * 8))
-            i = i + 1
-        return
-    if tag == 28:
-        _mark_reachable(load_ptr(o, 16))
-        _mark_reachable(load_ptr(o, 24))
-        _mark_reachable(load_ptr(o, 32))
-        return
-    if tag == 30:
-        _mark_reachable(load_ptr(o, 16))
-        _mark_reachable(load_ptr(o, 24))
-        return
-    if tag == 12:
-        _mark_reachable(load_ptr(o, 24))
-        _mark_reachable(load_ptr(o, 32))
-        _mark_reachable(load_ptr(o, 40))
-        return
-    if tag == 11 or tag >= 100:
-        cls = load_ptr(o, 16)
-        if ptr_is_null(cls) == 0:
-            n_fields: int = load_i32(cls, 72)
-            if n_fields < 0:
-                n_fields = 0
-            i: int = 0
-            while i < n_fields:
-                _mark_reachable(load_ptr(o, 24 + i * 8))
-                i = i + 1
-            flags: int = load_i32(cls, 12)
-            if (flags & 2) == 0:
-                _mark_reachable(load_ptr(o, 24 + n_fields * 8))
+    _py_obj_gc_visit_covered_slots(o, 3, null())
 
 
 def _clear_slot(slot) -> None:
@@ -584,25 +640,11 @@ def _clear_slot(slot) -> None:
     py_decref(child)
 
 
-def _clear_referents(o) -> None:
-    if ptr_is_null(o) or is_tagged_int(o):
-        return
-    tag: int = load_i32(o, 8)
+def _py_obj_gc_clear_container_metadata(o, tag: int) -> None:
     if tag == 5:
-        length: int = load_i64(o, 16)
-        items = load_ptr(o, 32)
-        i: int = 0
-        while i < length:
-            _clear_slot(ptr_add(items, i * 8))
-            i = i + 1
         store_i64(o, 16, 0)
         return
     if tag == 7:
-        length: int = load_i64(o, 16)
-        i: int = 0
-        while i < length:
-            _clear_slot(ptr_add(o, 24 + i * 8))
-            i = i + 1
         store_i64(o, 16, 0)
         return
     if tag == 6:
@@ -612,12 +654,7 @@ def _clear_referents(o) -> None:
             i: int = 0
             while i < used:
                 off: int = i * 24
-                key_slot = ptr_add(entries, off + 8)
-                key = load_ptr(key_slot, 0)
-                if ptr_is_null(key) == 0:
-                    _clear_slot(key_slot)
-                    _clear_slot(ptr_add(entries, off + 16))
-                    store_i64(entries, off, 0)
+                store_i64(entries, off, 0)
                 i = i + 1
         indices = load_ptr(o, 32)
         if ptr_is_null(indices) == 0:
@@ -637,67 +674,20 @@ def _clear_referents(o) -> None:
             i: int = 0
             while i < capacity:
                 key_slot = ptr_add(entries, i * 16 + 8)
-                key = load_ptr(key_slot, 0)
-                if ptr_is_null(key) == 0:
-                    store_ptr(key_slot, 0, null())
-                    if ptr_eq(key, dummy) == 0:
-                        if _is_unreachable(key) == 0:
-                            py_decref(key)
-                    store_i64(entries, i * 16, 0)
+                store_ptr(key_slot, 0, null())
+                store_i64(entries, i * 16, 0)
                 i = i + 1
         store_i64(o, 16, 0)
         store_i64(o, 32, 0)
         return
-    if tag == 9:
-        _clear_slot(ptr_add(o, 24))
+
+
+def _clear_referents(o) -> None:
+    if ptr_is_null(o) or is_tagged_int(o):
         return
-    if tag == 14:
-        _clear_slot(ptr_add(o, 16))
-        return
-    if tag == 15:
-        _clear_slot(ptr_add(o, 24))
-        _clear_slot(ptr_add(o, 48))
-        return
-    if tag == 20:
-        _clear_slot(ptr_add(o, 32))
-        _clear_slot(ptr_add(o, 40))
-        _clear_slot(ptr_add(o, 48))
-        return
-    if tag == 29:
-        slots = _continuation_slots(o)
-        count: int = _continuation_slot_count(o)
-        i: int = 0
-        while i < count:
-            _clear_slot(ptr_add(slots, i * 8))
-            i = i + 1
-        return
-    if tag == 28:
-        _clear_slot(ptr_add(o, 16))
-        _clear_slot(ptr_add(o, 24))
-        _clear_slot(ptr_add(o, 32))
-        return
-    if tag == 30:
-        _clear_slot(ptr_add(o, 16))
-        _clear_slot(ptr_add(o, 24))
-        return
-    if tag == 12:
-        _clear_slot(ptr_add(o, 24))
-        _clear_slot(ptr_add(o, 32))
-        _clear_slot(ptr_add(o, 40))
-        return
-    if tag == 11 or tag >= 100:
-        cls = load_ptr(o, 16)
-        if ptr_is_null(cls) == 0:
-            n_fields: int = load_i32(cls, 72)
-            if n_fields < 0:
-                n_fields = 0
-            i: int = 0
-            while i < n_fields:
-                _clear_slot(ptr_add(o, 24 + i * 8))
-                i = i + 1
-            flags: int = load_i32(cls, 12)
-            if (flags & 2) == 0:
-                _clear_slot(ptr_add(o, 24 + n_fields * 8))
+    tag: int = load_i32(o, 8)
+    if _py_obj_gc_visit_covered_slots(o, 4, null()) != 0:
+        _py_obj_gc_clear_container_metadata(o, tag)
 
 
 def _dealloc_unreachable(o) -> None:
@@ -740,6 +730,8 @@ def _dealloc_unreachable(o) -> None:
         py_dealloc_memoryview(o)
     elif tag == 21:
         py_dealloc_weakref(o)
+    elif pcc_capi_dealloc_cext_object(o, tag) != 0:
+        return
     elif tag >= 100:
         py_instance_dealloc(o)
     else:
@@ -831,7 +823,7 @@ def py_gc_track(o) -> None:
         return
     if is_tagged_int(o):
         return
-    if pcc_gc_backend() == 4 and pcc_threads_enabled() != 0:
+    if pcc_threads_enabled() != 0 and pcc_gc_backend() == 4:
         return
     flags: int = load_i32(o, 12)
     if (flags & 2) != 0:
@@ -867,7 +859,7 @@ def py_gc_untrack(o) -> None:
         return
     if is_tagged_int(o):
         return
-    if pcc_gc_backend() == 4 and pcc_threads_enabled() != 0:
+    if pcc_threads_enabled() != 0 and pcc_gc_backend() == 4:
         return
     flags: int = load_i32(o, 12)
     if (flags & 2) == 0:

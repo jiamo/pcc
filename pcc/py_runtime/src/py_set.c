@@ -98,8 +98,10 @@ static void py_set_lookup(PySetObject *s, int64_t hash, PyObject *key,
     uint64_t perturb = (uint64_t)hash;
     int64_t j = (int64_t)((uint64_t)hash & (uint64_t)mask);
     int64_t first_tombstone = -1;
+    int64_t probes = 0;
+    int64_t limit = s->capacity * 2;
 
-    for (;;) {
+    while (probes < limit) {
         SetEntry *e = &s->entries[j];
         PyObject *entry_key = py_set_entry_key(s, e);
         if (entry_key == NULL) {
@@ -116,7 +118,11 @@ static void py_set_lookup(PySetObject *s, int64_t hash, PyObject *key,
         }
         perturb >>= 5;
         j = (int64_t)(((uint64_t)j * 5u + perturb + 1u) & (uint64_t)mask);
+        probes++;
     }
+
+    *out_slot = (first_tombstone >= 0) ? first_tombstone : 0;
+    *out_found = 0;
 }
 
 /* Rebuild the entries[] array at `new_capacity`. Moves refs (no
@@ -143,6 +149,12 @@ static int py_set_rehash(PySetObject *s, int64_t new_capacity) {
         (void)found;
         s->entries[slot].hash = old_entries[i].hash;
         s->entries[slot].key  = k;
+        /* Move (no incref/decref): the migrated key is still owned by the
+         * set, just relocated to a new slot. Route it through the slot
+         * write barrier so backend #3's generational remembered set and
+         * backend #4's relocation slot tracking observe the new slot.
+         * Mirrors the decomposed move-store in py_dict_rehash. */
+        pcc_gc_note_slot_write_barrier((PyObject *)s, &s->entries[slot].key, k);
         s->size++;
         s->fill++;
     }
@@ -261,6 +273,50 @@ PyObject *py_set_symmetric_difference(PyObject *a, PyObject *b) {
     return out;
 }
 
+/* Drop every live key in `dst` (decref + tombstone) without freeing the
+ * entries array, then re-add every live key of `result`. Preserves the
+ * receiver object identity while replacing its contents. `result` is a
+ * private set produced by one of the *_difference/intersection helpers. */
+static void py_set_replace_contents(PyObject *dst, PyObject *result) {
+    if (dst == NULL) return;
+    if (PY_IS_TAGGED_INT(dst)) return;
+    if (py_header(dst)->type_tag != PY_TYPE_SET) return;
+    PySetObject *s = (PySetObject *)dst;
+    for (int64_t i = 0; i < s->capacity; i++) {
+        SetEntry *e = &s->entries[i];
+        PyObject *k = py_set_entry_key(s, e);
+        if (k == NULL || k == py_set_dummy) continue;
+        py_decref(k);
+        e->key = py_set_dummy;   /* tombstone; fill unchanged */
+        s->size--;
+    }
+    /* py_set_update re-adds each live key of `result` (incref via
+     * pcc_gc_store_ptr inside py_set_add). Tombstones from the clear above
+     * are reused as insert targets and reclaimed on the next rehash. */
+    py_set_update(dst, result);
+}
+
+void py_set_intersection_update(PyObject *dst, PyObject *other) {
+    PyObject *result = py_set_intersection(dst, other);
+    if (result == NULL) return;
+    py_set_replace_contents(dst, result);
+    py_decref(result);
+}
+
+void py_set_difference_update(PyObject *dst, PyObject *other) {
+    PyObject *result = py_set_difference(dst, other);
+    if (result == NULL) return;
+    py_set_replace_contents(dst, result);
+    py_decref(result);
+}
+
+void py_set_symmetric_difference_update(PyObject *dst, PyObject *other) {
+    PyObject *result = py_set_symmetric_difference(dst, other);
+    if (result == NULL) return;
+    py_set_replace_contents(dst, result);
+    py_decref(result);
+}
+
 int64_t py_set_issubset(PyObject *a, PyObject *b) {
     if (a == NULL || b == NULL) return 0;
     if (PY_IS_TAGGED_INT(a) || PY_IS_TAGGED_INT(b)) return 0;
@@ -294,6 +350,27 @@ PyObject *py_set_items(PyObject *set) {
         py_list_append(out, k);
     }
     return out;
+}
+
+PyObject *py_set_pop(PyObject *set) {
+    if (set == NULL) return NULL;
+    if (PY_IS_TAGGED_INT(set)) return NULL;
+    if (py_header(set)->type_tag != PY_TYPE_SET) return NULL;
+    PySetObject *s = (PySetObject *)set;
+    if (s->size <= 0) {
+        py_raise_owned(py_exc_new(PY_EXC_KEYERROR, "pop from an empty set"));
+        return NULL;
+    }
+    for (int64_t i = 0; i < s->capacity; i++) {
+        SetEntry *e = &s->entries[i];
+        PyObject *k = py_set_entry_key(s, e);
+        if (k == NULL || k == py_set_dummy) continue;
+        e->key = py_set_dummy;   /* transfer set's owned ref to caller */
+        s->size--;
+        return k;
+    }
+    py_raise_owned(py_exc_new(PY_EXC_KEYERROR, "pop from an empty set"));
+    return NULL;
 }
 
 int64_t py_set_contains(PyObject *set, PyObject *item) {

@@ -13,6 +13,8 @@ py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
 py_int_mod = extern("py_int_mod", (c_ptr, c_ptr), c_ptr)
 py_str_mod = extern("py_str_mod", (c_ptr, c_ptr), c_ptr)
+py_bytes_mod = extern("py_bytes_mod", (c_ptr, c_ptr), c_ptr)
+py_user_binop_dispatch = extern("py_user_binop_dispatch", (c_ptr, c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
 
 
 def _type_of(o) -> int:
@@ -30,7 +32,17 @@ def py_obj_mod(a, b):
     bt: int = _type_of(b)
     if at == 4:
         return py_str_mod(a, b)
+    if at == 17 or at == 18:            # PY_TYPE_BYTES / PY_TYPE_BYTEARRAY
+        return py_bytes_mod(a, b)
     if (at == 2 or at == 1) and (bt == 2 or bt == 1):
         return py_int_mod(a, b)
+    if at == 11 or at >= 100 or bt == 11 or bt >= 100:
+        return py_user_binop_dispatch(
+            a,
+            b,
+            cstr("__mod__"),
+            cstr("__rmod__"),
+            cstr("unsupported operand type(s) for %"),
+        )
     py_raise(py_exc_new(3, cstr("unsupported operand type(s) for %")))
     return null()

@@ -96,6 +96,36 @@ char *py_bigint_to_cstr(const PyIntObject *b) {
     return buf;
 }
 
+/* Full base-{2,8,16} string for a bignum: "[-]0<prefix_ch><digits>" (lowercase
+ * a-f for hex), e.g. py_bigint_to_base_cstr(B, 16, 'x') -> "0x10000...".
+ * Mirrors py_bigint_to_cstr but divides by the (small) base, one digit per
+ * iteration. Caller frees the returned malloc'd, NUL-terminated string. */
+char *py_bigint_to_base_cstr(const PyIntObject *b, unsigned base, char prefix_ch) {
+    int neg = b->sign < 0;
+    /* base 2 is the widest: up to 32 binary digits per 32-bit limb, plus
+     * sign + "0x" + NUL. */
+    size_t bufsz = (size_t)b->ndigits * 32 + 8;
+    char *buf = (char *)malloc(bufsz);
+    if (buf == NULL) return NULL;
+    PyIntObject *tmp = bigint_copy(b);
+    if (tmp == NULL) { free(buf); return NULL; }
+    tmp->sign = 1;  /* work on the magnitude (b is nonzero here) */
+    size_t pos = bufsz;
+    buf[--pos] = '\0';
+    do {
+        uint32_t rem = bigint_divmod_small_inplace(tmp, base);
+        buf[--pos] = (rem < 10) ? (char)('0' + rem)
+                                : (char)('a' + (rem - 10));
+    } while (tmp->ndigits > 0);
+    free(tmp);
+    buf[--pos] = prefix_ch;
+    buf[--pos] = '0';
+    if (neg) buf[--pos] = '-';
+    size_t len = bufsz - pos;  /* includes the NUL */
+    memmove(buf, buf + pos, len);
+    return buf;
+}
+
 /* Parse a decimal string (optional leading sign, then digits). Returns a
  * new bignum (never a tagged form) or NULL on error. */
 PyIntObject *py_bigint_from_cstr(const char *s) {

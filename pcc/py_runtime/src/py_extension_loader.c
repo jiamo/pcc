@@ -32,17 +32,15 @@ static char *pcc_ext_strdup(const char *s) {
     return out;
 }
 
-static PccExtensionModuleNode *pcc_extension_find(const char *module_name,
-                                                  const char *path) {
-    for (PccExtensionModuleNode *n = pcc_extension_modules; n != NULL; n = n->next) {
-        if (
-            strcmp(n->module_name, module_name ? module_name : "") == 0
-            && strcmp(n->path, path ? path : "") == 0
-        ) {
-            return n;
-        }
-    }
-    return NULL;
+/* PCC_DEBUG_EXT_IMPORT=1: off-by-default stderr trace of extension-module
+ * loads (cache hit/miss, exec begin, registration). The ordering of these
+ * events against a cext's own exec-time imports is what diagnosed the numpy
+ * re-init and parent-package-order bugs; see
+ * docs/investigations/numpy-loader-probe-cext-reimport-load-once.md. */
+static int pcc_ext_debug(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("PCC_DEBUG_EXT_IMPORT") != NULL ? 1 : 0;
+    return v;
 }
 
 static PccExtensionModuleNode *pcc_extension_find_module(const char *module_name) {
@@ -72,6 +70,47 @@ static char *pcc_extension_init_symbol(const char *module_name) {
     return symbol;
 }
 
+/* Take ownership of the caller's ref on `module` and publish it in the
+ * load-once cache. Returns the node, or NULL on allocation failure (caller
+ * keeps its ref). */
+static PccExtensionModuleNode *pcc_extension_register(
+    const char *module_name, const char *path, void *handle, PyObject *module
+) {
+    PccExtensionModuleNode *node =
+        (PccExtensionModuleNode *)calloc(1, sizeof(PccExtensionModuleNode));
+    if (node == NULL) return NULL;
+    node->module_name = pcc_ext_strdup(module_name);
+    node->path = pcc_ext_strdup(path);
+    if (node->module_name == NULL || node->path == NULL) {
+        free(node->module_name);
+        free(node->path);
+        free(node);
+        return NULL;
+    }
+    node->handle = handle;
+    node->module = module;
+    pcc_gc_pin(module);
+    node->next = pcc_extension_modules;
+    pcc_extension_modules = node;
+    if (pcc_ext_debug()) {
+        fprintf(stderr, "[ext-import] registered name=%s\n", module_name);
+    }
+    return node;
+}
+
+/* Roll a failed registration back out of the cache (exec-slot failure).
+ * Releases the node's module ref; the caller still owns dlclose. */
+static void pcc_extension_unregister(PccExtensionModuleNode *node) {
+    PccExtensionModuleNode **link = &pcc_extension_modules;
+    while (*link != NULL && *link != node) link = &(*link)->next;
+    if (*link == node) *link = node->next;
+    pcc_gc_unpin(node->module);
+    py_decref(node->module);
+    free(node->module_name);
+    free(node->path);
+    free(node);
+}
+
 static PyObject *pcc_extension_runtime_error(const char *prefix, const char *detail) {
     char buf[768];
     const char *p = prefix ? prefix : "native extension import failed";
@@ -94,7 +133,32 @@ PyObject *py_native_extension_import(const char *module_name, const char *path) 
         return pcc_extension_runtime_error("native extension import failed", "missing module name or path");
     }
 
-    PccExtensionModuleNode *cached = pcc_extension_find(module_name, path);
+    /* Cache lookup is keyed by the fully qualified module NAME, matching
+     * CPython's sys.modules: a second import of the same dotted name returns
+     * the already-initialized module even when it was resolved through a
+     * different filesystem path (compile-time baked path vs PCC_PACKAGE_SITE
+     * search can legitimately name the same module twice). Keying on
+     * (name, path) re-ran PyInit_* for the second path, which C extensions
+     * with process-global init guards (numpy's _multiarray_umath) reject with
+     * "cannot load module more than once per process". */
+    PccExtensionModuleNode *cached = pcc_extension_find_module(module_name);
+    if (pcc_ext_debug()) {
+        fprintf(stderr, "[ext-import] name=%s cached=%d path=%s\n",
+                module_name, cached != NULL && cached->module != NULL, path);
+    }
+    if (cached != NULL && cached->module != NULL) {
+        py_incref(cached->module);
+        return cached->module;
+    }
+
+    /* CPython initializes parent packages before loading a submodule
+     * extension. Running the compiled parents here means the packages that
+     * surround a C extension are in progress (or done) before its exec slots
+     * run, so exec-time imports back into the package see CPython's
+     * partial-module state instead of re-running whole package bodies. The
+     * parent init may itself import this extension; re-check the cache. */
+    if (py_compiled_module_ensure_parent_packages(module_name) != 0) return NULL;
+    cached = pcc_extension_find_module(module_name);
     if (cached != NULL && cached->module != NULL) {
         py_incref(cached->module);
         return cached->module;
@@ -129,10 +193,16 @@ PyObject *py_native_extension_import(const char *module_name, const char *path) 
         return NULL;
     }
     /* Multi-phase init (PEP 489): PyInit_* returned a module DEF, not a ready
-     * module. Build the module + run its Py_mod_exec slots (numpy registers its
-     * types / PyArray_API capsule there). */
+     * module. Build the module, REGISTER it, then run its Py_mod_exec slots
+     * (numpy registers its types / PyArray_API capsule there). Registration
+     * must precede exec — CPython puts the module into sys.modules before
+     * exec_module — so a nested import of the same module from inside an exec
+     * slot's Python imports returns the in-progress module instead of
+     * re-running PyInit (numpy's _multiarray_umath hard-fails a second init
+     * per process). */
     if (pcc_capi_is_moduledef(module)) {
-        PyObject *built = pcc_capi_module_exec(module);
+        PyObject *def_obj = module;
+        PyObject *built = pcc_capi_module_from_def(def_obj);
         if (built == NULL) {
             dlclose(handle);
             if (!py_err_occurred()) {
@@ -140,30 +210,35 @@ PyObject *py_native_extension_import(const char *module_name, const char *path) 
             }
             return NULL;
         }
-        module = built;
+        PccExtensionModuleNode *node =
+            pcc_extension_register(module_name, path, handle, built);
+        if (node == NULL) {
+            py_decref(built);
+            dlclose(handle);
+            return pcc_extension_runtime_error("native extension import failed", "out of memory");
+        }
+        if (pcc_ext_debug()) {
+            fprintf(stderr, "[ext-import] exec-begin name=%s\n", module_name);
+        }
+        if (pcc_capi_module_run_exec_slots(def_obj, built) != 0) {
+            pcc_extension_unregister(node);
+            dlclose(handle);
+            if (!py_err_occurred()) {
+                return pcc_extension_runtime_error("native extension exec failed", module_name);
+            }
+            return NULL;
+        }
+        py_incref(built);
+        return built;
     }
 
-    PccExtensionModuleNode *node = (PccExtensionModuleNode *)calloc(1, sizeof(PccExtensionModuleNode));
+    PccExtensionModuleNode *node =
+        pcc_extension_register(module_name, path, handle, module);
     if (node == NULL) {
         py_decref(module);
         dlclose(handle);
         return pcc_extension_runtime_error("native extension import failed", "out of memory");
     }
-    node->module_name = pcc_ext_strdup(module_name);
-    node->path = pcc_ext_strdup(path);
-    if (node->module_name == NULL || node->path == NULL) {
-        free(node->module_name);
-        free(node->path);
-        free(node);
-        py_decref(module);
-        dlclose(handle);
-        return pcc_extension_runtime_error("native extension import failed", "out of memory");
-    }
-    node->handle = handle;
-    node->module = module;
-    pcc_gc_pin(module);
-    node->next = pcc_extension_modules;
-    pcc_extension_modules = node;
     py_incref(module);
     return module;
 }
@@ -212,6 +287,19 @@ static int pcc_extension_path_exists(const char *path) {
 PyObject *py_native_extension_import_by_name(const char *module_name) {
     if (module_name == NULL || module_name[0] == '\0') return NULL;
     PccExtensionModuleNode *cached = pcc_extension_find_module(module_name);
+    if (pcc_ext_debug()) {
+        fprintf(stderr, "[ext-import] by-name name=%s cached=%d\n",
+                module_name, cached != NULL && cached->module != NULL);
+    }
+    if (cached != NULL && cached->module != NULL) {
+        py_incref(cached->module);
+        return cached->module;
+    }
+
+    /* Parent packages first (see py_native_extension_import); the parent
+     * init may import this extension, so re-check the cache afterwards. */
+    if (py_compiled_module_ensure_parent_packages(module_name) != 0) return NULL;
+    cached = pcc_extension_find_module(module_name);
     if (cached != NULL && cached->module != NULL) {
         py_incref(cached->module);
         return cached->module;

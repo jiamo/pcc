@@ -27,7 +27,8 @@ CPPFLAGS ?=
 INCLUDES  = -Iinclude
 PCC_WITH_THREADS ?= 0
 PCC_REFCOUNT_KIND ?=
-RUNTIME_HEADERS = Makefile include/py_runtime.h $(SRCDIR)/py_internal.h
+RUNTIME_HEADERS = Makefile include/py_runtime.h $(SRCDIR)/py_internal.h $(SRCDIR)/py_timer_heap.h $(SRCDIR)/py_io_waitset.h
+PCC_STDATOMIC_HEADER = $(PCC_REPO_ROOT)/utils/fake_libc_include/stdatomic.h
 
 # Phase 4: optional libpython fallback. Build with
 #   make PCC_WITH_LIBPYTHON=1
@@ -73,7 +74,12 @@ SRCS = \
 	$(SRCDIR)/py_os_native.c \
 	$(SRCDIR)/py_gc_backend.c \
 	$(SRCDIR)/pcc_threads.c \
+	$(SRCDIR)/py_timer_heap.c \
+	$(SRCDIR)/py_io_waitset.c \
 	$(SRCDIR)/pcc_runtime_log.c \
+	$(SRCDIR)/pcc_metal_runtime.c \
+	$(SRCDIR)/pcc_gc_external_resource.c \
+	$(SRCDIR)/pcc_dlpack_runtime.c \
 	$(SRCDIR)/py_obj_gc.c \
 	$(SRCDIR)/py_protocol.c \
 	$(SRCDIR)/py_obj_ops_compare.c \
@@ -100,11 +106,15 @@ SRCS = \
 	$(SRCDIR)/py_iter.c \
 	$(SRCDIR)/py_gen.c \
 	$(SRCDIR)/py_coroutine.c \
+	$(SRCDIR)/py_asyncio_io.c \
 	$(SRCDIR)/py_context.c \
 		$(SRCDIR)/py_format.c \
+		$(SRCDIR)/py_float_fromhex.c \
+		$(SRCDIR)/py_complex_pow.c \
 		$(SRCDIR)/py_call_splat.c \
 		$(SRCDIR)/py_module_attrs.c \
-		$(SRCDIR)/py_capi_shim.c \
+		$(SRCDIR)/py_compiled_module.c \
+		$(PY_CAPI_SHIM_SRC) \
 		$(SRCDIR)/py_extension_loader.c \
 		$(SRCDIR)/py_tuple.c \
 	$(SRCDIR)/py_dict.c \
@@ -123,7 +133,15 @@ SRCS = \
 	$(SRCDIR)/py_file.c \
 	$(SRCDIR)/py_process.c \
 	$(SRCDIR)/py_process_substrate.c \
+	$(SRCDIR)/py_process_timeout.c \
 	$(SRCDIR)/py_re.c \
+	$(SRCDIR)/py_re_engine.c \
+	$(SRCDIR)/py_re_engine_obj.c \
+	$(SRCDIR)/py_cpy_handle.c \
+	$(SRCDIR)/py_os_rss.c \
+	$(SRCDIR)/py_os_heap.c \
+	$(SRCDIR)/py_enumerate.c \
+	$(SRCDIR)/py_int_bytes.c \
 	$(SRCDIR)/py_weakref.c \
 	$(SRCDIR)/py_threading.c \
 	$(SRCDIR)/py_print_fmt.c \
@@ -137,6 +155,11 @@ ifeq ($(PCC_WITH_LIBPYTHON),1)
 LIBPYTHON_SRCS = py_libpython.c
 endif
 
+PY_CAPI_SHIM_SRC =
+ifneq ($(PCC_WITH_LIBPYTHON),1)
+PY_CAPI_SHIM_SRC = $(SRCDIR)/py_capi_shim.c
+endif
+
 OBJS     = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 OBJS_PCC = $(patsubst $(SRCDIR)/%.c,$(OBJDIR_PCC)/%.o,$(SRCS))
 OBJS_PY  = $(patsubst %,$(OBJDIR_PY)/%.o,$(PY_MODULES))
@@ -146,23 +169,52 @@ LIB_PCC    = libpy_runtime_pcc.a
 LIB_PCC_PY = libpy_runtime_pcc_py.a
 LIB_PCC_PY_LIBPYTHON = libpy_runtime_pcc_py_libpython.a
 OBJ_PY_CC_HELPERS = $(OBJDIR_PY)/py_gc_index_table.o $(OBJDIR_PY)/py_os_native.o $(OBJDIR_PY)/pcc_threads.o $(OBJDIR_PY)/pcc_runtime_log.o $(OBJDIR_PY)/py_json.o $(OBJDIR_PY)/py_pickle_copy.o $(OBJDIR_PY)/py_runtime_high_substrate.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/pcc_metal_runtime.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/pcc_gc_external_resource.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/pcc_dlpack_runtime.o
 OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_context.o $(OBJDIR_PY)/py_format.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_process_timeout.o
+# float.fromhex hex-float parser (C-only, no port; see py_float_fromhex.c).
+# Linked into the default pcc-Python port archive so float.fromhex works
+# under --python-libpython=off.
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_float_fromhex.o
+# Complex ``**`` (C-only, no port; see py_complex_pow.c / .py). Linked into the
+# default pcc-Python port archive alongside the other complex helpers.
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_complex_pow.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_asyncio_io.o
 OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_protocol.o $(OBJDIR_PY)/py_class_attrs.o
 OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_call_splat.o $(OBJDIR_PY)/py_module_attrs.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_compiled_module.o
 OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_capi_shim.o $(OBJDIR_PY)/py_extension_loader.o
 OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_http.o
 OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_int_modexp.o
 OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_obj_min_max.o
 OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_tuple_methods.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_re_engine.o $(OBJDIR_PY)/py_re_engine_obj.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_cpy_handle.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_os_rss.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_os_heap.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_enumerate.o
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_int_bytes.o
+# Dependency-free timer min-heap. pcc_threads.o (a C-only helper above) now
+# calls pcc_timer_heap_* for the vthread sleep/poll-timers path, so the object
+# must be in the pcc-Python runtime archive too, not only the C-runtime one.
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_timer_heap.o
+# Dependency-free IO waitset (poll fallback + Darwin kqueue). py_asyncio_io.o
+# (a C-only helper above) now calls pcc_io_waitset_kqueue_available() to report
+# the platform readiness backend, so the object must be in the pcc-Python
+# runtime archive too, not only the C-runtime one.
+OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_io_waitset.o
 
 .PHONY: all clean distclean
 
 all: $(LIB)
 
 $(LIB): $(OBJS)
-	rm -f $@
-	$(AR) rcs $@ $^
-	$(RANLIB) $@
+	rm -f $@.tmp
+	$(AR) rcs $@.tmp $^
+	$(RANLIB) $@.tmp
+	mv -f $@.tmp $@
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c $(RUNTIME_HEADERS) | $(OBJDIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
@@ -175,12 +227,42 @@ $(OBJDIR):
 # uses --cpp-arg=-I for header lookup because pcc does not (yet)
 # consume -I directly; --emit-obj writes the object file in place.
 $(LIB_PCC): $(OBJS_PCC)
-	rm -f $@
-	$(AR) rcs $@ $^
-	$(RANLIB) $@
+	rm -f $@.tmp
+	$(AR) rcs $@.tmp $^
+	$(RANLIB) $@.tmp
+	mv -f $@.tmp $@
 
 $(OBJDIR_PCC)/%.o: $(SRCDIR)/%.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
 	$(PCC) --cpp-arg=-I$(CURDIR)/include --cpp-arg=-I$(CURDIR)/src --emit-obj $@ $<
+
+# py_re_engine.c uses C11 atomics through pcc's parser-facing fake header.
+# Track that preprocessing input so an atomic-surface edit cannot leave a stale
+# pcc-emitted object/archive behind.
+$(OBJDIR_PCC)/py_re_engine.o: $(PCC_STDATOMIC_HEADER)
+
+# C-kernel platform-syscall helpers (PCC_CC_ONLY_SRCS): these read OS-specific,
+# ABI-sensitive structs through SDK headers that use modern syntax pcc's C
+# frontend does not parse (e.g. macOS <malloc/malloc.h> / <mach/mach.h> use C23
+# `enum : uint64_t` and bool bitfields; <sys/event.h>'s kevent has no fake-libc
+# shadow). fake-libc shadows would have to duplicate the OS struct layout
+# exactly, which is fragile; per the runtime layering doctrine these stay in the
+# C kernel. Their symbols may be referenced by other pcc-emitted objects in the
+# SAME archive (e.g. py_asyncio_io.o calls pcc_io_waitset_kqueue_available), and
+# that still links because the CC-built object is archived alongside them.
+# Explicit rules override the generic pcc pattern rule above.
+PCC_CC_ONLY_SRCS = py_os_rss py_os_heap py_io_waitset pcc_metal_runtime pcc_gc_external_resource pcc_dlpack_runtime
+$(OBJDIR_PCC)/pcc_metal_runtime.o: $(SRCDIR)/pcc_metal_runtime.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+$(OBJDIR_PCC)/pcc_gc_external_resource.o: $(SRCDIR)/pcc_gc_external_resource.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+$(OBJDIR_PCC)/pcc_dlpack_runtime.o: $(SRCDIR)/pcc_dlpack_runtime.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+$(OBJDIR_PCC)/py_os_rss.o: $(SRCDIR)/py_os_rss.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+$(OBJDIR_PCC)/py_io_waitset.o: $(SRCDIR)/py_io_waitset.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+$(OBJDIR_PCC)/py_os_heap.o: $(SRCDIR)/py_os_heap.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR_PCC):
 	mkdir -p $(OBJDIR_PCC)
@@ -191,17 +273,23 @@ $(OBJDIR_PCC):
 # relocatable object. The resulting archive is built directly from the
 # Python-built objects: the no-C closure must not depend on successfully
 # compiling the replaced C runtime sources on every target.
+# Build into a temp archive and atomically rename into place. A plain
+# `rm $@; ar rcs $@` leaves a window where $@ is absent/partial; a concurrent
+# linker (e.g. another xdist worker's clang, which holds no build lock) then
+# fails with "no such file: libpy_runtime_pcc_py.a". `mv` is an atomic rename,
+# so a linker always opens the old-or-new complete archive, never a gap.
 $(LIB_PCC_PY): $(OBJS_PY) $(OBJ_PY_CC_HELPERS)
-	rm -f $@
-	$(AR) rcs $@ $(OBJS_PY) $(OBJ_PY_CC_HELPERS)
-	$(RANLIB) $@
+	rm -f $@.tmp
+	$(AR) rcs $@.tmp $(OBJS_PY) $(OBJ_PY_CC_HELPERS)
+	$(RANLIB) $@.tmp
+	mv -f $@.tmp $@
 
 # Compatibility fallback archive for bootstrap builds that still emit
 # py_cpy_* calls. It keeps the pcc-Python runtime replacement archive
 # as the base and adds only the CPython bridge object.
 $(LIB_PCC_PY_LIBPYTHON): $(LIB_PCC_PY) $(OBJDIR_LIBPY)/py_libpython.o
-	cp $(LIB_PCC_PY) $@
-	-$(AR) d $@ py_libpython.o
+	cp $(LIB_PCC_PY) $@.tmp
+	-$(AR) d $@.tmp py_libpython.o
 	# In libpython mode the real libpython provides the CPython C-API. The
 	# no-libpython C-API shim (py_capi_shim.o: ~286 Py* symbols using pcc's
 	# object model with no libpython delegation) must NOT be in this variant:
@@ -213,9 +301,10 @@ $(LIB_PCC_PY_LIBPYTHON): $(LIB_PCC_PY) $(OBJDIR_LIBPY)/py_libpython.o
 	# so libpython's C-API wins. The no-libpython archive (LIB_PCC_PY) keeps
 	# the shim and is unchanged, so self-host bootstrap is unaffected. See
 	# docs/investigations/python-cpython-compat-import-numpy-multiarray-init-fails.md
-	-$(AR) d $@ py_capi_shim.o
-	$(AR) r $@ $(OBJDIR_LIBPY)/py_libpython.o
-	$(RANLIB) $@
+	-$(AR) d $@.tmp py_capi_shim.o
+	$(AR) r $@.tmp $(OBJDIR_LIBPY)/py_libpython.o
+	$(RANLIB) $@.tmp
+	mv -f $@.tmp $@
 
 $(OBJDIR_LIBPY)/py_libpython.o: $(SRCDIR)/py_libpython.c $(RUNTIME_HEADERS) | $(OBJDIR_LIBPY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DPCC_WITH_LIBPYTHON=1 $(shell python3-config --includes) $(INCLUDES) -c $< -o $@
@@ -223,7 +312,12 @@ $(OBJDIR_LIBPY)/py_libpython.o: $(SRCDIR)/py_libpython.c $(RUNTIME_HEADERS) | $(
 $(OBJDIR_LIBPY):
 	mkdir -p $(OBJDIR_LIBPY)
 
-$(OBJDIR_PY)/%.o: $(PYDIR)/%.py Makefile | $(OBJDIR_PY)
+# Recompile a pcc-Python runtime module when that module changes. The archive
+# target already tracks additions/removals through OBJS_PY/OBJ_PY_CC_HELPERS;
+# making every object depend on the entire Makefile turned any helper-list edit
+# into a full runtime rebuild. Compiler/target/config invalidation is owned by
+# pipeline._ensure_runtime's explicit full-rebuild decision.
+$(OBJDIR_PY)/%.o: $(PYDIR)/%.py | $(OBJDIR_PY)
 	PYTHONPATH=$(PCC_REPO_ROOT) PCC_HOST_PYTHON=$(PYTHON) $(PCC) --python-library --emit-llvm=$(OBJDIR_PY)/$*.ll $<
 	PYTHONPATH=$(PCC_REPO_ROOT) $(PCC_IR_TO_OBJ) $(OBJDIR_PY)/$*.ll $@
 
@@ -239,6 +333,15 @@ $(OBJDIR_PY)/py_os_native.o: $(SRCDIR)/py_os_native.c $(RUNTIME_HEADERS) | $(OBJ
 $(OBJDIR_PY)/py_http.o: $(SRCDIR)/py_http.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(OBJDIR_PY)/py_asyncio_io.o: $(SRCDIR)/py_asyncio_io.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_process_timeout.o: $(SRCDIR)/py_process_timeout.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_io_waitset.o: $(SRCDIR)/py_io_waitset.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(OBJDIR_PY)/py_int_modexp.o: $(SRCDIR)/py_int_modexp.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -248,10 +351,43 @@ $(OBJDIR_PY)/py_obj_min_max.o: $(SRCDIR)/py_obj_min_max.c $(RUNTIME_HEADERS) | $
 $(OBJDIR_PY)/py_tuple_methods.o: $(SRCDIR)/py_tuple_methods.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(OBJDIR_PY)/py_re_engine.o: $(SRCDIR)/py_re_engine.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_re_engine_obj.o: $(SRCDIR)/py_re_engine_obj.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_cpy_handle.o: $(SRCDIR)/py_cpy_handle.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_os_rss.o: $(SRCDIR)/py_os_rss.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_os_heap.o: $(SRCDIR)/py_os_heap.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_enumerate.o: $(SRCDIR)/py_enumerate.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_int_bytes.o: $(SRCDIR)/py_int_bytes.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_timer_heap.o: $(SRCDIR)/py_timer_heap.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(OBJDIR_PY)/pcc_threads.o: $(SRCDIR)/pcc_threads.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR_PY)/pcc_runtime_log.o: $(SRCDIR)/pcc_runtime_log.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/pcc_metal_runtime.o: $(SRCDIR)/pcc_metal_runtime.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/pcc_gc_external_resource.o: $(SRCDIR)/pcc_gc_external_resource.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/pcc_dlpack_runtime.o: $(SRCDIR)/pcc_dlpack_runtime.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR_PY)/py_json.o: $(SRCDIR)/py_json.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
@@ -275,10 +411,25 @@ $(OBJDIR_PY)/py_context.o: $(SRCDIR)/py_context.c $(RUNTIME_HEADERS) | $(OBJDIR_
 $(OBJDIR_PY)/py_format.o: $(SRCDIR)/py_format.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# Explicit rule: build the port-archive py_float_fromhex.o from the C source
+# (a C-only OBJ_PY_CC_HELPERS helper).
+$(OBJDIR_PY)/py_float_fromhex.o: $(SRCDIR)/py_float_fromhex.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Explicit rule: build the port-archive py_complex_pow.o from the C source (a
+# C-only OBJ_PY_CC_HELPERS helper). This overrides the generic
+# $(OBJDIR_PY)/%.o: $(PYDIR)/%.py pattern rule so the co-located reference
+# py_complex_pow.py (which is NOT a linked port module) is never compiled.
+$(OBJDIR_PY)/py_complex_pow.o: $(SRCDIR)/py_complex_pow.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(OBJDIR_PY)/py_call_splat.o: $(SRCDIR)/py_call_splat.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR_PY)/py_module_attrs.o: $(SRCDIR)/py_module_attrs.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR_PY)/py_compiled_module.o: $(SRCDIR)/py_compiled_module.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR_PY)/py_capi_shim.o: $(SRCDIR)/py_capi_shim.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)

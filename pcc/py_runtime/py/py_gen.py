@@ -230,6 +230,12 @@ def py_gen_close(gen):
             if py_exc_matches(cur, stop_cls) != 0:
                 py_clear_exception()
                 store_i64(gen, 40, 1)
+            elif ptr_eq(cur, exc) != 0:
+                # Our injected GeneratorExit propagated back unhandled:
+                # that IS the normal close path in CPython — swallow it.
+                # Any OTHER exception from the body keeps propagating.
+                py_clear_exception()
+                store_i64(gen, 40, 1)
             else:
                 return null()
     none = global_load_ptr("py_None")

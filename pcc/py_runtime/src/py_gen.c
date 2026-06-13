@@ -180,6 +180,14 @@ PyObject *py_gen_close(PyObject *gen) {
         if (py_exc_matches(cur, stop_cls)) {
             py_clear_exception();
             g->done = 1;
+        } else if (cur == exc) {
+            /* Our injected GeneratorExit propagated back unhandled:
+             * that IS the normal close path in CPython — swallow it.
+             * (Previously it stayed pending and detonated at the next
+             * err check.) Any OTHER exception raised by the generator
+             * body keeps propagating. */
+            py_clear_exception();
+            g->done = 1;
         } else {
             return NULL;
         }

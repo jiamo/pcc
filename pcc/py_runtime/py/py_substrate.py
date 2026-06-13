@@ -6,6 +6,7 @@ older runtime call sites.  The top-level define_global_* calls are
 compile-time pcc.unsafe intrinsics: they create data symbols in the
 object file and do not depend on the stripped synthetic main().
 """
+
 from pcc.extern import c_abi_export
 from pcc.unsafe import (
     access,
@@ -47,7 +48,6 @@ from pcc.unsafe import (
     write,
 )
 
-
 define_global_header("py_none_storage", 1, 0, 1)
 define_global_header("py_notimplemented_storage", 1, 0, 1)
 define_global_header("py_true_storage", 1, 1, 1)
@@ -76,6 +76,9 @@ define_global_cstr("PY_EXC_NAME_15", "OverflowError")
 define_global_cstr("PY_EXC_NAME_16", "AssertionError")
 define_global_cstr("PY_EXC_NAME_17", "StopAsyncIteration")
 define_global_cstr("PY_EXC_NAME_18", "ReferenceError")
+define_global_cstr("PY_EXC_NAME_19", "MemoryError")
+define_global_cstr("PY_EXC_NAME_20", "ImportError")
+define_global_cstr("PY_EXC_NAME_21", "ModuleNotFoundError")
 define_global_ptr_array(
     "PY_EXC_BUILTIN_NAMES",
     "PY_EXC_NAME_0",
@@ -97,6 +100,9 @@ define_global_ptr_array(
     "PY_EXC_NAME_16",
     "PY_EXC_NAME_17",
     "PY_EXC_NAME_18",
+    "PY_EXC_NAME_19",
+    "PY_EXC_NAME_20",
+    "PY_EXC_NAME_21",
 )
 define_global_i32_array(
     "PY_EXC_PARENT",
@@ -119,8 +125,11 @@ define_global_i32_array(
     1,
     1,
     1,
+    1,
+    1,
+    20,
 )
-define_global_null_ptr_array("py_exc_classes", 19)
+define_global_null_ptr_array("py_exc_classes", 22)
 
 define_global_i8("py_set_dummy_storage", 0)
 define_global_ptr_to_global("py_set_dummy", "py_set_dummy_storage")
@@ -131,12 +140,31 @@ define_global_i32("py_gc_threshold1", 10)
 define_global_i32("py_gc_threshold2", 10)
 define_global_i32("py_gc_freeze_count", 0)
 define_global_ptr_null("py_gc_head")
+define_global_ptr_null("pcc_gc_backend4_parked_head")
+define_global_i32("pcc_gc_forwarding_population", 0)
 define_global_i32("py_gc_tracked_count", 0)
 define_global_i32("py_gc_collecting", 0)
 define_global_ptr_null("py_gc_callbacks")
 define_global_i32("py_gc_callbacks_firing", 0)
 define_global_ptr_null("py_weakref_head")
 define_global_ptr_null("py_object_root_cache")
+define_global_i32("py_class_attr_cache_epoch", 0)
+define_global_ptr_null("py_inst_field_cache_cls0")
+define_global_ptr_null("py_inst_field_cache_cls1")
+define_global_ptr_null("py_inst_field_cache_cls2")
+define_global_ptr_null("py_inst_field_cache_cls3")
+define_global_ptr_null("py_inst_field_cache_name0")
+define_global_ptr_null("py_inst_field_cache_name1")
+define_global_ptr_null("py_inst_field_cache_name2")
+define_global_ptr_null("py_inst_field_cache_name3")
+define_global_i32("py_inst_field_cache_idx0", -1)
+define_global_i32("py_inst_field_cache_idx1", -1)
+define_global_i32("py_inst_field_cache_idx2", -1)
+define_global_i32("py_inst_field_cache_idx3", -1)
+define_global_i32("py_inst_field_cache_epoch0", -1)
+define_global_i32("py_inst_field_cache_epoch1", -1)
+define_global_i32("py_inst_field_cache_epoch2", -1)
+define_global_i32("py_inst_field_cache_epoch3", -1)
 define_global_ptr_null("py_tls_current_exc_storage")
 define_global_i32("pcc_gc_backend_selected", 0)
 define_global_i32("pcc_gc_metric_alloc", 0)
@@ -146,16 +174,24 @@ define_global_i32("pcc_gc_metric_safepoint", 0)
 define_global_i32("pcc_gc_metric_pin", 0)
 define_global_i32("pcc_gc_metric_step", 0)
 define_global_i32("pcc_gc_metric_max_pause_us", 0)
+define_global_i32("pcc_gc_metric_pause_count", 0)
+define_global_i32("pcc_gc_metric_pause_sum_us", 0)
+define_global_i32("pcc_gc_metric_pause_hist0", 0)
+define_global_i32("pcc_gc_metric_pause_hist1", 0)
+define_global_i32("pcc_gc_metric_pause_hist2", 0)
+define_global_i32("pcc_gc_metric_pause_hist3", 0)
 define_global_i32("pcc_gc_debt_bytes", 0)
 define_global_i32("pcc_gc_last_alloc_bytes", 0)
 define_global_i32("pcc_gc_live_bytes", 0)
-define_global_i32("pcc_gc_pause", 200)
-define_global_i32("pcc_gc_stepmul", 200)
+define_global_i32("pcc_gc_pause", 1000)
+define_global_i32("pcc_gc_stepmul", 10000)
 define_global_i32("pcc_gc_debt_threshold_override", 0)
 define_global_i32("pcc_gc_config_initialized", 0)
+define_global_i32("pcc_gc_read_barrier_enabled", 1)
 define_global_i32("pcc_gc_backend0_frame_roots_enabled", 0)
 define_global_i32("pcc_gc_in_auto_step", 0)
 define_global_i32("pcc_gc_explicit_collect_active", 0)
+define_global_i32("pcc_gc_gray_count", 0)
 define_global_i32("pcc_gc_minor_heap_size", 1048576)
 define_global_i32("pcc_gc_minor_alloc_max", 256)
 define_global_i32("pcc_gc_minor_allocations", 0)
@@ -211,27 +247,42 @@ define_global_i32("pcc_gc_backend4_store_buffer_medium_full_flushes_count", 0)
 define_global_i32("pcc_gc_backend4_remembered_set_entries_count", 0)
 define_global_i32("pcc_gc_backend4_remembered_set_duplicate_skips_count", 0)
 define_global_i32("pcc_gc_backend4_remembered_set_high_water_count", 0)
+define_global_i32("pcc_gc_backend3_remembered_overflow", 0)
 define_global_i32("pcc_gc_next_object_id", 1)
 define_global_ptr_null("pcc_gc_last_alloc")
 define_global_ptr_null("pcc_gc_forwarding_head")
 define_global_ptr_null("pcc_gc_identity_head")
 define_global_ptr_null("pcc_gc_relocation_set_head")
+define_global_ptr_null("pcc_gc_backend3_remembered_owner_head")
 define_global_ptr_null("pcc_gc_backend4_store_buffer_head")
 define_global_ptr_null("pcc_gc_backend4_store_buffer_medium_head")
 define_global_ptr_null("pcc_gc_backend4_zpage_head")
 define_global_ptr_null("pcc_gc_backend4_zpage_payload_span_head")
 define_global_ptr_null("pcc_gc_backend4_page_head")
 define_global_ptr_null("pcc_gc_backend4_free_page_head")
+define_global_ptr_null("pcc_gc_backend4_retained_page_head")
 define_global_ptr_null("pcc_gc_backend4_evacuation_page_head")
+define_global_ptr_null("pcc_gc_backend4_active_small_young_page")
+define_global_ptr_null("pcc_gc_backend4_active_small_old_page")
+define_global_ptr_null("pcc_gc_backend4_active_medium_young_page")
+define_global_ptr_null("pcc_gc_backend4_active_medium_old_page")
 define_global_ptr_null("pcc_gc_backend4_remembered_slots_head")
+define_global_ptr_null("pcc_gc_object_node_free_head")
+define_global_i32("pcc_gc_object_node_free_count", 0)
+define_global_ptr_null("pcc_gc_backend4_zpage_node_free_head")
+define_global_i32("pcc_gc_backend4_zpage_node_free_count", 0)
 define_global_i32("pcc_gc_mark_active", 0)
 define_global_i32("pcc_gc_cycle_requested", 0)
 define_global_i32("pcc_gc_root_count", 0)
 define_global_ptr_null("pcc_gc_root_slots")
 define_global_ptr_null("pcc_gc_frame_head")
+define_global_ptr_null("pcc_gc_frame_node_pool_heads")
+define_global_ptr_null("pcc_gc_frame_node_pool_counts")
 define_global_ptr_null("pcc_gc_continuation_root_head")
 define_global_ptr_null("pcc_gc_scheduler_root_head")
 define_global_ptr_null("pcc_gc_object_head")
+define_global_ptr_null("pcc_gc_trace_cursor")
+define_global_ptr_null("pcc_gc_relocate_slot_pairs_ctx")
 
 
 @c_abi_export("py_mem_alloc")
@@ -342,35 +393,42 @@ def py_subs_false():
 
 @c_abi_export("py_subs_exc_name")
 def py_subs_exc_name(tag: int):
-    if tag < 0 or tag >= 17:
+    if tag < 0 or tag >= 22:
         return null()
     return load_ptr(global_addr("PY_EXC_BUILTIN_NAMES"), tag * 8)
 
 
 @c_abi_export("py_subs_exc_parent")
 def py_subs_exc_parent(tag: int) -> int:
-    if tag < 0 or tag >= 17:
+    if tag < 0 or tag >= 22:
         return -1
     return load_i32(global_addr("PY_EXC_PARENT"), tag * 4)
 
 
 @c_abi_export("py_subs_exc_n_builtin")
 def py_subs_exc_n_builtin() -> int:
-    return 17
+    return 22
 
 
 @c_abi_export("py_subs_exc_cache_get")
 def py_subs_exc_cache_get(tag: int):
-    if tag < 0 or tag >= 17:
+    if tag < 0 or tag >= 22:
         return null()
     return load_ptr(global_addr("py_exc_classes"), tag * 8)
 
 
 @c_abi_export("py_subs_exc_cache_set")
 def py_subs_exc_cache_set(tag: int, cls) -> None:
-    if tag < 0 or tag >= 17:
+    if tag < 0 or tag >= 22:
         return
     store_ptr(global_addr("py_exc_classes"), tag * 8, cls)
+
+
+@c_abi_export("py_subs_exc_cache_slot")
+def py_subs_exc_cache_slot(tag: int):
+    if tag < 0 or tag >= 22:
+        return null()
+    return ptr_add(global_addr("py_exc_classes"), tag * 8)
 
 
 @c_abi_export("py_subs_set_dummy")
@@ -480,10 +538,12 @@ def py_subs_object_root():
     if ptr_is_null(root) == 0:
         return root
 
-    r = malloc(96)
+    # sizeof(PyClassObject); verified mechanically against py_internal.h by
+    # test_pyclass_layout_matches_pcc_python_mirror.
+    r = malloc(120)
     if ptr_is_null(r):
         return null()
-    memset(r, 0, 96)
+    memset(r, 0, 120)
 
     store_i64(r, 0, 1)
     store_i32(r, 8, 10)

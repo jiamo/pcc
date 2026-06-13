@@ -35,6 +35,17 @@ static void weakref_unlink(PyWeakRefObject *wr) {
 
 PyObject *py_weakref_new(PyObject *target, PyObject *callback) {
     if (target == NULL || PY_IS_TAGGED_INT(target)) return NULL;
+    /* Value projections are identity-free; a weak reference observes
+     * identity lifetime and a ValueBox's lifetime is unpredictable
+     * (every boxing makes a new box). Mirror CPython's analogue
+     * (weakref.ref(3) -> TypeError). The compile-time diagnostic
+     * catches the static form; this covers Dyn-path boxes. */
+    if (py_type_of(target) == PY_TYPE_VALUEBOX) {
+        py_raise(py_exc_new(
+            PY_EXC_TYPEERROR,
+            "cannot create weak reference to a valueclass payload"));
+        return NULL;
+    }
     if (callback == py_None) callback = NULL;
     target = pcc_gc_note_relocation_read(target);
 

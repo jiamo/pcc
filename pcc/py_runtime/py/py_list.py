@@ -60,6 +60,11 @@ py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_gc_track = extern("py_gc_track", (c_ptr,), c_void)
 pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+pcc_gc_backend4_zpage_register_owner_payload_span = extern(
+    "pcc_gc_backend4_zpage_register_owner_payload_span",
+    (c_ptr, c_ptr, c_int64),
+    c_int64,
+)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 py_dict_clear = extern("py_dict_clear", (c_ptr,), c_void)
 _pcc_debug_bad_incref = extern("pcc_debug_bad_incref", (c_ptr, c_int32), c_void)
@@ -158,6 +163,7 @@ def _grow_if_needed(l, want: int) -> int:
         return -1
     store_ptr(l, 32, new_items)
     store_i64(l, 24, cap)
+    pcc_gc_backend4_zpage_register_owner_payload_span(l, new_items, cap * 8)
     return 0
 
 
@@ -196,6 +202,7 @@ def py_list_new(initial_capacity: int):
         py_decref(l)
         return null()
     store_ptr(l, 32, items)
+    pcc_gc_backend4_zpage_register_owner_payload_span(l, items, cap * 8)
     py_gc_track(l)
     return l
 
@@ -272,6 +279,9 @@ def py_list_get_i64_nonnegative(lst, i: int) -> int:
 
 @c_abi_export("py_list_set")
 def py_list_set(lst, i: int, item) -> None:
+    # Internal non-raising setter: callers (sort/insert shifts, generator
+    # frames) index within bounds by construction. User-visible subscript
+    # stores go through py_list_setitem below.
     if not _list_is_sane(lst, -104):
         return
     length: int = load_i64(lst, 16)
@@ -280,6 +290,24 @@ def py_list_set(lst, i: int, item) -> None:
         return
     items = load_ptr(lst, 32)
     pcc_gc_store_ptr(lst, ptr_add(items, idx * 8), item)
+
+
+@c_abi_export("py_list_setitem")
+def py_list_setitem(lst, i: int, item) -> int:
+    # items[i] = v subscript store: like py_list_set but raises IndexError on
+    # out-of-range so try/except can catch it (CPython: "list assignment index
+    # out of range"). Mirrors py_list_setitem in py_list.c; py_list_set stays
+    # non-raising for internal callers. Negative indices normalize.
+    if not _list_is_sane(lst, -121):
+        return -1
+    length: int = load_i64(lst, 16)
+    idx: int = _normalize_index(i, length, 0)
+    if idx < 0:
+        py_raise(py_exc_new(5, cstr("list assignment index out of range")))  # PY_EXC_INDEXERROR
+        return -1
+    items = load_ptr(lst, 32)
+    pcc_gc_store_ptr(lst, ptr_add(items, idx * 8), item)
+    return 0
 
 
 @c_abi_export("py_list_len")
@@ -319,6 +347,32 @@ def py_list_concat(a, b):
         py_incref(v)
         store_ptr(out_items, (la + j) * 8, v)
         j = j + 1
+    store_i64(out, 16, n)
+    return out
+
+
+@c_abi_export("py_list_copy")
+def py_list_copy(src):
+    # list.copy() — shallow copy: fresh list, same elements (element refs
+    # shared with the source, incref'd once each). Mirrors py_list_copy in
+    # py_list.c. Empty source -> fresh empty list.
+    if not _list_is_sane(src, -106):
+        return null()
+    n: int = load_i64(src, 16)
+    cap_hint: int = n
+    if cap_hint <= 0:
+        cap_hint = 4
+    out = py_list_new(cap_hint)
+    if ptr_is_null(out):
+        return null()
+    out_items = load_ptr(out, 32)
+    src_items = load_ptr(src, 32)
+    i: int = 0
+    while i < n:
+        v = pcc_gc_load_ptr(src, ptr_add(src_items, i * 8))
+        py_incref(v)
+        store_ptr(out_items, i * 8, v)
+        i = i + 1
     store_i64(out, 16, n)
     return out
 
@@ -673,8 +727,12 @@ def py_list_extend(a, b) -> None:
         i: int = 0
         while i < bl:
             v = pcc_gc_load_ptr(b, ptr_add(b_items, i * 8))
-            py_incref(v)
-            store_ptr(a_items, (la + i) * 8, v)
+            # Match py_list_append's grown-slot store: NULL-init the fresh
+            # (unzeroed) capacity slot, then route through the collector
+            # barrier. pcc_gc_store_ptr increfs v, so the prior manual incref
+            # is dropped to keep the net accounting (+1 owned ref) identical.
+            store_ptr(a_items, (la + i) * 8, null())
+            pcc_gc_store_ptr(a, ptr_add(a_items, (la + i) * 8), v)
             i = i + 1
         store_i64(a, 16, la + bl)
         return
@@ -692,8 +750,11 @@ def py_list_extend(a, b) -> None:
         i: int = 0
         while i < bl:
             v = pcc_gc_load_ptr(b, ptr_add(b_items_base, i * 8))
-            py_incref(v)
-            store_ptr(a_items, (la + i) * 8, v)
+            # Same grown-slot store idiom as the list branch / py_list_append:
+            # NULL-init the fresh (unzeroed) capacity slot, then barrier-store.
+            # pcc_gc_store_ptr increfs v, so the manual incref is dropped (net +1).
+            store_ptr(a_items, (la + i) * 8, null())
+            pcc_gc_store_ptr(a, ptr_add(a_items, (la + i) * 8), v)
             i = i + 1
         store_i64(a, 16, la + bl)
         return
@@ -824,6 +885,40 @@ def py_list_index(lst, item) -> int:
     return -1
 
 
+@c_abi_export("py_list_index_range")
+def py_list_index_range(lst, item, start: int, end: int) -> int:
+    # Range-aware list.index(item, start, end). Negative bounds offset by the
+    # length once, then both clamp into [0, length]; the half-open window
+    # [start, end) is scanned. Raise ValueError (PY_EXC_VALUEERROR == 2) and
+    # return -1 when absent, matching CPython list.index. The frontend checks
+    # py_err_occurred() after the call.
+    length: int = 0
+    if _list_is_sane(lst, -126):
+        length = load_i64(lst, 16)
+    if start < 0:
+        start = start + length
+        if start < 0:
+            start = 0
+    elif start > length:
+        start = length
+    if end < 0:
+        end = end + length
+        if end < 0:
+            end = 0
+    elif end > length:
+        end = length
+    if length > 0:
+        items = load_ptr(lst, 32)
+        i: int = start
+        while i < end:
+            v = pcc_gc_load_ptr(lst, ptr_add(items, i * 8))
+            if py_obj_eq(v, item) != 0:
+                return i
+            i = i + 1
+    py_raise(py_exc_new(2, cstr("list.index(x): x not in list")))
+    return -1
+
+
 @c_abi_export("py_list_count")
 def py_list_count(lst, item) -> int:
     if not _list_is_sane(lst, -124):
@@ -851,7 +946,11 @@ def py_list_reverse(lst) -> None:
     while i < j:
         left = pcc_gc_load_ptr(lst, ptr_add(items, i * 8))
         right = pcc_gc_load_ptr(lst, ptr_add(items, j * 8))
-        store_ptr(items, i * 8, right)
-        store_ptr(items, j * 8, left)
+        py_incref(left)
+        py_incref(right)
+        pcc_gc_store_ptr(lst, ptr_add(items, i * 8), right)
+        pcc_gc_store_ptr(lst, ptr_add(items, j * 8), left)
+        py_decref(left)
+        py_decref(right)
         i = i + 1
         j = j - 1

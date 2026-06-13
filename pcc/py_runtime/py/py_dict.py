@@ -26,9 +26,11 @@ PY_DICT_TOMBSTONE= -2
 INITIAL_CAPACITY = 8 (must be power of 2; inlined per the
                      module-init gotcha — see feedback memory).
 """
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
     free,
+    global_addr,
     is_tagged_int,
     load_i32,
     ptr_add,
@@ -44,28 +46,39 @@ from pcc.unsafe import (
     untag_int,
 )
 
-py_incref            = extern("py_incref",            (c_ptr,),                    c_void)
-py_decref            = extern("py_decref",            (c_ptr,),                    c_void)
-py_obj_hash          = extern("py_obj_hash",          (c_ptr,),                    c_int64)
-py_obj_eq            = extern("py_obj_eq",            (c_ptr, c_ptr),              c_int32)
-py_gc_track          = extern("py_gc_track",          (c_ptr,),                    c_void)
-pcc_gc_store_ptr     = extern("pcc_gc_store_ptr",     (c_ptr, c_ptr, c_ptr),       c_void)
-pcc_gc_load_ptr      = extern("pcc_gc_load_ptr",      (c_ptr, c_ptr),              c_ptr)
-pcc_gc_alloc         = extern("pcc_gc_alloc",         (c_int64, c_int32, c_int32), c_ptr)
+py_incref = extern("py_incref", (c_ptr,), c_void)
+py_decref = extern("py_decref", (c_ptr,), c_void)
+pcc_gc_backend4_zpage_register_owner_payload_span = extern(
+    "pcc_gc_backend4_zpage_register_owner_payload_span",
+    (c_ptr, c_ptr, c_int64),
+    c_int64,
+)
+py_obj_hash = extern("py_obj_hash", (c_ptr,), c_int64)
+py_obj_eq = extern("py_obj_eq", (c_ptr, c_ptr), c_int32)
+py_str_eq = extern("py_str_eq", (c_ptr, c_ptr), c_int32)
+py_gc_track = extern("py_gc_track", (c_ptr,), c_void)
+pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
+pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+pcc_gc_note_slot_write_barrier = extern(
+    "pcc_gc_note_slot_write_barrier",
+    (c_ptr, c_ptr, c_ptr),
+    c_void,
+)
+pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 
-py_list_new          = extern("py_list_new",          (c_int64,),                  c_ptr)
-py_list_append       = extern("py_list_append",       (c_ptr, c_ptr),              c_void)
-py_tuple_new         = extern("py_tuple_new",         (c_int64,),                  c_ptr)
-py_tuple_set_item    = extern("py_tuple_set_item",    (c_ptr, c_int64, c_ptr),     c_void)
-py_exc_new_with_value = extern("py_exc_new_with_value", (c_int64, c_ptr),          c_ptr)
-py_raise         = extern("py_raise",         (c_ptr,),                    c_void)
-py_obj_iter      = extern("py_obj_iter",      (c_ptr,),                    c_ptr)
-py_obj_next      = extern("py_obj_next",      (c_ptr,),                    c_ptr)
-py_err_occurred  = extern("py_err_occurred",  (),                          c_int64)
-py_current_exception = extern("py_current_exception", (),                  c_ptr)
-py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,),          c_ptr)
-py_exc_matches   = extern("py_exc_matches",   (c_ptr, c_ptr),              c_int64)
-py_clear_exception = extern("py_clear_exception", (),                      c_void)
+py_list_new = extern("py_list_new", (c_int64,), c_ptr)
+py_list_append = extern("py_list_append", (c_ptr, c_ptr), c_void)
+py_tuple_new = extern("py_tuple_new", (c_int64,), c_ptr)
+py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
+py_exc_new_with_value = extern("py_exc_new_with_value", (c_int64, c_ptr), c_ptr)
+py_raise = extern("py_raise", (c_ptr,), c_void)
+py_obj_iter = extern("py_obj_iter", (c_ptr,), c_ptr)
+py_obj_next = extern("py_obj_next", (c_ptr,), c_ptr)
+py_err_occurred = extern("py_err_occurred", (), c_int64)
+py_current_exception = extern("py_current_exception", (), c_ptr)
+py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,), c_ptr)
+py_exc_matches = extern("py_exc_matches", (c_ptr, c_ptr), c_int64)
+py_clear_exception = extern("py_clear_exception", (), c_void)
 
 
 def _ptr_can_have_header(o) -> bool:
@@ -89,6 +102,21 @@ def _ptr_is_dict(o) -> bool:
     return load_i32(o, 8) == 6
 
 
+def _keys_equal(entry_key, key) -> int:
+    if ptr_eq(entry_key, key) != 0:
+        return 1
+    if is_tagged_int(entry_key) != 0 and is_tagged_int(key) != 0:
+        return 0
+    if is_tagged_int(entry_key) == 0 and is_tagged_int(key) == 0:
+        if load_i32(entry_key, 8) == 4 and load_i32(key, 8) == 4:
+            if py_str_eq(entry_key, key) != 0:
+                return 1
+            return 0
+    if py_obj_eq(entry_key, key) != 0:
+        return 1
+    return 0
+
+
 def _alloc_tables(d, capacity: int) -> int:
     # Returns 0 on success, -1 on alloc failure.
     indices = malloc(capacity * 8)
@@ -107,17 +135,26 @@ def _alloc_tables(d, capacity: int) -> int:
     store_ptr(d, 32, indices)
     store_ptr(d, 40, entries)
     store_i64(d, 24, capacity)
-    store_i64(d, 16, 0)            # size
-    store_i64(d, 48, 0)            # entries_used
+    store_i64(d, 16, 0)  # size
+    store_i64(d, 48, 0)  # entries_used
+    pcc_gc_backend4_zpage_register_owner_payload_span(d, entries, capacity * 24)
     return 0
+
+
+def _perturb_shift5(perturb: int) -> int:
+    # Mirror ``(uint64_t)perturb >> 5`` while the pcc-Python runtime exposes
+    # only signed i64 arithmetic.  Arithmetic shift differs from logical
+    # shift by exactly 2**59 when the input's high bit is set.
+    shifted: int = perturb >> 5
+    if perturb < 0:
+        shifted = shifted + 576460752303423488
+    return shifted
 
 
 def _lookup(d, hash_val: int, key) -> int:
     # Pack two int64 results into i64 return: high 32 = slot, low 32 =
     # entry_idx. Both fit because capacity is bounded. We return i64 here
     # as (slot << 32) | (entry_idx_or_minus1 & 0xFFFFFFFF).
-    if not _ptr_is_dict(d):
-        return 0xFFFFFFFF
     capacity: int = load_i64(d, 24)
     indices = load_ptr(d, 32)
     entries = load_ptr(d, 40)
@@ -128,11 +165,8 @@ def _lookup(d, hash_val: int, key) -> int:
     if ptr_is_null(entries) != 0:
         return 0xFFFFFFFF
     mask: int = capacity - 1
-    # Probe perturb must eventually shift down to zero. Hashes are
-    # signed i64 in the pcc-Python runtime; using a signed negative
-    # value here makes ``perturb >> 5`` stay negative forever and can
-    # trap lookup in a probe sub-cycle.
-    perturb: int = hash_val & 9223372036854775807
+    read_barrier_enabled: int = load_i32(global_addr("pcc_gc_read_barrier_enabled"), 0)
+    perturb: int = hash_val
     j: int = hash_val & mask
     first_tombstone: int = -1
     probes: int = 0
@@ -140,25 +174,26 @@ def _lookup(d, hash_val: int, key) -> int:
 
     while probes < limit:
         ix: int = load_i64(indices, j * 8)
-        if ix == -1:                       # PY_DICT_EMPTY
+        if ix == -1:  # PY_DICT_EMPTY
             slot: int = j
             if first_tombstone >= 0:
                 slot = first_tombstone
             return (slot << 32) | (0xFFFFFFFF)
-        if ix == -2:                       # PY_DICT_TOMBSTONE
+        if ix == -2:  # PY_DICT_TOMBSTONE
             if first_tombstone < 0:
                 first_tombstone = j
         else:
             entry_off: int = ix * 24
-            ek = pcc_gc_load_ptr(d, ptr_add(entries, entry_off + 8))
+            key_slot = ptr_add(entries, entry_off + 8)
+            ek = load_ptr(key_slot, 0)
+            if read_barrier_enabled != 0:
+                ek = pcc_gc_load_ptr(d, key_slot)
             if ptr_is_null(ek) == 0:
                 eh: int = load_i64(entries, entry_off)
                 if eh == hash_val:
-                    if ptr_eq(ek, key) != 0:
+                    if _keys_equal(ek, key) != 0:
                         return (j << 32) | (ix & 0xFFFFFFFF)
-                    if py_obj_eq(ek, key) != 0:
-                        return (j << 32) | (ix & 0xFFFFFFFF)
-        perturb = perturb >> 5
+        perturb = _perturb_shift5(perturb)
         j = (j * 5 + perturb + 1) & mask
         probes = probes + 1
 
@@ -181,17 +216,23 @@ def _entry_idx_of(packed: int) -> int:
 
 
 def _entry_key(d, entries, entry_off: int):
-    k = load_ptr(entries, entry_off + 8)
+    slot = ptr_add(entries, entry_off + 8)
+    k = load_ptr(slot, 0)
     if ptr_is_null(k) != 0:
         return k
-    return pcc_gc_load_ptr(d, ptr_add(entries, entry_off + 8))
+    if load_i32(global_addr("pcc_gc_read_barrier_enabled"), 0) == 0:
+        return k
+    return pcc_gc_load_ptr(d, slot)
 
 
 def _entry_value(d, entries, entry_off: int):
-    v = load_ptr(entries, entry_off + 16)
+    slot = ptr_add(entries, entry_off + 16)
+    v = load_ptr(slot, 0)
     if ptr_is_null(v) != 0:
         return v
-    return pcc_gc_load_ptr(d, ptr_add(entries, entry_off + 16))
+    if load_i32(global_addr("pcc_gc_read_barrier_enabled"), 0) == 0:
+        return v
+    return pcc_gc_load_ptr(d, slot)
 
 
 def _insert_fresh(d, hash_val: int, key, value) -> None:
@@ -200,7 +241,7 @@ def _insert_fresh(d, hash_val: int, key, value) -> None:
     slot: int = _slot_of(packed)
     indices = load_ptr(d, 32)
     entries = load_ptr(d, 40)
-    ei: int = load_i64(d, 48)            # entries_used
+    ei: int = load_i64(d, 48)  # entries_used
     store_i64(d, 48, ei + 1)
     entry_off: int = ei * 24
     store_i64(entries, entry_off, hash_val)
@@ -235,6 +276,7 @@ def _rehash(d, new_capacity: int) -> int:
     store_i64(d, 24, new_capacity)
     store_i64(d, 16, 0)
     store_i64(d, 48, 0)
+    pcc_gc_backend4_zpage_register_owner_payload_span(d, new_entries, new_capacity * 24)
     free(old_indices)
 
     # Walk old entries in insertion order, copying live ones over.
@@ -253,6 +295,8 @@ def _rehash(d, new_capacity: int) -> int:
             store_i64(new_entries, new_off, h)
             store_ptr(new_entries, new_off + 8, k)
             store_ptr(new_entries, new_off + 16, v)
+            pcc_gc_note_slot_write_barrier(d, ptr_add(new_entries, new_off + 8), k)
+            pcc_gc_note_slot_write_barrier(d, ptr_add(new_entries, new_off + 16), v)
             store_i64(new_indices, slot * 8, ei)
             sz: int = load_i64(d, 16)
             store_i64(d, 16, sz + 1)
@@ -279,11 +323,11 @@ def py_dict_new():
     d = pcc_gc_alloc(56, 6, 0)
     if ptr_is_null(d) != 0:
         return null()
-    store_i64(d, 16, 0)             # size
-    store_i64(d, 24, 0)             # capacity
-    store_ptr(d, 32, null())   # indices
-    store_ptr(d, 40, null())   # entries
-    store_i64(d, 48, 0)             # entries_used
+    store_i64(d, 16, 0)  # size
+    store_i64(d, 24, 0)  # capacity
+    store_ptr(d, 32, null())  # indices
+    store_ptr(d, 40, null())  # entries
+    store_i64(d, 48, 0)  # entries_used
     if _alloc_tables(d, 8) != 0:
         py_decref(d)
         return null()
@@ -368,7 +412,7 @@ def py_dict_fromkeys(iterable, value):
             if ptr_is_null(k) != 0:
                 if py_err_occurred() != 0:
                     cur = py_current_exception()
-                    stop = py_exc_builtin_class(8)   # PY_EXC_STOPITERATION
+                    stop = py_exc_builtin_class(8)  # PY_EXC_STOPITERATION
                     if py_exc_matches(cur, stop) != 0:
                         py_clear_exception()
                 done = 1
@@ -388,6 +432,36 @@ def py_dict_pop(d, key):
     exc = py_exc_new_with_value(4, key)  # PY_EXC_KEYERROR
     py_raise(exc)
     return null()
+
+
+@c_abi_export("py_dict_popitem")
+def py_dict_popitem(d):
+    # Remove+return the LAST-inserted (key,value) as a 2-tuple (dicts are
+    # insertion-ordered); KeyError if empty. py_tuple_set_item increfs, so
+    # py_dict_del's decref leaves key/value owned by the tuple. No `break`
+    # (pcc-Python lacks it): a `found` flag in the loop condition exits.
+    entries = load_ptr(d, 40)
+    ei: int = load_i64(d, 48)  # entries_used
+    i: int = ei - 1
+    found: int = 0
+    result = null()
+    while i >= 0 and found == 0:
+        entry_off: int = i * 24
+        key = _entry_key(d, entries, entry_off)
+        if ptr_is_null(key) == 0:
+            val = _entry_value(d, entries, entry_off)
+            tup = py_tuple_new(2)
+            py_tuple_set_item(tup, 0, key)
+            py_tuple_set_item(tup, 1, val)
+            py_dict_del(d, key)
+            result = tup
+            found = 1
+        i = i - 1
+    if found == 0:
+        exc = py_exc_new_with_value(4, null())  # bare KeyError
+        py_raise(exc)
+        return null()
+    return result
 
 
 @c_abi_export("py_dict_contains")
@@ -425,7 +499,7 @@ def py_dict_del(d, key) -> int:
     py_decref(ev)
     store_ptr(entries, entry_off + 8, null())
     store_ptr(entries, entry_off + 16, null())
-    store_i64(indices, slot * 8, -2)        # PY_DICT_TOMBSTONE
+    store_i64(indices, slot * 8, -2)  # PY_DICT_TOMBSTONE
     sz: int = load_i64(d, 16)
     store_i64(d, 16, sz - 1)
     return 0
@@ -464,6 +538,49 @@ def py_dict_len(d) -> int:
     if not _ptr_is_dict(d):
         return 0
     return load_i64(d, 16)
+
+
+@c_abi_export("py_dict_entries_used")
+def py_dict_entries_used(d) -> int:
+    if not _ptr_is_dict(d):
+        return 0
+    return load_i64(d, 48)
+
+
+@c_abi_export("py_dict_entry_key_at")
+def py_dict_entry_key_at(d, i: int):
+    if not _ptr_is_dict(d):
+        return null()
+    if i < 0:
+        return null()
+    entries_used: int = load_i64(d, 48)
+    if i >= entries_used:
+        return null()
+    entries = load_ptr(d, 40)
+    k = _entry_key(d, entries, i * 24)
+    if ptr_is_null(k) == 0:
+        py_incref(k)
+    return k
+
+
+@c_abi_export("py_dict_entry_value_at")
+def py_dict_entry_value_at(d, i: int):
+    if not _ptr_is_dict(d):
+        return null()
+    if i < 0:
+        return null()
+    entries_used: int = load_i64(d, 48)
+    if i >= entries_used:
+        return null()
+    entries = load_ptr(d, 40)
+    off: int = i * 24
+    k = _entry_key(d, entries, off)
+    if ptr_is_null(k) != 0:
+        return null()
+    v = _entry_value(d, entries, off)
+    if ptr_is_null(v) == 0:
+        py_incref(v)
+    return v
 
 
 @c_abi_export("py_dict_keys")

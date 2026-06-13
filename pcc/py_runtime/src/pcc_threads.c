@@ -9,12 +9,19 @@
  */
 
 #include "py_internal.h"
+#include "py_io_waitset.h"
+#include "py_timer_heap.h"
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <poll.h>
 #include <sys/time.h>
+#if defined(__APPLE__) || defined(__linux__)
+#include <execinfo.h>
+#endif
 
 /* ``pcc_gc_thread_unregister_buffers`` is defined for real in
  * ``py_gc_backend.c``. The previous fallback here was
@@ -327,14 +334,31 @@ void pcc_thread_safepoint(void) {
 int64_t pcc_stop_the_world(void) {
     int64_t self = pcc_current_thread_id();
     pthread_mutex_lock(&pcc_world_lock);
-    if (pcc_thread_stop_requested) {
-        if (pcc_stop_owner_thread_id == self) {
-            pcc_stop_depth++;
-            pthread_mutex_unlock(&pcc_world_lock);
-            return 0;
+    /* Serialize concurrent STW requesters.  A requester that loses the
+     * ownership race must participate in the current stop, otherwise the
+     * owner waits forever for this live thread to park.  Once the current
+     * owner resumes the world, the waiter acquires a fresh stop of its own.
+     * This is the same contract as Go's worldsema: concurrent stop requests
+     * are safe and each executes in turn. */
+    while (pcc_thread_stop_requested
+           && pcc_stop_owner_thread_id != self) {
+        if (!pcc_tls_thread_parked
+            || pcc_tls_parked_epoch != pcc_stop_epoch) {
+            pcc_tls_thread_parked = 1;
+            pcc_tls_parked_epoch = pcc_stop_epoch;
+            pcc_parked_thread_count++;
+            pthread_cond_broadcast(&pcc_world_cond);
         }
+        pthread_cond_wait(&pcc_world_cond, &pcc_world_lock);
+    }
+    if (!pcc_thread_stop_requested && pcc_tls_thread_parked) {
+        pcc_tls_thread_parked = 0;
+        pcc_tls_parked_epoch = 0;
+    }
+    if (pcc_thread_stop_requested) {
+        pcc_stop_depth++;
         pthread_mutex_unlock(&pcc_world_lock);
-        return -1;
+        return 0;
     }
     pcc_thread_stop_requested = 1;
     pcc_stop_owner_thread_id = self;
@@ -352,15 +376,17 @@ int64_t pcc_stop_the_world(void) {
 }
 
 int64_t pcc_resume_world(void) {
+    int64_t self = pcc_current_thread_id();
     pthread_mutex_lock(&pcc_world_lock);
     if (!pcc_thread_stop_requested) {
         pthread_mutex_unlock(&pcc_world_lock);
         return -1;
     }
-    if (
-        pcc_stop_owner_thread_id == pcc_current_thread_id()
-        && pcc_stop_depth > 1
-    ) {
+    if (pcc_stop_owner_thread_id != self) {
+        pthread_mutex_unlock(&pcc_world_lock);
+        return -1;
+    }
+    if (pcc_stop_depth > 1) {
         pcc_stop_depth--;
         pthread_mutex_unlock(&pcc_world_lock);
         return 0;
@@ -634,6 +660,8 @@ enum {
 typedef struct PccVirtualThreadQueueEntry {
     PyObject *thread;
     struct PccVirtualThreadQueueEntry *next;
+    void *root_handle;
+    int ready_pool_entry;
 } PccVirtualThreadQueueEntry;
 
 typedef struct PccVirtualThreadCarrierQueue {
@@ -641,10 +669,20 @@ typedef struct PccVirtualThreadCarrierQueue {
     PccVirtualThreadQueueEntry *tail;
 } PccVirtualThreadCarrierQueue;
 
+/* Timer-parked virtual thread. Each entry is a stable heap-allocated node that
+ * owns a GC root handle for its parked ``thread`` slot (root retention). The
+ * scheduler's timer *ordering* now lives in a binary min-heap
+ * (``pcc_vthread_timer_heap`` below, see py_timer_heap.h), replacing the
+ * former O(n)-insert sorted singly-linked list. The min-heap only stores an
+ * opaque ``int64_t timer_id``; we use the entry's own (stable) address as that
+ * id so a popped id casts straight back to its node -- the heap never holds a
+ * ``PyObject *`` so heap reordering can never move a GC-rooted slot (the roots
+ * stay at the fixed ``&entry->thread`` addresses, exactly as before). */
 typedef struct PccVirtualThreadTimerEntry {
     PyObject *thread;
     int64_t deadline_ms;
-    struct PccVirtualThreadTimerEntry *next;
+    struct PccVirtualThreadTimerEntry *next_free;
+    void *root_handle;
 } PccVirtualThreadTimerEntry;
 
 typedef struct PccVirtualThreadPollEntry {
@@ -653,6 +691,7 @@ typedef struct PccVirtualThreadPollEntry {
     int64_t events;
     int64_t deadline_ms;
     struct PccVirtualThreadPollEntry *next;
+    void *root_handle;
 } PccVirtualThreadPollEntry;
 
 static PccMutex *pcc_vthread_lock = NULL;
@@ -662,10 +701,38 @@ static PccVirtualThreadCarrierQueue *pcc_vthread_carrier_queues = NULL;
 static int64_t pcc_vthread_carrier_queue_count = 0;
 static int64_t pcc_vthread_next_carrier_enqueue = 0;
 static int64_t pcc_vthread_carrier_steal_count = 0;
-static PccVirtualThreadTimerEntry *pcc_vthread_timer_queue = NULL;
+static PccVirtualThreadQueueEntry *pcc_vthread_ready_entry_free_head = NULL;
+static int64_t pcc_vthread_ready_entry_free_count = 0;
+static int64_t pcc_vthread_ready_entry_alloc_count = 0;
+static int64_t pcc_vthread_ready_entry_reuse_count = 0;
+static int64_t pcc_vthread_waiter_entry_alloc_count = 0;
+static int64_t pcc_vthread_waiter_entry_reuse_count = 0;
+static int64_t pcc_vthread_waiter_entry_cached_count = 0;
+/* Min-heap timer index (py_timer_heap.h). ``pcc_vthread_timer_heap_ready``
+ * gates one-time init; all access is under ``pcc_vthread_lock``. */
+static PccTimerHeap pcc_vthread_timer_heap;
+static int pcc_vthread_timer_heap_ready = 0;
+static PccVirtualThreadTimerEntry *pcc_vthread_timer_entry_free_head = NULL;
+static int64_t pcc_vthread_timer_entry_free_count = 0;
+static int64_t pcc_vthread_timer_entry_alloc_count = 0;
+static int64_t pcc_vthread_timer_entry_reuse_count = 0;
 static PccVirtualThreadPollEntry *pcc_vthread_poll_queue = NULL;
+static PccVirtualThreadPollEntry *pcc_vthread_poll_entry_free_head = NULL;
+static int64_t pcc_vthread_poll_entry_free_count = 0;
+static int64_t pcc_vthread_poll_entry_alloc_count = 0;
+static int64_t pcc_vthread_poll_entry_reuse_count = 0;
+/* One production waitset indexes the GC-rooted poll-entry queue by live fd.
+ * On Darwin/BSD it owns kqueue; elsewhere (or when explicitly forced) it owns
+ * the one-poll-call fallback. Multiple vthreads may still wait on one fd: the
+ * waitset registration aggregates their interest/deadline, while the stable
+ * poll entries retain per-vthread roots and semantics. */
+static PccIoWaitSet pcc_vthread_io_waitset;
+static int pcc_vthread_io_waitset_ready = 0;
+static int64_t pcc_vthread_io_backend_value = PCC_VTHREAD_IO_BACKEND_POLL;
+static struct pollfd *pcc_vthread_live_pollfds = NULL;
+static int64_t pcc_vthread_live_pollfds_cap = 0;
 static int64_t pcc_vthread_ready_count_value = 0;
-static int64_t pcc_vthread_timer_count_value = 0;
+/* (timer count is now the min-heap live-set size; see py_virtual_thread_timer_count) */
 static int64_t pcc_vthread_io_wait_count_value = 0;
 static int64_t pcc_vthread_carrier_count = 1;
 static int64_t pcc_vthread_pin_depth_total = 0;
@@ -679,6 +746,115 @@ static int64_t pcc_vthread_persistent_pool_running = 0;
 static int64_t pcc_vthread_persistent_pool_stop = 0;
 static int64_t pcc_vthread_persistent_pool_failures = 0;
 
+/* Allocation-free production effect trace. Scheduler tests reset/read it only
+ * while carriers are quiescent; writers may be concurrent and reserve slots
+ * atomically. Once the bounded buffer fills, further events are counted as
+ * dropped rather than allocating or overwriting evidence. */
+#define PCC_VTHREAD_EFFECT_EVENT_CAPACITY 4096
+typedef struct PccVirtualThreadEffectEvent {
+    int64_t kind;
+    int64_t detail;
+    int64_t root_delta;
+    int64_t state;
+} PccVirtualThreadEffectEvent;
+
+static PccVirtualThreadEffectEvent pcc_vthread_effect_events[
+    PCC_VTHREAD_EFFECT_EVENT_CAPACITY
+];
+static int64_t pcc_vthread_effect_event_count = 0;
+static int64_t pcc_vthread_effect_event_dropped = 0;
+
+static void pcc_vthread_effect_emit(
+    int64_t kind,
+    int64_t detail,
+    int64_t root_delta,
+    int64_t state
+) {
+    int64_t index = __atomic_fetch_add(
+        &pcc_vthread_effect_event_count, 1, __ATOMIC_ACQ_REL
+    );
+    if (index < 0 || index >= PCC_VTHREAD_EFFECT_EVENT_CAPACITY) {
+        (void)__atomic_add_fetch(
+            &pcc_vthread_effect_event_dropped, 1, __ATOMIC_ACQ_REL
+        );
+        return;
+    }
+    pcc_vthread_effect_events[index].kind = kind;
+    pcc_vthread_effect_events[index].detail = detail;
+    pcc_vthread_effect_events[index].root_delta = root_delta;
+    pcc_vthread_effect_events[index].state = state;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+static int64_t pcc_vthread_effect_read_field(int64_t index, int field) {
+    int64_t count = __atomic_load_n(
+        &pcc_vthread_effect_event_count, __ATOMIC_ACQUIRE
+    );
+    if (
+        index < 0 || index >= count
+        || index >= PCC_VTHREAD_EFFECT_EVENT_CAPACITY
+    ) {
+        return -1;
+    }
+    PccVirtualThreadEffectEvent *event = &pcc_vthread_effect_events[index];
+    if (field == 0) return event->kind;
+    if (field == 1) return event->detail;
+    if (field == 2) return event->root_delta;
+    if (field == 3) return event->state;
+    return -1;
+}
+
+int64_t py_virtual_thread_effect_reset(void) {
+    __atomic_store_n(&pcc_vthread_effect_event_count, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&pcc_vthread_effect_event_dropped, 0, __ATOMIC_RELEASE);
+    return 0;
+}
+
+int64_t py_virtual_thread_effect_count(void) {
+    int64_t count = __atomic_load_n(
+        &pcc_vthread_effect_event_count, __ATOMIC_ACQUIRE
+    );
+    return count < PCC_VTHREAD_EFFECT_EVENT_CAPACITY
+        ? count : PCC_VTHREAD_EFFECT_EVENT_CAPACITY;
+}
+
+int64_t py_virtual_thread_effect_dropped(void) {
+    return __atomic_load_n(
+        &pcc_vthread_effect_event_dropped, __ATOMIC_ACQUIRE
+    );
+}
+
+int64_t py_virtual_thread_effect_kind_at(int64_t index) {
+    return pcc_vthread_effect_read_field(index, 0);
+}
+int64_t py_virtual_thread_effect_detail_at(int64_t index) {
+    return pcc_vthread_effect_read_field(index, 1);
+}
+int64_t py_virtual_thread_effect_root_delta_at(int64_t index) {
+    return pcc_vthread_effect_read_field(index, 2);
+}
+int64_t py_virtual_thread_effect_state_at(int64_t index) {
+    return pcc_vthread_effect_read_field(index, 3);
+}
+
+void pcc_vthread_effect_note_waiter_root_enter(void) {
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_ROOT_ENTER,
+        PCC_VTHREAD_NODE_WAITER,
+        1,
+        -1
+    );
+}
+
+void pcc_vthread_effect_note_waiter_root_leave(void) {
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_ROOT_LEAVE,
+        PCC_VTHREAD_NODE_WAITER,
+        -1,
+        -1
+    );
+}
+
 static int pcc_vthread_scheduler_init(void) {
     if (pcc_vthread_lock != NULL) return 0;
     pcc_vthread_lock = pcc_mutex_new();
@@ -689,6 +865,24 @@ static int64_t pcc_vthread_now_ms(void) {
     struct timeval tv;
     if (gettimeofday(&tv, NULL) != 0) return 0;
     return ((int64_t)tv.tv_sec * 1000) + ((int64_t)tv.tv_usec / 1000);
+}
+
+void pcc_vthread_waiter_pool_note_allocation(void) {
+    (void)__atomic_add_fetch(
+        &pcc_vthread_waiter_entry_alloc_count, 1, __ATOMIC_ACQ_REL
+    );
+}
+
+void pcc_vthread_waiter_pool_note_reuse(void) {
+    (void)__atomic_add_fetch(
+        &pcc_vthread_waiter_entry_reuse_count, 1, __ATOMIC_ACQ_REL
+    );
+}
+
+void pcc_vthread_waiter_pool_note_cached(int64_t count) {
+    __atomic_store_n(
+        &pcc_vthread_waiter_entry_cached_count, count, __ATOMIC_RELEASE
+    );
 }
 
 static PyVirtualThreadObject *checked_vthread(PyObject *vthread) {
@@ -702,6 +896,80 @@ static PyVirtualThreadObject *checked_vthread(PyObject *vthread) {
         return NULL;
     }
     return (PyVirtualThreadObject *)vthread;
+}
+
+#define PCC_VTHREAD_READY_ENTRY_POOL_LIMIT 4096
+
+static void pcc_vthread_ready_entry_clear(PccVirtualThreadQueueEntry *entry) {
+    if (entry == NULL) return;
+    entry->thread = NULL;
+    entry->next = NULL;
+    entry->root_handle = NULL;
+    entry->ready_pool_entry = 0;
+}
+
+static PccVirtualThreadQueueEntry *pcc_vthread_ready_entry_alloc_locked(
+    int use_ready_pool
+) {
+    PccVirtualThreadQueueEntry *entry = NULL;
+    if (use_ready_pool && pcc_vthread_ready_entry_free_head != NULL) {
+        entry = pcc_vthread_ready_entry_free_head;
+        pcc_vthread_ready_entry_free_head = entry->next;
+        pcc_vthread_ready_entry_reuse_count++;
+        if (pcc_vthread_ready_entry_free_count > 0) {
+            pcc_vthread_ready_entry_free_count--;
+        }
+    }
+    if (entry == NULL) {
+        entry = (PccVirtualThreadQueueEntry *)malloc(
+            sizeof(PccVirtualThreadQueueEntry)
+        );
+        if (entry != NULL) pcc_vthread_ready_entry_alloc_count++;
+    }
+    pcc_vthread_ready_entry_clear(entry);
+    if (entry != NULL) entry->ready_pool_entry = use_ready_pool ? 1 : 0;
+    return entry;
+}
+
+static void pcc_vthread_ready_entry_recycle_locked(
+    PccVirtualThreadQueueEntry *entry
+) {
+    if (entry == NULL) return;
+    int use_ready_pool = entry->ready_pool_entry;
+    pcc_vthread_ready_entry_clear(entry);
+    if (!use_ready_pool) {
+        free(entry);
+        return;
+    }
+    if (
+        pcc_vthread_ready_entry_free_count
+        >= PCC_VTHREAD_READY_ENTRY_POOL_LIMIT
+    ) {
+        free(entry);
+        return;
+    }
+    entry->ready_pool_entry = 1;
+    entry->next = pcc_vthread_ready_entry_free_head;
+    pcc_vthread_ready_entry_free_head = entry;
+    pcc_vthread_ready_entry_free_count++;
+}
+
+static void pcc_vthread_ready_entry_release_locked(
+    PccVirtualThreadQueueEntry *entry
+) {
+    if (entry == NULL) return;
+    if (entry->root_handle != NULL) {
+        pcc_gc_scheduler_root_unregister_handle(entry->root_handle);
+        pcc_vthread_effect_emit(
+            PCC_VTHREAD_EFFECT_ROOT_LEAVE,
+            PCC_VTHREAD_NODE_READY,
+            -1,
+            -1
+        );
+    }
+    entry->root_handle = NULL;
+    pcc_gc_store_root(&entry->thread, NULL);
+    pcc_vthread_ready_entry_recycle_locked(entry);
 }
 
 static void pcc_vthread_queue_push_entry_locked(
@@ -748,13 +1016,29 @@ static int pcc_vthread_enqueue_locked(PyObject *vthread) {
     if (vt->queued != 0 || vt->state != PCC_VTHREAD_READY) return 0;
     PccVirtualThreadQueueEntry *entry = (
         PccVirtualThreadQueueEntry *
-    )calloc(1, sizeof(PccVirtualThreadQueueEntry));
+    )pcc_vthread_ready_entry_alloc_locked(1);
     if (entry == NULL) return -1;
-    pcc_gc_scheduler_root_register(&entry->thread);
+    entry->root_handle = pcc_gc_scheduler_root_register_handle(&entry->thread);
+    if (entry->root_handle == NULL) {
+        pcc_vthread_ready_entry_recycle_locked(entry);
+        return -1;
+    }
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_ROOT_ENTER,
+        PCC_VTHREAD_NODE_READY,
+        1,
+        -1
+    );
     pcc_gc_store_root(&entry->thread, vthread);
     pcc_vthread_push_ready_entry_locked(entry);
     vt->queued = 1;
     pcc_vthread_ready_count_value++;
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_READY_ENQUEUE,
+        PCC_VTHREAD_NODE_READY,
+        0,
+        vt->state
+    );
     return 0;
 }
 
@@ -785,11 +1069,15 @@ static PyObject *pcc_vthread_dequeue_from_queue_locked(
             vt->queued = 0;
         }
         py_incref(thread);
-        pcc_gc_scheduler_root_unregister(&entry->thread);
-        pcc_gc_store_root(&entry->thread, NULL);
-        free(entry);
+        pcc_vthread_ready_entry_release_locked(entry);
         if (vt != NULL && vt->state == PCC_VTHREAD_READY) {
             vt->state = PCC_VTHREAD_RUNNING;
+            pcc_vthread_effect_emit(
+                PCC_VTHREAD_EFFECT_RESUME,
+                PCC_VTHREAD_NODE_READY,
+                0,
+                vt->state
+            );
             return thread;
         }
         py_decref(thread);
@@ -878,18 +1166,320 @@ static void pcc_vthread_carrier_queues_close_locked(void) {
     free(queues);
 }
 
-static void pcc_vthread_timer_entry_free(PccVirtualThreadTimerEntry *entry) {
+#define PCC_VTHREAD_TIMER_ENTRY_POOL_LIMIT 4096
+#define PCC_VTHREAD_POLL_ENTRY_POOL_LIMIT 4096
+
+static void pcc_vthread_timer_entry_clear(PccVirtualThreadTimerEntry *entry) {
     if (entry == NULL) return;
-    pcc_gc_scheduler_root_unregister(&entry->thread);
-    pcc_gc_store_root(&entry->thread, NULL);
-    free(entry);
+    entry->thread = NULL;
+    entry->deadline_ms = 0;
+    entry->next_free = NULL;
+    entry->root_handle = NULL;
 }
 
-static void pcc_vthread_poll_entry_free(PccVirtualThreadPollEntry *entry) {
+static PccVirtualThreadTimerEntry *pcc_vthread_timer_entry_alloc_locked(void) {
+    PccVirtualThreadTimerEntry *entry = pcc_vthread_timer_entry_free_head;
+    if (entry != NULL) {
+        pcc_vthread_timer_entry_free_head = entry->next_free;
+        pcc_vthread_timer_entry_reuse_count++;
+        if (pcc_vthread_timer_entry_free_count > 0) {
+            pcc_vthread_timer_entry_free_count--;
+        }
+    } else {
+        entry = (PccVirtualThreadTimerEntry *)malloc(
+            sizeof(PccVirtualThreadTimerEntry)
+        );
+        if (entry != NULL) pcc_vthread_timer_entry_alloc_count++;
+    }
+    pcc_vthread_timer_entry_clear(entry);
+    return entry;
+}
+
+static void pcc_vthread_timer_entry_recycle_locked(
+    PccVirtualThreadTimerEntry *entry
+) {
     if (entry == NULL) return;
-    pcc_gc_scheduler_root_unregister(&entry->thread);
+    pcc_vthread_timer_entry_clear(entry);
+    if (
+        pcc_vthread_timer_entry_free_count
+        >= PCC_VTHREAD_TIMER_ENTRY_POOL_LIMIT
+    ) {
+        free(entry);
+        return;
+    }
+    entry->next_free = pcc_vthread_timer_entry_free_head;
+    pcc_vthread_timer_entry_free_head = entry;
+    pcc_vthread_timer_entry_free_count++;
+}
+
+static void pcc_vthread_timer_entry_release_locked(
+    PccVirtualThreadTimerEntry *entry
+) {
+    if (entry == NULL) return;
+    if (entry->root_handle != NULL) {
+        pcc_gc_scheduler_root_unregister_handle(entry->root_handle);
+        pcc_vthread_effect_emit(
+            PCC_VTHREAD_EFFECT_ROOT_LEAVE,
+            PCC_VTHREAD_NODE_TIMER,
+            -1,
+            -1
+        );
+    }
+    entry->root_handle = NULL;
     pcc_gc_store_root(&entry->thread, NULL);
-    free(entry);
+    pcc_vthread_timer_entry_recycle_locked(entry);
+}
+
+/* Lazily init the timer min-heap. Caller must hold pcc_vthread_lock.
+ * Returns 0 on success, -1 on allocation failure. */
+static int pcc_vthread_timer_heap_ensure_locked(void) {
+    if (pcc_vthread_timer_heap_ready) return 0;
+    if (pcc_timer_heap_init(&pcc_vthread_timer_heap) != 0) return -1;
+    pcc_vthread_timer_heap_ready = 1;
+    return 0;
+}
+
+/* Map a stable timer-entry node <-> the opaque int64 id stored in the heap.
+ * The entry address is unique and stable for the entry's lifetime, and the
+ * heap never dereferences the id, so this round-trips exactly. */
+static int64_t pcc_vthread_timer_entry_id(const PccVirtualThreadTimerEntry *e) {
+    return (int64_t)(intptr_t)e;
+}
+static PccVirtualThreadTimerEntry *pcc_vthread_timer_entry_from_id(int64_t id) {
+    return (PccVirtualThreadTimerEntry *)(intptr_t)id;
+}
+
+/* Cancel and retire one active timer while holding pcc_vthread_lock.  The
+ * heap's cancellation is lazy, but the scheduler node and its GC root are not:
+ * they are released immediately.  A later timer may reuse the node address;
+ * the heap's authoritative (deadline, seq) live-map tuple distinguishes that
+ * new registration from the cancelled stale heap tuple. */
+static int pcc_vthread_timer_cancel_locked(PyVirtualThreadObject *vt) {
+    PccVirtualThreadTimerEntry *entry =
+        (PccVirtualThreadTimerEntry *)vt->timer_entry;
+    if (entry == NULL) return 0;
+    if (
+        !pcc_vthread_timer_heap_ready
+        || pcc_timer_heap_cancel(
+            &pcc_vthread_timer_heap,
+            pcc_vthread_timer_entry_id(entry)
+        ) != 1
+    ) {
+        return -1;
+    }
+    vt->timer_entry = NULL;
+    vt->queued = 0;
+    pcc_vthread_timer_entry_release_locked(entry);
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_CANCEL_TIMER,
+        PCC_VTHREAD_NODE_TIMER,
+        0,
+        vt->state
+    );
+    return 1;
+}
+
+static void pcc_vthread_poll_entry_clear(PccVirtualThreadPollEntry *entry) {
+    if (entry == NULL) return;
+    entry->thread = NULL;
+    entry->fd = 0;
+    entry->events = 0;
+    entry->deadline_ms = 0;
+    entry->next = NULL;
+    entry->root_handle = NULL;
+}
+
+static PccVirtualThreadPollEntry *pcc_vthread_poll_entry_alloc_locked(void) {
+    PccVirtualThreadPollEntry *entry = pcc_vthread_poll_entry_free_head;
+    if (entry != NULL) {
+        pcc_vthread_poll_entry_free_head = entry->next;
+        pcc_vthread_poll_entry_reuse_count++;
+        if (pcc_vthread_poll_entry_free_count > 0) {
+            pcc_vthread_poll_entry_free_count--;
+        }
+    } else {
+        entry = (PccVirtualThreadPollEntry *)malloc(
+            sizeof(PccVirtualThreadPollEntry)
+        );
+        if (entry != NULL) pcc_vthread_poll_entry_alloc_count++;
+    }
+    pcc_vthread_poll_entry_clear(entry);
+    return entry;
+}
+
+static void pcc_vthread_poll_entry_recycle_locked(
+    PccVirtualThreadPollEntry *entry
+) {
+    if (entry == NULL) return;
+    pcc_vthread_poll_entry_clear(entry);
+    if (
+        pcc_vthread_poll_entry_free_count >= PCC_VTHREAD_POLL_ENTRY_POOL_LIMIT
+    ) {
+        free(entry);
+        return;
+    }
+    entry->next = pcc_vthread_poll_entry_free_head;
+    pcc_vthread_poll_entry_free_head = entry;
+    pcc_vthread_poll_entry_free_count++;
+}
+
+static void pcc_vthread_poll_entry_release_locked(
+    PccVirtualThreadPollEntry *entry
+) {
+    if (entry == NULL) return;
+    if (entry->root_handle != NULL) {
+        pcc_gc_scheduler_root_unregister_handle(entry->root_handle);
+        pcc_vthread_effect_emit(
+            PCC_VTHREAD_EFFECT_ROOT_LEAVE,
+            PCC_VTHREAD_NODE_IO,
+            -1,
+            -1
+        );
+    }
+    entry->root_handle = NULL;
+    pcc_gc_store_root(&entry->thread, NULL);
+    pcc_vthread_poll_entry_recycle_locked(entry);
+}
+
+/* Select the live-fd owner once per process. ``auto`` (and an unset variable)
+ * selects kqueue when the compiled platform provides it. ``poll`` forces the
+ * portable fallback so its production path stays continuously testable. A
+ * requested-but-unavailable kqueue falls back explicitly and remains
+ * observable through py_virtual_thread_io_backend(). Caller holds the
+ * scheduler lock. */
+static int pcc_vthread_io_waitset_ensure_locked(void) {
+    if (pcc_vthread_io_waitset_ready) return 0;
+    const char *requested = getenv("PCC_VTHREAD_IO_BACKEND");
+    int force_poll = requested != NULL && strcmp(requested, "poll") == 0;
+    PccIoWaitSetBackend backend = PCC_IO_WAITSET_BACKEND_POLL;
+    if (!force_poll && pcc_io_waitset_kqueue_available()) {
+        backend = PCC_IO_WAITSET_BACKEND_KQUEUE;
+    }
+    if (pcc_io_waitset_init(&pcc_vthread_io_waitset, backend) != 0) {
+        if (backend == PCC_IO_WAITSET_BACKEND_POLL) return -1;
+        backend = PCC_IO_WAITSET_BACKEND_POLL;
+        if (pcc_io_waitset_init(&pcc_vthread_io_waitset, backend) != 0) {
+            return -1;
+        }
+    }
+    pcc_vthread_io_backend_value =
+        backend == PCC_IO_WAITSET_BACKEND_KQUEUE
+            ? PCC_VTHREAD_IO_BACKEND_KQUEUE
+            : PCC_VTHREAD_IO_BACKEND_POLL;
+    pcc_vthread_io_waitset_ready = 1;
+    return 0;
+}
+
+static int64_t pcc_vthread_io_interest(int64_t events) {
+    return events == 0 ? (int64_t)POLLIN : events;
+}
+
+/* Recompute the one waitset registration for fd from every per-vthread entry
+ * that waits on it. This preserves the old API's same-fd multi-waiter
+ * semantics while kqueue/poll own only one kernel registration per fd. */
+static int pcc_vthread_io_refresh_fd_locked(int64_t fd) {
+    if (pcc_vthread_io_waitset_ensure_locked() != 0) return -1;
+    int found = 0;
+    int64_t interest = 0;
+    int64_t deadline = -1;
+    PccVirtualThreadPollEntry *entry = pcc_vthread_poll_queue;
+    while (entry != NULL) {
+        if (entry->fd == fd) {
+            found = 1;
+            interest |= pcc_vthread_io_interest(entry->events);
+            if (
+                entry->deadline_ms >= 0
+                && (deadline < 0 || entry->deadline_ms < deadline)
+            ) {
+                deadline = entry->deadline_ms;
+            }
+        }
+        entry = entry->next;
+    }
+    if (!found) {
+        (void)pcc_io_waitset_remove(&pcc_vthread_io_waitset, fd);
+        return 0;
+    }
+    return pcc_io_waitset_add(
+        &pcc_vthread_io_waitset, fd, interest, deadline, 0
+    );
+}
+
+/* Remove one vthread's active IO wait immediately. The per-vthread root node
+ * is retired before returning; the aggregate kernel registration is then
+ * refreshed for any other waiters on the same fd. Caller holds the scheduler
+ * lock. */
+static int pcc_vthread_poll_cancel_locked(PyVirtualThreadObject *vt) {
+    PccVirtualThreadPollEntry *entry =
+        (PccVirtualThreadPollEntry *)vt->io_entry;
+    if (entry == NULL) return 0;
+    PccVirtualThreadPollEntry **cur = &pcc_vthread_poll_queue;
+    while (*cur != NULL && *cur != entry) cur = &(*cur)->next;
+    if (*cur == NULL) return -1;
+    int64_t fd = entry->fd;
+    *cur = entry->next;
+    if (pcc_vthread_io_wait_count_value > 0) {
+        pcc_vthread_io_wait_count_value--;
+    }
+    vt->io_entry = NULL;
+    vt->queued = 0;
+    pcc_vthread_poll_entry_release_locked(entry);
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_CANCEL_IO,
+        PCC_VTHREAD_NODE_IO,
+        0,
+        vt->state
+    );
+    return pcc_vthread_io_refresh_fd_locked(fd) == 0 ? 1 : -1;
+}
+
+static int pcc_vthread_live_pollfds_reserve_locked(int64_t need) {
+    if (need <= pcc_vthread_live_pollfds_cap) return 0;
+    int64_t cap = pcc_vthread_live_pollfds_cap > 0
+        ? pcc_vthread_live_pollfds_cap : 8;
+    while (cap < need) cap *= 2;
+    struct pollfd *grown = (struct pollfd *)realloc(
+        pcc_vthread_live_pollfds,
+        (size_t)cap * sizeof(struct pollfd)
+    );
+    if (grown == NULL) return -1;
+    pcc_vthread_live_pollfds = grown;
+    pcc_vthread_live_pollfds_cap = cap;
+    return 0;
+}
+
+/* Portable production fallback: one poll(2) call over the waitset's unique
+ * live fds, then feed the returned level state into the common waitset drain.
+ * This replaces the old one-poll-syscall-per-vthread linked-list walk. */
+static int pcc_vthread_io_feed_poll_locked(int64_t timeout_ms) {
+    int64_t count = pcc_io_waitset_count(&pcc_vthread_io_waitset);
+    if (count <= 0) return 0;
+    if (pcc_vthread_live_pollfds_reserve_locked(count) != 0) return -1;
+    int64_t n = 0;
+    for (int64_t i = 0; i < pcc_vthread_io_waitset.len; i++) {
+        PccIoWaitSlot *slot = &pcc_vthread_io_waitset.slots[i];
+        if (slot->state != 1) continue;
+        if (slot->fd < 0 || slot->fd > INT_MAX) return -1;
+        pcc_vthread_live_pollfds[n].fd = (int)slot->fd;
+        pcc_vthread_live_pollfds[n].events = (short)slot->interest;
+        pcc_vthread_live_pollfds[n].revents = 0;
+        n++;
+    }
+    int timeout = 0;
+    if (timeout_ms < 0) timeout = -1;
+    else if (timeout_ms > INT_MAX) timeout = INT_MAX;
+    else timeout = (int)timeout_ms;
+    int rc = poll(pcc_vthread_live_pollfds, (nfds_t)n, timeout);
+    if (rc < 0) return errno == EINTR ? 0 : -1;
+    for (int64_t i = 0; i < n; i++) {
+        if (pcc_vthread_live_pollfds[i].revents == 0) continue;
+        pcc_io_waitset_set_ready(
+            &pcc_vthread_io_waitset,
+            (int64_t)pcc_vthread_live_pollfds[i].fd,
+            (int64_t)pcc_vthread_live_pollfds[i].revents
+        );
+    }
+    return 0;
 }
 
 static int pcc_vthread_timer_add_locked(
@@ -897,21 +1487,43 @@ static int pcc_vthread_timer_add_locked(
     int64_t deadline_ms
 ) {
     PyVirtualThreadObject *vt = (PyVirtualThreadObject *)vthread;
-    PccVirtualThreadTimerEntry *entry = (
-        PccVirtualThreadTimerEntry *
-    )calloc(1, sizeof(PccVirtualThreadTimerEntry));
+    if (pcc_vthread_timer_cancel_locked(vt) < 0) return -1;
+    if (pcc_vthread_timer_heap_ensure_locked() != 0) return -1;
+    PccVirtualThreadTimerEntry *entry = pcc_vthread_timer_entry_alloc_locked();
     if (entry == NULL) return -1;
-    pcc_gc_scheduler_root_register(&entry->thread);
+    entry->root_handle = pcc_gc_scheduler_root_register_handle(&entry->thread);
+    if (entry->root_handle == NULL) {
+        pcc_vthread_timer_entry_recycle_locked(entry);
+        return -1;
+    }
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_ROOT_ENTER,
+        PCC_VTHREAD_NODE_TIMER,
+        1,
+        -1
+    );
     pcc_gc_store_root(&entry->thread, vthread);
     entry->deadline_ms = deadline_ms;
-    PccVirtualThreadTimerEntry **cur = &pcc_vthread_timer_queue;
-    while (*cur != NULL && (*cur)->deadline_ms <= deadline_ms) {
-        cur = &(*cur)->next;
+    /* O(log n) sift-up into the min-heap, keyed on (deadline_ms, seq); the seq
+     * tiebreak reproduces the old sorted-list FIFO-among-equal-deadlines walk
+     * (`<= deadline_ms`). The heap stores the entry's stable address as the
+     * opaque timer id. */
+    if (pcc_timer_heap_insert(
+            &pcc_vthread_timer_heap,
+            deadline_ms,
+            pcc_vthread_timer_entry_id(entry)
+        ) != 0) {
+        pcc_vthread_timer_entry_release_locked(entry);
+        return -1;
     }
-    entry->next = *cur;
-    *cur = entry;
+    vt->timer_entry = entry;
     vt->queued = 1;
-    pcc_vthread_timer_count_value++;
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_TIMER_PARK,
+        PCC_VTHREAD_NODE_TIMER,
+        0,
+        vt->state
+    );
     return 0;
 }
 
@@ -922,19 +1534,42 @@ static int pcc_vthread_poll_add_locked(
     int64_t deadline_ms
 ) {
     PyVirtualThreadObject *vt = (PyVirtualThreadObject *)vthread;
-    PccVirtualThreadPollEntry *entry = (
-        PccVirtualThreadPollEntry *
-    )calloc(1, sizeof(PccVirtualThreadPollEntry));
+    if (pcc_vthread_poll_cancel_locked(vt) < 0) return -1;
+    if (pcc_vthread_io_waitset_ensure_locked() != 0) return -1;
+    PccVirtualThreadPollEntry *entry = pcc_vthread_poll_entry_alloc_locked();
     if (entry == NULL) return -1;
-    pcc_gc_scheduler_root_register(&entry->thread);
+    entry->root_handle = pcc_gc_scheduler_root_register_handle(&entry->thread);
+    if (entry->root_handle == NULL) {
+        pcc_vthread_poll_entry_recycle_locked(entry);
+        return -1;
+    }
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_ROOT_ENTER,
+        PCC_VTHREAD_NODE_IO,
+        1,
+        -1
+    );
     pcc_gc_store_root(&entry->thread, vthread);
     entry->fd = fd;
     entry->events = events;
     entry->deadline_ms = deadline_ms;
     entry->next = pcc_vthread_poll_queue;
     pcc_vthread_poll_queue = entry;
+    if (pcc_vthread_io_refresh_fd_locked(fd) != 0) {
+        pcc_vthread_poll_queue = entry->next;
+        pcc_vthread_poll_entry_release_locked(entry);
+        (void)pcc_vthread_io_refresh_fd_locked(fd);
+        return -1;
+    }
+    vt->io_entry = entry;
     vt->queued = 1;
     pcc_vthread_io_wait_count_value++;
+    pcc_vthread_effect_emit(
+        PCC_VTHREAD_EFFECT_IO_PARK,
+        PCC_VTHREAD_NODE_IO,
+        0,
+        vt->state
+    );
     return 0;
 }
 
@@ -975,6 +1610,8 @@ PyObject *py_virtual_thread_new(PyObject *continuation) {
     vt->state = PCC_VTHREAD_NEW;
     vt->queued = 0;
     vt->pinned = 0;
+    vt->timer_entry = NULL;
+    vt->io_entry = NULL;
     pcc_gc_store_ptr(
         (PyObject *)vt,
         &vt->continuation,
@@ -990,10 +1627,23 @@ int64_t py_virtual_thread_start(PyObject *vthread) {
     if (vt->state == PCC_VTHREAD_DONE) return -1;
     if (pcc_vthread_scheduler_init() != 0) return -1;
     if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    if (pcc_vthread_timer_cancel_locked(vt) < 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
+    if (pcc_vthread_poll_cancel_locked(vt) < 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
     if (vt->state == PCC_VTHREAD_NEW || vt->state == PCC_VTHREAD_PARKED) {
         vt->state = PCC_VTHREAD_READY;
     }
     int rc = pcc_vthread_enqueue_locked((PyObject *)vt);
+    if (rc == 0) {
+        pcc_vthread_effect_emit(
+            PCC_VTHREAD_EFFECT_START, 0, 0, vt->state
+        );
+    }
     (void)pcc_mutex_unlock(pcc_vthread_lock);
     return rc == 0 ? 0 : -1;
 }
@@ -1002,6 +1652,7 @@ int64_t py_virtual_thread_park(PyObject *vthread) {
     PyVirtualThreadObject *vt = checked_vthread(vthread);
     if (vt == NULL || vt->state == PCC_VTHREAD_DONE) return -1;
     vt->state = PCC_VTHREAD_PARKED;
+    pcc_vthread_effect_emit(PCC_VTHREAD_EFFECT_PARK, 0, 0, vt->state);
     return 0;
 }
 
@@ -1010,7 +1661,20 @@ int64_t py_virtual_thread_unpark(PyObject *vthread) {
     if (vt == NULL || vt->state == PCC_VTHREAD_DONE) return -1;
     if (pcc_vthread_scheduler_init() != 0) return -1;
     if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    if (pcc_vthread_timer_cancel_locked(vt) < 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
+    if (pcc_vthread_poll_cancel_locked(vt) < 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
     int rc = pcc_vthread_make_ready_locked(vt);
+    if (rc == 0) {
+        pcc_vthread_effect_emit(
+            PCC_VTHREAD_EFFECT_UNPARK, 0, 0, vt->state
+        );
+    }
     (void)pcc_mutex_unlock(pcc_vthread_lock);
     return rc == 0 ? 0 : -1;
 }
@@ -1020,9 +1684,19 @@ int64_t py_virtual_thread_sleep(PyObject *vthread, int64_t delay_ms) {
     if (vt == NULL || vt->state == PCC_VTHREAD_DONE) return -1;
     if (pcc_vthread_scheduler_init() != 0) return -1;
     if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    if (pcc_vthread_poll_cancel_locked(vt) < 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
     int rc = 0;
     if (delay_ms <= 0) {
-        rc = pcc_vthread_make_ready_locked(vt);
+        rc = pcc_vthread_timer_cancel_locked(vt);
+        if (rc >= 0) rc = pcc_vthread_make_ready_locked(vt);
+        if (rc == 0) {
+            pcc_vthread_effect_emit(
+                PCC_VTHREAD_EFFECT_UNPARK, 0, 0, vt->state
+            );
+        }
     } else {
         vt->state = PCC_VTHREAD_PARKED;
         rc = pcc_vthread_timer_add_locked(
@@ -1034,30 +1708,69 @@ int64_t py_virtual_thread_sleep(PyObject *vthread, int64_t delay_ms) {
     return rc == 0 ? 0 : -1;
 }
 
+int64_t py_virtual_thread_cancel_timer(PyObject *vthread) {
+    PyVirtualThreadObject *vt = checked_vthread(vthread);
+    if (vt == NULL) return -1;
+    if (vt->timer_entry == NULL) return 0;
+    if (pcc_vthread_scheduler_init() != 0) return -1;
+    if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    int rc = pcc_vthread_timer_cancel_locked(vt);
+    (void)pcc_mutex_unlock(pcc_vthread_lock);
+    return rc;
+}
+
+#define PCC_VTHREAD_TIMER_DRAIN_BATCH 64
+
 int64_t py_virtual_thread_poll_timers(void) {
     if (pcc_vthread_scheduler_init() != 0) return 0;
     int64_t now = pcc_vthread_now_ms();
     int64_t woken = 0;
     if (pcc_mutex_lock(pcc_vthread_lock) != 0) return 0;
-    PccVirtualThreadTimerEntry **cur = &pcc_vthread_timer_queue;
-    while (*cur != NULL) {
-        PccVirtualThreadTimerEntry *entry = *cur;
-        if (entry->deadline_ms > now) break;
-        *cur = entry->next;
-        if (pcc_vthread_timer_count_value > 0) pcc_vthread_timer_count_value--;
-        PyObject *thread = entry->thread;
-        if (
-            thread != NULL
-            && !PY_IS_TAGGED_INT(thread)
-            && py_type_of(thread) == PY_TYPE_VIRTUAL_THREAD
-        ) {
-            PyVirtualThreadObject *vt = (PyVirtualThreadObject *)thread;
-            if (vt->state == PCC_VTHREAD_PARKED) {
-                vt->queued = 0;
-                if (pcc_vthread_make_ready_locked(vt) == 0) woken++;
+    if (!pcc_vthread_timer_heap_ready) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return 0;
+    }
+    /* Drain every id whose deadline <= now, in nondecreasing-deadline / FIFO
+     * order (the heap's pop_expired is inclusive at `deadline == now`, matching
+     * the old list's `deadline_ms > now` break). We drain in bounded batches so
+     * a huge due-set does not need one giant buffer; each pop_expired call
+     * unregisters what it returns, so the loop terminates. */
+    int64_t batch[PCC_VTHREAD_TIMER_DRAIN_BATCH];
+    for (;;) {
+        int64_t got = pcc_timer_heap_pop_expired(
+            &pcc_vthread_timer_heap, now, batch,
+            (int64_t)PCC_VTHREAD_TIMER_DRAIN_BATCH
+        );
+        for (int64_t i = 0; i < got; i++) {
+            PccVirtualThreadTimerEntry *entry =
+                pcc_vthread_timer_entry_from_id(batch[i]);
+            PyObject *thread = entry->thread;
+            /* Skip stale wakeups: a thread that was already unparked/made-ready
+             * (state != PARKED) is dropped without re-enqueue -- identical to
+             * the old poller's PCC_VTHREAD_PARKED check. */
+            if (
+                thread != NULL
+                && !PY_IS_TAGGED_INT(thread)
+                && py_type_of(thread) == PY_TYPE_VIRTUAL_THREAD
+            ) {
+                PyVirtualThreadObject *vt = (PyVirtualThreadObject *)thread;
+                if (vt->timer_entry == entry) vt->timer_entry = NULL;
+                if (vt->state == PCC_VTHREAD_PARKED) {
+                    vt->queued = 0;
+                    if (pcc_vthread_make_ready_locked(vt) == 0) {
+                        woken++;
+                        pcc_vthread_effect_emit(
+                            PCC_VTHREAD_EFFECT_TIMER_WAKE,
+                            PCC_VTHREAD_NODE_TIMER,
+                            0,
+                            vt->state
+                        );
+                    }
+                }
             }
+            pcc_vthread_timer_entry_release_locked(entry);
         }
-        pcc_vthread_timer_entry_free(entry);
+        if (got < (int64_t)PCC_VTHREAD_TIMER_DRAIN_BATCH) break;
     }
     (void)pcc_mutex_unlock(pcc_vthread_lock);
     return woken;
@@ -1066,7 +1779,11 @@ int64_t py_virtual_thread_poll_timers(void) {
 int64_t py_virtual_thread_timer_count(void) {
     if (pcc_vthread_scheduler_init() != 0) return 0;
     if (pcc_mutex_lock(pcc_vthread_lock) != 0) return 0;
-    int64_t count = pcc_vthread_timer_count_value;
+    /* Registered (not-yet-expired) timers = the heap's live-set size. */
+    int64_t count =
+        pcc_vthread_timer_heap_ready
+            ? pcc_timer_heap_size(&pcc_vthread_timer_heap)
+            : 0;
     (void)pcc_mutex_unlock(pcc_vthread_lock);
     return count;
 }
@@ -1083,6 +1800,13 @@ int64_t py_virtual_thread_block_on_fd(
     if (ready < 0) return -1;
     if (pcc_vthread_scheduler_init() != 0) return -1;
     if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    if (
+        pcc_vthread_timer_cancel_locked(vt) < 0
+        || pcc_vthread_poll_cancel_locked(vt) < 0
+    ) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
     int rc = 0;
     if (ready != 0) {
         rc = pcc_vthread_make_ready_locked(vt);
@@ -1096,23 +1820,57 @@ int64_t py_virtual_thread_block_on_fd(
     return rc == 0 ? 0 : -1;
 }
 
+static int64_t pcc_vthread_io_result_bits(
+    const PccIoWaitResult *result,
+    int64_t fd
+) {
+    int64_t bits = 0;
+    for (int64_t i = 0; i < result->ready_len; i++) {
+        if (result->ready[i].fd == fd) bits |= result->ready[i].events;
+    }
+    return bits;
+}
+
 int64_t py_virtual_thread_poll_io(int64_t timeout_ms) {
-    (void)timeout_ms;
-    if (pcc_vthread_scheduler_init() != 0) return 0;
-    int64_t woken = 0;
+    if (pcc_vthread_scheduler_init() != 0) return -1;
+    if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    if (pcc_vthread_io_waitset_ensure_locked() != 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
+    if (
+        pcc_vthread_io_backend_value == PCC_VTHREAD_IO_BACKEND_POLL
+        && pcc_vthread_io_feed_poll_locked(timeout_ms < 0 ? 0 : timeout_ms) != 0
+    ) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
+
+    PccIoWaitResult result;
     int64_t now = pcc_vthread_now_ms();
-    if (pcc_mutex_lock(pcc_vthread_lock) != 0) return 0;
+    if (pcc_io_waitset_wait(&pcc_vthread_io_waitset, now, &result) != 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
+
+    int64_t woken = 0;
     PccVirtualThreadPollEntry **cur = &pcc_vthread_poll_queue;
     while (*cur != NULL) {
         PccVirtualThreadPollEntry *entry = *cur;
+        int64_t ready_bits = pcc_vthread_io_result_bits(&result, entry->fd);
+        int64_t hit = ready_bits & (
+            pcc_vthread_io_interest(entry->events)
+            | (int64_t)PCC_IO_ALWAYS_REPORTED
+        );
         int expired = entry->deadline_ms >= 0 && entry->deadline_ms <= now;
-        int ready = expired ? 1 : pcc_vthread_fd_ready(entry->fd, entry->events, 0);
-        if (ready <= 0) {
+        if (hit == 0 && !expired) {
             cur = &(*cur)->next;
             continue;
         }
         *cur = entry->next;
-        if (pcc_vthread_io_wait_count_value > 0) pcc_vthread_io_wait_count_value--;
+        if (pcc_vthread_io_wait_count_value > 0) {
+            pcc_vthread_io_wait_count_value--;
+        }
         PyObject *thread = entry->thread;
         if (
             thread != NULL
@@ -1120,15 +1878,39 @@ int64_t py_virtual_thread_poll_io(int64_t timeout_ms) {
             && py_type_of(thread) == PY_TYPE_VIRTUAL_THREAD
         ) {
             PyVirtualThreadObject *vt = (PyVirtualThreadObject *)thread;
+            if (vt->io_entry == entry) vt->io_entry = NULL;
             if (vt->state == PCC_VTHREAD_PARKED) {
                 vt->queued = 0;
-                if (pcc_vthread_make_ready_locked(vt) == 0) woken++;
+                if (pcc_vthread_make_ready_locked(vt) == 0) {
+                    woken++;
+                    pcc_vthread_effect_emit(
+                        PCC_VTHREAD_EFFECT_IO_WAKE,
+                        PCC_VTHREAD_NODE_IO,
+                        0,
+                        vt->state
+                    );
+                }
             }
         }
-        pcc_vthread_poll_entry_free(entry);
+        pcc_vthread_poll_entry_release_locked(entry);
+    }
+
+    /* wait() removes every delivered/timed-out aggregate fd registration.
+     * Re-arm only those fds that still have later or differently-interested
+     * vthread entries. */
+    int refresh_failed = 0;
+    for (int64_t i = 0; i < result.ready_len; i++) {
+        if (pcc_vthread_io_refresh_fd_locked(result.ready[i].fd) != 0) {
+            refresh_failed = 1;
+        }
+    }
+    for (int64_t i = 0; i < result.timeout_len; i++) {
+        if (pcc_vthread_io_refresh_fd_locked(result.timed_out[i]) != 0) {
+            refresh_failed = 1;
+        }
     }
     (void)pcc_mutex_unlock(pcc_vthread_lock);
-    return woken;
+    return refresh_failed ? -1 : woken;
 }
 
 int64_t py_virtual_thread_io_wait_count(void) {
@@ -1137,6 +1919,15 @@ int64_t py_virtual_thread_io_wait_count(void) {
     int64_t count = pcc_vthread_io_wait_count_value;
     (void)pcc_mutex_unlock(pcc_vthread_lock);
     return count;
+}
+
+int64_t py_virtual_thread_io_backend(void) {
+    if (pcc_vthread_scheduler_init() != 0) return -1;
+    if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    int rc = pcc_vthread_io_waitset_ensure_locked();
+    int64_t backend = rc == 0 ? pcc_vthread_io_backend_value : -1;
+    (void)pcc_mutex_unlock(pcc_vthread_lock);
+    return backend;
 }
 
 PyObject *py_virtual_thread_poll_ready(void) {
@@ -1153,6 +1944,62 @@ int64_t py_virtual_thread_ready_count(void) {
     int64_t count = pcc_vthread_ready_count_value;
     (void)pcc_mutex_unlock(pcc_vthread_lock);
     return count;
+}
+
+int64_t py_virtual_thread_node_pool_stat(int64_t family, int64_t metric) {
+    if (family == PCC_VTHREAD_NODE_WAITER) {
+        if (metric == PCC_VTHREAD_POOL_ALLOCATIONS) {
+            return __atomic_load_n(
+                &pcc_vthread_waiter_entry_alloc_count, __ATOMIC_ACQUIRE
+            );
+        }
+        if (metric == PCC_VTHREAD_POOL_REUSES) {
+            return __atomic_load_n(
+                &pcc_vthread_waiter_entry_reuse_count, __ATOMIC_ACQUIRE
+            );
+        }
+        if (metric == PCC_VTHREAD_POOL_CACHED) {
+            return __atomic_load_n(
+                &pcc_vthread_waiter_entry_cached_count, __ATOMIC_ACQUIRE
+            );
+        }
+        return -1;
+    }
+    if (
+        metric != PCC_VTHREAD_POOL_ALLOCATIONS
+        && metric != PCC_VTHREAD_POOL_REUSES
+        && metric != PCC_VTHREAD_POOL_CACHED
+    ) return -1;
+    if (pcc_vthread_scheduler_init() != 0) return -1;
+    if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    int64_t value = -1;
+    if (family == PCC_VTHREAD_NODE_READY) {
+        if (metric == PCC_VTHREAD_POOL_ALLOCATIONS) {
+            value = pcc_vthread_ready_entry_alloc_count;
+        } else if (metric == PCC_VTHREAD_POOL_REUSES) {
+            value = pcc_vthread_ready_entry_reuse_count;
+        } else {
+            value = pcc_vthread_ready_entry_free_count;
+        }
+    } else if (family == PCC_VTHREAD_NODE_TIMER) {
+        if (metric == PCC_VTHREAD_POOL_ALLOCATIONS) {
+            value = pcc_vthread_timer_entry_alloc_count;
+        } else if (metric == PCC_VTHREAD_POOL_REUSES) {
+            value = pcc_vthread_timer_entry_reuse_count;
+        } else {
+            value = pcc_vthread_timer_entry_free_count;
+        }
+    } else if (family == PCC_VTHREAD_NODE_IO) {
+        if (metric == PCC_VTHREAD_POOL_ALLOCATIONS) {
+            value = pcc_vthread_poll_entry_alloc_count;
+        } else if (metric == PCC_VTHREAD_POOL_REUSES) {
+            value = pcc_vthread_poll_entry_reuse_count;
+        } else {
+            value = pcc_vthread_poll_entry_free_count;
+        }
+    }
+    (void)pcc_mutex_unlock(pcc_vthread_lock);
+    return value;
 }
 
 int64_t py_virtual_thread_carrier_count(void) {
@@ -1583,9 +2430,21 @@ int64_t py_virtual_thread_state(PyObject *vthread) {
 int64_t py_virtual_thread_complete(PyObject *vthread, PyObject *result) {
     PyVirtualThreadObject *vt = checked_vthread(vthread);
     if (vt == NULL) return -1;
+    if (pcc_vthread_scheduler_init() != 0) return -1;
+    if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    if (pcc_vthread_timer_cancel_locked(vt) < 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
+    if (pcc_vthread_poll_cancel_locked(vt) < 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return -1;
+    }
     pcc_gc_store_ptr((PyObject *)vt, &vt->result, result == NULL ? py_None : result);
     vt->state = PCC_VTHREAD_DONE;
     vt->queued = 0;
+    pcc_vthread_effect_emit(PCC_VTHREAD_EFFECT_COMPLETE, 0, 0, vt->state);
+    (void)pcc_mutex_unlock(pcc_vthread_lock);
     return 0;
 }
 
@@ -1653,6 +2512,62 @@ void py_dealloc_virtual_thread(PyObject *o) {
 /* DEBUG: catch py_incref called on a pointer that's not a valid PyObject. */
 void pcc_debug_bad_incref(void *o, int32_t tag) {
     fprintf(stderr, "[BAD_INCREF] o=%p tag=%d\n", o, tag);
+    if (o != NULL && tag >= 0) {
+        PyObjectHeader *h = py_header((PyObject *)o);
+        fprintf(
+            stderr,
+            "[BAD_INCREF_HEADER] refcount=%lld type_tag=%d flags=%d\n",
+            (long long)pcc_refcount_load(&h->refcount),
+            h->type_tag,
+            py_header_flags_load(h)
+        );
+    }
+#if defined(__APPLE__) || defined(__linux__)
+    const char *bt = getenv("PCC_DEBUG_BAD_BACKTRACE");
+    if (bt != NULL && bt[0] != '\0' && bt[0] != '0') {
+        void *frames[64];
+        int n = backtrace(frames, 64);
+        backtrace_symbols_fd(frames, n, 2);
+    }
+#endif
+    fflush(stderr);
+    __builtin_trap();
+}
+
+void pcc_debug_bad_dict_slot(
+    void *dict,
+    int64_t index,
+    int64_t offset,
+    void *obj,
+    int64_t tag
+) {
+    fprintf(
+        stderr,
+        "[DEBUG-dict-slot] dict=%p index=%lld offset=%lld obj=%p tag=%lld\n",
+        dict,
+        (long long)index,
+        (long long)offset,
+        obj,
+        (long long)tag
+    );
+    if (obj != NULL) {
+        PyObjectHeader *h = py_header((PyObject *)obj);
+        fprintf(
+            stderr,
+            "[DEBUG-dict-slot-header] refcount=%lld type_tag=%d flags=%d\n",
+            (long long)pcc_refcount_load(&h->refcount),
+            h->type_tag,
+            py_header_flags_load(h)
+        );
+    }
+#if defined(__APPLE__) || defined(__linux__)
+    const char *bt = getenv("PCC_DEBUG_BAD_BACKTRACE");
+    if (bt != NULL && bt[0] != '\0' && bt[0] != '0') {
+        void *frames[64];
+        int n = backtrace(frames, 64);
+        backtrace_symbols_fd(frames, n, 2);
+    }
+#endif
     fflush(stderr);
     __builtin_trap();
 }
@@ -1760,7 +2675,12 @@ static int pcc_debug_untracked_release_has_valid_header(void *obj) {
     if ((p & (sizeof(void *) - 1u)) != 0u) return 0;
     PyObjectHeader *h = py_header((PyObject *)obj);
     if (h->refcount <= 0) return 0;
-    if (!pcc_debug_type_tag_is_valid(h->type_tag) || h->type_tag > 500) return 0;
+    if (
+        (!pcc_debug_type_tag_is_valid(h->type_tag) || h->type_tag > 500)
+        && pcc_capi_is_cext_type_tag((int64_t)h->type_tag) == 0
+    ) {
+        return 0;
+    }
     return 1;
 }
 
@@ -1807,9 +2727,24 @@ int32_t pcc_debug_check_tuple_slot(
 
 void pcc_debug_check_release(const char *name, void *obj) {
     if (!pcc_debug_runtime_enabled()) return;
+    void *resolved = pcc_gc_note_relocation_read((PyObject *)obj);
+    if (resolved != NULL) obj = resolved;
     uintptr_t p = (uintptr_t)obj;
     if (obj == NULL) return;
     if ((p & 1u) != 0u) return;
+    if ((p & (sizeof(void *) - 1u)) == 0u) {
+        PyObjectHeader *h = py_header((PyObject *)obj);
+        if (pcc_gc_backend() == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
+            int32_t flags = py_header_flags_load(h);
+            if (
+                (flags & PY_FLAG_GC_MINOR_ARENA) != 0
+                && (flags & PY_FLAG_GC_OLD) != 0
+                && pcc_refcount_load(&h->refcount) <= 0
+            ) {
+                return;
+            }
+        }
+    }
     int64_t exact_size = pcc_debug_alloc_size_exact(obj);
     if (exact_size == 0 && p >= 0x160000000ULL && p < 0x180000000ULL) {
         if (pcc_debug_untracked_release_has_valid_header(obj)) return;
@@ -1825,10 +2760,23 @@ void pcc_debug_check_release(const char *name, void *obj) {
     }
     if (exact_size > 0) {
         PyObjectHeader *h = py_header((PyObject *)obj);
+        if (pcc_gc_backend() == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
+            int32_t flags = py_header_flags_load(h);
+            if (
+                (flags & PY_FLAG_GC_MINOR_ARENA) != 0
+                && (flags & PY_FLAG_GC_OLD) != 0
+                && pcc_refcount_load(&h->refcount) <= 0
+            ) {
+                return;
+            }
+        }
         if (
             h->refcount <= 0
             || !pcc_debug_type_tag_is_valid(h->type_tag)
-            || h->type_tag > 500
+            || (
+                h->type_tag > 500
+                && pcc_capi_is_cext_type_tag((int64_t)h->type_tag) == 0
+            )
         ) {
             fprintf(
                 stderr,
@@ -1850,14 +2798,43 @@ void pcc_debug_bad_str_concat(
     void *a, void *b, int64_t tag_a, int64_t tag_b
 ) {
     if (!pcc_debug_runtime_enabled()) return;
+    void *resolved_a = pcc_gc_note_relocation_read((PyObject *)a);
+    void *resolved_b = pcc_gc_note_relocation_read((PyObject *)b);
+    int64_t size_a = pcc_debug_alloc_size_exact(a);
+    int64_t size_b = pcc_debug_alloc_size_exact(b);
     fprintf(
         stderr,
-        "[BAD_STR_CONCAT] a=%p b=%p tag_a=%lld tag_b=%lld\n",
+        "[BAD_STR_CONCAT] a=%p b=%p tag_a=%lld tag_b=%lld "
+        "resolved_a=%p resolved_b=%p size_a=%lld size_b=%lld\n",
         a,
         b,
         (long long)tag_a,
-        (long long)tag_b
+        (long long)tag_b,
+        resolved_a,
+        resolved_b,
+        (long long)size_a,
+        (long long)size_b
     );
+    if (size_a > 0) {
+        PyObjectHeader *ha = py_header((PyObject *)a);
+        fprintf(
+            stderr,
+            "[BAD_STR_CONCAT_A_HEADER] refcount=%lld tag=%d flags=%d\n",
+            (long long)ha->refcount,
+            ha->type_tag,
+            ha->flags
+        );
+    }
+    if (size_b > 0) {
+        PyObjectHeader *hb = py_header((PyObject *)b);
+        fprintf(
+            stderr,
+            "[BAD_STR_CONCAT_B_HEADER] refcount=%lld tag=%d flags=%d\n",
+            (long long)hb->refcount,
+            hb->type_tag,
+            hb->flags
+        );
+    }
     fflush(stderr);
     __builtin_trap();
 }

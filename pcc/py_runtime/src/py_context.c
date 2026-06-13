@@ -17,9 +17,12 @@ static PyObject *call_unary_method(PyObject *method, PyObject *self) {
     if (method == NULL) return NULL;
     if (ptr_can_have_header(method) && !PY_IS_TAGGED_INT(method)
         && py_type_of(method) == PY_TYPE_FUNC) {
-        PyObject *args = py_tuple_new(1);
+        /* py_obj_getattr returned a bound PyFunc whose captures already own
+         * ``self``.  Match call_exit_method below: the dynamic call tuple
+         * contains only explicit Python arguments, which is empty for
+         * ``__enter__()``. */
+        PyObject *args = py_tuple_new(0);
         if (args == NULL) return NULL;
-        py_tuple_set_item(args, 0, self);
         PyObject *out = py_func_call(method, args);
         py_decref(args);
         return out;
@@ -68,11 +71,41 @@ PyObject *py_context_enter(PyObject *manager) {
 int64_t py_context_exit(PyObject *manager, PyObject *exc_type,
                         PyObject *exc, PyObject *tb) {
     if (manager == NULL) return 0;
+    /* Stash any in-flight exception so __exit__ runs without a pending error.
+     * py_obj_getattr and the method-call path bail out when py_err_occurred()
+     * is set, so on the exception-unwind path __exit__ would never be invoked
+     * (resources silently not released). CPython likewise runs __exit__ with
+     * the exception cleared and re-raises it afterwards unless __exit__ returns
+     * a truthy (suppressing) value. The caller's codegen expects the exception
+     * still pending on return — it clears it on the suppress branch and
+     * propagates it otherwise — so we restore the stashed object here rather
+     * than leaving the slot empty. py_tls_exc_set does not decref, so the
+     * stash/restore is refcount-neutral; pcc_gc_note_relocation_read keeps the
+     * pointer valid if a relocating GC moved the object while __exit__ ran. */
+    PyObject *stashed = py_current_exception();
+    if (stashed != NULL) {
+        py_tls_exc_set(NULL);
+    }
     PyObject *method = py_obj_getattr(manager, "__exit__");
-    if (method == NULL) return 0;
+    if (method == NULL) {
+        if (stashed != NULL) {
+            py_tls_exc_set(pcc_gc_note_relocation_read(stashed));
+        }
+        return 0;
+    }
     PyObject *result = call_exit_method(method, manager, exc_type, exc, tb);
-    if (result == NULL) return 0;
+    if (result == NULL) {
+        /* __exit__ raised its own exception, which is now pending and
+         * supersedes the original; drop the stashed one. */
+        if (stashed != NULL) {
+            py_decref(pcc_gc_note_relocation_read(stashed));
+        }
+        return 0;
+    }
     int64_t truth = py_obj_truthy(result);
     py_decref(result);
+    if (stashed != NULL) {
+        py_tls_exc_set(pcc_gc_note_relocation_read(stashed));
+    }
     return truth;
 }

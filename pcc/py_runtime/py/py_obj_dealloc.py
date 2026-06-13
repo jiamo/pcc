@@ -12,6 +12,7 @@ from pcc.unsafe import (
     global_addr,
     global_load_ptr,
     global_store_ptr,
+    is_tagged_int,
     load_i32,
     load_i64,
     load_ptr,
@@ -53,6 +54,15 @@ py_dealloc_virtual_thread = extern("py_dealloc_virtual_thread", (c_ptr,), c_void
 py_class_dealloc = extern("py_class_dealloc", (c_ptr,), c_void)
 py_instance_dealloc = extern("py_instance_dealloc", (c_ptr,), c_void)
 py_dealloc_exc = extern("py_dealloc_exc", (c_ptr,), c_void)
+pcc_capi_dealloc_cext_object = extern(
+    "pcc_capi_dealloc_cext_object",
+    (c_ptr, c_int64),
+    c_int64,
+)
+pcc_capi_is_cext_type_tag = extern("pcc_capi_is_cext_type_tag", (c_int64,), c_int64)
+pcc_debug_bad_dict_slot = extern(
+    "pcc_debug_bad_dict_slot", (c_ptr, c_int64, c_int64, c_ptr, c_int64), c_void,
+)
 
 define_global_i32("pcc_dealloc_depth", 0)
 define_global_ptr_null("pcc_dealloc_trash_head")
@@ -60,6 +70,8 @@ define_global_ptr_null("pcc_dealloc_trash_tail")
 
 
 def _dealloc_should_defer(tag: int) -> bool:
+    if pcc_capi_is_cext_type_tag(tag) != 0:
+        return False
     if tag == 5:     # PY_TYPE_LIST
         return True
     if tag == 7:     # PY_TYPE_TUPLE
@@ -87,6 +99,27 @@ def _dealloc_should_defer(tag: int) -> bool:
     if tag >= 100:   # PY_TYPE_USER
         return True
     return False
+
+
+def _debug_check_dict_dealloc_slot(
+    dict_obj,
+    index: int,
+    offset: int,
+    obj,
+) -> None:
+    if ptr_is_null(obj) != 0:
+        return
+    if is_tagged_int(obj) != 0:
+        return
+    flags: int = load_i32(obj, 12)
+    if (flags & 1) != 0:  # PY_FLAG_IMMORTAL
+        return
+    if pcc_gc_backend() == 3:
+        if (flags & 4096) != 0 and (flags & 256) != 0:
+            if load_i64(obj, 0) <= 0:
+                return
+    if load_i64(obj, 0) <= 0:
+        pcc_debug_bad_dict_slot(dict_obj, index, offset, obj, load_i32(obj, 8))
 
 
 def _dealloc_dispatch(o, tag: int) -> None:
@@ -168,6 +201,8 @@ def _dealloc_dispatch(o, tag: int) -> None:
     if tag == 12:       # PY_TYPE_EXC
         py_dealloc_exc(o)
         return
+    if pcc_capi_dealloc_cext_object(o, tag) != 0:
+        return
     if tag >= 100:      # PY_TYPE_USER
         py_instance_dealloc(o)
         return
@@ -211,8 +246,14 @@ def pcc_dealloc_with_trash(o, tag: int) -> None:
     depth: int = load_i32(depth_slot, 0)
     if depth > 0:
         if _dealloc_should_defer(tag):
-            if _trash_enqueue(o, tag):
-                return
+            # zpage-resident objects must dealloc IMMEDIATELY: their
+            # zpage accounting was already decremented in
+            # note_object_freeing, so a deferred dealloc can find its
+            # own header/fields memset by a page recycle triggered by
+            # a same-cascade death on the same page (gc4 exit UAF).
+            if (load_i32(o, 12) & 65536) == 0:
+                if _trash_enqueue(o, tag):
+                    return
     store_i32(depth_slot, 0, depth + 1)
     _dealloc_dispatch(o, tag)
     depth_after: int = load_i32(depth_slot, 0)
@@ -282,6 +323,8 @@ def py_dealloc_dict(o) -> None:
             if ptr_is_null(key) == 0:
                 key = pcc_gc_load_ptr(o, ptr_add(entries, off + 8))
                 value = pcc_gc_load_ptr(o, ptr_add(entries, off + 16))
+                _debug_check_dict_dealloc_slot(o, i, 8, key)
+                _debug_check_dict_dealloc_slot(o, i, 16, value)
                 py_decref(key)
                 if ptr_is_null(value) == 0:
                     py_decref(value)

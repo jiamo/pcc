@@ -21,12 +21,6 @@ static int32_t py_gc_threshold1 = 10;
 static int32_t py_gc_threshold2 = 10;
 static int64_t py_gc_freeze_count = 0;
 
-typedef struct PyGcNodeSlot {
-    PyObject *obj;
-    PyGcNode *node;
-    struct PyGcNodeSlot *next;
-} PyGcNodeSlot;
-
 typedef struct {
     PyObjectHeader h;
     const char *name;
@@ -41,9 +35,6 @@ typedef struct {
 static PyGcNode *py_gc_head = NULL;
 static int64_t py_gc_tracked_count = 0;
 static int32_t py_gc_collecting = 0;
-static PyGcNodeSlot **py_gc_node_index = NULL;
-static int64_t py_gc_node_index_cap = 0;
-static int64_t py_gc_node_index_count = 0;
 static unsigned char py_gc_table_lock_word = 0;
 
 static void py_gc_table_lock(void) {
@@ -56,100 +47,8 @@ static void py_gc_table_unlock(void) {
     __atomic_clear(&py_gc_table_lock_word, __ATOMIC_RELEASE);
 }
 
-static uint64_t py_gc_node_hash(PyObject *o) {
-    uintptr_t p = (uintptr_t)o;
-    p ^= p >> 33;
-    p *= 0xff51afd7ed558ccdULL;
-    p ^= p >> 33;
-    p *= 0xc4ceb9fe1a85ec53ULL;
-    p ^= p >> 33;
-    return (uint64_t)p;
-}
-
 static PyGcNode *py_gc_find_node(PyObject *o) {
-    if (py_gc_node_index == NULL || py_gc_node_index_cap <= 0 || o == NULL || PY_IS_TAGGED_INT(o)) {
-        return NULL;
-    }
-    size_t cap = (size_t)py_gc_node_index_cap;
-    size_t idx = py_gc_node_hash(o) & (cap - 1);
-    for (PyGcNodeSlot *slot = py_gc_node_index[idx]; slot != NULL; slot = slot->next) {
-        if (slot->obj == o) return slot->node;
-    }
-    return NULL;
-}
-
-static int py_gc_node_index_rehash(int64_t new_cap) {
-    if (new_cap < 1024) new_cap = 1024;
-    if ((new_cap & (new_cap - 1)) != 0) {
-        int64_t pow2 = 1;
-        while (pow2 < new_cap) pow2 <<= 1;
-        new_cap = pow2;
-    }
-    PyGcNodeSlot **new_index = (PyGcNodeSlot **)calloc((size_t)new_cap, sizeof(PyGcNodeSlot *));
-    if (!new_index) return -1;
-
-    if (py_gc_node_index != NULL) {
-        for (int64_t i = 0; i < py_gc_node_index_cap; i++) {
-            PyGcNodeSlot *slot = py_gc_node_index[i];
-            while (slot != NULL) {
-                PyGcNodeSlot *next = slot->next;
-                size_t idx = py_gc_node_hash(slot->obj) & (size_t)(new_cap - 1);
-                slot->next = new_index[idx];
-                new_index[idx] = slot;
-                slot = next;
-            }
-        }
-        free(py_gc_node_index);
-    }
-
-    py_gc_node_index = new_index;
-    py_gc_node_index_cap = new_cap;
-    return 0;
-}
-
-static int py_gc_node_index_init(void) {
-    if (py_gc_node_index != NULL) return 0;
-    return py_gc_node_index_rehash(1024);
-}
-
-static int py_gc_node_index_insert(PyObject *o, PyGcNode *node) {
-    if (o == NULL || node == NULL) return -1;
-    if (py_gc_node_index == NULL) {
-        if (py_gc_node_index_init() != 0) return -1;
-    }
-    if (py_gc_find_node(o) != NULL) return 0;
-    if (py_gc_node_index_count + 1 > py_gc_node_index_cap * 4 / 3) {
-        if (py_gc_node_index_rehash(py_gc_node_index_cap << 1) != 0) return -1;
-    }
-    size_t idx = py_gc_node_hash(o) & (size_t)(py_gc_node_index_cap - 1);
-    PyGcNodeSlot *slot = (PyGcNodeSlot *)malloc(sizeof(PyGcNodeSlot));
-    if (slot == NULL) return -1;
-    slot->obj = o;
-    slot->node = node;
-    slot->next = py_gc_node_index[idx];
-    py_gc_node_index[idx] = slot;
-    py_gc_node_index_count++;
-    return 1;
-}
-
-static PyGcNode *py_gc_node_index_remove(PyObject *o) {
-    if (py_gc_node_index == NULL || py_gc_node_index_cap <= 0 || o == NULL || PY_IS_TAGGED_INT(o)) {
-        return NULL;
-    }
-    size_t idx = py_gc_node_hash(o) & (size_t)(py_gc_node_index_cap - 1);
-    PyGcNodeSlot **slot = &py_gc_node_index[idx];
-    while (*slot != NULL) {
-        PyGcNodeSlot *cur = *slot;
-        if (cur->obj == o) {
-            PyGcNode *node = cur->node;
-            *slot = cur->next;
-            free(cur);
-            py_gc_node_index_count--;
-            return node;
-        }
-        slot = &(*slot)->next;
-    }
-    return NULL;
+    return py_gc_index_find(o);
 }
 
 static void py_gc_unlink_node(PyGcNode *n) {
@@ -167,86 +66,32 @@ static int py_gc_is_unreachable(PyObject *o) {
     return n != NULL && n->reachable == 0;
 }
 
+typedef struct {
+    void (*visit)(PyObject *child, void *ctx);
+    void *ctx;
+} PyGcReferentVisitCtx;
+
+static void py_gc_visit_referent_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    PyGcReferentVisitCtx *visit_ctx = (PyGcReferentVisitCtx *)ctx;
+    if (role == PY_OBJ_SLOT_BORROWED_UPDATE_ONLY) return;
+    if (slot == NULL || visit_ctx == NULL || visit_ctx->visit == NULL) return;
+    PyObject *child = pcc_gc_load_ptr(NULL, slot);
+    if (child == NULL) return;
+    visit_ctx->visit(child, visit_ctx->ctx);
+}
+
 static void py_gc_visit_referents(
     PyObject *o,
     void (*visit)(PyObject *child, void *ctx),
     void *ctx
 ) {
-    if (o == NULL || PY_IS_TAGGED_INT(o)) return;
-    int32_t tag = py_header(o)->type_tag;
-    if (tag == PY_TYPE_LIST) {
-        PyListObject *l = (PyListObject *)o;
-        for (int64_t i = 0; i < l->length; i++) visit(l->items[i], ctx);
-    } else if (tag == PY_TYPE_TUPLE) {
-        PyTupleObject *t = (PyTupleObject *)o;
-        for (int64_t i = 0; i < t->len; i++) visit(t->items[i], ctx);
-    } else if (tag == PY_TYPE_DICT) {
-        PyDictObject *d = (PyDictObject *)o;
-        if (d->entries != NULL) {
-            for (int64_t i = 0; i < d->entries_used; i++) {
-                DictEntry *e = &d->entries[i];
-                if (e->key != NULL) {
-                    visit(e->key, ctx);
-                    visit(e->value, ctx);
-                }
-            }
-        }
-    } else if (tag == PY_TYPE_SET) {
-        PySetObject *s = (PySetObject *)o;
-        if (s->entries != NULL) {
-            for (int64_t i = 0; i < s->capacity; i++) {
-                PyObject *k = s->entries[i].key;
-                if (k != NULL && k != py_set_dummy) visit(k, ctx);
-            }
-        }
-    } else if (tag == PY_TYPE_FUNC) {
-        PyFuncObject *f = (PyFuncObject *)o;
-        visit(f->captures, ctx);
-        visit(f->self_obj, ctx);
-    } else if (tag == PY_TYPE_ITER) {
-        PyIterObject *it = (PyIterObject *)o;
-        visit(it->seq, ctx);
-    } else if (tag == PY_TYPE_GEN) {
-        PyGenObject *g = (PyGenObject *)o;
-        visit(g->frame, ctx);
-        visit(g->send_value, ctx);
-    } else if (tag == PY_TYPE_COROUTINE) {
-        PyGcCoroutineObject *c = (PyGcCoroutineObject *)o;
-        visit(c->captures, ctx);
-        visit(c->args, ctx);
-        visit(c->result, ctx);
-    } else if (tag == PY_TYPE_CONTINUATION) {
-        PyContinuationObject *c = (PyContinuationObject *)o;
-        PyContinuationStackChunk *chunk = c->stack_chunk;
-        if (chunk != NULL && chunk->slots != NULL) {
-            for (int64_t i = 0; i < chunk->slot_count; i++) {
-                visit(chunk->slots[i], ctx);
-            }
-        }
-    } else if (tag == PY_TYPE_TASK) {
-        PyTaskObject *t = (PyTaskObject *)o;
-        visit(t->coro, ctx);
-        visit(t->result, ctx);
-        visit(t->waiter, ctx);
-    } else if (tag == PY_TYPE_VIRTUAL_THREAD) {
-        PyVirtualThreadObject *t = (PyVirtualThreadObject *)o;
-        visit(t->continuation, ctx);
-        visit(t->result, ctx);
-    } else if (tag == PY_TYPE_EXC) {
-        PyExceptionObject *e = (PyExceptionObject *)o;
-        visit(e->message, ctx);
-        visit(e->cause, ctx);
-        visit(e->context, ctx);
-    } else if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
-        PyInstanceObject *inst = (PyInstanceObject *)o;
-        PyClassObject *cls = inst->cls;
-        if (cls != NULL) {
-            int32_t n_fields = cls->n_fields;
-            if (n_fields < 0) n_fields = 0;
-            for (int32_t i = 0; i < n_fields; i++) visit(inst->fields[i], ctx);
-            if ((cls->h.flags & 2) == 0) visit(inst->fields[n_fields], ctx);
-        }
-    }
+    if (o == NULL || PY_IS_TAGGED_INT(o) || visit == NULL) return;
+    PyGcReferentVisitCtx visit_ctx = { visit, ctx };
+    (void)py_obj_visit_slots(o, py_gc_visit_referent_slot, &visit_ctx);
 }
 
 static void py_gc_subtract_child(PyObject *child, void *ctx) {
@@ -325,6 +170,10 @@ static void py_gc_mark_reachable(PyObject *o) {
 
 static void py_gc_recompute_reachability(void) {
     for (PyGcNode *n = py_gc_head; n != NULL; n = n->next) {
+        PCC_RT_TRIPWIRE(n->obj != NULL,
+                        "py_gc_recompute_reachability: tracked GC node has NULL object (freed/corrupt node still linked)");
+        PCC_RT_TRIPWIRE(!PY_IS_TAGGED_INT(n->obj),
+                        "py_gc_recompute_reachability: tracked GC node holds a tagged int (never trackable; py_header deref would be invalid)");
         n->gc_refs = py_header(n->obj)->refcount;
         n->reachable = 0;
     }
@@ -354,6 +203,7 @@ static int py_gc_maybe_finalize_unreachable(PyGcNode **unreachable,
         PyObjectHeader *h = py_header(obj);
         int32_t tag = h->type_tag;
         if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) continue;
+        if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) continue;
         int32_t flags_before = h->flags;
         py_user_del_dispatch(obj);
         if ((flags_before & PY_FLAG_FINALIZED) == 0 &&
@@ -373,27 +223,32 @@ static void py_gc_clear_slot(PyObject **slot) {
     py_decref(child);
 }
 
+static void py_gc_clear_owned_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    (void)ctx;
+    if (role != PY_OBJ_SLOT_OWNED) return;
+    py_gc_clear_slot(slot);
+}
+
 static void py_gc_clear_referents(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
     int32_t tag = py_header(o)->type_tag;
+    (void)py_obj_visit_slots(o, py_gc_clear_owned_slot, NULL);
     if (tag == PY_TYPE_LIST) {
         PyListObject *l = (PyListObject *)o;
-        for (int64_t i = 0; i < l->length; i++) py_gc_clear_slot(&l->items[i]);
         l->length = 0;
     } else if (tag == PY_TYPE_TUPLE) {
         PyTupleObject *t = (PyTupleObject *)o;
-        for (int64_t i = 0; i < t->len; i++) py_gc_clear_slot(&t->items[i]);
         t->len = 0;
     } else if (tag == PY_TYPE_DICT) {
         PyDictObject *d = (PyDictObject *)o;
         if (d->entries != NULL) {
             for (int64_t i = 0; i < d->entries_used; i++) {
                 DictEntry *e = &d->entries[i];
-                if (e->key != NULL) {
-                    py_gc_clear_slot(&e->key);
-                    py_gc_clear_slot(&e->value);
-                    e->hash = 0;
-                }
+                e->hash = 0;
             }
         }
         if (d->indices != NULL) {
@@ -405,67 +260,12 @@ static void py_gc_clear_referents(PyObject *o) {
         PySetObject *s = (PySetObject *)o;
         if (s->entries != NULL) {
             for (int64_t i = 0; i < s->capacity; i++) {
-                PyObject *k = s->entries[i].key;
-                if (k != NULL && k != py_set_dummy) {
-                    s->entries[i].key = NULL;
-                    if (!py_gc_is_unreachable(k)) py_decref(k);
-                } else {
-                    s->entries[i].key = NULL;
-                }
+                s->entries[i].key = NULL;
                 s->entries[i].hash = 0;
             }
         }
         s->size = 0;
         s->fill = 0;
-    } else if (tag == PY_TYPE_FUNC) {
-        PyFuncObject *f = (PyFuncObject *)o;
-        py_gc_clear_slot(&f->captures);
-        py_gc_clear_slot(&f->self_obj);
-    } else if (tag == PY_TYPE_ITER) {
-        PyIterObject *it = (PyIterObject *)o;
-        py_gc_clear_slot(&it->seq);
-    } else if (tag == PY_TYPE_GEN) {
-        PyGenObject *g = (PyGenObject *)o;
-        py_gc_clear_slot(&g->frame);
-        py_gc_clear_slot(&g->send_value);
-    } else if (tag == PY_TYPE_COROUTINE) {
-        PyGcCoroutineObject *c = (PyGcCoroutineObject *)o;
-        py_gc_clear_slot(&c->captures);
-        py_gc_clear_slot(&c->args);
-        py_gc_clear_slot(&c->result);
-    } else if (tag == PY_TYPE_CONTINUATION) {
-        PyContinuationObject *c = (PyContinuationObject *)o;
-        PyContinuationStackChunk *chunk = c->stack_chunk;
-        if (chunk != NULL && chunk->slots != NULL) {
-            for (int64_t i = 0; i < chunk->slot_count; i++) {
-                py_gc_clear_slot(&chunk->slots[i]);
-            }
-        }
-    } else if (tag == PY_TYPE_TASK) {
-        PyTaskObject *t = (PyTaskObject *)o;
-        py_gc_clear_slot(&t->coro);
-        py_gc_clear_slot(&t->result);
-        py_gc_clear_slot(&t->waiter);
-    } else if (tag == PY_TYPE_VIRTUAL_THREAD) {
-        PyVirtualThreadObject *t = (PyVirtualThreadObject *)o;
-        py_gc_clear_slot(&t->continuation);
-        py_gc_clear_slot(&t->result);
-    } else if (tag == PY_TYPE_EXC) {
-        PyExceptionObject *e = (PyExceptionObject *)o;
-        py_gc_clear_slot(&e->message);
-        py_gc_clear_slot(&e->cause);
-        py_gc_clear_slot(&e->context);
-    } else if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
-        PyInstanceObject *inst = (PyInstanceObject *)o;
-        PyClassObject *cls = inst->cls;
-        if (cls != NULL) {
-            int32_t n_fields = cls->n_fields;
-            if (n_fields < 0) n_fields = 0;
-            for (int32_t i = 0; i < n_fields; i++) {
-                py_gc_clear_slot(&inst->fields[i]);
-            }
-            if ((cls->h.flags & 2) == 0) py_gc_clear_slot(&inst->fields[n_fields]);
-        }
     }
 }
 
@@ -493,6 +293,7 @@ static void py_gc_dealloc_unreachable(PyObject *o) {
         case PY_TYPE_MEMORYVIEW: py_dealloc_memoryview(o); break;
         case PY_TYPE_WEAKREF:   py_dealloc_weakref(o);   break;
         default:
+            if (pcc_capi_dealloc_cext_object(o, (int64_t)h->type_tag) != 0) break;
             if (h->type_tag >= PY_TYPE_USER) py_instance_dealloc(o);
             else py_dealloc_generic(o);
             break;
@@ -564,7 +365,7 @@ int64_t py_gc_collect(void) {
         PyGcNode *n = unreachable[i];
         if (n->reachable != 0) continue;
         PyObject *obj = n->obj;
-        PyGcNode *index_n = py_gc_node_index_remove(obj);
+        PyGcNode *index_n = py_gc_index_remove(obj);
         (void)index_n;
         py_gc_unlink_node(n);
         py_header_flags_and(py_header(obj), ~PY_FLAG_GC_TRACKED);
@@ -586,8 +387,8 @@ done:
 void py_gc_track(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
     if (
-        pcc_gc_backend() == PCC_GC_KIND_COLORED_RELOCATING
-        && pcc_threads_enabled()
+        pcc_threads_enabled()
+        && pcc_gc_backend() == PCC_GC_KIND_COLORED_RELOCATING
     ) {
         return;
     }
@@ -603,7 +404,7 @@ void py_gc_track(PyObject *o) {
         py_gc_table_unlock();
         return;
     }
-    int status = py_gc_node_index_insert(o, n);
+    int status = (int)py_gc_index_insert(o, n);
     if (status == 0) {
         py_header_flags_or(h, PY_FLAG_GC_TRACKED);
         free(n);
@@ -627,8 +428,8 @@ void py_gc_track(PyObject *o) {
 void py_gc_untrack(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
     if (
-        pcc_gc_backend() == PCC_GC_KIND_COLORED_RELOCATING
-        && pcc_threads_enabled()
+        pcc_threads_enabled()
+        && pcc_gc_backend() == PCC_GC_KIND_COLORED_RELOCATING
     ) {
         return;
     }
@@ -638,7 +439,7 @@ void py_gc_untrack(PyObject *o) {
         py_gc_table_unlock();
         return;
     }
-    PyGcNode *n = py_gc_node_index_remove(o);
+    PyGcNode *n = py_gc_index_remove(o);
     if (n != NULL) {
         py_gc_unlink_node(n);
         free(n);

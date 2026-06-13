@@ -8,10 +8,12 @@ lives in py_int.c for now.
 from pcc.extern import c_abi_export
 from pcc.unsafe import (
     free,
+    global_load_ptr,
     is_tagged_int,
     load_i32,
     malloc,
     null,
+    ptr_eq,
     ptr_is_null,
     store_i32,
     store_i64,
@@ -119,6 +121,39 @@ def py_int_bit_length(n) -> int:
             top_bits = top_bits + 1
             top = top >> 1
         return (ndigits - 1) * 32 + top_bits
+    return 0
+
+
+@c_abi_export("py_int_bit_count")
+def py_int_bit_count(n) -> int:
+    # int.bit_count(): number of set bits in abs(value), 0 for 0. CPython counts
+    # the magnitude, so negatives match their absolute value:
+    # (-255).bit_count() == 8. Exact for bignums: popcount each base-2^32 limb
+    # (limbs store the magnitude; sign is separate). Mirrors py_int_bit_count in
+    # py_int_core.c. tagged-int path only sees i63-range values (negatable).
+    if ptr_is_null(n) != 0:
+        return 0
+    if is_tagged_int(n) != 0:
+        a: int = untag_int(n)
+        if a < 0:
+            a = 0 - a
+        bits: int = 0
+        while a > 0:
+            bits = bits + (a & 1)
+            a = a >> 1
+        return bits
+    tag: int = load_i32(n, 8)
+    if tag == 2:                            # PY_TYPE_INT bignum
+        ndigits: int = load_i32(n, 20)
+        total: int = 0
+        i: int = 0
+        while i < ndigits:
+            d: int = _load_u32(n, 24 + i * 4)
+            while d > 0:
+                total = total + (d & 1)
+                d = d >> 1
+            i = i + 1
+        return total
     return 0
 
 
@@ -247,7 +282,14 @@ def py_bigint_from_any(o):
         return py_bigint_from_i64(untag_int(o))
     if ptr_is_null(o):
         return null()
-    if load_i32(o, 8) != 2:
+    tag = load_i32(o, 8)
+    # bool is-a int (CPython): True -> 1, False -> 0, so bool operands flow
+    # through every int op (sum, +, *, ...) instead of failing as non-int.
+    if tag == 1:
+        if ptr_eq(o, global_load_ptr("py_True")) != 0:
+            return py_bigint_from_i64(1)
+        return py_bigint_from_i64(0)
+    if tag != 2:
         return null()
     return _bigint_copy(o)
 

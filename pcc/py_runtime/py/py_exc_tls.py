@@ -128,15 +128,28 @@ def py_err_occurred() -> int:
     return 1
 
 
+def _resolve_current_exception():
+    cur = py_tls_exc_get()
+    if ptr_is_null(cur):
+        return cur
+    resolved = pcc_gc_note_relocation_read(cur)
+    if ptr_eq(resolved, cur) == 0:
+        py_incref(resolved)
+        py_tls_exc_set(resolved)
+        py_decref(cur)
+        cur = resolved
+    return cur
+
+
 @c_abi_export("py_current_exception")
 def py_current_exception():
     # Borrowed reference — TLS still owns it.
-    return py_tls_exc_get()
+    return _resolve_current_exception()
 
 
 @c_abi_export("py_clear_exception")
 def py_clear_exception() -> None:
-    cur = py_tls_exc_get()
+    cur = _resolve_current_exception()
     if not ptr_is_null(cur):
         pcc_runtime_log_event_code(6, 4, _type_of(cur), 0, cur)
         py_decref(cur)
@@ -150,14 +163,7 @@ def py_raise(exc) -> None:
         pcc_runtime_log_event_code(6, 3, -1, 0, exc)
     else:
         pcc_runtime_log_event_code(6, 3, _type_of(exc), 0, exc)
-    cur = py_tls_exc_get()
-    if not ptr_is_null(cur):
-        resolved_cur = pcc_gc_note_relocation_read(cur)
-        if ptr_eq(resolved_cur, cur) == 0:
-            py_incref(resolved_cur)
-            py_tls_exc_set(resolved_cur)
-            py_decref(cur)
-            cur = resolved_cur
+    cur = _resolve_current_exception()
     cur_is_null: bool = ptr_is_null(cur)
     exc_is_null: bool = ptr_is_null(exc)
 
@@ -178,3 +184,9 @@ def py_raise(exc) -> None:
         py_decref(cur)
     py_tls_exc_set(exc)
     # Caller propagates via post-call py_err_occurred() check.
+
+
+@c_abi_export("py_raise_owned")
+def py_raise_owned(exc) -> None:
+    py_raise(exc)
+    py_decref(exc)

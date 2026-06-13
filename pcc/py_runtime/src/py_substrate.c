@@ -10,11 +10,30 @@
  * the design motivation.
  */
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "py_internal.h"
 #include "../include/py_runtime.h"
+
+int32_t py_class_attr_cache_epoch = 0;
+PyObject *py_inst_field_cache_cls0 = NULL;
+PyObject *py_inst_field_cache_cls1 = NULL;
+PyObject *py_inst_field_cache_cls2 = NULL;
+PyObject *py_inst_field_cache_cls3 = NULL;
+const char *py_inst_field_cache_name0 = NULL;
+const char *py_inst_field_cache_name1 = NULL;
+const char *py_inst_field_cache_name2 = NULL;
+const char *py_inst_field_cache_name3 = NULL;
+int32_t py_inst_field_cache_idx0 = -1;
+int32_t py_inst_field_cache_idx1 = -1;
+int32_t py_inst_field_cache_idx2 = -1;
+int32_t py_inst_field_cache_idx3 = -1;
+int32_t py_inst_field_cache_epoch0 = -1;
+int32_t py_inst_field_cache_epoch1 = -1;
+int32_t py_inst_field_cache_epoch2 = -1;
+int32_t py_inst_field_cache_epoch3 = -1;
 
 void *py_mem_alloc(size_t bytes) {
     return malloc(bytes);
@@ -171,6 +190,9 @@ const char *const PY_EXC_BUILTIN_NAMES[PY_EXC_N_BUILTIN] = {
     "AssertionError",
     "StopAsyncIteration",
     "ReferenceError",
+    "MemoryError",
+    "ImportError",
+    "ModuleNotFoundError",
 };
 
 const int32_t PY_EXC_PARENT[PY_EXC_N_BUILTIN] = {
@@ -193,6 +215,9 @@ const int32_t PY_EXC_PARENT[PY_EXC_N_BUILTIN] = {
     [PY_EXC_ASSERTIONERROR]    = PY_EXC_EXCEPTION,
     [PY_EXC_STOPASYNCITERATION] = PY_EXC_EXCEPTION,
     [PY_EXC_REFERENCEERROR]    = PY_EXC_EXCEPTION,
+    [PY_EXC_MEMORYERROR]       = PY_EXC_EXCEPTION,
+    [PY_EXC_IMPORTERROR]       = PY_EXC_EXCEPTION,
+    [PY_EXC_MODULENOTFOUNDERROR] = PY_EXC_IMPORTERROR,
 };
 
 /* Per-tag class cache. Populated lazily on first access by whichever
@@ -225,6 +250,11 @@ void *py_subs_exc_cache_get(int32_t tag) {
 void py_subs_exc_cache_set(int32_t tag, void *cls) {
     if (tag < 0 || tag >= PY_EXC_N_BUILTIN) return;
     py_exc_classes[tag] = (PyClassObject *)cls;
+}
+
+void **py_subs_exc_cache_slot(int32_t tag) {
+    if (tag < 0 || tag >= PY_EXC_N_BUILTIN) return (void **)0;
+    return (void **)&py_exc_classes[tag];
 }
 
 /* py_set_dummy tombstone sentinel. Must have a stable address that

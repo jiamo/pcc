@@ -29,6 +29,7 @@ static int32_t pcc_log_init_state = 0;
 static unsigned int pcc_log_mask = 0;
 static int pcc_log_json = 0;
 static const char *pcc_log_file_path = NULL;
+int32_t pcc_runtime_log_fast_state = -1;
 
 int64_t pcc_runtime_now_us(void) {
     struct timeval tv;
@@ -109,6 +110,11 @@ static void pcc_runtime_log_init_once(void) {
         const char *fmt = getenv("PCC_LOG_FORMAT");
         pcc_log_json = fmt != NULL && strcmp(fmt, "json") == 0;
         pcc_log_file_path = getenv("PCC_LOG_FILE");
+        __atomic_store_n(
+            &pcc_runtime_log_fast_state,
+            pcc_log_mask == 0 ? 0 : 1,
+            __ATOMIC_RELEASE
+        );
         __atomic_store_n(&pcc_log_init_state, 2, __ATOMIC_RELEASE);
         return;
     }
@@ -259,9 +265,37 @@ static const char *pcc_runtime_log_event_from_code(int32_t category, int32_t eve
     }
 }
 
+/* Fatal sink for PCC_RT_TRIPWIRE (py_internal.h). Only ever reached in
+ * builds compiled with -DPCC_RUNTIME_TRIPWIRES; in the default build the
+ * macro expands to ((void)0) and this function is never called. It reuses
+ * the existing runtime-log entrypoint (category "runtime") for the failure
+ * message so there is no second logging path, then aborts. To SEE the
+ * message, run with PCC_LOG=runtime (or PCC_LOG=all); the abort (SIGABRT)
+ * fires regardless. */
+void pcc_runtime_tripwire_fail(const char *msg, const char *file, int32_t line) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "TRIPWIRE %s:%ld: %s",
+             file != NULL ? file : "?",
+             (long)line,
+             msg != NULL ? msg : "invariant violated");
+    pcc_runtime_log_event("runtime", buf, (int64_t)line, 0, NULL);
+    abort();
+}
+
 void pcc_runtime_log_event_code(int32_t category, int32_t event,
                                 int64_t value0, int64_t value1,
                                 const void *ptr) {
+    if (
+        __atomic_load_n(&pcc_runtime_log_fast_state, __ATOMIC_RELAXED) == 0
+    ) {
+        return;
+    }
+    if (
+        __atomic_load_n(&pcc_log_init_state, __ATOMIC_RELAXED) == 2
+        && pcc_log_mask == 0
+    ) {
+        return;
+    }
     if (!pcc_runtime_log_code_enabled(category)) return;
     pcc_runtime_log_event(
         pcc_runtime_log_category_from_code(category),

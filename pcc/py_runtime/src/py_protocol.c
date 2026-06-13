@@ -11,7 +11,9 @@
  */
 
 #include "py_internal.h"
+#include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 static int ptr_can_have_header(void *ptr) {
     uintptr_t bits = (uintptr_t)ptr;
@@ -24,6 +26,13 @@ static int ptr_can_have_header(void *ptr) {
 #endif
     return 1;
 }
+
+/* Forward declarations for the dict-subclass fallback (defined at the end of
+ * this file). Declared up here so the generic user-dispatch helpers above can
+ * route to the backing dict for classes that subclass the builtin ``dict``. */
+static int class_is_dict_subclass(PyObject *o);
+static PyObject *dict_subclass_backing(PyObject *o, int create);
+PyObject *py_dict_subclass_getitem(PyObject *o, PyObject *key);
 
 static int is_user_instance(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
@@ -90,7 +99,16 @@ static PyObject *call_ternary(PyObject *method, PyObject *self,
 int64_t py_user_len_dispatch(PyObject *o, int64_t *handled) {
     if (handled) *handled = 0;
     PyObject *method = lookup_dunder(o, "__len__");
-    if (method == NULL) return 0;
+    if (method == NULL) {
+        /* No user __len__: a dict subclass reports its backing-dict size
+         * (inherited dict.__len__). */
+        if (class_is_dict_subclass(o)) {
+            if (handled) *handled = 1;
+            PyObject *d = dict_subclass_backing(o, 0);
+            return d != NULL ? py_dict_len(d) : 0;
+        }
+        return 0;
+    }
     if (handled) *handled = 1;
     PyObject *result = call_unary(method, o);
     if (result == NULL) return 0;
@@ -99,6 +117,16 @@ int64_t py_user_len_dispatch(PyObject *o, int64_t *handled) {
     py_decref(result);
     if (overflow || value < 0) return 0;
     return value;
+}
+
+/* abs(obj) for a user instance: dispatch __abs__ (unbound-func + explicit self,
+ * avoiding the bound-method double-self bug). Returns NULL with NO pending
+ * exception when the object has no __abs__ (caller then raises TypeError);
+ * NULL with a pending exception means __abs__ itself raised. */
+PyObject *py_user_abs_dispatch(PyObject *o) {
+    PyObject *method = lookup_dunder(o, "__abs__");
+    if (method == NULL) return NULL;
+    return call_unary(method, o);
 }
 
 int64_t py_user_bool_dispatch(PyObject *o, int64_t *handled) {
@@ -149,7 +177,16 @@ int64_t py_user_contains_dispatch(PyObject *o, PyObject *item,
                                   int64_t *handled) {
     if (handled) *handled = 0;
     PyObject *method = lookup_dunder(o, "__contains__");
-    if (method == NULL) return 0;
+    if (method == NULL) {
+        /* No user __contains__: a dict subclass tests key membership against
+         * its backing dict (inherited dict.__contains__). */
+        if (class_is_dict_subclass(o)) {
+            if (handled) *handled = 1;
+            PyObject *d = dict_subclass_backing(o, 0);
+            return (d != NULL && py_dict_contains(d, item)) ? 1 : 0;
+        }
+        return 0;
+    }
     if (handled) *handled = 1;
     PyObject *result = call_binary(method, o, item);
     if (result == NULL) return 0;
@@ -189,7 +226,14 @@ int64_t py_user_eq_dispatch(PyObject *a, PyObject *b) {
 
 PyObject *py_user_getitem_dispatch(PyObject *o, PyObject *key) {
     PyObject *method = lookup_dunder(o, "__getitem__");
-    if (method == NULL) return NULL;
+    if (method == NULL) {
+        /* No user __getitem__: a dict subclass still supports item access via
+         * its inherited dict.__getitem__ (backing dict + __missing__). */
+        if (class_is_dict_subclass(o)) {
+            return py_dict_subclass_getitem(o, key);
+        }
+        return NULL;
+    }
     return call_binary(method, o, key);
 }
 
@@ -210,11 +254,127 @@ PyObject *py_user_matmul_dispatch(PyObject *a, PyObject *b) {
     return NULL;
 }
 
+/* Generic user binary-dunder dispatch (J family: __add__/__radd__,
+ * __sub__/__rsub__, __mul__/__rmul__, ...). Mirrors the matmul shape:
+ * try a.<name>(b); on NotImplemented try b.<rname>(a); else raise the
+ * caller-provided TypeError message (a static string literal — it is
+ * NOT copied defensively here). A NULL from call_binary means the user
+ * dunder raised: the pending exception propagates as-is. */
+PyObject *py_user_binop_dispatch(
+    PyObject *a,
+    PyObject *b,
+    const char *name,
+    const char *rname,
+    const char *type_err_msg
+) {
+    PyObject *method = lookup_dunder(a, name);
+    if (method != NULL) {
+        PyObject *result = call_binary(method, a, b);
+        if (result != py_NotImplemented) return result;
+        py_decref(result);
+    }
+    method = lookup_dunder(b, rname);
+    if (method != NULL) {
+        PyObject *result = call_binary(method, b, a);
+        if (result != py_NotImplemented) return result;
+        py_decref(result);
+    }
+    py_raise(py_exc_new(PY_EXC_TYPEERROR, type_err_msg));
+    return NULL;
+}
+
+/* Generic ``a // b`` for dynamically-typed operands (C-only helper;
+ * the Dyn `//` emission used to coerce instances through the i64 fast
+ * path — silently wrong values). int/bool pairs keep Python floor
+ * semantics via py_int_floordiv; any-float numeric pairs floor the
+ * double quotient; instances dispatch __floordiv__/__rfloordiv__. */
+PyObject *py_obj_floordiv(PyObject *a, PyObject *b) {
+    if (a == NULL || b == NULL) {
+        py_raise(py_exc_new(
+            PY_EXC_TYPEERROR, "unsupported operand type(s) for //"));
+        return NULL;
+    }
+    int32_t at = py_type_of(a);
+    int32_t bt = py_type_of(b);
+    if (
+        (at == PY_TYPE_INT || at == PY_TYPE_BOOL)
+        && (bt == PY_TYPE_INT || bt == PY_TYPE_BOOL)
+    ) {
+        return py_int_floordiv(a, b);
+    }
+    int a_num = (at == PY_TYPE_INT || at == PY_TYPE_BOOL
+                 || at == PY_TYPE_FLOAT);
+    int b_num = (bt == PY_TYPE_INT || bt == PY_TYPE_BOOL
+                 || bt == PY_TYPE_FLOAT);
+    if (a_num && b_num) {
+        double bd = py_float_to_f64(b);
+        if (bd == 0.0) {
+            py_raise(py_exc_new(
+                PY_EXC_ZERODIVISIONERROR, "float floor division by zero"));
+            return NULL;
+        }
+        return py_float_from_f64(floor(py_float_to_f64(a) / bd));
+    }
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+        return py_user_binop_dispatch(
+            a, b, "__floordiv__", "__rfloordiv__",
+            "unsupported operand type(s) for //");
+    }
+    py_raise(py_exc_new(
+        PY_EXC_TYPEERROR, "unsupported operand type(s) for //"));
+    return NULL;
+}
+
+/* Augmented-assignment dispatch (a += b and friends): CPython tries
+ * type(a).__iop__ FIRST (NotImplemented falls through), then the
+ * plain binary protocol. op_code: 0:+ 1:- 2:* 3:/ 4:// 5:% */
+PyObject *py_obj_inplace_op(PyObject *a, PyObject *b, int64_t op_code) {
+    static const char *inames[6] = {
+        "__iadd__", "__isub__", "__imul__",
+        "__itruediv__", "__ifloordiv__", "__imod__",
+    };
+    if (a != NULL && !PY_IS_TAGGED_INT(a) && op_code >= 0 && op_code < 6) {
+        int32_t at = py_type_of(a);
+        if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER) {
+            PyObject *method = lookup_dunder(a, inames[op_code]);
+            if (method != NULL) {
+                PyObject *result = call_binary(method, a, b);
+                if (result != py_NotImplemented) return result;
+                py_decref(result);
+            }
+        }
+    }
+    switch (op_code) {
+        case 0: return py_obj_add(a, b);
+        case 1: return py_obj_sub(a, b);
+        case 2: return py_obj_mul(a, b);
+        case 3: return py_obj_truediv(a, b);
+        case 4: return py_obj_floordiv(a, b);
+        case 5: return py_obj_mod(a, b);
+        default:
+            py_raise(py_exc_new(
+                PY_EXC_TYPEERROR, "unsupported in-place operand"));
+            return NULL;
+    }
+}
+
 int64_t py_user_setitem_dispatch(PyObject *o, PyObject *key, PyObject *value,
                                  int64_t *handled) {
     if (handled) *handled = 0;
     PyObject *method = lookup_dunder(o, "__setitem__");
-    if (method == NULL) return -1;
+    if (method == NULL) {
+        /* No user __setitem__: a dict subclass stores into its backing dict
+         * (inherited dict.__setitem__). */
+        if (class_is_dict_subclass(o)) {
+            PyObject *d = dict_subclass_backing(o, 1);
+            if (d == NULL) return -1;
+            py_dict_set(d, key, value);
+            if (handled) *handled = 1;
+            return py_err_occurred() ? -1 : 0;
+        }
+        return -1;
+    }
     if (handled) *handled = 1;
     PyObject *result = call_ternary(method, o, key, value);
     if (result == NULL) return -1;
@@ -226,10 +386,279 @@ int64_t py_user_delitem_dispatch(PyObject *o, PyObject *key,
                                  int64_t *handled) {
     if (handled) *handled = 0;
     PyObject *method = lookup_dunder(o, "__delitem__");
-    if (method == NULL) return -1;
+    if (method == NULL) {
+        /* No user __delitem__: a dict subclass deletes from its backing dict
+         * (inherited dict.__delitem__). */
+        if (class_is_dict_subclass(o)) {
+            PyObject *d = dict_subclass_backing(o, 0);
+            if (handled) *handled = 1;
+            if (d == NULL) {
+                py_raise_owned(py_exc_new(PY_EXC_KEYERROR, "key not found"));
+                return -1;
+            }
+            return py_dict_del(d, key);
+        }
+        return -1;
+    }
     if (handled) *handled = 1;
     PyObject *result = call_binary(method, o, key);
     if (result == NULL) return -1;
     py_decref(result);
     return 0;
+}
+
+/* ====================================================================== *
+ * dict-subclass inherited behavior.
+ *
+ * A user class that subclasses the builtin ``dict`` (e.g. collections.Counter,
+ * OrderedDict, defaultdict) is created by the frontend as a plain
+ * PyInstanceObject: the ``dict`` base is not a user PyClassObject, so it is
+ * dropped from the native MRO and none of dict's item storage / methods are
+ * inherited. Without a fallback, ``self[k] = v`` (no user __setitem__),
+ * ``self.get(k, d)`` and iteration over ``self`` all fail with TypeError /
+ * AttributeError inside the pcc1-compiled stdlib.
+ *
+ * The frontend marks such classes with PY_CLASS_FLAG_DICT_SUBCLASS (bit 2).
+ * Item storage lives in a dedicated dict held UNDER A RESERVED KEY inside the
+ * instance's existing ``__dict__`` (dynamic-attribute) dict, so dict items and
+ * ordinary instance attributes (e.g. defaultdict.default_factory, or the
+ * synthetic ``args`` a foreign super().__init__() may store) never collide.
+ * The reserved key ("\x00pcc.dict.items") is not a valid Python identifier and
+ * is skipped by attribute access. User __getitem__ / __setitem__ overrides
+ * still win because py_user_getitem_dispatch / py_user_setitem_dispatch consult
+ * the user MRO first; the backing dict is only used when the user class defined
+ * no override.
+ * ====================================================================== */
+
+#define PY_CLASS_FLAG_SLOTS_ONLY 2
+#define PY_CLASS_FLAG_DICT_SUBCLASS 4
+
+/* Reserved __dict__ key under which the dict-subclass item storage lives. The
+ * leading NUL guarantees it can never be produced as a normal attribute name
+ * (attribute names are NUL-terminated C strings) so items and attrs stay
+ * separated even though both live in the one instance __dict__. */
+static const char PCC_DICT_ITEMS_KEY[] = "\x00pcc.dict.items";
+#define PCC_DICT_ITEMS_KEY_LEN ((int64_t)(sizeof(PCC_DICT_ITEMS_KEY) - 1))
+
+static int class_is_dict_subclass(PyObject *o) {
+    if (!is_user_instance(o)) return 0;
+    PyInstanceObject *inst = (PyInstanceObject *)o;
+    PyClassObject *cls = inst->cls;
+    if (cls == NULL) return 0;
+    return (cls->h.flags & PY_CLASS_FLAG_DICT_SUBCLASS) != 0;
+}
+
+/* Return the instance's __dict__ (dynamic-attribute) dict, materializing it if
+ * necessary. Mirrors dynamic_attr_slot() in py_class.c. Returns a BORROWED
+ * reference owned by the instance, or NULL. */
+static PyObject *dict_subclass_env(PyObject *o, int create) {
+    if (!class_is_dict_subclass(o)) return NULL;
+    PyInstanceObject *inst = (PyInstanceObject *)o;
+    PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
+        (PyObject *)inst, (PyObject **)&inst->cls);
+    if (cls == NULL) return NULL;
+    if ((cls->h.flags & PY_CLASS_FLAG_SLOTS_ONLY) != 0) return NULL;
+    int32_t n_fields = cls->n_fields;
+    if (n_fields < 0) n_fields = 0;
+    PyObject **slot = &inst->fields[n_fields];
+    PyObject *env = pcc_gc_load_ptr(o, slot);
+    if (env == NULL && create) {
+        env = py_dict_new();
+        if (env == NULL) return NULL;
+        pcc_gc_store_ptr(o, slot, env);
+        py_decref(env);  /* slot now owns it */
+        env = pcc_gc_load_ptr(o, slot);
+    }
+    return env;
+}
+
+/* Fetch the dict-subclass item-storage dict (lives under PCC_DICT_ITEMS_KEY in
+ * the instance __dict__), materializing an empty one on first use when
+ * ``create`` is set. Returns a BORROWED reference, or NULL. */
+static PyObject *dict_subclass_backing(PyObject *o, int create) {
+    PyObject *env = dict_subclass_env(o, create);
+    if (env == NULL) return NULL;
+    PyObject *key = py_str_new(PCC_DICT_ITEMS_KEY, PCC_DICT_ITEMS_KEY_LEN);
+    if (key == NULL) return NULL;
+    PyObject *d = py_dict_get(env, key);  /* owned or NULL */
+    if (d == NULL && create) {
+        d = py_dict_new();
+        if (d == NULL) { py_decref(key); return NULL; }
+        py_dict_set(env, key, d);   /* env now holds a ref */
+        py_decref(key);
+        py_decref(d);               /* drop our creation ref; env owns it */
+        return dict_subclass_backing(o, 0);  /* re-fetch as borrowed */
+    }
+    py_decref(key);
+    if (d != NULL) py_decref(d);    /* normalize to borrowed (env owns it) */
+    return d;
+}
+
+/* --- native bound-method entries -----------------------------------------
+ * Each entry receives ``captures = (instance,)`` and the positional call args
+ * tuple. They operate on the instance's backing dict. Returned refs follow the
+ * runtime convention (owned). */
+
+static PyObject *dictsub_get_entry(PyObject *captures, PyObject *args) {
+    PyObject *self = py_tuple_get(captures, 0);
+    if (self == NULL) return NULL;
+    int64_t nargs = (args != NULL && !PY_IS_TAGGED_INT(args)
+                     && py_type_of(args) == PY_TYPE_TUPLE)
+                        ? py_tuple_len(args) : 0;
+    PyObject *key = nargs >= 1 ? py_tuple_get(args, 0) : NULL;
+    PyObject *dflt = nargs >= 2 ? py_tuple_get(args, 1) : py_None;
+    if (nargs < 2) py_incref(dflt);  /* borrow py_None -> normalize to owned */
+    PyObject *d = dict_subclass_backing(self, 0);
+    PyObject *out;
+    if (d == NULL) {
+        out = dflt;         /* empty backing -> default */
+        py_incref(out);
+    } else {
+        out = py_dict_get_default(d, key, dflt);
+    }
+    py_decref(self);
+    if (key != NULL) py_decref(key);
+    py_decref(dflt);
+    return out;
+}
+
+static PyObject *dictsub_keys_entry(PyObject *captures, PyObject *args) {
+    (void)args;
+    PyObject *self = py_tuple_get(captures, 0);
+    if (self == NULL) return NULL;
+    PyObject *d = dict_subclass_backing(self, 1);
+    PyObject *out = d != NULL ? py_dict_keys(d) : NULL;
+    py_decref(self);
+    return out;
+}
+
+static PyObject *dictsub_values_entry(PyObject *captures, PyObject *args) {
+    (void)args;
+    PyObject *self = py_tuple_get(captures, 0);
+    if (self == NULL) return NULL;
+    PyObject *d = dict_subclass_backing(self, 1);
+    PyObject *out = d != NULL ? py_dict_values(d) : NULL;
+    py_decref(self);
+    return out;
+}
+
+static PyObject *dictsub_items_entry(PyObject *captures, PyObject *args) {
+    (void)args;
+    PyObject *self = py_tuple_get(captures, 0);
+    if (self == NULL) return NULL;
+    PyObject *d = dict_subclass_backing(self, 1);
+    PyObject *out = d != NULL ? py_dict_items(d) : NULL;
+    py_decref(self);
+    return out;
+}
+
+static PyObject *dictsub_pop_entry(PyObject *captures, PyObject *args) {
+    PyObject *self = py_tuple_get(captures, 0);
+    if (self == NULL) return NULL;
+    int64_t nargs = (args != NULL && !PY_IS_TAGGED_INT(args)
+                     && py_type_of(args) == PY_TYPE_TUPLE)
+                        ? py_tuple_len(args) : 0;
+    PyObject *key = nargs >= 1 ? py_tuple_get(args, 0) : NULL;
+    PyObject *d = dict_subclass_backing(self, 0);
+    PyObject *existing = (d != NULL && key != NULL) ? py_dict_get(d, key) : NULL;
+    PyObject *out;
+    if (existing != NULL) {
+        out = existing;              /* py_dict_get returns owned */
+        py_dict_del(d, key);
+    } else if (nargs >= 2) {
+        out = py_tuple_get(args, 1); /* default */
+    } else {
+        py_raise_owned(py_exc_new(PY_EXC_KEYERROR, "pop(): key not found"));
+        out = NULL;
+    }
+    py_decref(self);
+    if (key != NULL) py_decref(key);
+    return out;
+}
+
+static PyObject *dictsub_setdefault_entry(PyObject *captures, PyObject *args) {
+    PyObject *self = py_tuple_get(captures, 0);
+    if (self == NULL) return NULL;
+    int64_t nargs = (args != NULL && !PY_IS_TAGGED_INT(args)
+                     && py_type_of(args) == PY_TYPE_TUPLE)
+                        ? py_tuple_len(args) : 0;
+    PyObject *key = nargs >= 1 ? py_tuple_get(args, 0) : NULL;
+    PyObject *dflt = nargs >= 2 ? py_tuple_get(args, 1) : py_None;
+    if (nargs < 2) py_incref(dflt);
+    PyObject *d = dict_subclass_backing(self, 1);
+    PyObject *out = NULL;
+    if (d != NULL && key != NULL) {
+        PyObject *existing = py_dict_get(d, key);
+        if (existing != NULL) {
+            out = existing;
+        } else {
+            py_dict_set(d, key, dflt);
+            out = dflt;
+            py_incref(out);
+        }
+    }
+    py_decref(self);
+    if (key != NULL) py_decref(key);
+    py_decref(dflt);
+    return out;
+}
+
+static PyObject *dictsub_clear_entry(PyObject *captures, PyObject *args) {
+    (void)args;
+    PyObject *self = py_tuple_get(captures, 0);
+    if (self == NULL) return NULL;
+    PyObject *env = dict_subclass_env(self, 0);
+    if (env != NULL) {
+        PyObject *key = py_str_new(PCC_DICT_ITEMS_KEY, PCC_DICT_ITEMS_KEY_LEN);
+        if (key != NULL) {
+            PyObject *fresh = py_dict_new();
+            if (fresh != NULL) {
+                py_dict_set(env, key, fresh);  /* replace item storage */
+                py_decref(fresh);
+            }
+            py_decref(key);
+        }
+    }
+    py_decref(self);
+    py_incref(py_None);
+    return py_None;
+}
+
+/* Route a dict-subclass method name to a freshly bound native callable, or
+ * NULL when the name is not an inherited dict method (caller then continues to
+ * __getattr__ / AttributeError). Called from py_instance_getattr_default. */
+PyObject *py_dict_subclass_getattr(PyObject *o, const char *name) {
+    if (!class_is_dict_subclass(o) || name == NULL) return NULL;
+    void *entry = NULL;
+    if (strcmp(name, "get") == 0)             entry = (void *)dictsub_get_entry;
+    else if (strcmp(name, "keys") == 0)       entry = (void *)dictsub_keys_entry;
+    else if (strcmp(name, "values") == 0)     entry = (void *)dictsub_values_entry;
+    else if (strcmp(name, "items") == 0)      entry = (void *)dictsub_items_entry;
+    else if (strcmp(name, "pop") == 0)        entry = (void *)dictsub_pop_entry;
+    else if (strcmp(name, "setdefault") == 0) entry = (void *)dictsub_setdefault_entry;
+    else if (strcmp(name, "clear") == 0)      entry = (void *)dictsub_clear_entry;
+    if (entry == NULL) return NULL;
+    PyObject *cap = py_tuple_new(1);
+    if (cap == NULL) return NULL;
+    py_tuple_set_item(cap, 0, o);   /* increfs o */
+    PyObject *fn = py_func_new_named(entry, cap, name);
+    py_decref(cap);
+    return fn;
+}
+
+/* dict-subclass item read: try the backing dict, then the class __missing__,
+ * else KeyError. This is the inherited ``dict.__getitem__`` a subclass gets
+ * when it does NOT define its own __getitem__. Returns owned / NULL. */
+PyObject *py_dict_subclass_getitem(PyObject *o, PyObject *key) {
+    PyObject *d = dict_subclass_backing(o, 0);
+    if (d != NULL && key != NULL) {
+        PyObject *v = py_dict_get(d, key);   /* owned or NULL */
+        if (v != NULL) return v;
+    }
+    PyObject *missing = lookup_dunder(o, "__missing__");
+    if (missing != NULL) {
+        return call_binary(missing, o, key);
+    }
+    py_raise_owned(py_exc_new(PY_EXC_KEYERROR, "key not found"));
+    return NULL;
 }

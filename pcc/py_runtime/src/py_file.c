@@ -191,6 +191,105 @@ PyObject *py_file_write(PyObject *file, PyObject *text) {
     return py_int_from_i64((int64_t)wrote);
 }
 
+/* Shared open-file precondition for readline/seek/tell/flush: NULL /
+ * non-file receivers return NULL silently (matching the older read/write
+ * helpers); a closed file raises ValueError exactly like CPython. */
+static PyFileObject *file_checked_open(PyObject *file) {
+    if (file == NULL || py_type_of(file) != PY_TYPE_FILE) return NULL;
+    PyFileObject *f = (PyFileObject *)file;
+    if (f->closed || f->fp == NULL) {
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
+                                  "I/O operation on closed file."));
+        return NULL;
+    }
+    return f;
+}
+
+PyObject *py_file_readline(PyObject *file, int64_t limit) {
+    PyFileObject *f = file_checked_open(file);
+    if (f == NULL) return NULL;
+
+    char *buf = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    PyObject *vt = py_file_pin_current_vthread("file.readline");
+    for (;;) {
+        if (limit >= 0 && (int64_t)len >= limit) break;
+        int ch = fgetc(f->fp);
+        if (ch == EOF) {
+            if (ferror(f->fp)) {
+                py_file_unpin_current_vthread(vt);
+                free(buf);
+                return NULL;
+            }
+            break;
+        }
+        if (len + 2 > cap) {
+            size_t new_cap = cap ? cap * 2 : 128;
+            char *grown = (char *)realloc(buf, new_cap);
+            if (grown == NULL) {
+                py_file_unpin_current_vthread(vt);
+                free(buf);
+                return NULL;
+            }
+            buf = grown;
+            cap = new_cap;
+        }
+        buf[len++] = (char)ch;
+        if (ch == '\n') break;
+    }
+    py_file_unpin_current_vthread(vt);
+    PyObject *out = file_bytes_or_str(f, buf ? buf : "", (int64_t)len);
+    free(buf);
+    return out;
+}
+
+PyObject *py_file_seek(PyObject *file, int64_t offset, int64_t whence) {
+    PyFileObject *f = file_checked_open(file);
+    if (f == NULL) return NULL;
+
+    int w = SEEK_SET;
+    if (whence == 1) {
+        w = SEEK_CUR;
+    } else if (whence == 2) {
+        w = SEEK_END;
+    }
+    PyObject *vt = py_file_pin_current_vthread("file.seek");
+    int rc = fseek(f->fp, (long)offset, w);
+    long pos = (rc == 0) ? ftell(f->fp) : -1;
+    py_file_unpin_current_vthread(vt);
+    if (rc != 0 || pos < 0) {
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "Invalid argument"));
+        return NULL;
+    }
+    return py_int_from_i64((int64_t)pos);
+}
+
+PyObject *py_file_tell(PyObject *file) {
+    PyFileObject *f = file_checked_open(file);
+    if (f == NULL) return NULL;
+
+    PyObject *vt = py_file_pin_current_vthread("file.tell");
+    long pos = ftell(f->fp);
+    py_file_unpin_current_vthread(vt);
+    if (pos < 0) {
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "Invalid argument"));
+        return NULL;
+    }
+    return py_int_from_i64((int64_t)pos);
+}
+
+PyObject *py_file_flush(PyObject *file) {
+    PyFileObject *f = file_checked_open(file);
+    if (f == NULL) return NULL;
+
+    PyObject *vt = py_file_pin_current_vthread("file.flush");
+    fflush(f->fp);
+    py_file_unpin_current_vthread(vt);
+    py_incref(py_None);
+    return py_None;
+}
+
 void py_file_close(PyObject *file) {
     if (file == NULL || py_type_of(file) != PY_TYPE_FILE) return;
     PyFileObject *f = (PyFileObject *)file;

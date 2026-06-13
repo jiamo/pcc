@@ -141,6 +141,16 @@ static int re_match_here_flags(const char *p, const char *t, int ignore_case, in
     return 0;
 }
 
+/* E1a/E4: faithful-engine bridge (py_re_engine_obj.c) */
+PyObject *py_re_engine_truth_flags(PyObject *pattern, PyObject *text,
+                                   int64_t flags, int64_t search);
+PyObject *py_re_engine_truth_flags_from(PyObject *pattern, PyObject *text,
+                                        int64_t flags, int64_t search,
+                                        int64_t start, int64_t endpos);
+PyObject *py_re_engine_fullmatch_flags(PyObject *pattern, PyObject *text,
+                                       int64_t flags);
+#define PCC_RE_OK_FLAGS (2 | 8 | 16) /* re.I | re.M | re.S */
+
 static PyObject *py_re_match_impl(PyObject *pattern, PyObject *text, int64_t flags, int search) {
     const char *p;
     const char *t;
@@ -150,6 +160,20 @@ static PyObject *py_re_match_impl(PyObject *pattern, PyObject *text, int64_t fla
     if (py_type_of(pattern) != PY_TYPE_STR || py_type_of(text) != PY_TYPE_STR) {
         return py_None;
     }
+    if ((flags & ~(int64_t)PCC_RE_OK_FLAGS) == 0) {
+        /* Subset patterns (incl. re.I/M/S since E4) run on the faithful
+         * engine; outside-subset patterns raise (NULL) instead of silently
+         * mismatching the way the legacy literal matcher below would. */
+        return py_re_engine_truth_flags(pattern, text, flags, search);
+    }
+    py_raise(py_exc_new(
+        PY_EXC_NOTIMPLEMENTEDERROR,
+        "pcc re: flags outside the native regex subset (no-libpython)"
+    ));
+    return NULL;
+    /* legacy literal matcher below is retained only for reference; the
+     * mask routing above never falls through to it for match/search. */
+    if (0) {
     p = py_str_utf8(pattern);
     t = py_str_utf8(text);
     if (p == NULL || t == NULL) return py_None;
@@ -167,6 +191,7 @@ static PyObject *py_re_match_impl(PyObject *pattern, PyObject *text, int64_t fla
         t++;
     }
     return py_None;
+    }
 }
 
 PyObject *py_re_match(PyObject *pattern, PyObject *text) {
@@ -175,6 +200,25 @@ PyObject *py_re_match(PyObject *pattern, PyObject *text) {
 
 PyObject *py_re_match_flags(PyObject *pattern, PyObject *text, int64_t flags) {
     return py_re_match_impl(pattern, text, flags, 0);
+}
+
+PyObject *py_re_fullmatch(PyObject *pattern, PyObject *text) {
+    return py_re_fullmatch_flags(pattern, text, 0);
+}
+
+PyObject *py_re_fullmatch_flags(PyObject *pattern, PyObject *text, int64_t flags) {
+    if (pattern == NULL || text == NULL) return py_None;
+    if (py_type_of(pattern) != PY_TYPE_STR || py_type_of(text) != PY_TYPE_STR) {
+        return py_None;
+    }
+    if ((flags & ~(int64_t)PCC_RE_OK_FLAGS) == 0) {
+        return py_re_engine_fullmatch_flags(pattern, text, flags);
+    }
+    py_raise(py_exc_new(
+        PY_EXC_NOTIMPLEMENTEDERROR,
+        "pcc re: flags outside the native regex subset (no-libpython)"
+    ));
+    return NULL;
 }
 
 PyObject *py_re_search(PyObject *pattern, PyObject *text) {
@@ -250,6 +294,10 @@ static PyObject *re_findall_parenthesized(PyObject *text) {
     return out;
 }
 
+/* E3/E4: faithful-engine findall (py_re_engine_obj.c) */
+PyObject *py_re_engine_findall(PyObject *pattern, PyObject *text,
+                               int64_t flags);
+
 PyObject *py_re_findall_flags(PyObject *pattern, PyObject *text, int64_t flags) {
     const char *p;
     (void)flags;
@@ -257,6 +305,14 @@ PyObject *py_re_findall_flags(PyObject *pattern, PyObject *text, int64_t flags) 
     if (py_type_of(pattern) != PY_TYPE_STR || py_type_of(text) != PY_TYPE_STR) {
         return py_list_new(0);
     }
+    if ((flags & ~(int64_t)PCC_RE_OK_FLAGS) == 0) {
+        return py_re_engine_findall(pattern, text, flags);
+    }
+    py_raise(py_exc_new(
+        PY_EXC_NOTIMPLEMENTEDERROR,
+        "pcc re: flags outside the native regex subset (no-libpython)"
+    ));
+    return NULL;
     p = py_str_utf8(pattern);
     if (re_cstr_eq(p, "\\b[a-z][\\w$]*\\b")) {
         return re_findall_ident_words(text);
@@ -276,6 +332,10 @@ static PyObject *py_re_bound_method_call(PyObject *captures, PyObject *args) {
     int overflow = 0;
     int64_t flags;
     int64_t method_kind;
+    int64_t start = 0;
+    int64_t endpos = -1;
+    PyObject *start_obj = NULL;
+    PyObject *endpos_obj = NULL;
     if (captures == NULL || args == NULL) return py_None;
     if (py_tuple_len(captures) < 3 || py_tuple_len(args) < 1) return py_None;
     pattern = py_tuple_get(captures, 0);
@@ -294,15 +354,35 @@ static PyObject *py_re_bound_method_call(PyObject *captures, PyObject *args) {
     overflow = 0;
     method_kind = py_int_to_i64(method_obj, &overflow);
     if (overflow) method_kind = 0;
+    if (py_tuple_len(args) >= 2) {
+        start_obj = py_tuple_get(args, 1);
+        if (start_obj != NULL) {
+            overflow = 0;
+            start = py_int_to_i64(start_obj, &overflow);
+            if (overflow) start = 0;
+        }
+    }
+    if (py_tuple_len(args) >= 3) {
+        endpos_obj = py_tuple_get(args, 2);
+        if (endpos_obj != NULL) {
+            overflow = 0;
+            endpos = py_int_to_i64(endpos_obj, &overflow);
+            if (overflow) endpos = -1;
+        }
+    }
     if (method_kind == 2) {
         result = py_re_findall_flags(pattern, text, flags);
     } else {
-        result = py_re_match_impl(pattern, text, flags, method_kind == 1);
+        result = py_re_engine_truth_flags_from(
+            pattern, text, flags, method_kind == 1, start, endpos
+        );
     }
     py_decref(pattern);
     py_decref(flags_obj);
     py_decref(method_obj);
     py_decref(text);
+    if (start_obj != NULL) py_decref(start_obj);
+    if (endpos_obj != NULL) py_decref(endpos_obj);
     return result;
 }
 

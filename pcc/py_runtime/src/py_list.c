@@ -290,10 +290,28 @@ void py_list_set(PyObject *lst, int64_t i, PyObject *item) {
     PyListObject *l = (PyListObject *)lst;
     int64_t idx = normalize_index(i, l->length, 0);
     if (idx < 0) {
-        /* TODO(phase3): raise IndexError */
+        /* Internal non-raising setter: callers (sort/insert shifts, generator
+         * frames) index within bounds by construction. User-visible subscript
+         * stores go through py_list_setitem below. */
         return;
     }
     pcc_gc_store_ptr(lst, &l->items[idx], item);
+}
+
+int64_t py_list_setitem(PyObject *lst, int64_t i, PyObject *item) {
+    /* items[i] = v subscript store: like py_list_set but raises IndexError on
+     * out-of-range so try/except can catch it (CPython: "list assignment
+     * index out of range"). py_list_set stays non-raising for internal
+     * callers. Negative indices normalize. Mirrored in py_list.py. */
+    if (lst == NULL) return -1;
+    PyListObject *l = (PyListObject *)lst;
+    int64_t idx = normalize_index(i, l->length, 0);
+    if (idx < 0) {
+        py_raise(py_exc_new(PY_EXC_INDEXERROR, "list assignment index out of range"));
+        return -1;
+    }
+    pcc_gc_store_ptr(lst, &l->items[idx], item);
+    return 0;
 }
 
 int64_t py_list_len(PyObject *lst) {
@@ -341,6 +359,26 @@ PyObject *py_list_repeat(PyObject *src, int64_t count) {
             py_incref(v);
             lo->items[lo->length++] = v;
         }
+    }
+    return out;
+}
+
+/* list.copy() — shallow copy: a fresh list with the same elements (element
+ * refs are shared with the source, incref'd once each). Matches CPython
+ * ``list.copy()`` (equal contents, distinct identity). An empty source yields
+ * a fresh empty list. */
+PyObject *py_list_copy(PyObject *src) {
+    if (src == NULL) return NULL;
+    PyListObject *ls = (PyListObject *)src;
+    assert(ls->h.type_tag == PY_TYPE_LIST);
+    int64_t n = ls->length;
+    PyObject *out = py_list_new(n > 0 ? n : 4);
+    if (out == NULL) return NULL;
+    PyListObject *lo = (PyListObject *)out;
+    for (int64_t i = 0; i < n; i++) {
+        PyObject *v = pcc_gc_load_ptr(src, &ls->items[i]);
+        py_incref(v);
+        lo->items[lo->length++] = v;
     }
     return out;
 }
@@ -500,8 +538,14 @@ void py_list_extend(PyObject *a, PyObject *b) {
         }
         for (int64_t i = 0; i < bl; i++) {
             PyObject *v = pcc_gc_load_ptr(b, &lb->items[i]);
-            py_incref(v);
-            la->items[la->length++] = v;
+            /* Match py_list_append's grown-slot store: NULL-init the fresh
+             * capacity slot (py_list_new/grow leave items[] unzeroed, so the
+             * slot holds garbage), then route through the collector barrier.
+             * pcc_gc_store_ptr increfs v, so the prior manual incref is dropped
+             * to keep the net accounting (+1 owned ref) identical. */
+            la->items[la->length] = NULL;
+            pcc_gc_store_ptr(a, &la->items[la->length], v);
+            la->length++;
         }
         return;
     }
@@ -514,8 +558,12 @@ void py_list_extend(PyObject *a, PyObject *b) {
         }
         for (int64_t i = 0; i < bl; i++) {
             PyObject *v = pcc_gc_load_ptr(b, &tb->items[i]);
-            py_incref(v);
-            la->items[la->length++] = v;
+            /* Same grown-slot store idiom as the list branch / py_list_append:
+             * NULL-init the fresh (unzeroed) capacity slot, then barrier-store.
+             * pcc_gc_store_ptr increfs v, so the manual incref is dropped (net +1). */
+            la->items[la->length] = NULL;
+            pcc_gc_store_ptr(a, &la->items[la->length], v);
+            la->length++;
         }
         return;
     }
@@ -667,6 +715,41 @@ int64_t py_list_index(PyObject *lst, PyObject *item) {
     return -1;
 }
 
+/* list.index(item, start, end): search the half-open slice [start, end) for
+ * the first element equal to ``item``. ``start``/``end`` follow CPython slice
+ * clamping: negative indices are offset by the length once, then both bounds
+ * are clamped into [0, length]. When ``item`` is not found in the resolved
+ * window, raise ValueError (and return -1), matching CPython list.index. This
+ * is the range-aware variant of py_list_index; the frontend routes the 3-arg
+ * (and 2-arg) form here and checks py_err_occurred() after the call. */
+int64_t py_list_index_range(PyObject *lst, PyObject *item,
+                            int64_t start, int64_t end) {
+    int64_t length = (lst == NULL) ? 0 : ((PyListObject *)lst)->length;
+    if (start < 0) {
+        start += length;
+        if (start < 0) start = 0;
+    } else if (start > length) {
+        start = length;
+    }
+    if (end < 0) {
+        end += length;
+        if (end < 0) end = 0;
+    } else if (end > length) {
+        end = length;
+    }
+    if (lst != NULL) {
+        PyListObject *l = (PyListObject *)lst;
+        for (int64_t i = start; i < end; i++) {
+            PyObject *v = pcc_gc_load_ptr(lst, &l->items[i]);
+            if (py_obj_eq(v, item)) return i;
+        }
+    }
+    PyObject *exc = py_exc_new(PY_EXC_VALUEERROR, "list.index(x): x not in list");
+    py_raise(exc);
+    if (exc) py_decref(exc);
+    return -1;
+}
+
 int64_t py_list_count(PyObject *lst, PyObject *item) {
     if (lst == NULL) return 0;
     PyListObject *l = (PyListObject *)lst;
@@ -686,8 +769,12 @@ void py_list_reverse(PyObject *lst) {
     while (i < j) {
         PyObject *left = pcc_gc_load_ptr(lst, &l->items[i]);
         PyObject *right = pcc_gc_load_ptr(lst, &l->items[j]);
-        l->items[i] = right;
-        l->items[j] = left;
+        py_incref(left);
+        py_incref(right);
+        pcc_gc_store_ptr(lst, &l->items[i], right);
+        pcc_gc_store_ptr(lst, &l->items[j], left);
+        py_decref(left);
+        py_decref(right);
         i++;
         j--;
     }

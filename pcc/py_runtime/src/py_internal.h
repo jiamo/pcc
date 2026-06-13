@@ -28,6 +28,12 @@
 #define PY_FLAG_GC_FRESH_ALLOC 0x4000
 #define PY_FLAG_GC_LARGE_DEFERRED 0x8000
 #define PY_FLAG_GC_ZPAGE_ALLOC 0x10000
+/* Remap-phase epoch marker on relocated OLD shells: set at the remap
+ * that healed the heap, consumed (entry retired) at the NEXT remap, so
+ * stale SSA pointers from the in-between window still resolve. */
+#define PY_FLAG_GC_FORWARD_RETIRING 0x20000
+#define PY_FLAG_GC_MALLOC_ALLOC 0x40000
+#define PY_FLAG_GC_DEALLOCATING 0x80000
 #define PY_FLAG_GC_COLOR_MASK \
     (PY_FLAG_GC_WHITE | PY_FLAG_GC_GRAY | PY_FLAG_GC_BLACK)
 
@@ -93,6 +99,11 @@ void py_dealloc_thread_semaphore(PyObject *o);
 void py_dealloc_thread_thread(PyObject *o);
 void py_dealloc_virtual_thread(PyObject *o);
 void py_dealloc_generic(PyObject *o);
+void pcc_vthread_waiter_pool_note_allocation(void);
+void pcc_vthread_waiter_pool_note_reuse(void);
+void pcc_vthread_waiter_pool_note_cached(int64_t count);
+void pcc_vthread_effect_note_waiter_root_enter(void);
+void pcc_vthread_effect_note_waiter_root_leave(void);
 
 /* ---- GC backend selector/telemetry internals ------------------------- */
 void pcc_gc_note_alloc(int64_t bytes);
@@ -102,6 +113,47 @@ void pcc_gc_note_object_allocated(PyObject *o);
 void pcc_gc_note_object_allocated_sized(PyObject *o, int64_t size);
 void pcc_gc_note_object_freeing(PyObject *o);
 void pcc_gc_free_object_memory(PyObject *o);
+int64_t pcc_capi_is_cext_type_tag(int64_t type_tag);
+int64_t pcc_capi_dealloc_cext_object(PyObject *o, int64_t type_tag);
+PyObject *pcc_capi_call_cext_object(
+    PyObject *callable,
+    PyObject *args,
+    PyObject *kwargs
+);
+PyObject *pcc_capi_cext_subtract(PyObject *left, PyObject *right);
+PyObject *pcc_capi_cext_binary_number(
+    PyObject *left,
+    PyObject *right,
+    int64_t op
+);
+PyObject *pcc_capi_cext_absolute(PyObject *value);
+int64_t pcc_capi_cext_truthy(PyObject *value);
+int64_t pcc_capi_cext_richcompare_bool(
+    PyObject *left,
+    PyObject *right,
+    int64_t op
+);
+int64_t pcc_capi_cext_object_is_callable(PyObject *callable);
+PyObject *pcc_capi_cext_object_iter(PyObject *o);
+PyObject *pcc_capi_cext_object_next(PyObject *o);
+int64_t pcc_capi_cext_object_is_iterator(PyObject *o);
+PyObject *pcc_capi_cext_object_getitem(PyObject *o, PyObject *key);
+PyObject *pcc_capi_cext_object_getattr(PyObject *o, const char *name);
+int64_t pcc_capi_cext_object_setattr(
+    PyObject *o,
+    const char *name,
+    PyObject *value
+);
+PyObject *pcc_capi_call_type_object(
+    PyObject *callable,
+    PyObject *args,
+    PyObject *kwargs
+);
+int64_t pcc_capi_type_object_is_callable(PyObject *callable);
+int64_t pcc_capi_is_type_object_value(PyObject *value);
+int64_t pcc_capi_type_object_issubclass(PyObject *derived, PyObject *cls);
+PyObject *pcc_capi_type_object_getattr(PyObject *type_object, const char *name);
+PyObject *pcc_capi_builtin_object_getattr(PyObject *o, const char *name);
 void pcc_gc_note_load(void);
 PyObject *pcc_gc_note_relocation_read(PyObject *o);
 void pcc_gc_note_store(void);
@@ -125,6 +177,8 @@ typedef void (*PccGcRootVisitor)(PyObject *root, void *ctx);
 void pcc_gc_visit_runtime_roots(PccGcRootVisitor visit, void *ctx);
 void pcc_gc_note_frame_enter(const void *frame_map, PyObject **slots);
 void pcc_gc_note_frame_leave(PyObject **slots);
+void pcc_gc_note_frame_enter_lifo(const void *frame_map, PyObject **slots);
+void pcc_gc_note_frame_leave_lifo(PyObject **slots);
 
 /* ---- Threading/refcount substrate internals --------------------------- */
 typedef void *(*PccThreadMain)(void *arg);
@@ -139,7 +193,43 @@ void pcc_runtime_log_event(const char *category, const char *event,
                            int64_t value0, int64_t value1, const void *ptr);
 /* Integer-coded variant used by pcc-Python runtime ports that cannot cheaply
  * materialize borrowed C string literals in every hot path. */
+extern int32_t pcc_runtime_log_fast_state;
 void pcc_runtime_log_event_code(int32_t category, int32_t event, int64_t value0, int64_t value1, const void *ptr);
+
+/* ---- Production-safe runtime tripwires --------------------------------
+ *
+ * PCC_RT_TRIPWIRE(cond, msg) asserts a C-KERNEL object-graph invariant:
+ * object-header sanity, refcount discipline, and type-tag range at
+ * collector / decref / trace fan-out points. These are machine-boundary
+ * safety checks only (never Python semantics), so they are C-only and have
+ * NO pcc-Python mirror.
+ *
+ * Production-safe by construction:
+ *   - Default (production) build does NOT define PCC_RUNTIME_TRIPWIRES, so
+ *     the macro expands to ((void)0): zero cost, zero behavior change, and
+ *     `cond` is not even evaluated.
+ *   - Build with -DPCC_RUNTIME_TRIPWIRES to arm the checks. On a violated
+ *     invariant the message (with __FILE__/__LINE__) is routed through the
+ *     existing pcc_runtime_log entrypoint (category "runtime") and the
+ *     process aborts.
+ *
+ * The macro wraps its body in do/while(0) so it is a valid statement in
+ * every C context, evaluates `cond` exactly once, and does not depend on
+ * libpython. The fatal sink lives in pcc_runtime_log.c (the logging TU) so
+ * the abort path reuses the single logging entrypoint rather than inventing
+ * a second one. */
+void pcc_runtime_tripwire_fail(const char *msg, const char *file, int32_t line);
+
+#ifdef PCC_RUNTIME_TRIPWIRES
+#define PCC_RT_TRIPWIRE(cond, msg)                                           \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            pcc_runtime_tripwire_fail((msg), __FILE__, __LINE__);            \
+        }                                                                    \
+    } while (0)
+#else
+#define PCC_RT_TRIPWIRE(cond, msg) ((void)0)
+#endif
 
 int64_t pcc_refcount_incref(int64_t *slot);
 int64_t pcc_refcount_decref(int64_t *slot);
@@ -182,8 +272,73 @@ void *pcc_gc_object_index_find(PyObject *obj);
 int64_t pcc_gc_object_index_insert(PyObject *obj, void *node);
 void *pcc_gc_object_index_remove(PyObject *obj);
 void pcc_gc_object_index_clear(void);
+void pcc_gc_ptr_index_tls_pool_drain(void);
+typedef enum {
+    PY_OBJ_SLOT_OWNED = 1,
+    PY_OBJ_SLOT_BORROWED_TRACED = 2,
+    PY_OBJ_SLOT_BORROWED_UPDATE_ONLY = 3
+} PyObjSlotRole;
+typedef void (*PyObjSlotVisitor)(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+);
+typedef void (*PccPyObjSlotVisitorI64)(
+    PyObject **slot,
+    int64_t role,
+    void *ctx
+);
+int py_obj_visit_slots(PyObject *o, PyObjSlotVisitor visit, void *ctx);
+void py_obj_update_slot(PyObject **slot);
+int pcc_capi_visit_cext_object_slots(
+    PyObject *o,
+    PyObjSlotVisitor visit,
+    void *ctx
+);
+int pcc_capi_visit_cext_object_slots_i64(
+    PyObject *o,
+    PccPyObjSlotVisitorI64 visit,
+    void *ctx
+);
+/* Slot-address referent walker for the backend-4 remap phase
+ * (docs/plans/gc4-relocation-remap-plan.md). Coverage mirrors
+ * pcc_gc_trace_referents. */
+void pcc_gc_update_referents(PyObject *o, void (*update)(PyObject **slot));
+void *pcc_gc_forwarding_index_find(PyObject *obj);
+int64_t pcc_gc_forwarding_index_insert(PyObject *obj, void *node);
+void *pcc_gc_forwarding_index_remove(PyObject *obj);
+void pcc_gc_forwarding_index_clear(void);
+void *pcc_gc_forwarding_target_index_find(PyObject *obj);
+int64_t pcc_gc_forwarding_target_index_insert(PyObject *obj, void *node);
+int64_t pcc_gc_forwarding_target_index_upsert(PyObject *obj, void *node);
+void *pcc_gc_forwarding_target_index_remove(PyObject *obj);
+void pcc_gc_forwarding_target_index_clear(void);
+void *pcc_gc_identity_index_find(PyObject *obj);
+int64_t pcc_gc_identity_index_insert(PyObject *obj, void *node);
+void *pcc_gc_identity_index_remove(PyObject *obj);
+void pcc_gc_identity_index_clear(void);
+void *pcc_gc_frame_index_find(void *slots);
+int64_t pcc_gc_frame_index_insert(void *slots, void *node);
+void *pcc_gc_frame_index_replace(void *slots, void *node);
+void *pcc_gc_frame_index_remove(void *slots);
+void pcc_gc_frame_index_clear(void);
+extern int32_t pcc_gc_read_barrier_enabled;
+void *pcc_gc_zpage_owner_index_find(PyObject *obj);
+int64_t pcc_gc_zpage_owner_index_insert(PyObject *obj, void *node);
+int64_t pcc_gc_zpage_owner_index_upsert(PyObject *obj, void *node);
+void *pcc_gc_zpage_owner_index_remove(PyObject *obj);
+void pcc_gc_zpage_owner_index_clear(void);
+void *pcc_gc_zpage_page_index_find(void *page);
+int64_t pcc_gc_zpage_page_index_insert(void *page, void *node);
+int64_t pcc_gc_zpage_page_index_upsert(void *page, void *node);
+void *pcc_gc_zpage_page_index_remove(void *page);
+void pcc_gc_zpage_page_index_clear(void);
 int64_t pcc_gc_object_is_known(PyObject *obj);
 int64_t pcc_gc_object_is_known_no_lock(PyObject *obj);
+int64_t pcc_gc_backend4_slot_needs_resolve(PyObject *value);
+int64_t pcc_gc_forwarding_population_load(void);
+int64_t pcc_gc_relocation_set_active_load(void);
+int64_t pcc_gc_slot_is_runtime_root(PyObject **slot);
 
 /* ---- Tagged-int helpers ------------------------------------------------ */
 /* Encoding: low bit = 1 means value; shift right arithmetic to recover the
@@ -418,10 +573,42 @@ typedef struct PyClassObject {
     const char             **field_names;
     int32_t                  instance_size;
     int32_t                  type_tag_alloc;
+    /* Borrowed update-only alias of the method-table __del__ entry.  GC
+     * forwarding rewrites it, but semantic dispatch always performs the MRO
+     * lookup so this alias cannot become a second finalizer cache policy. */
     PyObject               *del_method;
     PyObject               *attrs;      /* owned dict for class-level variables */
     struct PyClassObject   *metaclass;  /* borrowed class object for type attrs */
 } PyClassObject;
+
+#define PCC_ASSERT_CLASS_OFFSET(field, expected) \
+    _Static_assert(offsetof(PyClassObject, field) == (expected), \
+                   "PyClassObject." #field " offset drift")
+
+_Static_assert(sizeof(PyClassObject) == 120,
+               "PyClassObject size drift from pcc-Python ABI");
+PCC_ASSERT_CLASS_OFFSET(h, 0);
+PCC_ASSERT_CLASS_OFFSET(name, 16);
+PCC_ASSERT_CLASS_OFFSET(n_bases, 24);
+PCC_ASSERT_CLASS_OFFSET(bases, 32);
+PCC_ASSERT_CLASS_OFFSET(n_mro, 40);
+PCC_ASSERT_CLASS_OFFSET(mro, 48);
+PCC_ASSERT_CLASS_OFFSET(n_methods, 56);
+PCC_ASSERT_CLASS_OFFSET(methods, 64);
+PCC_ASSERT_CLASS_OFFSET(n_fields, 72);
+PCC_ASSERT_CLASS_OFFSET(field_names, 80);
+PCC_ASSERT_CLASS_OFFSET(instance_size, 88);
+PCC_ASSERT_CLASS_OFFSET(type_tag_alloc, 92);
+PCC_ASSERT_CLASS_OFFSET(del_method, 96);
+PCC_ASSERT_CLASS_OFFSET(attrs, 104);
+PCC_ASSERT_CLASS_OFFSET(metaclass, 112);
+_Static_assert(sizeof(PyClassMethod) == 16, "PyClassMethod size drift");
+_Static_assert(offsetof(PyClassMethod, name) == 0,
+               "PyClassMethod.name offset drift");
+_Static_assert(offsetof(PyClassMethod, func) == 8,
+               "PyClassMethod.func offset drift");
+
+#undef PCC_ASSERT_CLASS_OFFSET
 
 /* Instance object: header + pointer to class + flexible field slot array.
  *
@@ -435,6 +622,9 @@ typedef struct PyInstanceObject {
     PyObject               *fields[];
 } PyInstanceObject;
 
+/* Shared module class owned by the compiled-module runtime layer. */
+PyClassObject *pcc_runtime_module_class(void);
+
 /* ValueBox objects are runtime object boxes for valueclass payloads at
  * object/object-boundary crossings. The layout matches PyInstanceObject so
  * that slots, GC tracing, and class dispatch can reuse instance behavior.
@@ -447,10 +637,20 @@ typedef PyObject *(*PyNativeFuncEntry)(PyObject *captures, PyObject *args);
 
 typedef struct {
     PyObjectHeader h;
+    /* CPython-compatible PyCFunctionObject prefix. Native Python functions
+     * leave these fields null; C-extension method wrappers populate
+     * capi_method/capi_self so direct fake-header field reads are valid. */
+    void *capi_method;
+    PyObject *capi_self;
+    PyObject *capi_module;
+    PyObject *capi_weakreflist;
+    void *capi_vectorcall;
+    /* pcc-private native-function payload follows the public C-API prefix. */
     PyNativeFuncEntry entry;
     PyObject *captures;
     const char *name;
     PyObject *self_obj;
+    PyObject *attrs;
 } PyFuncObject;
 
 typedef struct PyWeakRefObject {
@@ -496,6 +696,14 @@ typedef struct {
     int64_t state;
     int64_t queued;
     int64_t pinned;
+    /* Non-GC backpointer to the active scheduler timer node.  The node owns
+     * the GC root; this pointer exists only so cancel/complete/unpark can
+     * remove that registration immediately.  It must be NULL when unqueued. */
+    void *timer_entry;
+    /* Non-GC backpointer to the active scheduler IO-wait node. As with the
+     * timer backpointer, the node owns the registered GC root and this field
+     * must be NULL whenever the virtual thread is not IO-queued. */
+    void *io_entry;
 } PyVirtualThreadObject;
 
 /* ---- Class / Instance API (py_class.c) -------------------------------- */
@@ -522,6 +730,10 @@ PyObject *py_class_new_from_objects(PyObject *name,
                                     PyObject *bases,
                                     PyObject *ns);
 void py_class_mark_slots_only(PyClassObject *cls);
+void py_class_mark_dict_subclass(PyClassObject *cls);
+/* dict-subclass inherited-behavior fallback (py_protocol.c). */
+PyObject *py_dict_subclass_getattr(PyObject *o, const char *name);
+PyObject *py_dict_subclass_getitem(PyObject *o, PyObject *key);
 
 /* Install a method on the class. `func` is borrowed (caller retains
  * ownership). Methods added after py_class_new are visible to subsequent
@@ -564,6 +776,7 @@ void      py_valuebox_set_field(PyValueBoxObject *box, int32_t idx, PyObject *va
  * a borrowed reference (caller may py_incref if keeping). */
 PyObject *py_instance_getattr(PyInstanceObject *inst, const char *name);
 PyObject *py_instance_getattr_default(PyInstanceObject *inst, const char *name);
+PyObject *py_instance_vars(PyInstanceObject *inst);
 
 /* Attribute assignment. Returns 0 on success, -1 on failure (e.g. unknown
  * field and no method slot to accept). */
@@ -669,8 +882,11 @@ PyObject *py_obj_sub(PyObject *a, PyObject *b);
 PyObject *py_obj_mul(PyObject *a, PyObject *b);
 PyObject *py_obj_truediv(PyObject *a, PyObject *b);
 PyObject *py_obj_floordiv(PyObject *a, PyObject *b);
+PyObject *py_obj_inplace_op(PyObject *a, PyObject *b, int64_t op_code);
+void pcc_gc_record_explicit_pause(int64_t start_us, int64_t end_us);
 PyObject *py_obj_mod(PyObject *a, PyObject *b);
 PyObject *py_obj_pow(PyObject *a, PyObject *b);
+PyObject *py_obj_abs(PyObject *o);
 PyObject *py_obj_neg(PyObject *a);
 PyObject *py_obj_pos(PyObject *a);
 PyObject *py_obj_invert(PyObject *a);
@@ -756,6 +972,7 @@ void py_dealloc_exc(PyObject *o);
  * overflow out-param instead. */
 int64_t py_int_value_i64(PyObject *o);
 int64_t py_int_bit_length(PyObject *o);
+int64_t py_int_bit_count(PyObject *o);
 
 /* Access typed fields. */
 static inline PyObjectHeader *py_header(PyObject *o) {
@@ -808,6 +1025,9 @@ double py_bigint_to_double(const PyIntObject *b);
 /* Decimal string conversion. Returned buffer is malloc'd; caller owns and
  * must free(). Returns NULL on allocation failure. */
 char *py_bigint_to_cstr(const PyIntObject *b);
+/* Full base-{2,8,16} string for a bignum: "[-]0<prefix_ch><digits>" (lowercase
+ * a-f). malloc'd, NUL-terminated; caller frees. NULL on allocation failure. */
+char *py_bigint_to_base_cstr(const PyIntObject *b, unsigned base, char prefix_ch);
 
 /* Parse a (possibly signed) decimal string. Returns a new bignum or NULL on
  * parse / allocation failure. */
@@ -822,8 +1042,13 @@ int64_t py_user_hash_dispatch(PyObject *o, int64_t *handled);
 PyObject *py_user_iter_dispatch(PyObject *o);
 PyObject *py_user_next_dispatch(PyObject *o);
 PyObject *py_user_matmul_dispatch(PyObject *a, PyObject *b);
+PyObject *py_user_binop_dispatch(PyObject *a, PyObject *b, const char *name, const char *rname, const char *type_err_msg);
+PyObject *py_obj_floordiv(PyObject *a, PyObject *b);
+PyObject *py_obj_inplace_op(PyObject *a, PyObject *b, int64_t op_code);
+void pcc_gc_record_explicit_pause(int64_t start_us, int64_t end_us);
 int64_t py_user_len_dispatch(PyObject *o, int64_t *handled);
 int64_t py_user_bool_dispatch(PyObject *o, int64_t *handled);
+PyObject *py_user_abs_dispatch(PyObject *o);
 int64_t py_obj_index_i64(PyObject *o);
 int64_t py_user_contains_dispatch(PyObject *o, PyObject *item, int64_t *handled);
 PyObject *py_user_getitem_dispatch(PyObject *o, PyObject *key);
@@ -855,6 +1080,11 @@ int py_bigint_divmod(const PyIntObject *a, const PyIntObject *b,
  * real module (pcc_capi_module_exec). numpy's _multiarray_umath needs this. */
 int pcc_capi_is_moduledef(PyObject *o);
 PyObject *pcc_capi_module_exec(PyObject *def_as_obj);
+/* Split phases so the extension loader can register the module in its
+ * load-once cache between creation and exec (PEP 489 sys.modules-before-exec
+ * contract; prevents nested-import re-init of e.g. numpy). */
+PyObject *pcc_capi_module_from_def(PyObject *def_as_obj);
+int pcc_capi_module_run_exec_slots(PyObject *def_as_obj, PyObject *module);
 void pcc_capi_visit_extension_module_state_roots(
     PccGcRootVisitor visit,
     void *ctx

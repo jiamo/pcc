@@ -6,6 +6,8 @@
 
 #include "py_internal.h"
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 static int is_parse_space(unsigned char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
@@ -118,14 +120,120 @@ PyObject *py_int_from_cstr(const char *s, int base) {
     return py_int_from_i64((int64_t)value);
 }
 
+/* Append the CPython-style repr of the source byte ``c`` into ``buf`` at
+ * position ``n``, using ``quote`` as the active quote char (so only the active
+ * quote is backslash-escaped, matching CPython's quote-selection). ``buf`` must
+ * have room for the worst case (4 bytes: ``\xHH``). Returns the new length. */
+static int64_t repr_append_byte(char *buf, int64_t n, unsigned char c, char quote) {
+    static const char hexdigits[] = "0123456789abcdef";
+    if (c == '\\' || (char)c == quote) {
+        buf[n++] = '\\';
+        buf[n++] = (char)c;
+    } else if (c == '\n') {
+        buf[n++] = '\\';
+        buf[n++] = 'n';
+    } else if (c == '\r') {
+        buf[n++] = '\\';
+        buf[n++] = 'r';
+    } else if (c == '\t') {
+        buf[n++] = '\\';
+        buf[n++] = 't';
+    } else if (c < 0x20 || c == 0x7f) {
+        buf[n++] = '\\';
+        buf[n++] = 'x';
+        buf[n++] = hexdigits[(c >> 4) & 0xf];
+        buf[n++] = hexdigits[c & 0xf];
+    } else {
+        /* Printable ASCII and (byte-oriented) high bytes pass through, matching
+         * CPython's default repr which only escapes non-printables. */
+        buf[n++] = (char)c;
+    }
+    return n;
+}
+
+/* Build "invalid literal for int() with base <base>: <repr(s)>" into a freshly
+ * malloc'd NUL-terminated buffer; caller frees. ``base`` is the ORIGINAL base
+ * argument (0 renders as "base 0"), matching CPython's message. Returns NULL on
+ * OOM. */
+static char *build_bad_literal_message(const char *s, int base) {
+    int64_t slen = (int64_t)strlen(s);
+    /* Choose the quote char the way CPython does: single quote unless the
+     * string contains a single quote but no double quote. */
+    char quote = '\'';
+    int has_single = 0;
+    int has_double = 0;
+    for (int64_t i = 0; i < slen; i++) {
+        if (s[i] == '\'') has_single = 1;
+        else if (s[i] == '"') has_double = 1;
+    }
+    if (has_single && !has_double) quote = '"';
+
+    const char *prefix = "invalid literal for int() with base ";
+    /* Worst case: each source byte expands to 4 chars (\\xHH). */
+    int64_t cap = (int64_t)strlen(prefix) + 24 /* base digits + ": " */
+                  + 2 /* quotes */ + slen * 4 + 1;
+    char *buf = (char *)malloc((size_t)cap);
+    if (buf == NULL) return NULL;
+    int64_t n = 0;
+    for (const char *p = prefix; *p != '\0'; p++) buf[n++] = *p;
+
+    /* Render base as a signed decimal (handles 0 and, defensively, any value
+     * that reached here). */
+    char digits[24];
+    int64_t d = 0;
+    int b = base;
+    int neg = 0;
+    if (b < 0) { neg = 1; }
+    unsigned int ub = neg ? (unsigned int)(-(long)b) : (unsigned int)b;
+    if (ub == 0) {
+        digits[d++] = '0';
+    } else {
+        while (ub != 0) { digits[d++] = (char)('0' + (ub % 10)); ub /= 10; }
+    }
+    if (neg) buf[n++] = '-';
+    while (d > 0) buf[n++] = digits[--d];
+
+    buf[n++] = ':';
+    buf[n++] = ' ';
+    buf[n++] = quote;
+    for (int64_t i = 0; i < slen; i++) {
+        n = repr_append_byte(buf, n, (unsigned char)s[i], quote);
+    }
+    buf[n++] = quote;
+    buf[n] = '\0';
+    return buf;
+}
+
 /* int(str) builtin: parse like py_int_from_cstr but raise ValueError on invalid
  * input instead of returning NULL (which the frontend would otherwise unbox to
  * 0 -> int('xyz') silently became 0). py_int_from_cstr stays NULL-returning for
- * other callers. */
+ * other callers.
+ *
+ * CPython raises two distinct ValueError messages here, which this reproduces:
+ *   - a bad base (not 0 and outside 2..36):
+ *       "int() base must be >= 2 and <= 36, or 0"
+ *   - an unparseable literal (valid base):
+ *       "invalid literal for int() with base <base>: <repr(s)>"
+ * ``base`` is the ORIGINAL argument (0 stays "base 0"; the resolved base is not
+ * shown), and the repr is a CPython-accurate repr of the whole original string
+ * (whitespace and all), with CPython quote selection and \\x/\\n/\\r/\\t escapes. */
 PyObject *py_int_from_cstr_or_raise(const char *s, int base) {
+    if (base != 0 && (base < 2 || base > 36)) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+                            "int() base must be >= 2 and <= 36, or 0"));
+        return NULL;
+    }
     PyObject *v = py_int_from_cstr(s, base);
     if (v == NULL) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "invalid literal for int()"));
+        const char *src = (s != NULL) ? s : "";
+        char *msg = build_bad_literal_message(src, base);
+        if (msg != NULL) {
+            py_raise(py_exc_new(PY_EXC_VALUEERROR, msg));
+            free(msg);
+        } else {
+            py_raise(py_exc_new(PY_EXC_VALUEERROR,
+                                "invalid literal for int()"));
+        }
     }
     return v;
 }

@@ -19,22 +19,33 @@ from pcc.unsafe import (
     store_i8,
     store_i32,
     store_i64,
+    untag_int,
 )
 
 
 py_bigint_from_any = extern("py_bigint_from_any", (c_ptr,), c_ptr)
 py_bigint_to_cstr = extern("py_bigint_to_cstr", (c_ptr,), c_ptr)
+py_bigint_to_base_cstr = extern("py_bigint_to_base_cstr", (c_ptr, c_int32, c_int32), c_ptr)
 py_class_lookup = extern("py_class_lookup", (c_ptr, c_ptr), c_ptr)
+pcc_capi_is_cext_type_tag = extern("pcc_capi_is_cext_type_tag", (c_int64,), c_int64)
+py_bool_from_bit = extern("py_bool_from_bit", (c_int32,), c_ptr)
 py_clear_exception = extern("py_clear_exception", (), c_void)
+py_current_exception = extern("py_current_exception", (), c_ptr)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_int_to_i64 = extern("py_int_to_i64", (c_ptr, c_ptr), c_int64)
+py_incref = extern("py_incref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_decref = extern("py_decref", (c_ptr,), c_void)
+py_tuple_new = extern("py_tuple_new", (c_int64,), c_ptr)
+py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
+py_func_call = extern("py_func_call", (c_ptr, c_ptr), c_ptr)
+pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 strlen = extern("strlen", (c_ptr,), c_int64)
 pcc_runtime_log_event_code = extern("pcc_runtime_log_event_code", (c_int32, c_int32, c_int64, c_int64, c_ptr), c_void)
 pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+py_tls_exc_set = extern("py_tls_exc_set", (c_ptr,), c_void)
 
 
 def _type_of(obj) -> int:
@@ -50,10 +61,87 @@ def _load_instance_cls(o):
     return load_ptr(o, 16)
 
 
+def _call_user_unary_method(func, self_obj):
+    if ptr_is_null(func):
+        return null()
+    if is_tagged_int(func):
+        return call_ptr1(func, self_obj)
+    if load_i32(func, 8) == 9:  # PY_TYPE_FUNC
+        args = py_tuple_new(1)
+        if ptr_is_null(args):
+            return null()
+        py_tuple_set_item(args, 0, self_obj)
+        out = py_func_call(func, args)
+        py_decref(args)
+        return out
+    return call_ptr1(func, self_obj)
+
+
+def _call_user_unary_method_void(func, self_obj) -> None:
+    if ptr_is_null(func):
+        return
+    if is_tagged_int(func):
+        call_void_ptr1(func, self_obj)
+        return
+    if load_i32(func, 8) == 9:  # PY_TYPE_FUNC
+        result = _call_user_unary_method(func, self_obj)
+        if ptr_is_null(result) == 0:
+            py_decref(result)
+        return
+    call_void_ptr1(func, self_obj)
+
+
+def _tagged_int_to_str_obj(o):
+    v: int = untag_int(o)
+    mag: int = v
+    neg: int = 0
+    if v < 0:
+        neg = 1
+        mag = 0 - v
+
+    digits: int = 1
+    if mag < 10:
+        digits = 1
+    elif mag < 100:
+        digits = 2
+    elif mag < 1000:
+        digits = 3
+    else:
+        tmp: int = mag
+        while tmp >= 10:
+            tmp = tmp // 10
+            digits = digits + 1
+
+    byte_len: int = digits + neg
+    out = pcc_gc_alloc(40 + byte_len + 1, 4, 0)
+    if ptr_is_null(out):
+        return null()
+    store_i64(out, 0, 1)             # refcount
+    store_i32(out, 8, 4)             # PY_TYPE_STR
+    store_i64(out, 16, byte_len)     # byte_len
+    store_i64(out, 24, -1)           # cp_len
+    store_i64(out, 32, -1)           # hash
+    store_i8(out, 40 + byte_len, 0)  # NUL terminator
+
+    pos: int = byte_len
+    while True:
+        pos = pos - 1
+        store_i8(out, 40 + pos, 48 + (mag % 10))
+        mag = mag // 10
+        if mag == 0:
+            break
+    if neg != 0:
+        pos = pos - 1
+        store_i8(out, 40 + pos, 45)
+    return out
+
+
 @c_abi_export("py_int_to_str_obj")
 def py_int_to_str_obj(o):
     if ptr_is_null(o):
         return null()
+    if is_tagged_int(o):
+        return _tagged_int_to_str_obj(o)
     if _type_of(o) != 2:
         return null()
     b = py_bigint_from_any(o)
@@ -254,7 +342,16 @@ def _int_based_repr(o, base: int, prefix_ch: int):
     overflowed: int = load_i32(overflow, 0)
     free(overflow)
     if overflowed != 0:
-        return py_int_to_str_obj(o)   # bignum: best-effort (rare edge)
+        # Bignum exceeding i64: full base-N conversion (was: wrongly returned
+        # the DECIMAL value -> the C<->port drift; C raised). Mirrors
+        # py_dunder.c py_int_based_repr.
+        cbuf = py_bigint_to_base_cstr(o, base, prefix_ch)
+        if ptr_is_null(cbuf):
+            return null()
+        slen: int = strlen(cbuf)
+        out2 = py_str_new(cbuf, slen)
+        free(cbuf)
+        return out2
     neg: int = 0
     half: int = v
     add_one: int = 0
@@ -332,6 +429,28 @@ def py_builtin_oct(o):
     return _int_based_repr(o, 8, 111)   # 'o'
 
 
+@c_abi_export("py_builtin_callable")
+def py_builtin_callable(o):
+    # callable(x): mirror py_obj_call's dispatch classification. Functions
+    # (tag 9), classes (tag 10) and weakrefs (tag 21) are callable; an
+    # instance is callable iff its class defines __call__. Tagged ints, None
+    # and any other type tag are not callable.
+    if ptr_is_null(o):
+        return py_bool_from_bit(0)
+    if is_tagged_int(o):
+        return py_bool_from_bit(0)
+    tag: int = load_i32(o, 8)
+    if tag == 9 or tag == 10 or tag == 21:
+        return py_bool_from_bit(1)
+    if tag == 11 or tag >= 100:
+        cls = _load_instance_cls(o)
+        method = py_class_lookup(cls, cstr("__call__"))
+        if ptr_is_null(method):
+            return py_bool_from_bit(0)
+        return py_bool_from_bit(1)
+    return py_bool_from_bit(0)
+
+
 @c_abi_export("py_user_str_dispatch")
 def py_user_str_dispatch(o):
     if ptr_is_null(o):
@@ -347,7 +466,7 @@ def py_user_str_dispatch(o):
     func = py_class_lookup(cls, cstr("__str__"))
     if ptr_is_null(func):
         return null()
-    return call_ptr1(func, o)
+    return _call_user_unary_method(func, o)
 
 
 @c_abi_export("py_user_repr_dispatch")
@@ -365,7 +484,7 @@ def py_user_repr_dispatch(o):
     func = py_class_lookup(cls, cstr("__repr__"))
     if ptr_is_null(func):
         return null()
-    return call_ptr1(func, o)
+    return _call_user_unary_method(func, o)
 
 
 @c_abi_export("py_user_hash_dispatch")
@@ -390,7 +509,7 @@ def py_user_hash_dispatch(o, handled) -> int:
             store_i64(handled, 0, 1)
         py_raise(py_exc_new(3, cstr("unhashable type")))
         return 0
-    result = call_ptr1(func, o)
+    result = _call_user_unary_method(func, o)
     if ptr_is_null(handled) == 0:
         store_i64(handled, 0, 1)
     if ptr_is_null(result):
@@ -426,7 +545,7 @@ def py_user_iter_dispatch(o):
     func = py_class_lookup(cls, cstr("__iter__"))
     if ptr_is_null(func):
         return null()
-    return call_ptr1(func, o)
+    return _call_user_unary_method(func, o)
 
 
 @c_abi_export("py_user_next_dispatch")
@@ -444,7 +563,7 @@ def py_user_next_dispatch(o):
     func = py_class_lookup(cls, cstr("__next__"))
     if ptr_is_null(func):
         return null()
-    return call_ptr1(func, o)
+    return _call_user_unary_method(func, o)
 
 
 @c_abi_export("py_user_del_dispatch")
@@ -455,6 +574,8 @@ def py_user_del_dispatch(o) -> None:
         return
     tag: int = load_i32(o, 8)
     if tag != 11 and tag < 100:
+        return
+    if pcc_capi_is_cext_type_tag(tag) != 0:
         return
     flags: int = load_i32(o, 12)
     if (flags & 4) != 0:
@@ -467,7 +588,14 @@ def py_user_del_dispatch(o) -> None:
     if ptr_is_null(func):
         return
     store_i32(o, 12, flags | 4)
+    saved_exc = py_current_exception()
+    if ptr_is_null(saved_exc) == 0:
+        py_incref(saved_exc)
+        py_tls_exc_set(null())
     pcc_runtime_log_event_code(5, 2, tag, 0, o)
-    call_void_ptr1(func, o)
+    _call_user_unary_method_void(func, o)
     pcc_runtime_log_event_code(5, 3, tag, 0, o)
     py_clear_exception()
+    if ptr_is_null(saved_exc) == 0:
+        py_tls_exc_set(saved_exc)
+        py_decref(saved_exc)

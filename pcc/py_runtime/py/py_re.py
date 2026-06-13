@@ -17,7 +17,6 @@ from pcc.unsafe import (
     ptr_is_null,
 )
 
-
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 py_str_byte_slice_i64 = extern(
     "py_str_byte_slice_i64", (c_ptr, c_int64, c_int64), c_ptr
@@ -31,7 +30,22 @@ py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
 py_int_from_i64 = extern("py_int_from_i64", (c_int64,), c_ptr)
 py_int_to_i64 = extern("py_int_to_i64", (c_ptr, c_ptr), c_int64)
 py_func_new_named = extern("py_func_new_named", (c_ptr, c_ptr, c_ptr), c_ptr)
+# E1a/E4 faithful-engine bridge (C-only helper, py_re_engine_obj.c — no port)
+py_re_engine_truth_flags = extern(
+    "py_re_engine_truth_flags", (c_ptr, c_ptr, c_int64, c_int64), c_ptr
+)
+py_re_engine_truth_flags_from = extern(
+    "py_re_engine_truth_flags_from",
+    (c_ptr, c_ptr, c_int64, c_int64, c_int64, c_int64),
+    c_ptr,
+)
+py_re_engine_fullmatch_flags = extern(
+    "py_re_engine_fullmatch_flags", (c_ptr, c_ptr, c_int64), c_ptr
+)
+py_re_engine_findall = extern("py_re_engine_findall", (c_ptr, c_ptr, c_int64), c_ptr)
 py_decref = extern("py_decref", (c_ptr,), c_void)
+py_raise = extern("py_raise", (c_ptr,), c_void)
+py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 
 
 def _type_of(obj) -> int:
@@ -279,6 +293,17 @@ def _re_match_impl(pattern, text, flags: int, search: int):
         return none
     if _type_of(pattern) != 4 or _type_of(text) != 4:
         return none
+    if (flags & ~26) == 0:  # 26 == re.I|re.M|re.S — the engine flag mask
+        # Subset patterns (incl. re.I/M/S since E4) run on the faithful
+        # engine; outside-subset patterns raise NotImplementedError (NULL)
+        # instead of silently mismatching like the legacy matcher would.
+        return py_re_engine_truth_flags(pattern, text, flags, search)
+    py_raise(
+        py_exc_new(
+            11, cstr("pcc re: flags outside the native regex subset (no-libpython)")
+        )
+    )
+    return null()
     p = py_str_utf8(pattern)
     t = py_str_utf8(text)
     if ptr_is_null(p) or ptr_is_null(t):
@@ -317,6 +342,28 @@ def py_re_match(pattern, text):
 @c_abi_export("py_re_match_flags")
 def py_re_match_flags(pattern, text, flags: int):
     return _re_match_impl(pattern, text, flags, 0)
+
+
+@c_abi_export("py_re_fullmatch")
+def py_re_fullmatch(pattern, text):
+    return py_re_fullmatch_flags(pattern, text, 0)
+
+
+@c_abi_export("py_re_fullmatch_flags")
+def py_re_fullmatch_flags(pattern, text, flags: int):
+    none = global_load_ptr("py_None")
+    if ptr_is_null(pattern) or ptr_is_null(text):
+        return none
+    if _type_of(pattern) != 4 or _type_of(text) != 4:
+        return none
+    if (flags & ~26) == 0:  # 26 == re.I|re.M|re.S — the engine flag mask
+        return py_re_engine_fullmatch_flags(pattern, text, flags)
+    py_raise(
+        py_exc_new(
+            11, cstr("pcc re: flags outside the native regex subset (no-libpython)")
+        )
+    )
+    return null()
 
 
 @c_abi_export("py_re_search")
@@ -454,6 +501,15 @@ def py_re_findall_flags(pattern, text, flags: int):
         return py_list_new(0)
     if _type_of(pattern) != 4 or _type_of(text) != 4:
         return py_list_new(0)
+    if (flags & ~26) == 0:
+        # E3/E4 faithful-engine findall (C-only helper, py_re_engine_obj.c)
+        return py_re_engine_findall(pattern, text, flags)
+    py_raise(
+        py_exc_new(
+            11, cstr("pcc re: flags outside the native regex subset (no-libpython)")
+        )
+    )
+    return null()
     p = py_str_utf8(pattern)
     if _pattern_is_ident_words(p) != 0:
         return _findall_ident_words(text)
@@ -489,14 +545,32 @@ def py_re_bound_method_call(captures, args):
         return none
     flags: int = py_int_to_i64(flags_obj, null())
     method_kind: int = py_int_to_i64(method_obj, null())
+    start: int = 0
+    endpos: int = -1
+    start_obj = null()
+    endpos_obj = null()
+    if py_tuple_len(args) >= 2:
+        start_obj = py_tuple_get(args, 1)
+        if ptr_is_null(start_obj) == 0:
+            start = py_int_to_i64(start_obj, null())
+    if py_tuple_len(args) >= 3:
+        endpos_obj = py_tuple_get(args, 2)
+        if ptr_is_null(endpos_obj) == 0:
+            endpos = py_int_to_i64(endpos_obj, null())
     if method_kind == 2:
         result = py_re_findall_flags(pattern, text, flags)
     else:
-        result = _re_match_impl(pattern, text, flags, method_kind)
+        result = py_re_engine_truth_flags_from(
+            pattern, text, flags, method_kind, start, endpos
+        )
     py_decref(pattern)
     py_decref(flags_obj)
     py_decref(method_obj)
     py_decref(text)
+    if ptr_is_null(start_obj) == 0:
+        py_decref(start_obj)
+    if ptr_is_null(endpos_obj) == 0:
+        py_decref(endpos_obj)
     return result
 
 

@@ -302,6 +302,71 @@ int64_t py_str_rfind(PyObject *s, PyObject *sub) {
     return byte_offset_to_cp_offset(ss, bo);
 }
 
+/* CPython ADJUST_INDICES over codepoint units: normalise [start, end) in
+ * place. end is clamped to [0, cp_len]; start is only wrapped for negatives
+ * (a start > cp_len is deliberately left unclamped so the empty-substring
+ * case still returns -1 for start past the end, matching "abc".find("",5)==... */
+static void str_find_adjust_indices(int64_t cp_len, int64_t *start, int64_t *end) {
+    int64_t e = *end;
+    int64_t st = *start;
+    if (e > cp_len) {
+        e = cp_len;
+    } else if (e < 0) {
+        e += cp_len;
+        if (e < 0) e = 0;
+    }
+    if (st < 0) {
+        st += cp_len;
+        if (st < 0) st = 0;
+    }
+    *start = st;
+    *end = e;
+}
+
+/* str.find(sub, start[, end]) with codepoint-based start/end. Returns the
+ * absolute codepoint offset of the first match in the window s[start:end],
+ * or -1. Mirrors CPython stringlib_find_slice semantics. */
+int64_t py_str_find_range(PyObject *s, PyObject *sub,
+                          int64_t start, int64_t end) {
+    if (s == NULL || sub == NULL) return -1;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *sn = (PyStrObject *)sub;
+    int64_t cp_len = str_cp_len(ss);
+    str_find_adjust_indices(cp_len, &start, &end);
+    /* A start past the end of the string never matches (this is also what
+     * makes "abc".find("", cp_len+1) return -1 rather than the start). */
+    if (start > cp_len) return -1;
+    if (end < start) return -1;
+    int64_t start_byte = utf8_byte_offset_for_codepoint(ss, start);
+    int64_t end_byte = utf8_byte_offset_for_codepoint(ss, end);
+    int64_t win_len = end_byte - start_byte;
+    if (win_len < 0) return -1;
+    int64_t bo = byte_find(ss->data + start_byte, win_len,
+                           sn->data, sn->byte_len);
+    if (bo < 0) return -1;
+    return byte_offset_to_cp_offset(ss, start_byte + bo);
+}
+
+/* str.rfind(sub, start[, end]) with codepoint-based start/end. */
+int64_t py_str_rfind_range(PyObject *s, PyObject *sub,
+                           int64_t start, int64_t end) {
+    if (s == NULL || sub == NULL) return -1;
+    PyStrObject *ss = (PyStrObject *)s;
+    PyStrObject *sn = (PyStrObject *)sub;
+    int64_t cp_len = str_cp_len(ss);
+    str_find_adjust_indices(cp_len, &start, &end);
+    if (start > cp_len) return -1;
+    if (end < start) return -1;
+    int64_t start_byte = utf8_byte_offset_for_codepoint(ss, start);
+    int64_t end_byte = utf8_byte_offset_for_codepoint(ss, end);
+    int64_t win_len = end_byte - start_byte;
+    if (win_len < 0) return -1;
+    int64_t bo = byte_rfind(ss->data + start_byte, win_len,
+                            sn->data, sn->byte_len);
+    if (bo < 0) return -1;
+    return byte_offset_to_cp_offset(ss, start_byte + bo);
+}
+
 int64_t py_str_startswith(PyObject *s, PyObject *prefix) {
     if (s == NULL || prefix == NULL) return 0;
     if (py_type_of(prefix) == PY_TYPE_TUPLE) {
@@ -422,6 +487,94 @@ int64_t py_str_islower(PyObject *s) {
     return has_lower;
 }
 
+/* str.isascii(): True iff every byte is < 0x80 (empty string is True).
+ * Exact CPython semantics (isascii is purely codepoint <= 0x7F). */
+int64_t py_str_isascii(PyObject *s) {
+    if (s == NULL) return 0;
+    PyStrObject *ss = (PyStrObject *)s;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        if ((unsigned char)ss->data[i] >= 0x80) return 0;
+    }
+    return 1;
+}
+
+/* str.isidentifier(): ASCII scope (mirrors py_str_isalpha's ASCII-only rule).
+ * Empty -> False; first char [A-Za-z_]; remaining chars [A-Za-z0-9_].
+ * CPython additionally accepts Unicode XID characters; the ASCII scope here
+ * matches CPython for ASCII-only input. */
+int64_t py_str_isidentifier(PyObject *s) {
+    if (s == NULL) return 0;
+    PyStrObject *ss = (PyStrObject *)s;
+    if (ss->byte_len == 0) return 0;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        int alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+        if (i == 0) {
+            if (!alpha) return 0;
+        } else {
+            int ok = alpha || (c >= '0' && c <= '9');
+            if (!ok) return 0;
+        }
+    }
+    return 1;
+}
+
+/* str.isprintable(): ASCII scope. Empty -> True; else every byte must be a
+ * printable ASCII char in [0x20, 0x7E]. Non-ASCII bytes (>= 0x80) count as
+ * non-printable here; CPython treats printable Unicode as printable, so this
+ * matches CPython for ASCII-only input. */
+int64_t py_str_isprintable(PyObject *s) {
+    if (s == NULL) return 0;
+    PyStrObject *ss = (PyStrObject *)s;
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        if (c < 0x20 || c > 0x7E) return 0;
+    }
+    return 1;
+}
+
+/* str.isnumeric(): ASCII scope (mirrors py_str_isdigit). Empty -> False; else
+ * every char must be an ASCII digit '0'..'9'. CPython additionally accepts
+ * Unicode numeric characters; the ASCII scope matches for ASCII-only input. */
+int64_t py_str_isnumeric(PyObject *s) {
+    return py_str_isdigit(s);
+}
+
+/* str.isdecimal(): ASCII scope (mirrors py_str_isdigit). Empty -> False; else
+ * every char must be an ASCII decimal digit '0'..'9'. */
+int64_t py_str_isdecimal(PyObject *s) {
+    return py_str_isdigit(s);
+}
+
+/* str.istitle(): ASCII scope. True iff there is at least one cased (ASCII
+ * letter) char and titlecasing holds: each cased char that begins a run of
+ * letters (i.e. follows a non-cased char or the start) must be uppercase, and
+ * every cased char inside a run must be lowercase. Mirrors CPython's
+ * do_title/istitle scan over ASCII letters. */
+int64_t py_str_istitle(PyObject *s) {
+    if (s == NULL) return 0;
+    PyStrObject *ss = (PyStrObject *)s;
+    int cased = 0;          /* saw at least one cased char */
+    int prev_cased = 0;     /* previous char was a cased (ASCII letter) char */
+    for (int64_t i = 0; i < ss->byte_len; i++) {
+        unsigned char c = (unsigned char)ss->data[i];
+        int is_upper = (c >= 'A' && c <= 'Z');
+        int is_lower = (c >= 'a' && c <= 'z');
+        if (is_upper) {
+            if (prev_cased) return 0;   /* upper must not follow a cased char */
+            prev_cased = 1;
+            cased = 1;
+        } else if (is_lower) {
+            if (!prev_cased) return 0;  /* lower must follow a cased char */
+            prev_cased = 1;
+            cased = 1;
+        } else {
+            prev_cased = 0;
+        }
+    }
+    return cased;
+}
+
 /* str.index(sub): like find() but raises ValueError when sub is absent.
  * Named *_of to avoid the existing py_str_index (s[i] subscript helper). */
 int64_t py_str_index_of(PyObject *s, PyObject *sub) {
@@ -443,7 +596,113 @@ int64_t py_str_rindex_of(PyObject *s, PyObject *sub) {
     return idx;
 }
 
+/* str.index(sub, start[, end]): find_range() but raises ValueError if absent. */
+int64_t py_str_index_of_range(PyObject *s, PyObject *sub,
+                              int64_t start, int64_t end) {
+    int64_t idx = py_str_find_range(s, sub, start, end);
+    if (idx < 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
+        return -1;
+    }
+    return idx;
+}
+
+/* str.rindex(sub, start[, end]): rfind_range() but raises ValueError if absent. */
+int64_t py_str_rindex_of_range(PyObject *s, PyObject *sub,
+                               int64_t start, int64_t end) {
+    int64_t idx = py_str_rfind_range(s, sub, start, end);
+    if (idx < 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
+        return -1;
+    }
+    return idx;
+}
+
 /* ---- ASCII whitespace strip variants (byte-level) ---- */
+
+PyObject *py_textwrap_dedent(PyObject *s) {
+    if (s == NULL) return NULL;
+    PyStrObject *ss = (PyStrObject *)s;
+    const char *data = ss->data;
+    int64_t n = ss->byte_len;
+    int64_t margin_start = -1;
+    int64_t margin_len = 0;
+    int64_t start = 0;
+
+    while (start < n) {
+        int64_t next = start;
+        while (next < n && data[next] != '\n') next++;
+        if (next < n) next++;
+        int64_t body_end = next;
+        if (body_end > start && data[body_end - 1] == '\n') body_end--;
+        if (body_end > start && data[body_end - 1] == '\r') body_end--;
+
+        int blank = 1;
+        for (int64_t i = start; i < body_end; i++) {
+            if (data[i] != ' ' && data[i] != '\t') {
+                blank = 0;
+                break;
+            }
+        }
+        if (!blank) {
+            int64_t indent_len = 0;
+            while (start + indent_len < body_end
+                   && (data[start + indent_len] == ' '
+                       || data[start + indent_len] == '\t')) {
+                indent_len++;
+            }
+            if (margin_start < 0) {
+                margin_start = start;
+                margin_len = indent_len;
+            } else {
+                int64_t common = 0;
+                int64_t limit = margin_len < indent_len ? margin_len : indent_len;
+                while (common < limit
+                       && data[margin_start + common] == data[start + common]) {
+                    common++;
+                }
+                margin_len = common;
+            }
+        }
+        start = next;
+    }
+
+    char *out = (char *)malloc((size_t)(n > 0 ? n : 1));
+    if (out == NULL) return NULL;
+    int64_t out_len = 0;
+    start = 0;
+    while (start < n) {
+        int64_t next = start;
+        while (next < n && data[next] != '\n') next++;
+        if (next < n) next++;
+        int64_t body_end = next;
+        if (body_end > start && data[body_end - 1] == '\n') body_end--;
+        if (body_end > start && data[body_end - 1] == '\r') body_end--;
+
+        int blank = 1;
+        for (int64_t i = start; i < body_end; i++) {
+            if (data[i] != ' ' && data[i] != '\t') {
+                blank = 0;
+                break;
+            }
+        }
+        int64_t content_start = blank ? body_end : start + margin_len;
+        int64_t content_len = body_end - content_start;
+        if (content_len > 0) {
+            memcpy(out + out_len, data + content_start, (size_t)content_len);
+            out_len += content_len;
+        }
+        int64_t ending_len = next - body_end;
+        if (ending_len > 0) {
+            memcpy(out + out_len, data + body_end, (size_t)ending_len);
+            out_len += ending_len;
+        }
+        start = next;
+    }
+    PyObject *result = py_str_new(out, out_len);
+    free(out);
+    return result;
+}
 
 static int strip_is_ascii_ws(unsigned char c) {
     return c == ' ' || c == '\t' || c == '\n'
@@ -636,6 +895,15 @@ PyObject *py_str_casefold(PyObject *s) {
 
 PyObject *py_str_concat(PyObject *a, PyObject *b) {
     if (a == NULL || b == NULL) return NULL;
+    int64_t backend = pcc_gc_backend();
+    int moving_inputs = (
+        backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        || backend == PCC_GC_KIND_COLORED_RELOCATING
+    );
+    if (moving_inputs) {
+        a = pcc_gc_note_relocation_read(a);
+        b = pcc_gc_note_relocation_read(b);
+    }
     int32_t tag_a = py_type_of(a);
     int32_t tag_b = py_type_of(b);
     if (tag_a != PY_TYPE_STR || tag_b != PY_TYPE_STR) {
@@ -653,13 +921,33 @@ PyObject *py_str_concat(PyObject *a, PyObject *b) {
         return NULL;
     }
     int64_t total = sa->byte_len + sb->byte_len;
-    PyStrObject *out = str_alloc_local(total);
-    if (out == NULL) return NULL;
-    if (sa->byte_len > 0) memcpy(out->data, sa->data, (size_t)sa->byte_len);
-    if (sb->byte_len > 0) memcpy(out->data + sa->byte_len, sb->data, (size_t)sb->byte_len);
+    int64_t cp_len = -1;
     if (sa->cp_len >= 0 && sb->cp_len >= 0) {
-        out->cp_len = sa->cp_len + sb->cp_len;
+        cp_len = sa->cp_len + sb->cp_len;
     }
+    char *tmp = NULL;
+    if (moving_inputs && total > 0) {
+        if ((uint64_t)total > (uint64_t)SIZE_MAX) return NULL;
+        tmp = (char *)malloc((size_t)total);
+        if (tmp == NULL) return NULL;
+        if (sa->byte_len > 0) memcpy(tmp, sa->data, (size_t)sa->byte_len);
+        if (sb->byte_len > 0) {
+            memcpy(tmp + sa->byte_len, sb->data, (size_t)sb->byte_len);
+        }
+    }
+    PyStrObject *out = str_alloc_local(total);
+    if (out == NULL) {
+        if (tmp != NULL) free(tmp);
+        return NULL;
+    }
+    if (moving_inputs && total > 0) {
+        memcpy(out->data, tmp, (size_t)total);
+        free(tmp);
+    } else {
+        if (sa->byte_len > 0) memcpy(out->data, sa->data, (size_t)sa->byte_len);
+        if (sb->byte_len > 0) memcpy(out->data + sa->byte_len, sb->data, (size_t)sb->byte_len);
+    }
+    if (cp_len >= 0) out->cp_len = cp_len;
     return (PyObject *)out;
 }
 
@@ -790,7 +1078,10 @@ PyObject *py_str_index(PyObject *s, PyObject *i) {
     int64_t idx = int_or_default(i, 0);
     int64_t cp_len = str_cp_len(ss);
     int64_t real = normalise_index(idx, cp_len);
-    if (real < 0) return NULL;
+    if (real < 0) {
+        py_raise(py_exc_new(PY_EXC_INDEXERROR, "string index out of range"));
+        return NULL;
+    }
     int64_t bo = utf8_byte_offset_for_codepoint(ss, real);
     int64_t w = utf8_codepoint_byte_len(ss, bo);
     PyObject *out = str_from_range(ss->data + bo, w);
@@ -802,14 +1093,37 @@ PyObject *py_str_index(PyObject *s, PyObject *i) {
 
 /* ---- count ---- */
 
-int64_t py_str_count(PyObject *s, PyObject *sub) {
+int64_t py_str_count_range(PyObject *s, PyObject *sub,
+                           PyObject *start, PyObject *end) {
     if (s == NULL || sub == NULL) return 0;
     PyStrObject *ss = (PyStrObject *)s;
     PyStrObject *ps = (PyStrObject *)sub;
-    if (ps->byte_len == 0) return ss->byte_len + 1;
+    int64_t cp_len = str_cp_len(ss);
+    int64_t lo = int_or_default(start, 0);
+    int64_t hi = int_or_default(end, cp_len);
+
+    /* str.count uses slice-style codepoint bounds, except that a start past
+     * len(s) yields zero even for an empty substring.  Preserve that edge
+     * before clamping so ``"abc".count("", 4) == 0``. */
+    if (lo > cp_len) return 0;
+    if (lo < 0) {
+        lo += cp_len;
+        if (lo < 0) lo = 0;
+    }
+    if (hi < 0) {
+        hi += cp_len;
+        if (hi < 0) hi = 0;
+    } else if (hi > cp_len) {
+        hi = cp_len;
+    }
+    if (hi < lo) return 0;
+    if (ps->byte_len == 0) return hi - lo + 1;
+
+    int64_t byte_lo = utf8_byte_offset_for_codepoint(ss, lo);
+    int64_t byte_hi = utf8_byte_offset_for_codepoint(ss, hi);
     int64_t count = 0;
-    int64_t i = 0;
-    while (i + ps->byte_len <= ss->byte_len) {
+    int64_t i = byte_lo;
+    while (i + ps->byte_len <= byte_hi) {
         if (ss->data[i] == ps->data[0]
             && memcmp(ss->data + i, ps->data, (size_t)ps->byte_len) == 0) {
             count++;
@@ -819,6 +1133,10 @@ int64_t py_str_count(PyObject *s, PyObject *sub) {
         }
     }
     return count;
+}
+
+int64_t py_str_count(PyObject *s, PyObject *sub) {
+    return py_str_count_range(s, sub, NULL, NULL);
 }
 
 int64_t py_str_hash(PyObject *s) {
@@ -903,6 +1221,26 @@ static PyObject *py_str_split_whitespace(PyStrObject *ss) {
 
 PyObject *py_str_split(PyObject *s, PyObject *sep) {
     if (s == NULL) return NULL;
+    if (py_type_of(s) != PY_TYPE_STR) {
+        /* The dyn-receiver ``.split`` fast path can reach non-str objects
+         * (e.g. re.Pattern); dispatch generically instead of casting.
+         * getattr + call (not py_obj_call_method1, which prepends the
+         * receiver and breaks instance-dict function attributes). */
+        PyObject *method = py_obj_getattr(s, "split");
+        PyObject *args;
+        PyObject *out;
+        if (method == NULL) return NULL;
+        args = py_tuple_new(1);
+        if (args == NULL) {
+            py_decref(method);
+            return NULL;
+        }
+        py_tuple_set_item(args, 0, sep == NULL ? py_None : sep);
+        out = py_obj_call(method, args, NULL);
+        py_decref(method);
+        py_decref(args);
+        return out;
+    }
     PyStrObject *ss = (PyStrObject *)s;
     if (sep == NULL || sep == py_None) {
         return py_str_split_whitespace(ss);
@@ -1380,6 +1718,32 @@ PyObject *py_str_split_maxsplit(
     PyObject *s, PyObject *sep, int64_t maxsplit
 ) {
     if (s == NULL) return NULL;
+    if (py_type_of(s) != PY_TYPE_STR) {
+        /* generic dispatch for non-str receivers (see py_str_split) */
+        PyObject *method = py_obj_getattr(s, "split");
+        PyObject *args;
+        PyObject *ms;
+        PyObject *out;
+        if (method == NULL) return NULL;
+        args = py_tuple_new(2);
+        if (args == NULL) {
+            py_decref(method);
+            return NULL;
+        }
+        ms = py_int_from_i64(maxsplit);
+        if (ms == NULL) {
+            py_decref(method);
+            py_decref(args);
+            return NULL;
+        }
+        py_tuple_set_item(args, 0, sep == NULL ? py_None : sep);
+        py_tuple_set_item(args, 1, ms);
+        py_decref(ms);
+        out = py_obj_call(method, args, NULL);
+        py_decref(method);
+        py_decref(args);
+        return out;
+    }
     PyStrObject *ss = (PyStrObject *)s;
     if (maxsplit < 0) return py_str_split(s, sep);
     if (sep == NULL || sep == py_None) {
@@ -1420,6 +1784,11 @@ PyObject *py_str_split_maxsplit(
 
 PyObject *py_str_join(PyObject *sep, PyObject *list) {
     if (sep == NULL || list == NULL) return NULL;
+    sep = pcc_gc_note_relocation_read(sep);
+    list = pcc_gc_note_relocation_read(list);
+    if (py_type_of(sep) != PY_TYPE_STR || py_type_of(list) != PY_TYPE_LIST) {
+        return NULL;
+    }
     PyStrObject *sp = (PyStrObject *)sep;
     PyListObject *l = (PyListObject *)list;
 
@@ -1435,6 +1804,13 @@ PyObject *py_str_join(PyObject *sep, PyObject *list) {
 
     PyStrObject *out = str_alloc_local(total);
     if (out == NULL) return NULL;
+
+    /* Result allocation may relocate the rooted inputs.  Refresh both object
+     * pointers before reading the separator or the list's items buffer. */
+    sep = pcc_gc_note_relocation_read(sep);
+    list = pcc_gc_note_relocation_read(list);
+    sp = (PyStrObject *)sep;
+    l = (PyListObject *)list;
 
     int64_t off = 0;
     for (int64_t i = 0; i < l->length; i++) {

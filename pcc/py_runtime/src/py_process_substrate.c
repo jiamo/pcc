@@ -75,10 +75,10 @@ static char *build_shell_command(PyObject *argv) {
 
 PyObject *py_subprocess_check_output(PyObject *argv) {
     char *cmd = build_shell_command(argv);
-    if (cmd == NULL) return py_str_new("", 0);
+    if (cmd == NULL) return py_bytes_new("", 0);
     FILE *fp = popen(cmd, "r");
     free(cmd);
-    if (fp == NULL) return py_str_new("", 0);
+    if (fp == NULL) return py_bytes_new("", 0);
 
     char *out = NULL;
     int64_t len = 0;
@@ -90,7 +90,7 @@ PyObject *py_subprocess_check_output(PyObject *argv) {
             if (append_bytes(&out, &len, &cap, tmp, (int64_t)n) != 0) {
                 pclose(fp);
                 free(out);
-                return py_str_new("", 0);
+                return py_bytes_new("", 0);
             }
         }
         if (n < sizeof(tmp)) {
@@ -103,7 +103,7 @@ PyObject *py_subprocess_check_output(PyObject *argv) {
         free(out);
         return NULL;
     }
-    PyObject *result = py_str_new(out != NULL ? out : "", len);
+    PyObject *result = py_bytes_new(out != NULL ? out : "", len);
     free(out);
     return result;
 }

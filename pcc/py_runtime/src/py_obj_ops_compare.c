@@ -9,6 +9,7 @@
  */
 
 #include "py_internal.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -72,6 +73,9 @@ static const char *bytes_like_data(PyObject *o, int64_t *n) {
 }
 
 static PyObject *cmp_tuple_item(PyObject *owner, PyTupleObject *t, int64_t i) {
+    if (__atomic_load_n(&pcc_gc_read_barrier_enabled, __ATOMIC_ACQUIRE) == 0) {
+        return t->items[i];
+    }
     return pcc_gc_load_ptr(owner, &t->items[i]);
 }
 
@@ -212,6 +216,42 @@ static int64_t valuebox_classes_eq(PyClassObject *ca, PyClassObject *cb) {
     return 1;
 }
 
+PyObject *py_obj_abs(PyObject *o) {
+    if (o == NULL) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR, "bad operand type for abs()"));
+        return NULL;
+    }
+    if (PY_IS_TAGGED_INT(o)) {
+        int64_t value = py_untag_int(o);
+        if (value < 0) return py_int_neg(o);
+        return py_int_from_i64(value);
+    }
+    int32_t tag = py_type_of(o);
+    if (tag == PY_TYPE_BOOL) {
+        return py_int_from_i64(o == py_True ? 1 : 0);
+    }
+    if (tag == PY_TYPE_INT) {
+        PyIntObject *big = (PyIntObject *)o;
+        if (big->sign < 0) return py_int_neg(o);
+        py_incref(o);
+        return o;
+    }
+    if (tag == PY_TYPE_FLOAT) {
+        return py_float_from_f64(fabs(py_float_to_f64(o)));
+    }
+    if (pcc_capi_is_cext_type_tag(tag)) {
+        return pcc_capi_cext_absolute(o);
+    }
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+        /* abs(obj) on a user instance dispatches __abs__. NULL+no-exception
+         * means no __abs__ -> fall through to the TypeError below. */
+        PyObject *r = py_user_abs_dispatch(o);
+        if (r != NULL || py_err_occurred()) return r;
+    }
+    py_raise(py_exc_new(PY_EXC_TYPEERROR, "bad operand type for abs()"));
+    return NULL;
+}
+
 int64_t py_obj_eq(PyObject *a, PyObject *b) {
     if (a == b) return 1;
     if (a == NULL || b == NULL) return 0;
@@ -219,7 +259,18 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
     int32_t ta = py_type_of(a);
     int32_t tb = py_type_of(b);
 
+    /* numpy / C-extension scalar ==: drive its tp_richcompare (Py_EQ=2), same
+     * as py_obj_lt/le/gt/ge. Without this a[i] == 3 fell through to the default
+     * not-equal and returned False even when the values matched. */
+    if (pcc_capi_is_cext_type_tag(ta) || pcc_capi_is_cext_type_tag(tb)) {
+        return pcc_capi_cext_richcompare_bool(a, b, 2) > 0 ? 1 : 0;
+    }
+
     if (ta == PY_TYPE_BOOL && tb == PY_TYPE_BOOL) return 0;
+
+    if (ta == PY_TYPE_STR && tb == PY_TYPE_STR) {
+        return py_str_eq(a, b);
+    }
 
     if (is_int_like(ta) && is_int_like(tb)) {
         if (ta == PY_TYPE_INT && tb == PY_TYPE_INT) {
@@ -238,10 +289,6 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
         return ((PyFloatObject *)b)->value == (double)int_or_bool_as_i64(a);
     }
 
-    if (ta == PY_TYPE_STR && tb == PY_TYPE_STR) {
-        return py_str_eq(a, b);
-    }
-
     if (is_bytes_like(ta) && is_bytes_like(tb)) {
         int64_t na = 0;
         int64_t nb = 0;
@@ -257,10 +304,20 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
         PyTupleObject *tb_o = (PyTupleObject *)b;
         if (ta_o->len != tb_o->len) return 0;
         for (int64_t i = 0; i < ta_o->len; i++) {
-            if (!py_obj_eq(
-                    cmp_tuple_item(a, ta_o, i),
-                    cmp_tuple_item(b, tb_o, i)
-                )) return 0;
+            PyObject *ea = cmp_tuple_item(a, ta_o, i);
+            PyObject *eb = cmp_tuple_item(b, tb_o, i);
+            if (ea == eb) continue;
+            if (PY_IS_TAGGED_INT(ea) && PY_IS_TAGGED_INT(eb)) return 0;
+            if (!PY_IS_TAGGED_INT(ea)
+                && !PY_IS_TAGGED_INT(eb)
+                && ea != NULL
+                && eb != NULL
+                && py_header(ea)->type_tag == PY_TYPE_STR
+                && py_header(eb)->type_tag == PY_TYPE_STR) {
+                if (!py_str_eq(ea, eb)) return 0;
+                continue;
+            }
+            if (!py_obj_eq(ea, eb)) return 0;
         }
         return 1;
     }
@@ -354,6 +411,45 @@ static int64_t py_valuebox_hash(PyValueBoxObject *box) {
     return (h == -1) ? -2 : h;
 }
 
+static int py_obj_hash_leaf_fast(PyObject *o, int64_t *out) {
+    if (o == NULL) {
+        *out = 0;
+        return 1;
+    }
+    if (PY_IS_TAGGED_INT(o)) {
+        int64_t v = py_untag_int(o);
+        *out = (v == -1) ? -2 : v;
+        return 1;
+    }
+    int32_t tag = py_header(o)->type_tag;
+    switch (tag) {
+        case PY_TYPE_NONE:
+            *out = 0;
+            return 1;
+        case PY_TYPE_BOOL:
+            *out = (o == py_True) ? 1 : 0;
+            return 1;
+        case PY_TYPE_INT: {
+            int64_t v = py_int_value_i64(o);
+            *out = (v == -1) ? -2 : v;
+            return 1;
+        }
+        case PY_TYPE_STR: {
+            PyStrObject *s = (PyStrObject *)o;
+            if (s->hash != -1) {
+                *out = s->hash;
+                return 1;
+            }
+            int64_t h = fnv1a((const unsigned char *)s->data, (size_t)s->byte_len);
+            s->hash = h;
+            *out = h;
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+
 int64_t py_obj_hash(PyObject *o) {
     if (o == NULL) return 0;
     if (PY_IS_TAGGED_INT(o)) {
@@ -396,11 +492,21 @@ int64_t py_obj_hash(PyObject *o) {
         }
         case PY_TYPE_TUPLE: {
             PyTupleObject *t = (PyTupleObject *)o;
-            int64_t h = 0;
+            uint64_t h = 3527539u;
+            uint64_t mult = 1000003u;
             for (int64_t i = 0; i < t->len; i++) {
-                h ^= py_obj_hash(cmp_tuple_item(o, t, i));
+                PyObject *item = cmp_tuple_item(o, t, i);
+                int64_t item_hash = 0;
+                if (!py_obj_hash_leaf_fast(item, &item_hash)) {
+                    item_hash = py_obj_hash(item);
+                }
+                h = (h ^ (uint64_t)item_hash) * mult;
+                h += 82520u + (uint64_t)i + (uint64_t)i;
+                h &= 0x7fffffffffffffffull;
+                mult += 82520u + (uint64_t)i + (uint64_t)i;
             }
-            return (h == -1) ? -2 : h;
+            int64_t out = (int64_t)(h + 97531u);
+            return (out == -1) ? -2 : out;
         }
         default:
             if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
@@ -414,10 +520,56 @@ int64_t py_obj_hash(PyObject *o) {
     }
 }
 
-int64_t py_obj_lt(PyObject *a, PyObject *b) { return py_obj_cmp_threeway(a, b) < 0; }
-int64_t py_obj_le(PyObject *a, PyObject *b) { return py_obj_cmp_threeway(a, b) <= 0; }
-int64_t py_obj_gt(PyObject *a, PyObject *b) { return py_obj_cmp_threeway(a, b) > 0; }
-int64_t py_obj_ge(PyObject *a, PyObject *b) { return py_obj_cmp_threeway(a, b) >= 0; }
+/* Sets order by subset/superset (a PARTIAL order), not the total 3-way
+ * compare: ``a <= b`` is a.issubset(b), ``a < b`` is proper subset, etc.
+ * Two disjoint/overlapping sets are incomparable (all four return 0). */
+static int both_sets(PyObject *a, PyObject *b) {
+    return py_type_of(a) == PY_TYPE_SET && py_type_of(b) == PY_TYPE_SET;
+}
+int64_t py_obj_lt(PyObject *a, PyObject *b) {
+    if (
+        pcc_capi_is_cext_type_tag(py_type_of(a))
+        || pcc_capi_is_cext_type_tag(py_type_of(b))
+    ) {
+        return pcc_capi_cext_richcompare_bool(a, b, 0) > 0 ? 1 : 0;
+    }
+    if (both_sets(a, b)) {
+        return py_set_issubset(a, b) && py_set_len(a) < py_set_len(b);
+    }
+    return py_obj_cmp_threeway(a, b) < 0;
+}
+int64_t py_obj_le(PyObject *a, PyObject *b) {
+    if (
+        pcc_capi_is_cext_type_tag(py_type_of(a))
+        || pcc_capi_is_cext_type_tag(py_type_of(b))
+    ) {
+        return pcc_capi_cext_richcompare_bool(a, b, 1) > 0 ? 1 : 0;
+    }
+    if (both_sets(a, b)) return py_set_issubset(a, b);
+    return py_obj_cmp_threeway(a, b) <= 0;
+}
+int64_t py_obj_gt(PyObject *a, PyObject *b) {
+    if (
+        pcc_capi_is_cext_type_tag(py_type_of(a))
+        || pcc_capi_is_cext_type_tag(py_type_of(b))
+    ) {
+        return pcc_capi_cext_richcompare_bool(a, b, 4) > 0 ? 1 : 0;
+    }
+    if (both_sets(a, b)) {
+        return py_set_issuperset(a, b) && py_set_len(a) > py_set_len(b);
+    }
+    return py_obj_cmp_threeway(a, b) > 0;
+}
+int64_t py_obj_ge(PyObject *a, PyObject *b) {
+    if (
+        pcc_capi_is_cext_type_tag(py_type_of(a))
+        || pcc_capi_is_cext_type_tag(py_type_of(b))
+    ) {
+        return pcc_capi_cext_richcompare_bool(a, b, 5) > 0 ? 1 : 0;
+    }
+    if (both_sets(a, b)) return py_set_issuperset(a, b);
+    return py_obj_cmp_threeway(a, b) >= 0;
+}
 
 PyObject *py_obj_sorted(PyObject *x) {
     if (x == NULL) return NULL;
@@ -439,18 +591,13 @@ PyObject *py_obj_sorted(PyObject *x) {
             if (key == NULL || key == py_set_dummy) continue;
             py_list_append(out, key);
         }
-    } else if (py_type_of(x) == PY_TYPE_LIST || py_type_of(x) == PY_TYPE_TUPLE) {
-        for (int64_t i = 0; i < n; i++) {
-            PyObject *idx_box = py_int_from_i64(i);
-            PyObject *el = py_obj_getitem(x, idx_box);
-            py_list_append(out, el);
-            py_decref(idx_box);
-        }
     } else {
-        /* General iterable that is not integer-indexable: dict (-> keys),
-         * generator, range, etc. Use the iterator protocol. (Previously this
-         * branch used py_obj_getitem(x, i), which returns NULL for a dict
-         * since 0/1/... are not keys -> sorted(dict) gave [<null>, ...].) */
+        /* All other iterables — list, tuple, dict (-> keys), generator, range,
+         * etc. — use the iterator protocol. py_obj_next returns an OWNED ref so
+         * the py_decref(el) below is balanced. (The previous LIST/TUPLE
+         * getitem fill branch treated the BORROWED element ref as owned and
+         * decref'd it, under-counting heap elements -> double-free on clear;
+         * the pcc-Python port has no such branch and routes list/tuple here.) */
         PyObject *it = py_obj_iter(x);
         if (it != NULL) {
             for (;;) {
@@ -471,16 +618,109 @@ PyObject *py_obj_sorted(PyObject *x) {
         }
     }
     int64_t m = py_list_len(out);
-    for (int64_t i = 1; i < m; i++) {
-        PyObject *cur = py_list_get(out, i);
-        int64_t j = i;
-        while (j > 0) {
-            PyObject *prev = py_list_get(out, j - 1);
-            if (py_obj_cmp_threeway(prev, cur) <= 0) break;
-            py_list_set(out, j, prev);
-            j--;
+    if (m > 1) {
+        /* Bottom-up stable merge sort (was insertion sort — O(n^2)
+         * comparisons dominated codegen-worker profiles via sorted
+         * symbol lists). Ping-pong between `out` and a scratch py_list:
+         * every element stays visible to the GC in at least one list
+         * slot (all slot writes go through py_list_append's store
+         * barrier), elements are MOVED borrowed (C list contract:
+         * append does not incref, raw loads do not incref), and the
+         * scratch is emptied by resetting `length` before release so
+         * its aliasing slots never trigger element decrefs. Stability:
+         * the right run only wins when strictly smaller. */
+        PyObject *scratch = py_list_new(m);
+        if (scratch != NULL) {
+            PyObject *src_list = out;
+            PyObject *dst_list = scratch;
+            for (int64_t width = 1; width < m; width *= 2) {
+                PyListObject *src = (PyListObject *)src_list;
+                PyListObject *dst = (PyListObject *)dst_list;
+                /* Reset dst through the BALANCED slot store: py_list
+                 * stores go through pcc_gc_store_ptr (incref new /
+                 * decref old), so a bare `length = 0` would leak one
+                 * reference per element per pass. Clearing keeps every
+                 * element alive via its other list's slot. */
+                for (int64_t ci = 0; ci < dst->length; ci++) {
+                    pcc_gc_store_ptr(dst_list, &dst->items[ci], NULL);
+                }
+                dst->length = 0;
+                for (int64_t lo = 0; lo < m; lo += 2 * width) {
+                    int64_t mid = lo + width;
+                    if (mid > m) mid = m;
+                    int64_t hi = mid + width;
+                    if (hi > m) hi = m;
+                    int64_t i = lo;
+                    int64_t j = mid;
+                    while (i < mid && j < hi) {
+                        PyObject *ea =
+                            pcc_gc_load_ptr(src_list, &src->items[i]);
+                        PyObject *eb =
+                            pcc_gc_load_ptr(src_list, &src->items[j]);
+                        if (py_obj_cmp_threeway(eb, ea) < 0) {
+                            py_list_append(dst_list, eb);
+                            j++;
+                        } else {
+                            py_list_append(dst_list, ea);
+                            i++;
+                        }
+                    }
+                    while (i < mid) {
+                        py_list_append(
+                            dst_list,
+                            pcc_gc_load_ptr(src_list, &src->items[i]));
+                        i++;
+                    }
+                    while (j < hi) {
+                        py_list_append(
+                            dst_list,
+                            pcc_gc_load_ptr(src_list, &src->items[j]));
+                        j++;
+                    }
+                }
+                PyObject *tmp = src_list;
+                src_list = dst_list;
+                dst_list = tmp;
+            }
+            if (src_list != out) {
+                /* Final ordering ended in the scratch: move it back
+                 * (balanced: clear out's stale aliases, then append —
+                 * each element stays held by the scratch slot). */
+                PyListObject *src = (PyListObject *)src_list;
+                PyListObject *ao = (PyListObject *)out;
+                for (int64_t ci = 0; ci < ao->length; ci++) {
+                    pcc_gc_store_ptr(out, &ao->items[ci], NULL);
+                }
+                ao->length = 0;
+                for (int64_t i = 0; i < m; i++) {
+                    py_list_append(
+                        out, pcc_gc_load_ptr(src_list, &src->items[i]));
+                }
+            }
+            /* Release the scratch's element references (balanced) and
+             * the scratch itself; out's slots keep the elements. */
+            {
+                PyListObject *so = (PyListObject *)scratch;
+                for (int64_t ci = 0; ci < so->length; ci++) {
+                    pcc_gc_store_ptr(scratch, &so->items[ci], NULL);
+                }
+                so->length = 0;
+            }
+            py_decref(scratch);
+            return out;
         }
-        py_list_set(out, j, cur);
+        /* malloc-failure fallback: original insertion sort. */
+        for (int64_t i = 1; i < m; i++) {
+            PyObject *cur = py_list_get(out, i);
+            int64_t j = i;
+            while (j > 0) {
+                PyObject *prev = py_list_get(out, j - 1);
+                if (py_obj_cmp_threeway(prev, cur) <= 0) break;
+                py_list_set(out, j, prev);
+                j--;
+            }
+            py_list_set(out, j, cur);
+        }
     }
     return out;
 }

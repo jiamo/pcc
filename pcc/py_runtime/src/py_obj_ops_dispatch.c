@@ -32,7 +32,8 @@ static int dispatch_is_heap_obj(PyObject *o) {
 static PyObject *dispatch_call_method_with_args(
     PyObject *method,
     PyObject *self,
-    PyObject *args
+    PyObject *args,
+    PyObject *kwargs
 ) {
     if (method == NULL) return NULL;
     int64_t n = args == NULL ? 0 : py_tuple_len(args);
@@ -48,7 +49,7 @@ static PyObject *dispatch_call_method_with_args(
             py_tuple_set_item(full_args, i + 1, item);
             py_decref(item);
         }
-        PyObject *out = py_func_call(method, full_args);
+        PyObject *out = py_func_call_kwargs(method, full_args, kwargs);
         py_decref(full_args);
         return out;
     }
@@ -93,6 +94,10 @@ int64_t py_obj_truthy(PyObject *o) {
     if (o == py_True) return 1;
     if (PY_IS_TAGGED_INT(o)) return py_untag_int(o) != 0;
     int32_t tag = py_header(o)->type_tag;
+    if (pcc_capi_is_cext_type_tag(tag)) {
+        int64_t truth = pcc_capi_cext_truthy(o);
+        return truth > 0 ? 1 : 0;
+    }
     switch (tag) {
         case PY_TYPE_INT:
             return py_int_value_i64(o) != 0;
@@ -130,6 +135,13 @@ PyObject *py_obj_add(PyObject *a, PyObject *b) {
     }
     int32_t at = py_type_of(a);
     int32_t bt = py_type_of(b);
+    /* A C-extension operand owns numeric dispatch even when the other side is
+     * a native float/complex/int.  Checking the builtin fast paths first made
+     * ``ndarray + 0.0`` call py_float_add instead of ndarray.nb_add, returning
+     * NULL without ever invoking the extension slot. */
+    if (pcc_capi_is_cext_type_tag(at) || pcc_capi_is_cext_type_tag(bt)) {
+        return pcc_capi_cext_binary_number(a, b, 0);
+    }
     if (
         (at == PY_TYPE_INT || at == PY_TYPE_BOOL)
         && (bt == PY_TYPE_INT || bt == PY_TYPE_BOOL)
@@ -157,6 +169,12 @@ PyObject *py_obj_add(PyObject *a, PyObject *b) {
     if (at == PY_TYPE_TUPLE && bt == PY_TYPE_TUPLE) {
         return py_tuple_concat(a, b);
     }
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+        return py_user_binop_dispatch(
+            a, b, "__add__", "__radd__",
+            "unsupported operand type(s) for +");
+    }
     py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for +"));
     return NULL;
 }
@@ -177,6 +195,15 @@ PyObject *py_obj_sub(PyObject *a, PyObject *b) {
     if ((at == PY_TYPE_FLOAT || at == PY_TYPE_INT || at == PY_TYPE_BOOL)
         && (bt == PY_TYPE_FLOAT || bt == PY_TYPE_INT || bt == PY_TYPE_BOOL)) {
         return py_float_sub(a, b);
+    }
+    if (pcc_capi_is_cext_type_tag(at) || pcc_capi_is_cext_type_tag(bt)) {
+        return pcc_capi_cext_subtract(a, b);
+    }
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+        return py_user_binop_dispatch(
+            a, b, "__sub__", "__rsub__",
+            "unsupported operand type(s) for -");
     }
     py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for -"));
     return NULL;
@@ -217,6 +244,15 @@ PyObject *py_obj_mul(PyObject *a, PyObject *b) {
     if (bt == PY_TYPE_TUPLE && (at == PY_TYPE_INT || at == PY_TYPE_BOOL)) {
         return py_tuple_repeat(b, py_int_value_i64(a));
     }
+    if (pcc_capi_is_cext_type_tag(at) || pcc_capi_is_cext_type_tag(bt)) {
+        return pcc_capi_cext_binary_number(a, b, 2);
+    }
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+        return py_user_binop_dispatch(
+            a, b, "__mul__", "__rmul__",
+            "unsupported operand type(s) for *");
+    }
     py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for *"));
     return NULL;
 }
@@ -231,11 +267,20 @@ PyObject *py_obj_mod(PyObject *a, PyObject *b) {
     if (at == PY_TYPE_STR) {
         return py_str_mod(a, b);
     }
+    if (at == PY_TYPE_BYTES || at == PY_TYPE_BYTEARRAY) {
+        return py_bytes_mod(a, b);
+    }
     if (
         (at == PY_TYPE_INT || at == PY_TYPE_BOOL)
         && (bt == PY_TYPE_INT || bt == PY_TYPE_BOOL)
     ) {
         return py_int_mod(a, b);
+    }
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+        return py_user_binop_dispatch(
+            a, b, "__mod__", "__rmod__",
+            "unsupported operand type(s) for %");
     }
     py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for %"));
     return NULL;
@@ -269,12 +314,16 @@ PyObject *py_obj_truediv(PyObject *a, PyObject *b) {
         }
         return py_float_from_f64(py_float_to_f64(a) / bd);
     }
-    /* Non-numeric: defer to __truediv__ (e.g. a user class instance). */
-    PyObject *r = py_obj_call_method1(a, "__truediv__", b);
-    if (r == NULL && !py_err_occurred()) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for /"));
+    if (pcc_capi_is_cext_type_tag(at) || pcc_capi_is_cext_type_tag(bt)) {
+        return pcc_capi_cext_binary_number(a, b, 3);
     }
-    return r;
+    /* Non-numeric: full dunder protocol (__truediv__, NotImplemented,
+     * reflected __rtruediv__) — the old call_method1 defer only tried
+     * the LHS, so ``1 / R()`` raised AttributeError instead of using
+     * R.__rtruediv__. */
+    return py_user_binop_dispatch(
+        a, b, "__truediv__", "__rtruediv__",
+        "unsupported operand type(s) for /");
 }
 
 PyObject *py_obj_type_name(PyObject *o) {
@@ -341,6 +390,8 @@ static PyClassObject *pcc_type_cls_bytearray = NULL;
 static PyClassObject *pcc_type_cls_memoryview = NULL;
 static PyClassObject *pcc_type_cls_coroutine = NULL;
 static PyClassObject *pcc_type_cls_object = NULL;
+static PyClassObject *pcc_type_cls_super = NULL;
+static PyClassObject *pcc_slice_cls = NULL;
 
 static PyObject *pcc_builtin_type_class(
     const char *name,
@@ -355,8 +406,39 @@ static PyObject *pcc_builtin_type_class(
     return (PyObject *)*slot;
 }
 
+PyObject *py_slice_new(PyObject *start, PyObject *stop, PyObject *step) {
+    if (start == NULL) start = py_None;
+    if (stop == NULL) stop = py_None;
+    if (step == NULL) step = py_None;
+    if (pcc_slice_cls == NULL) {
+        pcc_slice_cls = py_class_new("slice", NULL, 0, NULL, 0);
+        if (pcc_slice_cls == NULL) return NULL;
+    }
+    PyObject *inst = py_instance_new(pcc_slice_cls);
+    if (inst == NULL) return NULL;
+    py_instance_setattr((PyInstanceObject *)inst, "start", start);
+    py_instance_setattr((PyInstanceObject *)inst, "stop", stop);
+    py_instance_setattr((PyInstanceObject *)inst, "step", step);
+    return inst;
+}
+
+/* isinstance(x, slice): a slice is an instance of the lazily-created
+ * pcc_slice_cls. Returns 0 when no slice has been created yet. */
+int64_t py_obj_is_slice(PyObject *o) {
+    if (o == NULL || pcc_slice_cls == NULL) return 0;
+    /* py_isinstance handles the tagged-int/header/instance-tag checks and the
+     * MRO walk; an instance may carry a per-class tag >= PY_TYPE_USER, so do
+     * NOT pre-filter on PY_TYPE_INSTANCE here. */
+    return py_isinstance(o, pcc_slice_cls) ? 1 : 0;
+}
+
 static PyObject *pcc_builtin_type_class_for_tag(int32_t tag) {
     switch (tag) {
+        /* Synthetic tag for the first-class ``super`` type object.  It is
+         * deliberately outside PyTypeTag: this token describes a built-in
+         * class value, not an object-header representation. */
+        case -3:
+            return pcc_builtin_type_class("super", &pcc_type_cls_super);
         case PY_TYPE_NONE:
             return pcc_builtin_type_class("NoneType", &pcc_type_cls_none);
         case PY_TYPE_BOOL:
@@ -390,6 +472,31 @@ static PyObject *pcc_builtin_type_class_for_tag(int32_t tag) {
         default:
             return pcc_builtin_type_class("object", &pcc_type_cls_object);
     }
+}
+
+PyObject *py_builtin_type_for_tag(int64_t tag) {
+    return pcc_builtin_type_class_for_tag((int32_t)tag);
+}
+
+int64_t py_builtin_type_class_tag(PyObject *value) {
+    if (value == NULL || PY_IS_TAGGED_INT(value)) return -2;
+    if (value == (PyObject *)pcc_type_cls_super) return -3;
+    if (value == (PyObject *)pcc_type_cls_none) return PY_TYPE_NONE;
+    if (value == (PyObject *)pcc_type_cls_bool) return PY_TYPE_BOOL;
+    if (value == (PyObject *)pcc_type_cls_int) return PY_TYPE_INT;
+    if (value == (PyObject *)pcc_type_cls_float) return PY_TYPE_FLOAT;
+    if (value == (PyObject *)pcc_type_cls_str) return PY_TYPE_STR;
+    if (value == (PyObject *)pcc_type_cls_list) return PY_TYPE_LIST;
+    if (value == (PyObject *)pcc_type_cls_dict) return PY_TYPE_DICT;
+    if (value == (PyObject *)pcc_type_cls_tuple) return PY_TYPE_TUPLE;
+    if (value == (PyObject *)pcc_type_cls_set) return PY_TYPE_SET;
+    if (value == (PyObject *)pcc_type_cls_type) return PY_TYPE_CLASS;
+    if (value == (PyObject *)pcc_type_cls_complex) return PY_TYPE_COMPLEX;
+    if (value == (PyObject *)pcc_type_cls_bytes) return PY_TYPE_BYTES;
+    if (value == (PyObject *)pcc_type_cls_bytearray) return PY_TYPE_BYTEARRAY;
+    if (value == (PyObject *)pcc_type_cls_memoryview) return PY_TYPE_MEMORYVIEW;
+    if (value == (PyObject *)pcc_type_cls_object) return -1;
+    return -2;
 }
 
 PyObject *py_type_builtin(PyObject *o) {
@@ -453,6 +560,9 @@ PyObject *py_obj_getitem(PyObject *o, PyObject *k) {
     if (o == NULL || k == NULL) return NULL;
     int32_t tag = py_type_of(o);
     pcc_runtime_log_event_code(7, 1, tag, py_type_of(k), o);
+    if (pcc_capi_is_cext_type_tag(tag)) {
+        return pcc_capi_cext_object_getitem(o, k);
+    }
     switch (tag) {
         case PY_TYPE_LIST: {
             int64_t idx = py_obj_index_i64(k);
@@ -480,6 +590,52 @@ PyObject *py_obj_getitem(PyObject *o, PyObject *k) {
     }
 }
 
+PyObject *py_obj_getitem_i64(PyObject *o, int64_t idx) {
+    if (o == NULL) return NULL;
+    int32_t tag = py_type_of(o);
+    pcc_runtime_log_event_code(7, 1, tag, PY_TYPE_INT, o);
+    if (pcc_capi_is_cext_type_tag(tag)) {
+        PyObject *key = py_int_from_i64(idx);
+        PyObject *out = pcc_capi_cext_object_getitem(o, key);
+        py_decref(key);
+        return out;
+    }
+    switch (tag) {
+        case PY_TYPE_LIST:
+            return py_list_get(o, idx);
+        case PY_TYPE_TUPLE:
+            return py_tuple_get(o, idx);
+        case PY_TYPE_DICT: {
+            PyObject *key = py_int_from_i64(idx);
+            PyObject *out = py_dict_get(o, key);
+            py_decref(key);
+            return out;
+        }
+        case PY_TYPE_STR: {
+            PyObject *key = py_int_from_i64(idx);
+            PyObject *out = py_str_index(o, key);
+            py_decref(key);
+            return out;
+        }
+        case PY_TYPE_BYTES:
+        case PY_TYPE_BYTEARRAY:
+        case PY_TYPE_MEMORYVIEW: {
+            PyObject *key = py_int_from_i64(idx);
+            PyObject *out = py_bytes_getitem(o, key);
+            py_decref(key);
+            return out;
+        }
+        default:
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+                PyObject *key = py_int_from_i64(idx);
+                PyObject *out = py_user_getitem_dispatch(o, key);
+                py_decref(key);
+                return out;
+            }
+            return NULL;
+    }
+}
+
 PyObject *py_obj_slice(PyObject *o, PyObject *lo, PyObject *hi, PyObject *step) {
     if (o == NULL) return NULL;
     int32_t tag = py_type_of(o);
@@ -496,6 +652,15 @@ PyObject *py_obj_slice(PyObject *o, PyObject *lo, PyObject *hi, PyObject *step) 
         case PY_TYPE_MEMORYVIEW:
             return py_bytes_slice(o, lo, hi, step);
         default:
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+                /* obj[lo:hi:step] on a user class dispatches
+                 * __getitem__(slice(lo, hi, step)), like CPython. */
+                PyObject *sl = py_slice_new(lo, hi, step);
+                if (sl == NULL) return NULL;
+                PyObject *r = py_obj_getitem(o, sl);
+                py_decref(sl);
+                return r;
+            }
             return NULL;
     }
 }
@@ -519,6 +684,8 @@ int64_t py_obj_del_slice(PyObject *o, PyObject *lo, PyObject *hi,
     switch (tag) {
         case PY_TYPE_LIST:
             return py_list_del_slice(o, lo, hi, step);
+        case PY_TYPE_BYTEARRAY:
+            return py_bytearray_del_slice(o, lo, hi, step);
         default:
             return -1;
     }
@@ -532,8 +699,9 @@ int64_t py_obj_setitem(PyObject *o, PyObject *k, PyObject *v) {
         case PY_TYPE_LIST: {
             int64_t idx = py_obj_index_i64(k);
             if (py_err_occurred()) return -1;
-            py_list_set(o, idx, v);
-            return 0;
+            /* User-visible store: out-of-range raises catchable IndexError
+             * (py_list_set stays the internal non-raising setter). */
+            return py_list_setitem(o, idx, v);
         }
         case PY_TYPE_DICT:
             py_dict_set(o, k, v);
@@ -545,6 +713,38 @@ int64_t py_obj_setitem(PyObject *o, PyObject *k, PyObject *v) {
                 int64_t handled = 0;
                 int64_t rc = py_user_setitem_dispatch(o, k, v, &handled);
                 if (handled) return rc;
+            }
+            return -1;
+    }
+}
+
+int64_t py_obj_setitem_i64(PyObject *o, int64_t idx, PyObject *v) {
+    if (o == NULL) return -1;
+    int32_t tag = py_type_of(o);
+    pcc_runtime_log_event_code(7, 3, tag, PY_TYPE_INT, o);
+    switch (tag) {
+        case PY_TYPE_LIST:
+            /* User-visible store: out-of-range raises catchable IndexError. */
+            return py_list_setitem(o, idx, v);
+        case PY_TYPE_DICT: {
+            PyObject *key = py_int_from_i64(idx);
+            py_dict_set(o, key, v);
+            py_decref(key);
+            return 0;
+        }
+        case PY_TYPE_BYTEARRAY: {
+            PyObject *key = py_int_from_i64(idx);
+            int64_t rc = py_bytearray_setitem(o, key, v);
+            py_decref(key);
+            return rc;
+        }
+        default:
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+                int64_t handled = 0;
+                PyObject *key = py_int_from_i64(idx);
+                int64_t rc = py_user_setitem_dispatch(o, key, v, &handled);
+                py_decref(key);
+                return handled ? rc : -1;
             }
             return -1;
     }
@@ -579,7 +779,7 @@ static int is_instance_tag_d(int32_t tag) {
 
 static PyObject *py_obj_missing_attr(const char *name) {
     if (!py_err_occurred()) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_ATTRIBUTEERROR,
             name != NULL ? name : ""
         ));
@@ -589,12 +789,203 @@ static PyObject *py_obj_missing_attr(const char *name) {
 
 static int64_t py_obj_attr_status_failed(const char *name) {
     if (!py_err_occurred()) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_ATTRIBUTEERROR,
             name != NULL ? name : ""
         ));
     }
     return -1;
+}
+
+static PyObject *py_coroutine_send_bound_entry(PyObject *captures, PyObject *args) {
+    PyObject *coro = py_tuple_get(captures, 0);
+    if (coro == NULL) return NULL;
+    PyObject *value = NULL;
+    if (args != NULL && py_tuple_len(args) > 0) {
+        value = py_tuple_get(args, 0);
+        if (value == NULL) {
+            py_decref(coro);
+            return NULL;
+        }
+    } else {
+        value = py_None;
+        py_incref(value);
+    }
+    PyObject *out = py_gen_send(coro, value);
+    py_decref(value);
+    py_decref(coro);
+    return out;
+}
+
+static PyObject *py_coroutine_bound_send(PyObject *coro) {
+    PyObject *captures = py_tuple_new(1);
+    if (captures == NULL) return NULL;
+    py_tuple_set_item(captures, 0, coro);
+    PyObject *fn = py_func_new_bound(
+        (void *)py_coroutine_send_bound_entry,
+        captures,
+        "send",
+        coro
+    );
+    py_decref(captures);
+    return fn;
+}
+
+static PyObject *py_list_pop_bound_entry(PyObject *captures, PyObject *args) {
+    PyObject *lst = py_tuple_get(captures, 0);
+    if (lst == NULL) return NULL;
+    int64_t nargs = (args != NULL && !PY_IS_TAGGED_INT(args)
+                     && py_type_of(args) == PY_TYPE_TUPLE)
+                        ? py_tuple_len(args) : 0;
+    if (nargs > 1) {
+        py_decref(lst);
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "list.pop expected at most 1 argument"));
+        return NULL;
+    }
+    int64_t idx = -1;
+    if (nargs == 1) {
+        PyObject *idx_obj = py_tuple_get(args, 0);
+        if (idx_obj == NULL) {
+            py_decref(lst);
+            return NULL;
+        }
+        idx = py_int_value_i64(idx_obj);
+        py_decref(idx_obj);
+        if (py_err_occurred()) {
+            py_decref(lst);
+            return NULL;
+        }
+    }
+    PyObject *out = py_list_pop(lst, idx);
+    py_decref(lst);
+    return out;
+}
+
+static PyObject *py_dict_pop_bound_entry(PyObject *captures, PyObject *args) {
+    PyObject *dict = py_tuple_get(captures, 0);
+    if (dict == NULL) return NULL;
+    int64_t nargs = (args != NULL && !PY_IS_TAGGED_INT(args)
+                     && py_type_of(args) == PY_TYPE_TUPLE)
+                        ? py_tuple_len(args) : 0;
+    if (nargs < 1) {
+        py_decref(dict);
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "dict.pop expected at least 1 argument"));
+        return NULL;
+    }
+    if (nargs > 2) {
+        py_decref(dict);
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "dict.pop expected at most 2 arguments"));
+        return NULL;
+    }
+    PyObject *key = py_tuple_get(args, 0);
+    if (key == NULL) {
+        py_decref(dict);
+        return NULL;
+    }
+    PyObject *out = py_dict_get(dict, key);
+    if (out != NULL) {
+        (void)py_dict_del(dict, key);
+    } else if (nargs == 2) {
+        out = py_tuple_get(args, 1);
+    } else {
+        py_raise_owned(py_exc_new_with_value(PY_EXC_KEYERROR, key));
+    }
+    py_decref(key);
+    py_decref(dict);
+    return out;
+}
+
+static PyObject *py_set_pop_bound_entry(PyObject *captures, PyObject *args) {
+    PyObject *set = py_tuple_get(captures, 0);
+    if (set == NULL) return NULL;
+    int64_t nargs = (args != NULL && !PY_IS_TAGGED_INT(args)
+                     && py_type_of(args) == PY_TYPE_TUPLE)
+                        ? py_tuple_len(args) : 0;
+    if (nargs > 0) {
+        py_decref(set);
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "set.pop expected no arguments"));
+        return NULL;
+    }
+    PyObject *out = py_set_pop(set);
+    py_decref(set);
+    return out;
+}
+
+static PyObject *py_builtin_pop_bound(PyObject *o, void *entry) {
+    PyObject *captures = py_tuple_new(1);
+    if (captures == NULL) return NULL;
+    py_tuple_set_item(captures, 0, o);
+    PyObject *fn = py_func_new_bound(entry, captures, "pop", o);
+    py_decref(captures);
+    return fn;
+}
+
+static PyObject *py_str_count_bound_entry(PyObject *captures, PyObject *args) {
+    PyObject *s = py_tuple_get(captures, 0);
+    if (s == NULL) return NULL;
+    int64_t nargs = (args != NULL && !PY_IS_TAGGED_INT(args)
+                     && py_type_of(args) == PY_TYPE_TUPLE)
+                        ? py_tuple_len(args) : 0;
+    if (nargs < 1 || nargs > 3) {
+        py_decref(s);
+        py_raise_owned(py_exc_new(
+            PY_EXC_TYPEERROR,
+            "str.count expected 1 to 3 arguments"
+        ));
+        return NULL;
+    }
+
+    PyObject *sub = py_tuple_get(args, 0);
+    if (sub == NULL) {
+        py_decref(s);
+        return NULL;
+    }
+    if (PY_IS_TAGGED_INT(sub) || py_type_of(sub) != PY_TYPE_STR) {
+        py_decref(sub);
+        py_decref(s);
+        py_raise_owned(py_exc_new(
+            PY_EXC_TYPEERROR,
+            "str.count argument must be str"
+        ));
+        return NULL;
+    }
+
+    int64_t count = 0;
+    if (nargs >= 2) {
+        PyObject *start = py_tuple_get(args, 1);
+        PyObject *end = nargs == 3 ? py_tuple_get(args, 2) : NULL;
+        if (start == NULL || (nargs == 3 && end == NULL)) {
+            if (start != NULL) py_decref(start);
+            if (end != NULL) py_decref(end);
+            py_decref(sub);
+            py_decref(s);
+            return NULL;
+        }
+        count = py_str_count_range(s, sub, start, end);
+        py_decref(start);
+        if (end != NULL) py_decref(end);
+    } else {
+        count = py_str_count(s, sub);
+    }
+
+    PyObject *out = py_int_from_i64(count);
+    py_decref(s);
+    py_decref(sub);
+    return out;
+}
+
+static PyObject *py_str_count_bound(PyObject *o) {
+    PyObject *captures = py_tuple_new(1);
+    if (captures == NULL) return NULL;
+    py_tuple_set_item(captures, 0, o);
+    PyObject *fn = py_func_new_bound(
+        (void *)py_str_count_bound_entry,
+        captures,
+        "count",
+        o
+    );
+    py_decref(captures);
+    return fn;
 }
 
 PyObject *py_obj_getattr(PyObject *o, const char *name) {
@@ -608,6 +999,34 @@ PyObject *py_obj_getattr(PyObject *o, const char *name) {
     int32_t tag = py_header(o)->type_tag;
     pcc_runtime_log_event_code(7, 5, tag, 0, o);
 
+    PyObject *type_attr = pcc_capi_type_object_getattr(o, name);
+    if (type_attr != NULL || py_err_occurred()) return type_attr;
+
+    PyObject *builtin_attr = pcc_capi_builtin_object_getattr(o, name);
+    if (builtin_attr != NULL || py_err_occurred()) return builtin_attr;
+
+    if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) {
+        PyObject *result = pcc_capi_cext_object_getattr(o, name);
+        if (result != NULL || py_err_occurred()) return result;
+        return py_obj_missing_attr(name);
+    }
+
+    if (strcmp(name, "pop") == 0) {
+        if (tag == PY_TYPE_LIST) {
+            return py_builtin_pop_bound(o, (void *)py_list_pop_bound_entry);
+        }
+        if (tag == PY_TYPE_DICT) {
+            return py_builtin_pop_bound(o, (void *)py_dict_pop_bound_entry);
+        }
+        if (tag == PY_TYPE_SET) {
+            return py_builtin_pop_bound(o, (void *)py_set_pop_bound_entry);
+        }
+    }
+
+    if (tag == PY_TYPE_STR && strcmp(name, "count") == 0) {
+        return py_str_count_bound(o);
+    }
+
     if (is_instance_tag_d(tag)) {
         PyObject *result = py_instance_getattr((PyInstanceObject *)o, name);
         if (result != NULL || py_err_occurred()) return result;
@@ -620,11 +1039,37 @@ PyObject *py_obj_getattr(PyObject *o, const char *name) {
     }
     if (tag == PY_TYPE_FUNC) {
         PyFuncObject *f = (PyFuncObject *)o;
-        if (strcmp(name, "__name__") == 0 && f->name != NULL) {
+        PyObject *attrs = pcc_gc_load_ptr(o, &f->attrs);
+        if (attrs != NULL) {
+            PyObject *key = py_str_new(name, (int64_t)strlen(name));
+            if (key == NULL) return NULL;
+            PyObject *value = py_dict_get(attrs, key);
+            py_decref(key);
+            if (value != NULL) return value;
+        }
+        if (
+            (strcmp(name, "__name__") == 0
+             || strcmp(name, "__qualname__") == 0)
+            && f->name != NULL
+        ) {
             return py_str_new(f->name, (int64_t)strlen(f->name));
         }
+        if (strcmp(name, "__code__") == 0) {
+            PyObject *code = py_func_get_code_metadata(o);
+            if (code != NULL || py_err_occurred()) return code;
+        }
+        if (strcmp(name, "__defaults__") == 0) {
+            PyObject *defaults = py_func_get_defaults_metadata(o);
+            if (defaults != NULL || py_err_occurred()) return defaults;
+        }
+        if (strcmp(name, "__doc__") == 0) {
+            py_incref(py_None);
+            return py_None;
+        }
         if (strcmp(name, "__self__") == 0) {
-            PyObject *self_obj = pcc_gc_load_ptr(o, &f->self_obj);
+            PyObject *self_obj = f->capi_method != NULL
+                ? pcc_gc_load_ptr(o, &f->capi_self)
+                : pcc_gc_load_ptr(o, &f->self_obj);
             if (self_obj != NULL) {
                 py_incref(self_obj);
                 return self_obj;
@@ -636,7 +1081,7 @@ PyObject *py_obj_getattr(PyObject *o, const char *name) {
         PyObject *target = py_weakref_call(o);
         if (target == NULL || target == py_None) {
             if (target != NULL) py_decref(target);
-            py_raise(py_exc_new(
+            py_raise_owned(py_exc_new(
                 PY_EXC_REFERENCEERROR,
                 "weakly-referenced object no longer exists"
             ));
@@ -650,6 +1095,8 @@ PyObject *py_obj_getattr(PyObject *o, const char *name) {
         PyObject *result = NULL;
         if (strcmp(name, "__class__") == 0) {
             result = py_coroutine_class();
+        } else if (strcmp(name, "send") == 0) {
+            return py_coroutine_bound_send(o);
         }
         if (result) py_incref(result);
         if (result != NULL || py_err_occurred()) return result;
@@ -683,6 +1130,43 @@ PyObject *py_obj_getattr(PyObject *o, const char *name) {
         } else if (strcmp(name, "value") == 0) {
             result = pcc_gc_load_ptr(o, &e->message);
             if (result == NULL) result = py_None;
+        } else if (strcmp(name, "msg") == 0) {
+            /* CPython exposes `.msg` on ImportError/ModuleNotFoundError (it is
+             * args[0]); other builtin exceptions have no `.msg`. numpy's
+             * `_core` re-init recovery branches on `exc.msg == "..."`, so
+             * faithful support is required — but stay scoped so a bare
+             * RuntimeError does not grow a `.msg` it lacks in CPython. */
+            PyClassObject *imp = py_exc_builtin_class(PY_EXC_IMPORTERROR);
+            if (imp != NULL && py_isinstance(o, imp)) {
+                result = pcc_gc_load_ptr(o, &e->message);
+                if (result == NULL) result = py_None;
+            } else {
+                return py_obj_missing_attr(name);
+            }
+        } else if (strcmp(name, "args") == 0) {
+            /* args tuple. The object stores only args[0] as `message`
+             * (capturing args[1:] needs a dedicated args-tuple field — a
+             * documented follow-up shared with multi-arg str(exc)), so return
+             * () when there is no message else (message,). py_tuple_set_item
+             * increfs, so msg's borrowed ref stays independent. */
+            PyObject *msg = pcc_gc_load_ptr(o, &e->message);
+            /* A no-arg exception (RuntimeError()) stores "" as its message, so
+             * an empty-string message reads back as args == () like CPython
+             * (message-only storage can't tell Error() from Error("") — the
+             * no-arg form is the common one). */
+            int empty = (msg == NULL || msg == py_None);
+            if (!empty && py_type_of(msg) == PY_TYPE_STR
+                && ((PyStrObject *)msg)->byte_len == 0) {
+                empty = 1;
+            }
+            PyObject *t;
+            if (empty) {
+                t = py_tuple_new(0);
+            } else {
+                t = py_tuple_new(1);
+                if (t != NULL) py_tuple_set_item(t, 0, msg);
+            }
+            return t;  /* already a new owned ref; skip the shared incref */
         }
         if (result) py_incref(result);
         if (result != NULL || py_err_occurred()) return result;
@@ -721,6 +1205,11 @@ int64_t py_obj_setattr(PyObject *o, const char *name, PyObject *v) {
     int32_t tag = py_header(o)->type_tag;
     pcc_runtime_log_event_code(7, 6, tag, 0, o);
 
+    if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) {
+        int64_t rc = pcc_capi_cext_object_setattr(o, name, v);
+        if (rc == 0 || py_err_occurred()) return rc;
+        return py_obj_attr_status_failed(name);
+    }
     if (is_instance_tag_d(tag)) {
         int64_t rc = py_instance_setattr((PyInstanceObject *)o, name, v);
         if (rc == 0 || py_err_occurred()) return rc;
@@ -729,6 +1218,26 @@ int64_t py_obj_setattr(PyObject *o, const char *name, PyObject *v) {
     if (tag == PY_TYPE_CLASS) {
         int64_t rc = py_class_setattr((PyClassObject *)o, name, v);
         if (rc == 0 || py_err_occurred()) return rc;
+    }
+    if (tag == PY_TYPE_FUNC) {
+        PyFuncObject *f = (PyFuncObject *)o;
+        PyObject *attrs = pcc_gc_load_ptr(o, &f->attrs);
+        int attrs_created = 0;
+        if (attrs == NULL) {
+            attrs = py_dict_new();
+            if (attrs == NULL) return py_obj_attr_status_failed(name);
+            pcc_gc_store_ptr(o, &f->attrs, attrs);
+            attrs_created = 1;
+        }
+        PyObject *key = py_str_new(name, (int64_t)strlen(name));
+        if (key == NULL) {
+            if (attrs_created) py_decref(attrs);
+            return py_obj_attr_status_failed(name);
+        }
+        py_dict_set(attrs, key, v);
+        py_decref(key);
+        if (attrs_created) py_decref(attrs);
+        return 0;
     }
     return py_obj_attr_status_failed(name);
 }
@@ -754,8 +1263,97 @@ PyObject *py_obj_call(PyObject *callable, PyObject *args, PyObject *kwargs) {
     int32_t tag = py_header(callable)->type_tag;
     pcc_runtime_log_event_code(7, 8, tag, 0, callable);
 
+    if (pcc_capi_type_object_is_callable(callable)) {
+        return pcc_capi_call_type_object(callable, args, kwargs);
+    }
+
     if (tag == PY_TYPE_CLASS) {
         PyClassObject *cls = (PyClassObject *)callable;
+        int64_t nargs = args != NULL ? py_tuple_len(args) : 0;
+        int64_t nkwargs = (
+            kwargs != NULL && kwargs != py_None && py_type_of(kwargs) == PY_TYPE_DICT
+        ) ? py_dict_len(kwargs) : 0;
+        if (
+            cls == pcc_type_cls_bool || cls == pcc_type_cls_int ||
+            cls == pcc_type_cls_float || cls == pcc_type_cls_str ||
+            cls == pcc_type_cls_list || cls == pcc_type_cls_dict ||
+            cls == pcc_type_cls_tuple
+        ) {
+            PyObject *arg = NULL;
+            PyObject *out = NULL;
+            if (nkwargs != 0 || nargs > 1) {
+                py_raise_owned(py_exc_new(
+                    PY_EXC_TYPEERROR,
+                    "native builtin constructor accepts at most one positional argument"
+                ));
+                return NULL;
+            }
+            if (nargs == 1) arg = py_tuple_get(args, 0);
+            if (cls == pcc_type_cls_bool) {
+                out = py_bool_from_bit(arg != NULL ? (int32_t)py_obj_truthy(arg) : 0);
+            } else if (cls == pcc_type_cls_int) {
+                if (arg == NULL) {
+                    out = py_int_from_i64(0);
+                } else if (py_type_of(arg) == PY_TYPE_INT) {
+                    py_incref(arg);
+                    out = arg;
+                } else if (py_type_of(arg) == PY_TYPE_BOOL) {
+                    out = py_int_from_i64(py_obj_truthy(arg));
+                } else if (py_type_of(arg) == PY_TYPE_FLOAT) {
+                    out = py_int_from_i64((int64_t)py_float_to_f64(arg));
+                } else if (py_type_of(arg) == PY_TYPE_STR) {
+                    out = py_int_from_cstr_or_raise(py_str_utf8(arg), 10);
+                } else {
+                    py_raise_owned(py_exc_new(
+                        PY_EXC_TYPEERROR,
+                        "int() argument must be a string or a real number"
+                    ));
+                }
+            } else if (cls == pcc_type_cls_float) {
+                out = py_float_from_f64(arg != NULL ? py_float_value_of(arg) : 0.0);
+            } else if (cls == pcc_type_cls_str) {
+                out = arg != NULL ? py_obj_str(arg) : py_str_new("", 0);
+            } else if (cls == pcc_type_cls_list) {
+                out = py_list_new(0);
+                if (out != NULL && arg != NULL) {
+                    py_list_extend(out, arg);
+                    if (py_err_occurred()) {
+                        py_decref(out);
+                        out = NULL;
+                    }
+                }
+            } else if (cls == pcc_type_cls_tuple) {
+                if (arg == NULL) {
+                    out = py_tuple_new(0);
+                } else if (py_type_of(arg) == PY_TYPE_TUPLE) {
+                    py_incref(arg);
+                    out = arg;
+                } else {
+                    PyObject *items = py_list_new(0);
+                    if (items != NULL) py_list_extend(items, arg);
+                    if (items != NULL && !py_err_occurred()) {
+                        out = py_tuple_from_list(items);
+                    }
+                    if (items != NULL) py_decref(items);
+                }
+            } else if (cls == pcc_type_cls_dict) {
+                out = py_dict_new();
+                if (out != NULL && arg != NULL) {
+                    if (py_type_of(arg) != PY_TYPE_DICT) {
+                        py_decref(out);
+                        py_raise_owned(py_exc_new(
+                            PY_EXC_NOTIMPLEMENTEDERROR,
+                            "pcc dict(iterable) currently requires a dict"
+                        ));
+                        out = NULL;
+                    } else {
+                        py_dict_update(out, arg);
+                    }
+                }
+            }
+            if (arg != NULL) py_decref(arg);
+            return out;
+        }
         PyObject *inst = py_instance_new(cls);
         if (inst == NULL) return NULL;
         PyObject *init_method = py_class_lookup(cls, "__init__");
@@ -763,7 +1361,8 @@ PyObject *py_obj_call(PyObject *callable, PyObject *args, PyObject *kwargs) {
             PyObject *result = dispatch_call_method_with_args(
                 init_method,
                 inst,
-                args
+                args,
+                kwargs
             );
             if (result == NULL && py_err_occurred()) {
                 py_decref(inst);
@@ -771,17 +1370,29 @@ PyObject *py_obj_call(PyObject *callable, PyObject *args, PyObject *kwargs) {
             }
             if (result != NULL) py_decref(result);
         }
-        (void)kwargs;
         return inst;
     }
     if (tag == PY_TYPE_FUNC) {
-        (void)kwargs;
-        return py_func_call(callable, args);
+        return py_func_call_kwargs(callable, args, kwargs);
     }
     if (tag == PY_TYPE_WEAKREF) {
         (void)args;
         (void)kwargs;
         return py_weakref_call(callable);
+    }
+    if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) {
+        return pcc_capi_call_cext_object(callable, args, kwargs);
+    }
+    if (is_instance_tag_d(tag)) {
+        PyInstanceObject *inst = (PyInstanceObject *)callable;
+        PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
+            callable,
+            (PyObject **)&inst->cls
+        );
+        PyObject *method = py_class_lookup(cls, "__call__");
+        if (method != NULL) {
+            return dispatch_call_method_with_args(method, callable, args, kwargs);
+        }
     }
     return NULL;
 }
@@ -803,6 +1414,60 @@ int64_t py_obj_isinstance(PyObject *o, PyObject *cls) {
     if (!o || !cls) return 0;
     if (PY_IS_TAGGED_INT(cls)) return 0;
     if (py_header(cls)->type_tag != PY_TYPE_CLASS) return 0;
+    if (cls == (PyObject *)pcc_type_cls_bool) return py_type_of(o) == PY_TYPE_BOOL;
+    if (cls == (PyObject *)pcc_type_cls_int) {
+        int32_t tag = py_type_of(o);
+        return tag == PY_TYPE_INT || tag == PY_TYPE_BOOL;
+    }
+    if (cls == (PyObject *)pcc_type_cls_float) return py_type_of(o) == PY_TYPE_FLOAT;
+    if (cls == (PyObject *)pcc_type_cls_str) return py_type_of(o) == PY_TYPE_STR;
+    if (cls == (PyObject *)pcc_type_cls_list) return py_type_of(o) == PY_TYPE_LIST;
+    if (cls == (PyObject *)pcc_type_cls_dict) return py_type_of(o) == PY_TYPE_DICT;
+    if (cls == (PyObject *)pcc_type_cls_tuple) return py_type_of(o) == PY_TYPE_TUPLE;
     pcc_runtime_log_event_code(7, 9, py_type_of(o), py_type_of(cls), o);
     return py_isinstance(o, (PyClassObject *)cls);
+}
+
+int64_t py_obj_issubclass(PyObject *derived, PyObject *cls) {
+    if (!derived || PY_IS_TAGGED_INT(derived)) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                            "issubclass() arg 1 must be a class"));
+        return -1;
+    }
+    int64_t derived_is_capi_type = pcc_capi_is_type_object_value(derived);
+    if (!derived_is_capi_type && py_header(derived)->type_tag != PY_TYPE_CLASS) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                            "issubclass() arg 1 must be a class"));
+        return -1;
+    }
+    if (!cls || PY_IS_TAGGED_INT(cls)) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                            "issubclass() arg 2 must be a class"));
+        return -1;
+    }
+    int64_t cls_is_capi_type = pcc_capi_is_type_object_value(cls);
+    if (!cls_is_capi_type && py_header(cls)->type_tag != PY_TYPE_CLASS) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                            "issubclass() arg 2 must be a class"));
+        return -1;
+    }
+    if (derived_is_capi_type || cls_is_capi_type) {
+        if (!derived_is_capi_type || !cls_is_capi_type) return 0;
+        return pcc_capi_type_object_issubclass(derived, cls);
+    }
+    PyClassObject *derived_cls = (PyClassObject *)pcc_gc_note_relocation_read(
+        derived
+    );
+    PyClassObject *target_cls = (PyClassObject *)pcc_gc_note_relocation_read(
+        cls
+    );
+    if (derived_cls == target_cls) return 1;
+    for (int32_t i = 0; i < derived_cls->n_mro; i++) {
+        PyClassObject *m = (PyClassObject *)pcc_gc_load_ptr(
+            (PyObject *)derived_cls,
+            (PyObject **)&derived_cls->mro[i]
+        );
+        if (m == target_cls) return 1;
+    }
+    return 0;
 }

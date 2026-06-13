@@ -89,6 +89,72 @@ PyObject *py_tuple_new(int64_t n) {
     return (PyObject *)t;
 }
 
+/* Build a new tuple from a pcc list's elements (returns a new ref).
+ * Used by the dynamic-call lowering to normalize mixed ``f(a, *rest)``
+ * argument lists to the tuple the native callable ABI requires. */
+PyObject *py_tuple_from_list(PyObject *lst) {
+    if (lst == NULL) return NULL;
+    int64_t n = py_list_len(lst);
+    PyObject *tup = py_tuple_new(n);
+    if (tup == NULL) return NULL;
+    for (int64_t i = 0; i < n; i++) {
+        PyObject *elem = py_list_get(lst, i);  /* new ref */
+        py_tuple_set_item(tup, i, elem);       /* increfs */
+        py_decref(elem);
+    }
+    return tup;
+}
+
+PyObject *py_tuple_from_splat(PyObject *seq) {
+    if (seq == NULL) return NULL;
+
+    int32_t tag = py_type_of(seq);
+    int64_t n = -1;
+    if (tag == PY_TYPE_TUPLE) {
+        n = py_tuple_len(seq);
+    } else if (tag == PY_TYPE_LIST) {
+        n = py_list_len(seq);
+    } else {
+        n = py_obj_len(seq);
+        if (py_err_occurred()) return NULL;
+    }
+    if (n < 0) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR, "tuple() argument is not iterable"));
+        return NULL;
+    }
+
+    PyObject *out = py_tuple_new(n);
+    if (out == NULL) return NULL;
+
+    if (tag == PY_TYPE_TUPLE) {
+        PyTupleObject *src = (PyTupleObject *)seq;
+        for (int64_t i = 0; i < n; i++) {
+            PyObject *item = pcc_gc_load_ptr(seq, &src->items[i]);
+            py_tuple_set_item(out, i, item);
+        }
+        return out;
+    }
+    if (tag == PY_TYPE_LIST) {
+        PyListObject *src = (PyListObject *)seq;
+        for (int64_t i = 0; i < n; i++) {
+            PyObject *item = pcc_gc_load_ptr(seq, &src->items[i]);
+            py_tuple_set_item(out, i, item);
+        }
+        return out;
+    }
+
+    for (int64_t i = 0; i < n; i++) {
+        PyObject *item = py_obj_getitem_i64(seq, i);
+        if (item == NULL && py_err_occurred()) {
+            py_decref(out);
+            return NULL;
+        }
+        py_tuple_set_item(out, i, item);
+        if (item != NULL) py_decref(item);
+    }
+    return out;
+}
+
 void py_tuple_set_item(PyObject *tuple, int64_t i, PyObject *item) {
     /* Used during construction only. The slot is expected to be NULL —
      * we don't decref the old slot, only incref the new item so the
@@ -96,7 +162,12 @@ void py_tuple_set_item(PyObject *tuple, int64_t i, PyObject *item) {
     if (tuple == NULL) return;
     PyTupleObject *t = (PyTupleObject *)tuple;
     if (i < 0 || i >= t->len) return;
-    pcc_gc_store_ptr(tuple, &t->items[i], item);
+    if (pcc_gc_backend() == PCC_GC_KIND_REFCOUNT_CYCLE) {
+        py_incref(item);
+        t->items[i] = item;
+    } else {
+        pcc_gc_store_ptr(tuple, &t->items[i], item);
+    }
     if (py_tuple_item_can_participate_in_cycle(item)) {
         int32_t flags = py_header(tuple)->flags;
         if ((flags & PY_FLAG_GC_TRACKED) == 0) {
@@ -111,7 +182,31 @@ PyObject *py_tuple_get(PyObject *tuple, int64_t i) {
     /* Python allows negative indices. */
     if (i < 0) i += t->len;
     if (i < 0 || i >= t->len) {
-        /* TODO(phase3): raise IndexError. */
+        /* Non-raising: internal callers (tuple unpacking, capture/arg
+         * extraction, weakref/re machinery) always pass in-range indices and
+         * rely on the silent-NULL contract. User-level ``t[i]`` subscripts go
+         * through py_tuple_getitem below, which raises IndexError. */
+        return NULL;
+    }
+    PyObject *v = pcc_gc_load_ptr(tuple, &t->items[i]);
+    py_incref(v);
+    return v;
+}
+
+PyObject *py_tuple_get_known(PyObject *tuple, int64_t i) {
+    return py_tuple_get(tuple, i);
+}
+
+/* t[i] subscript: like py_tuple_get but raises IndexError on out-of-range so a
+ * surrounding try/except can catch it. py_tuple_get stays non-raising for the
+ * many internal callers. Negative indices normalize like CPython. Mirrors the
+ * py_list_get / py_list_getitem split in py_list.c. */
+PyObject *py_tuple_getitem(PyObject *tuple, int64_t i) {
+    if (tuple == NULL) return NULL;
+    PyTupleObject *t = (PyTupleObject *)tuple;
+    if (i < 0) i += t->len;
+    if (i < 0 || i >= t->len) {
+        py_raise(py_exc_new(PY_EXC_INDEXERROR, "tuple index out of range"));
         return NULL;
     }
     PyObject *v = pcc_gc_load_ptr(tuple, &t->items[i]);

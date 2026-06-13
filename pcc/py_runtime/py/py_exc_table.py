@@ -8,6 +8,7 @@ and typed memory primitives.
 
 Returned by: PyClassObject*. Recursive on parent chain.
 """
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32
 from pcc.unsafe import (
     global_addr,
@@ -20,7 +21,7 @@ from pcc.unsafe import (
     store_ptr,
 )
 
-py_class_new           = extern(
+py_class_new = extern(
     "py_class_new",
     (c_ptr, c_ptr, c_int32, c_ptr, c_int32),
     c_ptr,
@@ -51,9 +52,9 @@ def _exc_cache_set(tag: int, cls) -> None:
 
 @c_abi_export("py_exc_builtin_class")
 def py_exc_builtin_class(tag: int):
-    n_builtin: int = 19                         # PY_EXC_N_BUILTIN
+    n_builtin: int = 22  # PY_EXC_N_BUILTIN
     if tag < 0 or tag >= n_builtin:
-        tag = 1                             # PY_EXC_EXCEPTION
+        tag = 1  # PY_EXC_EXCEPTION
 
     cached = _exc_cache_get(tag)
     if not ptr_is_null(cached):
@@ -77,8 +78,8 @@ def py_exc_builtin_class(tag: int):
     cls = py_class_new(name_cstr, bases_ptr, n_bases, null(), 0)
 
     if not ptr_is_null(cls):
-        flags: int = load_i32(cls, 12)        # OFFSET_FLAGS
-        store_i32(cls, 12, flags | 1)         # | PY_FLAG_IMMORTAL
+        flags: int = load_i32(cls, 12)  # OFFSET_FLAGS
+        store_i32(cls, 12, flags | 1)  # | PY_FLAG_IMMORTAL
         _exc_cache_set(tag, cls)
 
     return cls

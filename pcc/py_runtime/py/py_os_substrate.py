@@ -19,9 +19,11 @@ from pcc.unsafe import (
     access,
     cstr,
     define_global_ptr_null,
+    free,
     global_load_ptr,
     global_store_ptr,
     is_tagged_int,
+    load_i8,
     load_i32,
     load_i64,
     malloc,
@@ -30,14 +32,16 @@ from pcc.unsafe import (
     ptr_is_null,
     stat_kind,
     stat_mtime,
+    store_i64,
     strlen,
     target_platform_machine,
     target_sys_platform,
 )
 
-
 getcwd = extern("getcwd", (c_ptr, c_size_t), c_ptr)
+localtime_r = extern("localtime_r", (c_ptr, c_ptr), c_ptr)
 realpath = extern("realpath", (c_ptr, c_ptr), c_ptr)
+strftime = extern("strftime", (c_ptr, c_size_t, c_ptr, c_ptr), c_size_t)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_obj_str = extern("py_obj_str", (c_ptr,), c_ptr)
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
@@ -45,8 +49,13 @@ py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 py_list_new = extern("py_list_new", (c_int64,), c_ptr)
 py_list_append = extern("py_list_append", (c_ptr, c_ptr), c_void)
 py_float_from_f64 = extern("py_float_from_f64", (c_double,), c_ptr)
+pcc_runtime_now_us = extern("pcc_runtime_now_us", (), c_int64)
 pcc_runtime_monotonic_us = extern("pcc_runtime_monotonic_us", (), c_int64)
 py_str_byte_len = extern("py_str_byte_len", (c_ptr,), c_int64)
+py_bytes_new = extern("py_bytes_new", (c_ptr, c_int64), c_ptr)
+py_int_value_i64 = extern("py_int_value_i64", (c_ptr,), c_int64)
+arc4random_buf = extern("arc4random_buf", (c_ptr, c_size_t), c_void)
+read_sys = extern("read", (c_int32, c_ptr, c_size_t), c_int64)
 write_sys = extern("write", (c_int32, c_ptr, c_size_t), c_size_t)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 
@@ -74,6 +83,82 @@ def py_path_stat_mtime(p) -> float:
 @c_abi_export("py_time_monotonic")
 def py_time_monotonic():
     return py_float_from_f64(pcc_runtime_monotonic_us() * 0.000001)
+
+
+@c_abi_export("py_time_perf_counter")
+def py_time_perf_counter():
+    return py_float_from_f64(pcc_runtime_monotonic_us() * 0.000001)
+
+
+@c_abi_export("py_time_time")
+def py_time_time():
+    return py_float_from_f64(pcc_runtime_now_us() * 0.000001)
+
+
+@c_abi_export("py_time_strftime")
+def py_time_strftime(fmt):
+    fmt_str = py_obj_str(fmt)
+    if ptr_is_null(fmt_str):
+        return null()
+    raw_fmt = py_str_utf8(fmt_str)
+    if ptr_is_null(raw_fmt):
+        py_decref(fmt_str)
+        return py_str_new(null(), 0)
+    now_buf = malloc(8)
+    tm_buf = malloc(128)
+    out_buf = malloc(256)
+    if ptr_is_null(now_buf) or ptr_is_null(tm_buf) or ptr_is_null(out_buf):
+        free(now_buf)
+        free(tm_buf)
+        free(out_buf)
+        py_decref(fmt_str)
+        return null()
+    store_i64(now_buf, 0, pcc_runtime_now_us() // 1000000)
+    if ptr_is_null(localtime_r(now_buf, tm_buf)):
+        free(now_buf)
+        free(tm_buf)
+        free(out_buf)
+        py_decref(fmt_str)
+        return py_str_new(null(), 0)
+    n: int = strftime(out_buf, 256, raw_fmt, tm_buf)
+    out = py_str_new(out_buf, n)
+    free(now_buf)
+    free(tm_buf)
+    free(out_buf)
+    py_decref(fmt_str)
+    return out
+
+
+@c_abi_export("py_sys_stdin_readline")
+def py_sys_stdin_readline():
+    buf = malloc(4096)
+    if ptr_is_null(buf):
+        return null()
+    pos: int = 0
+    while pos < 4095:
+        got: int = read_sys(0, ptr_add(buf, pos), 1)
+        if got <= 0:
+            break
+        if load_i8(buf, pos) == 10:
+            pos = pos + 1
+            break
+        pos = pos + 1
+    out = py_str_new(buf, pos)
+    free(buf)
+    return out
+
+
+@c_abi_export("py_os_urandom")
+def py_os_urandom(n_obj):
+    n: int = py_int_value_i64(n_obj)
+    if n < 0:
+        return null()
+    out = py_bytes_new(null(), n)
+    if ptr_is_null(out):
+        return null()
+    if n > 0:
+        arc4random_buf(ptr_add(out, 24), n)
+    return out
 
 
 @c_abi_export("py_path_getcwd")

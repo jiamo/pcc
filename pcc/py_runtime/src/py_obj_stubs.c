@@ -25,6 +25,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* repr(exc) builder, shared C-only helper in py_format.c. */
+extern PyObject *py_exc_repr(PyObject *o);
+/* repr(complex) builder (== str), shared C-only helper in py_format.c. */
+extern PyObject *py_complex_repr(PyObject *o);
+
 /* ---- Float ------------------------------------------------------------ */
 
 PyObject *py_float_from_f64(double v) {
@@ -104,6 +109,10 @@ PyObject *py_float_mul(PyObject *a, PyObject *b) {
         return py_float_from_f64(py_float_to_f64(a) * py_float_to_f64(b));
     }
     return NULL;
+}
+
+PyObject *py_float_round_ndigits(double v, int64_t ndigits) {
+    return py_float_from_f64(pcc_float_round_fixed_f64(v, ndigits));
 }
 
 PyObject *py_float_format_fixed(PyObject *o, int64_t precision) {
@@ -321,6 +330,13 @@ PyObject *py_obj_repr(PyObject *o) {
         tag == PY_TYPE_SET || tag == PY_TYPE_BYTES) {
         return py_format_obj_to_str(o, 1);
     }
+    if (tag == PY_TYPE_EXC) {
+        /* repr(exc) == ClassName(repr(arg)); shared C helper (py_format.c). */
+        return py_exc_repr(o);
+    }
+    if (tag == PY_TYPE_COMPLEX) {
+        return py_complex_repr(o);
+    }
     PyObject *dunder = py_user_repr_dispatch(o);
     if (dunder != NULL) return dunder;
     return NULL;
@@ -337,6 +353,7 @@ PyObject *py_obj_ascii(PyObject *o) {
 
 PyObject *py_obj_str(PyObject *o) {
     if (o == NULL) return NULL;
+    o = pcc_gc_note_relocation_read(o);
     int32_t tag = py_type_of(o);
     if (tag == PY_TYPE_STR) {
         py_incref(o);
@@ -355,6 +372,11 @@ PyObject *py_obj_str(PyObject *o) {
     if (tag == PY_TYPE_EXC) {
         PyObject *msg = py_exc_get_message(o);
         if (msg != NULL) {
+            /* KeyError.__str__ is repr(key), not the bare key (CPython):
+             * str(KeyError('x')) == "'x'". */
+            if (py_exc_matches(o, (PyObject *)py_exc_builtin_class(PY_EXC_KEYERROR))) {
+                return py_obj_repr(msg);
+            }
             py_incref(msg);
             return msg;
         }

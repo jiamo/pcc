@@ -57,6 +57,11 @@ pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
 pcc_gc_store_root = extern("pcc_gc_store_root", (c_ptr, c_ptr), c_void)
+pcc_gc_backend4_zpage_register_owner_payload_span = extern(
+    "pcc_gc_backend4_zpage_register_owner_payload_span",
+    (c_ptr, c_ptr, c_int64),
+    c_int64,
+)
 pcc_gc_register_continuation_root = extern(
     "pcc_gc_register_continuation_root",
     (c_ptr, c_ptr),
@@ -272,6 +277,18 @@ def py_asyncio_sleep(delay):
     return py_coroutine_new_native(cstr("sleep"), null(), null(), null())
 
 
+@c_abi_export("py_coroutine_get_args")
+def py_coroutine_get_args(coro):
+    coro = _checked_coroutine(coro)
+    if ptr_is_null(coro):
+        return null()
+    args = pcc_gc_load_ptr(coro, ptr_add(coro, 40))
+    if ptr_is_null(args):
+        args = global_load_ptr("py_None")
+    py_incref(args)
+    return args
+
+
 def _continuation_slot_count_from_map(frame_map) -> int:
     if ptr_is_null(frame_map):
         return 0
@@ -352,6 +369,12 @@ def _py_continuation_new_with_abi(frame_map, slots, resume_pc, resume_abi: int):
     store_ptr(cont, 24, chunk)  # stack_chunk
     store_i64(cont, 32, 1)  # mounted
     store_i64(cont, 40, resume_abi)  # typed resume ABI
+    if n_slots > 0:
+        pcc_gc_backend4_zpage_register_owner_payload_span(
+            cont,
+            chunk_slots,
+            n_slots * 8,
+        )
 
     i: int = 0
     while i < n_slots:

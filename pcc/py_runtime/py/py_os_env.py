@@ -8,8 +8,10 @@ Coercion: keys/values may be any py object; non-str gets routed
 through py_obj_str() to realize a PyStrObject before reading its
 UTF-8 bytes.
 """
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void
 from pcc.unsafe import (
+    cstr,
     getenv,
     global_load_ptr,
     is_tagged_int,
@@ -21,11 +23,13 @@ from pcc.unsafe import (
     unsetenv,
 )
 
-
-py_decref            = extern("py_decref",            (c_ptr,),                   c_void)
-py_str_new           = extern("py_str_new",           (c_ptr, c_int64),           c_ptr)
-py_str_utf8          = extern("py_str_utf8",          (c_ptr,),                   c_ptr)
-py_obj_str           = extern("py_obj_str",           (c_ptr,),                   c_ptr)
+py_decref = extern("py_decref", (c_ptr,), c_void)
+py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
+py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
+py_obj_str = extern("py_obj_str", (c_ptr,), c_ptr)
+py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
+py_exc_new_with_value = extern("py_exc_new_with_value", (c_int64, c_ptr), c_ptr)
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 
 
 # PY_TYPE_STR (=4) is inlined at every use site because pcc-Python
@@ -35,7 +39,7 @@ py_obj_str           = extern("py_obj_str",           (c_ptr,),                 
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2       # PY_TYPE_INT
+        return 2  # PY_TYPE_INT
     return load_i32(obj, 8)
 
 
@@ -44,7 +48,7 @@ def _coerce_to_str(o):
     # is the temporary we must decref after, or NULL.
     if ptr_is_null(o):
         return null(), null()
-    if _type_of(o) == 4:           # PY_TYPE_STR
+    if _type_of(o) == 4:  # PY_TYPE_STR
         return o, null()
     new_s = py_obj_str(o)
     return new_s, new_s
@@ -69,6 +73,23 @@ def py_os_getenv(key, default_value):
         return default_value
     n: int = strlen(raw)
     return py_str_new(raw, n)
+
+
+@c_abi_export("py_os_environ_contains")
+def py_os_environ_contains(key) -> int:
+    if ptr_is_null(key) != 0:
+        py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
+        return -1
+    if _type_of(key) != 4:  # PY_TYPE_STR
+        py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
+        return -1
+    name = py_str_utf8(key)
+    if ptr_is_null(name) != 0:
+        py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
+        return -1
+    if ptr_is_null(getenv(name)) != 0:
+        return 0
+    return 1
 
 
 @c_abi_export("py_os_putenv")
@@ -96,6 +117,58 @@ def py_os_putenv(key, value):
         py_decref(k_owned)
     if not ptr_is_null(v_owned):
         py_decref(v_owned)
+    return global_load_ptr("py_None")
+
+
+@c_abi_export("py_os_environ_getitem")
+def py_os_environ_getitem(key):
+    # os.environ[key]: CPython mapping semantics — the key must be a
+    # str (TypeError otherwise, like CPython's encodekey()) and a
+    # missing variable raises KeyError carrying the key. Mirrors
+    # py_os_environ_getitem in py_os_env.c; py_os_getenv stays
+    # non-raising for os.getenv() / os.environ.get().
+    if ptr_is_null(key) != 0:
+        py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
+        return null()
+    if _type_of(key) != 4:  # PY_TYPE_STR
+        py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
+        return null()
+    name = py_str_utf8(key)
+    if ptr_is_null(name) != 0:
+        py_raise_owned(py_exc_new_with_value(4, key))  # PY_EXC_KEYERROR
+        return null()
+    raw = getenv(name)
+    if ptr_is_null(raw) != 0:
+        py_raise_owned(py_exc_new_with_value(4, key))  # PY_EXC_KEYERROR
+        return null()
+    n: int = strlen(raw)
+    return py_str_new(raw, n)
+
+
+@c_abi_export("py_os_environ_setitem")
+def py_os_environ_setitem(key, value):
+    # os.environ[key] = value: CPython mapping semantics — both key
+    # and value must be str (TypeError otherwise); the store is
+    # visible to the process environment (setenv), matching CPython's
+    # putenv-backed __setitem__. Mirrors py_os_environ_setitem in
+    # py_os_env.c; py_os_putenv stays coercing/non-raising.
+    if ptr_is_null(key) != 0:
+        py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
+        return null()
+    if _type_of(key) != 4:  # PY_TYPE_STR
+        py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
+        return null()
+    if ptr_is_null(value) != 0:
+        py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
+        return null()
+    if _type_of(value) != 4:  # PY_TYPE_STR
+        py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
+        return null()
+    k_raw = py_str_utf8(key)
+    v_raw = py_str_utf8(value)
+    if ptr_is_null(k_raw) == 0:
+        if ptr_is_null(v_raw) == 0:
+            setenv(k_raw, v_raw, 1)
     return global_load_ptr("py_None")
 
 

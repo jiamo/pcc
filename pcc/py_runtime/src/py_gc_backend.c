@@ -19,6 +19,7 @@ int64_t py_weakref_retarget(PyObject *from, PyObject *to);
 void py_gc_untrack(PyObject *o);
 
 static int64_t pcc_gc_selected_backend = PCC_GC_KIND_REFCOUNT_CYCLE;
+int32_t pcc_gc_read_barrier_enabled = 1;
 static int64_t pcc_gc_metrics[6] = {0, 0, 0, 0, 0, 0};
 static int32_t pcc_gc_mark_active = 0;
 static int32_t pcc_gc_cycle_requested = 0;
@@ -28,15 +29,27 @@ static _Thread_local int32_t pcc_gc_in_auto_step = 0;
 static _Thread_local int32_t pcc_gc_explicit_collect_active = 0;
 static int64_t pcc_gc_debt_bytes = 0;
 static int64_t pcc_gc_live_bytes = 0;
-static int64_t pcc_gc_gcpause = 200;
-static int64_t pcc_gc_gcstepmul = 200;
+static int64_t pcc_gc_gcpause = 1000;
+static int64_t pcc_gc_gcstepmul = 10000;
 static int64_t pcc_gc_debt_threshold_override = 0;
 static int64_t pcc_gc_max_pause_us = 0;
-static int64_t pcc_gc_minor_heap_size = 1048576;
-static int64_t pcc_gc_minor_alloc_max = 256;
+static int64_t pcc_gc_pause_count = 0;
+static int64_t pcc_gc_pause_sum_us = 0;
+static int64_t pcc_gc_pause_hist[4] = {0, 0, 0, 0};
+static int64_t pcc_gc_minor_heap_size = 33554432;
+static int64_t pcc_gc_minor_alloc_max = 16;
 static int64_t pcc_gc_minor_allocations = 0;
 static int64_t pcc_gc_minor_collections = 0;
 static int64_t pcc_gc_minor_bytes = 0;
+
+static int pcc_gc_pointer_can_have_header(PyObject *obj) {
+    uintptr_t bits = (uintptr_t)obj;
+    if (obj == NULL || PY_IS_TAGGED_INT(obj)) return 0;
+    if (bits < 4096u) return 0;
+    if ((bits & 7u) != 0) return 0;
+    if (bits >= (1ULL << 48)) return 0;
+    return 1;
+}
 
 typedef struct PccGcMinorBlock {
     uint8_t *base;
@@ -47,34 +60,54 @@ typedef struct PccGcMinorBlock {
     struct PccGcMinorBlock *next;
 } PccGcMinorBlock;
 
+struct PccGcZPageNode;
+
 typedef struct PccGcObjectNode {
     PyObject *obj;
     int64_t size;
     int32_t freeing;
     PccGcMinorBlock *minor_block;
     struct PccGcObjectNode *next;
+    struct PccGcObjectNode *prev;
+    struct PccGcZPageNode *zpage_node;
+    int64_t gc_refs;
 } PccGcObjectNode;
 
 typedef struct PccGcFrameNode {
     const int32_t *frame_map;
     PyObject **slots;
     struct PccGcFrameNode *next;
+    struct PccGcFrameNode *prev;
+    struct PccGcFrameNode *dup_next;
+    int64_t root_count;
+    int32_t borrowed;
+    PyObject **stable_values;
 } PccGcFrameNode;
 
 typedef struct PccGcContinuationRootNode {
     const int32_t *frame_map;
     PyObject **slots;
     struct PccGcContinuationRootNode *next;
+    int64_t root_count;
+    int32_t borrowed;
+    PyObject **stable_values;
 } PccGcContinuationRootNode;
 
 typedef struct PccGcSchedulerRootNode {
     PyObject **slot;
     struct PccGcSchedulerRootNode *next;
+    struct PccGcSchedulerRootNode *prev;
 } PccGcSchedulerRootNode;
+
+typedef struct PccGcRememberedOwnerNode {
+    PyObject *owner;
+    struct PccGcRememberedOwnerNode *next;
+} PccGcRememberedOwnerNode;
 
 typedef struct PccGcSchedulerQueueEntry {
     PyObject *value;
     struct PccGcSchedulerQueueEntry *next;
+    void *root_handle;
 } PccGcSchedulerQueueEntry;
 
 struct PccGcSchedulerQueue {
@@ -82,18 +115,27 @@ struct PccGcSchedulerQueue {
     PccGcSchedulerQueueEntry *head;
     PccGcSchedulerQueueEntry *tail;
     int64_t length;
+    PccGcSchedulerQueueEntry *free_head;
+    int64_t free_count;
 };
 
 typedef struct PccGcForwardNode {
     PyObject *from;
     PyObject *to;
     struct PccGcForwardNode *next;
+    struct PccGcForwardNode *prev;
+    struct PccGcForwardNode *target_next;
+    struct PccGcForwardNode *target_prev;
+    /* page owning `from`'s span, captured at install time so the
+     * retirement decrement is O(1) instead of an O(pages) addr walk */
+    struct PccGcZPage *from_page;
 } PccGcForwardNode;
 
 typedef struct PccGcIdentityNode {
     PyObject *obj;
     int64_t id;
     struct PccGcIdentityNode *next;
+    struct PccGcIdentityNode *prev;
 } PccGcIdentityNode;
 
 typedef struct PccGcRelocationNode {
@@ -147,7 +189,21 @@ typedef struct {
 } PccGcThreadObject;
 
 static PccGcObjectNode *pcc_gc_objects = NULL;
+static PccGcObjectNode *pcc_gc_trace_cursor = NULL;
+static PccGcObjectNode *pcc_gc_object_node_free_list = NULL;
+static int64_t pcc_gc_object_node_free_count = 0;
+static int64_t pcc_gc_gray_count = 0;
 static PccGcFrameNode *pcc_gc_frames = NULL;
+#define PCC_GC_FRAME_NODE_POOL_MAX_ROOTS 16
+#define PCC_GC_FRAME_NODE_POOL_LIMIT 1024
+#define PCC_GC_FRAME_NODE_FLAG_BORROWED 1
+#define PCC_GC_FRAME_NODE_FLAG_LIFO 2
+static PccGcFrameNode *pcc_gc_frame_node_free_lists[
+    PCC_GC_FRAME_NODE_POOL_MAX_ROOTS + 1
+] = {0};
+static int64_t pcc_gc_frame_node_free_counts[
+    PCC_GC_FRAME_NODE_POOL_MAX_ROOTS + 1
+] = {0};
 static PccGcContinuationRootNode *pcc_gc_continuation_roots = NULL;
 static PccGcSchedulerRootNode *pcc_gc_scheduler_roots = NULL;
 static PccGcForwardNode *pcc_gc_forwardings = NULL;
@@ -188,6 +244,13 @@ typedef struct PccGcZPage {
     uint8_t *span_base;
     int64_t span_capacity_bytes;
     int64_t pending_alloc_count;
+    /* Forwarding entries whose OLD address lies in this page's span.
+     * The lazy-heal read barrier reads the old copy's header, so the
+     * span must stay mapped until this reaches zero; pages that are
+     * otherwise empty defer destruction via `zombie`. */
+    int64_t pending_forwardings;
+    int32_t zombie;
+    struct PccGcZPageNode *object_head;
     struct PccGcZPage *next;
 } PccGcZPage;
 
@@ -197,6 +260,13 @@ typedef struct PccGcZPageNode {
     int64_t offset_bytes;
     int64_t size_bytes;
     struct PccGcZPageNode *next;
+    struct PccGcZPageNode *prev;
+    struct PccGcZPageNode *page_next;
+    struct PccGcZPageNode *page_prev;
+    /* per-owner payload-span chain: O(own spans) register/remove/query
+     * instead of a global O(all spans) list walk (the global walk was
+     * 95%% of gc4 churn wall time once containers registered spans) */
+    struct PccGcZPagePayloadSpanNode *payload_spans;
 } PccGcZPageNode;
 
 typedef struct PccGcZPagePayloadSpanNode {
@@ -227,9 +297,12 @@ typedef struct PccGcZPageEvacuationNode {
 } PccGcZPageEvacuationNode;
 
 static PccGcZPageNode *pcc_gc_backend4_zpages = NULL;
-static PccGcZPagePayloadSpanNode *pcc_gc_backend4_zpage_payload_spans = NULL;
+static PccGcZPageNode *pcc_gc_backend4_zpage_node_free_list = NULL;
+static int64_t pcc_gc_backend4_zpage_node_free_count = 0;
 static PccGcZPage *pcc_gc_backend4_pages = NULL;
 static PccGcZPage *pcc_gc_backend4_free_pages = NULL;
+static PccGcZPage *pcc_gc_backend4_retained_pages = NULL;
+static PccGcZPage *pcc_gc_backend4_active_pages[3][3] = {{NULL}};
 static PccGcZPageEvacuationNode *pcc_gc_backend4_evacuation_pages = NULL;
 static void pcc_gc_backend4_zpage_note_remembered_slot_unlocked(
     PyObject *owner,
@@ -240,12 +313,18 @@ static void pcc_gc_backend4_zpage_note_remembered_card_unlocked(
     PyObject **slot,
     int64_t delta
 );
+static PccGcZPageNode *pcc_gc_backend4_zpage_node_alloc_unlocked(void);
+static void pcc_gc_backend4_zpage_node_release_unlocked(
+    PccGcZPageNode *node
+);
 typedef struct PccGcStoreBufferMediumState {
     PccGcStoreBufferEntry *entries;
     int32_t *count;
     struct PccGcStoreBufferMediumState *next;
 } PccGcStoreBufferMediumState;
 static PccGcStoreBufferMediumState *pcc_gc_backend4_store_buffer_medium_states = NULL;
+static PccGcRememberedOwnerNode *pcc_gc_backend3_remembered_owners = NULL;
+static int32_t pcc_gc_backend3_remembered_overflow = 0;
 static PccGcMinorBlock *pcc_gc_minor_blocks = NULL;
 static _Thread_local PccGcMinorBlock *pcc_gc_minor_current = NULL;
 static _Thread_local PccGcMinorBlock *pcc_gc_pending_minor_block = NULL;
@@ -253,6 +332,7 @@ static int64_t pcc_gc_next_object_id = 1;
 static int pcc_gc_tracks_objects(void);
 static int pcc_gc_is_known_object(PyObject *o);
 static int pcc_gc_has_sweep_candidate(void);
+static int pcc_gc_backend3_graph_leaf_tag(int32_t tag);
 static void pcc_gc_backend4_evacuation_page_clear_unlocked(void);
 static PccGcZPageEvacuationNode *
 pcc_gc_backend4_evacuation_page_find_unlocked(PccGcZPage *page);
@@ -260,11 +340,16 @@ static int64_t pcc_gc_known_object_size_unlocked(PyObject *obj);
 static int64_t pcc_gc_cms_trace_gray_object_unlocked(PyObject *o);
 static int64_t pcc_gc_cms_worker_trace_cycle_unlocked(int64_t budget);
 static int64_t pcc_gc_step_trace_cycle(int64_t budget);
+static void pcc_gc_backend3_remembered_owners_clear_unlocked(void);
+static void pcc_gc_backend4_remap_and_retire_unlocked(void);
+static void pcc_gc_backend4_park_page_unlocked(struct PccGcZPage *page);
+static int64_t pcc_gc_forwarding_population = 0;
+#define PCC_GC_BACKEND4_REMAP_THRESHOLD 4096
 
 #define PCC_GC_SAFEPOINT_BATCH 16
 #define PCC_GC_DEFAULT_DEBT_THRESHOLD 65536LL
 #define PCC_GC_WORK_BYTES 64LL
-#define PCC_GC_MAX_AUTO_STEP_BUDGET 128LL
+#define PCC_GC_MAX_AUTO_STEP_BUDGET 65536LL
 #define PCC_GC_CMS_QUEUE_CAPACITY 256
 #define PCC_GC_CMS_WB_BUFFER_CAPACITY 32
 #define PCC_GC_BACKEND4_STORE_BUFFER_BATCH_CAPACITY 8
@@ -273,6 +358,7 @@ static int64_t pcc_gc_step_trace_cycle(int64_t budget);
 #define PCC_GC_BACKEND4_MEDIUM_PAGE_LIMIT 65536
 #define PCC_GC_BACKEND4_FREE_SMALL_PAGE_LIMIT 8
 #define PCC_GC_BACKEND4_FREE_MEDIUM_PAGE_LIMIT 4
+#define PCC_GC_BACKEND4_ZPAGE_SPAN_GUARD_BYTES 256
 
 static int64_t pcc_gc_cms_queue[PCC_GC_CMS_QUEUE_CAPACITY];
 static int32_t pcc_gc_cms_queue_head = 0;
@@ -297,8 +383,10 @@ static int64_t pcc_gc_cms_worker_drains = 0;
 static int64_t pcc_gc_cms_mutator_assists = 0;
 static int64_t pcc_gc_cms_worker_traces = 0;
 static int64_t pcc_gc_cms_wb_flushes = 0;
+#if PCC_WITH_THREADS
 static int32_t pcc_gc_graph_lock_state = 0;
 static _Thread_local int32_t pcc_gc_graph_lock_depth = 0;
+#endif
 static int64_t pcc_gc_minor_arena_refills = 0;
 static int64_t pcc_gc_minor_arena_bumps = 0;
 static int64_t pcc_gc_minor_arena_fallbacks = 0;
@@ -412,10 +500,111 @@ static void pcc_gc_object_node_set_freeing(PccGcObjectNode *n) {
 }
 
 static int pcc_gc_object_node_is_active(PccGcObjectNode *n) {
-    return n != NULL
-        && !pcc_gc_object_node_is_freeing(n)
-        && n->obj != NULL
-        && !PY_IS_TAGGED_INT(n->obj);
+    if (
+        n == NULL
+        || pcc_gc_object_node_is_freeing(n)
+        || n->obj == NULL
+        || PY_IS_TAGGED_INT(n->obj)
+    ) {
+        return 0;
+    }
+    /* Backend #4 intentionally keeps zpage ownership/index metadata until
+     * after the type-specific deallocator has consumed the object's fields.
+     * A concurrent collector must exclude that retained node, but refcount
+     * zero alone is too broad: relocation shells can legitimately keep a
+     * zero count until forwarding retirement.  py_decref publishes this
+     * dedicated bit only for the delayed zpage-deallocation window. */
+    return (
+        py_header_flags_load(py_header(n->obj)) & PY_FLAG_GC_DEALLOCATING
+    ) == 0;
+}
+
+static void pcc_gc_object_node_link_head(PccGcObjectNode *n) {
+    if (n == NULL) return;
+    n->prev = NULL;
+    n->next = pcc_gc_objects;
+    if (pcc_gc_objects != NULL) {
+        pcc_gc_objects->prev = n;
+    }
+    pcc_gc_objects = n;
+}
+
+static void pcc_gc_object_node_unlink(PccGcObjectNode *n) {
+    if (n == NULL) return;
+    if (pcc_gc_trace_cursor == n) {
+        pcc_gc_trace_cursor = n->next;
+    }
+    if (n->prev != NULL) {
+        n->prev->next = n->next;
+    } else if (pcc_gc_objects == n) {
+        pcc_gc_objects = n->next;
+    } else {
+        PccGcObjectNode **cur = &pcc_gc_objects;
+        while (*cur != NULL && *cur != n) {
+            cur = &(*cur)->next;
+        }
+        if (*cur == n) {
+            *cur = n->next;
+        }
+    }
+    if (n->next != NULL) {
+        n->next->prev = n->prev;
+    }
+    n->prev = NULL;
+    n->next = NULL;
+}
+
+#define PCC_GC_OBJECT_NODE_FREE_LIMIT 8192
+
+static PccGcObjectNode *pcc_gc_object_node_alloc(void) {
+    PccGcObjectNode *n = pcc_gc_object_node_free_list;
+    if (n != NULL) {
+        pcc_gc_object_node_free_list = n->next;
+        if (pcc_gc_object_node_free_count > 0) {
+            pcc_gc_object_node_free_count--;
+        }
+        return n;
+    }
+    return (PccGcObjectNode *)malloc(sizeof(PccGcObjectNode));
+}
+
+static void pcc_gc_object_node_release(PccGcObjectNode *n) {
+    if (n == NULL) return;
+    if (pcc_gc_object_node_free_count >= PCC_GC_OBJECT_NODE_FREE_LIMIT) {
+        free(n);
+        return;
+    }
+    n->next = pcc_gc_object_node_free_list;
+    pcc_gc_object_node_free_list = n;
+    pcc_gc_object_node_free_count++;
+}
+
+static int64_t pcc_gc_gray_count_load(void) {
+    return __atomic_load_n(&pcc_gc_gray_count, __ATOMIC_ACQUIRE);
+}
+
+static void pcc_gc_gray_count_store(int64_t value) {
+    __atomic_store_n(&pcc_gc_gray_count, value, __ATOMIC_RELEASE);
+}
+
+static void pcc_gc_gray_count_inc(void) {
+    __atomic_add_fetch(&pcc_gc_gray_count, 1, __ATOMIC_ACQ_REL);
+}
+
+static void pcc_gc_gray_count_dec(void) {
+    int64_t old = __atomic_load_n(&pcc_gc_gray_count, __ATOMIC_ACQUIRE);
+    while (old > 0) {
+        if (__atomic_compare_exchange_n(
+                &pcc_gc_gray_count,
+                &old,
+                old - 1,
+                0,
+                __ATOMIC_ACQ_REL,
+                __ATOMIC_ACQUIRE
+            )) {
+            return;
+        }
+    }
 }
 
 static int64_t pcc_gc_now_us(void) {
@@ -441,6 +630,19 @@ static int64_t pcc_gc_parse_env_i64(
     return (int64_t)value;
 }
 
+static int pcc_gc_backend_kind_uses_forwarding(int64_t backend) {
+    return backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        || backend == PCC_GC_KIND_COLORED_RELOCATING;
+}
+
+static void pcc_gc_update_read_barrier_enabled(int64_t backend) {
+    __atomic_store_n(
+        &pcc_gc_read_barrier_enabled,
+        pcc_gc_backend_kind_uses_forwarding(backend) ? 1 : 0,
+        __ATOMIC_RELEASE
+    );
+}
+
 static void pcc_gc_init_config(void) {
     if (pcc_gc_config_initialized) return;
     pcc_gc_config_initialized = 1;
@@ -451,8 +653,9 @@ static void pcc_gc_init_config(void) {
         PCC_GC_KIND_COLORED_RELOCATING
     );
     pcc_gc_selected_backend = backend;
-    pcc_gc_gcpause = pcc_gc_parse_env_i64("PCC_GC_PAUSE", 200, 50, 1000);
-    pcc_gc_gcstepmul = pcc_gc_parse_env_i64("PCC_GC_STEPMUL", 200, 1, 10000);
+    pcc_gc_update_read_barrier_enabled(backend);
+    pcc_gc_gcpause = pcc_gc_parse_env_i64("PCC_GC_PAUSE", 1000, 50, 1000);
+    pcc_gc_gcstepmul = pcc_gc_parse_env_i64("PCC_GC_STEPMUL", 10000, 1, 10000);
     pcc_gc_gcstepmul = pcc_gc_parse_env_i64(
         "PCC_GC_STEP_MUL",
         pcc_gc_gcstepmul,
@@ -467,13 +670,13 @@ static void pcc_gc_init_config(void) {
     );
     pcc_gc_minor_heap_size = pcc_gc_parse_env_i64(
         "PCC_GC_MINOR_HEAP_SIZE",
-        1048576,
+        33554432,
         256,
         1LL << 40
     );
     pcc_gc_minor_alloc_max = pcc_gc_parse_env_i64(
         "PCC_GC_MINOR_ALLOC_MAX",
-        256,
+        16,
         16,
         1LL << 30
     );
@@ -538,6 +741,12 @@ static void pcc_gc_discharge_debt(int64_t processed) {
 static void pcc_gc_record_pause(int64_t start_us, int64_t end_us) {
     if (start_us <= 0 || end_us < start_us) return;
     int64_t pause = end_us - start_us;
+    /* G-P3-LONGRUN: count + sum + fixed histogram alongside the max.
+     * Endpoint-only atomics — no hot-path cost. */
+    __atomic_fetch_add(&pcc_gc_pause_count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pcc_gc_pause_sum_us, pause, __ATOMIC_RELAXED);
+    int hist_idx = pause < 100 ? 0 : (pause < 1000 ? 1 : (pause < 10000 ? 2 : 3));
+    __atomic_fetch_add(&pcc_gc_pause_hist[hist_idx], 1, __ATOMIC_RELAXED);
     int64_t old_pause = __atomic_load_n(
         &pcc_gc_max_pause_us, __ATOMIC_RELAXED
     );
@@ -555,6 +764,13 @@ static void pcc_gc_record_pause(int64_t start_us, int64_t end_us) {
     }
 }
 
+/* Public endpoint for explicit-collect pause timing from outside this
+ * translation unit (backend 0's cycle collect in pcc_gc_collect). */
+void pcc_gc_record_explicit_pause(int64_t start_us, int64_t end_us) {
+    pcc_gc_record_pause(start_us, end_us);
+}
+
+#if PCC_WITH_THREADS
 static int pcc_gc_graph_try_lock(void) {
     int32_t expected = 0;
     return __atomic_compare_exchange_n(
@@ -566,8 +782,12 @@ static int pcc_gc_graph_try_lock(void) {
         __ATOMIC_ACQUIRE
     );
 }
+#endif
 
 static void pcc_gc_graph_lock(void) {
+#if !PCC_WITH_THREADS
+    return;
+#else
     if (pcc_gc_graph_lock_depth > 0) {
         pcc_gc_graph_lock_depth++;
         return;
@@ -577,13 +797,18 @@ static void pcc_gc_graph_lock(void) {
         usleep(100);
     }
     pcc_gc_graph_lock_depth = 1;
+#endif
 }
 
 static void pcc_gc_graph_unlock(void) {
+#if !PCC_WITH_THREADS
+    return;
+#else
     if (pcc_gc_graph_lock_depth <= 0) return;
     pcc_gc_graph_lock_depth--;
     if (pcc_gc_graph_lock_depth > 0) return;
     __atomic_store_n(&pcc_gc_graph_lock_state, 0, __ATOMIC_RELEASE);
+#endif
 }
 
 void pcc_gc_root_slot_lock(void) {
@@ -798,52 +1023,156 @@ static void pcc_gc_cms_stop_worker(void) {
 
 static PccGcForwardNode *pcc_gc_forwarding_find(PyObject *from) {
     if (from == NULL || PY_IS_TAGGED_INT(from)) return NULL;
-    for (PccGcForwardNode *n = pcc_gc_forwardings; n != NULL; n = n->next) {
-        if (n->from == from) return n;
-    }
-    return NULL;
+    return (PccGcForwardNode *)pcc_gc_forwarding_index_find(from);
+}
+
+static PccGcForwardNode *pcc_gc_forwarding_target_find(PyObject *target) {
+    if (target == NULL || PY_IS_TAGGED_INT(target)) return NULL;
+    return (PccGcForwardNode *)pcc_gc_forwarding_target_index_find(target);
 }
 
 static int pcc_gc_forwarding_target_exists(PyObject *target) {
     if (target == NULL || PY_IS_TAGGED_INT(target)) return 0;
-    for (PccGcForwardNode *n = pcc_gc_forwardings; n != NULL; n = n->next) {
-        if (n->to == target) return 1;
-    }
+    return pcc_gc_forwarding_target_find(target) != NULL;
+}
+
+static int pcc_gc_forwarding_target_prepare(
+    PyObject *target,
+    PccGcForwardNode *node,
+    PccGcForwardNode **head_out
+) {
+    if (
+        target == NULL
+        || PY_IS_TAGGED_INT(target)
+        || node == NULL
+        || head_out == NULL
+    ) return -1;
+    PccGcForwardNode *head = pcc_gc_forwarding_target_find(target);
+    int64_t rc = (
+        head == NULL
+        ? pcc_gc_forwarding_target_index_insert(target, node)
+        : pcc_gc_forwarding_target_index_upsert(target, node)
+    );
+    if (rc < 0) return -1;
+    *head_out = head;
     return 0;
 }
 
+static void pcc_gc_forwarding_target_attach_prepared(
+    PccGcForwardNode *node,
+    PccGcForwardNode *old_head
+) {
+    if (node == NULL) return;
+    node->target_next = old_head;
+    node->target_prev = NULL;
+    if (old_head != NULL) old_head->target_prev = node;
+}
+
+static void pcc_gc_forwarding_target_unlink(PccGcForwardNode *node) {
+    if (node == NULL || node->to == NULL || PY_IS_TAGGED_INT(node->to)) {
+        return;
+    }
+    PccGcForwardNode *prev = node->target_prev;
+    PccGcForwardNode *next = node->target_next;
+    if (prev != NULL) {
+        prev->target_next = next;
+    } else if (next != NULL) {
+        (void)pcc_gc_forwarding_target_index_upsert(node->to, next);
+    } else {
+        (void)pcc_gc_forwarding_target_index_remove(node->to);
+    }
+    if (next != NULL) next->target_prev = prev;
+    node->target_next = NULL;
+    node->target_prev = NULL;
+}
+
+static void pcc_gc_forwarding_unlink_main(PccGcForwardNode *node) {
+    if (node == NULL) return;
+    if (node->prev != NULL) {
+        node->prev->next = node->next;
+    } else {
+        pcc_gc_forwardings = node->next;
+    }
+    if (node->next != NULL) node->next->prev = node->prev;
+    node->prev = NULL;
+    node->next = NULL;
+}
+
+static void pcc_gc_backend4_zpage_note_forwarding_removed_unlocked(
+    PyObject *from
+);
+static void pcc_gc_backend4_note_forwarding_removed_on_page_unlocked(
+    struct PccGcZPage *page
+);
+
 static void pcc_gc_forwarding_remove(PyObject *from) {
     if (from == NULL || PY_IS_TAGGED_INT(from)) return;
-    PccGcForwardNode **cur = &pcc_gc_forwardings;
-    while (*cur != NULL) {
-        if ((*cur)->from == from) {
-            PccGcForwardNode *dead = *cur;
-            *cur = dead->next;
-            py_decref(dead->to);
-            free(dead);
-            return;
+    PccGcForwardNode *dead = (
+        PccGcForwardNode *
+    )pcc_gc_forwarding_index_remove(from);
+    if (dead == NULL) return;
+    pcc_gc_forwarding_target_unlink(dead);
+    pcc_gc_forwarding_unlink_main(dead);
+    py_decref(dead->to);
+    PccGcZPage *from_page = dead->from_page;
+    free(dead);
+    if (pcc_gc_forwarding_population > 0) pcc_gc_forwarding_population--;
+    if (from_page != NULL) {
+        pcc_gc_backend4_note_forwarding_removed_on_page_unlocked(from_page);
+    } else {
+        pcc_gc_backend4_zpage_note_forwarding_removed_unlocked(from);
+    }
+}
+
+static void pcc_gc_forwarding_remove_target(PyObject *target) {
+    if (target == NULL || PY_IS_TAGGED_INT(target)) return;
+    PccGcForwardNode *n = (
+        PccGcForwardNode *
+    )pcc_gc_forwarding_target_index_remove(target);
+    while (n != NULL) {
+        PccGcForwardNode *next = n->target_next;
+        PyObject *from = n->from;
+        (void)pcc_gc_forwarding_index_remove(from);
+        pcc_gc_forwarding_unlink_main(n);
+        n->target_next = NULL;
+        n->target_prev = NULL;
+        PccGcZPage *fp = n->from_page;
+        free(n);
+        if (pcc_gc_forwarding_population > 0) pcc_gc_forwarding_population--;
+        if (fp != NULL) {
+            pcc_gc_backend4_note_forwarding_removed_on_page_unlocked(fp);
+        } else {
+            pcc_gc_backend4_zpage_note_forwarding_removed_unlocked(from);
         }
-        cur = &(*cur)->next;
+        n = next;
     }
 }
 
 static void pcc_gc_forwarding_clear_all(void) {
     PccGcForwardNode *n = pcc_gc_forwardings;
     pcc_gc_forwardings = NULL;
+    pcc_gc_forwarding_index_clear();
+    pcc_gc_forwarding_target_index_clear();
     while (n != NULL) {
         PccGcForwardNode *next = n->next;
         py_decref(n->to);
         free(n);
         n = next;
     }
+    pcc_gc_forwarding_population = 0;
+}
+
+int64_t pcc_gc_forwarding_population_load(void) {
+    return pcc_gc_forwarding_population;
+}
+
+int64_t pcc_gc_relocation_set_active_load(void) {
+    return pcc_gc_relocation_set != NULL ? 1 : 0;
 }
 
 static PccGcIdentityNode *pcc_gc_identity_find(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return NULL;
-    for (PccGcIdentityNode *n = pcc_gc_identities; n != NULL; n = n->next) {
-        if (n->obj == obj) return n;
-    }
-    return NULL;
+    return (PccGcIdentityNode *)pcc_gc_identity_index_find(obj);
 }
 
 static PccGcIdentityNode *pcc_gc_identity_ensure(PyObject *obj) {
@@ -859,7 +1188,15 @@ static PccGcIdentityNode *pcc_gc_identity_ensure(PyObject *obj) {
     n->obj = obj;
     n->id = pcc_gc_next_object_id++;
     n->next = pcc_gc_identities;
+    n->prev = NULL;
+    if (pcc_gc_identities != NULL) pcc_gc_identities->prev = n;
     pcc_gc_identities = n;
+    if (pcc_gc_identity_index_insert(obj, n) < 0) {
+        pcc_gc_identities = n->next;
+        if (n->next != NULL) n->next->prev = NULL;
+        free(n);
+        return NULL;
+    }
     return n;
 }
 
@@ -878,27 +1215,37 @@ static int pcc_gc_identity_assign(PyObject *obj, int64_t id) {
     n->obj = obj;
     n->id = id;
     n->next = pcc_gc_identities;
+    n->prev = NULL;
+    if (pcc_gc_identities != NULL) pcc_gc_identities->prev = n;
     pcc_gc_identities = n;
+    if (pcc_gc_identity_index_insert(obj, n) < 0) {
+        pcc_gc_identities = n->next;
+        if (n->next != NULL) n->next->prev = NULL;
+        free(n);
+        return 0;
+    }
     return 1;
 }
 
 static void pcc_gc_identity_remove(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return;
-    PccGcIdentityNode **cur = &pcc_gc_identities;
-    while (*cur != NULL) {
-        if ((*cur)->obj == obj) {
-            PccGcIdentityNode *dead = *cur;
-            *cur = dead->next;
-            free(dead);
-            return;
-        }
-        cur = &(*cur)->next;
+    PccGcIdentityNode *dead = (
+        PccGcIdentityNode *
+    )pcc_gc_identity_index_remove(obj);
+    if (dead == NULL) return;
+    if (dead->prev != NULL) {
+        dead->prev->next = dead->next;
+    } else {
+        pcc_gc_identities = dead->next;
     }
+    if (dead->next != NULL) dead->next->prev = dead->prev;
+    free(dead);
 }
 
 static void pcc_gc_identity_clear_all(void) {
     PccGcIdentityNode *n = pcc_gc_identities;
     pcc_gc_identities = NULL;
+    pcc_gc_identity_index_clear();
     while (n != NULL) {
         PccGcIdentityNode *next = n->next;
         free(n);
@@ -953,7 +1300,11 @@ static void pcc_gc_relocation_set_remove(PyObject *obj) {
         if ((*cur)->obj == obj) {
             PccGcRelocationNode *dead = *cur;
             *cur = dead->next;
-            py_header_flags_and(py_header(obj), ~PY_FLAG_GC_RELOCATION_CANDIDATE);
+            if (pcc_gc_forwarding_find(obj) == NULL) {
+                py_header_flags_and(
+                    py_header(obj), ~PY_FLAG_GC_RELOCATION_CANDIDATE
+                );
+            }
             free(dead);
             return;
         }
@@ -1884,6 +2235,10 @@ static void pcc_gc_backend4_store_buffer_clear(void) {
 }
 
 void pcc_gc_thread_unregister_buffers(void) {
+    /* Free this exiting thread's _Thread_local ptr-index entry pool first —
+     * before the backend4 store-buffer early return below, which fires for most
+     * threads and would otherwise skip the drain and leak the pool. */
+    pcc_gc_ptr_index_tls_pool_drain();
     PccGcStoreBufferMediumState *state =
         pcc_gc_backend4_store_buffer_medium_state;
     if (state == NULL) return;
@@ -1912,9 +2267,11 @@ void pcc_gc_reset_relocation_set(void) {
     while (n != NULL) {
         PccGcRelocationNode *next = n->next;
         if (n->obj != NULL && !PY_IS_TAGGED_INT(n->obj)) {
-            py_header_flags_and(
-                py_header(n->obj), ~PY_FLAG_GC_RELOCATION_CANDIDATE
-            );
+            if (pcc_gc_forwarding_find(n->obj) == NULL) {
+                py_header_flags_and(
+                    py_header(n->obj), ~PY_FLAG_GC_RELOCATION_CANDIDATE
+                );
+            }
         }
         free(n);
         n = next;
@@ -2232,6 +2589,51 @@ static int32_t pcc_gc_backend4_generation_for_owner(PyObject *owner) {
     return 1;
 }
 
+static PccGcZPage *pcc_gc_backend4_active_page_unlocked(
+    int32_t page_class,
+    int32_t generation
+) {
+    if (page_class < 0 || page_class > 2) return NULL;
+    if (generation < 0 || generation > 2) return NULL;
+    return pcc_gc_backend4_active_pages[page_class][generation];
+}
+
+static void pcc_gc_backend4_active_page_set_unlocked(PccGcZPage *page) {
+    if (page == NULL) return;
+    if (page->page_class < 0 || page->page_class > 2) return;
+    if (page->generation < 0 || page->generation > 2) return;
+    pcc_gc_backend4_active_pages[page->page_class][page->generation] = page;
+}
+
+static void pcc_gc_backend4_active_page_clear_unlocked(PccGcZPage *page) {
+    if (page == NULL) return;
+    for (int32_t page_class = 0; page_class < 3; page_class++) {
+        for (int32_t generation = 0; generation < 3; generation++) {
+            if (pcc_gc_backend4_active_pages[page_class][generation] == page) {
+                pcc_gc_backend4_active_pages[page_class][generation] = NULL;
+            }
+        }
+    }
+}
+
+static int pcc_gc_backend4_zpage_accepts_alloc_unlocked(
+    PccGcZPage *page,
+    int32_t page_class,
+    int32_t generation,
+    int64_t alloc_size
+) {
+    if (page == NULL) return 0;
+    if (
+        pcc_gc_backend4_evacuation_pages != NULL
+        && pcc_gc_backend4_evacuation_page_find_unlocked(page) != NULL
+    ) {
+        return 0;
+    }
+    if (page->page_class != page_class) return 0;
+    if (page->generation != generation) return 0;
+    return page->capacity_bytes - page->allocated_bytes >= alloc_size;
+}
+
 static int64_t pcc_gc_backend4_page_class_population(
     int32_t page_class,
     int32_t count_bytes
@@ -2298,20 +2700,21 @@ static PccGcZPage *pcc_gc_backend4_zpage_find_reusable_page_unlocked(
     int32_t page_class = pcc_gc_backend4_page_class_for_size(size);
     int32_t generation = pcc_gc_backend4_generation_for_owner(owner);
     int64_t alloc_size = pcc_gc_backend4_align_alloc_size(size);
-    for (
-        PccGcZPage *page = pcc_gc_backend4_pages;
-        page != NULL;
-        page = page->next
+    PccGcZPage *active = pcc_gc_backend4_active_page_unlocked(
+        page_class,
+        generation
+    );
+    if (
+        pcc_gc_backend4_zpage_accepts_alloc_unlocked(
+            active,
+            page_class,
+            generation,
+            alloc_size
+        )
     ) {
-        if (pcc_gc_backend4_evacuation_page_find_unlocked(page) != NULL) {
-            continue;
-        }
-        if (page->page_class != page_class) continue;
-        if (page->generation != generation) continue;
-        if (page->capacity_bytes - page->allocated_bytes >= alloc_size) {
-            return page;
-        }
+        return active;
     }
+    pcc_gc_backend4_active_page_clear_unlocked(active);
     return NULL;
 }
 
@@ -2324,20 +2727,21 @@ static PccGcZPage *pcc_gc_backend4_zpage_find_reusable_page_for_gen_unlocked(
     }
     int32_t page_class = pcc_gc_backend4_page_class_for_size(size);
     int64_t alloc_size = pcc_gc_backend4_align_alloc_size(size);
-    for (
-        PccGcZPage *page = pcc_gc_backend4_pages;
-        page != NULL;
-        page = page->next
+    PccGcZPage *active = pcc_gc_backend4_active_page_unlocked(
+        page_class,
+        generation
+    );
+    if (
+        pcc_gc_backend4_zpage_accepts_alloc_unlocked(
+            active,
+            page_class,
+            generation,
+            alloc_size
+        )
     ) {
-        if (pcc_gc_backend4_evacuation_page_find_unlocked(page) != NULL) {
-            continue;
-        }
-        if (page->page_class != page_class) continue;
-        if (page->generation != generation) continue;
-        if (page->capacity_bytes - page->allocated_bytes >= alloc_size) {
-            return page;
-        }
+        return active;
     }
+    pcc_gc_backend4_active_page_clear_unlocked(active);
     return NULL;
 }
 
@@ -2382,6 +2786,8 @@ static void pcc_gc_backend4_zpage_reset_unlocked(
     page->remembered_cards = 0;
     page->remembered_card_bitmap = 0;
     page->pending_alloc_count = 0;
+    page->pending_forwardings = 0;
+    page->zombie = 0;
     memset(
         page->remembered_card_refcounts,
         0,
@@ -2391,9 +2797,11 @@ static void pcc_gc_backend4_zpage_reset_unlocked(
         page->span_base == NULL
         || page->span_capacity_bytes < page->capacity_bytes
     ) {
-        free(page->span_base);
         page->span_base = (uint8_t *)calloc(
-            1, (size_t)page->capacity_bytes
+            1,
+            (size_t)(
+                page->capacity_bytes + PCC_GC_BACKEND4_ZPAGE_SPAN_GUARD_BYTES
+            )
         );
         page->span_capacity_bytes =
             page->span_base == NULL ? 0 : page->capacity_bytes;
@@ -2410,6 +2818,23 @@ static PccGcZPage *pcc_gc_backend4_zpage_find_page_for_addr_unlocked(
     if (ptr == NULL || size <= 0) return NULL;
     uintptr_t addr = (uintptr_t)ptr;
     int64_t alloc_size = pcc_gc_backend4_align_alloc_size(size);
+    int32_t page_class = pcc_gc_backend4_page_class_for_size(size);
+    if (page_class < 2) {
+        for (int32_t generation = 1; generation <= 2; generation++) {
+            PccGcZPage *active = pcc_gc_backend4_active_page_unlocked(
+                page_class,
+                generation
+            );
+            if (active == NULL || active->span_base == NULL) continue;
+            if (active->span_capacity_bytes <= 0) continue;
+            uintptr_t base = (uintptr_t)active->span_base;
+            uintptr_t span = (uintptr_t)active->span_capacity_bytes;
+            if (addr >= base && addr - base + (uintptr_t)alloc_size <= span) {
+                if (offset_out != NULL) *offset_out = (int64_t)(addr - base);
+                return active;
+            }
+        }
+    }
     for (
         PccGcZPage *page = pcc_gc_backend4_pages;
         page != NULL;
@@ -2453,8 +2878,14 @@ static int32_t pcc_gc_backend4_zpage_owns_addr_unlocked(void *ptr) {
         )) {
         return 1;
     }
-    return pcc_gc_backend4_zpage_list_owns_addr_unlocked(
+    if (pcc_gc_backend4_zpage_list_owns_addr_unlocked(
         pcc_gc_backend4_free_pages,
+        ptr
+    )) {
+        return 1;
+    }
+    return pcc_gc_backend4_zpage_list_owns_addr_unlocked(
+        pcc_gc_backend4_retained_pages,
         ptr
     );
 }
@@ -2470,11 +2901,30 @@ void *pcc_gc_backend4_try_zpage_alloc(int64_t size, int32_t flags) {
     int32_t generation = pcc_gc_backend4_generation_for_flags(flags);
     pcc_gc_graph_lock();
     int32_t page_needs_reset = 0;
-    PccGcZPage *page =
-        pcc_gc_backend4_zpage_find_reusable_page_for_gen_unlocked(
+    int32_t page_class = pcc_gc_backend4_page_class_for_size(size);
+    PccGcZPage *page = NULL;
+    PccGcZPage *active = pcc_gc_backend4_active_page_unlocked(
+        page_class,
+        generation
+    );
+    if (
+        pcc_gc_backend4_zpage_accepts_alloc_unlocked(
+            active,
+            page_class,
+            generation,
+            alloc_size
+        )
+    ) {
+        page = active;
+    } else {
+        pcc_gc_backend4_active_page_clear_unlocked(active);
+    }
+    if (page == NULL) {
+        page = pcc_gc_backend4_zpage_find_reusable_page_for_gen_unlocked(
             size,
             generation
         );
+    }
     if (page == NULL) {
         page = pcc_gc_backend4_zpage_pop_free_page_unlocked(size);
         if (page != NULL) page_needs_reset = 1;
@@ -2506,6 +2956,7 @@ void *pcc_gc_backend4_try_zpage_alloc(int64_t size, int32_t flags) {
     memset(ptr, 0, (size_t)alloc_size);
     page->allocated_bytes += alloc_size;
     page->pending_alloc_count++;
+    pcc_gc_backend4_active_page_set_unlocked(page);
     pcc_gc_graph_unlock();
     return ptr;
 }
@@ -2530,14 +2981,52 @@ static int64_t pcc_gc_backend4_free_page_limit_for_class(int32_t page_class) {
     return 0;
 }
 
+static void pcc_gc_backend4_zpage_clear_reusable_state_unlocked(
+    PccGcZPage *page
+) {
+    if (page == NULL) return;
+    page->primary_owner = NULL;
+    page->used_bytes = 0;
+    page->allocated_bytes = 0;
+    page->object_count = 0;
+    page->pending_alloc_count = 0;
+    page->pending_forwardings = 0;
+    page->zombie = 0;
+    page->remembered_slots = 0;
+    page->remembered_cards = 0;
+    page->remembered_card_bitmap = 0;
+    page->object_head = NULL;
+    memset(
+        page->remembered_card_refcounts,
+        0,
+        sizeof(page->remembered_card_refcounts)
+    );
+}
+
+static void pcc_gc_backend4_zpage_cache_unlocked(PccGcZPage *page) {
+    if (page == NULL) return;
+    pcc_gc_backend4_active_page_clear_unlocked(page);
+    pcc_gc_backend4_zpage_clear_reusable_state_unlocked(page);
+    page->next = pcc_gc_backend4_free_pages;
+    pcc_gc_backend4_free_pages = page;
+}
+
 static void pcc_gc_backend4_zpage_destroy_unlocked(PccGcZPage *page) {
     if (page == NULL) return;
-    free(page->span_base);
-    free(page);
+    pcc_gc_backend4_active_page_clear_unlocked(page);
+    /* Correctness-first retirement: old SSA values, delayed trashcan entries,
+     * and stale borrowed pointers can outlive owner-index membership. Keep the
+     * backing span recognizable, but remove the page from the reusable cache so
+     * free-list scans and reuse stay bounded. Physical release needs a stronger
+     * remap/epoch proof than the current runtime has. */
+    pcc_gc_backend4_zpage_clear_reusable_state_unlocked(page);
+    page->next = pcc_gc_backend4_retained_pages;
+    pcc_gc_backend4_retained_pages = page;
 }
 
 static void pcc_gc_backend4_zpage_recycle_unlocked(PccGcZPage *page) {
     if (page == NULL) return;
+    pcc_gc_backend4_active_page_clear_unlocked(page);
     if (page->page_class > 1) {
         pcc_gc_backend4_zpage_destroy_unlocked(page);
         return;
@@ -2554,38 +3043,83 @@ static void pcc_gc_backend4_zpage_recycle_unlocked(PccGcZPage *page) {
         pcc_gc_backend4_zpage_destroy_unlocked(page);
         return;
     }
-    page->primary_owner = NULL;
-    page->used_bytes = 0;
-    page->allocated_bytes = 0;
-    page->object_count = 0;
-    page->pending_alloc_count = 0;
-    page->remembered_slots = 0;
-    page->remembered_cards = 0;
-    page->remembered_card_bitmap = 0;
-    memset(
-        page->remembered_card_refcounts,
-        0,
-        sizeof(page->remembered_card_refcounts)
-    );
-    page->next = pcc_gc_backend4_free_pages;
-    pcc_gc_backend4_free_pages = page;
+    pcc_gc_backend4_zpage_cache_unlocked(page);
 }
 
-static void pcc_gc_backend4_zpage_track_alloc_unlocked(
+static PccGcZPageNode *pcc_gc_backend4_zpage_page_head_unlocked(
+    PccGcZPage *page
+) {
+    return page != NULL ? page->object_head : NULL;
+}
+
+static void pcc_gc_backend4_zpage_set_page_head_unlocked(
+    PccGcZPage *page,
+    PccGcZPageNode *head
+) {
+    if (page == NULL) return;
+    page->object_head = head;
+    if (head != NULL) {
+        page->primary_owner = head->owner;
+    } else {
+        page->primary_owner = NULL;
+    }
+}
+
+static void pcc_gc_backend4_zpage_link_node_unlocked(PccGcZPageNode *node) {
+    if (node == NULL) return;
+    node->prev = NULL;
+    node->next = pcc_gc_backend4_zpages;
+    if (node->next != NULL) node->next->prev = node;
+    pcc_gc_backend4_zpages = node;
+    (void)pcc_gc_zpage_owner_index_upsert(node->owner, node);
+
+    node->page_prev = NULL;
+    node->page_next = pcc_gc_backend4_zpage_page_head_unlocked(node->page);
+    if (node->page_next != NULL) node->page_next->page_prev = node;
+    pcc_gc_backend4_zpage_set_page_head_unlocked(node->page, node);
+}
+
+static void pcc_gc_backend4_zpage_unlink_node_unlocked(PccGcZPageNode *node) {
+    if (node == NULL) return;
+    (void)pcc_gc_zpage_owner_index_remove(node->owner);
+    if (node->prev != NULL) {
+        node->prev->next = node->next;
+    } else if (pcc_gc_backend4_zpages == node) {
+        pcc_gc_backend4_zpages = node->next;
+    }
+    if (node->next != NULL) node->next->prev = node->prev;
+
+    PccGcZPage *page = node->page;
+    if (page != NULL) {
+        if (node->page_prev != NULL) {
+            node->page_prev->page_next = node->page_next;
+        } else {
+            pcc_gc_backend4_zpage_set_page_head_unlocked(page, node->page_next);
+        }
+        if (node->page_next != NULL) {
+            node->page_next->page_prev = node->page_prev;
+        }
+        if (node->page_prev != NULL) {
+            PccGcZPageNode *head =
+                pcc_gc_backend4_zpage_page_head_unlocked(page);
+            page->primary_owner = head != NULL ? head->owner : NULL;
+        }
+    }
+    node->next = NULL;
+    node->prev = NULL;
+    node->page_next = NULL;
+    node->page_prev = NULL;
+}
+
+static PccGcZPageNode *pcc_gc_backend4_zpage_track_alloc_unlocked(
     PyObject *owner,
     int64_t size
 ) {
-    if (owner == NULL || PY_IS_TAGGED_INT(owner)) return;
-    if (pcc_gc_selected_backend != PCC_GC_KIND_COLORED_RELOCATING) return;
-    PccGcZPageNode *page = (PccGcZPageNode *)calloc(
-        1,
-        sizeof(PccGcZPageNode)
-    );
-    if (page == NULL) return;
-    PccGcZPage *zpage = pcc_gc_backend4_zpage_find_reusable_page_unlocked(
-        owner,
-        size
-    );
+    if (owner == NULL || PY_IS_TAGGED_INT(owner)) return NULL;
+    if (pcc_gc_selected_backend != PCC_GC_KIND_COLORED_RELOCATING) return NULL;
+    PccGcZPageNode *page = pcc_gc_backend4_zpage_node_alloc_unlocked();
+    if (page == NULL) return NULL;
+    PccGcZPage *zpage = NULL;
     int64_t existing_offset = -1;
     if ((py_header_flags_load(py_header(owner)) & PY_FLAG_GC_ZPAGE_ALLOC) != 0) {
         zpage = pcc_gc_backend4_zpage_find_page_for_addr_unlocked(
@@ -2595,13 +3129,19 @@ static void pcc_gc_backend4_zpage_track_alloc_unlocked(
         );
     }
     if (zpage == NULL) {
+        zpage = pcc_gc_backend4_zpage_find_reusable_page_unlocked(
+            owner,
+            size
+        );
+    }
+    if (zpage == NULL) {
         zpage = pcc_gc_backend4_zpage_pop_free_page_unlocked(size);
     }
     if (zpage == NULL) {
         zpage = (PccGcZPage *)calloc(1, sizeof(PccGcZPage));
         if (zpage == NULL) {
-            free(page);
-            return;
+            pcc_gc_backend4_zpage_node_release_unlocked(page);
+            return NULL;
         }
     }
     if (existing_offset < 0 && zpage->object_count <= 0) {
@@ -2614,6 +3154,7 @@ static void pcc_gc_backend4_zpage_track_alloc_unlocked(
     page->offset_bytes =
         existing_offset >= 0 ? existing_offset : zpage->allocated_bytes;
     page->size_bytes = size;
+    page->payload_spans = NULL;
     if (existing_offset >= 0 && zpage->pending_alloc_count > 0) {
         zpage->pending_alloc_count--;
     }
@@ -2622,9 +3163,9 @@ static void pcc_gc_backend4_zpage_track_alloc_unlocked(
     }
     zpage->used_bytes += size;
     zpage->object_count++;
-    if (zpage->primary_owner == NULL) zpage->primary_owner = owner;
-    page->next = pcc_gc_backend4_zpages;
-    pcc_gc_backend4_zpages = page;
+    pcc_gc_backend4_active_page_set_unlocked(zpage);
+    pcc_gc_backend4_zpage_link_node_unlocked(page);
+    return page;
 }
 
 static void pcc_gc_backend4_zpage_unlink_page_unlocked(PccGcZPage *page) {
@@ -2643,86 +3184,202 @@ static PyObject *pcc_gc_backend4_zpage_find_owner_for_page_unlocked(
     PccGcZPage *page
 ) {
     if (page == NULL) return NULL;
-    for (
-        PccGcZPageNode *n = pcc_gc_backend4_zpages;
-        n != NULL;
-        n = n->next
-    ) {
-        if (n->page == page) return n->owner;
-    }
-    return NULL;
+    PccGcZPageNode *node = pcc_gc_backend4_zpage_page_head_unlocked(page);
+    return node != NULL ? node->owner : NULL;
 }
 
 static void pcc_gc_backend4_zpage_remove_payload_spans_unlocked(
-    PyObject *owner
+    PccGcZPageNode *owner_node
 ) {
-    if (owner == NULL || PY_IS_TAGGED_INT(owner)) return;
-    PccGcZPagePayloadSpanNode **cur = &pcc_gc_backend4_zpage_payload_spans;
-    while (*cur != NULL) {
-        PccGcZPagePayloadSpanNode *node = *cur;
-        if (node->owner == owner) {
-            *cur = node->next;
-            if (node->page != NULL && node->size_bytes > 0) {
-                if (node->page->used_bytes >= node->size_bytes) {
-                    node->page->used_bytes -= node->size_bytes;
-                } else {
-                    node->page->used_bytes = 0;
-                }
+    if (owner_node == NULL) return;
+    PccGcZPagePayloadSpanNode *node = owner_node->payload_spans;
+    owner_node->payload_spans = NULL;
+    while (node != NULL) {
+        PccGcZPagePayloadSpanNode *next = node->next;
+        if (node->page != NULL && node->size_bytes > 0) {
+            if (
+                node->offset_bytes >= 0
+                && node->page->allocated_bytes
+                    == node->offset_bytes + node->size_bytes
+            ) {
+                node->page->allocated_bytes = node->offset_bytes;
             }
-            free(node);
+            if (node->page->used_bytes >= node->size_bytes) {
+                node->page->used_bytes -= node->size_bytes;
+            } else {
+                node->page->used_bytes = 0;
+            }
+        }
+        free(node);
+        node = next;
+    }
+}
+
+static int64_t pcc_gc_backend4_zpage_remove_payload_span_base_unlocked(
+    PccGcZPageNode *owner_node,
+    void *base
+) {
+    if (owner_node == NULL || base == NULL) return 0;
+    int64_t removed = 0;
+    PccGcZPagePayloadSpanNode **link = &owner_node->payload_spans;
+    while (*link != NULL) {
+        PccGcZPagePayloadSpanNode *node = *link;
+        if (node->base != (uint8_t *)base) {
+            link = &node->next;
             continue;
         }
-        cur = &(*cur)->next;
+        *link = node->next;
+        if (node->page != NULL && node->size_bytes > 0) {
+            if (node->page->used_bytes >= node->size_bytes) {
+                node->page->used_bytes -= node->size_bytes;
+            } else {
+                node->page->used_bytes = 0;
+            }
+        }
+        free(node);
+        removed++;
     }
+    return removed;
 }
 
 static void pcc_gc_backend4_zpage_remove_unlocked(PyObject *owner) {
     if (owner == NULL || PY_IS_TAGGED_INT(owner)) return;
     if (pcc_gc_selected_backend != PCC_GC_KIND_COLORED_RELOCATING) return;
-    PccGcZPageNode **cur = &pcc_gc_backend4_zpages;
-    while (*cur != NULL) {
-        if ((*cur)->owner == owner) {
-            PccGcZPageNode *dead = *cur;
-            *cur = dead->next;
-            PccGcZPage *page = dead->page;
-            if (page != NULL) {
-                pcc_gc_backend4_zpage_remove_payload_spans_unlocked(owner);
-                int64_t size = pcc_gc_known_object_size_unlocked(owner);
-                if (size > 0 && page->used_bytes >= size) {
-                    page->used_bytes -= size;
-                } else if (size > 0) {
-                    page->used_bytes = 0;
-                }
-                if (page->object_count > 0) page->object_count--;
-                if (page->primary_owner == owner) {
-                    page->primary_owner =
-                        pcc_gc_backend4_zpage_find_owner_for_page_unlocked(page);
-                }
-                if (
-                    page->object_count <= 0
-                    && page->pending_alloc_count <= 0
-                ) {
-                    pcc_gc_backend4_zpage_unlink_page_unlocked(page);
-                    pcc_gc_backend4_zpage_recycle_unlocked(page);
-                }
-            }
-            free(dead);
-            continue;
-        }
-        cur = &(*cur)->next;
+    PccGcObjectNode *owner_obj_node =
+        (PccGcObjectNode *)pcc_gc_object_index_find(owner);
+    PccGcZPageNode *dead =
+        owner_obj_node != NULL ? owner_obj_node->zpage_node : NULL;
+    if (owner_obj_node != NULL) owner_obj_node->zpage_node = NULL;
+    PccGcZPageNode *indexed =
+        (PccGcZPageNode *)pcc_gc_zpage_owner_index_find(owner);
+    if (dead == NULL) {
+        dead = indexed;
     }
+    if (dead == NULL) return;
+    PccGcZPage *page = dead->page;
+    pcc_gc_backend4_zpage_unlink_node_unlocked(dead);
+    if (page != NULL) {
+        pcc_gc_backend4_zpage_remove_payload_spans_unlocked(dead);
+        int64_t size = dead->size_bytes;
+        if (size <= 0) {
+            size = pcc_gc_known_object_size_unlocked(owner);
+        }
+        if (size > 0 && page->used_bytes >= size) {
+            page->used_bytes -= size;
+        } else if (size > 0) {
+            page->used_bytes = 0;
+        }
+        if (page->object_count > 0) page->object_count--;
+        if (page->primary_owner == owner) {
+            page->primary_owner =
+                pcc_gc_backend4_zpage_find_owner_for_page_unlocked(page);
+        }
+        if (
+            page->object_count <= 0
+            && page->pending_alloc_count <= 0
+        ) {
+            if (page->pending_forwardings <= 0) {
+                pcc_gc_backend4_zpage_unlink_page_unlocked(page);
+                pcc_gc_backend4_zpage_recycle_unlocked(page);
+            } else {
+                /* Defer: un-healed slots may still reference this span
+                 * through forwarding entries; destroying it would free
+                 * memory the lazy-heal read barrier must still read.
+                 * The page stays on the page list (addr lookup) but is
+                 * never handed out for allocation. */
+                page->zombie = 1;
+                pcc_gc_backend4_active_page_clear_unlocked(page);
+                PCC_RT_TRIPWIRE(
+                    page->zombie != 0 && page->pending_forwardings > 0,
+                    "pcc_gc_backend4_zpage_remove_unlocked: live forwarding span was not retained as a zombie page"
+                );
+            }
+        }
+    }
+    pcc_gc_backend4_zpage_node_release_unlocked(dead);
 }
 
 static PccGcZPageNode *pcc_gc_backend4_zpage_find_unlocked(PyObject *owner) {
     if (owner == NULL || PY_IS_TAGGED_INT(owner)) return NULL;
-    for (
-        PccGcZPageNode *n = pcc_gc_backend4_zpages;
-        n != NULL;
-        n = n->next
-    ) {
-        if (n->owner == owner) return n;
+    PccGcObjectNode *node = (PccGcObjectNode *)pcc_gc_object_index_find(owner);
+    if (node != NULL && !pcc_gc_object_node_is_freeing(node)) {
+        if (node->zpage_node != NULL) return node->zpage_node;
     }
-    return NULL;
+    return (PccGcZPageNode *)pcc_gc_zpage_owner_index_find(owner);
+}
+
+#define PCC_GC_BACKEND4_ZPAGE_NODE_FREE_LIMIT 8192
+
+static PccGcZPageNode *pcc_gc_backend4_zpage_node_alloc_unlocked(void) {
+    PccGcZPageNode *node = pcc_gc_backend4_zpage_node_free_list;
+    if (node != NULL) {
+        pcc_gc_backend4_zpage_node_free_list = node->next;
+        if (pcc_gc_backend4_zpage_node_free_count > 0) {
+            pcc_gc_backend4_zpage_node_free_count--;
+        }
+        return node;
+    }
+    return (PccGcZPageNode *)malloc(sizeof(PccGcZPageNode));
+}
+
+static void pcc_gc_backend4_zpage_node_release_unlocked(
+    PccGcZPageNode *node
+) {
+    if (node == NULL) return;
+    if (
+        pcc_gc_backend4_zpage_node_free_count
+        >= PCC_GC_BACKEND4_ZPAGE_NODE_FREE_LIMIT
+    ) {
+        free(node);
+        return;
+    }
+    node->next = pcc_gc_backend4_zpage_node_free_list;
+    pcc_gc_backend4_zpage_node_free_list = node;
+    pcc_gc_backend4_zpage_node_free_count++;
+}
+
+static void pcc_gc_backend4_note_forwarding_removed_on_page_unlocked(
+    PccGcZPage *page
+) {
+    if (page == NULL) return;
+    PCC_RT_TRIPWIRE(
+        page->pending_forwardings > 0,
+        "pcc_gc_backend4_note_forwarding_removed_on_page_unlocked: forwarding count underflow / duplicate removal"
+    );
+    if (page->pending_forwardings > 0) page->pending_forwardings--;
+    if (
+        page->zombie != 0
+        && page->pending_forwardings <= 0
+        && page->object_count <= 0
+        && page->pending_alloc_count <= 0
+    ) {
+        page->zombie = 0;
+        pcc_gc_backend4_zpage_unlink_page_unlocked(page);
+        /* one-epoch defer: recycling would let the span be reused (or
+         * freed) while stale SSA/borrowed pointers from the current
+         * step window can still read old headers — park instead; the
+         * NEXT remap destroys parked pages. */
+        pcc_gc_backend4_park_page_unlocked(page);
+    }
+}
+
+static void pcc_gc_backend4_zpage_note_forwarding_removed_unlocked(
+    PyObject *from
+) {
+    if (pcc_gc_selected_backend != PCC_GC_KIND_COLORED_RELOCATING) return;
+    if (from == NULL || PY_IS_TAGGED_INT(from)) return;
+    if (
+        (py_header_flags_load(py_header(from)) & PY_FLAG_GC_ZPAGE_ALLOC) == 0
+    ) {
+        return;
+    }
+    pcc_gc_backend4_note_forwarding_removed_on_page_unlocked(
+        pcc_gc_backend4_zpage_find_page_for_addr_unlocked(
+            (void *)from,
+            (int64_t)sizeof(PyObjectHeader),
+            NULL
+        )
+    );
 }
 
 static void pcc_gc_backend4_zpage_note_owner_promoted_unlocked(
@@ -2747,18 +3404,17 @@ static int32_t pcc_gc_backend4_zpage_card_for_node_unlocked(
 }
 
 static int64_t pcc_gc_backend4_zpage_payload_offset_for_slot_unlocked(
-    PyObject *owner,
+    PccGcZPageNode *owner_node,
     PyObject **slot
 ) {
-    if (owner == NULL || PY_IS_TAGGED_INT(owner) || slot == NULL) return -1;
+    if (owner_node == NULL || slot == NULL) return -1;
     uintptr_t slot_addr = (uintptr_t)slot;
     for (
-        PccGcZPagePayloadSpanNode *span =
-            pcc_gc_backend4_zpage_payload_spans;
+        PccGcZPagePayloadSpanNode *span = owner_node->payload_spans;
         span != NULL;
         span = span->next
     ) {
-        if (span->owner != owner || span->base == NULL) continue;
+        if (span->base == NULL) continue;
         if (span->size_bytes <= 0 || span->offset_bytes < 0) continue;
         uintptr_t base = (uintptr_t)span->base;
         uintptr_t size = (uintptr_t)span->size_bytes;
@@ -2785,7 +3441,7 @@ static int32_t pcc_gc_backend4_zpage_card_for_node_slot_unlocked(
         } else {
             int64_t payload_offset =
                 pcc_gc_backend4_zpage_payload_offset_for_slot_unlocked(
-                    node->owner,
+                    node,
                     slot
                 );
             if (payload_offset >= 0) span_offset = payload_offset;
@@ -3137,37 +3793,40 @@ int64_t pcc_gc_backend4_zpage_owner_slot_span_card(
     return card;
 }
 
-int64_t pcc_gc_backend4_zpage_register_owner_payload_span(
+static int64_t pcc_gc_backend4_zpage_register_owner_payload_span_unlocked(
     PyObject *owner,
     void *base,
     int64_t size_bytes
 ) {
-    pcc_gc_init_config();
     if (owner == NULL || PY_IS_TAGGED_INT(owner)) return -1;
     if (base == NULL || size_bytes <= 0) return -1;
-    pcc_gc_graph_lock();
     PccGcZPageNode *node = pcc_gc_backend4_zpage_find_unlocked(owner);
-    if (node == NULL || node->page == NULL) {
-        pcc_gc_graph_unlock();
-        return -1;
-    }
+    if (node == NULL || node->page == NULL) return -1;
     PccGcZPage *page = node->page;
-    pcc_gc_backend4_zpage_remove_payload_spans_unlocked(owner);
-    if (page->allocated_bytes > page->capacity_bytes) {
-        pcc_gc_graph_unlock();
-        return -1;
+    for (PccGcZPagePayloadSpanNode *span = node->payload_spans;
+         span != NULL;
+         span = span->next) {
+        if (span->base != (uint8_t *)base) continue;
+        if (span->page != page || span->offset_bytes < 0) return -1;
+        if (size_bytes > page->capacity_bytes - span->offset_bytes) return -1;
+        if (size_bytes >= span->size_bytes) {
+            page->used_bytes += size_bytes - span->size_bytes;
+        } else {
+            int64_t delta = span->size_bytes - size_bytes;
+            if (page->used_bytes >= delta) page->used_bytes -= delta;
+            else page->used_bytes = 0;
+        }
+        span->size_bytes = size_bytes;
+        int64_t end = span->offset_bytes + size_bytes;
+        if (page->allocated_bytes < end) page->allocated_bytes = end;
+        return span->offset_bytes;
     }
+    if (page->allocated_bytes > page->capacity_bytes) return -1;
     int64_t available = page->capacity_bytes - page->allocated_bytes;
-    if (size_bytes > available) {
-        pcc_gc_graph_unlock();
-        return -1;
-    }
+    if (size_bytes > available) return -1;
     PccGcZPagePayloadSpanNode *span =
         (PccGcZPagePayloadSpanNode *)calloc(1, sizeof(PccGcZPagePayloadSpanNode));
-    if (span == NULL) {
-        pcc_gc_graph_unlock();
-        return -1;
-    }
+    if (span == NULL) return -1;
     span->owner = owner;
     span->base = (uint8_t *)base;
     span->size_bytes = size_bytes;
@@ -3175,9 +3834,94 @@ int64_t pcc_gc_backend4_zpage_register_owner_payload_span(
     span->page = page;
     page->allocated_bytes += size_bytes;
     page->used_bytes += size_bytes;
-    span->next = pcc_gc_backend4_zpage_payload_spans;
-    pcc_gc_backend4_zpage_payload_spans = span;
-    int64_t offset = span->offset_bytes;
+    span->next = node->payload_spans;
+    node->payload_spans = span;
+    return span->offset_bytes;
+}
+
+static int64_t pcc_gc_backend4_zpage_retarget_owner_payload_span_unlocked(
+    PyObject *owner,
+    void *old_base,
+    void *new_base,
+    int64_t size_bytes
+) {
+    if (owner == NULL || PY_IS_TAGGED_INT(owner)) return -1;
+    if (old_base == NULL || new_base == NULL || size_bytes <= 0) return -1;
+    PccGcZPageNode *node = pcc_gc_backend4_zpage_find_unlocked(owner);
+    if (node == NULL || node->page == NULL) return -1;
+    PccGcZPage *page = node->page;
+    for (PccGcZPagePayloadSpanNode *span = node->payload_spans;
+         span != NULL;
+         span = span->next) {
+        if (span->base != (uint8_t *)old_base) continue;
+        if (span->page != page || span->offset_bytes < 0) return -1;
+        if (size_bytes > page->capacity_bytes - span->offset_bytes) return -1;
+        if (size_bytes >= span->size_bytes) {
+            page->used_bytes += size_bytes - span->size_bytes;
+        } else {
+            int64_t delta = span->size_bytes - size_bytes;
+            if (page->used_bytes >= delta) page->used_bytes -= delta;
+            else page->used_bytes = 0;
+        }
+        span->base = (uint8_t *)new_base;
+        span->size_bytes = size_bytes;
+        int64_t end = span->offset_bytes + size_bytes;
+        if (page->allocated_bytes < end) page->allocated_bytes = end;
+        return span->offset_bytes;
+    }
+    return -1;
+}
+
+int64_t pcc_gc_backend4_zpage_register_owner_payload_span(
+    PyObject *owner,
+    void *base,
+    int64_t size_bytes
+) {
+    pcc_gc_init_config();
+    if (pcc_gc_selected_backend != PCC_GC_KIND_COLORED_RELOCATING) return -1;
+    pcc_gc_graph_lock();
+    int64_t offset = pcc_gc_backend4_zpage_register_owner_payload_span_unlocked(
+        owner,
+        base,
+        size_bytes
+    );
+    pcc_gc_graph_unlock();
+    return offset;
+}
+
+int64_t pcc_gc_backend4_zpage_unregister_owner_payload_span(
+    PyObject *owner,
+    void *base
+) {
+    pcc_gc_init_config();
+    if (owner == NULL || PY_IS_TAGGED_INT(owner) || base == NULL) return -1;
+    pcc_gc_graph_lock();
+    PccGcZPageNode *node = pcc_gc_backend4_zpage_find_unlocked(owner);
+    int64_t removed = 0;
+    if (node != NULL) {
+        removed = pcc_gc_backend4_zpage_remove_payload_span_base_unlocked(
+            node,
+            base
+        );
+    }
+    pcc_gc_graph_unlock();
+    return removed;
+}
+
+int64_t pcc_gc_backend4_zpage_retarget_owner_payload_span(
+    PyObject *owner,
+    void *old_base,
+    void *new_base,
+    int64_t size_bytes
+) {
+    pcc_gc_init_config();
+    pcc_gc_graph_lock();
+    int64_t offset = pcc_gc_backend4_zpage_retarget_owner_payload_span_unlocked(
+        owner,
+        old_base,
+        new_base,
+        size_bytes
+    );
     pcc_gc_graph_unlock();
     return offset;
 }
@@ -3562,6 +4306,9 @@ static int pcc_gc_relocate_copy_supported_tag(int32_t tag) {
         case PY_TYPE_COMPLEX:
         case PY_TYPE_BYTES:
         case PY_TYPE_BYTEARRAY:
+        /* CpyHandle has no pcc pointer slots (foreign ref only) — a
+         * shallow relocation copy is exactly as safe as for str. */
+        case PY_TYPE_CPY_HANDLE:
             return 1;
         default:
             return 0;
@@ -3588,20 +4335,193 @@ static int pcc_gc_colored_relocate_copy_supported_tag(int32_t tag) {
     if (tag == PY_TYPE_SET) return 1;
     if (tag == PY_TYPE_TASK) return 1;
     if (tag == PY_TYPE_VIRTUAL_THREAD) return 1;
+    if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) return 0;
     if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) return 1;
     return pcc_gc_relocate_copy_supported_tag(tag);
 }
 
 static PyObject *pcc_gc_note_relocation_read_unlocked(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return o;
-    PccGcForwardNode *forwarding = pcc_gc_forwarding_find(o);
-    py_header_flags_and(py_header(o), ~PY_FLAG_GC_RELOCATION_CANDIDATE);
-    PyObject *resolved = o;
-    if (forwarding != NULL && forwarding->to != NULL) {
-        pcc_gc_relocation_barrier_forwards++;
-        resolved = forwarding->to;
+    if (!pcc_gc_is_known_object(o)) {
+        PccGcForwardNode *unknown_forwarding = pcc_gc_forwarding_find(o);
+        if (unknown_forwarding != NULL && unknown_forwarding->to != NULL) {
+            PCC_RT_TRIPWIRE(
+                unknown_forwarding->from == o,
+                "pcc_gc_note_relocation_read_unlocked: UNKNOWN forwarding lookup returned the wrong source"
+            );
+            PCC_RT_TRIPWIRE(
+                pcc_gc_pointer_can_have_header(unknown_forwarding->to),
+                "pcc_gc_note_relocation_read_unlocked: UNKNOWN forwarding target cannot contain an object header"
+            );
+            PCC_RT_TRIPWIRE(
+                py_header(o)->type_tag
+                    == py_header(unknown_forwarding->to)->type_tag,
+                "pcc_gc_note_relocation_read_unlocked: UNKNOWN forwarding source/target type_tag mismatch"
+            );
+            PCC_RT_TRIPWIRE(
+                (
+                    py_header_flags_load(py_header(o))
+                    & PY_FLAG_GC_ZPAGE_ALLOC
+                ) == 0
+                    || pcc_gc_backend4_zpage_owns_addr_unlocked(o) != 0,
+                "pcc_gc_note_relocation_read_unlocked: UNKNOWN zpage forwarding source lost its retained span"
+            );
+            pcc_gc_relocation_barrier_forwards++;
+            return unknown_forwarding->to;
+        }
+        return o;
     }
-    return resolved;
+    PyObjectHeader *h = py_header(o);
+    int32_t flags = py_header_flags_load(h);
+    PccGcForwardNode *forwarding = pcc_gc_forwarding_find(o);
+    if (forwarding != NULL && forwarding->to != NULL) {
+        PCC_RT_TRIPWIRE(py_header(o)->type_tag == py_header(forwarding->to)->type_tag,
+                        "pcc_gc_note_relocation_read_unlocked: forwarding source/target type_tag mismatch (stale/corrupt relocation forwarding entry)");
+        pcc_gc_relocation_barrier_forwards++;
+        return forwarding->to;
+    }
+    if ((flags & PY_FLAG_GC_RELOCATION_CANDIDATE) != 0) {
+        py_header_flags_and(h, ~PY_FLAG_GC_RELOCATION_CANDIDATE);
+    }
+    return o;
+}
+
+typedef struct {
+    PyObject ***from_slots;
+    PyObject ***to_slots;
+    int32_t *from_roles;
+    int32_t *to_roles;
+    int64_t count;
+    int64_t index;
+} PccGcRelocateSlotPairs;
+
+static void pcc_gc_relocate_count_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    PccGcRelocateSlotPairs *pairs = (PccGcRelocateSlotPairs *)ctx;
+    (void)slot;
+    (void)role;
+    if (pairs != NULL) pairs->count++;
+}
+
+static void pcc_gc_relocate_collect_from_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    PccGcRelocateSlotPairs *pairs = (PccGcRelocateSlotPairs *)ctx;
+    if (pairs == NULL || pairs->index >= pairs->count) return;
+    pairs->from_slots[pairs->index] = slot;
+    pairs->from_roles[pairs->index] = role;
+    pairs->index++;
+}
+
+static void pcc_gc_relocate_collect_to_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    PccGcRelocateSlotPairs *pairs = (PccGcRelocateSlotPairs *)ctx;
+    if (pairs == NULL || pairs->index >= pairs->count) return;
+    pairs->to_slots[pairs->index] = slot;
+    pairs->to_roles[pairs->index] = role;
+    pairs->index++;
+}
+
+static void pcc_gc_relocate_slot_pairs_dispose(PccGcRelocateSlotPairs *pairs) {
+    if (pairs == NULL) return;
+    free(pairs->from_slots);
+    free(pairs->to_slots);
+    free(pairs->from_roles);
+    free(pairs->to_roles);
+    memset(pairs, 0, sizeof(*pairs));
+}
+
+static int pcc_gc_relocate_slot_pairs_prepare(
+    PyObject *from,
+    PyObject *to,
+    int64_t size,
+    PccGcRelocateSlotPairs *pairs
+) {
+    if (from == NULL || to == NULL || pairs == NULL || size < 0) return -1;
+    memset(pairs, 0, sizeof(*pairs));
+    if (!py_obj_visit_slots(from, pcc_gc_relocate_count_slot, pairs)) return -1;
+    if (pairs->count > INT64_MAX / (int64_t)sizeof(PyObject **)) return -1;
+    if (pairs->count > INT64_MAX / (int64_t)sizeof(int32_t)) return -1;
+    if (pairs->count > 0) {
+        pairs->from_slots = (PyObject ***)calloc(
+            (size_t)pairs->count, sizeof(PyObject **)
+        );
+        pairs->to_slots = (PyObject ***)calloc(
+            (size_t)pairs->count, sizeof(PyObject **)
+        );
+        pairs->from_roles = (int32_t *)calloc(
+            (size_t)pairs->count, sizeof(int32_t)
+        );
+        pairs->to_roles = (int32_t *)calloc(
+            (size_t)pairs->count, sizeof(int32_t)
+        );
+        if (
+            pairs->from_slots == NULL
+            || pairs->to_slots == NULL
+            || pairs->from_roles == NULL
+            || pairs->to_roles == NULL
+        ) {
+            pcc_gc_relocate_slot_pairs_dispose(pairs);
+            return -1;
+        }
+    }
+    pairs->index = 0;
+    (void)py_obj_visit_slots(from, pcc_gc_relocate_collect_from_slot, pairs);
+    if (pairs->index != pairs->count) {
+        pcc_gc_relocate_slot_pairs_dispose(pairs);
+        return -1;
+    }
+    uintptr_t from_start = (uintptr_t)from;
+    uintptr_t from_end = from_start + (uintptr_t)size;
+    for (int64_t i = 0; i < pairs->count; i++) {
+        uintptr_t slot_addr = (uintptr_t)pairs->from_slots[i];
+        if (
+            pairs->from_roles[i] == PY_OBJ_SLOT_OWNED
+            && slot_addr >= from_start
+            && slot_addr + sizeof(PyObject *) <= from_end
+        ) {
+            uintptr_t offset = slot_addr - from_start;
+            *(PyObject **)((uintptr_t)to + offset) = NULL;
+        }
+    }
+    return 0;
+}
+
+static int pcc_gc_relocate_copy_slots(
+    PyObject *from,
+    PyObject *to,
+    PccGcRelocateSlotPairs *pairs
+) {
+    if (from == NULL || to == NULL || pairs == NULL) return -1;
+    pairs->index = 0;
+    if (!py_obj_visit_slots(to, pcc_gc_relocate_collect_to_slot, pairs)) {
+        return -1;
+    }
+    if (pairs->index != pairs->count) return -1;
+    for (int64_t i = 0; i < pairs->count; i++) {
+        if (pairs->from_roles[i] != pairs->to_roles[i]) return -1;
+    }
+    for (int64_t i = 0; i < pairs->count; i++) {
+        PyObject **from_slot = pairs->from_slots[i];
+        PyObject **to_slot = pairs->to_slots[i];
+        py_obj_update_slot(from_slot);
+        PyObject *value = *from_slot;
+        if (value == from) value = to;
+        if (pairs->from_roles[i] == PY_OBJ_SLOT_OWNED) py_incref(value);
+        *to_slot = value;
+        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
+            from, to, from_slot, to_slot
+        );
+    }
+    return 0;
 }
 
 static int pcc_gc_relocate_copy_payload(
@@ -3611,279 +4531,76 @@ static int pcc_gc_relocate_copy_payload(
 ) {
     if (from == NULL || to == NULL) return -1;
     int32_t tag = py_header(from)->type_tag;
-    if (tag == PY_TYPE_PROPERTY) {
-        PyPropertyObject *src = (PyPropertyObject *)from;
-        PyPropertyObject *dst = (PyPropertyObject *)to;
-        PyObject *fget = src->fget;
-        PyObject *fset = src->fset;
-        PyObject *fdel = src->fdel;
-
-        dst->fget = NULL;
-        dst->fset = NULL;
-        dst->fdel = NULL;
-
-        py_incref(fget);
-        py_incref(fset);
-        py_incref(fdel);
-        dst->fget = fget;
-        dst->fset = fset;
-        dst->fdel = fdel;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->fget, &dst->fget
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->fset, &dst->fset
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->fdel, &dst->fdel
-        );
-        return 0;
+    int result = -1;
+    PyContinuationStackChunk *continuation_src_chunk = NULL;
+    PyContinuationStackChunk *continuation_dst_chunk = NULL;
+    PccGcRelocateSlotPairs pairs;
+    if (pcc_gc_relocate_slot_pairs_prepare(from, to, size, &pairs) != 0) {
+        return -1;
     }
-    if (tag == PY_TYPE_CLASSMETHOD) {
-        PyClassMethodObject *src = (PyClassMethodObject *)from;
-        PyClassMethodObject *dst = (PyClassMethodObject *)to;
-        PyObject *func = src->func;
 
-        dst->func = NULL;
-        py_incref(func);
-        dst->func = func;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->func, &dst->func
-        );
-        return 0;
-    }
-    if (tag == PY_TYPE_STATICMETHOD) {
-        PyStaticMethodObject *src = (PyStaticMethodObject *)from;
-        PyStaticMethodObject *dst = (PyStaticMethodObject *)to;
-        PyObject *func = src->func;
-
-        dst->func = NULL;
-        py_incref(func);
-        dst->func = func;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->func, &dst->func
-        );
-        return 0;
-    }
-    if (tag == PY_TYPE_MEMORYVIEW) {
-        PyMemoryViewObject *src = (PyMemoryViewObject *)from;
-        PyMemoryViewObject *dst = (PyMemoryViewObject *)to;
-        PyObject *base = src->base;
-
-        dst->base = NULL;
-        py_incref(base);
-        dst->base = base;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->base, &dst->base
-        );
-        return 0;
-    }
-    if (tag == PY_TYPE_FUNC) {
-        PyFuncObject *src = (PyFuncObject *)from;
-        PyFuncObject *dst = (PyFuncObject *)to;
-        PyObject *captures = pcc_gc_load_ptr(from, &src->captures);
-        PyObject *self_obj = pcc_gc_load_ptr(from, &src->self_obj);
-
-        dst->entry = src->entry;
-        dst->name = src->name;
-        dst->captures = NULL;
-        dst->self_obj = NULL;
-
-        py_incref(captures);
-        dst->captures = captures;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->captures, &dst->captures
-        );
-        if (self_obj != NULL) {
-            py_incref(self_obj);
-            dst->self_obj = self_obj;
-            pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-                from, to, &src->self_obj, &dst->self_obj
-            );
-        }
-        return 0;
-    }
-    if (tag == PY_TYPE_ITER) {
-        PyIterObject *src = (PyIterObject *)from;
-        PyIterObject *dst = (PyIterObject *)to;
-        PyObject *seq = src->seq;
-
-        dst->seq = NULL;
-        dst->index = src->index;
-
-        py_incref(seq);
-        dst->seq = seq;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->seq, &dst->seq
-        );
-        return 0;
-    }
-    if (tag == PY_TYPE_GEN) {
-        PyGenObject *src = (PyGenObject *)from;
-        PyGenObject *dst = (PyGenObject *)to;
-        PyObject *frame = src->frame;
-        PyObject *send_value = src->send_value;
-
-        dst->resume = src->resume;
-        dst->frame = NULL;
-        dst->state = src->state;
-        dst->done = src->done;
-        dst->send_value = NULL;
-
-        py_incref(frame);
-        py_incref(send_value);
-        dst->frame = frame;
-        dst->send_value = send_value;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->frame, &dst->frame
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->send_value, &dst->send_value
-        );
-        return 0;
-    }
-    if (tag == PY_TYPE_COROUTINE) {
-        PccGcCoroutineObject *src = (PccGcCoroutineObject *)from;
-        PccGcCoroutineObject *dst = (PccGcCoroutineObject *)to;
-        PyObject *captures = src->captures;
-        PyObject *args = src->args;
-        PyObject *result = src->result;
-
-        dst->name = src->name;
-        dst->entry = src->entry;
-        dst->captures = NULL;
-        dst->args = NULL;
-        dst->result = NULL;
-        dst->closed = src->closed;
-        dst->done = src->done;
-
-        py_incref(captures);
-        py_incref(args);
-        py_incref(result);
-        dst->captures = captures;
-        dst->args = args;
-        dst->result = result;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->captures, &dst->captures
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->args, &dst->args
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->result, &dst->result
-        );
-        return 0;
-    }
     if (tag == PY_TYPE_CONTINUATION) {
         PyContinuationObject *src = (PyContinuationObject *)from;
         PyContinuationObject *dst = (PyContinuationObject *)to;
-        PyContinuationStackChunk *src_chunk = src->stack_chunk;
-        PyContinuationStackChunk *dst_chunk = NULL;
-
-        dst->resume_pc = src->resume_pc;
+        continuation_src_chunk = src->stack_chunk;
         dst->stack_chunk = NULL;
-        dst->mounted = src->mounted;
-        dst->resume_abi = src->resume_abi;
-
-        if (src_chunk != NULL) {
-            if (src_chunk->slot_count < 0) return -1;
-            dst_chunk = (
-                PyContinuationStackChunk *
-            )calloc(1, sizeof(PyContinuationStackChunk));
-            if (dst_chunk == NULL) return -1;
-            dst_chunk->root_map_slot_count = src_chunk->root_map_slot_count;
-            dst_chunk->slot_count = src_chunk->slot_count;
-            if (src_chunk->slot_count > 0) {
-                dst_chunk->slots = (
-                    PyObject **
-                )calloc((size_t)src_chunk->slot_count, sizeof(PyObject *));
-                if (dst_chunk->slots == NULL) {
-                    free(dst_chunk);
-                    return -1;
+        if (continuation_src_chunk != NULL) {
+            if (continuation_src_chunk->slot_count < 0) goto done;
+            continuation_dst_chunk = (PyContinuationStackChunk *)calloc(
+                1, sizeof(PyContinuationStackChunk)
+            );
+            if (continuation_dst_chunk == NULL) goto done;
+            continuation_dst_chunk->root_map_slot_count = (
+                continuation_src_chunk->root_map_slot_count
+            );
+            continuation_dst_chunk->slot_count = continuation_src_chunk->slot_count;
+            if (continuation_src_chunk->slot_count > 0) {
+                continuation_dst_chunk->slots = (PyObject **)calloc(
+                    (size_t)continuation_src_chunk->slot_count,
+                    sizeof(PyObject *)
+                );
+                if (continuation_dst_chunk->slots == NULL) {
+                    free(continuation_dst_chunk);
+                    continuation_dst_chunk = NULL;
+                    goto done;
                 }
-                for (int64_t i = 0; i < src_chunk->slot_count; i++) {
-                    PyObject *value = src_chunk->slots[i];
-                    py_incref(value);
-                    dst_chunk->slots[i] = value;
-                    pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-                        from, to, &src_chunk->slots[i], &dst_chunk->slots[i]
-                    );
-                }
-            }
-            dst->stack_chunk = dst_chunk;
-            if (src->mounted == 0) {
-                pcc_gc_retarget_continuation_root_slots_unlocked(
-                    src_chunk->slots,
-                    &src_chunk->root_map_slot_count,
-                    dst_chunk->slots,
-                    &dst_chunk->root_map_slot_count
+                memcpy(
+                    continuation_dst_chunk->slots,
+                    continuation_src_chunk->slots,
+                    (size_t)continuation_src_chunk->slot_count * sizeof(PyObject *)
+                );
+                (void)pcc_gc_backend4_zpage_register_owner_payload_span_unlocked(
+                    to,
+                    continuation_dst_chunk->slots,
+                    continuation_src_chunk->slot_count * (int64_t)sizeof(PyObject *)
                 );
             }
+            dst->stack_chunk = continuation_dst_chunk;
         }
-        return 0;
-    }
-    if (tag == PY_TYPE_EXC) {
+    } else if (tag == PY_TYPE_EXC) {
         PyExceptionObject *src = (PyExceptionObject *)from;
         PyExceptionObject *dst = (PyExceptionObject *)to;
-        PyClassObject *exc_class = src->exc_class;
-        PyObject *message = src->message;
-        PyObject *cause = src->cause;
-        PyObject *context = src->context;
-        PyFrameRecord *traceback = src->traceback;
         int32_t n_frames = src->n_frames;
         int32_t cap_frames = src->cap_frames;
-
-        dst->exc_class = NULL;
-        dst->message = NULL;
-        dst->cause = NULL;
-        dst->context = NULL;
         dst->traceback = NULL;
         dst->n_frames = 0;
         dst->cap_frames = 0;
-
-        if (n_frames < 0 || cap_frames < 0 || n_frames > cap_frames) {
-            return -1;
-        }
-        if (cap_frames > 0 && traceback == NULL) return -1;
-        if (
-            cap_frames > INT64_MAX / (int64_t)sizeof(PyFrameRecord)
-        ) return -1;
-
+        if (n_frames < 0 || cap_frames < 0 || n_frames > cap_frames) goto done;
+        if (cap_frames > 0 && src->traceback == NULL) goto done;
+        if (cap_frames > INT64_MAX / (int64_t)sizeof(PyFrameRecord)) goto done;
         if (cap_frames > 0) {
             dst->traceback = (PyFrameRecord *)malloc(
                 (size_t)cap_frames * sizeof(PyFrameRecord)
             );
-            if (dst->traceback == NULL) return -1;
+            if (dst->traceback == NULL) goto done;
             memcpy(
                 dst->traceback,
-                traceback,
+                src->traceback,
                 (size_t)cap_frames * sizeof(PyFrameRecord)
             );
         }
-
-        py_incref((PyObject *)exc_class);
-        py_incref(message);
-        py_incref(cause);
-        py_incref(context);
-        dst->exc_class = exc_class;
-        dst->message = message;
-        dst->cause = cause;
-        dst->context = context;
         dst->n_frames = n_frames;
         dst->cap_frames = cap_frames;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, (PyObject **)&src->exc_class, (PyObject **)&dst->exc_class
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->message, &dst->message
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->cause, &dst->cause
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->context, &dst->context
-        );
-        return 0;
     }
     if (tag == PY_TYPE_CLASS) {
         PyClassObject *src = (PyClassObject *)from;
@@ -3892,13 +4609,6 @@ static int pcc_gc_relocate_copy_payload(
         int32_t n_mro = src->n_mro;
         int32_t n_methods = src->n_methods;
         int32_t n_fields = src->n_fields;
-        PyObject *del_method = src->del_method;
-        PyObject *attrs = pcc_gc_load_ptr((PyObject *)src, &src->attrs);
-        PyClassObject *metaclass = (PyClassObject *)pcc_gc_load_ptr(
-            (PyObject *)src,
-            (PyObject **)&src->metaclass
-        );
-
         dst->name = src->name;
         dst->n_bases = 0;
         dst->bases = NULL;
@@ -3910,12 +4620,10 @@ static int pcc_gc_relocate_copy_payload(
         dst->field_names = NULL;
         dst->instance_size = src->instance_size;
         dst->type_tag_alloc = src->type_tag_alloc;
-        dst->del_method = del_method;
         dst->attrs = NULL;
-        dst->metaclass = metaclass;
 
         if (n_bases < 0 || n_mro < 0 || n_methods < 0 || n_fields < 0) {
-            return -1;
+            goto done;
         }
         if (
             n_bases > INT64_MAX / (int64_t)sizeof(PyClassObject *)
@@ -3923,52 +4631,66 @@ static int pcc_gc_relocate_copy_payload(
             || n_methods > INT64_MAX / (int64_t)sizeof(PyClassMethod)
             || n_fields > INT64_MAX / (int64_t)sizeof(const char *)
         ) {
-            return -1;
+            goto done;
         }
 
         if (n_bases > 0) {
-            if (src->bases == NULL) return -1;
+            if (src->bases == NULL) goto done;
             dst->bases = (PyClassObject **)malloc(
                 (size_t)n_bases * sizeof(PyClassObject *)
             );
-            if (dst->bases == NULL) return -1;
-            for (int32_t i = 0; i < n_bases; i++) {
-                dst->bases[i] = (PyClassObject *)pcc_gc_note_relocation_read_unlocked(
-                    (PyObject *)src->bases[i]
-                );
-            }
+            if (dst->bases == NULL) goto done;
+            memcpy(
+                dst->bases,
+                src->bases,
+                (size_t)n_bases * sizeof(PyClassObject *)
+            );
+            (void)pcc_gc_backend4_zpage_register_owner_payload_span_unlocked(
+                to,
+                dst->bases,
+                (int64_t)n_bases * (int64_t)sizeof(PyClassObject *)
+            );
         }
         if (n_mro > 0) {
-            if (src->mro == NULL) return -1;
+            if (src->mro == NULL) goto done;
             dst->mro = (PyClassObject **)malloc(
                 (size_t)n_mro * sizeof(PyClassObject *)
             );
-            if (dst->mro == NULL) return -1;
-            for (int32_t i = 0; i < n_mro; i++) {
-                PyClassObject *entry = (PyClassObject *)pcc_gc_note_relocation_read_unlocked(
-                    (PyObject *)src->mro[i]
-                );
-                if (entry == src) entry = dst;
-                dst->mro[i] = entry;
-            }
+            if (dst->mro == NULL) goto done;
+            memcpy(
+                dst->mro,
+                src->mro,
+                (size_t)n_mro * sizeof(PyClassObject *)
+            );
+            (void)pcc_gc_backend4_zpage_register_owner_payload_span_unlocked(
+                to,
+                dst->mro,
+                (int64_t)n_mro * (int64_t)sizeof(PyClassObject *)
+            );
         }
         if (n_methods > 0) {
-            if (src->methods == NULL) return -1;
+            if (src->methods == NULL) goto done;
             dst->methods = (PyClassMethod *)malloc(
                 (size_t)n_methods * sizeof(PyClassMethod)
             );
-            if (dst->methods == NULL) return -1;
-            for (int32_t i = 0; i < n_methods; i++) {
-                dst->methods[i].name = src->methods[i].name;
-                dst->methods[i].func = src->methods[i].func;
-            }
+            if (dst->methods == NULL) goto done;
+            memcpy(
+                dst->methods,
+                src->methods,
+                (size_t)n_methods * sizeof(PyClassMethod)
+            );
+            (void)pcc_gc_backend4_zpage_register_owner_payload_span_unlocked(
+                to,
+                dst->methods,
+                (int64_t)n_methods * (int64_t)sizeof(PyClassMethod)
+            );
         }
         if (n_fields > 0) {
-            if (src->field_names == NULL) return -1;
+            if (src->field_names == NULL) goto done;
             dst->field_names = (const char **)malloc(
                 (size_t)n_fields * sizeof(const char *)
             );
-            if (dst->field_names == NULL) return -1;
+            if (dst->field_names == NULL) goto done;
             memcpy(
                 (void *)dst->field_names,
                 src->field_names,
@@ -3980,169 +4702,50 @@ static int pcc_gc_relocate_copy_payload(
         dst->n_mro = n_mro;
         dst->n_methods = n_methods;
         dst->n_fields = n_fields;
-        py_incref(attrs);
-        dst->attrs = attrs;
-        if (py_class_attrs_retarget(src, dst) != 0) return -1;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->attrs, &dst->attrs
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from,
-            to,
-            (PyObject **)&src->metaclass,
-            (PyObject **)&dst->metaclass
-        );
-        return 0;
     }
     if (tag == PY_TYPE_WEAKREF) {
-        PyWeakRefObject *src = (PyWeakRefObject *)from;
         PyWeakRefObject *dst = (PyWeakRefObject *)to;
-        PyObject *callback = src->callback;
-
-        dst->target = src->target;
-        dst->callback = NULL;
         dst->prev = NULL;
         dst->next = NULL;
-
-        if (callback != NULL) py_incref(callback);
-        dst->callback = callback;
-        if (py_weakref_retarget(from, to) != 0) return -1;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->callback, &dst->callback
-        );
-        return 0;
     }
     if (tag == PY_TYPE_THREAD) {
         PccGcThreadObject *src = (PccGcThreadObject *)from;
         PccGcThreadObject *dst = (PccGcThreadObject *)to;
-        PyObject *callable = src->callable;
-        PyObject *args = src->args;
-        PyObject *result = src->result;
-
-        if (src->handle != NULL) return -1;
-
+        if (src->handle != NULL) goto done;
         dst->handle = NULL;
-        dst->callable = NULL;
-        dst->args = NULL;
-        dst->result = NULL;
-        dst->started = src->started;
-        dst->joined = src->joined;
-        dst->finished = src->finished;
-
-        if (callable != NULL) py_incref(callable);
-        if (args != NULL) py_incref(args);
-        if (result != NULL) py_incref(result);
-        dst->callable = callable;
-        dst->args = args;
-        dst->result = result;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->callable, &dst->callable
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->args, &dst->args
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->result, &dst->result
-        );
-        return 0;
-    }
-    if (tag == PY_TYPE_TASK) {
-        PyTaskObject *src = (PyTaskObject *)from;
-        PyTaskObject *dst = (PyTaskObject *)to;
-        PyObject *coro = src->coro;
-        PyObject *result = src->result;
-        PyObject *waiter = src->waiter;
-
-        dst->coro = NULL;
-        dst->result = NULL;
-        dst->waiter = NULL;
-
-        py_incref(coro);
-        py_incref(result);
-        py_incref(waiter);
-        dst->coro = coro;
-        dst->result = result;
-        dst->waiter = waiter;
-        dst->done = src->done;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->coro, &dst->coro
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->result, &dst->result
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->waiter, &dst->waiter
-        );
-        return 0;
     }
     if (tag == PY_TYPE_VIRTUAL_THREAD) {
         PyVirtualThreadObject *src = (PyVirtualThreadObject *)from;
         PyVirtualThreadObject *dst = (PyVirtualThreadObject *)to;
-        PyObject *continuation = src->continuation;
-        PyObject *result = src->result;
-
-        dst->continuation = NULL;
-        dst->result = NULL;
-        dst->state = src->state;
+        if (src->queued != 0) goto done;
         dst->queued = 0;
-        dst->pinned = src->pinned;
-
-        if (src->queued != 0) return -1;
-        py_incref(continuation);
-        py_incref(result);
-        dst->continuation = continuation;
-        dst->result = result;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->continuation, &dst->continuation
-        );
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, &src->result, &dst->result
-        );
-        return 0;
+        dst->timer_entry = NULL;
+        dst->io_entry = NULL;
     }
     if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
         PyInstanceObject *src = (PyInstanceObject *)from;
-        PyInstanceObject *dst = (PyInstanceObject *)to;
-        PyClassObject *cls = src->cls;
-        dst->cls = NULL;
-
-        if (size < (int64_t)sizeof(PyInstanceObject)) return -1;
+        PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
+            from,
+            (PyObject **)&src->cls
+        );
+        if (size < (int64_t)sizeof(PyInstanceObject)) goto done;
         if (cls == NULL || py_header((PyObject *)cls)->type_tag != PY_TYPE_CLASS) {
-            return -1;
+            goto done;
         }
 
         int32_t n_fields = cls->n_fields;
         if (n_fields < 0) n_fields = 0;
         int64_t n_slots = (int64_t)n_fields;
         if ((py_header((PyObject *)cls)->flags & 2) == 0) n_slots++;
-        if (n_slots < 0) return -1;
+        if (n_slots < 0) goto done;
         if (n_slots > (
             INT64_MAX - (int64_t)sizeof(PyInstanceObject)
         ) / (int64_t)sizeof(PyObject *)) {
-            return -1;
+            goto done;
         }
         int64_t required = (int64_t)sizeof(PyInstanceObject)
             + n_slots * (int64_t)sizeof(PyObject *);
-        if (size < required) return -1;
-
-        for (int64_t i = 0; i < n_slots; i++) {
-            PyObject *child = src->fields[i];
-            py_incref(child);
-            dst->fields[i] = child;
-        }
-        dst->cls = cls;
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from, to, (PyObject **)&src->cls, (PyObject **)&dst->cls
-        );
-        for (int64_t i = 0; i < n_slots; i++) {
-            pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-                from,
-                to,
-                &src->fields[i],
-                &dst->fields[i]
-            );
-        }
-        return 0;
+        if (size < required) goto done;
     }
     if (tag == PY_TYPE_DICT) {
         PyDictObject *src = (PyDictObject *)from;
@@ -4159,59 +4762,37 @@ static int pcc_gc_relocate_copy_payload(
         dst->entries = NULL;
         dst->entries_used = 0;
 
-        if (size < (int64_t)sizeof(PyDictObject)) return -1;
-        if (capacity < 0 || entries_used < 0 || dict_size < 0) return -1;
-        if (entries_used > capacity || dict_size > entries_used) return -1;
-        if (capacity == 0) return 0;
-        if (src_indices == NULL || src_entries == NULL) return -1;
-        if (capacity > INT64_MAX / (int64_t)sizeof(int64_t)) return -1;
-        if (capacity > INT64_MAX / (int64_t)sizeof(DictEntry)) return -1;
-
-        int64_t *indices = (int64_t *)malloc(
-            (size_t)capacity * sizeof(int64_t)
-        );
-        if (indices == NULL) return -1;
-        DictEntry *entries = (DictEntry *)calloc(
-            (size_t)capacity, sizeof(DictEntry)
-        );
-        if (entries == NULL) {
-            free(indices);
-            return -1;
-        }
-
-        memcpy(indices, src_indices, (size_t)capacity * sizeof(int64_t));
-        for (int64_t i = 0; i < entries_used; i++) {
-            DictEntry *src_entry = &src_entries[i];
-            DictEntry *dst_entry = &entries[i];
-            PyObject *key = src_entry->key;
-            PyObject *value = src_entry->value;
-            dst_entry->hash = src_entry->hash;
-            dst_entry->key = key;
-            dst_entry->value = value;
-            if (key != NULL) {
-                py_incref(key);
-                py_incref(value);
+        if (size < (int64_t)sizeof(PyDictObject)) goto done;
+        if (capacity < 0 || entries_used < 0 || dict_size < 0) goto done;
+        if (entries_used > capacity || dict_size > entries_used) goto done;
+        if (capacity > 0) {
+            if (src_indices == NULL || src_entries == NULL) goto done;
+            if (capacity > INT64_MAX / (int64_t)sizeof(int64_t)) goto done;
+            if (capacity > INT64_MAX / (int64_t)sizeof(DictEntry)) goto done;
+            int64_t *indices = (int64_t *)malloc(
+                (size_t)capacity * sizeof(int64_t)
+            );
+            if (indices == NULL) goto done;
+            DictEntry *entries = (DictEntry *)malloc(
+                (size_t)capacity * sizeof(DictEntry)
+            );
+            if (entries == NULL) {
+                free(indices);
+                goto done;
             }
-            pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-                from,
+            memcpy(indices, src_indices, (size_t)capacity * sizeof(int64_t));
+            memcpy(entries, src_entries, (size_t)capacity * sizeof(DictEntry));
+            dst->indices = indices;
+            dst->entries = entries;
+            (void)pcc_gc_backend4_zpage_register_owner_payload_span_unlocked(
                 to,
-                &src_entry->key,
-                &dst_entry->key
-            );
-            pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-                from,
-                to,
-                &src_entry->value,
-                &dst_entry->value
+                entries,
+                capacity * (int64_t)sizeof(DictEntry)
             );
         }
-
-        dst->indices = indices;
-        dst->entries = entries;
         dst->capacity = capacity;
         dst->size = dict_size;
         dst->entries_used = entries_used;
-        return 0;
     }
     if (tag == PY_TYPE_SET) {
         PySetObject *src = (PySetObject *)from;
@@ -4224,109 +4805,96 @@ static int pcc_gc_relocate_copy_payload(
         dst->fill = 0;
         dst->entries = NULL;
 
-        if (size < (int64_t)sizeof(PySetObject)) return -1;
-        if (capacity < 0) return -1;
-        if (capacity == 0) return 0;
-        if (src_entries == NULL) return -1;
-        if (capacity > INT64_MAX / (int64_t)sizeof(SetEntry)) return -1;
-
-        SetEntry *entries = (SetEntry *)calloc(
-            (size_t)capacity, sizeof(SetEntry)
-        );
-        if (entries == NULL) return -1;
-
-        for (int64_t i = 0; i < capacity; i++) {
-            PyObject *key = src_entries[i].key;
-            entries[i].hash = src_entries[i].hash;
-            entries[i].key = key;
-            if (key != NULL && key != py_set_dummy) {
-                py_incref(key);
-            }
-            pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-                from,
+        if (size < (int64_t)sizeof(PySetObject)) goto done;
+        if (capacity < 0) goto done;
+        if (capacity > 0) {
+            if (src_entries == NULL) goto done;
+            if (capacity > INT64_MAX / (int64_t)sizeof(SetEntry)) goto done;
+            SetEntry *entries = (SetEntry *)malloc(
+                (size_t)capacity * sizeof(SetEntry)
+            );
+            if (entries == NULL) goto done;
+            memcpy(entries, src_entries, (size_t)capacity * sizeof(SetEntry));
+            dst->entries = entries;
+            (void)pcc_gc_backend4_zpage_register_owner_payload_span_unlocked(
                 to,
-                &src_entries[i].key,
-                &entries[i].key
+                entries,
+                capacity * (int64_t)sizeof(SetEntry)
             );
         }
-
-        dst->entries = entries;
         dst->capacity = capacity;
         dst->size = src->size;
         dst->fill = src->fill;
-        return 0;
     }
     if (tag == PY_TYPE_TUPLE) {
         PyTupleObject *src = (PyTupleObject *)from;
-        PyTupleObject *dst = (PyTupleObject *)to;
         int64_t length = src->len;
-        dst->len = 0;
-
-        if (length < 0) return -1;
+        if (length < 0) goto done;
         if (length > (
             INT64_MAX - (int64_t)sizeof(PyTupleObject)
         ) / (int64_t)sizeof(PyObject *)) {
-            return -1;
+            goto done;
         }
         int64_t required = (int64_t)sizeof(PyTupleObject)
             + length * (int64_t)sizeof(PyObject *);
-        if (size < required) return -1;
-
-        for (int64_t i = 0; i < length; i++) {
-            py_incref(dst->items[i]);
-            pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-                from,
+        if (size < required) goto done;
+    }
+    if (tag == PY_TYPE_LIST) {
+        PyListObject *src = (PyListObject *)from;
+        PyListObject *dst = (PyListObject *)to;
+        int64_t length = src->length;
+        int64_t capacity = src->capacity;
+        PyObject **src_items = src->items;
+        dst->length = 0;
+        dst->capacity = 0;
+        dst->items = NULL;
+        if (length < 0 || capacity < length) goto done;
+        if (capacity > 0) {
+            if (src_items == NULL) goto done;
+            if (capacity > INT64_MAX / (int64_t)sizeof(PyObject *)) goto done;
+            PyObject **items = (PyObject **)calloc(
+                (size_t)capacity, sizeof(PyObject *)
+            );
+            if (items == NULL) goto done;
+            memcpy(items, src_items, (size_t)length * sizeof(PyObject *));
+            dst->items = items;
+            (void)pcc_gc_backend4_zpage_register_owner_payload_span_unlocked(
                 to,
-                &src->items[i],
-                &dst->items[i]
+                items,
+                capacity * (int64_t)sizeof(PyObject *)
             );
         }
-        dst->len = length;
-        return 0;
-    }
-    if (tag != PY_TYPE_LIST) return 0;
-
-    PyListObject *src = (PyListObject *)from;
-    PyListObject *dst = (PyListObject *)to;
-    int64_t length = src->length;
-    int64_t capacity = src->capacity;
-    PyObject **src_items = src->items;
-
-    dst->length = 0;
-    dst->capacity = 0;
-    dst->items = NULL;
-
-    if (length < 0 || capacity < length) return -1;
-    if (capacity == 0) return 0;
-    if (src_items == NULL) return -1;
-    if (capacity > INT64_MAX / (int64_t)sizeof(PyObject *)) return -1;
-
-    PyObject **items = (PyObject **)calloc(
-        (size_t)capacity, sizeof(PyObject *)
-    );
-    if (items == NULL) return -1;
-    for (int64_t i = 0; i < length; i++) {
-        items[i] = src_items[i];
-        py_incref(items[i]);
+        dst->length = length;
+        dst->capacity = capacity;
     }
 
-    dst->items = items;
-    dst->length = length;
-    dst->capacity = capacity;
-    for (int64_t i = 0; i < capacity; i++) {
-        pcc_gc_backend4_remembered_set_retarget_slot_unlocked(
-            from,
-            to,
-            &src_items[i],
-            &items[i]
+    if (pcc_gc_relocate_copy_slots(from, to, &pairs) != 0) goto done;
+    if (
+        tag == PY_TYPE_CLASS
+        && py_class_attrs_retarget((PyClassObject *)from, (PyClassObject *)to) != 0
+    ) goto done;
+    if (tag == PY_TYPE_WEAKREF && py_weakref_retarget(from, to) != 0) goto done;
+    if (
+        tag == PY_TYPE_CONTINUATION
+        && continuation_src_chunk != NULL
+        && ((PyContinuationObject *)from)->mounted == 0
+    ) {
+        pcc_gc_retarget_continuation_root_slots_unlocked(
+            continuation_src_chunk->slots,
+            &continuation_src_chunk->root_map_slot_count,
+            continuation_dst_chunk->slots,
+            &continuation_dst_chunk->root_map_slot_count
         );
     }
-    return 0;
+    result = 0;
+
+done:
+    pcc_gc_relocate_slot_pairs_dispose(&pairs);
+    return result;
 }
 
 static int pcc_gc_backend_uses_forwarding(void) {
-    return pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
-        || pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING;
+    return pcc_gc_backend_kind_uses_forwarding(pcc_gc_selected_backend);
 }
 
 static int pcc_gc_backend4_evacuation_policy_accept(int64_t size) {
@@ -4439,6 +5007,7 @@ static int pcc_gc_backend4_evacuation_page_add_unlocked(PccGcZPage *page) {
     if (pcc_gc_backend4_evacuation_page_find_unlocked(page) != NULL) {
         return 0;
     }
+    pcc_gc_backend4_active_page_clear_unlocked(page);
     PccGcZPageEvacuationNode *n = (PccGcZPageEvacuationNode *)calloc(
         1, sizeof(PccGcZPageEvacuationNode)
     );
@@ -4715,6 +5284,11 @@ int64_t pcc_gc_select_relocation_set(int64_t budget) {
 
 static int64_t pcc_gc_known_object_size_unlocked(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return 0;
+    PccGcObjectNode *indexed =
+        (PccGcObjectNode *)pcc_gc_object_index_find(obj);
+    if (indexed != NULL && !pcc_gc_object_node_is_freeing(indexed)) {
+        return indexed->size;
+    }
     for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
         if (n->obj == obj && !pcc_gc_object_node_is_freeing(n)) {
             return n->size;
@@ -4754,12 +5328,31 @@ static PyObject *pcc_gc_relocate_copy_unlocked(PyObject *from, int64_t size) {
             & ~(PY_FLAG_GC_RELOCATION_CANDIDATE | PY_FLAG_GC_RELOCATION_TARGET)
     );
     if (to == NULL) return NULL;
+    /* The header memcpy below clobbers `to`'s flags with `from`'s.
+     * Allocation-origin bits describe WHERE `to` physically lives and
+     * must survive the copy: losing ZPAGE_ALLOC undercounts the page's
+     * pending_forwardings on chained relocations (page destroyed while
+     * forwarded -> UAF), and inheriting a stale bit leaks/mis-frees. */
+    int32_t to_residency = py_header_flags_load(py_header(to))
+        & (
+            PY_FLAG_GC_ZPAGE_ALLOC
+            | PY_FLAG_GC_MINOR_ARENA
+            | PY_FLAG_GC_MALLOC_ALLOC
+        );
     memcpy(to, from, (size_t)size);
     PyObjectHeader *to_h = py_header(to);
     to_h->refcount = 1;
     py_header_flags_and(
-        to_h, ~(PY_FLAG_GC_RELOCATION_CANDIDATE | PY_FLAG_GC_RELOCATION_TARGET)
+        to_h,
+        ~(
+            PY_FLAG_GC_RELOCATION_CANDIDATE
+            | PY_FLAG_GC_RELOCATION_TARGET
+            | PY_FLAG_GC_ZPAGE_ALLOC
+            | PY_FLAG_GC_MINOR_ARENA
+            | PY_FLAG_GC_MALLOC_ALLOC
+        )
     );
+    py_header_flags_or(to_h, to_residency);
     if (pcc_gc_relocate_copy_payload(from, to, size) != 0) {
         py_decref(to);
         return NULL;
@@ -4767,6 +5360,22 @@ static PyObject *pcc_gc_relocate_copy_unlocked(PyObject *from, int64_t size) {
     if (pcc_gc_install_forwarding(from, to) != 0) {
         py_decref(to);
         return NULL;
+    }
+    /* Count-on-NEW (remap design R2): move the OLD copy's entire
+     * outstanding refcount onto the new copy now, and make the old
+     * copy an immortal shell. From here on every incref/decref through
+     * a stale pointer resolves to the new copy (py_incref/py_decref
+     * candidate branches), slot heals are count-neutral, and the shell
+     * is freed by page retirement after the remap pass — never by
+     * refcount. */
+    {
+        int64_t outstanding = pcc_refcount_load(&from_h->refcount);
+        if (outstanding > 0) {
+            __atomic_add_fetch(
+                &py_header(to)->refcount, outstanding, __ATOMIC_ACQ_REL
+            );
+        }
+        py_header_flags_or(from_h, PY_FLAG_IMMORTAL);
     }
     PccGcZPage *from_page = NULL;
     PccGcZPageNode *from_zpage = pcc_gc_backend4_zpage_find_unlocked(from);
@@ -4823,6 +5432,14 @@ static int64_t pcc_gc_relocate_selected_unlocked(int64_t budget) {
             1,
             __ATOMIC_RELAXED
         );
+    }
+    if (
+        pcc_gc_relocation_set == NULL
+        && pcc_gc_forwarding_population > 0
+    ) {
+        /* Evacuation drained: heal roots/slots and mark forwarding entries
+         * retiring. A later idle step performs the second epoch retirement. */
+        pcc_gc_backend4_remap_and_retire_unlocked();
     }
     return moved;
 }
@@ -4890,6 +5507,12 @@ int64_t pcc_gc_backend4_evacuation_page_drain(int64_t page_budget) {
             __ATOMIC_RELAXED
         );
     }
+    if (
+        pcc_gc_relocation_set == NULL
+        && pcc_gc_forwarding_population > 0
+    ) {
+        pcc_gc_backend4_remap_and_retire_unlocked();
+    }
     pcc_gc_graph_unlock();
     return moved;
 }
@@ -4914,9 +5537,17 @@ static int64_t pcc_gc_install_forwarding_unlocked(PyObject *from, PyObject *to) 
     PccGcForwardNode *existing = pcc_gc_forwarding_find(from);
     if (existing != NULL) {
         if (existing->to != to) {
+            PccGcForwardNode *target_head = NULL;
+            if (
+                pcc_gc_forwarding_target_prepare(
+                    to, existing, &target_head
+                ) < 0
+            ) return -1;
             py_incref(to);
+            pcc_gc_forwarding_target_unlink(existing);
             PyObject *old = existing->to;
             existing->to = to;
+            pcc_gc_forwarding_target_attach_prepared(existing, target_head);
             py_decref(old);
         }
     } else {
@@ -4928,7 +5559,36 @@ static int64_t pcc_gc_install_forwarding_unlocked(PyObject *from, PyObject *to) 
         n->from = from;
         n->to = to;
         n->next = pcc_gc_forwardings;
+        n->prev = NULL;
+        if (pcc_gc_forwardings != NULL) pcc_gc_forwardings->prev = n;
         pcc_gc_forwardings = n;
+        if (pcc_gc_forwarding_index_insert(from, n) < 0) {
+            pcc_gc_forwardings = n->next;
+            if (n->next != NULL) n->next->prev = NULL;
+            py_decref(to);
+            free(n);
+            return -1;
+        }
+        PccGcForwardNode *target_head = NULL;
+        if (pcc_gc_forwarding_target_prepare(to, n, &target_head) < 0) {
+            (void)pcc_gc_forwarding_index_remove(from);
+            pcc_gc_forwarding_unlink_main(n);
+            py_decref(to);
+            free(n);
+            return -1;
+        }
+        pcc_gc_forwarding_target_attach_prepared(n, target_head);
+        pcc_gc_forwarding_population++;
+        if (
+            pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING
+            && (py_header_flags_load(from_h) & PY_FLAG_GC_ZPAGE_ALLOC) != 0
+        ) {
+            PccGcZPageNode *zn = pcc_gc_backend4_zpage_find_unlocked(from);
+            if (zn != NULL && zn->page != NULL) {
+                zn->page->pending_forwardings++;
+                n->from_page = zn->page;
+            }
+        }
     }
     py_header_flags_or(from_h, PY_FLAG_GC_RELOCATION_CANDIDATE);
     py_header_flags_or(py_header(to), PY_FLAG_GC_RELOCATION_TARGET);
@@ -4944,14 +5604,17 @@ int64_t pcc_gc_install_forwarding(PyObject *from, PyObject *to) {
     return rc;
 }
 
-static int64_t pcc_gc_step_generational_promotion(int64_t budget);
+static int64_t pcc_gc_step_generational_promotion(
+    int64_t budget,
+    int promote_all_young
+);
 
 static void pcc_gc_minor_collect_reset(void) {
     __atomic_add_fetch(
         &pcc_gc_minor_collections, 1, __ATOMIC_RELAXED
     );
     if (pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
-        (void)pcc_gc_step_generational_promotion(1024);
+        (void)pcc_gc_step_generational_promotion(1024, 0);
     }
     __atomic_store_n(&pcc_gc_minor_bytes, 0, __ATOMIC_RELEASE);
 }
@@ -4999,6 +5662,25 @@ static PccGcMinorBlock *pcc_gc_minor_new_block(int64_t min_bytes) {
     return block;
 }
 
+static PccGcMinorBlock *pcc_gc_minor_find_reusable_block(int64_t min_bytes) {
+    int64_t owner_thread_id = pcc_current_thread_id();
+    pcc_gc_graph_lock();
+    for (PccGcMinorBlock *block = pcc_gc_minor_blocks; block != NULL; block = block->next) {
+        if (block->owner_thread_id != owner_thread_id) continue;
+        if (__atomic_load_n(&block->live_objects, __ATOMIC_ACQUIRE) != 0) {
+            continue;
+        }
+        if ((int64_t)(block->end - block->base) < min_bytes) continue;
+        block->ptr = block->base;
+        pcc_gc_graph_unlock();
+        pcc_gc_minor_current = block;
+        __atomic_store_n(&pcc_gc_minor_bytes, 0, __ATOMIC_RELEASE);
+        return block;
+    }
+    pcc_gc_graph_unlock();
+    return NULL;
+}
+
 void *pcc_gc_try_minor_alloc(int64_t bytes) {
     pcc_gc_init_config();
     if (pcc_gc_selected_backend != PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
@@ -5015,10 +5697,25 @@ void *pcc_gc_try_minor_alloc(int64_t bytes) {
 
     PccGcMinorBlock *block = pcc_gc_minor_current;
     if (
-        block == NULL
-        || (int64_t)(block->end - block->ptr) < aligned
+        block != NULL
+        && (int64_t)(block->end - block->ptr) < aligned
     ) {
-        if (block != NULL) pcc_gc_minor_collect_reset();
+        if (
+            block->owner_thread_id == pcc_current_thread_id()
+            && __atomic_load_n(&block->live_objects, __ATOMIC_ACQUIRE) == 0
+            && (int64_t)(block->end - block->base) >= aligned
+        ) {
+            block->ptr = block->base;
+            __atomic_store_n(&pcc_gc_minor_bytes, 0, __ATOMIC_RELEASE);
+        } else {
+            pcc_gc_minor_collect_reset();
+            block = pcc_gc_minor_find_reusable_block(aligned);
+        }
+    }
+    if (block == NULL) {
+        block = pcc_gc_minor_find_reusable_block(aligned);
+    }
+    if (block == NULL) {
         block = pcc_gc_minor_new_block(aligned);
         if (block == NULL) {
             __atomic_add_fetch(
@@ -5050,7 +5747,14 @@ static int pcc_gc_should_track_frame_roots(void) {
         || pcc_gc_backend0_frame_roots_enabled != 0;
 }
 
+static int pcc_gc_frame_roots_disabled_fast(void) {
+    return pcc_gc_config_initialized != 0
+        && pcc_gc_selected_backend == PCC_GC_KIND_REFCOUNT_CYCLE
+        && pcc_gc_backend0_frame_roots_enabled == 0;
+}
+
 int64_t pcc_gc_backend(void) {
+    if (pcc_gc_config_initialized) return pcc_gc_selected_backend;
     pcc_gc_init_config();
     return pcc_gc_selected_backend;
 }
@@ -5059,13 +5763,19 @@ int64_t pcc_gc_set_backend(int64_t backend) {
     pcc_gc_init_config();
     if (!pcc_gc_backend_valid(backend)) return -1;
     int64_t old_backend = pcc_gc_selected_backend;
+    if (pcc_gc_backend_kind_uses_forwarding(backend)) {
+        pcc_gc_update_read_barrier_enabled(backend);
+    }
     if (backend == PCC_GC_KIND_REFCOUNT_CYCLE) {
         pcc_gc_backend0_frame_roots_enabled = 1;
     }
     pcc_gc_graph_lock();
     pcc_gc_selected_backend = backend;
+    pcc_gc_update_read_barrier_enabled(backend);
     pcc_gc_mark_active_store(0);
     pcc_gc_cycle_requested_store(1);
+    pcc_gc_trace_cursor = NULL;
+    pcc_gc_gray_count_store(0);
     __atomic_store_n(&pcc_gc_debt_bytes, 0, __ATOMIC_RELEASE);
     if (!pcc_gc_tracks_objects()) {
         while (pcc_gc_objects != NULL) {
@@ -5073,6 +5783,7 @@ int64_t pcc_gc_set_backend(int64_t backend) {
             free(pcc_gc_objects);
             pcc_gc_objects = next;
         }
+        pcc_gc_object_index_clear();
         __atomic_store_n(&pcc_gc_live_bytes, 0, __ATOMIC_RELEASE);
     }
     pcc_gc_graph_unlock();
@@ -5118,6 +5829,21 @@ int64_t pcc_gc_telemetry(int64_t metric) {
     }
     if (metric == PCC_GC_COUNTER_MAX_PAUSE_US) {
         return __atomic_load_n(&pcc_gc_max_pause_us, __ATOMIC_RELAXED);
+    }
+    if (metric == PCC_GC_COUNTER_PAUSE_COUNT) {
+        return __atomic_load_n(&pcc_gc_pause_count, __ATOMIC_RELAXED);
+    }
+    if (metric == PCC_GC_COUNTER_PAUSE_SUM_US) {
+        return __atomic_load_n(&pcc_gc_pause_sum_us, __ATOMIC_RELAXED);
+    }
+    if (
+        metric >= PCC_GC_COUNTER_PAUSE_HIST_LT_100US
+        && metric <= PCC_GC_COUNTER_PAUSE_HIST_GE_10MS
+    ) {
+        return __atomic_load_n(
+            &pcc_gc_pause_hist[metric - PCC_GC_COUNTER_PAUSE_HIST_LT_100US],
+            __ATOMIC_RELAXED
+        );
     }
     if (metric == PCC_GC_COUNTER_MINOR_ALLOCATIONS) {
         return __atomic_load_n(
@@ -5580,10 +6306,18 @@ static void pcc_gc_backend4_reseed_relocation_epoch_state(void) {
 
 void pcc_gc_telemetry_reset(void) {
     pcc_gc_init_config();
+    pcc_gc_graph_lock();
+    pcc_gc_backend3_remembered_owners_clear_unlocked();
+    pcc_gc_graph_unlock();
     for (int i = 0; i <= PCC_GC_COUNTER_WORK_STEPS; i++) {
         __atomic_store_n(&pcc_gc_metrics[i], 0, __ATOMIC_RELAXED);
     }
     __atomic_store_n(&pcc_gc_max_pause_us, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcc_gc_pause_count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcc_gc_pause_sum_us, 0, __ATOMIC_RELAXED);
+    for (int hi = 0; hi < 4; hi++) {
+        __atomic_store_n(&pcc_gc_pause_hist[hi], 0, __ATOMIC_RELAXED);
+    }
     __atomic_store_n(&pcc_gc_minor_allocations, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&pcc_gc_minor_collections, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&pcc_gc_minor_bytes, 0, __ATOMIC_RELAXED);
@@ -5742,17 +6476,71 @@ static int pcc_gc_tracks_objects(void) {
     return pcc_gc_selected_backend != PCC_GC_KIND_REFCOUNT_CYCLE;
 }
 
+static int pcc_gc_backend3_graph_leaf_tag(int32_t tag) {
+    switch (tag) {
+        case PY_TYPE_NONE:
+        case PY_TYPE_BOOL:
+        case PY_TYPE_INT:
+        case PY_TYPE_FLOAT:
+        case PY_TYPE_STR:
+        case PY_TYPE_COMPLEX:
+        case PY_TYPE_BYTES:
+        case PY_TYPE_BYTEARRAY:
+        case PY_TYPE_CPY_HANDLE:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static int pcc_gc_is_known_object(PyObject *o) {
     if (!pcc_gc_tracks_objects()) return 0;
     if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
-    for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
-        if (n->obj == o && !pcc_gc_object_node_is_freeing(n)) return 1;
+    PccGcObjectNode *indexed = (PccGcObjectNode *)pcc_gc_object_index_find(o);
+    if (indexed != NULL) {
+        return pcc_gc_object_node_is_active(indexed) ? 1 : 0;
     }
+    /* The object index is authoritative; the historical O(N) list
+     * fallback turned every index miss into a full-heap walk (95%+ of
+     * cc-tier gc4 churn wall time through the resolve-first paths). */
     return 0;
 }
 
 int64_t pcc_gc_object_is_known_no_lock(PyObject *obj) {
     return pcc_gc_is_known_object(obj) ? 1 : 0;
+}
+
+/* Backend-4 read-barrier safe candidate decision (G-P0-LONGRUN exit UAF).
+ *
+ * The read barrier used to decide "does this slot value need relocation
+ * resolution?" by loading the value's header flags directly
+ * (py_gc_relocation_candidate -> py_header_flags_load). Under backend #4
+ * churn a slot can hold a STALE reference: a freed malloc'd child, or an
+ * old copy whose address the object index / forwarding table never mapped.
+ * The address heuristic (py_pointer_can_have_header) cannot tell a
+ * plausible-looking-but-unmapped address apart from a live one, so the
+ * header load faulted at exit-time list dealloc (No.6/No.9 in
+ * docs/investigations/gc-backend4-churn-exit-list-item-uaf.md).
+ *
+ * The object index and forwarding table are pointer-VALUE hash lookups; they
+ * never dereference the pointer. Consult them FIRST and only touch the
+ * header of a proven-mapped (known-live) object:
+ *   - forwarded stale reference   -> resolve (no header deref)
+ *   - known-live object           -> safe to read its candidate flag
+ *   - unknown & unforwarded        -> a dead pointer leaked into the slot;
+ *                                     do NOT dereference, do not resolve.
+ * This bounds the stale-borrow window (No.10 case 3) without a fault and
+ * without weakening relocation semantics for live objects. */
+int64_t pcc_gc_backend4_slot_needs_resolve(PyObject *value) {
+    if (value == NULL || PY_IS_TAGGED_INT(value)) return 0;
+    if (pcc_gc_forwarding_find(value) != NULL) return 1;
+    if (pcc_gc_is_known_object(value)) {
+        return (
+            py_header_flags_load(py_header(value))
+            & PY_FLAG_GC_RELOCATION_CANDIDATE
+        ) != 0 ? 1 : 0;
+    }
+    return 0;
 }
 
 int64_t pcc_gc_object_is_known(PyObject *obj) {
@@ -5801,31 +6589,32 @@ static void pcc_gc_clear_slot(PyObject **slot) {
     py_decref(child);
 }
 
+static void pcc_gc_clear_owned_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    (void)ctx;
+    if (role != PY_OBJ_SLOT_OWNED) return;
+    pcc_gc_clear_slot(slot);
+}
+
 static void pcc_gc_clear_referents(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
     int32_t tag = py_header(o)->type_tag;
+    (void)py_obj_visit_slots(o, pcc_gc_clear_owned_slot, NULL);
     if (tag == PY_TYPE_LIST) {
         PyListObject *l = (PyListObject *)o;
-        for (int64_t i = 0; i < l->length; i++) {
-            pcc_gc_clear_slot(&l->items[i]);
-        }
         l->length = 0;
     } else if (tag == PY_TYPE_TUPLE) {
         PyTupleObject *t = (PyTupleObject *)o;
-        for (int64_t i = 0; i < t->len; i++) {
-            pcc_gc_clear_slot(&t->items[i]);
-        }
         t->len = 0;
     } else if (tag == PY_TYPE_DICT) {
         PyDictObject *d = (PyDictObject *)o;
         if (d->entries != NULL) {
             for (int64_t i = 0; i < d->entries_used; i++) {
                 DictEntry *e = &d->entries[i];
-                if (e->key != NULL) {
-                    pcc_gc_clear_slot(&e->key);
-                    pcc_gc_clear_slot(&e->value);
-                    e->hash = 0;
-                }
+                e->hash = 0;
             }
         }
         if (d->indices != NULL) {
@@ -5839,95 +6628,12 @@ static void pcc_gc_clear_referents(PyObject *o) {
         PySetObject *s = (PySetObject *)o;
         if (s->entries != NULL) {
             for (int64_t i = 0; i < s->capacity; i++) {
-                PyObject *key = s->entries[i].key;
-                if (key != NULL && key != py_set_dummy) {
-                    s->entries[i].key = NULL;
-                    if (!pcc_gc_is_sweep_candidate(key)) py_decref(key);
-                } else {
-                    s->entries[i].key = NULL;
-                }
+                s->entries[i].key = NULL;
                 s->entries[i].hash = 0;
             }
         }
         s->size = 0;
         s->fill = 0;
-    } else if (tag == PY_TYPE_FUNC) {
-        PyFuncObject *f = (PyFuncObject *)o;
-        pcc_gc_clear_slot(&f->captures);
-        pcc_gc_clear_slot(&f->self_obj);
-    } else if (tag == PY_TYPE_ITER) {
-        PyIterObject *it = (PyIterObject *)o;
-        pcc_gc_clear_slot(&it->seq);
-    } else if (tag == PY_TYPE_GEN) {
-        PyGenObject *g = (PyGenObject *)o;
-        pcc_gc_clear_slot(&g->frame);
-        pcc_gc_clear_slot(&g->send_value);
-    } else if (tag == PY_TYPE_COROUTINE) {
-        PccGcCoroutineObject *c = (PccGcCoroutineObject *)o;
-        pcc_gc_clear_slot(&c->captures);
-        pcc_gc_clear_slot(&c->args);
-        pcc_gc_clear_slot(&c->result);
-    } else if (tag == PY_TYPE_CONTINUATION) {
-        PyContinuationObject *c = (PyContinuationObject *)o;
-        PyContinuationStackChunk *chunk = c->stack_chunk;
-        if (chunk != NULL && chunk->slots != NULL) {
-            for (int64_t i = 0; i < chunk->slot_count; i++) {
-                pcc_gc_clear_slot(&chunk->slots[i]);
-            }
-        }
-    } else if (tag == PY_TYPE_TASK) {
-        PyTaskObject *t = (PyTaskObject *)o;
-        pcc_gc_clear_slot(&t->coro);
-        pcc_gc_clear_slot(&t->result);
-        pcc_gc_clear_slot(&t->waiter);
-    } else if (tag == PY_TYPE_VIRTUAL_THREAD) {
-        PyVirtualThreadObject *t = (PyVirtualThreadObject *)o;
-        pcc_gc_clear_slot(&t->continuation);
-        pcc_gc_clear_slot(&t->result);
-    } else if (tag == PY_TYPE_EXC) {
-        PyExceptionObject *e = (PyExceptionObject *)o;
-        pcc_gc_clear_slot((PyObject **)&e->exc_class);
-        pcc_gc_clear_slot(&e->message);
-        pcc_gc_clear_slot(&e->cause);
-        pcc_gc_clear_slot(&e->context);
-    } else if (tag == PY_TYPE_PROPERTY) {
-        PyPropertyObject *p = (PyPropertyObject *)o;
-        pcc_gc_clear_slot(&p->fget);
-        pcc_gc_clear_slot(&p->fset);
-        pcc_gc_clear_slot(&p->fdel);
-    } else if (tag == PY_TYPE_CLASSMETHOD) {
-        PyClassMethodObject *m = (PyClassMethodObject *)o;
-        pcc_gc_clear_slot(&m->func);
-    } else if (tag == PY_TYPE_STATICMETHOD) {
-        PyStaticMethodObject *m = (PyStaticMethodObject *)o;
-        pcc_gc_clear_slot(&m->func);
-    } else if (tag == PY_TYPE_MEMORYVIEW) {
-        PyMemoryViewObject *mv = (PyMemoryViewObject *)o;
-        pcc_gc_clear_slot(&mv->base);
-    } else if (tag == PY_TYPE_CLASS) {
-        PyClassObject *cls = (PyClassObject *)o;
-        pcc_gc_clear_slot(&cls->attrs);
-    } else if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
-        PyInstanceObject *inst = (PyInstanceObject *)o;
-        PyClassObject *cls = inst->cls;
-        if (cls != NULL) {
-            int32_t n_fields = cls->n_fields;
-            if (n_fields < 0) n_fields = 0;
-            for (int32_t i = 0; i < n_fields; i++) {
-                pcc_gc_clear_slot(&inst->fields[i]);
-            }
-            if ((cls->h.flags & 2) == 0) {
-                pcc_gc_clear_slot(&inst->fields[n_fields]);
-            }
-        }
-    } else if (tag == PY_TYPE_WEAKREF) {
-        PyWeakRefObject *wr = (PyWeakRefObject *)o;
-        pcc_gc_clear_slot(&wr->callback);
-    } else if (tag == PY_TYPE_THREAD) {
-        PccGcThreadObject *t = (PccGcThreadObject *)o;
-        pcc_gc_clear_slot(&t->callable);
-        pcc_gc_clear_slot(&t->args);
-        pcc_gc_clear_slot(&t->result);
     }
 }
 
@@ -5948,7 +6654,18 @@ static void pcc_gc_clear_unreachable(PyObject *o) {
 static void pcc_gc_finalize_unreachable(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
     PyObjectHeader *h = py_header(o);
-    pcc_gc_note_object_freeing(o);
+    int32_t flags = py_header_flags_load(h);
+    int delay_zpage_freeing_note = (
+        pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING
+        && (flags & PY_FLAG_GC_ZPAGE_ALLOC) != 0
+    );
+    /* Publish logical death before any type-specific deallocator can reach a
+     * safepoint.  Refcount-zero forwarding shells do not set this bit; only an
+     * object that is actually entering finalization does. */
+    py_header_flags_or(h, PY_FLAG_GC_DEALLOCATING);
+    if (!delay_zpage_freeing_note) {
+        pcc_gc_note_object_freeing(o);
+    }
     pcc_refcount_forget(&h->refcount);
     py_gc_untrack(o);
     h->refcount = 0;
@@ -5964,6 +6681,7 @@ static void pcc_gc_finalize_unreachable(PyObject *o) {
         case PY_TYPE_CLASS:     py_class_dealloc(o);     break;
         case PY_TYPE_INSTANCE:  py_instance_dealloc(o);  break;
         case PY_TYPE_EXC:       py_dealloc_exc(o);       break;
+        case PY_TYPE_FILE:      py_dealloc_file(o);      break;
         case PY_TYPE_ITER:      py_dealloc_iter(o);      break;
         case PY_TYPE_GEN:       py_dealloc_gen(o);       break;
         case PY_TYPE_COROUTINE: py_dealloc_coroutine(o); break;
@@ -5978,10 +6696,15 @@ static void pcc_gc_finalize_unreachable(PyObject *o) {
         case PY_TYPE_THREAD_CONDITION: py_dealloc_thread_condition(o); break;
         case PY_TYPE_THREAD_SEMAPHORE: py_dealloc_thread_semaphore(o); break;
         case PY_TYPE_THREAD: py_dealloc_thread_thread(o); break;
+        case PY_TYPE_CPY_HANDLE: py_dealloc_cpy_handle(o); break;
         default:
+            if (pcc_capi_dealloc_cext_object(o, (int64_t)h->type_tag) != 0) break;
             if (h->type_tag >= PY_TYPE_USER_CLASS_START) py_instance_dealloc(o);
             else py_dealloc_generic(o);
             break;
+    }
+    if (delay_zpage_freeing_note) {
+        pcc_gc_note_object_freeing(o);
     }
 }
 
@@ -5999,7 +6722,8 @@ static int64_t pcc_gc_sweep_unreachable(int64_t budget) {
         PyObject *o = fn->obj;
         int32_t flags = py_header_flags_load(py_header(o));
         if ((flags & PY_FLAG_GC_SWEEP_CANDIDATE) != 0 &&
-            (flags & (PY_FLAG_GC_PINNED | PY_FLAG_GC_FRESH_ALLOC)) == 0) {
+            (flags & (PY_FLAG_GC_PINNED | PY_FLAG_GC_FRESH_ALLOC)) == 0 &&
+            pcc_capi_is_cext_type_tag((int64_t)py_header(o)->type_tag) == 0) {
             py_user_del_dispatch(o);
         }
     }
@@ -6061,7 +6785,11 @@ static void pcc_gc_gray_object(PyObject *o) {
     }
     if (!pcc_gc_is_known_object(o)) return;
     PyObjectHeader *h = py_header(o);
-    if ((py_header_flags_load(h) & PY_FLAG_GC_BLACK) != 0) return;
+    int32_t flags = py_header_flags_load(h);
+    if ((flags & PY_FLAG_GC_BLACK) != 0) return;
+    if ((flags & PY_FLAG_GC_GRAY) == 0) {
+        pcc_gc_gray_count_inc();
+    }
     py_header_flags_update(h, PY_FLAG_GC_COLOR_MASK, PY_FLAG_GC_GRAY);
 }
 
@@ -6074,6 +6802,10 @@ static void pcc_gc_gray_root_object(PyObject *o) {
     }
     if (!pcc_gc_is_known_object(o)) return;
     PyObjectHeader *h = py_header(o);
+    int32_t flags = py_header_flags_load(h);
+    if ((flags & PY_FLAG_GC_GRAY) == 0) {
+        pcc_gc_gray_count_inc();
+    }
     py_header_flags_update(h, PY_FLAG_GC_COLOR_MASK, PY_FLAG_GC_GRAY);
 }
 
@@ -6081,12 +6813,39 @@ static PyObject *pcc_gc_resolve_root_slot_unlocked(PyObject **slot) {
     if (slot == NULL) return NULL;
     PyObject *value = *slot;
     if (value == NULL || PY_IS_TAGGED_INT(value)) return value;
-    if (!pcc_gc_is_known_object(value)) return value;
+    if (!pcc_gc_is_known_object(value)) {
+        PccGcForwardNode *unknown_forwarding = pcc_gc_forwarding_find(value);
+        if (unknown_forwarding == NULL || unknown_forwarding->to == NULL) {
+            return value;
+        }
+        PyObject *unknown_resolved = unknown_forwarding->to;
+        if (unknown_resolved == value) return value;
+        if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
+            *slot = unknown_resolved;
+            return unknown_resolved;
+        }
+        py_incref(unknown_resolved);
+        *slot = unknown_resolved;
+        py_decref(value);
+        return unknown_resolved;
+    }
+    PyObjectHeader *h = py_header(value);
+    int32_t flags = py_header_flags_load(h);
+    if ((flags & PY_FLAG_GC_RELOCATION_CANDIDATE) == 0) return value;
     PccGcForwardNode *forwarding = pcc_gc_forwarding_find(value);
-    py_header_flags_and(py_header(value), ~PY_FLAG_GC_RELOCATION_CANDIDATE);
-    if (forwarding == NULL || forwarding->to == NULL) return value;
+    if (forwarding == NULL || forwarding->to == NULL) {
+        py_header_flags_and(h, ~PY_FLAG_GC_RELOCATION_CANDIDATE);
+        return value;
+    }
     PyObject *resolved = forwarding->to;
-    if (resolved == value) return value;
+    if (resolved == value) {
+        py_header_flags_and(h, ~PY_FLAG_GC_RELOCATION_CANDIDATE);
+        return value;
+    }
+    if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
+        *slot = resolved;
+        return resolved;
+    }
     py_incref(resolved);
     *slot = resolved;
     py_decref(value);
@@ -6095,14 +6854,19 @@ static PyObject *pcc_gc_resolve_root_slot_unlocked(PyObject **slot) {
 
 static void pcc_gc_mark_forwarded_source_inactive(PyObject *from) {
     if (from == NULL || PY_IS_TAGGED_INT(from)) return;
-    for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
-        if (n->obj != from) continue;
-        if (pcc_gc_object_node_is_freeing(n)) return;
-        if (n->size > 0) pcc_gc_live_bytes_subtract(n->size);
-        pcc_gc_backend4_zpage_remove_unlocked(from);
-        pcc_gc_object_node_set_freeing(n);
-        return;
+    PccGcObjectNode *n = (PccGcObjectNode *)pcc_gc_object_index_find(from);
+    if (n == NULL) {
+        for (PccGcObjectNode *scan = pcc_gc_objects; scan != NULL; scan = scan->next) {
+            if (scan->obj == from) {
+                n = scan;
+                break;
+            }
+        }
     }
+    if (n == NULL || pcc_gc_object_node_is_freeing(n)) return;
+    if (n->size > 0) pcc_gc_live_bytes_subtract(n->size);
+    pcc_gc_backend4_zpage_remove_unlocked(from);
+    pcc_gc_object_node_set_freeing(n);
 }
 
 static PyObject *pcc_gc_generational_oldify_copy(PyObject *from) {
@@ -6113,14 +6877,19 @@ static PyObject *pcc_gc_generational_oldify_copy(PyObject *from) {
     ) {
         return NULL;
     }
-    PccGcForwardNode *existing = pcc_gc_forwarding_find(from);
-    if (existing != NULL) {
-        return existing->to;
+    if (!pcc_gc_is_known_object(from)) {
+        PccGcForwardNode *unknown_existing = pcc_gc_forwarding_find(from);
+        if (unknown_existing != NULL) {
+            return unknown_existing->to;
+        }
+        return NULL;
     }
-    if (!pcc_gc_is_known_object(from)) return NULL;
-
     PyObjectHeader *from_h = py_header(from);
     int32_t from_flags = py_header_flags_load(from_h);
+    PccGcForwardNode *existing = pcc_gc_forwarding_find(from);
+    if (existing != NULL && existing->to != NULL) {
+        return existing->to;
+    }
     if ((from_flags & PY_FLAG_GC_YOUNG) == 0) return NULL;
     if ((from_flags & PY_FLAG_GC_PINNED) != 0) return NULL;
     if (!pcc_gc_relocate_copy_supported_tag(from_h->type_tag)) return NULL;
@@ -6133,7 +6902,7 @@ static PyObject *pcc_gc_generational_oldify_copy(PyObject *from) {
     memcpy(to, from, (size_t)size);
 
     PyObjectHeader *to_h = py_header(to);
-    to_h->refcount = 0;
+    to_h->refcount = 1;
     to_h->flags = (
         to_h->flags
         & ~(
@@ -6143,33 +6912,39 @@ static PyObject *pcc_gc_generational_oldify_copy(PyObject *from) {
             | PY_FLAG_GC_RELOCATION_CANDIDATE
         )
     ) | PY_FLAG_GC_OLD;
+    if (pcc_gc_relocate_copy_payload(from, to, size) != 0) {
+        py_decref(to);
+        return NULL;
+    }
+    to_h->refcount = 0;
 
-    PccGcObjectNode *n = (PccGcObjectNode *)calloc(
-        1, sizeof(PccGcObjectNode)
-    );
+    PccGcObjectNode *n = pcc_gc_object_node_alloc();
     if (n == NULL) {
         free(to);
         return NULL;
     }
     n->obj = to;
     n->size = size;
+    n->freeing = 0;
     n->minor_block = NULL;
-    n->next = pcc_gc_objects;
-    pcc_gc_objects = n;
+    n->next = NULL;
+    n->prev = NULL;
+    n->zpage_node = NULL;
+    pcc_gc_object_node_link_head(n);
+    if (pcc_gc_object_index_insert(to, n) < 0) {
+        pcc_gc_object_node_unlink(n);
+        pcc_gc_object_node_release(n);
+        free(to);
+        return NULL;
+    }
     __atomic_add_fetch(&pcc_gc_live_bytes, size, __ATOMIC_ACQ_REL);
 
     if (pcc_gc_install_forwarding(from, to) != 0) {
-        PccGcObjectNode **cur = &pcc_gc_objects;
-        while (*cur != NULL) {
-            if (*cur == n) {
-                *cur = n->next;
-                break;
-            }
-            cur = &(*cur)->next;
-        }
+        (void)pcc_gc_object_index_remove(to);
+        pcc_gc_object_node_unlink(n);
         pcc_gc_live_bytes_subtract(size);
         pcc_gc_identity_remove(to);
-        free(n);
+        pcc_gc_object_node_release(n);
         free(to);
         return NULL;
     }
@@ -6179,42 +6954,141 @@ static PyObject *pcc_gc_generational_oldify_copy(PyObject *from) {
     return to;
 }
 
+static void pcc_gc_promote_owner_referents(PyObject *o, int recurse);
+static void pcc_gc_promote_remembered_owner_referents(PyObject *o);
+
 static void pcc_gc_promote_young_object(PyObject *o) {
     if (!pcc_gc_is_known_object(o)) return;
     PyObjectHeader *h = py_header(o);
     if ((py_header_flags_load(h) & PY_FLAG_GC_YOUNG) != 0) {
-        if (pcc_gc_generational_oldify_copy(o) != NULL) return;
+        PyObject *oldified = pcc_gc_generational_oldify_copy(o);
+        if (oldified != NULL) {
+            pcc_gc_promote_remembered_owner_referents(oldified);
+            return;
+        }
+        if (
+            pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+            && (py_header_flags_load(h) & PY_FLAG_GC_MINOR_ARENA) != 0
+        ) {
+            py_header_flags_update(
+                h,
+                PY_FLAG_GC_YOUNG | PY_FLAG_GC_REMEMBERED,
+                PY_FLAG_GC_OLD
+            );
+            pcc_gc_promote_remembered_owner_referents(o);
+            return;
+        }
+        PCC_RT_TRIPWIRE((py_header_flags_load(h) & PY_FLAG_GC_OLD) == 0,
+                        "pcc_gc_promote_young_object: promoting a YOUNG object already marked OLD (young->old generation invariant violated)");
         py_header_flags_update(h, PY_FLAG_GC_YOUNG, PY_FLAG_GC_OLD);
         if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
             pcc_gc_backend4_zpage_note_owner_promoted_unlocked(o);
         }
+        if (pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
+            pcc_gc_promote_remembered_owner_referents(o);
+        }
     }
 }
 
-static void pcc_gc_promote_young_slot(PyObject **slot) {
+static void pcc_gc_promote_young_slot_with_mode(PyObject **slot, int recurse) {
     if (slot == NULL) return;
     PyObject *child = *slot;
     if (child == NULL || PY_IS_TAGGED_INT(child)) return;
+    if (!pcc_gc_pointer_can_have_header(child)) return;
+    if (
+        !pcc_gc_is_known_object(child)
+        && pcc_gc_forwarding_find(child) == NULL
+    ) {
+        return;
+    }
+    int32_t child_flags = py_header_flags_load(py_header(child));
+    if (
+        (child_flags & (
+            PY_FLAG_GC_YOUNG | PY_FLAG_GC_RELOCATION_CANDIDATE
+        )) == 0
+    ) {
+        return;
+    }
     PyObject *oldified = pcc_gc_generational_oldify_copy(child);
     if (oldified != NULL && oldified != child) {
         py_incref(oldified);
         *slot = oldified;
+        pcc_gc_promote_remembered_owner_referents(oldified);
         py_decref(child);
         return;
     }
+    if (!recurse) return;
+    pcc_gc_promote_young_object(child);
+}
+
+static void pcc_gc_promote_young_slot(PyObject **slot) {
+    pcc_gc_promote_young_slot_with_mode(slot, 1);
+}
+
+static void pcc_gc_promote_young_borrowed_slot_with_mode(
+    PyObject **slot,
+    int recurse
+) {
+    if (slot == NULL) return;
+    PyObject *child = *slot;
+    if (child == NULL || PY_IS_TAGGED_INT(child)) return;
+    if (!pcc_gc_pointer_can_have_header(child)) return;
+    if (
+        !pcc_gc_is_known_object(child)
+        && pcc_gc_forwarding_find(child) == NULL
+    ) {
+        return;
+    }
+    int32_t child_flags = py_header_flags_load(py_header(child));
+    if (
+        (child_flags & (
+            PY_FLAG_GC_YOUNG | PY_FLAG_GC_RELOCATION_CANDIDATE
+        )) == 0
+    ) {
+        return;
+    }
+    PyObject *oldified = pcc_gc_generational_oldify_copy(child);
+    if (oldified != NULL && oldified != child) {
+        *slot = oldified;
+        pcc_gc_promote_remembered_owner_referents(oldified);
+        return;
+    }
+    if (!recurse) return;
     pcc_gc_promote_young_object(child);
 }
 
 static void pcc_gc_promote_young_borrowed_slot(PyObject **slot) {
-    if (slot == NULL) return;
-    PyObject *child = *slot;
-    if (child == NULL || PY_IS_TAGGED_INT(child)) return;
-    PyObject *oldified = pcc_gc_generational_oldify_copy(child);
-    if (oldified != NULL && oldified != child) {
-        *slot = oldified;
-        return;
+    pcc_gc_promote_young_borrowed_slot_with_mode(slot, 1);
+}
+
+static int pcc_gc_root_slot_value_is_stable(PyObject *value) {
+    if (value == NULL || PY_IS_TAGGED_INT(value)) return 1;
+    if (!pcc_gc_pointer_can_have_header(value)) return 1;
+    if (!pcc_gc_is_known_object(value)) {
+        return pcc_gc_forwarding_find(value) == NULL;
     }
-    pcc_gc_promote_young_object(child);
+    int32_t flags = py_header_flags_load(py_header(value));
+    return (
+        flags & (PY_FLAG_GC_YOUNG | PY_FLAG_GC_RELOCATION_CANDIDATE)
+    ) == 0;
+}
+
+static void pcc_gc_promote_cached_frame_slot(
+    PyObject **slot,
+    PyObject **stable_slot,
+    int borrowed
+) {
+    if (slot == NULL) return;
+    PyObject *before = *slot;
+    if (stable_slot != NULL && *stable_slot == before) return;
+    if (borrowed) {
+        pcc_gc_promote_young_borrowed_slot(slot);
+    } else {
+        pcc_gc_promote_young_slot(slot);
+    }
+    if (stable_slot == NULL) return;
+    PyObject *after = *slot;
+    *stable_slot = pcc_gc_root_slot_value_is_stable(after) ? after : NULL;
 }
 
 static void pcc_gc_trace_referents(
@@ -6222,6 +7096,143 @@ static void pcc_gc_trace_referents(
     void (*visit)(PyObject *child)
 );
 static int64_t pcc_gc_root_slot_count_from_map(const int32_t *frame_map);
+static int pcc_gc_root_map_is_borrowed(const int32_t *frame_map);
+
+typedef void (*PccGcMappedRootSlotVisitor)(
+    PyObject **slot,
+    PyObject **stable_slot,
+    int borrowed,
+    void *ctx
+);
+
+static int64_t pcc_gc_visit_mapped_root_slots_unlocked(
+    int64_t root_count,
+    PyObject **slots,
+    PyObject **stable_values,
+    int borrowed,
+    PccGcMappedRootSlotVisitor visit,
+    void *ctx
+) {
+    int64_t n_slots = root_count;
+    if (n_slots <= 0 || slots == NULL || visit == NULL) return 0;
+    for (int64_t i = 0; i < n_slots; i++) {
+        visit(
+            &slots[i],
+            stable_values == NULL ? NULL : &stable_values[i],
+            borrowed,
+            ctx
+        );
+    }
+    return n_slots;
+}
+
+static void pcc_gc_promote_mapped_root_slot(
+    PyObject **slot,
+    PyObject **stable_slot,
+    int borrowed,
+    void *ctx
+) {
+    (void)ctx;
+    pcc_gc_promote_cached_frame_slot(slot, stable_slot, borrowed);
+}
+
+typedef struct {
+    int resolve;
+} PccGcGrayMappedRootSlotCtx;
+
+static void pcc_gc_gray_mapped_root_slot(
+    PyObject **slot,
+    PyObject **stable_slot,
+    int borrowed,
+    void *ctx
+) {
+    (void)stable_slot;
+    (void)borrowed;
+    PccGcGrayMappedRootSlotCtx *gray_ctx = (PccGcGrayMappedRootSlotCtx *)ctx;
+    int resolve = gray_ctx == NULL || gray_ctx->resolve != 0;
+    PyObject *root = resolve ? pcc_gc_resolve_root_slot_unlocked(slot) : *slot;
+    pcc_gc_gray_root_object(root);
+}
+
+typedef struct {
+    PccGcRootVisitor visit;
+    void *ctx;
+} PccGcVisitRuntimeMappedRootCtx;
+
+static void pcc_gc_visit_runtime_mapped_root_slot(
+    PyObject **slot,
+    PyObject **stable_slot,
+    int borrowed,
+    void *ctx
+) {
+    (void)stable_slot;
+    (void)borrowed;
+    PccGcVisitRuntimeMappedRootCtx *visit_ctx = (
+        PccGcVisitRuntimeMappedRootCtx *
+    )ctx;
+    if (slot == NULL || visit_ctx == NULL || visit_ctx->visit == NULL) {
+        return;
+    }
+    visit_ctx->visit(*slot, visit_ctx->ctx);
+}
+
+typedef struct {
+    int64_t rewritten;
+} PccGcRewriteMappedRootCtx;
+
+static void pcc_gc_rewrite_mapped_root_slot(
+    PyObject **slot,
+    PyObject **stable_slot,
+    int borrowed,
+    void *ctx
+) {
+    (void)stable_slot;
+    (void)borrowed;
+    if (slot == NULL) return;
+    PccGcRewriteMappedRootCtx *rewrite_ctx = (
+        PccGcRewriteMappedRootCtx *
+    )ctx;
+    PyObject *before = *slot;
+    PyObject *after = pcc_gc_resolve_root_slot_unlocked(slot);
+    if (rewrite_ctx != NULL && after != before) rewrite_ctx->rewritten++;
+}
+
+static int64_t pcc_gc_visit_scheduler_root_slots_unlocked(
+    PccGcMappedRootSlotVisitor visit,
+    void *ctx
+) {
+    if (visit == NULL) return 0;
+    int64_t n_slots = 0;
+    for (
+        PccGcSchedulerRootNode *r = pcc_gc_scheduler_roots;
+        r != NULL;
+        r = r->next
+    ) {
+        PCC_RT_TRIPWIRE(
+            r->slot != NULL,
+            "pcc_gc_visit_scheduler_root_slots_unlocked: registered scheduler root has a NULL slot address"
+        );
+        if (r->slot == NULL) continue;
+        visit(r->slot, NULL, 0, ctx);
+        n_slots++;
+    }
+    return n_slots;
+}
+
+static int64_t pcc_gc_visit_builtin_exception_cache_slots_unlocked(
+    PccGcMappedRootSlotVisitor visit,
+    void *ctx
+) {
+    if (visit == NULL) return 0;
+    int64_t n_slots = 0;
+    for (int32_t tag = 0; tag < PY_EXC_N_BUILTIN; tag++) {
+        PyObject **slot = (PyObject **)py_subs_exc_cache_slot(tag);
+        if (slot == NULL) continue;
+        visit(slot, NULL, 0, ctx);
+        n_slots++;
+    }
+    return n_slots;
+}
 
 static void pcc_gc_promote_frame_roots(int64_t budget) {
     if (budget <= 0) return;
@@ -6230,35 +7241,144 @@ static void pcc_gc_promote_frame_roots(int64_t budget) {
         f != NULL;
         f = f->next
     ) {
-        int64_t n_slots = pcc_gc_root_slot_count_from_map(f->frame_map);
-        if (n_slots <= 0 || f->slots == NULL) continue;
-        for (int64_t i = 0; i < n_slots; i++) {
-            pcc_gc_promote_young_slot(&f->slots[i]);
-        }
+        int borrowed = f->borrowed & PCC_GC_FRAME_NODE_FLAG_BORROWED;
+        (void)pcc_gc_visit_mapped_root_slots_unlocked(
+            f->root_count,
+            f->slots,
+            f->stable_values,
+            borrowed,
+            pcc_gc_promote_mapped_root_slot,
+            NULL
+        );
     }
     for (
         PccGcContinuationRootNode *c = pcc_gc_continuation_roots;
         c != NULL;
         c = c->next
     ) {
-        int64_t n_slots = pcc_gc_root_slot_count_from_map(c->frame_map);
-        if (n_slots <= 0 || c->slots == NULL) continue;
-        for (int64_t i = 0; i < n_slots; i++) {
-            pcc_gc_promote_young_slot(&c->slots[i]);
-        }
+        (void)pcc_gc_visit_mapped_root_slots_unlocked(
+            c->root_count,
+            c->slots,
+            c->stable_values,
+            c->borrowed,
+            pcc_gc_promote_mapped_root_slot,
+            NULL
+        );
     }
 }
 
 static void pcc_gc_promote_scheduler_roots(int64_t budget) {
     if (budget <= 0) return;
-    for (
-        PccGcSchedulerRootNode *r = pcc_gc_scheduler_roots;
-        r != NULL;
-        r = r->next
-    ) {
-        if (r->slot == NULL) continue;
-        pcc_gc_promote_young_slot(r->slot);
+    (void)pcc_gc_visit_scheduler_root_slots_unlocked(
+        pcc_gc_promote_mapped_root_slot,
+        NULL
+    );
+    (void)pcc_gc_visit_builtin_exception_cache_slots_unlocked(
+        pcc_gc_promote_mapped_root_slot,
+        NULL
+    );
+}
+
+static void pcc_gc_promote_remembered_owner_referents(PyObject *o);
+
+static void pcc_gc_backend3_remember_owner_unlocked(
+    PyObject *owner,
+    PyObjectHeader *owner_h
+) {
+    if (owner == NULL || owner_h == NULL || PY_IS_TAGGED_INT(owner)) return;
+    int32_t flags = py_header_flags_load(owner_h);
+    if ((flags & PY_FLAG_GC_REMEMBERED) != 0) return;
+    PccGcRememberedOwnerNode *n = (
+        PccGcRememberedOwnerNode *
+    )calloc(1, sizeof(PccGcRememberedOwnerNode));
+    if (n == NULL) {
+        pcc_gc_backend3_remembered_overflow = 1;
+        py_header_flags_or(owner_h, PY_FLAG_GC_REMEMBERED);
+        return;
     }
+    n->owner = owner;
+    n->next = pcc_gc_backend3_remembered_owners;
+    pcc_gc_backend3_remembered_owners = n;
+    py_header_flags_or(owner_h, PY_FLAG_GC_REMEMBERED);
+}
+
+static void pcc_gc_backend3_remembered_owners_clear_unlocked(void) {
+    PccGcRememberedOwnerNode *n = pcc_gc_backend3_remembered_owners;
+    pcc_gc_backend3_remembered_owners = NULL;
+    pcc_gc_backend3_remembered_overflow = 0;
+    while (n != NULL) {
+        PccGcRememberedOwnerNode *next = n->next;
+        free(n);
+        n = next;
+    }
+}
+
+static int64_t pcc_gc_backend3_scan_remembered_owners(int64_t budget) {
+    int64_t processed = 0;
+    for (
+        PccGcObjectNode *n = pcc_gc_objects;
+        n != NULL && processed < budget;
+        n = n->next
+    ) {
+        if (!pcc_gc_object_node_is_active(n)) continue;
+        PyObjectHeader *h = py_header(n->obj);
+        int32_t flags = py_header_flags_load(h);
+        if ((flags & PY_FLAG_GC_REMEMBERED) != 0) {
+            pcc_gc_promote_remembered_owner_referents(n->obj);
+            py_header_flags_and(h, ~PY_FLAG_GC_REMEMBERED);
+            processed++;
+            if ((processed % PCC_GC_SAFEPOINT_BATCH) == 0) {
+                pcc_thread_safepoint();
+            }
+        }
+    }
+    return processed;
+}
+
+static int64_t pcc_gc_backend3_drain_remembered_owners(int64_t budget) {
+    int64_t processed = 0;
+    if (pcc_gc_backend3_remembered_overflow != 0) {
+        pcc_gc_backend3_remembered_owners_clear_unlocked();
+        processed += pcc_gc_backend3_scan_remembered_owners(budget);
+        pcc_gc_backend3_remembered_overflow = 0;
+        return processed;
+    }
+    while (
+        pcc_gc_backend3_remembered_owners != NULL
+        && processed < budget
+    ) {
+        PccGcRememberedOwnerNode *n = pcc_gc_backend3_remembered_owners;
+        pcc_gc_backend3_remembered_owners = n->next;
+        PyObject *owner = n->owner;
+        PCC_RT_TRIPWIRE(owner != NULL,
+                        "pcc_gc_backend3_drain_remembered_owners: remembered-owner entry has NULL owner (insertion rejects NULL; NULL here is a corrupt remembered-set node)");
+        free(n);
+        if (!pcc_gc_is_known_object(owner)) continue;
+        PyObjectHeader *h = py_header(owner);
+        int32_t flags = py_header_flags_load(h);
+        if ((flags & PY_FLAG_GC_REMEMBERED) == 0) continue;
+        pcc_gc_promote_remembered_owner_referents(owner);
+        py_header_flags_and(h, ~PY_FLAG_GC_REMEMBERED);
+        processed++;
+        if ((processed % PCC_GC_SAFEPOINT_BATCH) == 0) {
+            pcc_thread_safepoint();
+        }
+    }
+    return processed;
+}
+
+static void pcc_gc_promote_tls_exception_root(void) {
+    PyObject *cur = (PyObject *)py_tls_exc_get();
+    if (cur == NULL || PY_IS_TAGGED_INT(cur)) return;
+    PyObject *oldified = pcc_gc_generational_oldify_copy(cur);
+    if (oldified != NULL && oldified != cur) {
+        py_incref(oldified);
+        py_tls_exc_set(oldified);
+        pcc_gc_promote_remembered_owner_referents(oldified);
+        py_decref(cur);
+        return;
+    }
+    pcc_gc_promote_young_object(cur);
 }
 
 static void pcc_gc_promote_extension_module_state_root(
@@ -6269,160 +7389,451 @@ static void pcc_gc_promote_extension_module_state_root(
     pcc_gc_promote_young_object(root);
 }
 
-static void pcc_gc_promote_remembered_owner_referents(PyObject *o) {
-    if (o == NULL || PY_IS_TAGGED_INT(o)) return;
+typedef void (*PccGcOwnerSlotVisitor)(PyObject **slot, void *ctx);
+
+static int pcc_gc_visit_core_container_owner_slots(
+    PyObject *o,
+    PccGcOwnerSlotVisitor visit,
+    void *ctx
+) {
+    if (o == NULL || PY_IS_TAGGED_INT(o) || visit == NULL) return 0;
     int32_t tag = py_header(o)->type_tag;
     if (tag == PY_TYPE_LIST) {
         PyListObject *l = (PyListObject *)o;
-        for (int64_t i = 0; i < l->length; i++) {
-            pcc_gc_promote_young_slot(&l->items[i]);
-        }
-        return;
-    } else if (tag == PY_TYPE_TUPLE) {
+        for (int64_t i = 0; i < l->length; i++) visit(&l->items[i], ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_TUPLE) {
         PyTupleObject *t = (PyTupleObject *)o;
-        for (int64_t i = 0; i < t->len; i++) {
-            pcc_gc_promote_young_slot(&t->items[i]);
-        }
-        return;
-    } else if (tag == PY_TYPE_DICT) {
+        for (int64_t i = 0; i < t->len; i++) visit(&t->items[i], ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_DICT) {
         PyDictObject *d = (PyDictObject *)o;
         if (d->entries != NULL) {
             for (int64_t i = 0; i < d->entries_used; i++) {
                 DictEntry *e = &d->entries[i];
                 if (e->key != NULL) {
-                    pcc_gc_promote_young_slot(&e->key);
-                    pcc_gc_promote_young_slot(&e->value);
+                    visit(&e->key, ctx);
+                    visit(&e->value, ctx);
                 }
             }
         }
-        return;
-    } else if (tag == PY_TYPE_SET) {
+        return 1;
+    }
+    if (tag == PY_TYPE_SET) {
         PySetObject *s = (PySetObject *)o;
         if (s->entries != NULL) {
             for (int64_t i = 0; i < s->capacity; i++) {
-                PyObject *k = s->entries[i].key;
-                if (k != NULL && k != py_set_dummy) {
-                    pcc_gc_promote_young_slot(&s->entries[i].key);
-                }
+                PyObject **k = &s->entries[i].key;
+                if (*k != NULL && *k != py_set_dummy) visit(k, ctx);
             }
         }
-        return;
-    } else if (tag == PY_TYPE_FUNC) {
+        return 1;
+    }
+    return 0;
+}
+
+static int pcc_gc_visit_fixed_owner_slots(
+    PyObject *o,
+    PccGcOwnerSlotVisitor visit,
+    void *ctx
+) {
+    if (o == NULL || PY_IS_TAGGED_INT(o) || visit == NULL) return 0;
+    int32_t tag = py_header(o)->type_tag;
+    if (tag == PY_TYPE_FUNC) {
         PyFuncObject *f = (PyFuncObject *)o;
-        pcc_gc_promote_young_slot(&f->captures);
-        pcc_gc_promote_young_slot(&f->self_obj);
-        return;
-    } else if (tag == PY_TYPE_ITER) {
+        visit(&f->capi_self, ctx);
+        visit(&f->capi_module, ctx);
+        visit(&f->capi_weakreflist, ctx);
+        visit(&f->captures, ctx);
+        visit(&f->self_obj, ctx);
+        visit(&f->attrs, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_ITER) {
         PyIterObject *it = (PyIterObject *)o;
-        pcc_gc_promote_young_slot(&it->seq);
-        return;
-    } else if (tag == PY_TYPE_GEN) {
+        visit(&it->seq, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_GEN) {
         PyGenObject *g = (PyGenObject *)o;
-        pcc_gc_promote_young_slot(&g->frame);
-        pcc_gc_promote_young_slot(&g->send_value);
-        return;
-    } else if (tag == PY_TYPE_COROUTINE) {
+        visit(&g->frame, ctx);
+        visit(&g->send_value, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_COROUTINE) {
         PccGcCoroutineObject *c = (PccGcCoroutineObject *)o;
-        pcc_gc_promote_young_slot(&c->captures);
-        pcc_gc_promote_young_slot(&c->args);
-        pcc_gc_promote_young_slot(&c->result);
-        return;
-    } else if (tag == PY_TYPE_CONTINUATION) {
-        PyContinuationObject *c = (PyContinuationObject *)o;
-        PyContinuationStackChunk *chunk = c->stack_chunk;
-        if (chunk != NULL && chunk->slots != NULL) {
-            for (int64_t i = 0; i < chunk->slot_count; i++) {
-                pcc_gc_promote_young_slot(&chunk->slots[i]);
-            }
-        }
-        return;
-    } else if (tag == PY_TYPE_TASK) {
+        visit(&c->captures, ctx);
+        visit(&c->args, ctx);
+        visit(&c->result, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_TASK) {
         PyTaskObject *t = (PyTaskObject *)o;
-        pcc_gc_promote_young_slot(&t->coro);
-        pcc_gc_promote_young_slot(&t->result);
-        pcc_gc_promote_young_slot(&t->waiter);
-        return;
-    } else if (tag == PY_TYPE_VIRTUAL_THREAD) {
+        visit(&t->coro, ctx);
+        visit(&t->result, ctx);
+        visit(&t->waiter, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_VIRTUAL_THREAD) {
         PyVirtualThreadObject *t = (PyVirtualThreadObject *)o;
-        pcc_gc_promote_young_slot(&t->continuation);
-        pcc_gc_promote_young_slot(&t->result);
-        return;
-    } else if (tag == PY_TYPE_EXC) {
+        visit(&t->continuation, ctx);
+        visit(&t->result, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_EXC) {
         PyExceptionObject *e = (PyExceptionObject *)o;
-        pcc_gc_promote_young_slot((PyObject **)&e->exc_class);
-        pcc_gc_promote_young_slot(&e->message);
-        pcc_gc_promote_young_slot(&e->cause);
-        pcc_gc_promote_young_slot(&e->context);
-        return;
-    } else if (tag == PY_TYPE_PROPERTY) {
+        visit((PyObject **)&e->exc_class, ctx);
+        visit(&e->message, ctx);
+        visit(&e->cause, ctx);
+        visit(&e->context, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_PROPERTY) {
         PyPropertyObject *p = (PyPropertyObject *)o;
-        pcc_gc_promote_young_slot(&p->fget);
-        pcc_gc_promote_young_slot(&p->fset);
-        pcc_gc_promote_young_slot(&p->fdel);
-        return;
-    } else if (tag == PY_TYPE_CLASSMETHOD) {
+        visit(&p->fget, ctx);
+        visit(&p->fset, ctx);
+        visit(&p->fdel, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_CLASSMETHOD) {
         PyClassMethodObject *m = (PyClassMethodObject *)o;
-        pcc_gc_promote_young_slot(&m->func);
-        return;
-    } else if (tag == PY_TYPE_STATICMETHOD) {
+        visit(&m->func, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_STATICMETHOD) {
         PyStaticMethodObject *m = (PyStaticMethodObject *)o;
-        pcc_gc_promote_young_slot(&m->func);
-        return;
-    } else if (tag == PY_TYPE_MEMORYVIEW) {
+        visit(&m->func, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_MEMORYVIEW) {
         PyMemoryViewObject *mv = (PyMemoryViewObject *)o;
-        pcc_gc_promote_young_slot(&mv->base);
-        return;
-    } else if (tag == PY_TYPE_CLASS) {
-        PyClassObject *cls = (PyClassObject *)o;
+        visit(&mv->base, ctx);
+        return 1;
+    }
+    if (tag == PY_TYPE_THREAD) {
+        PccGcThreadObject *t = (PccGcThreadObject *)o;
+        visit(&t->callable, ctx);
+        visit(&t->args, ctx);
+        visit(&t->result, ctx);
+        return 1;
+    }
+    return 0;
+}
+
+static int pcc_gc_visit_weakref_slots(
+    PyObject *o,
+    PccGcOwnerSlotVisitor visit_owned,
+    PccGcOwnerSlotVisitor visit_borrowed_update_only,
+    void *ctx
+) {
+    if (
+        o == NULL
+        || PY_IS_TAGGED_INT(o)
+        || (visit_owned == NULL && visit_borrowed_update_only == NULL)
+    ) return 0;
+    int32_t tag = py_header(o)->type_tag;
+    if (tag != PY_TYPE_WEAKREF) return 0;
+    PyWeakRefObject *wr = (PyWeakRefObject *)o;
+    if (visit_borrowed_update_only != NULL) {
+        visit_borrowed_update_only(&wr->target, ctx);
+    }
+    if (visit_owned != NULL) {
+        visit_owned(&wr->callback, ctx);
+    }
+    return 1;
+}
+
+static int pcc_gc_visit_continuation_owner_slots(
+    PyObject *o,
+    PccGcOwnerSlotVisitor visit,
+    void *ctx
+) {
+    if (o == NULL || PY_IS_TAGGED_INT(o) || visit == NULL) return 0;
+    int32_t tag = py_header(o)->type_tag;
+    if (tag != PY_TYPE_CONTINUATION) return 0;
+    PyContinuationObject *c = (PyContinuationObject *)o;
+    PyContinuationStackChunk *chunk = c->stack_chunk;
+    if (chunk != NULL && chunk->slots != NULL) {
+        for (int64_t i = 0; i < chunk->slot_count; i++) {
+            visit(&chunk->slots[i], ctx);
+        }
+    }
+    return 1;
+}
+
+static int pcc_gc_visit_instance_owner_slots(
+    PyObject *o,
+    PccGcOwnerSlotVisitor visit_owned,
+    PccGcOwnerSlotVisitor visit_borrowed,
+    void *ctx
+) {
+    if (
+        o == NULL
+        || PY_IS_TAGGED_INT(o)
+        || (visit_owned == NULL && visit_borrowed == NULL)
+    ) return 0;
+    int32_t tag = py_header(o)->type_tag;
+    if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) return 0;
+    if (
+        tag != PY_TYPE_INSTANCE
+        && tag != PY_TYPE_VALUEBOX
+        && tag < PY_TYPE_USER_CLASS_START
+    ) return 0;
+    PyInstanceObject *inst = (PyInstanceObject *)o;
+    if (inst->cls == NULL) return 1;
+    if (visit_borrowed != NULL) {
+        visit_borrowed((PyObject **)&inst->cls, ctx);
+    }
+    PyClassObject *cls = inst->cls;
+    if (cls == NULL || visit_owned == NULL) return 1;
+    PCC_RT_TRIPWIRE(py_header((PyObject *)cls)->type_tag == PY_TYPE_CLASS,
+                    "pcc_gc_visit_instance_owner_slots: instance->cls is not a live PY_TYPE_CLASS (class freed/over-released; n_fields slot walk would read a zeroed/corrupt class)");
+    int32_t n_fields = cls->n_fields;
+    if (n_fields < 0) n_fields = 0;
+    for (int32_t i = 0; i < n_fields; i++) {
+        visit_owned(&inst->fields[i], ctx);
+    }
+    if ((cls->h.flags & 2) == 0) {
+        visit_owned(&inst->fields[n_fields], ctx);
+    }
+    return 1;
+}
+
+static int pcc_gc_visit_class_slots(
+    PyObject *o,
+    PccGcOwnerSlotVisitor visit_owned,
+    PccGcOwnerSlotVisitor visit_borrowed_traced,
+    PccGcOwnerSlotVisitor visit_borrowed_update_only,
+    void *ctx
+) {
+    if (
+        o == NULL
+        || PY_IS_TAGGED_INT(o)
+        || (
+            visit_owned == NULL
+            && visit_borrowed_traced == NULL
+            && visit_borrowed_update_only == NULL
+        )
+    ) return 0;
+    int32_t tag = py_header(o)->type_tag;
+    if (tag != PY_TYPE_CLASS) return 0;
+    PyClassObject *cls = (PyClassObject *)o;
+    if (visit_borrowed_traced != NULL) {
         if (cls->bases != NULL) {
             for (int32_t i = 0; i < cls->n_bases; i++) {
-                pcc_gc_promote_young_borrowed_slot(
-                    (PyObject **)&cls->bases[i]
-                );
+                visit_borrowed_traced((PyObject **)&cls->bases[i], ctx);
             }
         }
         if (cls->mro != NULL) {
             for (int32_t i = 0; i < cls->n_mro; i++) {
-                pcc_gc_promote_young_borrowed_slot(
-                    (PyObject **)&cls->mro[i]
-                );
+                visit_borrowed_traced((PyObject **)&cls->mro[i], ctx);
             }
         }
+    }
+    if (visit_borrowed_update_only != NULL) {
         if (cls->methods != NULL) {
             for (int32_t i = 0; i < cls->n_methods; i++) {
-                pcc_gc_promote_young_borrowed_slot(&cls->methods[i].func);
+                visit_borrowed_update_only(&cls->methods[i].func, ctx);
             }
         }
-        pcc_gc_promote_young_borrowed_slot(&cls->del_method);
-        pcc_gc_promote_young_slot(&cls->attrs);
-        pcc_gc_promote_young_borrowed_slot((PyObject **)&cls->metaclass);
-        return;
-    } else if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
-        PyInstanceObject *inst = (PyInstanceObject *)o;
-        PyClassObject *cls = inst->cls;
-        if (cls != NULL) {
-            int32_t n_fields = cls->n_fields;
-            if (n_fields < 0) n_fields = 0;
-            for (int32_t i = 0; i < n_fields; i++) {
-                pcc_gc_promote_young_slot(&inst->fields[i]);
-            }
-            if ((cls->h.flags & 2) == 0) {
-                pcc_gc_promote_young_slot(&inst->fields[n_fields]);
-            }
-        }
-        return;
-    } else if (tag == PY_TYPE_WEAKREF) {
-        PyWeakRefObject *wr = (PyWeakRefObject *)o;
-        pcc_gc_promote_young_slot(&wr->callback);
-        return;
-    } else if (tag == PY_TYPE_THREAD) {
-        PccGcThreadObject *t = (PccGcThreadObject *)o;
-        pcc_gc_promote_young_slot(&t->callable);
-        pcc_gc_promote_young_slot(&t->args);
-        pcc_gc_promote_young_slot(&t->result);
+        visit_borrowed_update_only(&cls->del_method, ctx);
+    }
+    if (visit_owned != NULL) {
+        visit_owned(&cls->attrs, ctx);
+    }
+    if (visit_borrowed_traced != NULL) {
+        visit_borrowed_traced((PyObject **)&cls->metaclass, ctx);
+    }
+    return 1;
+}
+
+typedef struct {
+    PyObjSlotVisitor visit;
+    void *ctx;
+} PyObjVisitCtx;
+
+static void py_obj_visit_role_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    PyObjVisitCtx *visit_ctx = (PyObjVisitCtx *)ctx;
+    if (
+        slot == NULL
+        || visit_ctx == NULL
+        || visit_ctx->visit == NULL
+    ) return;
+    visit_ctx->visit(slot, role, visit_ctx->ctx);
+}
+
+static void py_obj_visit_owned_slot(PyObject **slot, void *ctx) {
+    py_obj_visit_role_slot(slot, PY_OBJ_SLOT_OWNED, ctx);
+}
+
+static void py_obj_visit_borrowed_traced_slot(PyObject **slot, void *ctx) {
+    py_obj_visit_role_slot(slot, PY_OBJ_SLOT_BORROWED_TRACED, ctx);
+}
+
+static void py_obj_visit_borrowed_update_only_slot(
+    PyObject **slot,
+    void *ctx
+) {
+    py_obj_visit_role_slot(slot, PY_OBJ_SLOT_BORROWED_UPDATE_ONLY, ctx);
+}
+
+static int py_obj_has_no_pointer_slots(PyObject *o) {
+    if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
+    switch (py_header(o)->type_tag) {
+        case PY_TYPE_NONE:
+        case PY_TYPE_BOOL:
+        case PY_TYPE_INT:
+        case PY_TYPE_FLOAT:
+        case PY_TYPE_STR:
+        case PY_TYPE_COMPLEX:
+        case PY_TYPE_BYTES:
+        case PY_TYPE_BYTEARRAY:
+        case PY_TYPE_FILE:
+        case PY_TYPE_CPY_HANDLE:
+            return 1;
+        /* Thread wait queues store virtual threads in external waiter nodes
+         * registered as scheduler roots, not object-inline PyObject slots. */
+        case PY_TYPE_THREAD_LOCK:
+        case PY_TYPE_THREAD_RLOCK:
+        case PY_TYPE_THREAD_EVENT:
+        case PY_TYPE_THREAD_CONDITION:
+        case PY_TYPE_THREAD_SEMAPHORE:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+int py_obj_visit_slots(PyObject *o, PyObjSlotVisitor visit, void *ctx) {
+    if (o == NULL || PY_IS_TAGGED_INT(o) || visit == NULL) return 0;
+    PCC_RT_TRIPWIRE(py_header(o)->type_tag >= 0,
+                    "py_obj_visit_slots: negative type_tag at trace fan-out entry (corrupt object header)");
+    if (py_obj_has_no_pointer_slots(o)) return 1;
+    PyObjVisitCtx visit_ctx = { visit, ctx };
+    if (
+        pcc_gc_visit_core_container_owner_slots(
+            o,
+            py_obj_visit_owned_slot,
+            &visit_ctx
+        )
+    ) return 1;
+    if (
+        pcc_gc_visit_fixed_owner_slots(
+            o,
+            py_obj_visit_owned_slot,
+            &visit_ctx
+        )
+    ) return 1;
+    if (
+        pcc_gc_visit_weakref_slots(
+            o,
+            py_obj_visit_owned_slot,
+            py_obj_visit_borrowed_update_only_slot,
+            &visit_ctx
+        )
+    ) return 1;
+    if (
+        pcc_gc_visit_continuation_owner_slots(
+            o,
+            py_obj_visit_owned_slot,
+            &visit_ctx
+        )
+    ) return 1;
+    if (
+        pcc_gc_visit_class_slots(
+            o,
+            py_obj_visit_owned_slot,
+            py_obj_visit_borrowed_traced_slot,
+            py_obj_visit_borrowed_update_only_slot,
+            &visit_ctx
+        )
+    ) return 1;
+    if (pcc_capi_visit_cext_object_slots(o, visit, ctx)) return 1;
+    if (
+        pcc_gc_visit_instance_owner_slots(
+            o,
+            py_obj_visit_owned_slot,
+            py_obj_visit_borrowed_traced_slot,
+            &visit_ctx
+        )
+    ) return 1;
+    return 0;
+}
+
+typedef struct {
+    void (*visit)(PyObject *child);
+} PccGcTraceOwnerSlotCtx;
+
+static void pcc_gc_trace_owner_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    PccGcTraceOwnerSlotCtx *trace_ctx = (PccGcTraceOwnerSlotCtx *)ctx;
+    if (role == PY_OBJ_SLOT_BORROWED_UPDATE_ONLY) return;
+    if (slot == NULL || trace_ctx == NULL || trace_ctx->visit == NULL) return;
+    PyObject *child = pcc_gc_load_ptr(NULL, slot);
+    if (child == NULL) return;
+    trace_ctx->visit(child);
+}
+
+typedef struct {
+    void (*update)(PyObject **slot);
+} PccGcUpdateOwnerSlotCtx;
+
+static void pcc_gc_update_owner_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    PccGcUpdateOwnerSlotCtx *update_ctx = (PccGcUpdateOwnerSlotCtx *)ctx;
+    (void)role;
+    if (slot == NULL || update_ctx == NULL || update_ctx->update == NULL) {
         return;
     }
-    pcc_gc_trace_referents(o, pcc_gc_promote_young_object);
+    update_ctx->update(slot);
+}
+
+typedef struct {
+    int recurse;
+} PccGcPromoteOwnerSlotCtx;
+
+static void pcc_gc_promote_owner_slot(
+    PyObject **slot,
+    int32_t role,
+    void *ctx
+) {
+    PccGcPromoteOwnerSlotCtx *promote_ctx = (
+        PccGcPromoteOwnerSlotCtx *
+    )ctx;
+    if (slot == NULL || promote_ctx == NULL) return;
+    if (role == PY_OBJ_SLOT_OWNED) {
+        pcc_gc_promote_young_slot_with_mode(slot, promote_ctx->recurse);
+    } else {
+        pcc_gc_promote_young_borrowed_slot_with_mode(
+            slot,
+            promote_ctx->recurse
+        );
+    }
+}
+
+static void pcc_gc_promote_owner_referents(PyObject *o, int recurse) {
+    if (o == NULL || PY_IS_TAGGED_INT(o)) return;
+    PccGcPromoteOwnerSlotCtx promote_ctx = { recurse };
+    if (py_obj_visit_slots(o, pcc_gc_promote_owner_slot, &promote_ctx)) return;
+    if (recurse) {
+        pcc_gc_trace_referents(o, pcc_gc_promote_young_object);
+    }
+}
+
+static void pcc_gc_promote_remembered_owner_referents(PyObject *o) {
+    pcc_gc_promote_owner_referents(o, 1);
 }
 
 static void pcc_gc_trace_referents(
@@ -6430,118 +7841,25 @@ static void pcc_gc_trace_referents(
     void (*visit)(PyObject *child)
 ) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
-    int32_t tag = py_header(o)->type_tag;
-    if (tag == PY_TYPE_LIST) {
-        PyListObject *l = (PyListObject *)o;
-        for (int64_t i = 0; i < l->length; i++) visit(l->items[i]);
-    } else if (tag == PY_TYPE_TUPLE) {
-        PyTupleObject *t = (PyTupleObject *)o;
-        for (int64_t i = 0; i < t->len; i++) visit(t->items[i]);
-    } else if (tag == PY_TYPE_DICT) {
-        PyDictObject *d = (PyDictObject *)o;
-        if (d->entries != NULL) {
-            for (int64_t i = 0; i < d->entries_used; i++) {
-                DictEntry *e = &d->entries[i];
-                if (e->key != NULL) {
-                    visit(e->key);
-                    visit(e->value);
-                }
-            }
-        }
-    } else if (tag == PY_TYPE_SET) {
-        PySetObject *s = (PySetObject *)o;
-        if (s->entries != NULL) {
-            for (int64_t i = 0; i < s->capacity; i++) {
-                PyObject *k = s->entries[i].key;
-                if (k != NULL && k != py_set_dummy) visit(k);
-            }
-        }
-    } else if (tag == PY_TYPE_FUNC) {
-        PyFuncObject *f = (PyFuncObject *)o;
-        visit(f->captures);
-        visit(f->self_obj);
-    } else if (tag == PY_TYPE_CLASS) {
-        PyClassObject *cls = (PyClassObject *)o;
-        if (cls->bases != NULL) {
-            for (int32_t i = 0; i < cls->n_bases; i++) {
-                visit((PyObject *)cls->bases[i]);
-            }
-        }
-        if (cls->mro != NULL) {
-            for (int32_t i = 0; i < cls->n_mro; i++) {
-                visit((PyObject *)cls->mro[i]);
-            }
-        }
-        visit(cls->attrs);
-        visit((PyObject *)cls->metaclass);
-    } else if (tag == PY_TYPE_ITER) {
-        PyIterObject *it = (PyIterObject *)o;
-        visit(it->seq);
-    } else if (tag == PY_TYPE_GEN) {
-        PyGenObject *g = (PyGenObject *)o;
-        visit(g->frame);
-        visit(g->send_value);
-    } else if (tag == PY_TYPE_COROUTINE) {
-        PccGcCoroutineObject *c = (PccGcCoroutineObject *)o;
-        visit(c->captures);
-        visit(c->args);
-        visit(c->result);
-    } else if (tag == PY_TYPE_CONTINUATION) {
-        PyContinuationObject *c = (PyContinuationObject *)o;
-        PyContinuationStackChunk *chunk = c->stack_chunk;
-        if (chunk != NULL && chunk->slots != NULL) {
-            for (int64_t i = 0; i < chunk->slot_count; i++) {
-                visit(chunk->slots[i]);
-            }
-        }
-    } else if (tag == PY_TYPE_TASK) {
-        PyTaskObject *t = (PyTaskObject *)o;
-        visit(t->coro);
-        visit(t->result);
-        visit(t->waiter);
-    } else if (tag == PY_TYPE_VIRTUAL_THREAD) {
-        PyVirtualThreadObject *t = (PyVirtualThreadObject *)o;
-        visit(t->continuation);
-        visit(t->result);
-    } else if (tag == PY_TYPE_EXC) {
-        PyExceptionObject *e = (PyExceptionObject *)o;
-        visit((PyObject *)e->exc_class);
-        visit(e->message);
-        visit(e->cause);
-        visit(e->context);
-    } else if (tag == PY_TYPE_PROPERTY) {
-        PyPropertyObject *p = (PyPropertyObject *)o;
-        visit(p->fget);
-        visit(p->fset);
-        visit(p->fdel);
-    } else if (tag == PY_TYPE_CLASSMETHOD) {
-        PyClassMethodObject *m = (PyClassMethodObject *)o;
-        visit(m->func);
-    } else if (tag == PY_TYPE_STATICMETHOD) {
-        PyStaticMethodObject *m = (PyStaticMethodObject *)o;
-        visit(m->func);
-    } else if (tag == PY_TYPE_MEMORYVIEW) {
-        PyMemoryViewObject *mv = (PyMemoryViewObject *)o;
-        visit(mv->base);
-    } else if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
-        PyInstanceObject *inst = (PyInstanceObject *)o;
-        PyClassObject *cls = inst->cls;
-        if (cls != NULL) {
-            visit((PyObject *)cls);
-            int32_t n_fields = cls->n_fields;
-            if (n_fields < 0) n_fields = 0;
-            for (int32_t i = 0; i < n_fields; i++) visit(inst->fields[i]);
-            if ((cls->h.flags & 2) == 0) visit(inst->fields[n_fields]);
-        }
-    } else if (tag == PY_TYPE_WEAKREF) {
-        PyWeakRefObject *wr = (PyWeakRefObject *)o;
-        visit(wr->callback);
-    } else if (tag == PY_TYPE_THREAD) {
-        PccGcThreadObject *t = (PccGcThreadObject *)o;
-        visit(t->callable);
-        visit(t->args);
-        visit(t->result);
-    }
+    PccGcTraceOwnerSlotCtx trace_ctx = { visit };
+    (void)py_obj_visit_slots(o, pcc_gc_trace_owner_slot, &trace_ctx);
+}
+
+/* Slot-ADDRESS flavored sibling of pcc_gc_trace_referents, for the
+ * backend-4 remap phase (docs/plans/gc4-relocation-remap-plan.md):
+ * `update` receives pointer-slot addresses that may need forwarding
+ * rewrites. Object-reference slots that participate in tracing must stay
+ * in sync with pcc_gc_trace_referents above: a type traced but not updated
+ * keeps stale pointers alive past forwarding retirement. Some additional
+ * non-owning borrowed metadata slots are intentionally update-only for
+ * relocation healing/promotion and must not become mark roots. */
+void pcc_gc_update_referents(
+    PyObject *o,
+    void (*update)(PyObject **slot)
+) {
+    if (o == NULL || PY_IS_TAGGED_INT(o)) return;
+    PccGcUpdateOwnerSlotCtx update_ctx = { update };
+    (void)py_obj_visit_slots(o, pcc_gc_update_owner_slot, &update_ctx);
 }
 
 static int64_t pcc_gc_cms_trace_gray_object_unlocked(PyObject *o) {
@@ -6569,53 +7887,14 @@ static int pcc_gc_gray_exists(void) {
 static int64_t pcc_gc_root_slot_count_from_map(const int32_t *frame_map) {
     if (frame_map == NULL) return 0;
     int32_t n_slots = frame_map[0];
-    if (n_slots < 0 || n_slots > 100000) return 0;
+    if (n_slots == -2147483647 - 1) return 0;
+    if (n_slots < 0) n_slots = -n_slots;
+    if (n_slots > 100000) return 0;
     return (int64_t)n_slots;
 }
 
-static int64_t pcc_gc_gray_mapped_roots_unlocked(
-    const int32_t *frame_map,
-    PyObject **slots,
-    int resolve
-) {
-    int64_t n_slots = pcc_gc_root_slot_count_from_map(frame_map);
-    if (n_slots <= 0 || slots == NULL) return 0;
-    for (int64_t i = 0; i < n_slots; i++) {
-        PyObject *root = resolve
-            ? pcc_gc_resolve_root_slot_unlocked(&slots[i])
-            : slots[i];
-        pcc_gc_gray_root_object(root);
-    }
-    return n_slots;
-}
-
-static int64_t pcc_gc_visit_mapped_roots_unlocked(
-    const int32_t *frame_map,
-    PyObject **slots,
-    PccGcRootVisitor visit,
-    void *ctx
-) {
-    int64_t n_slots = pcc_gc_root_slot_count_from_map(frame_map);
-    if (n_slots <= 0 || slots == NULL || visit == NULL) return 0;
-    for (int64_t i = 0; i < n_slots; i++) {
-        visit(slots[i], ctx);
-    }
-    return n_slots;
-}
-
-static int64_t pcc_gc_rewrite_mapped_roots_unlocked(
-    const int32_t *frame_map,
-    PyObject **slots
-) {
-    int64_t n_slots = pcc_gc_root_slot_count_from_map(frame_map);
-    if (n_slots <= 0 || slots == NULL) return 0;
-    int64_t rewritten = 0;
-    for (int64_t i = 0; i < n_slots; i++) {
-        PyObject *before = slots[i];
-        PyObject *after = pcc_gc_resolve_root_slot_unlocked(&slots[i]);
-        if (after != before) rewritten++;
-    }
-    return rewritten;
+static int pcc_gc_root_map_is_borrowed(const int32_t *frame_map) {
+    return frame_map != NULL && frame_map[0] < 0;
 }
 
 static void pcc_gc_gray_runtime_root(PyObject *root, void *ctx) {
@@ -6631,11 +7910,15 @@ static void pcc_gc_gray_current_roots(void) {
             pcc_gc_gray_root_object(n->obj);
         }
     }
+    PccGcGrayMappedRootSlotCtx root_ctx = { 1 };
     for (PccGcFrameNode *f = pcc_gc_frames; f != NULL; f = f->next) {
-        (void)pcc_gc_gray_mapped_roots_unlocked(
-            f->frame_map,
+        (void)pcc_gc_visit_mapped_root_slots_unlocked(
+            f->root_count,
             f->slots,
-            1
+            NULL,
+            f->borrowed & PCC_GC_FRAME_NODE_FLAG_BORROWED,
+            pcc_gc_gray_mapped_root_slot,
+            &root_ctx
         );
     }
     for (
@@ -6643,39 +7926,70 @@ static void pcc_gc_gray_current_roots(void) {
         c != NULL;
         c = c->next
     ) {
-        (void)pcc_gc_gray_mapped_roots_unlocked(
-            c->frame_map,
+        (void)pcc_gc_visit_mapped_root_slots_unlocked(
+            c->root_count,
             c->slots,
-            1
+            NULL,
+            c->borrowed,
+            pcc_gc_gray_mapped_root_slot,
+            &root_ctx
         );
     }
-    for (
-        PccGcSchedulerRootNode *r = pcc_gc_scheduler_roots;
-        r != NULL;
-        r = r->next
-    ) {
-        if (r->slot != NULL) {
-            pcc_gc_gray_root_object(
-                pcc_gc_resolve_root_slot_unlocked(r->slot)
-            );
-        }
-    }
+    (void)pcc_gc_visit_scheduler_root_slots_unlocked(
+        pcc_gc_gray_mapped_root_slot,
+        &root_ctx
+    );
+    (void)pcc_gc_visit_builtin_exception_cache_slots_unlocked(
+        pcc_gc_gray_mapped_root_slot,
+        &root_ctx
+    );
     pcc_capi_visit_extension_module_state_roots(
         pcc_gc_gray_runtime_root,
         NULL
     );
 }
 
+static void pcc_gc_subtract_known_child_ref(PyObject *child) {
+    if (child == NULL || PY_IS_TAGGED_INT(child)) return;
+    PccGcForwardNode *forwarding = pcc_gc_forwarding_find(child);
+    if (forwarding != NULL && forwarding->to != NULL) {
+        child = forwarding->to;
+    }
+    PccGcObjectNode *child_node = (PccGcObjectNode *)pcc_gc_object_index_find(child);
+    if (child_node == NULL || !pcc_gc_object_node_is_active(child_node)) return;
+    child_node->gc_refs--;
+}
+
+static void pcc_gc_gray_refcount_external_roots(void) {
+    for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
+        if (!pcc_gc_object_node_is_active(n)) continue;
+        n->gc_refs = pcc_refcount_load(&py_header(n->obj)->refcount);
+    }
+    for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
+        if (!pcc_gc_object_node_is_active(n)) continue;
+        pcc_gc_trace_referents(n->obj, pcc_gc_subtract_known_child_ref);
+    }
+    for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
+        if (!pcc_gc_object_node_is_active(n)) continue;
+        if (n->gc_refs > 0) {
+            pcc_gc_gray_root_object(n->obj);
+        }
+    }
+}
+
 void pcc_gc_visit_runtime_roots(PccGcRootVisitor visit, void *ctx) {
     if (visit == NULL) return;
     pcc_gc_init_config();
     pcc_gc_graph_lock();
+    PccGcVisitRuntimeMappedRootCtx mapped_ctx = { visit, ctx };
     for (PccGcFrameNode *f = pcc_gc_frames; f != NULL; f = f->next) {
-        (void)pcc_gc_visit_mapped_roots_unlocked(
-            f->frame_map,
+        (void)pcc_gc_visit_mapped_root_slots_unlocked(
+            f->root_count,
             f->slots,
-            visit,
-            ctx
+            NULL,
+            f->borrowed & PCC_GC_FRAME_NODE_FLAG_BORROWED,
+            pcc_gc_visit_runtime_mapped_root_slot,
+            &mapped_ctx
         );
     }
     for (
@@ -6683,27 +7997,193 @@ void pcc_gc_visit_runtime_roots(PccGcRootVisitor visit, void *ctx) {
         c != NULL;
         c = c->next
     ) {
-        (void)pcc_gc_visit_mapped_roots_unlocked(
-            c->frame_map,
+        (void)pcc_gc_visit_mapped_root_slots_unlocked(
+            c->root_count,
             c->slots,
-            visit,
-            ctx
+            NULL,
+            c->borrowed,
+            pcc_gc_visit_runtime_mapped_root_slot,
+            &mapped_ctx
         );
     }
-    for (
-        PccGcSchedulerRootNode *r = pcc_gc_scheduler_roots;
-        r != NULL;
-        r = r->next
-    ) {
-        if (r->slot != NULL) {
-            visit(*r->slot, ctx);
-        }
-    }
+    (void)pcc_gc_visit_scheduler_root_slots_unlocked(
+        pcc_gc_visit_runtime_mapped_root_slot,
+        &mapped_ctx
+    );
+    (void)pcc_gc_visit_builtin_exception_cache_slots_unlocked(
+        pcc_gc_visit_runtime_mapped_root_slot,
+        &mapped_ctx
+    );
     pcc_capi_visit_extension_module_state_roots(visit, ctx);
     pcc_gc_graph_unlock();
 }
 
+/* ----- backend-4 remap phase (gc4-relocation-remap-plan.md stage 2) -----
+ *
+ * Count-on-NEW accounting (relocate_copy moves the outstanding count to
+ * the new copy; old copies are immortal shells) means refcounts never
+ * drain old copies. Instead, this pass runs at a safepoint when an
+ * evacuation drain has emptied the relocation set: it rewrites every
+ * candidate pointer (objects' slots, frames, continuation/scheduler
+ * roots) through the forwarding table, then retires the table and the
+ * shells' bookkeeping. Pages whose last forwarding entry is removed are
+ * PARKED and only destroyed at the NEXT remap (one-epoch defer), so
+ * stale SSA/borrowed pointers from the interrupted frame can still
+ * read old headers safely until then. */
+
+static PccGcZPage *pcc_gc_backend4_parked_pages = NULL;
+
+static void pcc_gc_backend4_park_page_unlocked(struct PccGcZPage *page) {
+    if (page == NULL) return;
+    pcc_gc_backend4_active_page_clear_unlocked(page);
+    page->object_head = NULL;
+    page->next = pcc_gc_backend4_parked_pages;
+    pcc_gc_backend4_parked_pages = page;
+}
+
+static void pcc_gc_backend4_drain_parked_pages_unlocked(void) {
+    while (pcc_gc_backend4_parked_pages != NULL) {
+        PccGcZPage *page = pcc_gc_backend4_parked_pages;
+        pcc_gc_backend4_parked_pages = page->next;
+        page->next = NULL;
+        pcc_gc_backend4_zpage_destroy_unlocked(page);
+    }
+}
+
+static void pcc_gc_backend4_remap_heal_slot(PyObject **slot) {
+    PyObject *v = *slot;
+    if (v == NULL || PY_IS_TAGGED_INT(v)) return;
+    if (
+        (py_header_flags_load(py_header(v)) & PY_FLAG_GC_RELOCATION_CANDIDATE)
+        == 0
+    ) {
+        return;
+    }
+    PccGcForwardNode *n = pcc_gc_forwarding_find(v);
+    if (n == NULL || n->to == NULL) return;
+    /* bits only: under count-on-NEW the slot's reference is already
+     * accounted on the new copy */
+    PCC_RT_TRIPWIRE(py_header(v)->type_tag == py_header(n->to)->type_tag,
+                    "pcc_gc_backend4_remap_heal_slot: remap target type_tag differs from the old shell (zeroed/corrupt relocation target)");
+    *slot = n->to;
+}
+
+void py_obj_update_slot(PyObject **slot) {
+    pcc_gc_backend4_remap_heal_slot(slot);
+}
+
+static void pcc_gc_backend4_remap_and_retire_unlocked(void) {
+    if (pcc_gc_selected_backend != PCC_GC_KIND_COLORED_RELOCATING) return;
+    /* one-epoch defer: destroy what the PREVIOUS remap parked */
+    pcc_gc_backend4_drain_parked_pages_unlocked();
+    if (pcc_gc_forwardings == NULL) return;
+
+    /* 1. heal every object's referent slots */
+    for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
+        if (!pcc_gc_object_node_is_active(n)) continue;
+        pcc_gc_update_referents(n->obj, py_obj_update_slot);
+    }
+    /* 2. heal frames, continuation roots, scheduler roots (the same
+     * sets the gray pass walks; resolve_root_slot rewrites in place) */
+    PccGcRewriteMappedRootCtx rewrite_ctx = { 0 };
+    for (PccGcFrameNode *f = pcc_gc_frames; f != NULL; f = f->next) {
+        (void)pcc_gc_visit_mapped_root_slots_unlocked(
+            f->root_count,
+            f->slots,
+            NULL,
+            f->borrowed & PCC_GC_FRAME_NODE_FLAG_BORROWED,
+            pcc_gc_rewrite_mapped_root_slot,
+            &rewrite_ctx
+        );
+    }
+    for (
+        PccGcContinuationRootNode *c = pcc_gc_continuation_roots;
+        c != NULL;
+        c = c->next
+    ) {
+        (void)pcc_gc_visit_mapped_root_slots_unlocked(
+            c->root_count,
+            c->slots,
+            NULL,
+            c->borrowed,
+            pcc_gc_rewrite_mapped_root_slot,
+            &rewrite_ctx
+        );
+    }
+    (void)pcc_gc_visit_scheduler_root_slots_unlocked(
+        pcc_gc_rewrite_mapped_root_slot,
+        &rewrite_ctx
+    );
+    (void)pcc_gc_visit_builtin_exception_cache_slots_unlocked(
+        pcc_gc_rewrite_mapped_root_slot,
+        &rewrite_ctx
+    );
+
+    /* 3. retire forwarding entries + shell bookkeeping — ONE EPOCH
+     * LATE: entries are only retired at the remap AFTER the one that
+     * healed the heap (RETIRING marker on the old shell). Stale SSA
+     * pointers held across the healing remap can be stored into slots
+     * afterwards; they keep resolving until the next remap's heal pass
+     * (which runs above, before this retirement) rewrites them.
+     * forwarding_remove unlinks from the main list, drops the table's
+     * reference on the new copy, and decrements the page's
+     * pending_forwardings (parking the page via the zombie hook when
+     * it reaches zero). */
+    PccGcForwardNode *fn = pcc_gc_forwardings;
+    while (fn != NULL) {
+        PccGcForwardNode *next = fn->next;
+        PyObject *old = fn->from;
+        if (old == NULL || PY_IS_TAGGED_INT(old)) {
+            /* defensive: never installed in practice; unlink manually */
+            pcc_gc_forwarding_target_unlink(fn);
+            pcc_gc_forwarding_unlink_main(fn);
+            py_decref(fn->to);
+            free(fn);
+            if (pcc_gc_forwarding_population > 0) pcc_gc_forwarding_population--;
+            fn = next;
+            continue;
+        }
+        PyObjectHeader *old_h = py_header(old);
+        if ((py_header_flags_load(old_h) & PY_FLAG_GC_FORWARD_RETIRING) == 0) {
+            /* first remap after this entry's installation: mark only */
+            py_header_flags_or(old_h, PY_FLAG_GC_FORWARD_RETIRING);
+            fn = next;
+            continue;
+        }
+        py_header_flags_and(
+            old_h,
+            ~(PY_FLAG_GC_RELOCATION_CANDIDATE | PY_FLAG_GC_FORWARD_RETIRING)
+        );
+        pcc_gc_identity_remove(old);
+        PccGcObjectNode *dead =
+            (PccGcObjectNode *)pcc_gc_object_index_find(old);
+        if (dead == NULL) {
+            for (
+                PccGcObjectNode *scan = pcc_gc_objects;
+                scan != NULL;
+                scan = scan->next
+            ) {
+                if (scan->obj == old) {
+                    dead = scan;
+                    break;
+                }
+            }
+        }
+        if (dead != NULL) {
+            if (!pcc_gc_object_node_is_freeing(dead) && dead->size > 0) {
+                pcc_gc_live_bytes_subtract(dead->size);
+            }
+            (void)pcc_gc_object_index_remove(old);
+            pcc_gc_object_node_unlink(dead);
+            pcc_gc_object_node_release(dead);
+        }
+        pcc_gc_forwarding_remove(old);
+        fn = next;
+    }
+}
+
 static void pcc_gc_seed_roots(void) {
+    pcc_gc_gray_count_store(0);
     for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
         if (!pcc_gc_object_node_is_active(n)) continue;
         PyObjectHeader *h = py_header(n->obj);
@@ -6725,6 +8205,7 @@ static void pcc_gc_seed_roots(void) {
             );
         }
     }
+    pcc_gc_gray_refcount_external_roots();
     pcc_gc_gray_current_roots();
 }
 
@@ -6737,6 +8218,7 @@ static int64_t pcc_gc_drain_all_gray_unlocked(void) {
             PyObjectHeader *h = py_header(n->obj);
             if ((py_header_flags_load(h) & PY_FLAG_GC_GRAY) == 0) continue;
             pcc_gc_trace_referents(n->obj, pcc_gc_gray_object);
+            pcc_gc_gray_count_dec();
             py_header_flags_update(
                 h, PY_FLAG_GC_COLOR_MASK, PY_FLAG_GC_BLACK
             );
@@ -6775,7 +8257,11 @@ static void pcc_gc_begin_mark_cycle(void) {
     pcc_gc_seed_roots();
     pcc_gc_mark_active_store(1);
     pcc_gc_cycle_requested_store(0);
-    if (!pcc_gc_gray_exists()) pcc_gc_mark_active_store(0);
+    pcc_gc_trace_cursor = pcc_gc_objects;
+    if (pcc_gc_gray_count_load() == 0) {
+        pcc_gc_trace_cursor = NULL;
+        pcc_gc_mark_active_store(0);
+    }
 }
 
 static int pcc_gc_finish_tracing_cycle(void) {
@@ -6822,26 +8308,38 @@ static int64_t pcc_gc_step_trace_cycle_unlocked(
         pcc_gc_begin_mark_cycle();
     }
 
-    for (
-        PccGcObjectNode *n = pcc_gc_objects;
-        n != NULL && processed < budget;
-        n = n->next
-    ) {
-        if (!pcc_gc_object_node_is_active(n)) continue;
-        PyObjectHeader *h = py_header(n->obj);
-        if ((py_header_flags_load(h) & PY_FLAG_GC_GRAY) != 0) {
-            pcc_gc_trace_referents(n->obj, pcc_gc_gray_object);
-            py_header_flags_update(
-                h, PY_FLAG_GC_COLOR_MASK, PY_FLAG_GC_BLACK
-            );
-            processed++;
-        }
+    if (pcc_gc_trace_cursor == NULL) {
+        pcc_gc_trace_cursor = pcc_gc_objects;
     }
 
-    if (finish_cycle && !pcc_gc_gray_exists()) {
-        if (pcc_gc_finish_tracing_cycle()) {
-            pcc_gc_mark_active_store(0);
-            pcc_gc_cycle_requested_store(0);
+    PccGcObjectNode *n = pcc_gc_trace_cursor;
+    while (n != NULL && processed < budget) {
+        PccGcObjectNode *next = n->next;
+        if (pcc_gc_object_node_is_active(n)) {
+            PyObjectHeader *h = py_header(n->obj);
+            if ((py_header_flags_load(h) & PY_FLAG_GC_GRAY) != 0) {
+                pcc_gc_trace_referents(n->obj, pcc_gc_gray_object);
+                pcc_gc_gray_count_dec();
+                py_header_flags_update(
+                    h, PY_FLAG_GC_COLOR_MASK, PY_FLAG_GC_BLACK
+                );
+                processed++;
+            }
+        }
+        n = next;
+    }
+    pcc_gc_trace_cursor = n;
+
+    if (finish_cycle && pcc_gc_trace_cursor == NULL) {
+        if (pcc_gc_gray_count_load() != 0) {
+            pcc_gc_trace_cursor = pcc_gc_objects;
+        } else {
+            if (pcc_gc_finish_tracing_cycle()) {
+                pcc_gc_trace_cursor = NULL;
+                pcc_gc_gray_count_store(0);
+                pcc_gc_mark_active_store(0);
+                pcc_gc_cycle_requested_store(0);
+            }
         }
     }
 
@@ -6860,49 +8358,43 @@ static int64_t pcc_gc_step_trace_cycle(int64_t budget) {
     return processed;
 }
 
-static int64_t pcc_gc_step_generational_promotion(int64_t budget) {
+static int64_t pcc_gc_step_generational_promotion(
+    int64_t budget,
+    int promote_all_young
+) {
     if (budget <= 0) return 0;
     int64_t processed = 0;
     pcc_gc_graph_lock();
     pcc_gc_promote_frame_roots(budget);
     pcc_gc_promote_scheduler_roots(budget);
+    pcc_gc_promote_tls_exception_root();
     pcc_capi_visit_extension_module_state_roots(
         pcc_gc_promote_extension_module_state_root,
         NULL
     );
-    for (
-        PccGcObjectNode *n = pcc_gc_objects;
-        n != NULL && processed < budget;
-        n = n->next
-    ) {
-        if (!pcc_gc_object_node_is_active(n)) continue;
-        PyObjectHeader *h = py_header(n->obj);
-        int32_t flags = py_header_flags_load(h);
-        if ((flags & PY_FLAG_GC_REMEMBERED) != 0) {
-            pcc_gc_promote_remembered_owner_referents(n->obj);
-            py_header_flags_and(h, ~PY_FLAG_GC_REMEMBERED);
-            processed++;
-            if ((processed % PCC_GC_SAFEPOINT_BATCH) == 0) {
-                pcc_thread_safepoint();
-            }
-        }
-    }
-    for (
-        PccGcObjectNode *n = pcc_gc_objects;
-        n != NULL && processed < budget;
-        n = n->next
-    ) {
-        if (!pcc_gc_object_node_is_active(n)) continue;
-        PyObjectHeader *h = py_header(n->obj);
-        int32_t flags = py_header_flags_load(h);
-        if ((flags & PY_FLAG_GC_YOUNG) != 0) {
-            if (pcc_gc_forwarding_find(n->obj) != NULL) continue;
-            py_header_flags_update(
-                h, PY_FLAG_GC_YOUNG, PY_FLAG_GC_OLD
-            );
-            processed++;
-            if ((processed % PCC_GC_SAFEPOINT_BATCH) == 0) {
-                pcc_thread_safepoint();
+    processed += pcc_gc_backend3_drain_remembered_owners(budget - processed);
+    if (promote_all_young) {
+        for (
+            PccGcObjectNode *n = pcc_gc_objects;
+            n != NULL && processed < budget;
+            n = n->next
+        ) {
+            if (!pcc_gc_object_node_is_active(n)) continue;
+            PyObjectHeader *h = py_header(n->obj);
+            int32_t flags = py_header_flags_load(h);
+            if ((flags & PY_FLAG_GC_YOUNG) != 0) {
+                if (pcc_gc_forwarding_find(n->obj) != NULL) continue;
+                pcc_gc_promote_young_object(n->obj);
+                int32_t after_flags = py_header_flags_load(h);
+                if (
+                    (after_flags & PY_FLAG_GC_YOUNG) == 0
+                    || pcc_gc_forwarding_find(n->obj) != NULL
+                ) {
+                    processed++;
+                    if ((processed % PCC_GC_SAFEPOINT_BATCH) == 0) {
+                        pcc_thread_safepoint();
+                    }
+                }
             }
         }
     }
@@ -7005,6 +8497,8 @@ static int64_t pcc_gc_step_colored_generation_aging(int64_t budget) {
         PyObjectHeader *h = py_header(o);
         int32_t flags = py_header_flags_load(h);
         if ((flags & PY_FLAG_GC_YOUNG) == 0) continue;
+        PCC_RT_TRIPWIRE((flags & PY_FLAG_GC_OLD) == 0,
+                        "pcc_gc_backend4 young-promotion drain: promoting a YOUNG object already marked OLD (young->old generation invariant violated)");
         py_header_flags_update(h, PY_FLAG_GC_YOUNG, PY_FLAG_GC_OLD);
         if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
             pcc_gc_backend4_zpage_note_owner_promoted_unlocked(o);
@@ -7039,7 +8533,7 @@ int64_t pcc_gc_step(int64_t budget) {
     } else if (
         pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
     ) {
-        processed += pcc_gc_step_generational_promotion(budget);
+        processed += pcc_gc_step_generational_promotion(budget, 1);
         if (
             pcc_gc_explicit_collect_active
             && processed < budget
@@ -7096,6 +8590,22 @@ int64_t pcc_gc_step(int64_t budget) {
                 int64_t stw = pcc_stop_the_world();
                 processed += pcc_gc_step_trace_cycle(budget - processed);
                 if (stw == 0) (void)pcc_resume_world();
+            }
+            if (processed == 0 && pcc_gc_forwarding_population_load() > 0) {
+                int64_t before = 0;
+                int64_t after = 0;
+                pcc_gc_graph_lock();
+                before = pcc_gc_forwarding_population;
+                if (pcc_gc_relocation_set == NULL && before > 0) {
+                    pcc_gc_backend4_remap_and_retire_unlocked();
+                }
+                after = pcc_gc_forwarding_population;
+                pcc_gc_graph_unlock();
+                if (before > after) {
+                    processed += before - after;
+                } else if (before > 0) {
+                    processed += 1;
+                }
             }
         }
     }
@@ -7267,20 +8777,37 @@ void pcc_gc_note_object_allocated_sized(PyObject *o, int64_t size) {
         }
         pcc_gc_cycle_requested_store(1);
     }
-    PccGcObjectNode *n = (PccGcObjectNode *)calloc(1, sizeof(PccGcObjectNode));
+    if (
+        (
+            pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+            || pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING
+        )
+        && pcc_gc_pending_minor_block == NULL
+        && pcc_gc_backend3_graph_leaf_tag(py_header(o)->type_tag)
+    ) {
+        pcc_gc_graph_unlock();
+        return;
+    }
+    PccGcObjectNode *n = pcc_gc_object_node_alloc();
     if (n == NULL) {
         pcc_gc_pending_minor_block = NULL;
         pcc_gc_graph_unlock();
         return;
     }
     n->size = size;
+    n->freeing = 0;
     __atomic_add_fetch(&pcc_gc_live_bytes, n->size, __ATOMIC_ACQ_REL);
     n->minor_block = pcc_gc_pending_minor_block;
     pcc_gc_pending_minor_block = NULL;
     n->obj = o;
-    n->next = pcc_gc_objects;
-    pcc_gc_objects = n;
-    pcc_gc_backend4_zpage_track_alloc_unlocked(o, n->size);
+    n->next = NULL;
+    n->prev = NULL;
+    n->zpage_node = NULL;
+    pcc_gc_object_node_link_head(n);
+    (void)pcc_gc_object_index_insert(o, n);
+    if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
+        n->zpage_node = pcc_gc_backend4_zpage_track_alloc_unlocked(o, n->size);
+    }
     pcc_gc_graph_unlock();
 }
 
@@ -7292,35 +8819,65 @@ void pcc_gc_note_object_freeing(PyObject *o) {
     pcc_gc_init_config();
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
     pcc_gc_graph_lock();
-    pcc_gc_forwarding_remove(o);
+    if (pcc_gc_backend_uses_forwarding()) {
+        pcc_gc_forwarding_remove(o);
+        pcc_gc_forwarding_remove_target(o);
+    }
     pcc_gc_identity_remove(o);
-    pcc_gc_relocation_set_remove(o);
-    pcc_gc_backend4_store_buffer_remove(o);
-    pcc_gc_backend4_remembered_set_remove(o);
-    pcc_gc_backend4_zpage_remove_unlocked(o);
+    if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
+        pcc_gc_relocation_set_remove(o);
+        pcc_gc_backend4_store_buffer_remove(o);
+        pcc_gc_backend4_remembered_set_remove(o);
+        int32_t zpage_flags = py_header_flags_load(py_header(o))
+            & PY_FLAG_GC_ZPAGE_ALLOC;
+        PccGcObjectNode *zpage_owner_node =
+            (PccGcObjectNode *)pcc_gc_object_index_find(o);
+        int32_t zpage_indexed = (
+            zpage_owner_node != NULL
+            && zpage_owner_node->zpage_node != NULL
+        );
+        int32_t zpage_addr_owned = 0;
+        if (
+            zpage_flags == 0
+            && zpage_indexed == 0
+            && (py_header_flags_load(py_header(o)) & PY_FLAG_GC_MALLOC_ALLOC) == 0
+        ) {
+            zpage_addr_owned = pcc_gc_backend4_zpage_owns_addr_unlocked(o);
+        }
+        if (zpage_flags != 0 || zpage_indexed != 0 || zpage_addr_owned != 0) {
+            if (zpage_flags == 0) {
+                py_header_flags_or(py_header(o), PY_FLAG_GC_ZPAGE_ALLOC);
+            }
+            pcc_gc_backend4_zpage_remove_unlocked(o);
+        }
+    }
     if (!pcc_gc_tracks_objects()) {
         pcc_gc_graph_unlock();
         return;
     }
-    PccGcObjectNode **cur = &pcc_gc_objects;
-    while (*cur != NULL) {
-        if ((*cur)->obj == o) {
-            PccGcObjectNode *dead = *cur;
-            if (!pcc_gc_object_node_is_freeing(dead) && dead->size > 0) {
-                pcc_gc_live_bytes_subtract(dead->size);
+    PccGcObjectNode *dead = (PccGcObjectNode *)pcc_gc_object_index_find(o);
+    if (dead == NULL) {
+        for (PccGcObjectNode *scan = pcc_gc_objects; scan != NULL; scan = scan->next) {
+            if (scan->obj == o) {
+                dead = scan;
+                break;
             }
-            pcc_gc_object_node_set_freeing(dead);
-            if (dead->minor_block != NULL) {
-                pcc_gc_graph_unlock();
-                return;
-            }
-            (void)pcc_gc_object_index_remove(o);
-            *cur = dead->next;
-            free(dead);
+        }
+    }
+    if (dead != NULL) {
+        if (!pcc_gc_object_node_is_freeing(dead) && dead->size > 0) {
+            pcc_gc_live_bytes_subtract(dead->size);
+        }
+        pcc_gc_object_node_set_freeing(dead);
+        if (dead->minor_block != NULL) {
             pcc_gc_graph_unlock();
             return;
         }
-        cur = &(*cur)->next;
+        (void)pcc_gc_object_index_remove(o);
+        pcc_gc_object_node_unlink(dead);
+        pcc_gc_object_node_release(dead);
+        pcc_gc_graph_unlock();
+        return;
     }
     pcc_gc_graph_unlock();
 }
@@ -7345,25 +8902,25 @@ static void pcc_gc_minor_release_block(PccGcMinorBlock *block) {
     }
     if (live != 0) return;
 
-    if (block == pcc_gc_minor_current) {
+    /* Minor blocks are span-retained: stale SSA/root pointers can outlive the
+     * object index entry, so the span must remain recognizable until a safer
+     * epoch reclamation scheme exists. */
+    if (block->owner_thread_id == pcc_current_thread_id()) {
         block->ptr = block->base;
+        pcc_gc_minor_current = block;
         __atomic_store_n(&pcc_gc_minor_bytes, 0, __ATOMIC_RELEASE);
-        return;
     }
-    if (block->owner_thread_id != pcc_current_thread_id()) {
-        return;
-    }
+}
 
-    PccGcMinorBlock **cur = &pcc_gc_minor_blocks;
-    while (*cur != NULL) {
-        if (*cur == block) {
-            *cur = block->next;
-            free(block->base);
-            free(block);
-            return;
-        }
-        cur = &(*cur)->next;
+static PccGcMinorBlock *pcc_gc_minor_block_containing_unlocked(void *ptr) {
+    if (ptr == NULL) return NULL;
+    uintptr_t p = (uintptr_t)ptr;
+    for (PccGcMinorBlock *block = pcc_gc_minor_blocks; block != NULL; block = block->next) {
+        uintptr_t base = (uintptr_t)block->base;
+        uintptr_t end = (uintptr_t)block->end;
+        if (p >= base && p < end) return block;
     }
+    return NULL;
 }
 
 void pcc_gc_free_object_memory(PyObject *o) {
@@ -7373,37 +8930,112 @@ void pcc_gc_free_object_memory(PyObject *o) {
     if ((flags & PY_FLAG_GC_ZPAGE_ALLOC) != 0) {
         return;
     }
-    if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
+    if (
+        pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING
+        && (flags & PY_FLAG_GC_MALLOC_ALLOC) == 0
+    ) {
         pcc_gc_graph_lock();
-        int32_t zpage_owned =
-            pcc_gc_backend4_zpage_owns_addr_unlocked((void *)o);
+        PccGcObjectNode *zpage_owner_node =
+            (PccGcObjectNode *)pcc_gc_object_index_find(o);
+        int32_t zpage_indexed = (
+            zpage_owner_node != NULL
+            && zpage_owner_node->zpage_node != NULL
+        );
+        int32_t zpage_addr_owned = 0;
+        if (zpage_indexed == 0) {
+            zpage_addr_owned = pcc_gc_backend4_zpage_owns_addr_unlocked(o);
+        }
         pcc_gc_graph_unlock();
-        if (zpage_owned != 0) return;
+        if (zpage_indexed != 0 || zpage_addr_owned != 0) return;
     }
-    if ((flags & PY_FLAG_GC_MINOR_ARENA) == 0) {
-        free(o);
+    if (
+        (
+            pcc_gc_selected_backend == PCC_GC_KIND_INCREMENTAL_TRICOLOR
+            || pcc_gc_selected_backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP
+        )
+        && flags == 0
+    ) {
         return;
     }
-
-    pcc_gc_graph_lock();
-    PccGcObjectNode **cur = &pcc_gc_objects;
-    while (*cur != NULL) {
-        if ((*cur)->obj == o) {
-            PccGcObjectNode *dead = *cur;
+    /* Every live GC3 object has an explicit allocation-origin split: an arena
+     * object carries MINOR_ARENA, while fallback/copy-oldified heap objects do
+     * not. Zero flags are reserved for stale/non-owned shells below. The
+     * refcount release path normally removed a heap object's index node in
+     * pcc_gc_note_object_freeing already; an O(1) lookup here also makes direct
+     * helper callers safe. Do not fall through to the historical object-list /
+     * minor-block address scans: doing so made N old-object releases O(N^2). */
+    if (
+        pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        && flags != 0
+        && (flags & PY_FLAG_GC_MINOR_ARENA) == 0
+    ) {
+        pcc_gc_graph_lock();
+        PccGcObjectNode *dead =
+            (PccGcObjectNode *)pcc_gc_object_index_find(o);
+        if (dead != NULL) {
             if (!pcc_gc_object_node_is_freeing(dead) && dead->size > 0) {
                 pcc_gc_live_bytes_subtract(dead->size);
             }
-            pcc_gc_backend4_zpage_remove_unlocked(o);
+            (void)pcc_gc_object_index_remove(o);
+            pcc_gc_object_node_unlink(dead);
+            pcc_gc_object_node_release(dead);
+        }
+        pcc_gc_graph_unlock();
+        free(o);
+        return;
+    }
+    if (
+        (flags & PY_FLAG_GC_MINOR_ARENA) != 0
+    ) {
+        pcc_gc_graph_lock();
+        PccGcObjectNode *dead = (PccGcObjectNode *)pcc_gc_object_index_find(o);
+        if (dead == NULL) {
+            for (PccGcObjectNode *scan = pcc_gc_objects; scan != NULL; scan = scan->next) {
+                if (scan->obj == o) {
+                    dead = scan;
+                    break;
+                }
+            }
+        }
+        if (dead != NULL) {
+            if (!pcc_gc_object_node_is_freeing(dead) && dead->size > 0) {
+                pcc_gc_live_bytes_subtract(dead->size);
+            }
+            if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
+                pcc_gc_backend4_zpage_remove_unlocked(o);
+            }
             PccGcMinorBlock *block = dead->minor_block;
-            *cur = dead->next;
-            free(dead);
-            pcc_gc_minor_release_block(block);
+            (void)pcc_gc_object_index_remove(o);
+            pcc_gc_object_node_unlink(dead);
+            pcc_gc_object_node_release(dead);
+            if (block != NULL || (flags & PY_FLAG_GC_MINOR_ARENA) != 0) {
+                pcc_gc_minor_release_block(block);
+                pcc_gc_graph_unlock();
+                return;
+            }
             pcc_gc_graph_unlock();
+            free(o);
             return;
         }
-        cur = &(*cur)->next;
+        pcc_gc_graph_unlock();
     }
-    pcc_gc_graph_unlock();
+    if (pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
+        pcc_gc_graph_lock();
+        PccGcMinorBlock *block =
+            pcc_gc_minor_block_containing_unlocked((void *)o);
+        pcc_gc_graph_unlock();
+        if (block != NULL) {
+            pcc_gc_minor_release_block(block);
+            return;
+        }
+        /* A normal GC3 heap object has color/generation bits. A zero-flag
+         * object reaching this late free path is a stale/non-owned shell; do
+         * not hand it to malloc. */
+        if (flags == 0) {
+            return;
+        }
+    }
+    free(o);
 }
 
 void pcc_gc_note_load(void) {
@@ -7413,6 +9045,15 @@ void pcc_gc_note_load(void) {
 PyObject *pcc_gc_note_relocation_read(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return o;
     pcc_gc_init_config();
+    if (pcc_gc_is_known_object(o)) {
+        PyObjectHeader *h = py_header(o);
+        if (
+            (py_header_flags_load(h) & PY_FLAG_GC_RELOCATION_CANDIDATE)
+            == 0
+        ) {
+            return o;
+        }
+    }
     pcc_gc_graph_lock();
     PyObject *resolved = pcc_gc_note_relocation_read_unlocked(o);
     pcc_gc_graph_unlock();
@@ -7430,7 +9071,6 @@ void pcc_gc_note_slot_write_barrier(
 ) {
     if (value == NULL || PY_IS_TAGGED_INT(value)) return;
     int64_t barrier_backend = pcc_gc_selected_backend;
-    PyObjectHeader *value_h = py_header(value);
     if (owner == NULL) {
         if (
             barrier_backend == PCC_GC_KIND_INCREMENTAL_TRICOLOR
@@ -7439,16 +9079,17 @@ void pcc_gc_note_slot_write_barrier(
         ) {
             int flush_cms_wb = 0;
             pcc_gc_graph_lock();
-        int32_t value_flags = py_header_flags_load(value_h);
-        int should_gray = (value_flags & PY_FLAG_GC_WHITE) != 0;
-        if (barrier_backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP) {
-            should_gray = (value_flags & PY_FLAG_GC_GRAY) == 0;
-        }
-        if (
-            pcc_gc_mark_active_load() != 0
-            && pcc_gc_is_known_object(value)
-            && should_gray
-        ) {
+            if (!pcc_gc_is_known_object(value)) {
+                pcc_gc_graph_unlock();
+                return;
+            }
+            PyObjectHeader *value_h = py_header(value);
+            int32_t value_flags = py_header_flags_load(value_h);
+            int should_gray = (value_flags & PY_FLAG_GC_WHITE) != 0;
+            if (barrier_backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP) {
+                should_gray = (value_flags & PY_FLAG_GC_GRAY) == 0;
+            }
+            if (pcc_gc_mark_active_load() != 0 && should_gray) {
                 py_header_flags_update(
                     value_h, PY_FLAG_GC_COLOR_MASK, PY_FLAG_GC_GRAY
                 );
@@ -7466,7 +9107,6 @@ void pcc_gc_note_slot_write_barrier(
         return;
     }
     if (PY_IS_TAGGED_INT(owner)) return;
-    PyObjectHeader *owner_h = py_header(owner);
     if (
         barrier_backend == PCC_GC_KIND_INCREMENTAL_TRICOLOR
         || barrier_backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP
@@ -7477,6 +9117,8 @@ void pcc_gc_note_slot_write_barrier(
             pcc_gc_graph_unlock();
             return;
         }
+        PyObjectHeader *owner_h = py_header(owner);
+        PyObjectHeader *value_h = py_header(value);
         int should_shade = 0;
         if (
             barrier_backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP
@@ -7509,6 +9151,20 @@ void pcc_gc_note_slot_write_barrier(
         barrier_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
         || barrier_backend == PCC_GC_KIND_COLORED_RELOCATING
     ) {
+        if (
+            !pcc_gc_pointer_can_have_header(owner)
+            || !pcc_gc_pointer_can_have_header(value)
+        ) {
+            return;
+        }
+        PyObjectHeader *owner_h = py_header(owner);
+        PyObjectHeader *value_h = py_header(value);
+        if (
+            (py_header_flags_load(owner_h) & PY_FLAG_GC_OLD) == 0
+            || (py_header_flags_load(value_h) & PY_FLAG_GC_YOUNG) == 0
+        ) {
+            return;
+        }
         pcc_gc_graph_lock();
         if (!pcc_gc_is_known_object(owner) || !pcc_gc_is_known_object(value)) {
             pcc_gc_graph_unlock();
@@ -7529,7 +9185,7 @@ void pcc_gc_note_slot_write_barrier(
             } else if (
                 barrier_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
             ) {
-                py_header_flags_or(owner_h, PY_FLAG_GC_REMEMBERED);
+                pcc_gc_backend3_remember_owner_unlocked(owner, owner_h);
             }
         }
         pcc_gc_graph_unlock();
@@ -7548,18 +9204,71 @@ void pcc_gc_note_pin(int32_t delta) {
     pcc_gc_metric_add(PCC_GC_COUNTER_PIN_BALANCE, delta);
 }
 
-void pcc_gc_scheduler_root_register(PyObject **slot) {
+static void pcc_gc_scheduler_root_link_locked(PccGcSchedulerRootNode *node) {
+    if (node == NULL) return;
+    node->prev = NULL;
+    node->next = pcc_gc_scheduler_roots;
+    if (pcc_gc_scheduler_roots != NULL) {
+        pcc_gc_scheduler_roots->prev = node;
+    }
+    pcc_gc_scheduler_roots = node;
+    PCC_RT_TRIPWIRE(
+        node->slot != NULL,
+        "pcc_gc_scheduler_root_link_locked: scheduler root has a NULL slot address"
+    );
+    PCC_RT_TRIPWIRE(
+        node->prev == NULL
+            && (node->next == NULL || node->next->prev == node),
+        "pcc_gc_scheduler_root_link_locked: scheduler root list links are inconsistent"
+    );
+}
+
+static void pcc_gc_scheduler_root_unlink_locked(PccGcSchedulerRootNode *node) {
+    if (node == NULL) return;
+    if (node->prev != NULL) {
+        node->prev->next = node->next;
+    } else if (pcc_gc_scheduler_roots == node) {
+        pcc_gc_scheduler_roots = node->next;
+    } else {
+        PccGcSchedulerRootNode **cur = &pcc_gc_scheduler_roots;
+        while (*cur != NULL && *cur != node) {
+            cur = &(*cur)->next;
+        }
+        if (*cur == NULL) return;
+        *cur = node->next;
+    }
+    if (node->next != NULL) node->next->prev = node->prev;
+    node->next = NULL;
+    node->prev = NULL;
+}
+
+void *pcc_gc_scheduler_root_register_handle(PyObject **slot) {
     pcc_gc_init_config();
-    if (slot == NULL) return;
+    if (slot == NULL) return NULL;
     PccGcSchedulerRootNode *node = (
         PccGcSchedulerRootNode *
     )calloc(1, sizeof(PccGcSchedulerRootNode));
-    if (node == NULL) return;
+    if (node == NULL) return NULL;
     node->slot = slot;
     pcc_gc_graph_lock();
-    node->next = pcc_gc_scheduler_roots;
-    pcc_gc_scheduler_roots = node;
+    pcc_gc_scheduler_root_link_locked(node);
     pcc_gc_graph_unlock();
+    pcc_gc_cycle_requested_store(1);
+    return node;
+}
+
+void pcc_gc_scheduler_root_register(PyObject **slot) {
+    (void)pcc_gc_scheduler_root_register_handle(slot);
+}
+
+void pcc_gc_scheduler_root_unregister_handle(void *handle) {
+    pcc_gc_init_config();
+    if (handle == NULL) return;
+    PccGcSchedulerRootNode *node = (PccGcSchedulerRootNode *)handle;
+    pcc_gc_graph_lock();
+    pcc_gc_scheduler_root_unlink_locked(node);
+    pcc_gc_graph_unlock();
+    free(node);
     pcc_gc_cycle_requested_store(1);
 }
 
@@ -7572,7 +9281,7 @@ void pcc_gc_scheduler_root_unregister(PyObject **slot) {
     while (*cur != NULL) {
         if ((*cur)->slot == slot) {
             dead = *cur;
-            *cur = dead->next;
+            pcc_gc_scheduler_root_unlink_locked(dead);
             break;
         }
         cur = &(*cur)->next;
@@ -7601,7 +9310,7 @@ static void pcc_gc_scheduler_queue_entry_free(PccGcSchedulerQueueEntry *entry) {
     if (entry == NULL) return;
     pcc_gc_graph_lock();
     int64_t barrier_before = pcc_gc_relocation_barrier_forwards;
-    (void)pcc_gc_load_ptr(NULL, &entry->value);
+    (void)pcc_gc_resolve_root_slot_unlocked(&entry->value);
     if (
         pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING
         && entry->value != NULL
@@ -7610,10 +9319,76 @@ static void pcc_gc_scheduler_queue_entry_free(PccGcSchedulerQueueEntry *entry) {
     ) {
         pcc_gc_relocation_barrier_forwards++;
     }
-    pcc_gc_scheduler_root_unregister(&entry->value);
+    pcc_gc_scheduler_root_unregister_handle(entry->root_handle);
+    entry->root_handle = NULL;
     pcc_gc_graph_unlock();
     pcc_gc_store_root(&entry->value, NULL);
     free(entry);
+}
+
+#define PCC_GC_SCHEDULER_QUEUE_ENTRY_POOL_LIMIT 4096
+
+static PccGcSchedulerQueueEntry *pcc_gc_scheduler_queue_entry_alloc(
+    PccGcSchedulerQueue *queue
+) {
+    PccGcSchedulerQueueEntry *entry = NULL;
+    if (queue != NULL && queue->mutex != NULL) {
+        if (pcc_mutex_lock(queue->mutex) == 0) {
+            entry = queue->free_head;
+            if (entry != NULL) {
+                queue->free_head = entry->next;
+                if (queue->free_count > 0) queue->free_count--;
+            }
+            (void)pcc_mutex_unlock(queue->mutex);
+        }
+    }
+    if (entry == NULL) {
+        entry = (PccGcSchedulerQueueEntry *)malloc(
+            sizeof(PccGcSchedulerQueueEntry)
+        );
+    }
+    if (entry != NULL) memset(entry, 0, sizeof(PccGcSchedulerQueueEntry));
+    return entry;
+}
+
+static void pcc_gc_scheduler_queue_entry_recycle(
+    PccGcSchedulerQueue *queue,
+    PccGcSchedulerQueueEntry *entry
+) {
+    if (entry == NULL) return;
+    memset(entry, 0, sizeof(PccGcSchedulerQueueEntry));
+    if (queue == NULL || queue->mutex == NULL) {
+        free(entry);
+        return;
+    }
+    if (pcc_mutex_lock(queue->mutex) != 0) {
+        free(entry);
+        return;
+    }
+    if (queue->free_count >= PCC_GC_SCHEDULER_QUEUE_ENTRY_POOL_LIMIT) {
+        (void)pcc_mutex_unlock(queue->mutex);
+        free(entry);
+        return;
+    }
+    entry->next = queue->free_head;
+    queue->free_head = entry;
+    queue->free_count++;
+    (void)pcc_mutex_unlock(queue->mutex);
+}
+
+static void pcc_gc_scheduler_queue_entry_release(
+    PccGcSchedulerQueue *queue,
+    PccGcSchedulerQueueEntry *entry
+) {
+    if (entry == NULL) return;
+    pcc_gc_graph_lock();
+    PyObject *value = pcc_gc_resolve_root_slot_unlocked(&entry->value);
+    (void)value;
+    pcc_gc_scheduler_root_unregister_handle(entry->root_handle);
+    entry->root_handle = NULL;
+    pcc_gc_graph_unlock();
+    pcc_gc_store_root(&entry->value, NULL);
+    pcc_gc_scheduler_queue_entry_recycle(queue, entry);
 }
 
 void pcc_gc_scheduler_queue_free(PccGcSchedulerQueue *queue) {
@@ -7629,6 +9404,14 @@ void pcc_gc_scheduler_queue_free(PccGcSchedulerQueue *queue) {
         pcc_gc_scheduler_queue_entry_free(entry);
         entry = next;
     }
+    entry = queue->free_head;
+    while (entry != NULL) {
+        PccGcSchedulerQueueEntry *next = entry->next;
+        free(entry);
+        entry = next;
+    }
+    queue->free_head = NULL;
+    queue->free_count = 0;
     pcc_mutex_free(queue->mutex);
     free(queue);
 }
@@ -7637,16 +9420,19 @@ int64_t pcc_gc_scheduler_queue_push(
     PccGcSchedulerQueue *queue, PyObject *value
 ) {
     if (queue == NULL) return -1;
-    PccGcSchedulerQueueEntry *entry = (
-        PccGcSchedulerQueueEntry *
-    )calloc(1, sizeof(PccGcSchedulerQueueEntry));
+    PccGcSchedulerQueueEntry *entry = pcc_gc_scheduler_queue_entry_alloc(queue);
     if (entry == NULL) return -1;
     pcc_gc_graph_lock();
-    pcc_gc_scheduler_root_register(&entry->value);
+    entry->root_handle = pcc_gc_scheduler_root_register_handle(&entry->value);
+    if (entry->root_handle == NULL) {
+        pcc_gc_graph_unlock();
+        pcc_gc_scheduler_queue_entry_recycle(queue, entry);
+        return -1;
+    }
     pcc_gc_store_ptr(NULL, &entry->value, value);
     pcc_gc_graph_unlock();
     if (pcc_mutex_lock(queue->mutex) != 0) {
-        pcc_gc_scheduler_queue_entry_free(entry);
+        pcc_gc_scheduler_queue_entry_release(queue, entry);
         return -1;
     }
     if (queue->tail == NULL) {
@@ -7675,12 +9461,13 @@ int64_t pcc_gc_scheduler_queue_pop_into(
     queue->length--;
     (void)pcc_mutex_unlock(queue->mutex);
     pcc_gc_graph_lock();
-    PyObject *value = pcc_gc_load_ptr(NULL, &entry->value);
+    PyObject *value = pcc_gc_resolve_root_slot_unlocked(&entry->value);
     if (out_slot != NULL) pcc_gc_store_ptr(NULL, out_slot, value);
-    pcc_gc_scheduler_root_unregister(&entry->value);
+    pcc_gc_scheduler_root_unregister_handle(entry->root_handle);
+    entry->root_handle = NULL;
     pcc_gc_graph_unlock();
     pcc_gc_store_root(&entry->value, NULL);
-    free(entry);
+    pcc_gc_scheduler_queue_entry_recycle(queue, entry);
     return 1;
 }
 
@@ -7696,11 +9483,25 @@ int64_t pcc_gc_scheduler_root_count(void) {
     pcc_gc_init_config();
     pcc_gc_graph_lock();
     int64_t count = 0;
+#ifdef PCC_RUNTIME_TRIPWIRES
+    PccGcSchedulerRootNode *prev = NULL;
+#endif
     for (
         PccGcSchedulerRootNode *n = pcc_gc_scheduler_roots;
         n != NULL;
         n = n->next
     ) {
+        PCC_RT_TRIPWIRE(
+            n->slot != NULL,
+            "pcc_gc_scheduler_root_count: scheduler root has a NULL slot address"
+        );
+        PCC_RT_TRIPWIRE(
+            n->prev == prev,
+            "pcc_gc_scheduler_root_count: scheduler root prev/next linkage mismatch"
+        );
+#ifdef PCC_RUNTIME_TRIPWIRES
+        prev = n;
+#endif
         count++;
     }
     pcc_gc_graph_unlock();
@@ -7716,7 +9517,7 @@ int64_t pcc_gc_frame_root_slot_count(void) {
         n != NULL;
         n = n->next
     ) {
-        slots += pcc_gc_root_slot_count_from_map(n->frame_map);
+        slots += n->root_count;
     }
     pcc_gc_graph_unlock();
     return slots;
@@ -7731,7 +9532,19 @@ int64_t pcc_gc_continuation_root_slot_count(void) {
         n != NULL;
         n = n->next
     ) {
-        slots += pcc_gc_root_slot_count_from_map(n->frame_map);
+        PCC_RT_TRIPWIRE(
+            n->frame_map != NULL && n->slots != NULL,
+            "pcc_gc_continuation_root_slot_count: continuation root lost its map or slot base"
+        );
+        PCC_RT_TRIPWIRE(
+            n->root_count > 0 && n->stable_values != NULL,
+            "pcc_gc_continuation_root_slot_count: continuation root count/stable buffer is invalid"
+        );
+        PCC_RT_TRIPWIRE(
+            n->root_count == pcc_gc_root_slot_count_from_map(n->frame_map),
+            "pcc_gc_continuation_root_slot_count: continuation root map/count drift"
+        );
+        slots += n->root_count;
     }
     pcc_gc_graph_unlock();
     return slots;
@@ -7743,6 +9556,60 @@ int64_t pcc_gc_coroutine_root_score(void) {
         + pcc_gc_continuation_root_slot_count();
 }
 
+static int pcc_gc_slot_in_root_range(
+    PyObject **slot,
+    PyObject **slots,
+    int64_t count
+) {
+    if (slot == NULL || slots == NULL || count <= 0) return 0;
+    if (count > (INT64_MAX / (int64_t)sizeof(PyObject *))) return 0;
+    uintptr_t slot_addr = (uintptr_t)slot;
+    uintptr_t base_addr = (uintptr_t)slots;
+    uintptr_t bytes = (uintptr_t)count * (uintptr_t)sizeof(PyObject *);
+    uintptr_t end_addr = base_addr + bytes;
+    if (end_addr < base_addr) return 0;
+    if (slot_addr < base_addr || slot_addr >= end_addr) return 0;
+    return ((slot_addr - base_addr) % sizeof(PyObject *)) == 0;
+}
+
+int64_t pcc_gc_slot_is_runtime_root(PyObject **slot) {
+    pcc_gc_init_config();
+    if (slot == NULL) return 0;
+    pcc_gc_graph_lock();
+    for (
+        PccGcFrameNode *n = pcc_gc_frames;
+        n != NULL;
+        n = n->next
+    ) {
+        if (pcc_gc_slot_in_root_range(slot, n->slots, n->root_count)) {
+            pcc_gc_graph_unlock();
+            return 1;
+        }
+    }
+    for (
+        PccGcContinuationRootNode *n = pcc_gc_continuation_roots;
+        n != NULL;
+        n = n->next
+    ) {
+        if (pcc_gc_slot_in_root_range(slot, n->slots, n->root_count)) {
+            pcc_gc_graph_unlock();
+            return 1;
+        }
+    }
+    for (
+        PccGcSchedulerRootNode *n = pcc_gc_scheduler_roots;
+        n != NULL;
+        n = n->next
+    ) {
+        if (n->slot == slot) {
+            pcc_gc_graph_unlock();
+            return 1;
+        }
+    }
+    pcc_gc_graph_unlock();
+    return 0;
+}
+
 void pcc_gc_register_continuation_root(
     const void *frame_map,
     PyObject **slots
@@ -7751,12 +9618,20 @@ void pcc_gc_register_continuation_root(
     if (frame_map == NULL || slots == NULL) return;
     int64_t n_slots = pcc_gc_root_slot_count_from_map((const int32_t *)frame_map);
     if (n_slots <= 0) return;
+    size_t stable_bytes = (size_t)n_slots * sizeof(PyObject *);
     PccGcContinuationRootNode *n = (
         PccGcContinuationRootNode *
-    )calloc(1, sizeof(PccGcContinuationRootNode));
+    )calloc(1, sizeof(PccGcContinuationRootNode) + stable_bytes);
     if (n == NULL) return;
     n->frame_map = (const int32_t *)frame_map;
     n->slots = slots;
+    n->root_count = n_slots;
+    n->borrowed = pcc_gc_root_map_is_borrowed((const int32_t *)frame_map);
+    n->stable_values = (PyObject **)((uint8_t *)n + sizeof(*n));
+    PCC_RT_TRIPWIRE(
+        n->root_count == n_slots && n->stable_values != NULL,
+        "pcc_gc_register_continuation_root: continuation root allocation metadata is inconsistent"
+    );
     pcc_gc_graph_lock();
     n->next = pcc_gc_continuation_roots;
     pcc_gc_continuation_roots = n;
@@ -7787,15 +9662,19 @@ int64_t pcc_gc_trace_continuation_roots(void) {
     pcc_gc_init_config();
     pcc_gc_graph_lock();
     int64_t traced = 0;
+    PccGcGrayMappedRootSlotCtx root_ctx = { 0 };
     for (
         PccGcContinuationRootNode *n = pcc_gc_continuation_roots;
         n != NULL;
         n = n->next
     ) {
-        traced += pcc_gc_gray_mapped_roots_unlocked(
-            n->frame_map,
+        traced += pcc_gc_visit_mapped_root_slots_unlocked(
+            n->root_count,
             n->slots,
-            0
+            NULL,
+            n->borrowed,
+            pcc_gc_gray_mapped_root_slot,
+            &root_ctx
         );
     }
     pcc_gc_graph_unlock();
@@ -7811,31 +9690,197 @@ int64_t pcc_gc_rewrite_continuation_roots(void) {
         n != NULL;
         n = n->next
     ) {
-        rewritten += pcc_gc_rewrite_mapped_roots_unlocked(
-            n->frame_map,
-            n->slots
+        PccGcRewriteMappedRootCtx rewrite_ctx = { 0 };
+        (void)pcc_gc_visit_mapped_root_slots_unlocked(
+            n->root_count,
+            n->slots,
+            NULL,
+            n->borrowed,
+            pcc_gc_rewrite_mapped_root_slot,
+            &rewrite_ctx
         );
+        rewritten += rewrite_ctx.rewritten;
     }
     pcc_gc_graph_unlock();
     return rewritten;
 }
 
+static void pcc_gc_frame_node_unlink(PccGcFrameNode *node) {
+    if (node == NULL) return;
+    PccGcFrameNode *prev = node->prev;
+    PccGcFrameNode *next = node->next;
+    if (prev != NULL) {
+        prev->next = next;
+    } else if (pcc_gc_frames == node) {
+        pcc_gc_frames = next;
+    }
+    if (next != NULL) next->prev = prev;
+    node->prev = NULL;
+    node->next = NULL;
+    node->dup_next = NULL;
+}
+
+static int64_t pcc_gc_frame_node_bucket(int64_t root_count) {
+    if (
+        root_count <= 0
+        || root_count > PCC_GC_FRAME_NODE_POOL_MAX_ROOTS
+    ) {
+        return 0;
+    }
+    return root_count;
+}
+
+static size_t pcc_gc_frame_node_size(int64_t root_count) {
+    size_t stable_bytes = (size_t)root_count * sizeof(PyObject *);
+    return sizeof(PccGcFrameNode) + stable_bytes;
+}
+
+static PccGcFrameNode *pcc_gc_frame_node_alloc_unlocked(int64_t root_count) {
+    int64_t bucket = pcc_gc_frame_node_bucket(root_count);
+    size_t bytes = pcc_gc_frame_node_size(root_count);
+    if (bucket > 0) {
+        PccGcFrameNode *node = pcc_gc_frame_node_free_lists[bucket];
+        if (node != NULL) {
+            pcc_gc_frame_node_free_lists[bucket] = node->next;
+            if (pcc_gc_frame_node_free_counts[bucket] > 0) {
+                pcc_gc_frame_node_free_counts[bucket]--;
+            }
+            memset(node, 0, bytes);
+            return node;
+        }
+    }
+    return (PccGcFrameNode *)calloc(1, bytes);
+}
+
+static PccGcFrameNode *pcc_gc_frame_node_create_unlocked(
+    const void *frame_map,
+    PyObject **slots,
+    int64_t n_slots,
+    int32_t extra_flags
+) {
+    PccGcFrameNode *n = pcc_gc_frame_node_alloc_unlocked(n_slots);
+    if (n == NULL) return NULL;
+    n->frame_map = (const int32_t *)frame_map;
+    n->slots = slots;
+    n->root_count = n_slots;
+    n->borrowed = (
+        pcc_gc_root_map_is_borrowed((const int32_t *)frame_map)
+        | extra_flags
+    );
+    n->stable_values = (PyObject **)((uint8_t *)n + sizeof(*n));
+    n->next = pcc_gc_frames;
+    n->prev = NULL;
+    if (pcc_gc_frames != NULL) pcc_gc_frames->prev = n;
+    pcc_gc_frames = n;
+    return n;
+}
+
+static void pcc_gc_frame_node_release_unlocked(PccGcFrameNode *node) {
+    if (node == NULL) return;
+    int64_t bucket = pcc_gc_frame_node_bucket(node->root_count);
+    if (
+        bucket <= 0
+        || pcc_gc_frame_node_free_counts[bucket] >= PCC_GC_FRAME_NODE_POOL_LIMIT
+    ) {
+        free(node);
+        return;
+    }
+    size_t bytes = pcc_gc_frame_node_size(node->root_count);
+    memset(node, 0, bytes);
+    node->next = pcc_gc_frame_node_free_lists[bucket];
+    pcc_gc_frame_node_free_lists[bucket] = node;
+    pcc_gc_frame_node_free_counts[bucket]++;
+}
+
 void pcc_gc_note_frame_enter(const void *frame_map, PyObject **slots) {
+    if (pcc_gc_frame_roots_disabled_fast()) return;
     pcc_gc_init_config();
     if (!pcc_gc_should_track_frame_roots()) return;
     if (frame_map == NULL || slots == NULL) return;
-    PccGcFrameNode *n = (PccGcFrameNode *)calloc(1, sizeof(PccGcFrameNode));
-    if (n == NULL) return;
-    n->frame_map = (const int32_t *)frame_map;
-    n->slots = slots;
+    int64_t n_slots = pcc_gc_root_slot_count_from_map((const int32_t *)frame_map);
+    if (n_slots <= 0) return;
     pcc_gc_graph_lock();
-    n->next = pcc_gc_frames;
-    pcc_gc_frames = n;
+    PccGcFrameNode *n = pcc_gc_frame_node_create_unlocked(
+        frame_map,
+        slots,
+        n_slots,
+        0
+    );
+    if (n == NULL) {
+        pcc_gc_graph_unlock();
+        return;
+    }
+    PccGcFrameNode *duplicate = (
+        PccGcFrameNode *
+    )pcc_gc_frame_index_replace((void *)slots, n);
+    if (duplicate == n) {
+        pcc_gc_frame_node_unlink(n);
+        pcc_gc_frame_node_release_unlocked(n);
+        pcc_gc_graph_unlock();
+        return;
+    }
+    n->dup_next = duplicate;
     pcc_gc_cycle_requested_store(1);
     pcc_gc_graph_unlock();
 }
 
+void pcc_gc_note_frame_enter_lifo(const void *frame_map, PyObject **slots) {
+    if (pcc_gc_frame_roots_disabled_fast()) return;
+    pcc_gc_init_config();
+    if (!pcc_gc_should_track_frame_roots()) return;
+    if (frame_map == NULL || slots == NULL) return;
+    int64_t n_slots = pcc_gc_root_slot_count_from_map((const int32_t *)frame_map);
+    if (n_slots <= 0) return;
+    pcc_gc_graph_lock();
+    PccGcFrameNode *n = pcc_gc_frame_node_create_unlocked(
+        frame_map,
+        slots,
+        n_slots,
+        PCC_GC_FRAME_NODE_FLAG_LIFO
+    );
+    if (n == NULL) {
+        pcc_gc_graph_unlock();
+        return;
+    }
+    pcc_gc_cycle_requested_store(1);
+    pcc_gc_graph_unlock();
+}
+
+void pcc_gc_note_frame_leave_lifo(PyObject **slots) {
+    if (pcc_gc_frame_roots_disabled_fast()) return;
+    pcc_gc_init_config();
+    if (!pcc_gc_should_track_frame_roots()) return;
+    if (slots == NULL) return;
+    pcc_gc_graph_lock();
+    PccGcFrameNode *node = pcc_gc_frames;
+    if (
+        node != NULL
+        && node->slots == slots
+        && (node->borrowed & PCC_GC_FRAME_NODE_FLAG_LIFO) != 0
+    ) {
+        pcc_gc_frame_node_unlink(node);
+        pcc_gc_frame_node_release_unlocked(node);
+        pcc_gc_cycle_requested_store(1);
+        pcc_gc_graph_unlock();
+        return;
+    }
+    for (node = pcc_gc_frames; node != NULL; node = node->next) {
+        if (
+            node->slots == slots
+            && (node->borrowed & PCC_GC_FRAME_NODE_FLAG_LIFO) != 0
+        ) {
+            pcc_gc_frame_node_unlink(node);
+            pcc_gc_frame_node_release_unlocked(node);
+            pcc_gc_cycle_requested_store(1);
+            pcc_gc_graph_unlock();
+            return;
+        }
+    }
+    pcc_gc_graph_unlock();
+}
+
 void pcc_gc_note_frame_leave(PyObject **slots) {
+    if (pcc_gc_frame_roots_disabled_fast()) return;
     pcc_gc_init_config();
     if (!pcc_gc_should_track_frame_roots()) return;
     if (slots == NULL) return;
@@ -7847,17 +9892,26 @@ void pcc_gc_note_frame_leave(PyObject **slots) {
         pcc_gc_graph_unlock();
         return;
     }
-    PccGcFrameNode **cur = &pcc_gc_frames;
-    while (*cur != NULL) {
-        if ((*cur)->slots == slots) {
-            PccGcFrameNode *dead = *cur;
-            *cur = dead->next;
-            free(dead);
-            pcc_gc_cycle_requested_store(1);
-            pcc_gc_graph_unlock();
-            return;
+    PccGcFrameNode *indexed = (
+        PccGcFrameNode *
+    )pcc_gc_frame_index_find((void *)slots);
+    if (indexed == NULL) {
+        pcc_gc_graph_unlock();
+        return;
+    }
+    if (indexed->slots == slots) {
+        PccGcFrameNode *duplicate = indexed->dup_next;
+        pcc_gc_frame_node_unlink(indexed);
+        if (duplicate != NULL) {
+            (void)pcc_gc_frame_index_replace((void *)slots, duplicate);
+        } else {
+            (void)pcc_gc_frame_index_remove((void *)slots);
         }
-        cur = &(*cur)->next;
+        pcc_gc_frame_node_release_unlocked(indexed);
+        pcc_gc_cycle_requested_store(1);
+    } else {
+        (void)pcc_gc_frame_index_remove((void *)slots);
+        (void)pcc_gc_frame_index_insert((void *)indexed->slots, indexed);
     }
     pcc_gc_graph_unlock();
 }

@@ -11,6 +11,7 @@ from pcc.unsafe import (
     cstr,
     free,
     getenv,
+    global_load_ptr,
     is_tagged_int,
     load_i8,
     load_i32,
@@ -45,6 +46,10 @@ py_path_getcwd     = extern("py_path_getcwd",     (),               c_ptr)
 py_path_realpath   = extern("py_path_realpath",   (c_ptr,),         c_ptr)
 py_tuple_new       = extern("py_tuple_new",       (c_int64,),       c_ptr)
 py_tuple_set_item  = extern("py_tuple_set_item",  (c_ptr, c_int64, c_ptr), c_void)
+py_str_utf8        = extern("py_str_utf8",        (c_ptr,),         c_ptr)
+py_exc_new         = extern("py_exc_new",         (c_int64, c_ptr), c_ptr)
+py_raise_owned     = extern("py_raise_owned",     (c_ptr,),         c_void)
+mkdir_sys          = extern("mkdir",              (c_ptr, c_int32), c_int32)
 
 
 def _type_of(obj) -> int:
@@ -87,6 +92,62 @@ def _path_seq_borrow(parts, i: int):
     if tag == 7:                  # PY_TYPE_TUPLE
         return pcc_gc_load_ptr(parts, ptr_add(parts, 24 + i * 8))
     return null()
+
+
+@c_abi_export("py_os_makedirs")
+def py_os_makedirs(path, exist_ok: int):
+    item, owned = _coerce_path_str(path)
+    if ptr_is_null(item) != 0:
+        if ptr_is_null(owned) == 0:
+            py_decref(owned)
+        py_raise_owned(py_exc_new(3, cstr("path must be string-like")))
+        return null()
+
+    raw = py_str_utf8(item)
+    raw_len: int = py_str_byte_len(item)
+    if ptr_is_null(raw) != 0 or raw_len <= 0:
+        if ptr_is_null(owned) == 0:
+            py_decref(owned)
+        py_raise_owned(py_exc_new(14, cstr("cannot create empty path")))
+        return null()
+
+    buf = malloc(raw_len + 1)
+    if ptr_is_null(buf) != 0:
+        if ptr_is_null(owned) == 0:
+            py_decref(owned)
+        py_raise_owned(py_exc_new(14, cstr("could not allocate path")))
+        return null()
+    memmove(buf, raw, raw_len)
+    store_i8(buf, raw_len, 0)
+
+    end: int = raw_len
+    while end > 1 and load_i8(buf, end - 1) == 47:
+        end = end - 1
+    store_i8(buf, end, 0)
+
+    i: int = 1
+    while i <= end:
+        if i == end or load_i8(buf, i) == 47:
+            saved: int = load_i8(buf, i)
+            store_i8(buf, i, 0)
+            if mkdir_sys(buf, 511) != 0:
+                kind: int = py_path_stat_kind(buf)
+                if kind != 2 or (i == end and exist_ok == 0):
+                    store_i8(buf, i, saved)
+                    free(buf)
+                    if ptr_is_null(owned) == 0:
+                        py_decref(owned)
+                    py_raise_owned(
+                        py_exc_new(14, cstr("could not create directory"))
+                    )
+                    return null()
+            store_i8(buf, i, saved)
+        i = i + 1
+
+    free(buf)
+    if ptr_is_null(owned) == 0:
+        py_decref(owned)
+    return global_load_ptr("py_None")
 
 
 @c_abi_export("py_os_path_join")

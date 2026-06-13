@@ -14,9 +14,14 @@
 #include "py_internal.h"
 
 /* pow(base, exp, mod). Assumes integer operands. Handles exp >= 0 and mod != 0
- * (the common case; CPython raises for a negative exp without a modular
- * inverse and for mod == 0 — those are left to a NULL return). Returns a new
- * reference, or NULL on error. */
+ * (the common case). Matches CPython's error surface: raises ValueError for
+ * mod == 0 ("pow() 3rd argument cannot be 0"), and — since we do not yet
+ * compute a modular inverse — raises ValueError for a negative exponent with a
+ * modulus (CPython supports it via the inverse; we defer it explicitly rather
+ * than return a wrong result). Both error paths set a Python exception via
+ * py_raise so the frontend py_err_occurred() check branches to the error path
+ * (a bare NULL return would NOT be caught — there is no stack unwinding).
+ * Returns a new reference, or NULL (with an exception set) on error. */
 PyObject *py_int_pow_mod(PyObject *base, PyObject *exp, PyObject *mod) {
     if (base == NULL || exp == NULL || mod == NULL) return NULL;
 
@@ -28,10 +33,25 @@ PyObject *py_int_pow_mod(PyObject *base, PyObject *exp, PyObject *mod) {
         return NULL;
     }
 
-    /* Negative exponent: not supported here (CPython would need a modular
-     * inverse). Return NULL so the caller surfaces an error rather than a
-     * wrong result. */
+    /* mod == 0: CPython raises ValueError, not ZeroDivisionError. Check up
+     * front (before the first py_int_mod, which would otherwise return a bare
+     * NULL for a zero divisor with no exception set). */
+    if (py_int_cmp(mod, zero) == 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+                            "pow() 3rd argument cannot be 0"));
+        py_decref(one);
+        py_decref(zero);
+        return NULL;
+    }
+
+    /* Negative exponent: CPython computes base**-e mod m via the modular
+     * inverse of base. We do not implement the inverse yet; raise a clear,
+     * matching-typed error (ValueError) instead of returning a wrong result or
+     * a silent NULL. */
     if (py_int_cmp(exp, zero) < 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+                            "pow() negative exponent with modulus not "
+                            "supported"));
         py_decref(one);
         py_decref(zero);
         return NULL;
@@ -93,4 +113,95 @@ PyObject *py_int_pow_mod(PyObject *base, PyObject *exp, PyObject *mod) {
     py_decref(one);
     py_decref(zero);
     return result;
+}
+
+/* math.isqrt(n): floor of the exact square root, bignum-correct.
+ *
+ * Kept as a C helper in OBJ_PY_CC_HELPERS (no pcc-Python port — see the file
+ * header) so the frontend can route ``math.isqrt(n)`` to a single
+ * implementation for arbitrary-precision operands. Uses integer Newton
+ * iteration on boxed PyObject ints via the py_int_* helpers, so it never
+ * converts to float (which would lose precision above 2**53 and give wrong
+ * results such as isqrt((10**30)+1)).
+ *
+ * Matches CPython's error surface: raises ValueError for a negative argument
+ * ("isqrt() argument must be nonnegative") via py_raise so the frontend
+ * py_err_occurred() check branches to the error path (a bare NULL return
+ * would NOT be caught — there is no stack unwinding). Returns a new
+ * reference, or NULL (with an exception set) on error.
+ *
+ * Algorithm (verified against math.isqrt over a wide random/bignum range):
+ *   if n < 0: raise ValueError
+ *   if n == 0: return 0
+ *   x = 1 << ((bit_length(n) + 1) / 2)     -- initial overestimate
+ *   loop: y = (x + n // x) // 2; if y >= x: return x; x = y
+ * The iterate is a monotone-decreasing overestimate that stops at
+ * floor(sqrt(n)); the y >= x test detects the fixed point / oscillation. */
+PyObject *py_int_isqrt(PyObject *n) {
+    if (n == NULL) return NULL;
+
+    PyObject *zero = py_int_from_i64(0);
+    if (zero == NULL) return NULL;
+
+    /* Negative argument: CPython raises ValueError. */
+    if (py_int_cmp(n, zero) < 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+                            "isqrt() argument must be nonnegative"));
+        py_decref(zero);
+        return NULL;
+    }
+
+    /* n == 0: isqrt(0) == 0. (Also guards the n // x division below, which
+     * would be undefined for the initial x when n is 0.) */
+    if (py_int_cmp(n, zero) == 0) {
+        return zero;  /* transfer ownership of the boxed 0 to the caller */
+    }
+
+    PyObject *one = py_int_from_i64(1);
+    PyObject *two = py_int_from_i64(2);
+    if (one == NULL || two == NULL) {
+        if (one) py_decref(one);
+        if (two) py_decref(two);
+        py_decref(zero);
+        return NULL;
+    }
+
+    /* x = 1 << ((bit_length(n) + 1) / 2): a tight overestimate of the root
+     * whose bit length is ceil(bit_length(n) / 2). */
+    int64_t bl = py_int_bit_length(n);
+    PyObject *shift = py_int_from_i64((bl + 1) / 2);
+    PyObject *x = (shift != NULL) ? py_int_shl(one, shift) : NULL;
+    if (shift) py_decref(shift);
+    if (x == NULL) {
+        py_decref(one);
+        py_decref(two);
+        py_decref(zero);
+        return NULL;
+    }
+
+    /* Newton iteration on boxed ints: y = (x + n // x) // 2. */
+    while (1) {
+        PyObject *q = py_int_floordiv(n, x);              /* n // x */
+        PyObject *sum = (q != NULL) ? py_int_add(x, q) : NULL;
+        if (q) py_decref(q);
+        PyObject *y = (sum != NULL) ? py_int_floordiv(sum, two) : NULL;
+        if (sum) py_decref(sum);
+        if (y == NULL) {
+            py_decref(x);
+            x = NULL;
+            break;
+        }
+        /* if y >= x: converged, x is floor(sqrt(n)). */
+        if (py_int_cmp(y, x) >= 0) {
+            py_decref(y);
+            break;
+        }
+        py_decref(x);
+        x = y;
+    }
+
+    py_decref(one);
+    py_decref(two);
+    py_decref(zero);
+    return x;  /* owned result (floor sqrt), or NULL with an exception set */
 }

@@ -273,6 +273,18 @@ def pcc_gc_telemetry(metric: int) -> int:
         return load_i32(global_addr("pcc_gc_debt_bytes"), 0)
     if metric == 7:
         return load_i32(global_addr("pcc_gc_metric_max_pause_us"), 0)
+    if metric == 32:
+        return load_i32(global_addr("pcc_gc_metric_pause_count"), 0)
+    if metric == 33:
+        return load_i32(global_addr("pcc_gc_metric_pause_sum_us"), 0)
+    if metric == 34:
+        return load_i32(global_addr("pcc_gc_metric_pause_hist0"), 0)
+    if metric == 35:
+        return load_i32(global_addr("pcc_gc_metric_pause_hist1"), 0)
+    if metric == 36:
+        return load_i32(global_addr("pcc_gc_metric_pause_hist2"), 0)
+    if metric == 37:
+        return load_i32(global_addr("pcc_gc_metric_pause_hist3"), 0)
     if metric == 8:
         return pcc_py_atomic_i32_load(global_addr("pcc_gc_minor_allocations"))
     if metric == 9:

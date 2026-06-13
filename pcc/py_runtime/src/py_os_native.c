@@ -15,7 +15,41 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 #include <unistd.h>
+
+/* `os.uname()` — five strings in CPython's sequence order. The compiler also
+ * recognizes direct `.sysname` / `.machine` access on the result. Keeping the
+ * syscall in this non-replaced C-kernel module gives the cc and pcc-Python
+ * runtime archives one implementation and avoids baking build-host values
+ * into deployable artifacts. */
+PyObject *py_os_uname(void) {
+    struct utsname raw;
+    if (uname(&raw) != 0) {
+        py_raise(py_exc_new(PY_EXC_OSERROR, "os.uname() failed"));
+        return NULL;
+    }
+
+    const char *fields[5] = {
+        raw.sysname,
+        raw.nodename,
+        raw.release,
+        raw.version,
+        raw.machine,
+    };
+    PyObject *out = py_tuple_new(5);
+    if (out == NULL) return NULL;
+    for (int64_t i = 0; i < 5; i++) {
+        PyObject *field = py_str_new(fields[i], (int64_t)strlen(fields[i]));
+        if (field == NULL) {
+            py_decref(out);
+            return NULL;
+        }
+        py_tuple_set_item(out, i, field);
+        py_decref(field);
+    }
+    return out;
+}
 
 /* `os.cpu_count()` — number of CPUs the current process can use.
  * CPython returns None when undeterminable; pcc returns a tagged-int

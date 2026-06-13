@@ -12,7 +12,30 @@
 #include <string.h>
 
 PyObject *py_int_to_str_obj(PyObject *o) {
-    if (o == NULL || py_type_of(o) != PY_TYPE_INT) return NULL;
+    if (o == NULL) return NULL;
+
+    if (PY_IS_TAGGED_INT(o)) {
+        int64_t v = py_untag_int(o);
+        uint64_t mag;
+        int neg = v < 0;
+        if (neg) {
+            mag = (uint64_t)(-(v + 1)) + 1u;
+        } else {
+            mag = (uint64_t)v;
+        }
+
+        char buf[32];
+        char *end = buf + sizeof(buf);
+        char *p = end;
+        do {
+            *--p = (char)('0' + (mag % 10u));
+            mag /= 10u;
+        } while (mag != 0);
+        if (neg) *--p = '-';
+        return py_str_new(p, (int64_t)(end - p));
+    }
+
+    if (py_type_of(o) != PY_TYPE_INT) return NULL;
 
     PyIntObject *b = py_bigint_from_any(o);
     if (b == NULL) return NULL;
@@ -123,11 +146,13 @@ static PyObject *py_int_based_repr(PyObject *o, unsigned base, char prefix_ch) {
             int overflow = 0;
             v = py_int_to_i64(o, &overflow);
             if (overflow) {
-                py_raise(py_exc_new(
-                    PY_EXC_VALUEERROR,
-                    "bin/hex/oct of integers larger than 64-bit "
-                    "is not yet supported"));
-                return NULL;
+                /* Bignum exceeding i64: convert the full magnitude in base. */
+                char *s = py_bigint_to_base_cstr(
+                    (const PyIntObject *)o, base, prefix_ch);
+                if (s == NULL) return NULL;
+                PyObject *r = py_str_new(s, (int64_t)strlen(s));
+                free(s);
+                return r;
             }
         } else {
             py_raise(py_exc_new(
@@ -157,6 +182,28 @@ static PyObject *py_int_based_repr(PyObject *o, unsigned base, char prefix_ch) {
 PyObject *py_builtin_bin(PyObject *o) { return py_int_based_repr(o, 2u, 'b'); }
 PyObject *py_builtin_hex(PyObject *o) { return py_int_based_repr(o, 16u, 'x'); }
 PyObject *py_builtin_oct(PyObject *o) { return py_int_based_repr(o, 8u, 'o'); }
+
+/* ``callable(x)``: mirror py_obj_call's dispatch classification. Functions,
+ * classes and weakrefs are callable; an instance is callable iff its class
+ * defines ``__call__``. Tagged ints, None, and any other type tag are not. */
+PyObject *py_builtin_callable(PyObject *o) {
+    if (o == NULL) return py_bool_from_bit(0);
+    if (PY_IS_TAGGED_INT(o)) return py_bool_from_bit(0);
+    int32_t tag = py_header(o)->type_tag;
+    if (tag == PY_TYPE_FUNC || tag == PY_TYPE_CLASS || tag == PY_TYPE_WEAKREF) {
+        return py_bool_from_bit(1);
+    }
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+        PyInstanceObject *inst = (PyInstanceObject *)o;
+        PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
+            o,
+            (PyObject **)&inst->cls
+        );
+        PyObject *method = py_class_lookup(cls, "__call__");
+        return py_bool_from_bit(method != NULL ? 1 : 0);
+    }
+    return py_bool_from_bit(0);
+}
 
 PyObject *py_int_format_decimal(
     PyObject *o, int64_t width, int64_t zero_pad, int64_t comma
@@ -259,6 +306,20 @@ static PyObject *pcc_call_user_unary_method(PyObject *func, PyObject *self) {
     return meth(self);
 }
 
+static void pcc_call_user_unary_method_void(PyObject *func, PyObject *self) {
+    if (func == NULL) return;
+    if (pcc_dunder_pointer_can_have_header(func)
+        && !PY_IS_TAGGED_INT(func)
+        && py_type_of(func) == PY_TYPE_FUNC) {
+        PyObject *result = pcc_call_user_unary_method(func, self);
+        if (result != NULL) py_decref(result);
+        return;
+    }
+    typedef void (*VoidUnaryMethod)(PyObject *);
+    VoidUnaryMethod meth = (VoidUnaryMethod)(uintptr_t)func;
+    meth(self);
+}
+
 PyObject *py_user_str_dispatch(PyObject *o) {
     PyObject *func = pcc_user_dunder_lookup(o, "__str__");
     return pcc_call_user_unary_method(func, o);
@@ -309,6 +370,7 @@ void py_user_del_dispatch(PyObject *o) {
     PyObjectHeader *h = py_header(o);
     int32_t tag = h->type_tag;
     if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return;
+    if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) return;
     if ((h->flags & PY_FLAG_FINALIZED) != 0) {
         pcc_runtime_log_event("finalizer", "skipped", tag, 1, o);
         return;
@@ -320,21 +382,27 @@ void py_user_del_dispatch(PyObject *o) {
     );
     if (cls == NULL) return;
 
-    PyObject *func = pcc_gc_load_ptr((PyObject *)cls, &cls->del_method);
-    if (func == NULL) {
-        func = py_class_lookup(cls, "__del__");
-        pcc_gc_note_slot_write_barrier(
-            (PyObject *)cls, &cls->del_method, func
-        );
-        cls->del_method = func;
-        if (func == NULL) return;
-    }
+    /* Match the pcc-Python runtime: del_method is a borrowed update-only GC
+     * alias, not a second semantic cache.  Looking through the MRO here keeps
+     * finalizer dispatch correct if class metadata changes after creation. */
+    PyObject *func = py_class_lookup(cls, "__del__");
+    if (func == NULL) return;
 
     h->flags |= PY_FLAG_FINALIZED;
+
+    /* A finalizer may run while an exception from the operation that dropped
+     * the last reference is already pending (for example, a failing
+     * __init__).  Give __del__ an empty exception slot so any error it raises
+     * is independently suppressible, then restore the caller's exception.
+     * py_tls_exc_set is a raw slot transfer, so keep one temporary reference
+     * while the slot is detached. */
+    PyObject *saved_exc = py_current_exception();
+    if (saved_exc != NULL) {
+        py_incref(saved_exc);
+        py_tls_exc_set(NULL);
+    }
     pcc_runtime_log_event("finalizer", "call", tag, 0, o);
-    typedef void (*FinalizerMethod)(PyObject *);
-    FinalizerMethod meth = (FinalizerMethod)(uintptr_t)func;
-    meth(o);
+    pcc_call_user_unary_method_void(func, o);
     pcc_runtime_log_event("finalizer", "done", tag, 0, o);
 
     /* CPython reports most finalizer exceptions as unraisable and keeps
@@ -342,4 +410,8 @@ void py_user_del_dispatch(PyObject *o) {
      * important invariant here is that stale TLS exception state cannot
      * poison the caller after a best-effort finalizer dispatch. */
     py_clear_exception();
+    if (saved_exc != NULL) {
+        py_tls_exc_set(saved_exc);
+        py_decref(saved_exc);
+    }
 }

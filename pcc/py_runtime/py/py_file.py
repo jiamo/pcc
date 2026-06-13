@@ -24,6 +24,7 @@ from pcc.unsafe import (
     ptr_eq,
     ptr_is_null,
     realloc,
+    store_i8,
     store_i32,
     store_i64,
     store_ptr,
@@ -32,12 +33,20 @@ from pcc.unsafe import (
 
 fclose = extern("fclose", (c_ptr,), c_int32)
 ferror = extern("ferror", (c_ptr,), c_int32)
+fflush = extern("fflush", (c_ptr,), c_int32)
+fgetc = extern("fgetc", (c_ptr,), c_int32)
 fopen = extern("fopen", (c_ptr, c_ptr), c_ptr)
 fread = extern("fread", (c_ptr, c_size_t, c_size_t, c_ptr), c_size_t)
+# LP64 targets (aarch64-darwin / x86_64-linux): C ``long`` is 64-bit, so
+# fseek/ftell take/return c_int64 here.
+fseek = extern("fseek", (c_ptr, c_int64, c_int32), c_int32)
+ftell = extern("ftell", (c_ptr,), c_int64)
 fwrite = extern("fwrite", (c_ptr, c_size_t, c_size_t, c_ptr), c_size_t)
 
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_incref = extern("py_incref", (c_ptr,), c_void)
+py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_bool_from_bit = extern("py_bool_from_bit", (c_int32,), c_ptr)
 py_int_from_i64 = extern("py_int_from_i64", (c_int64,), c_ptr)
 py_int_value_i64 = extern("py_int_value_i64", (c_ptr,), c_int64)
@@ -241,6 +250,113 @@ def py_file_write(file, text):
         wrote = fwrite(py_str_utf8(s), 1, n, load_ptr(f, 16))
     py_decref(owned)
     return py_int_from_i64(wrote)
+
+
+def _checked_open_file(file):
+    """Shared open-file precondition for readline/seek/tell/flush.
+
+    NULL / non-file receivers return null silently (matching the older
+    read/write helpers); a closed file raises ValueError exactly like
+    CPython ("I/O operation on closed file.").
+    """
+    if ptr_is_null(file):
+        return null()
+    if _type_of(file) != 13:
+        return null()
+    if load_i32(file, 24) != 0 or ptr_is_null(load_ptr(file, 16)):
+        # 2 == PY_EXC_VALUEERROR
+        py_raise_owned(py_exc_new(2, cstr("I/O operation on closed file.")))
+        return null()
+    return file
+
+
+@c_abi_export("py_file_readline")
+def py_file_readline(file, limit: int):
+    f = _checked_open_file(file)
+    if ptr_is_null(f):
+        return null()
+    fp = load_ptr(f, 16)
+
+    buf = null()
+    length: int = 0
+    cap: int = 0
+    while True:
+        if limit >= 0 and length >= limit:
+            break
+        ch: int = fgetc(fp)
+        if ch < 0:
+            if ferror(fp) != 0:
+                free(buf)
+                return null()
+            break
+        if length + 2 > cap:
+            new_cap: int = 128
+            if cap != 0:
+                new_cap = cap * 2
+            grown = realloc(buf, new_cap)
+            if ptr_is_null(grown):
+                free(buf)
+                return null()
+            buf = grown
+            cap = new_cap
+        store_i8(buf, length, ch)
+        length = length + 1
+        if ch == 10:
+            break
+    data = buf
+    if ptr_is_null(data):
+        data = cstr("")
+    out = _file_bytes_or_str(f, data, length)
+    free(buf)
+    return out
+
+
+@c_abi_export("py_file_seek")
+def py_file_seek(file, offset: int, whence: int):
+    f = _checked_open_file(file)
+    if ptr_is_null(f):
+        return null()
+    fp = load_ptr(f, 16)
+    # SEEK_SET/SEEK_CUR/SEEK_END are 0/1/2 on both LP64 targets; unknown
+    # whence values fall back to SEEK_SET like the C mirror.
+    w: int = 0
+    if whence == 1:
+        w = 1
+    if whence == 2:
+        w = 2
+    rc: int = fseek(fp, offset, w)
+    pos: int = -1
+    if rc == 0:
+        pos = ftell(fp)
+    if rc != 0 or pos < 0:
+        # 14 == PY_EXC_OSERROR
+        py_raise_owned(py_exc_new(14, cstr("Invalid argument")))
+        return null()
+    return py_int_from_i64(pos)
+
+
+@c_abi_export("py_file_tell")
+def py_file_tell(file):
+    f = _checked_open_file(file)
+    if ptr_is_null(f):
+        return null()
+    pos: int = ftell(load_ptr(f, 16))
+    if pos < 0:
+        # 14 == PY_EXC_OSERROR
+        py_raise_owned(py_exc_new(14, cstr("Invalid argument")))
+        return null()
+    return py_int_from_i64(pos)
+
+
+@c_abi_export("py_file_flush")
+def py_file_flush(file):
+    f = _checked_open_file(file)
+    if ptr_is_null(f):
+        return null()
+    fflush(load_ptr(f, 16))
+    none = global_load_ptr("py_None")
+    py_incref(none)
+    return none
 
 
 @c_abi_export("py_file_close")

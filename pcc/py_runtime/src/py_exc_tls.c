@@ -111,6 +111,20 @@ static PyObject *py_raise_normalize(PyObject *exc, int *owned) {
 }
 
 
+static PyObject *py_resolve_current_exception(void) {
+    PyObject *cur = (PyObject *)py_tls_exc_get();
+    if (cur == NULL) return NULL;
+    PyObject *resolved = pcc_gc_note_relocation_read(cur);
+    if (resolved != cur) {
+        py_incref(resolved);
+        py_tls_exc_set(resolved);
+        py_decref(cur);
+        cur = resolved;
+    }
+    return cur;
+}
+
+
 void py_raise(PyObject *exc) {
     int exc_owned = 0;
     exc = py_raise_normalize(exc, &exc_owned);
@@ -119,16 +133,7 @@ void py_raise(PyObject *exc) {
         (exc != NULL && !PY_IS_TAGGED_INT(exc)) ? py_type_of(exc) : -1,
         exc_owned, exc
     );
-    PyObject *cur = (PyObject *)py_tls_exc_get();
-    if (cur != NULL) {
-        PyObject *resolved_cur = pcc_gc_note_relocation_read(cur);
-        if (resolved_cur != cur) {
-            py_incref(resolved_cur);
-            py_tls_exc_set(resolved_cur);
-            py_decref(cur);
-            cur = resolved_cur;
-        }
-    }
+    PyObject *cur = py_resolve_current_exception();
     /* Auto-chain context: if a prior exception is still active
      * (we're inside an except block), stash it as __context__ on
      * the new one. Matches CPython's implicit chaining. */
@@ -149,18 +154,24 @@ void py_raise(PyObject *exc) {
 }
 
 
+void py_raise_owned(PyObject *exc) {
+    py_raise(exc);
+    py_decref(exc);
+}
+
+
 int64_t py_err_occurred(void) {
     return py_tls_exc_get() != NULL ? 1 : 0;
 }
 
 
 PyObject *py_current_exception(void) {
-    return (PyObject *)py_tls_exc_get();   /* borrowed */
+    return py_resolve_current_exception();   /* borrowed */
 }
 
 
 void py_clear_exception(void) {
-    PyObject *cur = (PyObject *)py_tls_exc_get();
+    PyObject *cur = py_resolve_current_exception();
     if (cur != NULL) {
         pcc_runtime_log_event_code(
             6, 4,

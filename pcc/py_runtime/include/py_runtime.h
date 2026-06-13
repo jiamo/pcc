@@ -43,6 +43,12 @@ enum {
     PY_TYPE_TASK = 28,
     PY_TYPE_CONTINUATION = 29,
     PY_TYPE_VIRTUAL_THREAD = 30,
+    /* Owned handle to a foreign CPython object (J2': generator-frame
+     * storage for cpy locals). No pcc pointer slots — the foreign ref
+     * is released by the dealloc hook via py_cpy_decref. Tag 32 stays
+     * OUTSIDE the port's 29..31 lifecycle anti-forgery group; the
+     * port validity window widens to <= 32 accordingly. */
+    PY_TYPE_CPY_HANDLE = 32,
     PY_TYPE_VALUEBOX = 200,
     PY_TYPE_USER    = 100   /* user-defined classes >= this */
 };
@@ -68,7 +74,10 @@ enum {
     PY_EXC_ASSERTIONERROR    = 16,
     PY_EXC_STOPASYNCITERATION = 17,
     PY_EXC_REFERENCEERROR    = 18,
-    PY_EXC_N_BUILTIN         = 19
+    PY_EXC_MEMORYERROR       = 19,
+    PY_EXC_IMPORTERROR       = 20,
+    PY_EXC_MODULENOTFOUNDERROR = 21,
+    PY_EXC_N_BUILTIN         = 22
 };
 
 /* Every PyObject has this header prefix. */
@@ -105,6 +114,8 @@ void      pcc_debug_check_release(const char *name, void *obj);
 void      pcc_debug_bad_str_concat(void *a, void *b,
                                    int64_t tag_a, int64_t tag_b);
 PyObject *pcc_gc_load_ptr(PyObject *owner, PyObject **slot);
+PyObject *pcc_gc_load_borrowed_ptr(PyObject *owner, PyObject **slot);
+PyObject *pcc_gc_resolve_owned_ptr(PyObject *value);
 void      pcc_gc_store_ptr(PyObject *owner, PyObject **slot, PyObject *value);
 void      pcc_gc_store_root(PyObject **slot, PyObject *value);
 void      pcc_gc_note_write_barrier(PyObject *owner, PyObject *value);
@@ -113,22 +124,99 @@ void      pcc_gc_note_slot_write_barrier(
     PyObject **slot,
     PyObject *value
 );
+void     *pcc_gc_scheduler_root_register_handle(PyObject **slot);
+void      pcc_gc_scheduler_root_unregister_handle(void *handle);
 void      pcc_gc_scheduler_root_register(PyObject **slot);
 void      pcc_gc_scheduler_root_unregister(PyObject **slot);
 void      pcc_gc_register_continuation_root(const void *frame_map, PyObject **slots);
 void      pcc_gc_unregister_continuation_root(PyObject **slots);
 int64_t   pcc_gc_trace_continuation_roots(void);
 int64_t   pcc_gc_rewrite_continuation_roots(void);
+
+/* Opaque external-device resources live in the C-level kernel, outside the
+ * PyObject graph. The same registry is consumed by every GC backend and by
+ * both the C-authored and pcc-Python-authored runtimes. A zero resource id or
+ * a negative operation result denotes failure. Release callbacks run outside
+ * the registry lock and at most once, after both final host release and fence
+ * completion have been observed. */
+enum {
+    PCC_GC_EXTERNAL_RESOURCE_GPU_BUFFER = 1,
+    PCC_GC_EXTERNAL_RESOURCE_GPU_FENCE = 2
+};
+typedef int64_t (*PccGcExternalReleaseFn)(
+    uint64_t native_handle,
+    void *context
+);
+typedef void (*PccGcExternalContextFreeFn)(void *context);
+uint64_t  pcc_gc_external_resource_register(
+    int32_t kind,
+    uint64_t native_handle,
+    PccGcExternalReleaseFn release_fn,
+    void *release_context,
+    PccGcExternalContextFreeFn context_free_fn
+);
+int64_t   pcc_gc_external_resource_retain(uint64_t resource_id);
+int64_t   pcc_gc_external_resource_release_after_fence(uint64_t resource_id);
+int64_t   pcc_gc_external_resource_mark_fence_complete(uint64_t resource_id);
+int64_t   pcc_gc_external_resource_poll(void);
+int64_t   pcc_gc_external_resource_backend(uint64_t resource_id);
+int64_t   pcc_gc_external_resource_active_count(void);
+int64_t   pcc_gc_external_resource_pending_count(void);
+int64_t   pcc_gc_external_resource_release_count(void);
+int64_t   pcc_gc_external_resource_release_failure_count(void);
+int64_t   pcc_gc_external_resource_last_release_error(void);
+uint64_t  pcc_gc_external_metal_buffer_register(
+    const char *runtime_library_path,
+    uint64_t native_handle
+);
+
+/* Classic DLPack kDLMetal bridge for pcc-native/no-libpython producers and
+ * consumers. The capsule remains a generic PyCapsule object; this packet is
+ * the POD re-entry boundary used by Kernel IR launch plumbing. */
+#define PCC_DLPACK_MAX_NDIM 8
+typedef struct PccDlpackBufferHandlePacket {
+    uint64_t native_handle;
+    uint64_t external_resource_id;
+    uint64_t nbytes;
+    int64_t shape[PCC_DLPACK_MAX_NDIM];
+    int64_t ndim;
+    int32_t device_type;
+    int32_t device_id;
+    int32_t dtype_code;
+    int32_t dtype_bits;
+    int32_t dtype_lanes;
+} PccDlpackBufferHandlePacket;
+int64_t   pcc_dlpack_buffer_handle_packet_size(void);
+PyObject *pcc_dlpack_metal_capsule_new(
+    uint64_t external_resource_id,
+    uint64_t native_handle,
+    int32_t dtype_code,
+    int32_t dtype_bits,
+    int32_t dtype_lanes,
+    int64_t ndim,
+    const int64_t *shape
+);
+int64_t   pcc_dlpack_capsule_name_code(PyObject *capsule);
+int64_t   pcc_dlpack_capsule_consume(
+    PyObject *capsule,
+    PccDlpackBufferHandlePacket *out_handle,
+    void **out_managed_tensor
+);
+int64_t   pcc_dlpack_managed_tensor_release(void *managed_tensor);
+
 PccGcSchedulerQueue *pcc_gc_scheduler_queue_new(void);
 void      pcc_gc_scheduler_queue_free(PccGcSchedulerQueue *queue);
 int64_t   pcc_gc_scheduler_queue_push(PccGcSchedulerQueue *queue, PyObject *value);
 int64_t   pcc_gc_scheduler_queue_pop_into(PccGcSchedulerQueue *queue, PyObject **out_slot);
 int64_t   pcc_gc_scheduler_queue_len(PccGcSchedulerQueue *queue);
-/* Frame map format, v0: frame_map points at an int32 slot count.
+/* Frame map format, v0: frame_map points at a signed int32 slot count.
+ * Positive counts are owning roots; negative counts are borrowed roots.
  * slots points at a contiguous PyObject* local/root array. Future precise
  * maps can extend this block; a NULL frame_map means "no roots". */
 void      pcc_gc_frame_enter(const void *frame_map, PyObject **slots);
 void      pcc_gc_frame_leave(PyObject **slots);
+void      pcc_gc_frame_enter_lifo(const void *frame_map, PyObject **slots);
+void      pcc_gc_frame_leave_lifo(PyObject **slots);
 void      pcc_gc_safepoint(void);
 int64_t   pcc_gc_collect(int32_t reason);
 void      pcc_gc_pin(PyObject *o);
@@ -185,90 +273,111 @@ enum {
     PCC_GC_COUNTER_CMS_WORKBUFFER_SCORE = 29,
     PCC_GC_COUNTER_GEN_MINOR_PRODUCTIVITY_SCORE = 30,
     PCC_GC_COUNTER_GEN_REMEMBERED_UPDATE_SCORE = 31,
-    PCC_GC_COUNTER_SCHEDULER_ROOTS = 32,
-    PCC_GC_COUNTER_FRAME_ROOT_SLOTS = 33,
-    PCC_GC_COUNTER_COROUTINE_ROOT_SCORE = 34,
-    PCC_GC_COUNTER_GENZGC_STORE_BARRIERS = 35,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_ENTRIES = 36,
-    PCC_GC_COUNTER_GENZGC_YOUNG_PROMOTIONS = 37,
-    PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATES = 38,
-    PCC_GC_COUNTER_GENZGC_EVACUATED_BYTES = 39,
-    PCC_GC_COUNTER_GENZGC_PAGE_POLICY_SCORE = 40,
-    PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_DEFERS = 41,
-    PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_DEFERRED_BYTES = 42,
-    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATES = 43,
-    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATES = 44,
-    PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATE_BYTES = 45,
-    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATE_BYTES = 46,
-    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATE_BYTES = 47,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DRAIN_BATCHES = 48,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DRAINED_ENTRIES = 49,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DUPLICATE_SKIPS = 50,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_HIGH_WATER = 51,
-    PCC_GC_COUNTER_GENZGC_PAGE_PRESSURE_SCORE = 52,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_OWNER_FANOUT_HIGH_WATER = 53,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_OWNER_COUNT_HIGH_WATER = 54,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_INCOMPLETE_DRAINS = 55,
-    PCC_GC_COUNTER_GENZGC_EVACUATION_INCOMPLETE_BATCHES = 56,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_BATCH_CAPACITY = 57,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MAX_BATCH_SIZE = 58,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_FULL_BATCHES = 59,
-    PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_ENTRIES = 60,
-    PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_DUPLICATE_SKIPS = 61,
-    PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_HIGH_WATER = 62,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_CAPACITY = 63,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_PENDING = 64,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FLUSHES = 65,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FLUSHED_ENTRIES = 66,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FULL_FLUSHES = 67,
-    PCC_GC_COUNTER_GENZGC_EVACUATION_EFFICIENCY_PER_MILLE = 68,
-    PCC_GC_COUNTER_GENZGC_FRAGMENTATION_BACKLOG_BYTES = 69,
-    PCC_GC_COUNTER_GENZGC_FRAGMENTATION_POLICY_SCORE = 70,
-    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_LIMIT_BYTES = 71,
-    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_LIMIT_BYTES = 72,
-    PCC_GC_COUNTER_GENZGC_LARGE_DEFER_LIMIT_BYTES = 73,
-    PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_RECONSIDERATIONS = 74,
-    PCC_GC_COUNTER_GENZGC_YOUNG_OBJECTS = 75,
-    PCC_GC_COUNTER_GENZGC_OLD_OBJECTS = 76,
-    PCC_GC_COUNTER_GENZGC_YOUNG_BYTES = 77,
-    PCC_GC_COUNTER_GENZGC_OLD_BYTES = 78,
-    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_OBJECTS = 79,
-    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_OBJECTS = 80,
-    PCC_GC_COUNTER_GENZGC_LARGE_PAGE_OBJECTS = 81,
-    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_BYTES = 82,
-    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_BYTES = 83,
-    PCC_GC_COUNTER_GENZGC_LARGE_PAGE_BYTES = 84,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_CROSS_THREAD_MEDIUM_FLUSHES = 85,
-    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_CROSS_THREAD_MEDIUM_FLUSHED_ENTRIES = 86,
-    PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_ENTRIES = 87,
-    PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_SLOT_ENTRIES = 88,
-    PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_HIGH_WATER = 89,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_COUNT = 90,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_CAPACITY_BYTES = 91,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTATION_BYTES = 92,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_LARGE_PAGES = 93,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_USED_BYTES = 94,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTATION_PER_MILLE = 95,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_POLICY_SCORE = 96,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_SLOTS = 97,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_DIRTY_PAGES = 98,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTED_PAGES = 99,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_YOUNG_PAGES = 100,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_OLD_PAGES = 101,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARDS = 102,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARD_RATIO_PER_MILLE = 103,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_PAGES = 104,
-    PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_CAPACITY_BYTES = 105,
-    PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATE_ZPAGE_BYTES = 106,
-    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATE_ZPAGE_BYTES = 107,
-    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATE_ZPAGE_BYTES = 108,
-    PCC_GC_COUNTER_GENZGC_EVACUATION_PAGE_CANDIDATES = 109
+    /* G-P3-LONGRUN pause telemetry (docs/plans/gc-longrun-benchmark-plan.md):
+     * recorded at collect/step endpoints by pcc_gc_record_pause. */
+    PCC_GC_COUNTER_PAUSE_COUNT = 32,
+    PCC_GC_COUNTER_PAUSE_SUM_US = 33,
+    PCC_GC_COUNTER_PAUSE_HIST_LT_100US = 34,
+    PCC_GC_COUNTER_PAUSE_HIST_LT_1MS = 35,
+    PCC_GC_COUNTER_PAUSE_HIST_LT_10MS = 36,
+    PCC_GC_COUNTER_PAUSE_HIST_GE_10MS = 37,
+    PCC_GC_COUNTER_SCHEDULER_ROOTS = 38,
+    PCC_GC_COUNTER_FRAME_ROOT_SLOTS = 39,
+    PCC_GC_COUNTER_COROUTINE_ROOT_SCORE = 40,
+    PCC_GC_COUNTER_GENZGC_STORE_BARRIERS = 41,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_ENTRIES = 42,
+    PCC_GC_COUNTER_GENZGC_YOUNG_PROMOTIONS = 43,
+    PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATES = 44,
+    PCC_GC_COUNTER_GENZGC_EVACUATED_BYTES = 45,
+    PCC_GC_COUNTER_GENZGC_PAGE_POLICY_SCORE = 46,
+    PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_DEFERS = 47,
+    PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_DEFERRED_BYTES = 48,
+    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATES = 49,
+    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATES = 50,
+    PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATE_BYTES = 51,
+    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATE_BYTES = 52,
+    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATE_BYTES = 53,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DRAIN_BATCHES = 54,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DRAINED_ENTRIES = 55,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_DUPLICATE_SKIPS = 56,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_HIGH_WATER = 57,
+    PCC_GC_COUNTER_GENZGC_PAGE_PRESSURE_SCORE = 58,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_OWNER_FANOUT_HIGH_WATER = 59,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_OWNER_COUNT_HIGH_WATER = 60,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_INCOMPLETE_DRAINS = 61,
+    PCC_GC_COUNTER_GENZGC_EVACUATION_INCOMPLETE_BATCHES = 62,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_BATCH_CAPACITY = 63,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MAX_BATCH_SIZE = 64,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_FULL_BATCHES = 65,
+    PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_ENTRIES = 66,
+    PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_DUPLICATE_SKIPS = 67,
+    PCC_GC_COUNTER_GENZGC_REMEMBERED_SET_HIGH_WATER = 68,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_CAPACITY = 69,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_PENDING = 70,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FLUSHES = 71,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FLUSHED_ENTRIES = 72,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FULL_FLUSHES = 73,
+    PCC_GC_COUNTER_GENZGC_EVACUATION_EFFICIENCY_PER_MILLE = 74,
+    PCC_GC_COUNTER_GENZGC_FRAGMENTATION_BACKLOG_BYTES = 75,
+    PCC_GC_COUNTER_GENZGC_FRAGMENTATION_POLICY_SCORE = 76,
+    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_LIMIT_BYTES = 77,
+    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_LIMIT_BYTES = 78,
+    PCC_GC_COUNTER_GENZGC_LARGE_DEFER_LIMIT_BYTES = 79,
+    PCC_GC_COUNTER_GENZGC_LARGE_OBJECT_RECONSIDERATIONS = 80,
+    PCC_GC_COUNTER_GENZGC_YOUNG_OBJECTS = 81,
+    PCC_GC_COUNTER_GENZGC_OLD_OBJECTS = 82,
+    PCC_GC_COUNTER_GENZGC_YOUNG_BYTES = 83,
+    PCC_GC_COUNTER_GENZGC_OLD_BYTES = 84,
+    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_OBJECTS = 85,
+    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_OBJECTS = 86,
+    PCC_GC_COUNTER_GENZGC_LARGE_PAGE_OBJECTS = 87,
+    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_BYTES = 88,
+    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_BYTES = 89,
+    PCC_GC_COUNTER_GENZGC_LARGE_PAGE_BYTES = 90,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_CROSS_THREAD_MEDIUM_FLUSHES = 91,
+    PCC_GC_COUNTER_GENZGC_STORE_BUFFER_CROSS_THREAD_MEDIUM_FLUSHED_ENTRIES = 92,
+    PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_ENTRIES = 93,
+    PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_SLOT_ENTRIES = 94,
+    PCC_GC_COUNTER_GENZGC_REMEMBERED_PAGE_HIGH_WATER = 95,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_COUNT = 96,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_CAPACITY_BYTES = 97,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTATION_BYTES = 98,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_LARGE_PAGES = 99,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_USED_BYTES = 100,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTATION_PER_MILLE = 101,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_POLICY_SCORE = 102,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_SLOTS = 103,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_DIRTY_PAGES = 104,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_FRAGMENTED_PAGES = 105,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_YOUNG_PAGES = 106,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_OLD_PAGES = 107,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARDS = 108,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_REMEMBERED_CARD_RATIO_PER_MILLE = 109,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_PAGES = 110,
+    PCC_GC_COUNTER_GENZGC_ZPAGE_FREE_CAPACITY_BYTES = 111,
+    PCC_GC_COUNTER_GENZGC_EVACUATION_CANDIDATE_ZPAGE_BYTES = 112,
+    PCC_GC_COUNTER_GENZGC_SMALL_PAGE_CANDIDATE_ZPAGE_BYTES = 113,
+    PCC_GC_COUNTER_GENZGC_MEDIUM_PAGE_CANDIDATE_ZPAGE_BYTES = 114,
+    PCC_GC_COUNTER_GENZGC_EVACUATION_PAGE_CANDIDATES = 115
 };
 
 int64_t   pcc_gc_backend(void);
 int64_t   pcc_gc_set_backend(int64_t backend);
 const char *pcc_gc_backend_name(int64_t backend);
 int64_t   pcc_gc_telemetry(int64_t metric);
+/* G-P3-LONGRUN: process RSS sampling (C-only; -1 on failure). */
+int64_t   pcc_os_current_rss_bytes(void);
+int64_t   pcc_os_peak_rss_bytes(void);
+/* G-P3-LONGRUN: malloc-heap statistics for backends 0-3 fragmentation
+ * (C-only; -1 on failure). in_use = bytes handed to the program;
+ * capacity = bytes the allocator holds from the OS. */
+int64_t   pcc_os_heap_in_use_bytes(void);
+int64_t   pcc_os_heap_capacity_bytes(void);
+/* Value-position enumerate(): eager (index, item) tuple list. */
+PyObject *py_enumerate_list(PyObject *iterable, int64_t start);
+/* int.to_bytes / int.from_bytes (unsigned; CPython-matching errors). */
+PyObject *py_int_to_bytes(PyObject *v, int64_t length, PyObject *byteorder);
+PyObject *py_int_from_bytes(PyObject *bytes_obj, PyObject *byteorder);
 void      pcc_gc_telemetry_reset(void);
 int64_t   pcc_gc_step(int64_t budget);
 int64_t   pcc_gc_backend4_verify_no_old_addresses(void);
@@ -331,6 +440,8 @@ int64_t   pcc_gc_backend4_zpage_owner_size_bytes(PyObject *owner);
 int64_t   pcc_gc_backend4_zpage_owner_span_card(PyObject *owner);
 int64_t   pcc_gc_backend4_zpage_owner_slot_span_card(PyObject *owner, PyObject **slot);
 int64_t   pcc_gc_backend4_zpage_register_owner_payload_span(PyObject *owner, void *base, int64_t size_bytes);
+int64_t   pcc_gc_backend4_zpage_unregister_owner_payload_span(PyObject *owner, void *base);
+int64_t   pcc_gc_backend4_zpage_retarget_owner_payload_span(PyObject *owner, void *old_base, void *new_base, int64_t size_bytes);
 int64_t   pcc_gc_backend4_zpage_count(void);
 int64_t   pcc_gc_backend4_zpage_capacity_bytes(void);
 int64_t   pcc_gc_backend4_zpage_fragmentation_bytes(void);
@@ -486,6 +597,7 @@ PyObject *py_int_truediv(PyObject *a, PyObject *b);    /* returns float */
 PyObject *py_int_mod(PyObject *a, PyObject *b);        /* Python sign semantics */
 PyObject *py_int_pow(PyObject *a, PyObject *b);
 PyObject *py_int_pow_mod(PyObject *base, PyObject *exp, PyObject *mod);  /* 3-arg pow */
+PyObject *py_int_isqrt(PyObject *n);  /* math.isqrt: bignum floor sqrt */
 PyObject *py_int_neg(PyObject *a);
 PyObject *py_int_and(PyObject *a, PyObject *b);
 PyObject *py_int_or(PyObject *a, PyObject *b);
@@ -499,6 +611,10 @@ PyObject *py_int_format_decimal(PyObject *o, int64_t width, int64_t zero_pad, in
 PyObject *py_builtin_bin(PyObject *o);
 PyObject *py_builtin_hex(PyObject *o);
 PyObject *py_builtin_oct(PyObject *o);
+/* ``callable(x)`` builtin: returns py_True/py_False. A tagged int, None, or
+ * any non-callable type tag yields False; PY_TYPE_FUNC/CLASS/WEAKREF and any
+ * instance whose class defines ``__call__`` yield True. */
+PyObject *py_builtin_callable(PyObject *o);
 /* ``int(str)`` / ``int(str, base)`` — returns a tagged or heap int
  * matching strtoll(); on parse error, returns NULL. Base 0 auto-
  * detects 0x / 0o / 0b prefixes. Use base 10 for Python's default. */
@@ -508,12 +624,19 @@ PyObject *py_int_from_cstr_or_raise(const char *s, int base);  /* ValueError on 
 /* ---- Float ------------------------------------------------------------- */
 PyObject *py_float_from_f64(double v);
 double    py_float_to_f64(PyObject *o);
+double    py_float_value_of(PyObject *o);  /* float(x): str-aware (parses) */
 PyObject *py_float_add(PyObject *a, PyObject *b);
 PyObject *py_float_sub(PyObject *a, PyObject *b);
 PyObject *py_float_mul(PyObject *a, PyObject *b);
+PyObject *py_float_round_ndigits(double v, int64_t ndigits);
+double    pcc_float_round_fixed_f64(double v, int64_t ndigits);
 PyObject *py_float_format_fixed(PyObject *o, int64_t precision);
 PyObject *py_float_repr_shortest(PyObject *o);
 int64_t   py_float_is_integer(PyObject *o);     /* float.is_integer() -> bool */
+/* float.fromhex(s): parse a hexadecimal floating-point string (optional 0x
+ * prefix, 'p' binary exponent) exactly like CPython float.fromhex; raises
+ * ValueError on a malformed string and OverflowError when out of range. */
+PyObject *py_float_fromhex(PyObject *text);
 /* ... sub, mul, div, mod, pow, neg, cmp ... */
 
 /* ---- Complex ----------------------------------------------------------- */
@@ -521,6 +644,16 @@ PyObject *py_complex_new(double real, double imag);
 PyObject *py_complex_real(PyObject *o);
 PyObject *py_complex_imag(PyObject *o);
 PyObject *py_complex_add(PyObject *a, PyObject *b);
+PyObject *py_complex_sub(PyObject *a, PyObject *b);
+PyObject *py_complex_mul(PyObject *a, PyObject *b);
+PyObject *py_complex_div(PyObject *a, PyObject *b);
+/* base ** exp; mirrors CPython _Py_c_pow. Raises ZeroDivisionError for
+ * 0 ** (negative or complex power); returns NULL after py_raise. */
+PyObject *py_complex_pow(PyObject *a, PyObject *b);
+PyObject *py_complex_neg(PyObject *a);
+PyObject *py_complex_conjugate(PyObject *a);
+PyObject *py_complex_abs(PyObject *a);  /* returns a float (magnitude) */
+PyObject *py_complex_repr(PyObject *a); /* "(re+imj)"; str==repr for complex */
 
 /* ---- Bytes / bytearray / memoryview ------------------------------------ */
 PyObject *py_bytes_new(const char *data, int64_t byte_len);
@@ -528,13 +661,34 @@ PyObject *py_bytearray_from_obj(PyObject *o);
 PyObject *py_bytes_from_obj(PyObject *o);
 PyObject *py_memoryview_new(PyObject *o);
 PyObject *py_bytes_decode(PyObject *o);
+PyObject *py_bytes_decode_utf8_ignore(PyObject *o);
+PyObject *py_bytes_decode_with_encoding(PyObject *o,
+                                        PyObject *encoding,
+                                        PyObject *errors);
 PyObject *py_bytes_hex(PyObject *o);    /* bytes.hex() -> lowercase hex str */
+PyObject *py_bytes_upper(PyObject *o);
+PyObject *py_bytes_lower(PyObject *o);
+PyObject *py_bytes_strip(PyObject *o);
 PyObject *py_bytes_getitem(PyObject *o, PyObject *k);
 PyObject *py_bytes_slice(PyObject *o, PyObject *lo, PyObject *hi, PyObject *step);
 PyObject *py_bytes_concat(PyObject *a, PyObject *b);
 PyObject *py_bytes_repeat(PyObject *src, int64_t count);
+PyObject *py_bytes_maketrans(PyObject *x, PyObject *y);
+PyObject *py_bytes_translate(PyObject *src, PyObject *table);
+PyObject *py_bytes_fromhex(PyObject *text);
+PyObject *py_bytes_replace(PyObject *src, PyObject *old, PyObject *new_value);
 int64_t   py_bytes_len(PyObject *o);
+int64_t   py_bytes_find(PyObject *src, PyObject *needle);
+int64_t   py_bytes_rfind(PyObject *src, PyObject *needle);
+int64_t   py_bytes_count(PyObject *src, PyObject *needle);
+PyObject *py_bytes_split(PyObject *src, PyObject *sep);
+PyObject *py_bytes_partition(PyObject *src, PyObject *sep);
+PyObject *py_bytearray_extend(PyObject *o, PyObject *iterable);
+PyObject *py_bytearray_append(PyObject *o, PyObject *item);
+PyObject *py_bytearray_insert(PyObject *o, PyObject *index, PyObject *item);
+PyObject *py_bytearray_pop(PyObject *o, PyObject *index);
 int64_t   py_bytearray_setitem(PyObject *o, PyObject *k, PyObject *v);
+int64_t   py_bytearray_del_slice(PyObject *o, PyObject *lo, PyObject *hi, PyObject *step);
 
 /* ---- Str --------------------------------------------------------------- */
 PyObject *py_str_new(const char *utf8, int64_t byte_len);
@@ -555,6 +709,11 @@ int64_t   py_str_eq(PyObject *a, PyObject *b);
 int64_t   py_str_contains(PyObject *s, PyObject *sub);
 int64_t   py_str_find(PyObject *s, PyObject *sub);   /* -1 if not found */
 int64_t   py_str_rfind(PyObject *s, PyObject *sub);  /* -1 if not found */
+/* find/rfind with codepoint start/end window (CPython ADJUST_INDICES) */
+int64_t   py_str_find_range(PyObject *s, PyObject *sub,
+                            int64_t start, int64_t end);   /* -1 if not found */
+int64_t   py_str_rfind_range(PyObject *s, PyObject *sub,
+                             int64_t start, int64_t end);  /* -1 if not found */
 PyObject *py_str_upper(PyObject *s);
 PyObject *py_str_lower(PyObject *s);
 PyObject *py_str_capitalize(PyObject *s);
@@ -565,6 +724,7 @@ PyObject *py_str_expandtabs(PyObject *s, int64_t tabsize);
 PyObject *py_str_rpartition(PyObject *s, PyObject *sep);
 PyObject *py_str_translate(PyObject *s, PyObject *table);  /* dict {ord:ord|str|None} */
 PyObject *py_str_maketrans(PyObject *x, PyObject *y);      /* {ord(x[i]):ord(y[i])} */
+PyObject *py_textwrap_dedent(PyObject *s);
 PyObject *py_str_strip(PyObject *s);
 PyObject *py_str_split(PyObject *s, PyObject *sep);  /* returns list */
 PyObject *py_str_split_maxsplit(PyObject *s, PyObject *sep, int64_t maxsplit);
@@ -576,10 +736,12 @@ int64_t   py_str_endswith(PyObject *s, PyObject *suffix);
 PyObject *py_chr_from_i64(int64_t codepoint);
 PyObject *py_json_loads(PyObject *text);
 PyObject *py_json_dumps(PyObject *obj);
+PyObject *py_json_dumps_ex(PyObject *obj, int64_t sort_keys);
 PyObject *py_copy_copy(PyObject *o);
 PyObject *py_copy_deepcopy(PyObject *o);
 PyObject *py_pickle_dumps(PyObject *o, PyObject *protocol);
 PyObject *py_pickle_loads(PyObject *data);
+PyObject *py_os_urandom(PyObject *n);
 
 /* ---- List -------------------------------------------------------------- */
 PyObject *py_list_new(int64_t initial_capacity);
@@ -589,11 +751,13 @@ PyObject *py_list_getitem(PyObject *lst, int64_t i); /* a[i]; IndexError if OOB 
 int64_t   py_list_get_i64(PyObject *lst, int64_t i); /* borrowed typed-int fast path */
 int64_t   py_list_get_i64_nonnegative(PyObject *lst, int64_t i); /* non-negative typed-int fast path */
 void      py_list_set(PyObject *lst, int64_t i, PyObject *item);
+int64_t   py_list_setitem(PyObject *lst, int64_t i, PyObject *item); /* a[i]=v; IndexError if OOB */
 int64_t   py_list_len(PyObject *lst);
 PyObject *py_list_slice(PyObject *lst, PyObject *lo, PyObject *hi, PyObject *step);
 int64_t   py_list_set_slice(PyObject *lst, PyObject *lo, PyObject *hi, PyObject *step, PyObject *replacement);
 int64_t   py_list_del_slice(PyObject *lst, PyObject *lo, PyObject *hi, PyObject *step);
 PyObject *py_list_concat(PyObject *a, PyObject *b);
+PyObject *py_list_copy(PyObject *src);
 PyObject *py_list_repeat(PyObject *src, int64_t count);
 void      py_list_extend(PyObject *a, PyObject *b);
 void      py_list_insert(PyObject *lst, int64_t i, PyObject *item);
@@ -603,6 +767,8 @@ void      py_list_clear(PyObject *lst);
 void      py_obj_clear(PyObject *obj);
 int64_t   py_list_contains(PyObject *lst, PyObject *item);
 int64_t   py_list_index(PyObject *lst, PyObject *item);
+int64_t   py_list_index_range(PyObject *lst, PyObject *item,
+                              int64_t start, int64_t end);
 int64_t   py_list_count(PyObject *lst, PyObject *item);
 void      py_list_reverse(PyObject *lst);
 
@@ -617,8 +783,13 @@ PyObject *py_dict_get_default(PyObject *d, PyObject *k, PyObject *def);
 int64_t   py_dict_contains(PyObject *d, PyObject *k);
 /* Returns 0 on success, -1 if missing. int64_t for pcc-Python ABI parity. */
 int64_t   py_dict_del(PyObject *d, PyObject *k);
+/* dict.popitem(): remove+return last (key,value) 2-tuple; KeyError if empty. */
+PyObject *py_dict_popitem(PyObject *d);
 void      py_dict_clear(PyObject *d);
 int64_t   py_dict_len(PyObject *d);
+int64_t   py_dict_entries_used(PyObject *d);
+PyObject *py_dict_entry_key_at(PyObject *d, int64_t i);
+PyObject *py_dict_entry_value_at(PyObject *d, int64_t i);
 PyObject *py_dict_keys(PyObject *d);                 /* list */
 PyObject *py_dict_values(PyObject *d);               /* list */
 PyObject *py_dict_items(PyObject *d);                /* list of tuples */
@@ -626,8 +797,12 @@ void      py_dict_update(PyObject *dst, PyObject *src);
 
 /* ---- Tuple ------------------------------------------------------------- */
 PyObject *py_tuple_new(int64_t n);
+PyObject *py_tuple_from_list(PyObject *lst);         /* new tuple from list elems */
+PyObject *py_tuple_from_splat(PyObject *seq);        /* new tuple from tuple/list/len+getitem seq */
 void      py_tuple_set_item(PyObject *t, int64_t i, PyObject *item); /* during construction only */
 PyObject *py_tuple_get(PyObject *t, int64_t i);
+PyObject *py_tuple_get_known(PyObject *t, int64_t i);
+PyObject *py_tuple_getitem(PyObject *t, int64_t i); /* t[i]; IndexError if OOB */
 int64_t   py_tuple_len(PyObject *t);
 int64_t   py_tuple_count(PyObject *t, PyObject *item);
 int64_t   py_tuple_index(PyObject *t, PyObject *item);  /* raises ValueError if absent */
@@ -642,9 +817,16 @@ void      py_set_update(PyObject *dst, PyObject *src);
 PyObject *py_set_intersection(PyObject *a, PyObject *b);
 PyObject *py_set_difference(PyObject *a, PyObject *b);
 PyObject *py_set_symmetric_difference(PyObject *a, PyObject *b);
+/* In-place variants: mutate `dst` to hold the corresponding result and
+ * return None-less (void). The receiver identity is preserved so aliases
+ * observe the change, matching CPython's set.*_update methods. */
+void      py_set_intersection_update(PyObject *dst, PyObject *other);
+void      py_set_difference_update(PyObject *dst, PyObject *other);
+void      py_set_symmetric_difference_update(PyObject *dst, PyObject *other);
 int64_t   py_set_issubset(PyObject *a, PyObject *b);
 int64_t   py_set_issuperset(PyObject *a, PyObject *b);
 PyObject *py_set_items(PyObject *s);                 /* list */
+PyObject *py_set_pop(PyObject *s);                   /* set.pop(); KeyError if empty */
 /* Returns 1 if item is in the set, 0 otherwise. Returns int64_t so the
  * pcc-Python port (py_set.py) emits under pcc's default `int` lowering
  * without a type mismatch. */
@@ -657,8 +839,10 @@ int64_t   py_set_len(PyObject *s);
 PyObject *py_obj_call(PyObject *callable, PyObject *args_tuple, PyObject *kwargs_dict);
 PyObject *py_obj_call_method1(PyObject *o, const char *name, PyObject *arg);
 PyObject *py_obj_add(PyObject *a, PyObject *b);
+PyObject *py_obj_abs(PyObject *o);
 PyObject *py_obj_mod(PyObject *a, PyObject *b);
 PyObject *py_str_mod(PyObject *fmt, PyObject *args);
+PyObject *py_bytes_mod(PyObject *fmt, PyObject *args);
 PyObject *py_weakref_new(PyObject *target, PyObject *callback);
 PyObject *py_weakref_call(PyObject *ref);
 void      py_weakref_invalidate(PyObject *target);
@@ -672,12 +856,17 @@ int64_t   py_weak_key_dict_len(PyObject *dict);
 void      py_dealloc_weakref(PyObject *ref);
 PyObject *py_obj_getattr(PyObject *o, const char *name);
 PyObject *py_obj_getattr_default(PyObject *o, const char *name);
+PyObject *py_obj_vars(PyObject *o);
 int64_t   py_obj_setattr(PyObject *o, const char *name, PyObject *v);
 int64_t   py_obj_delattr(PyObject *o, const char *name);
 PyObject *py_obj_type_name(PyObject *o);
 PyObject *py_type_builtin(PyObject *o);
+PyObject *py_builtin_type_for_tag(int64_t tag);
+int64_t py_builtin_type_class_tag(PyObject *value);
 PyObject *py_obj_getitem(PyObject *o, PyObject *k);
+PyObject *py_obj_getitem_i64(PyObject *o, int64_t idx);
 int64_t   py_obj_setitem(PyObject *o, PyObject *k, PyObject *v);
+int64_t   py_obj_setitem_i64(PyObject *o, int64_t idx, PyObject *v);
 int64_t   py_obj_delitem(PyObject *o, PyObject *k);
 int64_t   py_obj_len(PyObject *o);
 int64_t   py_obj_contains(PyObject *container, PyObject *item);
@@ -689,14 +878,27 @@ PyObject *py_str_strip_chars(PyObject *s, PyObject *chars);
 PyObject *py_str_lstrip_chars(PyObject *s, PyObject *chars);
 PyObject *py_str_rstrip_chars(PyObject *s, PyObject *chars);
 int64_t   py_str_count(PyObject *s, PyObject *sub);
+int64_t   py_str_count_range(PyObject *s, PyObject *sub,
+                             PyObject *start, PyObject *end);
 int64_t   py_str_isdigit(PyObject *s);
 int64_t   py_str_isalpha(PyObject *s);
 int64_t   py_str_isspace(PyObject *s);
 int64_t   py_str_isalnum(PyObject *s);
 int64_t   py_str_isupper(PyObject *s);
 int64_t   py_str_islower(PyObject *s);
+int64_t   py_str_isascii(PyObject *s);        /* all bytes < 0x80 (empty True) */
+int64_t   py_str_isidentifier(PyObject *s);   /* ASCII [A-Za-z_][A-Za-z0-9_]* */
+int64_t   py_str_isprintable(PyObject *s);    /* ASCII printable [0x20,0x7E] */
+int64_t   py_str_isnumeric(PyObject *s);      /* ASCII scope == isdigit */
+int64_t   py_str_isdecimal(PyObject *s);      /* ASCII scope == isdigit */
+int64_t   py_str_istitle(PyObject *s);        /* ASCII titlecase predicate */
 int64_t   py_str_index_of(PyObject *s, PyObject *sub);  /* find(); ValueError if absent */
 int64_t   py_str_rindex_of(PyObject *s, PyObject *sub); /* rfind(); ValueError if absent */
+/* index/rindex with codepoint start/end window; ValueError if absent */
+int64_t   py_str_index_of_range(PyObject *s, PyObject *sub,
+                                int64_t start, int64_t end);
+int64_t   py_str_rindex_of_range(PyObject *s, PyObject *sub,
+                                 int64_t start, int64_t end);
 /* ``sorted(x)`` — returns a new list with elements of ``x`` in
  * py_obj_eq / py_int_cmp order. ``x`` must be any py_obj_len /
  * py_obj_getitem-friendly container. Only numeric / string
@@ -719,8 +921,13 @@ PyObject *py_obj_repr(PyObject *o);
 PyObject *py_obj_ascii(PyObject *o);
 PyObject *py_obj_str(PyObject *o);
 int64_t   py_obj_isinstance(PyObject *o, PyObject *cls);
+int64_t   py_obj_issubclass(PyObject *derived, PyObject *cls);
 PyObject *py_obj_iter(PyObject *o);
 PyObject *py_obj_next(PyObject *it);
+/* iter(callable, sentinel): callable-iterator over the existing PY_TYPE_ITER
+ * object. Returns a new reference to a callable-iterator that yields
+ * callable() until a result compares equal to sentinel. */
+PyObject *py_iter_callable_new(PyObject *callable, PyObject *sentinel);
 
 /* User-defined protocol / dunder dispatch helpers. These are exposed so the
  * C runtime and pcc-Python runtime ports can share one ABI surface. */
@@ -745,6 +952,17 @@ int64_t   py_module_attr_set(const char *module_name,
                              const char *attr_name,
                              PyObject *value);
 PyObject *py_module_attr_get(const char *module_name, const char *attr_name);
+int64_t   py_module_import_star(const char *module_name,
+                                PyObject *source_module);
+int64_t   py_compiled_module_register_init(const char *module_name,
+                                           void *init_fn);
+PyObject *py_compiled_module_import_by_name(const char *module_name);
+/* Run the guarded top-init of each '.'-prefix parent package of module_name
+ * (CPython imports parents before the child; in-progress parents return
+ * early, keeping partial-module semantics). Returns 0, or -1 with an
+ * exception set. */
+int py_compiled_module_ensure_parent_packages(const char *module_name);
+PyObject *py_builtin_import(PyObject *name, PyObject *fromlist);
 PyObject *py_module_attr_value_or_default(PyObject **slot,
                                           PyObject *default_value);
 int64_t   py_module_attr_del(const char *module_name, const char *attr_name);
@@ -768,11 +986,28 @@ PyObject *py_func_new_bound(
     const char *name,
     PyObject *self_obj
 );
+int64_t py_func_attach_code_metadata(
+    PyObject *func,
+    PyObject *signature,
+    const char *name
+);
+PyObject *py_func_get_code_metadata(PyObject *func);
+PyObject *py_func_get_defaults_metadata(PyObject *func);
+extern PyObject *py_func_code_class_cache;
 PyObject *py_func_call(PyObject *callable, PyObject *args_tuple);
+PyObject *py_func_call_kwargs(
+    PyObject *callable,
+    PyObject *args_tuple,
+    PyObject *kwargs
+);
 PyObject *py_functools_partial(PyObject *fn, PyObject *bound_args);
+PyObject *py_functools_partial_kw(PyObject *fn, PyObject *bound_args, PyObject *bound_kwargs);
 PyObject *py_instance_bind_method(PyObject *method, PyObject *self, const char *name);
 PyObject *py_property_new(PyObject *fget, PyObject *fset, PyObject *fdel);
 PyObject *py_classmethod_new(PyObject *func);
+PyObject *py_slice_new(PyObject *start, PyObject *stop, PyObject *step);
+/* isinstance(x, slice): 1 if x is a slice instance, else 0. */
+int64_t   py_obj_is_slice(PyObject *o);
 
 /* ---- Native generator objects ------------------------------------------ */
 PyObject *py_gen_new(void *resume, PyObject *frame);
@@ -797,6 +1032,14 @@ int64_t   py_coroutine_is_done(PyObject *coro);
 PyObject *py_coroutine_get_result(PyObject *coro);
 PyObject *py_await(PyObject *awaitable);
 PyObject *py_asyncio_sleep(PyObject *delay);
+PyObject *py_coroutine_get_args(PyObject *coro);
+int64_t   py_asyncio_fd_relay(PyObject *fd1_in_obj, PyObject *fd1_out_obj,
+                              PyObject *fd2_in_obj, PyObject *fd2_out_obj);
+PyObject *py_asyncio_fd_relay_step(PyObject *fd1_in_obj, PyObject *fd1_out_obj,
+                                   PyObject *fd2_in_obj, PyObject *fd2_out_obj,
+                                   PyObject *active_mask_obj);
+PyObject *py_asyncio_fd_relay_step_last_progress(void);
+PyObject *py_asyncio_io_waitset_backend(void);
 PyObject *py_continuation_class(void);
 PyObject *py_continuation_new(const void *frame_map, PyObject **slots, void *resume_pc);
 PyObject *py_continuation_new_typed(const void *frame_map, PyObject **slots, void *resume_pc);
@@ -815,11 +1058,17 @@ int64_t   py_virtual_thread_start(PyObject *vthread);
 int64_t   py_virtual_thread_park(PyObject *vthread);
 int64_t   py_virtual_thread_unpark(PyObject *vthread);
 int64_t   py_virtual_thread_sleep(PyObject *vthread, int64_t delay_ms);
+int64_t   py_virtual_thread_cancel_timer(PyObject *vthread);
 int64_t   py_virtual_thread_poll_timers(void);
 int64_t   py_virtual_thread_timer_count(void);
 int64_t   py_virtual_thread_block_on_fd(PyObject *vthread, int64_t fd, int64_t events, int64_t timeout_ms);
 int64_t   py_virtual_thread_poll_io(int64_t timeout_ms);
 int64_t   py_virtual_thread_io_wait_count(void);
+enum {
+    PCC_VTHREAD_IO_BACKEND_POLL = 0,
+    PCC_VTHREAD_IO_BACKEND_KQUEUE = 1
+};
+int64_t   py_virtual_thread_io_backend(void);
 int64_t   py_virtual_thread_pin_enter(PyObject *vthread, const char *reason);
 int64_t   py_virtual_thread_pin_leave(PyObject *vthread);
 int64_t   py_virtual_thread_pin_count(PyObject *vthread);
@@ -827,6 +1076,43 @@ int64_t   py_virtual_thread_pinned_count(void);
 int64_t   py_virtual_thread_pin_event_count(void);
 PyObject *py_virtual_thread_poll_ready(void);
 int64_t   py_virtual_thread_ready_count(void);
+enum {
+    PCC_VTHREAD_NODE_READY = 0,
+    PCC_VTHREAD_NODE_WAITER = 1,
+    PCC_VTHREAD_NODE_TIMER = 2,
+    PCC_VTHREAD_NODE_IO = 3
+};
+enum {
+    PCC_VTHREAD_POOL_ALLOCATIONS = 0,
+    PCC_VTHREAD_POOL_REUSES = 1,
+    PCC_VTHREAD_POOL_CACHED = 2
+};
+int64_t   py_virtual_thread_node_pool_stat(int64_t family, int64_t metric);
+/* Fixed-capacity production scheduler-effect trace. Reset/read are intended
+ * for quiescent diagnostics and gates; recording itself is allocation-free. */
+enum {
+    PCC_VTHREAD_EFFECT_ROOT_ENTER = 1,
+    PCC_VTHREAD_EFFECT_ROOT_LEAVE = 2,
+    PCC_VTHREAD_EFFECT_READY_ENQUEUE = 3,
+    PCC_VTHREAD_EFFECT_START = 4,
+    PCC_VTHREAD_EFFECT_PARK = 5,
+    PCC_VTHREAD_EFFECT_UNPARK = 6,
+    PCC_VTHREAD_EFFECT_RESUME = 7,
+    PCC_VTHREAD_EFFECT_TIMER_PARK = 8,
+    PCC_VTHREAD_EFFECT_TIMER_WAKE = 9,
+    PCC_VTHREAD_EFFECT_IO_PARK = 10,
+    PCC_VTHREAD_EFFECT_IO_WAKE = 11,
+    PCC_VTHREAD_EFFECT_CANCEL_TIMER = 12,
+    PCC_VTHREAD_EFFECT_CANCEL_IO = 13,
+    PCC_VTHREAD_EFFECT_COMPLETE = 14
+};
+int64_t   py_virtual_thread_effect_reset(void);
+int64_t   py_virtual_thread_effect_count(void);
+int64_t   py_virtual_thread_effect_dropped(void);
+int64_t   py_virtual_thread_effect_kind_at(int64_t index);
+int64_t   py_virtual_thread_effect_detail_at(int64_t index);
+int64_t   py_virtual_thread_effect_root_delta_at(int64_t index);
+int64_t   py_virtual_thread_effect_state_at(int64_t index);
 int64_t   py_virtual_thread_carrier_count(void);
 int64_t   py_virtual_thread_carrier_steal_count(void);
 int64_t   py_virtual_thread_run_once(void);
@@ -855,6 +1141,15 @@ PyObject *py_file_read_all(PyObject *file);
 PyObject *py_file_read(PyObject *file, int64_t limit);
 PyObject *py_file_write(PyObject *file, PyObject *text);
 void      py_file_close(PyObject *file);
+/* readline/seek/tell/flush mirror CPython's file-object surface. ``limit``
+ * < 0 means "no size limit". seek/tell positions are byte offsets; whence
+ * follows os.SEEK_SET/CUR/END (0/1/2). All four raise ValueError("I/O
+ * operation on closed file.") on a closed file and return NULL; callers
+ * must check py_err_occurred(). */
+PyObject *py_file_readline(PyObject *file, int64_t limit);
+PyObject *py_file_seek(PyObject *file, int64_t offset, int64_t whence);
+PyObject *py_file_tell(PyObject *file);
+PyObject *py_file_flush(PyObject *file);
 PyObject *py_fileinput_new(PyObject *files, PyObject *openhook);
 PyObject *py_fileinput_readline(PyObject *state);
 PyObject *py_fileinput_filename(PyObject *state);
@@ -882,6 +1177,9 @@ PyObject *py_sys_prefix_str(int64_t kind);
 PyObject *py_os_getpid(void);
 PyObject *py_subprocess_check_output(PyObject *argv);
 int64_t py_subprocess_run(PyObject *argv, int32_t capture_output);
+int64_t py_subprocess_run_timeout(
+    PyObject *argv, int32_t capture_output, int64_t timeout_ms
+);
 PyObject *py_sysconfig_get_config_var(PyObject *name);
 PyObject *py_os_listdir(PyObject *path);
 PyObject *py_shlex_split(PyObject *text);
@@ -890,11 +1188,17 @@ PyObject *py_tempdir_new(PyObject *prefix);
 void py_tempdir_cleanup(PyObject *path);
 PyObject *py_re_match(PyObject *pattern, PyObject *text);
 PyObject *py_re_match_flags(PyObject *pattern, PyObject *text, int64_t flags);
+PyObject *py_re_fullmatch(PyObject *pattern, PyObject *text);
+PyObject *py_re_fullmatch_flags(PyObject *pattern, PyObject *text, int64_t flags);
 PyObject *py_re_search(PyObject *pattern, PyObject *text);
 PyObject *py_re_search_flags(PyObject *pattern, PyObject *text, int64_t flags);
 PyObject *py_re_findall_flags(PyObject *pattern, PyObject *text, int64_t flags);
 PyObject *py_re_compile_method(PyObject *pattern, int64_t flags, int64_t method_kind);
 PyObject *py_time_monotonic(void);
+PyObject *py_time_perf_counter(void);
+PyObject *py_time_time(void);
+PyObject *py_time_strftime(PyObject *fmt);
+PyObject *py_sys_stdin_readline(void);
 
 /* ---- Narrow os.path subset --------------------------------------------- */
 /* Native helpers used by the Python frontend for the no-libpython subset of
@@ -904,6 +1208,13 @@ PyObject *py_time_monotonic(void);
 PyObject *py_os_getenv(PyObject *key, PyObject *default_value);
 PyObject *py_os_putenv(PyObject *key, PyObject *value);
 PyObject *py_os_unsetenv(PyObject *key);
+/* os.environ mapping semantics: getitem raises KeyError (carrying the
+ * key) when unset and TypeError for non-str keys; setitem requires str
+ * key/value (TypeError otherwise) and stores via setenv. The plain
+ * getenv/putenv helpers above stay coercing/non-raising. */
+PyObject *py_os_environ_getitem(PyObject *key);
+PyObject *py_os_environ_setitem(PyObject *key, PyObject *value);
+int32_t   py_os_environ_contains(PyObject *key);
 PyObject *py_os_path_join(PyObject *parts);
 PyObject *py_os_path_basename(PyObject *path);
 PyObject *py_os_path_dirname(PyObject *path);
@@ -952,6 +1263,8 @@ PyObject   *py_platform_machine_str(void);
 PyObject   *py_platform_release_str(void);
 /* Boxed `os.getcwd()` value. NULL if getcwd() fails. */
 PyObject   *py_os_getcwd_str(void);
+/* Recursive `os.makedirs(path, exist_ok=...)`; raises OSError on failure. */
+PyObject   *py_os_makedirs(PyObject *path, int32_t exist_ok);
 /* `os.access(path, mode)` — returns 1 (accessible) / 0 (not). */
 int32_t     py_os_access(PyObject *path, int32_t mode);
 /* `os.write(fd, data)` — writes bytes/str data to fd. Returns number of bytes written. */
@@ -970,6 +1283,10 @@ int64_t     py_http_download_to_file(PyObject *url, PyObject *dest_path);
  * code) must check py_err_occurred() after each call that could raise
  * and branch to an error-handler / function epilogue. */
 void py_raise(PyObject *exc);
+
+/* Raise a freshly-created exception object and release the caller-owned
+ * temporary reference after py_raise has installed its TLS-owned reference. */
+void py_raise_owned(PyObject *exc);
 
 /* Return the active exception (borrowed), or NULL if none is set. */
 PyObject *py_current_exception(void);
@@ -1035,6 +1352,16 @@ void py_exc_append_frame(PyObject *exc,
  * the unhandled-exception handler at program top level. */
 void py_exc_print_unhandled(PyObject *exc);
 
+/* traceback.format_exc(): CPython-style traceback text for the
+ * exception being handled. `exc` is borrowed and may be NULL (no
+ * exception being handled — formats as "NoneType: None\n" like
+ * CPython). Returns a new owned PyStrObject reference. */
+PyObject *py_exc_traceback_format_exc(PyObject *exc);
+
+/* traceback.print_exc(): same text as py_exc_traceback_format_exc,
+ * written to stderr. `exc` is borrowed and may be NULL. */
+void py_exc_traceback_print_exc(PyObject *exc);
+
 /* ---- GC ---------------------------------------------------------------- */
 void py_gc_init(void);
 int64_t py_gc_collect(void);
@@ -1088,6 +1415,14 @@ int     py_cpy_setitem(void *obj, void *key, void *value);
 int     py_cpy_truthy(void *obj);
 void   *py_cpy_iter(void *obj);
 void   *py_cpy_iter_next(void *it);
+
+/* J2' boxed cpy handle (PY_TYPE_CPY_HANDLE): generator-frame-safe
+ * carrier for an OWNED foreign reference. new() takes ownership;
+ * get() borrows; the dealloc hook releases the foreign ref. */
+PyObject *py_cpy_handle_new(void *cpy_ref);
+void     *py_cpy_handle_get(PyObject *o);
+void      py_dealloc_cpy_handle(PyObject *o);
+void      py_cpy_handle_set_release_fn(void (*fn)(void *));
 PyObject *py_cpy_to_pcc_str(void *cpy_obj);
 /* Best-effort CPython PyObject* -> pcc PyObject* converter. Handles
  * None/bool/int/float/str/list/tuple/dict/set recursively; unsupported
@@ -1208,6 +1543,7 @@ int32_t     py_subs_exc_n_builtin(void);
 /* Legacy function-style accessors for the builtin exception cache. */
 void       *py_subs_exc_cache_get(int32_t tag);
 void        py_subs_exc_cache_set(int32_t tag, void *cls);
+void      **py_subs_exc_cache_slot(int32_t tag);
 
 /* py_set_dummy tombstone sentinel accessor (value of the global
  * const pointer). Lives in substrate so py_set.c can be replaced. */
@@ -1239,5 +1575,52 @@ int32_t     py_subs_alloc_user_tag(void);
  * tail. Hosted in substrate so a swap doesn't lose the once-only
  * static-storage object. Returns a PyClassObject*. */
 void       *py_subs_object_root(void);
+
+/* Metal runtime-source launch bridge. This is a narrow no-libpython ABI for
+ * calling a prebuilt Objective-C/Metal bridge dylib from pcc-native code. */
+int64_t     pcc_metal_source_runtime_call_prebuilt(
+                const char *bridge_library_path,
+                const char *symbol,
+                const uint8_t *metal_source,
+                uint64_t metal_source_nbytes,
+                const uint64_t *native_buffer_ptrs,
+                uint64_t num_buffers,
+                const uint8_t *scalar_payload,
+                const uint64_t *scalar_offsets,
+                uint64_t num_scalars,
+                int32_t wait_until_completed);
+int64_t     pcc_metal_metallib_runtime_call_prebuilt(
+                const char *bridge_library_path,
+                const char *symbol,
+                const char *metallib_path,
+                const uint64_t *native_buffer_ptrs,
+                uint64_t num_buffers,
+                const uint8_t *scalar_payload,
+                const uint64_t *scalar_offsets,
+                uint64_t num_scalars,
+                int32_t wait_until_completed);
+int64_t     pcc_metal_buffer_runtime_create_prebuilt(
+                const char *runtime_library_path,
+                uint64_t nbytes,
+                uint64_t *out_buffer_ptr);
+int64_t     pcc_metal_buffer_runtime_length_prebuilt(
+                const char *runtime_library_path,
+                uint64_t buffer_ptr,
+                uint64_t *out_nbytes);
+int64_t     pcc_metal_buffer_runtime_write_prebuilt(
+                const char *runtime_library_path,
+                uint64_t buffer_ptr,
+                uint64_t offset,
+                const uint8_t *src,
+                uint64_t nbytes);
+int64_t     pcc_metal_buffer_runtime_read_prebuilt(
+                const char *runtime_library_path,
+                uint64_t buffer_ptr,
+                uint64_t offset,
+                uint8_t *dst,
+                uint64_t nbytes);
+int64_t     pcc_metal_buffer_runtime_release_prebuilt(
+                const char *runtime_library_path,
+                uint64_t buffer_ptr);
 
 #endif /* PY_RUNTIME_H */

@@ -81,7 +81,12 @@ PyObject *py_bigint_to_pyobject(PyIntObject *b) {
 
 PyIntObject *py_bigint_from_any(PyObject *o) {
     if (PY_IS_TAGGED_INT(o)) return py_bigint_from_i64(py_untag_int(o));
-    if (o == NULL || py_header(o)->type_tag != PY_TYPE_INT) return NULL;
+    if (o == NULL) return NULL;
+    /* bool is-a int (CPython): True -> 1, False -> 0. Lets bool operands flow
+     * through every int op (sum, +, *, ...) instead of failing as non-int. */
+    if (py_header(o)->type_tag == PY_TYPE_BOOL)
+        return py_bigint_from_i64(o == py_True ? 1 : 0);
+    if (py_header(o)->type_tag != PY_TYPE_INT) return NULL;
     return bigint_copy((const PyIntObject *)o);
 }
 
@@ -124,6 +129,31 @@ int64_t py_int_bit_length(PyObject *o) {
         int64_t top_bits = 0;
         while (top > 0) { top_bits++; top >>= 1; }
         return (int64_t)(b->ndigits - 1) * 32 + top_bits;
+    }
+    return 0;
+}
+
+/* int.bit_count(): number of set bits (population count) in abs(value); 0 for
+ * 0. CPython counts bits of the magnitude, so negatives match their absolute
+ * value: (-255).bit_count() == 8. Exact for bignums (popcount each base-2^32
+ * limb; the limbs already store the magnitude, sign is separate). */
+int64_t py_int_bit_count(PyObject *o) {
+    if (o == NULL) return 0;
+    if (PY_IS_TAGGED_INT(o)) {
+        int64_t v = py_untag_int(o);
+        uint64_t a = (v < 0) ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
+        int64_t bits = 0;
+        while (a > 0) { bits += (int64_t)(a & 1u); a >>= 1; }
+        return bits;
+    }
+    if (py_header(o)->type_tag == PY_TYPE_INT) {
+        const PyIntObject *b = (const PyIntObject *)o;
+        int64_t bits = 0;
+        for (int32_t i = 0; i < b->ndigits; i++) {
+            uint32_t d = b->digits[i];
+            while (d > 0) { bits += (int64_t)(d & 1u); d >>= 1; }
+        }
+        return bits;
     }
     return 0;
 }

@@ -37,6 +37,24 @@
 #include <string.h>
 #include <stdint.h>
 
+extern int32_t py_class_attr_cache_epoch;
+extern PyObject *py_inst_field_cache_cls0;
+extern PyObject *py_inst_field_cache_cls1;
+extern PyObject *py_inst_field_cache_cls2;
+extern PyObject *py_inst_field_cache_cls3;
+extern const char *py_inst_field_cache_name0;
+extern const char *py_inst_field_cache_name1;
+extern const char *py_inst_field_cache_name2;
+extern const char *py_inst_field_cache_name3;
+extern int32_t py_inst_field_cache_idx0;
+extern int32_t py_inst_field_cache_idx1;
+extern int32_t py_inst_field_cache_idx2;
+extern int32_t py_inst_field_cache_idx3;
+extern int32_t py_inst_field_cache_epoch0;
+extern int32_t py_inst_field_cache_epoch1;
+extern int32_t py_inst_field_cache_epoch2;
+extern int32_t py_inst_field_cache_epoch3;
+
 /* ---- Forward decls (for dispatch from py_obj.c) ----------------------- */
 
 /* py_obj.c already dispatches on type_tag via a switch; we hook
@@ -47,6 +65,14 @@
 static PyClassObject *object_root(void);
 
 #define PY_CLASS_FLAG_SLOTS_ONLY 2
+/* Bit 2: this class subclasses the builtin ``dict``. The frontend drops the
+ * ``dict`` base from the native MRO (dict is not a user PyClassObject), so
+ * dict-inherited item storage / methods (__setitem__ / __getitem__ / get /
+ * __missing__ / keys / values / items / __len__ / __contains__ / iteration)
+ * must be provided as a fallback. When this flag is set, those operations are
+ * routed to a backing dict lazily materialized in the instance's hidden
+ * dynamic-attribute (__dict__) slot. See py_dict_subclass_* in py_protocol.c. */
+#define PY_CLASS_FLAG_DICT_SUBCLASS 4
 
 /* ---- Helpers ---------------------------------------------------------- */
 
@@ -71,9 +97,11 @@ static int instance_pointer_is_instance(PyInstanceObject *inst) {
     if (!pointer_can_have_header((void *)inst)) return 0;
     int32_t tag = py_header((PyObject *)inst)->type_tag;
     if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return 0;
-    PyClassObject *cls = inst->cls;
+    PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
+        (PyObject *)inst,
+        (PyObject **)&inst->cls
+    );
     if (cls == NULL) return 0;
-    cls = (PyClassObject *)pcc_gc_note_relocation_read((PyObject *)cls);
     return class_pointer_is_class(cls);
 }
 
@@ -352,6 +380,12 @@ PyClassObject *py_class_new(const char *name,
     if (!c) return NULL;
     memset((char *)c + sizeof(PyObjectHeader), 0,
            sizeof(PyClassObject) - sizeof(PyObjectHeader));
+    /* Class/type objects are process-lifetime and are referenced by every
+     * instance via a *borrowed* (uncounted) class pointer. Mark them
+     * PY_FLAG_IMMORTAL so a stray over-release cannot free a live class out
+     * from under its instances (which zeroes the field table and breaks all
+     * subsequent attribute lookups). Mirrors py_class.py::py_class_new. */
+    c->h.flags |= PY_FLAG_IMMORTAL;
 
     c->name       = name;
     c->n_bases    = n_bases;
@@ -359,6 +393,13 @@ PyClassObject *py_class_new(const char *name,
     if (n_bases > 0 && c->bases == NULL) {
         pcc_gc_free_object_memory((PyObject *)c);
         return NULL;
+    }
+    if (n_bases > 0) {
+        (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+            (PyObject *)c,
+            c->bases,
+            n_bases * (int64_t)sizeof(PyClassObject *)
+        );
     }
     c->n_fields   = n_fields;
     c->field_names = copy_name_array(field_names, n_fields);
@@ -407,6 +448,11 @@ PyClassObject *py_class_new(const char *name,
     for (int32_t i = 0; i < tail_len; i++) c->mro[1 + i] = tail[i];
     if (append_root) c->mro[mro_len - 1] = root;
     c->n_mro = mro_len;
+    (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+        (PyObject *)c,
+        c->mro,
+        mro_len * (int64_t)sizeof(PyClassObject *)
+    );
 
     c->del_method = py_class_lookup(c, "__del__");
 
@@ -417,6 +463,11 @@ PyClassObject *py_class_new(const char *name,
 void py_class_mark_slots_only(PyClassObject *cls) {
     if (!cls) return;
     cls->h.flags |= PY_CLASS_FLAG_SLOTS_ONLY;
+}
+
+void py_class_mark_dict_subclass(PyClassObject *cls) {
+    if (!cls) return;
+    cls->h.flags |= PY_CLASS_FLAG_DICT_SUBCLASS;
 }
 
 void py_class_set_metaclass(PyClassObject *cls, PyClassObject *metaclass) {
@@ -470,13 +521,36 @@ void py_class_add_method(PyClassObject *cls, const char *name, PyObject *func) {
     if (!class_pointer_is_class(cls) || !name) return;
     cls = (PyClassObject *)pcc_gc_note_relocation_read((PyObject *)cls);
     int32_t new_n = cls->n_methods + 1;
+    PyClassMethod *old_methods = cls->methods;
     PyClassMethod *newarr = (PyClassMethod *)realloc(
-        cls->methods, sizeof(PyClassMethod) * (size_t)new_n);
+        old_methods, sizeof(PyClassMethod) * (size_t)new_n);
     if (!newarr) return;   /* best-effort: drop on OOM */
     newarr[cls->n_methods].name = name;
     newarr[cls->n_methods].func = func;
     cls->methods = newarr;
     cls->n_methods = new_n;
+    int64_t payload_offset = -1;
+    if (old_methods != NULL && old_methods != newarr) {
+        payload_offset = pcc_gc_backend4_zpage_retarget_owner_payload_span(
+            (PyObject *)cls,
+            old_methods,
+            newarr,
+            new_n * (int64_t)sizeof(PyClassMethod)
+        );
+    }
+    if (payload_offset < 0) {
+        if (old_methods != NULL && old_methods != newarr) {
+            (void)pcc_gc_backend4_zpage_unregister_owner_payload_span(
+                (PyObject *)cls,
+                old_methods
+            );
+        }
+        (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+            (PyObject *)cls,
+            cls->methods,
+            new_n * (int64_t)sizeof(PyClassMethod)
+        );
+    }
     class_note_borrowed_metadata_slot_store(
         cls,
         &cls->methods[cls->n_methods - 1].func,
@@ -508,6 +582,13 @@ PyObject *py_class_lookup(PyClassObject *cls, const char *name) {
         }
         return t;
     }
+    if (strcmp(name, "__base__") == 0) {
+        if (cls->n_bases <= 0 || cls->bases == NULL) return py_None;
+        return pcc_gc_load_ptr(
+            (PyObject *)cls,
+            (PyObject **)&cls->bases[0]
+        );
+    }
     for (int32_t i = 0; i < cls->n_mro; i++) {
         PyClassObject *m = (PyClassObject *)pcc_gc_load_ptr(
             (PyObject *)cls,
@@ -517,7 +598,11 @@ PyObject *py_class_lookup(PyClassObject *cls, const char *name) {
         for (int32_t j = 0; j < m->n_methods; j++) {
             const char *method_name = m->methods[j].name;
             if (method_name && (method_name == name || strcmp(method_name, name) == 0)) {
-                return m->methods[j].func;
+                PyObject *func = pcc_gc_note_relocation_read(m->methods[j].func);
+                if (func != m->methods[j].func) {
+                    m->methods[j].func = func;
+                }
+                return func;
             }
         }
     }
@@ -609,6 +694,64 @@ static int32_t lookup_field_index(PyClassObject *cls, const char *name) {
     return -1;
 }
 
+static int32_t field_cache_slot(PyClassObject *cls, const char *name) {
+    uintptr_t key = ((uintptr_t)cls >> 4) ^ ((uintptr_t)name >> 4);
+    return (int32_t)(key & 3u);
+}
+
+static int32_t field_cache_lookup(PyClassObject *cls, const char *name) {
+    if (py_inst_field_cache_epoch0 == py_class_attr_cache_epoch
+        && py_inst_field_cache_cls0 == (PyObject *)cls
+        && py_inst_field_cache_name0 == name) {
+        return (int32_t)py_inst_field_cache_idx0;
+    }
+    if (py_inst_field_cache_epoch1 == py_class_attr_cache_epoch
+        && py_inst_field_cache_cls1 == (PyObject *)cls
+        && py_inst_field_cache_name1 == name) {
+        return (int32_t)py_inst_field_cache_idx1;
+    }
+    if (py_inst_field_cache_epoch2 == py_class_attr_cache_epoch
+        && py_inst_field_cache_cls2 == (PyObject *)cls
+        && py_inst_field_cache_name2 == name) {
+        return (int32_t)py_inst_field_cache_idx2;
+    }
+    if (py_inst_field_cache_epoch3 == py_class_attr_cache_epoch
+        && py_inst_field_cache_cls3 == (PyObject *)cls
+        && py_inst_field_cache_name3 == name) {
+        return (int32_t)py_inst_field_cache_idx3;
+    }
+    return -1;
+}
+
+static void field_cache_store(PyClassObject *cls, const char *name, int32_t idx) {
+    switch (field_cache_slot(cls, name)) {
+        case 0:
+            py_inst_field_cache_cls0 = (PyObject *)cls;
+            py_inst_field_cache_name0 = name;
+            py_inst_field_cache_idx0 = idx;
+            py_inst_field_cache_epoch0 = py_class_attr_cache_epoch;
+            return;
+        case 1:
+            py_inst_field_cache_cls1 = (PyObject *)cls;
+            py_inst_field_cache_name1 = name;
+            py_inst_field_cache_idx1 = idx;
+            py_inst_field_cache_epoch1 = py_class_attr_cache_epoch;
+            return;
+        case 2:
+            py_inst_field_cache_cls2 = (PyObject *)cls;
+            py_inst_field_cache_name2 = name;
+            py_inst_field_cache_idx2 = idx;
+            py_inst_field_cache_epoch2 = py_class_attr_cache_epoch;
+            return;
+        default:
+            py_inst_field_cache_cls3 = (PyObject *)cls;
+            py_inst_field_cache_name3 = name;
+            py_inst_field_cache_idx3 = idx;
+            py_inst_field_cache_epoch3 = py_class_attr_cache_epoch;
+            return;
+    }
+}
+
 static PyObject **dynamic_attr_slot(PyInstanceObject *inst) {
     if (!instance_pointer_is_instance(inst)) return NULL;
     PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
@@ -619,6 +762,62 @@ static PyObject **dynamic_attr_slot(PyInstanceObject *inst) {
     int32_t n_fields = cls->n_fields;
     if (n_fields < 0) n_fields = 0;
     return &inst->fields[n_fields];
+}
+
+PyObject *py_instance_vars(PyInstanceObject *inst) {
+    if (!instance_pointer_is_instance(inst)) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR, "vars() argument has no __dict__"));
+        return NULL;
+    }
+    PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
+        (PyObject *)inst,
+        (PyObject **)&inst->cls
+    );
+    if (!class_pointer_is_class(cls)) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR, "vars() argument has no __dict__"));
+        return NULL;
+    }
+    PyObject *out = py_dict_new();
+    if (out == NULL) return NULL;
+    int32_t n_fields = cls->n_fields;
+    if (n_fields < 0) n_fields = 0;
+    for (int32_t i = 0; i < n_fields; i++) {
+        const char *field_name = cls->field_names != NULL ? cls->field_names[i] : NULL;
+        if (field_name == NULL) continue;
+        PyObject *value = pcc_gc_load_ptr((PyObject *)inst, &inst->fields[i]);
+        if (value == NULL) continue;
+        PyObject *key = py_str_new(field_name, (int64_t)strlen(field_name));
+        if (key == NULL) {
+            py_decref(out);
+            return NULL;
+        }
+        py_dict_set(out, key, value);
+        py_decref(key);
+    }
+    PyObject **dyn_slot = dynamic_attr_slot(inst);
+    PyObject *dyn_obj = dyn_slot
+        ? pcc_gc_load_ptr((PyObject *)inst, dyn_slot)
+        : NULL;
+    if (dyn_obj != NULL) {
+        py_dict_update(out, dyn_obj);
+    }
+    return out;
+}
+
+PyObject *py_obj_vars(PyObject *o) {
+    if (o == NULL || PY_IS_TAGGED_INT(o)) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR, "vars() argument has no __dict__"));
+        return NULL;
+    }
+    int32_t tag = py_header(o)->type_tag;
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+        return py_instance_vars((PyInstanceObject *)o);
+    }
+    PyObject *dict = py_obj_getattr_default(o, "__dict__");
+    if (dict != NULL) return dict;
+    py_clear_exception();
+    py_raise(py_exc_new(PY_EXC_TYPEERROR, "vars() argument has no __dict__"));
+    return NULL;
 }
 
 static PyObject *class_attr_lookup_in_mro(PyClassObject *cls, const char *name) {
@@ -782,6 +981,12 @@ PyObject *py_instance_getattr_default(PyInstanceObject *inst, const char *name) 
         py_incref(dyn_obj);
         return dyn_obj;
     }
+    int32_t cached_idx = field_cache_lookup(cls, name);
+    if (cached_idx >= 0) {
+        PyObject *v = pcc_gc_load_ptr((PyObject *)inst, &inst->fields[cached_idx]);
+        if (v) py_incref(v);
+        return v;
+    }
     PyObject *class_attr = class_attr_lookup_in_mro(cls, name);
     if (class_attr != NULL && descriptor_is_data(class_attr)) {
         PyObject *out = descriptor_call_get(class_attr, (PyObject *)inst, cls);
@@ -790,6 +995,7 @@ PyObject *py_instance_getattr_default(PyInstanceObject *inst, const char *name) 
     }
     int32_t idx = lookup_field_index(cls, name);
     if (idx >= 0) {
+        field_cache_store(cls, name, idx);
         /* Return a new reference so callers can uniformly py_decref. */
         PyObject *v = pcc_gc_load_ptr((PyObject *)inst, &inst->fields[idx]);
         if (v) py_incref(v);
@@ -827,6 +1033,15 @@ PyObject *py_instance_getattr_default(PyInstanceObject *inst, const char *name) 
     PyObject *method = py_class_lookup(cls, name);
     if (method != NULL) {
         return py_instance_bind_method(method, (PyObject *)inst, name);
+    }
+
+    /* dict-subclass inherited method fallback (get / keys / values / items /
+     * update / setdefault / pop / ...). User methods/attrs above win; this only
+     * fires for names the user class did not define. Returns a bound native
+     * callable, or NULL (no such dict method — fall through to __getattr__). */
+    if ((cls->h.flags & PY_CLASS_FLAG_DICT_SUBCLASS) != 0) {
+        PyObject *dm = py_dict_subclass_getattr((PyObject *)inst, name);
+        if (dm != NULL || py_err_occurred()) return dm;
     }
 
     PyObject *getattr_method = py_class_lookup(cls, "__getattr__");
@@ -1041,6 +1256,12 @@ int64_t py_isinstance(PyObject *obj, PyClassObject *cls) {
     obj = pcc_gc_note_relocation_read(obj);
     cls = (PyClassObject *)pcc_gc_note_relocation_read((PyObject *)cls);
     int32_t tag = py_header(obj)->type_tag;
+    if (tag == PY_TYPE_EXC) {
+        /* Builtin exception objects match via their exc_class MRO, not the
+         * instance->cls path below (which is only for PY_TYPE_INSTANCE/user).
+         * Without this isinstance(ValueError('x'), ValueError) was False. */
+        return py_exc_matches(obj, (PyObject *)cls) ? 1 : 0;
+    }
     if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return 0;
     PyInstanceObject *inst = (PyInstanceObject *)obj;
     if (!instance_pointer_is_instance(inst)) return 0;
@@ -1102,7 +1323,11 @@ PyObject *py_super_lookup(PyClassObject *start_cls,
         for (int32_t j = 0; j < m->n_methods; j++) {
             const char *method_name = m->methods[j].name;
             if (method_name && (method_name == name || strcmp(method_name, name) == 0)) {
-                return m->methods[j].func;
+                PyObject *func = pcc_gc_note_relocation_read(m->methods[j].func);
+                if (func != m->methods[j].func) {
+                    m->methods[j].func = func;
+                }
+                return func;
             }
         }
     }
@@ -1136,13 +1361,23 @@ void py_instance_dealloc(PyObject *o) {
         return;
     }
     if (instance_pointer_is_instance(inst)) {
-        PyClassObject *cls = inst->cls;
+        PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
+            o,
+            (PyObject **)&inst->cls
+        );
         for (int32_t i = 0; i < cls->n_fields; i++) {
-            PyObject *v = inst->fields[i];
-            if (v) py_decref(v);
+            PyObject *v = pcc_gc_load_ptr(o, &inst->fields[i]);
+            /* Null the slot before decref so a finalizer that re-enters
+             * py_instance_dealloc (its __del__ arg-tuple holds self and drops
+             * self to 0 on free) reads NULL and does not double-release this
+             * field. Mirrors py_class_dealloc. */
+            if (v) { inst->fields[i] = NULL; py_decref(v); }
         }
         PyObject **dyn_slot = dynamic_attr_slot(inst);
-        if (dyn_slot && *dyn_slot) py_decref(*dyn_slot);
+        if (dyn_slot) {
+            PyObject *dyn = pcc_gc_load_ptr(o, dyn_slot);
+            if (dyn) { *dyn_slot = NULL; py_decref(dyn); }
+        }
     }
     pcc_gc_free_object_memory(o);
 }

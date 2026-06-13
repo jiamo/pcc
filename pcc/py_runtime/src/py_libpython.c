@@ -50,6 +50,222 @@ extern int  Py_IsInitialized(void);
 
 static void *g_libpython_handle = NULL;
 
+/* libpython-mode archives intentionally remove py_capi_shim.o so dlopen'd
+ * CPython extensions bind to the real CPython C-API. A few runtime objects
+ * still reference pcc-shim internal helpers for no-libpython extension objects;
+ * in libpython mode those pcc extension tags/module-def roots do not exist. */
+int64_t pcc_capi_is_cext_type_tag(int64_t type_tag) {
+    (void)type_tag;
+    return 0;
+}
+
+PyObject *pcc_capi_cext_object_getattr(PyObject *o, const char *name) {
+    (void)o;
+    (void)name;
+    return NULL;
+}
+
+PyObject *pcc_capi_cext_object_iter(PyObject *o) {
+    (void)o;
+    return NULL;
+}
+
+PyObject *pcc_capi_cext_object_next(PyObject *o) {
+    (void)o;
+    return NULL;
+}
+
+int64_t pcc_capi_cext_object_is_iterator(PyObject *o) {
+    (void)o;
+    return 0;
+}
+
+int64_t pcc_capi_cext_object_is_callable(PyObject *callable) {
+    (void)callable;
+    return 0;
+}
+
+PyObject *pcc_capi_cext_object_getitem(PyObject *o, PyObject *key) {
+    (void)o;
+    (void)key;
+    return NULL;
+}
+
+PyObject *pcc_capi_cext_object_repr(PyObject *o) {
+    (void)o;
+    return NULL;
+}
+
+PyObject *pcc_capi_cext_binary_number(
+    PyObject *left,
+    PyObject *right,
+    int64_t op
+) {
+    (void)left;
+    (void)right;
+    (void)op;
+    return NULL;
+}
+
+PyObject *pcc_capi_cext_subtract(PyObject *left, PyObject *right) {
+    (void)left;
+    (void)right;
+    return NULL;
+}
+
+PyObject *pcc_capi_cext_absolute(PyObject *value) {
+    (void)value;
+    return NULL;
+}
+
+int64_t pcc_capi_cext_truthy(PyObject *value) {
+    (void)value;
+    return 0;
+}
+
+int64_t pcc_capi_cext_richcompare_bool(
+    PyObject *left,
+    PyObject *right,
+    int64_t op
+) {
+    (void)left;
+    (void)right;
+    (void)op;
+    return -1;
+}
+
+int64_t py_cext_number_to_i64(PyObject *o, int *overflow) {
+    (void)o;
+    if (overflow != NULL) *overflow = 1;
+    return 0;
+}
+
+int64_t pcc_capi_cext_object_setattr(
+    PyObject *o,
+    const char *name,
+    PyObject *value
+) {
+    (void)o;
+    (void)name;
+    (void)value;
+    return -1;
+}
+
+int64_t pcc_capi_is_type_object_value(PyObject *value) {
+    (void)value;
+    return 0;
+}
+
+int64_t pcc_capi_type_object_issubclass(PyObject *derived, PyObject *cls) {
+    (void)derived;
+    (void)cls;
+    return 0;
+}
+
+PyObject *pcc_capi_type_object_getattr(
+    PyObject *type_object,
+    const char *name
+) {
+    (void)type_object;
+    (void)name;
+    return NULL;
+}
+
+PyObject *pcc_capi_builtin_object_getattr(PyObject *o, const char *name) {
+    (void)o;
+    (void)name;
+    return NULL;
+}
+
+int64_t pcc_capi_type_object_is_callable(PyObject *callable) {
+    (void)callable;
+    return 0;
+}
+
+PyObject *pcc_capi_call_type_object(
+    PyObject *callable,
+    PyObject *args,
+    PyObject *kwargs
+) {
+    (void)callable;
+    (void)args;
+    (void)kwargs;
+    return NULL;
+}
+
+PyObject *pcc_capi_call_cext_object(
+    PyObject *callable,
+    PyObject *args,
+    PyObject *kwargs
+) {
+    (void)callable;
+    (void)args;
+    (void)kwargs;
+    return NULL;
+}
+
+int64_t pcc_capi_dealloc_cext_object(PyObject *o, int64_t type_tag) {
+    (void)o;
+    (void)type_tag;
+    return 0;
+}
+
+int pcc_capi_is_moduledef(PyObject *o) {
+    (void)o;
+    return 0;
+}
+
+PyObject *pcc_capi_module_exec(PyObject *def_as_obj) {
+    (void)def_as_obj;
+    return NULL;
+}
+
+PyObject *pcc_capi_module_from_def(PyObject *def_as_obj) {
+    (void)def_as_obj;
+    return NULL;
+}
+
+int pcc_capi_module_run_exec_slots(PyObject *def_as_obj, PyObject *module) {
+    (void)def_as_obj;
+    (void)module;
+    return -1;
+}
+
+int py_compiled_module_ensure_parent_packages(const char *module_name) {
+    (void)module_name;
+    return 0;
+}
+
+void pcc_capi_visit_extension_module_state_roots(
+    PccGcRootVisitor visit,
+    void *ctx
+) {
+    (void)visit;
+    (void)ctx;
+}
+
+int pcc_capi_visit_cext_object_slots(
+    PyObject *o,
+    PyObjSlotVisitor visit,
+    void *ctx
+) {
+    (void)o;
+    (void)visit;
+    (void)ctx;
+    return 0;
+}
+
+int pcc_capi_visit_cext_object_slots_i64(
+    PyObject *o,
+    PccPyObjSlotVisitorI64 visit,
+    void *ctx
+) {
+    (void)o;
+    (void)visit;
+    (void)ctx;
+    return 0;
+}
+
 static CPyObject *(*p_PyImport_ImportModule)(const char *name);
 static CPyObject *(*p_PyObject_GetAttrString)(CPyObject *o, const char *attr);
 static int (*p_PyObject_SetAttrString)(CPyObject *o, const char *attr, CPyObject *v);
@@ -538,6 +754,8 @@ static void py_cpy_seed_sys_path(void) {
         "    if os.path.isdir(venv_lib):\n"
         "        for site in glob.glob(os.path.join(venv_lib, 'python*', 'site-packages')):\n"
         "            _pcc_add_path(site)\n"
+        "for _pcc_pkg_site in os.environ.get('PCC_PACKAGE_SITE', '').split(os.pathsep):\n"
+        "    _pcc_add_path(_pcc_pkg_site.strip())\n"
         "cwd = os.getcwd()\n"
         "if cwd:\n"
         "    _pcc_seed_root(cwd)\n"
@@ -580,6 +798,10 @@ void py_cpy_ensure_init(void) {
         Py_Initialize();
         py_runtime_program_args_hook = py_cpy_sync_sys_argv;
         py_format_cpy_object_hook = py_format_cpy_object_via_str;
+        /* CpyHandle boxes (J2') release their foreign refs through
+         * this hook; registered here so the main runtime archive
+         * never references libpython-archive symbols directly. */
+        py_cpy_handle_set_release_fn(py_cpy_decref);
         py_cpy_sync_sys_argv();
         py_cpy_seed_sys_path();
         atexit(py_libpython_atexit);
@@ -639,8 +861,21 @@ int py_cpy_setattr(void *obj, const char *name, void *value) {
     return rc;
 }
 
+/* The CPython C-API forbids entering a call with an exception pending.
+ * A pending error here is stale state from an earlier failed bridge
+ * call whose NULL result the program already flowed past (see
+ * py_cpy_call1); left set it corrupts unrelated calls with
+ * ``SystemError: ... returned a result with an exception set``. Log it
+ * under PCC_CPY_DEBUG_ERRORS, then clear. */
+static void py_cpy_clear_stale_error(const char *where) {
+    if (PyErr_Occurred() == NULL) return;
+    py_cpy_debug_current_error(where);
+    PyErr_Clear();
+}
+
 void *py_cpy_call_noargs(void *callable) {
     if (callable == NULL) return NULL;
+    py_cpy_clear_stale_error("py_cpy_call_noargs(stale)");
     CPyObject *res = PyObject_CallNoArgs((CPyObject *)callable);
     py_cpy_debug_result_state("py_cpy_call_noargs", res);
     return (void *)res;
@@ -991,15 +1226,22 @@ void *py_cpy_from_pcc_obj(PyObject *o) {
     }
 }
 
+/* NULL args are failed results from an earlier bridge call flowing
+ * through (the emitted IR does not branch on cpy results). Calling
+ * CPython's call APIs with a NULL argument is undefined behavior, so
+ * skip the call and let the NULL keep flowing, matching the
+ * py_cpy_getitem/py_cpy_setitem guards. */
 void *py_cpy_call1(void *callable, void *a) {
-    if (callable == NULL) return NULL;
+    if (callable == NULL || a == NULL) return NULL;
+    py_cpy_clear_stale_error("py_cpy_call1(stale)");
     CPyObject *res = PyObject_CallOneArg((CPyObject *)callable, (CPyObject *)a);
     py_cpy_debug_result_state("py_cpy_call1", res);
     return (void *)res;
 }
 
 void *py_cpy_call2(void *callable, void *a, void *b) {
-    if (callable == NULL) return NULL;
+    if (callable == NULL || a == NULL || b == NULL) return NULL;
+    py_cpy_clear_stale_error("py_cpy_call2(stale)");
     CPyObject *res = PyObject_CallFunctionObjArgs(
         (CPyObject *)callable, (CPyObject *)a, (CPyObject *)b, (CPyObject *)NULL
     );
@@ -1008,7 +1250,8 @@ void *py_cpy_call2(void *callable, void *a, void *b) {
 }
 
 void *py_cpy_call3(void *callable, void *a, void *b, void *c) {
-    if (callable == NULL) return NULL;
+    if (callable == NULL || a == NULL || b == NULL || c == NULL) return NULL;
+    py_cpy_clear_stale_error("py_cpy_call3(stale)");
     CPyObject *res = PyObject_CallFunctionObjArgs(
         (CPyObject *)callable,
         (CPyObject *)a, (CPyObject *)b, (CPyObject *)c,
@@ -1054,6 +1297,16 @@ void *py_cpy_iter_next(void *it) {
  * the caller must not decref its argv entries after this returns. */
 void *py_cpy_call_argv(void *callable, int64_t n, void **argv) {
     if (callable == NULL) return NULL;
+    for (int64_t i = 0; i < n; i++) {
+        if (argv[i] != NULL) continue;
+        /* Failed-result NULL flowing through (see py_cpy_call1). Release
+         * the owned refs this call would have stolen, then skip the call. */
+        for (int64_t j = 0; j < n; j++) {
+            if (argv[j] != NULL) Py_DecRef((CPyObject *)argv[j]);
+        }
+        return NULL;
+    }
+    py_cpy_clear_stale_error("py_cpy_call_argv(stale)");
     CPyObject *tup = PyTuple_New((long)n);
     if (tup == NULL) return NULL;
     for (int64_t i = 0; i < n; i++) {

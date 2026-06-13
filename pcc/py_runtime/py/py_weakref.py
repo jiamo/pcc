@@ -3,6 +3,7 @@
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
     calloc,
+    cstr,
     free,
     global_load_ptr,
     global_store_ptr,
@@ -37,6 +38,8 @@ py_tuple_get = extern("py_tuple_get", (c_ptr, c_int64), c_ptr)
 py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
 py_obj_call = extern("py_obj_call", (c_ptr, c_ptr, c_ptr), c_ptr)
 py_clear_exception = extern("py_clear_exception", (), c_void)
+py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
+py_raise = extern("py_raise", (c_ptr,), c_void)
 pcc_runtime_log_event_code = extern("pcc_runtime_log_event_code", (c_int32, c_int32, c_int64, c_int64, c_ptr), c_void)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
@@ -83,6 +86,19 @@ def py_weakref_new(target, callback):
     if ptr_is_null(target) != 0:
         return null()
     if is_tagged_int(target) != 0:
+        return null()
+    # Value projections are identity-free; a ValueBox's lifetime is
+    # unpredictable (every boxing makes a new box) — mirror CPython's
+    # analogue (weakref.ref(3) -> TypeError). 200 == PY_TYPE_VALUEBOX,
+    # 3 == PY_EXC_TYPEERROR. The compile-time diagnostic catches the
+    # static form; this covers Dyn-path boxes.
+    if load_i32(target, 8) == 200:
+        py_raise(
+            py_exc_new(
+                3,
+                cstr("cannot create weak reference to a valueclass payload"),
+            )
+        )
         return null()
     if ptr_eq(callback, _py_none()) != 0:
         callback = null()

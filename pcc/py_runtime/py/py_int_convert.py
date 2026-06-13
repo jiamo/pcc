@@ -15,6 +15,11 @@ from pcc.unsafe import is_tagged_int, load_i32, ptr_is_null, store_i32
 
 
 py_int_value_i64     = extern("py_int_value_i64",     (c_ptr,),                  c_int64)
+# Unbox a C-extension number scalar (numpy int/bool scalar from ndarray element
+# access) via its nb_int/nb_index slot. C-only helper (py_capi_shim.c); no cc
+# baseline mirror because cext objects only exist under the no-libpython C-API
+# shim that this port archive links.
+py_cext_number_to_i64 = extern("py_cext_number_to_i64", (c_ptr, c_ptr),          c_int64)
 
 
 def _set_overflow(slot, value: int) -> None:
@@ -38,8 +43,11 @@ def py_int_to_i64(o, overflow) -> int:
     if is_tagged_int(o):
         return py_int_value_i64(o)
     if load_i32(o, 8) != 2:
-        _set_overflow(overflow, 1)
-        return 0
+        # Not a pcc heap int. A C-extension number scalar (numpy int/bool)
+        # unboxes through its number protocol; py_cext_number_to_i64 sets
+        # overflow=1 and returns 0 for any non-cext-number object, preserving
+        # the previous behaviour for genuinely non-integer objects.
+        return py_cext_number_to_i64(o, overflow)
 
     sign: int = load_i32(o, 16)
     if sign == 0:

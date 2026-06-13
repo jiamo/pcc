@@ -13,6 +13,9 @@ py_list_slice = extern("py_list_slice", (c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
 py_tuple_slice = extern("py_tuple_slice", (c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
 py_str_slice = extern("py_str_slice", (c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
 py_bytes_slice = extern("py_bytes_slice", (c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
+py_slice_new = extern("py_slice_new", (c_ptr, c_ptr, c_ptr), c_ptr)
+py_obj_getitem = extern("py_obj_getitem", (c_ptr, c_ptr), c_ptr)
+py_decref = extern("py_decref", (c_ptr,), c_void)
 pcc_runtime_log_event_code = extern(
     "pcc_runtime_log_event_code",
     (c_int32, c_int32, c_int64, c_int64, c_ptr),
@@ -40,4 +43,13 @@ def py_obj_slice(o, lo, hi, step):
         return py_str_slice(o, lo, hi, step)
     if tag == 17 or tag == 18 or tag == 19:
         return py_bytes_slice(o, lo, hi, step)
+    if tag == 11 or tag >= 100:  # PY_TYPE_INSTANCE / user class
+        # obj[lo:hi:step] dispatches __getitem__(slice(lo, hi, step)) via the
+        # generic getitem path, like CPython.
+        sl = py_slice_new(lo, hi, step)
+        if ptr_is_null(sl) != 0:
+            return null()
+        r = py_obj_getitem(o, sl)
+        py_decref(sl)
+        return r
     return null()

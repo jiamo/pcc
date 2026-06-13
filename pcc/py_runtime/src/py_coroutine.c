@@ -134,6 +134,15 @@ PyObject *py_coroutine_get_result(PyObject *coro) {
     return result;
 }
 
+PyObject *py_coroutine_get_args(PyObject *coro) {
+    PyCoroutineObject *c = checked_coroutine(coro);
+    if (c == NULL) return NULL;
+    PyObject *args = pcc_gc_load_ptr(coro, &c->args);
+    if (args == NULL) args = py_None;
+    py_incref(args);
+    return args;
+}
+
 PyObject *py_coroutine_close(PyObject *coro) {
     if (coro == NULL || PY_IS_TAGGED_INT(coro)) return py_None;
     if (py_type_of(coro) == PY_TYPE_COROUTINE) {
@@ -271,6 +280,13 @@ static PyObject *py_continuation_new_with_abi(
     c->stack_chunk = stack_chunk;
     c->mounted = 1;
     c->resume_abi = resume_abi;
+    if (stack_chunk->slots != NULL && n_slots > 0) {
+        (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+            (PyObject *)c,
+            stack_chunk->slots,
+            n_slots * (int64_t)sizeof(PyObject *)
+        );
+    }
     for (int64_t i = 0; i < n_slots; i++) {
         pcc_gc_store_ptr((PyObject *)c, &stack_chunk->slots[i], slots[i]);
     }

@@ -34,6 +34,8 @@ py_decref = extern("py_decref", (c_ptr,), c_void)
 py_exc_get_message = extern("py_exc_get_message", (c_ptr,), c_ptr)
 py_obj_str = extern("py_obj_str", (c_ptr,), c_ptr)
 py_obj_repr = extern("py_obj_repr", (c_ptr,), c_ptr)
+py_exc_matches = extern("py_exc_matches", (c_ptr, c_ptr), c_int64)
+py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,), c_ptr)
 fflush = extern("fflush", (c_ptr,), c_int32)
 # Returns 1 if the unknown-tag object was a CPython PyObject and was
 # rendered via PyObject_Str (libpython mode). Returns 0 in strict
@@ -44,6 +46,10 @@ py_format_try_cpy_object_into_fd = extern(
     (c_int32, c_ptr, c_int32),
     c_int32,
 )
+# Render a numpy / C-extension scalar by driving its own tp_repr slot (NOT
+# PyObject_Repr, which routes back to pcc and raises for a foreign object).
+pcc_capi_cext_object_repr = extern("pcc_capi_cext_object_repr", (c_ptr,), c_ptr)
+pcc_capi_is_cext_type_tag = extern("pcc_capi_is_cext_type_tag", (c_int64,), c_int64)
 
 
 def _type_of(obj) -> int:
@@ -294,10 +300,11 @@ def _format_repr(o) -> None:
     if tag == 18:                   # PY_TYPE_BYTEARRAY
         _format_bytearray(o)
         return
-    if tag == 11 or tag >= 100:     # PY_TYPE_INSTANCE / user classes
+    if tag == 11 or tag == 12 or tag >= 100:  # PY_TYPE_INSTANCE / EXC / user
         # repr() of a user instance must dispatch __repr__, not __str__.
         # Container elements recurse here, so a class with both __str__ and
-        # __repr__ would otherwise show __str__ inside a list. On NULL (no
+        # __repr__ would otherwise show __str__ inside a list. PY_TYPE_EXC (12):
+        # repr([KeyError('m')]) == [KeyError('m')], not the str. On NULL (no
         # __repr__) fall through to _format's default handling.
         s = py_obj_repr(o)
         if ptr_is_null(s) == 0:
@@ -351,11 +358,17 @@ def _format(o) -> None:
         # str(exc) is the str of its single message value (CPython: the
         # exception args). py_exc_get_message returns a borrowed ref, so
         # no decref here; an arg-less exception (NULL message) renders as
-        # the empty string. KeyError's repr-quoting of the key is a
-        # separate, pre-existing gap shared with the traceback printer.
+        # the empty string. KeyError is special: its __str__ is repr(key)
+        # (CPython str(KeyError('x'))=="'x'").
         msg = py_exc_get_message(o)
         if ptr_is_null(msg) == 0:
-            _format(msg)
+            if py_exc_matches(o, py_exc_builtin_class(4)) != 0:  # PY_EXC_KEYERROR
+                r = py_obj_repr(msg)
+                if ptr_is_null(r) == 0:
+                    _format_str(r)
+                    py_decref(r)
+            else:
+                _format(msg)
     else:
         # User-class instances and other objects: str(x) routes through
         # py_obj_str, which dispatches __str__ (then __repr__). This is what
@@ -364,6 +377,12 @@ def _format(o) -> None:
         # result (no __str__/__repr__) falls back to the libpython hook then
         # "<object tag=N>".
         s = py_obj_str(o)
+        if ptr_is_null(s) != 0:
+            # numpy / C-extension scalar (e.g. an ndarray element): py_obj_str
+            # has no pcc dispatch for it, so drive its own tp_repr slot rather
+            # than printing the opaque <object tag=N>.
+            if pcc_capi_is_cext_type_tag(tag) != 0:
+                s = pcc_capi_cext_object_repr(o)
         if ptr_is_null(s) == 0:
             _format_str(s)
             py_decref(s)

@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define PCC_FUNC_SIGNATURE_MAGIC "__pcc_func_signature_v1__"
+
+extern int32_t py_class_attr_cache_epoch;
+
 typedef struct PccClassAttrsNode {
     PyClassObject *cls;
     PyObject *attrs;
@@ -44,6 +48,12 @@ static PyObject *pcc_class_attrs_sync(
     return attrs;
 }
 
+static PyObject *pcc_class_attrs_call_pyfunc_bound_args(
+    PyObject *func,
+    PyObject *bound_args
+);
+static int pcc_class_attrs_pointer_can_have_header(void *ptr);
+
 static PyObject *pcc_classmethod_bound_entry(
     PyObject *captures,
     PyObject *args
@@ -74,7 +84,16 @@ static PyObject *pcc_classmethod_bound_entry(
         py_tuple_set_item(full_args, i + 1, arg);
         py_decref(arg);
     }
-    PyObject *out = py_obj_call(func, full_args, py_None);
+    PyObject *out = NULL;
+    if (
+        pcc_class_attrs_pointer_can_have_header(func) &&
+        !PY_IS_TAGGED_INT(func) &&
+        py_type_of(func) == PY_TYPE_FUNC
+    ) {
+        out = pcc_class_attrs_call_pyfunc_bound_args(func, full_args);
+    } else {
+        out = py_obj_call(func, full_args, py_None);
+    }
     py_decref(full_args);
     py_decref(func);
     py_decref(cls);
@@ -91,6 +110,216 @@ static int pcc_class_attrs_pointer_can_have_header(void *ptr) {
     if ((bits >> 48) != 0u) return 0;
 #endif
     return 1;
+}
+
+static int pcc_class_attrs_func_signature_valid(PyObject *sig) {
+    if (sig == NULL || PY_IS_TAGGED_INT(sig)) return 0;
+    if (py_type_of(sig) != PY_TYPE_TUPLE) return 0;
+    if (py_tuple_len(sig) < 5) return 0;
+
+    PyObject *magic = py_tuple_get(sig, 0);
+    if (magic == NULL) return 0;
+    PyObject *expected = py_str_new(
+        PCC_FUNC_SIGNATURE_MAGIC,
+        (int64_t)strlen(PCC_FUNC_SIGNATURE_MAGIC)
+    );
+    int ok = expected != NULL && py_str_eq(magic, expected) != 0;
+    py_decref(magic);
+    if (expected != NULL) py_decref(expected);
+    return ok;
+}
+
+static PyObject *pcc_class_attrs_func_signature(PyObject *func) {
+    if (func == NULL || PY_IS_TAGGED_INT(func)) return NULL;
+    if (py_type_of(func) != PY_TYPE_FUNC) return NULL;
+    PyObject *captures = pcc_gc_load_ptr(
+        func,
+        &((PyFuncObject *)func)->captures
+    );
+    if (captures == NULL || PY_IS_TAGGED_INT(captures)) return NULL;
+    if (py_type_of(captures) != PY_TYPE_TUPLE || py_tuple_len(captures) != 2) {
+        return NULL;
+    }
+    PyObject *candidate = py_tuple_get(captures, 1);
+    if (!pcc_class_attrs_func_signature_valid(candidate)) {
+        if (candidate != NULL) py_decref(candidate);
+        return NULL;
+    }
+    return candidate;
+}
+
+static PyObject *pcc_class_attrs_bound_signature(PyObject *func) {
+    PyObject *sig = pcc_class_attrs_func_signature(func);
+    if (sig == NULL) return NULL;
+
+    PyObject *names = py_tuple_get(sig, 1);
+    PyObject *kinds = py_tuple_get(sig, 2);
+    PyObject *has_defaults = py_tuple_get(sig, 3);
+    PyObject *defaults = py_tuple_get(sig, 4);
+    if (
+        names == NULL || kinds == NULL ||
+        has_defaults == NULL || defaults == NULL
+    ) {
+        if (names != NULL) py_decref(names);
+        if (kinds != NULL) py_decref(kinds);
+        if (has_defaults != NULL) py_decref(has_defaults);
+        if (defaults != NULL) py_decref(defaults);
+        py_decref(sig);
+        return NULL;
+    }
+
+    int64_t n = py_tuple_len(names);
+    if (
+        n <= 0 ||
+        py_tuple_len(kinds) != n ||
+        py_tuple_len(has_defaults) != n ||
+        py_tuple_len(defaults) != n
+    ) {
+        py_decref(names);
+        py_decref(kinds);
+        py_decref(has_defaults);
+        py_decref(defaults);
+        py_decref(sig);
+        return NULL;
+    }
+
+    PyObject *out_names = py_tuple_new(n - 1);
+    PyObject *out_kinds = py_tuple_new(n - 1);
+    PyObject *out_has_defaults = py_tuple_new(n - 1);
+    PyObject *out_defaults = py_tuple_new(n - 1);
+    PyObject *out_sig = py_tuple_new(5);
+    if (
+        out_names == NULL || out_kinds == NULL ||
+        out_has_defaults == NULL || out_defaults == NULL || out_sig == NULL
+    ) {
+        if (out_names != NULL) py_decref(out_names);
+        if (out_kinds != NULL) py_decref(out_kinds);
+        if (out_has_defaults != NULL) py_decref(out_has_defaults);
+        if (out_defaults != NULL) py_decref(out_defaults);
+        if (out_sig != NULL) py_decref(out_sig);
+        py_decref(names);
+        py_decref(kinds);
+        py_decref(has_defaults);
+        py_decref(defaults);
+        py_decref(sig);
+        return NULL;
+    }
+
+    for (int64_t i = 1; i < n; i++) {
+        PyObject *name = py_tuple_get(names, i);
+        PyObject *kind = py_tuple_get(kinds, i);
+        PyObject *has_default = py_tuple_get(has_defaults, i);
+        PyObject *default_obj = py_tuple_get(defaults, i);
+        if (
+            name == NULL || kind == NULL ||
+            has_default == NULL || default_obj == NULL
+        ) {
+            if (name != NULL) py_decref(name);
+            if (kind != NULL) py_decref(kind);
+            if (has_default != NULL) py_decref(has_default);
+            if (default_obj != NULL) py_decref(default_obj);
+            py_decref(out_names);
+            py_decref(out_kinds);
+            py_decref(out_has_defaults);
+            py_decref(out_defaults);
+            py_decref(out_sig);
+            py_decref(names);
+            py_decref(kinds);
+            py_decref(has_defaults);
+            py_decref(defaults);
+            py_decref(sig);
+            return NULL;
+        }
+        int64_t out_i = i - 1;
+        py_tuple_set_item(out_names, out_i, name);
+        py_tuple_set_item(out_kinds, out_i, kind);
+        py_tuple_set_item(out_has_defaults, out_i, has_default);
+        py_tuple_set_item(out_defaults, out_i, default_obj);
+        py_decref(name);
+        py_decref(kind);
+        py_decref(has_default);
+        py_decref(default_obj);
+    }
+
+    PyObject *magic = py_tuple_get(sig, 0);
+    if (magic == NULL) {
+        py_decref(out_names);
+        py_decref(out_kinds);
+        py_decref(out_has_defaults);
+        py_decref(out_defaults);
+        py_decref(out_sig);
+        py_decref(names);
+        py_decref(kinds);
+        py_decref(has_defaults);
+        py_decref(defaults);
+        py_decref(sig);
+        return NULL;
+    }
+    py_tuple_set_item(out_sig, 0, magic);
+    py_tuple_set_item(out_sig, 1, out_names);
+    py_tuple_set_item(out_sig, 2, out_kinds);
+    py_tuple_set_item(out_sig, 3, out_has_defaults);
+    py_tuple_set_item(out_sig, 4, out_defaults);
+    py_decref(magic);
+    py_decref(out_names);
+    py_decref(out_kinds);
+    py_decref(out_has_defaults);
+    py_decref(out_defaults);
+    py_decref(names);
+    py_decref(kinds);
+    py_decref(has_defaults);
+    py_decref(defaults);
+    py_decref(sig);
+    return out_sig;
+}
+
+static PyObject *pcc_class_attrs_wrap_bound_captures(
+    PyObject *method,
+    PyObject *captures
+) {
+    PyObject *signature = pcc_class_attrs_bound_signature(method);
+    if (signature == NULL) return captures;
+    PyObject *wrapped = py_tuple_new(2);
+    if (wrapped == NULL) {
+        py_decref(signature);
+        return captures;
+    }
+    py_tuple_set_item(wrapped, 0, captures);
+    py_tuple_set_item(wrapped, 1, signature);
+    py_decref(signature);
+    return wrapped;
+}
+
+static PyObject *pcc_class_attrs_call_pyfunc_bound_args(
+    PyObject *func,
+    PyObject *bound_args
+) {
+    if (func == NULL || PY_IS_TAGGED_INT(func)) return NULL;
+    if (py_type_of(func) != PY_TYPE_FUNC) return NULL;
+    PyFuncObject *f = (PyFuncObject *)func;
+    if (f->entry == NULL) return NULL;
+    PyObject *captures = pcc_gc_load_ptr(func, &f->captures);
+    PyObject *actual_captures = captures;
+    int owns_actual = 0;
+    if (
+        captures != NULL &&
+        !PY_IS_TAGGED_INT(captures) &&
+        py_type_of(captures) == PY_TYPE_TUPLE &&
+        py_tuple_len(captures) == 2
+    ) {
+        PyObject *candidate = py_tuple_get(captures, 1);
+        if (pcc_class_attrs_func_signature_valid(candidate)) {
+            PyObject *inner = py_tuple_get(captures, 0);
+            if (inner != NULL) {
+                actual_captures = inner;
+                owns_actual = 1;
+            }
+        }
+        if (candidate != NULL) py_decref(candidate);
+    }
+    PyObject *out = f->entry(actual_captures, bound_args);
+    if (owns_actual) py_decref(actual_captures);
+    return out;
 }
 
 static PyObject *pcc_instance_bound_method_entry(
@@ -126,7 +355,7 @@ static PyObject *pcc_instance_bound_method_entry(
             py_tuple_set_item(full_args, i + 1, arg);
             py_decref(arg);
         }
-        PyObject *out = py_func_call(func, full_args);
+        PyObject *out = pcc_class_attrs_call_pyfunc_bound_args(func, full_args);
         py_decref(full_args);
         py_decref(func);
         py_decref(self);
@@ -192,12 +421,17 @@ PyObject *py_instance_bind_method(PyObject *method, PyObject *self, const char *
         PyFuncObject *func = (PyFuncObject *)method;
         if (func->name != NULL) bound_name = func->name;
     }
+    PyObject *bound_captures = pcc_class_attrs_wrap_bound_captures(
+        method,
+        captures
+    );
     PyObject *bound = py_func_new_bound(
         (void *)pcc_instance_bound_method_entry,
-        captures,
+        bound_captures,
         bound_name,
         self
     );
+    if (bound_captures != captures) py_decref(bound_captures);
     py_decref(captures);
     return bound;
 }
@@ -329,12 +563,17 @@ static PyObject *pcc_classmethod_bind(PyObject *descriptor, PyClassObject *cls) 
     if (!PY_IS_TAGGED_INT(func) && py_type_of(func) == PY_TYPE_FUNC) {
         name = ((PyFuncObject *)func)->name;
     }
+    PyObject *bound_captures = pcc_class_attrs_wrap_bound_captures(
+        func,
+        captures
+    );
     PyObject *bound = py_func_new_bound(
         (void *)pcc_classmethod_bound_entry,
-        captures,
+        bound_captures,
         name,
         (PyObject *)cls
     );
+    if (bound_captures != captures) py_decref(bound_captures);
     py_decref(captures);
     return bound;
 }
@@ -598,7 +837,14 @@ PyObject *py_class_getattr(PyClassObject *cls, const char *name) {
         }
     }
     py_decref(key);
-    return py_class_lookup(cls, name);
+    /* py_class_lookup returns a BORROWED method-table ref, but the attrs-dict
+     * branch above and the public py_obj_getattr contract return OWNED. Return
+     * owned uniformly: otherwise a caller that releases the getattr result
+     * (e.g. the candidate-path CALL lowering) frees the method-table slot,
+     * and the next Class.method access reads a dangling slot -> <null>. */
+    PyObject *m = py_class_lookup(cls, name);
+    if (m != NULL) py_incref(m);
+    return m;
 }
 
 int64_t py_class_setattr_raw(
@@ -614,6 +860,7 @@ int64_t py_class_setattr_raw(
     if (key == NULL) return -1;
     py_dict_set(attrs, key, value);
     py_decref(key);
+    py_class_attr_cache_epoch++;
     return 0;
 }
 

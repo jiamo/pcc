@@ -18,6 +18,7 @@ extern int py_format_try_cpy_object_into_fd(int fd, void *obj, int32_t tag);
 extern PyObject *py_exc_get_message(PyObject *exc);
 extern PyObject *py_obj_str(PyObject *o);
 extern PyObject *py_obj_repr(PyObject *o);
+extern int64_t py_exc_matches(PyObject *exc, PyObject *type);
 
 static void py_format(FILE *fp, PyObject *o);
 static void py_format_repr(FILE *fp, PyObject *o);
@@ -222,11 +223,12 @@ static void py_format_repr(FILE *fp, PyObject *o) {
         py_format_bytearray(fp, o);
         return;
     }
-    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+    if (tag == PY_TYPE_INSTANCE || tag == PY_TYPE_EXC || tag >= PY_TYPE_USER) {
         /* repr() of a user instance must dispatch __repr__, not __str__.
          * Container elements (list/tuple/dict/set) recurse through here, so a
          * class with both __str__ and __repr__ would otherwise show __str__
          * inside a list. Falling through to py_format would call py_obj_str.
+         * PY_TYPE_EXC: repr([KeyError('m')]) == [KeyError('m')], not the str.
          * On NULL (no __repr__) fall through to py_format's default handling. */
         PyObject *s = py_obj_repr(o);
         if (s != NULL) {
@@ -294,12 +296,20 @@ static void py_format(FILE *fp, PyObject *o) {
         case PY_TYPE_EXC: {
             /* str(exc) == str of its single message value; py_exc_get_message
              * returns a borrowed ref (no decref). An arg-less exception (NULL
-             * message) renders as the empty string. KeyError's repr-quoting of
-             * the key is a separate, pre-existing gap shared with the
-             * traceback printer. */
+             * message) renders as the empty string. KeyError is special: its
+             * __str__ is repr(key) (CPython str(KeyError('x'))=="'x'"). */
             PyObject *msg = py_exc_get_message(o);
             if (msg != NULL) {
-                py_format(fp, msg);
+                if (py_exc_matches(
+                        o, (PyObject *)py_exc_builtin_class(PY_EXC_KEYERROR))) {
+                    PyObject *r = py_obj_repr(msg);
+                    if (r != NULL) {
+                        py_format(fp, r);
+                        py_decref(r);
+                    }
+                } else {
+                    py_format(fp, msg);
+                }
             }
             break;
         }

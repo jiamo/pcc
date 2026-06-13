@@ -9,13 +9,102 @@
  */
 #include "py_internal.h"
 
+#include <fcntl.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 PyObject *py_time_monotonic(void) {
     return py_float_from_f64((double)pcc_runtime_monotonic_us() / 1.0e6);
+}
+
+PyObject *py_time_perf_counter(void) {
+    return py_float_from_f64((double)pcc_runtime_monotonic_us() / 1.0e6);
+}
+
+PyObject *py_time_time(void) {
+    return py_float_from_f64((double)pcc_runtime_now_us() / 1.0e6);
+}
+
+PyObject *py_time_strftime(PyObject *fmt) {
+    PyObject *fmt_str = py_obj_str(fmt);
+    if (fmt_str == NULL) return NULL;
+    const char *raw_fmt = py_str_utf8(fmt_str);
+    if (raw_fmt == NULL) {
+        py_decref(fmt_str);
+        return py_str_new("", 0);
+    }
+    time_t now = (time_t)(pcc_runtime_now_us() / 1000000);
+    struct tm tmv;
+#if defined(_WIN32)
+    struct tm *tmp = localtime(&now);
+    if (tmp == NULL) {
+        py_decref(fmt_str);
+        return py_str_new("", 0);
+    }
+    tmv = *tmp;
+#else
+    if (localtime_r(&now, &tmv) == NULL) {
+        py_decref(fmt_str);
+        return py_str_new("", 0);
+    }
+#endif
+    char buf[256];
+    size_t n = strftime(buf, sizeof(buf), raw_fmt, &tmv);
+    py_decref(fmt_str);
+    return py_str_new(buf, (int64_t)n);
+}
+
+PyObject *py_sys_stdin_readline(void) {
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&line, &cap, stdin);
+    if (n < 0) {
+        free(line);
+        return py_str_new("", 0);
+    }
+    PyObject *out = py_str_new(line, (int64_t)n);
+    free(line);
+    return out;
+}
+
+PyObject *py_os_urandom(PyObject *n_obj) {
+    int overflow = 0;
+    int64_t n = py_int_to_i64(n_obj, &overflow);
+    if (overflow || n < 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR, "negative argument not allowed"));
+        return NULL;
+    }
+    PyObject *out = py_bytes_new(NULL, n);
+    if (out == NULL || n == 0) return out;
+    char *data = ((PyBytesObject *)out)->data;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(data, (size_t)n);
+    return out;
+#else
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        py_decref(out);
+        py_raise(py_exc_new(PY_EXC_OSERROR, "could not open /dev/urandom"));
+        return NULL;
+    }
+    int64_t pos = 0;
+    while (pos < n) {
+        ssize_t got = read(fd, data + pos, (size_t)(n - pos));
+        if (got <= 0) {
+            close(fd);
+            py_decref(out);
+            py_raise(py_exc_new(PY_EXC_OSERROR, "could not read /dev/urandom"));
+            return NULL;
+        }
+        pos += (int64_t)got;
+    }
+    close(fd);
+    return out;
+#endif
 }
 
 /* Classify a path by struct stat type:

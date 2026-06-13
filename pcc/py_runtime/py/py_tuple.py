@@ -22,6 +22,7 @@ from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
     cstr,
     getenv,
+    global_addr,
     is_tagged_int,
     load_i32,
     load_i64,
@@ -39,15 +40,20 @@ from pcc.unsafe import (
 
 
 py_incref         = extern("py_incref",        (c_ptr,),                             c_void)
+py_decref         = extern("py_decref",        (c_ptr,),                             c_void)
+py_list_len       = extern("py_list_len",      (c_ptr,),                             c_int64)
+py_list_get       = extern("py_list_get",      (c_ptr, c_int64),                     c_ptr)
+py_obj_len        = extern("py_obj_len",       (c_ptr,),                             c_int64)
+py_obj_getitem_i64 = extern("py_obj_getitem_i64", (c_ptr, c_int64),                  c_ptr)
 py_int_value_i64  = extern("py_int_value_i64", (c_ptr,),                             c_int64)
+py_err_occurred   = extern("py_err_occurred",  (),                                   c_int64)
 py_gc_track       = extern("py_gc_track",       (c_ptr,),                             c_void)
+py_exc_new        = extern("py_exc_new",        (c_int64, c_ptr),                     c_ptr)
+py_raise          = extern("py_raise",          (c_ptr,),                             c_void)
 pcc_gc_store_ptr  = extern("pcc_gc_store_ptr",  (c_ptr, c_ptr, c_ptr),                c_void)
 pcc_gc_load_ptr   = extern("pcc_gc_load_ptr",   (c_ptr, c_ptr),                       c_ptr)
 pcc_gc_alloc      = extern("pcc_gc_alloc",      (c_int64, c_int32, c_int32),          c_ptr)
 _pcc_debug_bad_incref = extern("pcc_debug_bad_incref", (c_ptr, c_int32), c_void)
-_pcc_debug_check_tuple_slot = extern(
-    "pcc_debug_check_tuple_slot", (c_ptr, c_int64, c_int64, c_ptr), c_int32
-)
 
 
 def _debug_bad_container(o, code: int) -> None:
@@ -143,16 +149,95 @@ def py_tuple_new(n: int):
     return t
 
 
+@c_abi_export("py_tuple_from_list")
+def py_tuple_from_list(lst):
+    # New tuple from a pcc list's elements. Mirrors py_tuple_from_list in
+    # py_tuple.c; used by the dynamic-call lowering to normalize mixed
+    # ``f(a, *rest)`` argument lists to the tuple the callable ABI requires.
+    if ptr_is_null(lst):
+        return null()
+    n: int = py_list_len(lst)
+    out = py_tuple_new(n)
+    if ptr_is_null(out):
+        return null()
+    i: int = 0
+    while i < n:
+        v = py_list_get(lst, i)        # new ref
+        py_tuple_set_item(out, i, v)   # increfs
+        py_decref(v)
+        i = i + 1
+    return out
+
+
+@c_abi_export("py_tuple_from_splat")
+def py_tuple_from_splat(seq):
+    if ptr_is_null(seq):
+        return null()
+    if not _ptr_can_have_header(seq):
+        return null()
+
+    tag: int = load_i32(seq, 8)
+    n: int = -1
+    if tag == 7:
+        n = load_i64(seq, 16)
+    elif tag == 5:
+        n = py_list_len(seq)
+    else:
+        n = py_obj_len(seq)
+        if py_err_occurred() != 0:
+            return null()
+    if n < 0:
+        py_raise(py_exc_new(6, cstr("tuple() argument is not iterable")))  # PY_EXC_TYPEERROR
+        return null()
+
+    out = py_tuple_new(n)
+    if ptr_is_null(out):
+        return null()
+
+    i: int = 0
+    if tag == 7:
+        while i < n:
+            v = pcc_gc_load_ptr(seq, ptr_add(seq, 24 + i * 8))
+            py_tuple_set_item(out, i, v)
+            i = i + 1
+        return out
+    if tag == 5:
+        items = load_ptr(seq, 32)
+        while i < n:
+            v = pcc_gc_load_ptr(seq, ptr_add(items, i * 8))
+            py_tuple_set_item(out, i, v)
+            i = i + 1
+        return out
+
+    while i < n:
+        v = py_obj_getitem_i64(seq, i)
+        if ptr_is_null(v) and py_err_occurred() != 0:
+            py_decref(out)
+            return null()
+        py_tuple_set_item(out, i, v)
+        if ptr_is_null(v) == 0:
+            py_decref(v)
+        i = i + 1
+    return out
+
+
 @c_abi_export("py_tuple_set_item")
 def py_tuple_set_item(tuple_ptr, i: int, item) -> None:
-    if not _tuple_is_sane(tuple_ptr, -131):
+    if ptr_is_null(tuple_ptr) != 0:
         return
     tuple_len: int = load_i64(tuple_ptr, 16)
     if i < 0 or i >= tuple_len:
         return
-    _pcc_debug_check_tuple_slot(tuple_ptr, i, tuple_len, item)
     slot_offset: int = 24 + i * 8
-    pcc_gc_store_ptr(tuple_ptr, ptr_add(tuple_ptr, slot_offset), item)
+    slot = ptr_add(tuple_ptr, slot_offset)
+    if (
+        load_i32(global_addr("pcc_gc_config_initialized"), 0) != 0
+        and load_i32(global_addr("pcc_gc_backend_selected"), 0) == 0
+    ):
+        py_incref(item)
+        store_ptr(slot, 0, item)
+    else:
+        pcc_gc_store_ptr(tuple_ptr, slot, item)
     if _tuple_item_can_participate_in_cycle(item) != 0:
         flags = load_i32(tuple_ptr, 12)
         if (flags & 2) == 0:
@@ -161,7 +246,26 @@ def py_tuple_set_item(tuple_ptr, i: int, item) -> None:
 
 @c_abi_export("py_tuple_get")
 def py_tuple_get(tuple_ptr, i: int):
-    if not _tuple_is_sane(tuple_ptr, -132):
+    if ptr_is_null(tuple_ptr) != 0:
+        return null()
+    tuple_len: int = load_i64(tuple_ptr, 16)
+    if i < 0:
+        i = i + tuple_len
+    if i < 0 or i >= tuple_len:
+        # Non-raising: internal callers rely on the silent-NULL contract.
+        # User-level t[i] subscripts route to py_tuple_getitem, which raises.
+        return null()
+    slot_offset: int = 24 + i * 8
+    v = pcc_gc_load_ptr(tuple_ptr, ptr_add(tuple_ptr, slot_offset))
+    py_incref(v)
+    return v
+
+
+@c_abi_export("py_tuple_get_known")
+def py_tuple_get_known(tuple_ptr, i: int):
+    # Adapter-only helper: generated function-call ABI args are known tuples.
+    # Keep py_tuple_get's owned-ref result but skip its defensive shape checks.
+    if ptr_is_null(tuple_ptr) != 0:
         return null()
     tuple_len: int = load_i64(tuple_ptr, 16)
     if i < 0:
@@ -174,9 +278,28 @@ def py_tuple_get(tuple_ptr, i: int):
     return v
 
 
+@c_abi_export("py_tuple_getitem")
+def py_tuple_getitem(tuple_ptr, i: int):
+    # t[i] subscript: like py_tuple_get but raises IndexError on out-of-range so
+    # try/except can catch it. Mirrors py_tuple_getitem in py_tuple.c; py_tuple_get
+    # stays non-raising for other callers. Negative indices normalize.
+    if ptr_is_null(tuple_ptr) != 0:
+        return null()
+    tuple_len: int = load_i64(tuple_ptr, 16)
+    if i < 0:
+        i = i + tuple_len
+    if i < 0 or i >= tuple_len:
+        py_raise(py_exc_new(5, cstr("tuple index out of range")))  # PY_EXC_INDEXERROR
+        return null()
+    slot_offset: int = 24 + i * 8
+    v = pcc_gc_load_ptr(tuple_ptr, ptr_add(tuple_ptr, slot_offset))
+    py_incref(v)
+    return v
+
+
 @c_abi_export("py_tuple_len")
 def py_tuple_len(tuple_ptr) -> int:
-    if not _tuple_is_sane(tuple_ptr, -133):
+    if ptr_is_null(tuple_ptr) != 0:
         return 0
     return load_i64(tuple_ptr, 16)
 
