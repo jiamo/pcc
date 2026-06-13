@@ -1,12 +1,22 @@
 """Typing and protocol helper lowering for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Attr, Call, Expr, IntLit, Name, StrLit, Subscript
-
+from ..py_ast import (
+    Attr,
+    BinOp,
+    Call,
+    Expr,
+    IntLit,
+    Name,
+    StrLit,
+    Subscript,
+    TupleExpr,
+)
 
 _I1 = ir.IntType(1)
 _TYPING_METADATA_ALIAS_VALUES = frozenset(
@@ -27,11 +37,21 @@ _TYPING_METADATA_ALIAS_VALUES = frozenset(
         "typing.Dict",
         "typing.Set",
         "typing.Tuple",
+        "typing.SupportsIndex",
+        "typing.TypeAlias",
+        "typing.TypedDict",
     )
 )
 
 
 class TypingProtocolMixin:
+    def _typing_type_alias_annotation(self, annotation: object) -> bool:
+        return (
+            getattr(annotation, "name", None) == "TypeAlias"
+            and self._native_builtin_value_aliases.get("TypeAlias")
+            == "typing.TypeAlias"
+        )
+
     def _typing_typevar_name(self, expr: Expr) -> Optional[str]:
         if not isinstance(expr, Call) or len(expr.args) != 1:
             return None
@@ -71,10 +91,34 @@ class TypingProtocolMixin:
         return None
 
     def _typing_metadata_alias_expr(self, expr: Expr) -> bool:
+        if isinstance(expr, BinOp) and expr.op == "|":
+            return self._typing_metadata_alias_expr(
+                expr.lhs
+            ) or self._typing_metadata_alias_expr(expr.rhs)
+        if isinstance(expr, TupleExpr):
+            return any(self._typing_metadata_alias_expr(elem) for elem in expr.elems)
+        if isinstance(expr, Call) and isinstance(expr.func, Name):
+            ident = expr.func.ident
+            if ident not in self.env and ident not in self._module_globals:
+                return (
+                    self._native_builtin_value_aliases.get(ident)
+                    == "typing.TypeAliasType"
+                )
         if isinstance(expr, Subscript):
-            return self._typing_metadata_alias_expr(expr.obj)
+            if self._typing_metadata_alias_expr(expr.obj):
+                return True
+            # ``dict[Engine, list[tuple]]`` where ``Engine`` was itself an
+            # elided typing-metadata alias: the alias has no runtime binding
+            # (its assignment emitted no IR), so any subscript referencing it
+            # must be treated as metadata too or codegen would load a NULL
+            # module global at runtime.
+            return self._typing_metadata_alias_expr(
+                expr.idx
+            ) or self._typing_metadata_alias_index_ref(expr.idx)
         value_kind = None
         if isinstance(expr, Name):
+            if expr.ident in self._typing_metadata_aliases:
+                return True
             if expr.ident in self.env or expr.ident in self._module_globals:
                 return False
             value_kind = self._native_builtin_value_aliases.get(expr.ident)
@@ -85,6 +129,19 @@ class TypingProtocolMixin:
         ):
             value_kind = "typing." + expr.name
         return value_kind in _TYPING_METADATA_ALIAS_VALUES
+
+    def _typing_metadata_alias_index_ref(self, expr: Expr) -> bool:
+        if isinstance(expr, Name):
+            return expr.ident in self._typing_metadata_aliases
+        if isinstance(expr, TupleExpr):
+            return any(
+                self._typing_metadata_alias_index_ref(elem) for elem in expr.elems
+            )
+        if isinstance(expr, Subscript):
+            return self._typing_metadata_alias_index_ref(
+                expr.obj
+            ) or self._typing_metadata_alias_index_ref(expr.idx)
+        return False
 
     def _maybe_emit_typing_alias_name_attr(self, expr: Attr) -> Optional[ir.Value]:
         if expr.name != "__name__":

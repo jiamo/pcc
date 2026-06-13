@@ -1,4 +1,5 @@
 """Attribute load lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
@@ -29,7 +30,6 @@ from . import marshal
 from .errors import L1CodegenError
 from .runtime_abi import declare_runtime_global
 
-
 _I1 = ir.IntType(1)
 _I8 = ir.IntType(8)
 _I32 = ir.IntType(32)
@@ -44,6 +44,20 @@ def _same_type_kind(a: Type, b: Type) -> bool:
 
 
 class AttrLoadLoweringMixin:
+    def _valueclass_payload_expr_type(self, expr: Expr) -> Type | None:
+        if isinstance(expr, Name):
+            slot = self.env.get(expr.ident)
+            if slot is not None:
+                return slot[2]
+            return expr.ty
+        if isinstance(expr, Attr):
+            owner_ty = self._valueclass_payload_expr_type(expr.obj)
+            if owner_ty is not None and self._is_valueclass_payload_type(owner_ty):
+                field_info = self._valueclass_field_info(owner_ty, expr.name)
+                if field_info is not None:
+                    return field_info[1]
+        return getattr(expr, "ty", None)
+
     def _metaclass_data_descriptor_info(self, class_info, attr_name: str):
         metaclass_name = getattr(class_info, "metaclass_name", None)
         if metaclass_name is None:
@@ -92,7 +106,9 @@ class AttrLoadLoweringMixin:
             name=self._fresh(f"metaclass.descr.{attr_name}"),
         )
         meta_cls = self.builder.load(
-            self.class_lowering.classes[getattr(class_info, "metaclass_name")].global_var,
+            self.class_lowering.classes[
+                getattr(class_info, "metaclass_name")
+            ].global_var,
             name=self._fresh(f"metaclass.descr.owner.{class_info.name}"),
         )
         return self._call_user(
@@ -262,12 +278,31 @@ class AttrLoadLoweringMixin:
             self.runtime["py_tuple_set_item"],
             [captures, ir.Constant(_I64, 0), self_val],
         )
+        signature = self._emit_cached_native_func_signature(
+            user_args,
+            f"{self.ast_module.name or 'mod'}.{info.name}.{method_name}.bound",
+        )
+        wrapped_captures = self.builder.call(
+            self.runtime["py_tuple_new"],
+            [ir.Constant(_I64, 2)],
+            name=self._fresh(f"bound.{method_name}.signature.wrapper"),
+        )
+        self.builder.call(
+            self.runtime["py_tuple_set_item"],
+            [wrapped_captures, ir.Constant(_I64, 0), captures],
+        )
+        self.builder.call(
+            self.runtime["py_tuple_set_item"],
+            [wrapped_captures, ir.Constant(_I64, 1), signature],
+        )
         fn_obj = self.builder.call(
             self.runtime["py_func_new_bound"],
-            [adapter, captures, self._attr_name_ptr(method_name), self_val],
+            [adapter, wrapped_captures, self._attr_name_ptr(method_name), self_val],
             name=self._fresh(f"bound.{method_name}.func"),
         )
         self._gc_release(captures)
+        self._gc_release(signature)
+        self._gc_release(wrapped_captures)
         return fn_obj
 
     def _emit_bound_class_method_value(
@@ -352,12 +387,36 @@ class AttrLoadLoweringMixin:
             self.runtime["py_tuple_set_item"],
             [captures, ir.Constant(_I64, 0), receiver_cls],
         )
+        signature = self._emit_cached_native_func_signature(
+            user_args,
+            f"{self.ast_module.name or 'mod'}.{owner_info.name}.{method_name}.classmethod",
+        )
+        wrapped_captures = self.builder.call(
+            self.runtime["py_tuple_new"],
+            [ir.Constant(_I64, 2)],
+            name=self._fresh(f"bound.{method_name}.classmethod.signature.wrapper"),
+        )
+        self.builder.call(
+            self.runtime["py_tuple_set_item"],
+            [wrapped_captures, ir.Constant(_I64, 0), captures],
+        )
+        self.builder.call(
+            self.runtime["py_tuple_set_item"],
+            [wrapped_captures, ir.Constant(_I64, 1), signature],
+        )
         fn_obj = self.builder.call(
             self.runtime["py_func_new_bound"],
-            [adapter, captures, self._attr_name_ptr(method_name), receiver_cls],
+            [
+                adapter,
+                wrapped_captures,
+                self._attr_name_ptr(method_name),
+                receiver_cls,
+            ],
             name=self._fresh(f"bound.{method_name}.classmethod.func"),
         )
         self._gc_release(captures)
+        self._gc_release(signature)
+        self._gc_release(wrapped_captures)
         return fn_obj
 
     def _emit_cached_zero_capture_func_value(
@@ -600,26 +659,35 @@ class AttrLoadLoweringMixin:
         return fn_obj
 
     def _maybe_emit_valueclass_payload_attr(self, expr: Attr):
-        if not isinstance(expr.obj, Name):
+        alloca = None
+        declared_ty = self._valueclass_payload_expr_type(expr.obj)
+        if isinstance(expr.obj, Name):
+            slot = self.env.get(expr.obj.ident)
+            if slot is not None:
+                alloca, _ir_ty, declared_ty = slot
+        if declared_ty is None:
             return None
-        slot = self.env.get(expr.obj.ident)
-        if slot is None:
-            return None
-        alloca, _ir_ty, declared_ty = slot
         if not self._is_valueclass_payload_type(declared_ty):
             return None
         field_info = self._valueclass_field_info(declared_ty, expr.name)
         if field_info is None:
             return None
         field_idx, _field_ty = field_info
-        payload = self.builder.load(
-            alloca,
-            name=self._fresh(f"value.{expr.obj.ident}.payload"),
-        )
+        if alloca is not None:
+            payload = self.builder.load(
+                alloca,
+                name=self._fresh(f"value.{expr.obj.ident}.payload"),
+            )
+        else:
+            payload = self._emit_expr(expr.obj)
+            if isinstance(payload.type, ir.PointerType):
+                return None
         return self.builder.extract_value(
             payload,
             [field_idx],
-            name=self._fresh(f"value.{expr.obj.ident}.{expr.name}"),
+            name=self._fresh(
+                f"value.{getattr(expr.obj, 'ident', 'payload')}.{expr.name}"
+            ),
         )
 
     def _maybe_emit_valueclass_payload_attr_from_dyn(self, expr: Attr):
@@ -647,8 +715,10 @@ class AttrLoadLoweringMixin:
         if not isinstance(obj.type, ir.PointerType):
             return None
 
-        selected = ir.Constant(_CSTR, None)
-        has_match = ir.Constant(_I1, 0)
+        done_bb = self.current_function.append_basic_block(
+            name=self._fresh(f"value.{expr.obj.ident}.{expr.name}.done"),
+        )
+        incoming: list[tuple[ir.Value, object]] = []
         for info, field_idx in candidates:
             cls_ptr = self.builder.load(
                 info.global_var,
@@ -665,41 +735,284 @@ class AttrLoadLoweringMixin:
                 ir.Constant(_I64, 0),
                 name=self._fresh(f"value.{expr.obj.ident}.{info.name}.isinstance"),
             )
+            match_bb = self.current_function.append_basic_block(
+                name=self._fresh(
+                    f"value.{expr.obj.ident}.{expr.name}.{info.name}.match"
+                ),
+            )
+            next_bb = self.current_function.append_basic_block(
+                name=self._fresh(
+                    f"value.{expr.obj.ident}.{expr.name}.{info.name}.next"
+                ),
+            )
+            self.builder.cbranch(is_instance_i1, match_bb, next_bb)
+
+            self.builder.position_at_end(match_bb)
             value_field = self.builder.call(
                 self.runtime["py_valuebox_get_field"],
                 [obj, ir.Constant(_I32, field_idx)],
-                name=self._fresh(f"value.{expr.obj.ident}.{expr.name}.{info.name}.field"),
+                name=self._fresh(
+                    f"value.{expr.obj.ident}.{expr.name}.{info.name}.field"
+                ),
             )
-            take = self.builder.and_(
-                is_instance_i1,
-                self.builder.not_(has_match),
-                name=self._fresh(f"value.{expr.obj.ident}.{expr.name}.{info.name}.take"),
-            )
-            selected = self.builder.select(take, value_field, selected)
-            has_match = self.builder.or_(has_match, is_instance_i1)
+            self.builder.branch(done_bb)
+            incoming.append((value_field, self.builder.block))
+
+            self.builder.position_at_end(next_bb)
+
         fallback = self.builder.call(
             self.runtime["py_obj_getattr"],
             [obj, self._attr_name_ptr(expr.name)],
-            name=self._fresh(f"value.{expr.obj.ident}.{expr.name}.fallback"),
+            name=self._fresh(f"value.{expr.obj.ident}.{expr.name}.fallback.value"),
         )
-        result = self.builder.select(
-            has_match,
-            selected,
-            fallback,
+        self.builder.branch(done_bb)
+        incoming.append((fallback, self.builder.block))
+
+        self.builder.position_at_end(done_bb)
+        result = self.builder.phi(
+            _CSTR,
             name=self._fresh(f"value.{expr.obj.ident}.{expr.name}.picked"),
         )
+        for value, block in incoming:
+            result.add_incoming(value, block)
         self._emit_attribute_error_if_null(result, expr.name, expr.span)
         if isinstance(expr.ty, (IntType, FloatType, BoolType)):
-            return marshal.marshal_from_object(
+            native_result = marshal.marshal_from_object(
                 self.builder,
                 self.module,
                 self.runtime,
                 result,
                 expr.ty,
             )
+            self._gc_release(result, self._release_expr_label("valuebox_attr", expr))
+            return native_result
         return result
 
     def _emit_attr(self, expr: Attr) -> ir.Value:
+        runtime_attr_name = expr.name
+        uname_attr = self._emit_native_os_uname_attr(expr)
+        if uname_attr is not None:
+            return uname_attr
+        lexical_class = self.current_class
+        if lexical_class is not None and hasattr(self, "class_lowering"):
+            runtime_attr_name = self.class_lowering.mangle_private_attr_name(
+                lexical_class,
+                expr.name,
+            )
+        if (
+            expr.name == "__new__"
+            and isinstance(expr.obj, Name)
+            and self._name_returns_native_builtin_callable_value(expr.obj.ident)
+        ):
+            # Direct ``int.__new__(...)`` calls have a dedicated lowering, but
+            # stdlib modules also treat ``int.__new__`` as a first-class value
+            # (notably ``copyreg`` during import). Materialise a real native
+            # callable rather than asking the runtime builtin-type ClassInfo
+            # for a descriptor it does not own.
+            builtin_name = expr.obj.ident
+            builtin_type = self._emit_native_builtin_callable_value(builtin_name)
+            if builtin_type is not None:
+                adapter_name = f"__pcc_builtin_type_{builtin_name}_dunder_new"
+                adapter = self.module.globals.get(adapter_name)
+                if not isinstance(adapter, ir.Function):
+                    adapter_ty = ir.FunctionType(_CSTR, [_CSTR, _CSTR])
+                    adapter = ir.Function(
+                        self.module,
+                        adapter_ty,
+                        name=adapter_name,
+                    )
+                    adapter.linkage = "internal"
+                    adapter_builder = ir.IRBuilder(
+                        adapter.append_basic_block(name="entry")
+                    )
+                    captures_arg, args_arg = adapter.args
+                    argc = adapter_builder.call(
+                        self.runtime["py_tuple_len"],
+                        [args_arg],
+                        name="argc",
+                    )
+                    has_cls = adapter_builder.icmp_signed(
+                        ">=",
+                        argc,
+                        ir.Constant(_I64, 1),
+                        name="has.cls",
+                    )
+                    check_cls_bb = adapter.append_basic_block(name="check.cls")
+                    arity_error_bb = adapter.append_basic_block(name="arity.error")
+                    adapter_builder.cbranch(
+                        has_cls,
+                        check_cls_bb,
+                        arity_error_bb,
+                    )
+
+                    adapter_builder.position_at_end(arity_error_bb)
+                    self._emit_native_builtin_callable_type_error(
+                        adapter_builder,
+                        f"{builtin_name}.__new__() needs a class argument",
+                        builtin_name,
+                        "dunder_new_arity",
+                    )
+
+                    adapter_builder.position_at_end(check_cls_bb)
+                    captured_type = adapter_builder.call(
+                        self.runtime["py_tuple_get"],
+                        [captures_arg, ir.Constant(_I64, 0)],
+                        name="captured.type",
+                    )
+                    requested_cls = adapter_builder.call(
+                        self.runtime["py_tuple_get"],
+                        [args_arg, ir.Constant(_I64, 0)],
+                        name="requested.cls",
+                    )
+                    exact_cls = adapter_builder.icmp_unsigned(
+                        "==",
+                        captured_type,
+                        requested_cls,
+                        name="exact.cls",
+                    )
+                    call_bb = adapter.append_basic_block(name="call")
+                    subclass_error_bb = adapter.append_basic_block(
+                        name="subclass.error"
+                    )
+                    adapter_builder.cbranch(
+                        exact_cls,
+                        call_bb,
+                        subclass_error_bb,
+                    )
+
+                    adapter_builder.position_at_end(subclass_error_bb)
+                    adapter_builder.call(
+                        self.runtime["py_decref"],
+                        [requested_cls],
+                    )
+                    adapter_builder.call(
+                        self.runtime["py_decref"],
+                        [captured_type],
+                    )
+                    self._emit_native_builtin_callable_type_error(
+                        adapter_builder,
+                        f"{builtin_name}.__new__() native builtin subclasses "
+                        "are not implemented",
+                        builtin_name,
+                        "dunder_new_subclass",
+                    )
+
+                    adapter_builder.position_at_end(call_bb)
+                    one = adapter_builder.call(
+                        self.runtime["py_int_from_i64"],
+                        [ir.Constant(_I64, 1)],
+                        name="slice.one",
+                    )
+                    none_gv = declare_runtime_global(self.module, "py_None")
+                    none_obj = adapter_builder.load(none_gv, name="none")
+                    ctor_args = adapter_builder.call(
+                        self.runtime["py_tuple_slice"],
+                        [args_arg, one, none_obj, none_obj],
+                        name="ctor.args",
+                    )
+                    result = adapter_builder.call(
+                        self.runtime["py_obj_call"],
+                        [captured_type, ctor_args, none_obj],
+                        name="result",
+                    )
+                    adapter_builder.call(
+                        self.runtime["py_decref"],
+                        [ctor_args],
+                    )
+                    adapter_builder.call(self.runtime["py_decref"], [one])
+                    adapter_builder.call(
+                        self.runtime["py_decref"],
+                        [requested_cls],
+                    )
+                    adapter_builder.call(
+                        self.runtime["py_decref"],
+                        [captured_type],
+                    )
+                    adapter_builder.ret(result)
+
+                captures = self.builder.call(
+                    self.runtime["py_tuple_new"],
+                    [ir.Constant(_I64, 1)],
+                    name=self._fresh(f"{builtin_name}.__new__.captures"),
+                )
+                self.builder.call(
+                    self.runtime["py_tuple_set_item"],
+                    [captures, ir.Constant(_I64, 0), builtin_type],
+                )
+                fn_obj = self.builder.call(
+                    self.runtime["py_func_new_named"],
+                    [adapter, captures, self._attr_name_ptr("__new__")],
+                    name=self._fresh(f"{builtin_name}.__new__.func"),
+                )
+                self._gc_release(captures)
+                return fn_obj
+        if expr.name == "join" and isinstance(expr.obj.ty, StrType):
+            adapter_name = "__pcc_bound_str_join"
+            adapter = self.module.globals.get(adapter_name)
+            if not isinstance(adapter, ir.Function):
+                adapter_ty = ir.FunctionType(_CSTR, [_CSTR, _CSTR])
+                adapter = ir.Function(self.module, adapter_ty, name=adapter_name)
+                adapter.linkage = "internal"
+                saved_builder = self.builder
+                self.builder = ir.IRBuilder(adapter.append_basic_block("entry"))
+                sep = self.builder.call(
+                    self.runtime["py_tuple_get"],
+                    [adapter.args[0], ir.Constant(_I64, 0)],
+                    name="str.join.sep",
+                )
+                argc = self.builder.call(
+                    self.runtime["py_tuple_len"],
+                    [adapter.args[1]],
+                    name="str.join.argc",
+                )
+                valid = self.builder.icmp_signed(
+                    "==",
+                    argc,
+                    ir.Constant(_I64, 1),
+                    name="str.join.arity.ok",
+                )
+                ok_bb = adapter.append_basic_block("arity.ok")
+                err_bb = adapter.append_basic_block("arity.err")
+                self.builder.cbranch(valid, ok_bb, err_bb)
+                self.builder.position_at_end(err_bb)
+                self._emit_native_builtin_callable_type_error(
+                    self.builder,
+                    "str.join() takes exactly one argument",
+                    "str_join",
+                    "arity",
+                )
+                self.builder.position_at_end(ok_bb)
+                iterable = self.builder.call(
+                    self.runtime["py_tuple_get"],
+                    [adapter.args[1], ir.Constant(_I64, 0)],
+                    name="str.join.iterable",
+                )
+                result = self.builder.call(
+                    self.runtime["py_str_join"],
+                    [sep, iterable],
+                    name="str.join.result",
+                )
+                self.builder.call(self.runtime["py_decref"], [iterable])
+                self.builder.call(self.runtime["py_decref"], [sep])
+                self.builder.ret(result)
+                self.builder = saved_builder
+            sep = self._emit_as_object(expr.obj)
+            captures = self.builder.call(
+                self.runtime["py_tuple_new"],
+                [ir.Constant(_I64, 1)],
+                name=self._fresh("str.join.captures"),
+            )
+            self.builder.call(
+                self.runtime["py_tuple_set_item"],
+                [captures, ir.Constant(_I64, 0), sep],
+            )
+            fn_obj = self.builder.call(
+                self.runtime["py_func_new_named"],
+                [adapter, captures, self._attr_name_ptr("str.join")],
+                name=self._fresh("str.join.bound"),
+            )
+            self._gc_release(captures)
+            return fn_obj
         inspect_alias_attr = self._maybe_emit_inspect_alias_attr(expr)
         if inspect_alias_attr is not None:
             return inspect_alias_attr
@@ -718,6 +1031,18 @@ class AttrLoadLoweringMixin:
             version_part = self._emit_sys_version_info_attr(expr.name)
             if version_part is not None:
                 return version_part
+        if (
+            isinstance(expr.obj, Attr)
+            and isinstance(expr.obj.obj, Name)
+            and expr.obj.name == "implementation"
+            and self._native_builtin_module_for_name(expr.obj.obj.ident) == "sys"
+        ):
+            # Mirror the pcc-owned implementation descriptor in
+            # pcc/py_stdlib/sys.py without materializing a CPython object.
+            if expr.name == "name":
+                return self._emit_str_literal("pcc")
+            if expr.name == "cache_tag":
+                return self._emit_none_literal()
         native_module_type_name = self._maybe_emit_native_module_type_name(expr)
         if native_module_type_name is not None:
             return native_module_type_name
@@ -767,7 +1092,7 @@ class AttrLoadLoweringMixin:
             type_name = self._static_runtime_type_name(expr.obj.args[0].ty)
             if type_name is not None:
                 return self._emit_str_literal(type_name)
-            obj_val = self._emit_as_object(expr.obj.args[0])
+            obj_val = self._emit_expr_as_pcc_object(expr.obj.args[0])
             return self.builder.call(
                 self.runtime["py_obj_type_name"],
                 [obj_val],
@@ -815,7 +1140,7 @@ class AttrLoadLoweringMixin:
                         name=self._fresh(f"cls.{expr.name}"),
                     )
             elif kind == "function":
-                return self._declare_extern_user_function(
+                return self._emit_native_module_export_value(
                     module_name,
                     expr.name,
                     info,
@@ -864,7 +1189,7 @@ class AttrLoadLoweringMixin:
                             name=self._fresh(f"cls.{expr.name}"),
                         )
                 elif kind == "function":
-                    return self._declare_extern_user_function(
+                    return self._emit_native_module_export_value(
                         module_name,
                         expr.name,
                         info,
@@ -883,6 +1208,27 @@ class AttrLoadLoweringMixin:
                         info,
                         expr.span,
                     )
+            alias_module = getattr(self, "_native_module_aliases", {}).get(
+                expr.obj.ident
+            )
+            if alias_module is not None:
+                module_name_ptr = self._ptr_to_cstr(
+                    self._cstr_global(
+                        alias_module,
+                        f".pcc.compiled.attr.module.{alias_module}",
+                    )
+                )
+                dynamic_attr = self.builder.call(
+                    self.runtime["py_module_attr_get"],
+                    [module_name_ptr, self._attr_name_ptr(runtime_attr_name)],
+                    name=self._fresh(f"compiled.module.{alias_module}.{expr.name}"),
+                )
+                self._emit_attribute_error_if_null(
+                    dynamic_attr,
+                    expr.name,
+                    expr.span,
+                )
+                return dynamic_attr
             builtin_module = self._native_builtin_module_for_name(expr.obj.ident)
             if builtin_module is not None:
                 builtin_attr = self._emit_native_builtin_module_attr(
@@ -946,6 +1292,8 @@ class AttrLoadLoweringMixin:
                         "MULTILINE": 8,
                         "S": 16,
                         "DOTALL": 16,
+                        "X": 64,
+                        "VERBOSE": 64,
                     }
                     if expr.name in _RE_CONSTS:
                         return self.builder.call(
@@ -961,6 +1309,16 @@ class AttrLoadLoweringMixin:
                         [],
                         name=self._fresh("sys.executable"),
                     )
+                if builtin_module == "sys" and expr.name in (
+                    "stdin",
+                    "stdout",
+                    "stderr",
+                ):
+                    # Value-position standard streams. Direct stream methods such as
+                    # sys.stdin.readline() still lower through native_system.py; the
+                    # marker here covers callbacks/containers that only need a
+                    # stable pcc object instead of a CPython stream.
+                    return self._emit_str_literal("<sys." + expr.name + ">")
                 if builtin_module == "sys" and expr.name in ("prefix", "base_prefix"):
                     return self.builder.call(
                         self.runtime["py_sys_prefix_str"],
@@ -1023,12 +1381,31 @@ class AttrLoadLoweringMixin:
                     # without dragging libpython for one constant.
                     if expr.name == "sep":
                         return self._emit_str_literal("/")
+                    if expr.name == "curdir":
+                        return self._emit_str_literal(".")
+                    if expr.name == "pardir":
+                        return self._emit_str_literal("..")
+                    if expr.name == "extsep":
+                        return self._emit_str_literal(".")
+                    if expr.name == "devnull":
+                        return self._emit_str_literal("/dev/null")
                     if expr.name == "linesep":
                         return self._emit_str_literal("\n")
                     if expr.name == "altsep":
                         return self._emit_none_literal()
                     if expr.name == "pathsep":
                         return self._emit_str_literal(":")
+                compiled_export = self._native_builtin_compiled_export_info(
+                    expr.obj.ident,
+                    expr.name,
+                )
+                if compiled_export is not None:
+                    compiled_module, info = compiled_export
+                    return self._emit_native_module_export_value(
+                        compiled_module,
+                        expr.name,
+                        info,
+                    )
                 return self._emit_cpy_attr(
                     self._emit_cpython_module_value(builtin_module),
                     expr.name,
@@ -1067,10 +1444,7 @@ class AttrLoadLoweringMixin:
                     or class_attr_state == "unknown"
                     or class_attr_state == "deleted"
                 )
-                if (
-                    method_owner is not None
-                    and expr.name in method_owner.methods
-                ):
+                if method_owner is not None and expr.name in method_owner.methods:
                     method_kind = method_owner.method_kinds.get(expr.name, "instance")
                     method_fn = method_owner.methods[expr.name]
                     if class_attr_runtime_candidate:
@@ -1084,9 +1458,7 @@ class AttrLoadLoweringMixin:
                         elif method_kind == "classmethod":
                             receiver_cls = self.builder.load(
                                 info.global_var,
-                                name=self._fresh(
-                                    f"cls.{expr.obj.ident}.method.recv"
-                                ),
+                                name=self._fresh(f"cls.{expr.obj.ident}.method.recv"),
                             )
                             static_fallback = self._emit_bound_class_method_value(
                                 method_owner,
@@ -1107,7 +1479,7 @@ class AttrLoadLoweringMixin:
                         )
                         runtime_value = self.builder.call(
                             self.runtime["py_obj_getattr"],
-                            [cls_obj, self._attr_name_ptr(expr.name)],
+                            [cls_obj, self._attr_name_ptr(runtime_attr_name)],
                             name=self._fresh(f"cls.{expr.obj.ident}.{expr.name}"),
                         )
                         self._emit_attribute_error_if_null(
@@ -1170,7 +1542,7 @@ class AttrLoadLoweringMixin:
                 )
                 result = self.builder.call(
                     self.runtime["py_obj_getattr"],
-                    [cls_obj, self._attr_name_ptr(expr.name)],
+                    [cls_obj, self._attr_name_ptr(runtime_attr_name)],
                     name=self._fresh(f"cls.{expr.obj.ident}.{expr.name}"),
                 )
                 self._emit_attribute_error_if_null(result, expr.name, expr.span)
@@ -1199,10 +1571,13 @@ class AttrLoadLoweringMixin:
             if getattr(self, "_cpy_env_flags", {}).get(expr.obj.ident, False):
                 obj_val = self._emit_expr(expr.obj)
                 return self._emit_cpy_attr(obj_val, expr.name)
-        if isinstance(expr.obj, (Attr, Subscript, Call)):
+        if isinstance(expr.obj, (Attr, Subscript, Call)) and self._expr_looks_cpython(
+            expr.obj
+        ):
             chain_val = self._emit_expr(expr.obj)
             if chain_val in getattr(self, "_cpy_values", ()):
                 return self._emit_cpy_attr(chain_val, expr.name)
+            self._gc_release_if_owned(chain_val, expr.obj)
         if isinstance(expr.obj, BinOp) and self._expr_looks_cpython(expr.obj):
             # Attribute load on a BINARY-OP result that is itself a CPython value
             # (e.g. ``(a + b).dtype`` on numpy arrays): ``py_cpy_binop`` yields a
@@ -1259,7 +1634,40 @@ class AttrLoadLoweringMixin:
                         class_info = self.class_lowering.classes.get(hint)
                 else:
                     class_info = self.class_lowering.classes.get(hint)
-                if class_info is not None:
+                if (
+                    class_info is not None
+                    and self.class_lowering.lookup_field_index(
+                        class_info,
+                        expr.name,
+                    )
+                    is not None
+                ):
+                    # Python lookup precedence is data descriptor, then the
+                    # instance, then a non-data/class attribute. A PEP 526
+                    # annotation can leave a same-named class metadata slot
+                    # while __init__ supplies the real instance field. The
+                    # old class-attr-first fast path loaded that null metadata
+                    # slot and made neighboring self-host state appear lost
+                    # (notably _InferCtx.globals).
+                    obj_val = self._emit_expr(expr.obj)
+                    return self._unbox_scalar_attr_result(
+                        self.class_lowering.emit_self_attr_load(
+                            class_info,
+                            expr.name,
+                            obj_val,
+                        ),
+                        expr.ty,
+                    )
+                if class_info is not None and not (
+                    self.class_lowering.class_attr_overridden_by_subclass(
+                        class_info,
+                        expr.name,
+                    )
+                ):
+                    # A static class-attr load is only sound when no subclass
+                    # overrides the attribute; the hinted local may hold a
+                    # subclass instance. Otherwise fall through to the runtime
+                    # MRO lookup below.
                     class_attr = self.class_lowering.emit_class_attr_load(
                         class_info,
                         expr.name,
@@ -1275,7 +1683,7 @@ class AttrLoadLoweringMixin:
                         "deleted",
                     )
                     if class_attr is not None and not class_attr_runtime_candidate:
-                        return class_attr
+                        return self._unbox_scalar_attr_result(class_attr, expr.ty)
 
         # Fast path for ``self.<attr>`` inside a method body: use the
         # declared-field index when known, otherwise fall through to the
@@ -1313,8 +1721,11 @@ class AttrLoadLoweringMixin:
                     method_fn,
                     self_val,
                 )
-            return self.class_lowering.emit_self_attr_load(
-                receiver_info, expr.name, self_val
+            return self._unbox_scalar_attr_result(
+                self.class_lowering.emit_self_attr_load(
+                    receiver_info, expr.name, self_val
+                ),
+                expr.ty,
             )
         if (
             current_class is not None
@@ -1325,7 +1736,7 @@ class AttrLoadLoweringMixin:
             cls_val = self._emit_expr(expr.obj)
             result = self.builder.call(
                 self.runtime["py_obj_getattr"],
-                [cls_val, self._attr_name_ptr(expr.name)],
+                [cls_val, self._attr_name_ptr(runtime_attr_name)],
                 name=self._fresh(f"cls.attr.{expr.name}"),
             )
             self._emit_attribute_error_if_null(result, expr.name, expr.span)
@@ -1352,17 +1763,20 @@ class AttrLoadLoweringMixin:
                     is not None
                 ):
                     obj_val = self._emit_expr(expr.obj)
-                    return self.class_lowering.emit_self_attr_load(
-                        class_info,
-                        expr.name,
-                        obj_val,
+                    return self._unbox_scalar_attr_result(
+                        self.class_lowering.emit_self_attr_load(
+                            class_info,
+                            expr.name,
+                            obj_val,
+                        ),
+                        expr.ty,
                     )
 
         obj = self._emit_expr(expr.obj)
         # Any object goes through py_obj_getattr; if the object is
         # ``None`` at runtime the runtime lib raises AttributeError —
         # that's the correct Python semantic (no segfault).
-        name_ptr = self._attr_name_ptr(expr.name)
+        name_ptr = self._attr_name_ptr(runtime_attr_name)
         result = self.builder.call(
             self.runtime["py_obj_getattr"],
             [obj, name_ptr],
@@ -1370,11 +1784,33 @@ class AttrLoadLoweringMixin:
         )
         self._emit_attribute_error_if_null(result, expr.name, expr.span)
         if isinstance(expr.ty, (IntType, FloatType, BoolType)):
-            return marshal.marshal_from_object(
+            native_result = marshal.marshal_from_object(
                 self.builder,
                 self.module,
                 self.runtime,
                 result,
                 expr.ty,
+            )
+            self._gc_release_if_owned(obj, expr.obj)
+            return native_result
+        self._gc_release_if_owned(obj, expr.obj)
+        return result
+
+    def _unbox_scalar_attr_result(self, result: ir.Value, result_ty: Type) -> ir.Value:
+        """Normalize boxed instance/class slots to the inferred scalar ABI.
+
+        Instance fields and class attributes are stored as ``PyObject*`` even
+        when inference knows the expression is an int, float, or bool.  The
+        generic getattr path already performs this conversion; keep the known-
+        class fast paths on the same boundary so their consumers never receive
+        a pointer where LLVM requires a native scalar.
+        """
+        if isinstance(result_ty, (IntType, FloatType, BoolType)):
+            return marshal.marshal_from_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                result,
+                result_ty,
             )
         return result

@@ -1,4 +1,5 @@
 """Assignment storage helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -8,13 +9,47 @@ from pcc.llvm_capi.compat import ir
 from ..py_ast import Attr, DynType, Expr, Name, Subscript, TupleExpr, Type
 from . import marshal
 
-
 _I8 = ir.IntType(8)
+_I1 = ir.IntType(1)
 _I64 = ir.IntType(64)
 _CSTR = _I8.as_pointer()
 
 
 class AssignmentStoreLoweringMixin:
+    def _publish_module_global_assignment(
+        self,
+        name: str,
+        value: ir.Value,
+        declared_ty: Type,
+        *,
+        is_cpy_value: bool = False,
+    ) -> None:
+        """Expose an executed global assignment through the module object."""
+        if is_cpy_value or self._is_valueclass_payload_type(declared_ty):
+            return
+        published = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            value,
+            declared_ty,
+        )
+        module_name = self.ast_module.name or "__main__"
+        module_name_ptr = self._pooled_cstr_ptr(
+            module_name,
+            ".pcc.assign.binding.module",
+        )
+        self.builder.call(
+            self.runtime["py_module_attr_set"],
+            [module_name_ptr, self._attr_name_ptr(name), published],
+            name=self._fresh(f"pcc.assign.binding.publish.{name}"),
+        )
+        if not isinstance(value.type, ir.PointerType):
+            self._gc_release(
+                published,
+                self._release_context_label("module_publish_box"),
+            )
+
     def _coerce_unpack_name_like(self, lhs: Expr) -> Expr:
         if isinstance(lhs, Name):
             return lhs
@@ -67,6 +102,21 @@ class AssignmentStoreLoweringMixin:
             )
             return
         if isinstance(lhs, Name):
+            module_global_target = lhs.ident in self._module_globals and (
+                self.current_func_def is None or lhs.ident in self._current_global_names
+            )
+            if module_global_target:
+                # Module destructuring has one binding, not a shadow local
+                # plus a global.  Creating an alloca here made subsequent
+                # statements in the same module read the still-null local
+                # even though the unpack value had been published globally.
+                self._store_value_at_name(
+                    lhs,
+                    value,
+                    value_ty,
+                    value_is_owned=unpack_value_is_owned,
+                )
+                return
             slot = self.env.get(lhs.ident)
             target_ty = lhs.ty
             if slot is None and target_ty is not None:
@@ -92,11 +142,7 @@ class AssignmentStoreLoweringMixin:
                     and lhs.ident not in getattr(self, "_current_param_names", set())
                     and not getattr(self, "_cpy_env_flags", {}).get(lhs.ident, False)
                 ):
-                    old = self.builder.load(
-                        alloca,
-                        name=self._fresh(f"unpack.overwrite.{lhs.ident}"),
-                    )
-                    self._gc_release(old)
+                    self._emit_release_owned_local_if_flagged(lhs.ident, alloca)
             self._store_value_at_name(
                 lhs,
                 value,
@@ -114,16 +160,22 @@ class AssignmentStoreLoweringMixin:
                 value_ty,
                 unpack_value_is_owned,
             )
+            slot_after_store = self.env.get(lhs.ident)
+            flag_alloca = None
+            if slot_after_store is not None:
+                flag_alloca = slot_after_store[0]
             if lhs.ident in self._owned_local_names:
+                flag = self._ensure_owned_local_flag(lhs.ident, flag_alloca)
+                self.builder.store(ir.Constant(_I1, 1), flag)
                 self._owned_local_has_value.add(lhs.ident)
             else:
+                flag = self._owned_local_flag_for(lhs.ident, flag_alloca)
+                if flag is not None:
+                    self.builder.store(ir.Constant(_I1, 0), flag)
                 self._owned_local_has_value.discard(lhs.ident)
             return
         lhs_kind = type(lhs).__name__
-        if (
-            isinstance(lhs, TupleExpr)
-            or lhs_kind == "TupleExpr"
-        ):
+        if isinstance(lhs, TupleExpr) or lhs_kind == "TupleExpr":
             for i, sub in enumerate(lhs.elems):
                 idx_box = self.builder.call(
                     self.runtime["py_int_from_i64"],
@@ -143,9 +195,7 @@ class AssignmentStoreLoweringMixin:
                 )
             return
         raise NotImplementedError(
-            "Layer 1 tuple-unpack target kind "
-            + lhs_kind
-            + " not supported"
+            "Layer 1 tuple-unpack target kind " + lhs_kind + " not supported"
         )
 
     def _store_value_at_name(
@@ -182,9 +232,16 @@ class AssignmentStoreLoweringMixin:
             else:
                 self._cpy_module_flags.pop(target.ident, None)
                 is_cpy_value = False
+            self._publish_module_global_assignment(
+                target.ident,
+                value,
+                declared_ty,
+                is_cpy_value=is_cpy_value,
+            )
             self._store_module_global_root_value(
                 gv,
                 value,
+                declared_ty=declared_ty,
                 value_is_owned=value_is_owned,
                 is_cpy_value=is_cpy_value,
             )
@@ -193,7 +250,11 @@ class AssignmentStoreLoweringMixin:
         slot = self.env.get(target.ident)
         if slot is None:
             target_ty = target.ty
-            if not (self._is_scalar(target_ty) or self._is_object(target_ty)):
+            if not (
+                self._is_scalar(target_ty)
+                or self._is_object(target_ty)
+                or self._is_valueclass_payload_type(target_ty)
+            ):
                 raise NotImplementedError(
                     f"Layer 1 tuple-unpack target {target.ident!r} has "
                     f"unsupported type {type(target_ty).__name__}"
@@ -213,6 +274,8 @@ class AssignmentStoreLoweringMixin:
         alloca, _ir_ty, declared_ty = slot
         value = self._coerce(value, value_ty, declared_ty)
         self.builder.store(value, alloca)
+        if self._is_valueclass_payload_type(declared_ty):
+            self._ensure_valueclass_payload_gc_roots(target.ident, alloca, declared_ty)
 
     def _store_value_at_subscript(
         self,
@@ -223,8 +286,18 @@ class AssignmentStoreLoweringMixin:
         release_value: bool = False,
     ) -> None:
         """Runtime subscript store given a pre-computed value."""
+        # ``os.environ[key] = value`` store hook (native_os.py): CPython
+        # mapping semantics via py_os_environ_setitem instead of a
+        # generic py_obj_setitem on the (non-native) os.environ object.
+        if self._emit_native_os_environ_setitem_value(
+            target,
+            value,
+            value_ty,
+            release_value=release_value,
+        ):
+            return
         obj = self._emit_expr(target.obj)
-        idx_val = self._emit_expr(target.idx)
+        k_obj = self._emit_subscript_key_object(target.idx)
         v_obj = marshal.marshal_to_object(
             self.builder,
             self.module,
@@ -232,17 +305,14 @@ class AssignmentStoreLoweringMixin:
             value,
             value_ty,
         )
-        k_obj = marshal.marshal_to_object(
-            self.builder,
-            self.module,
-            self.runtime,
-            idx_val,
-            target.idx.ty,
-        )
         self.builder.call(
             self.runtime["py_obj_setitem"],
             [obj, k_obj, v_obj],
         )
+        # py_obj_setitem raises for user-visible failures (out-of-range list
+        # store -> IndexError); without this check the pending exception
+        # skips the enclosing try/except and corrupts later dispatch.
+        self._emit_post_call_err_check(target.span)
         if release_value and isinstance(v_obj.type, ir.PointerType):
             if v_obj not in getattr(self, "_cpy_values", ()):
                 self._gc_release(v_obj)

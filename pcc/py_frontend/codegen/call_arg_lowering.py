@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Call, Expr, Name
+from ..py_ast import Call, DictExpr, DictType, DynType, Expr, Name, StrType
 from . import marshal
 
 
@@ -52,7 +52,7 @@ class CallArgLoweringMixin:
         arg_exprs: tuple[Expr, ...],
     ) -> tuple[tuple[Expr, ...], Expr] | None:
         positional: list[Expr] = []
-        kwargs_expr: Expr | None = None
+        kwargs_exprs: list[Expr] = []
         for arg in arg_exprs:
             if (
                 isinstance(arg, Call)
@@ -61,16 +61,37 @@ class CallArgLoweringMixin:
                 and len(arg.args) == 1
                 and not arg.kwargs
             ):
-                if kwargs_expr is not None:
-                    return None
-                kwargs_expr = arg.args[0]
+                kwargs_exprs.append(arg.args[0])
                 continue
-            if kwargs_expr is not None:
+            if kwargs_exprs:
                 return None
             positional.append(arg)
-        if kwargs_expr is None:
+        if not kwargs_exprs:
             return None
-        return tuple(positional), kwargs_expr
+        if len(kwargs_exprs) == 1:
+            return tuple(positional), kwargs_exprs[0]
+
+        span = getattr(kwargs_exprs[0], "span", None)
+        pairs: list[tuple[Expr, Expr]] = []
+        for kwargs_expr in kwargs_exprs:
+            pairs.append(
+                (
+                    Name(span=span, ty=DynType(name="dyn"), ident="**"),
+                    kwargs_expr,
+                )
+            )
+        return (
+            tuple(positional),
+            DictExpr(
+                span=span,
+                ty=DictType(
+                    name="dict",
+                    key=StrType(name="str"),
+                    value=DynType(name="dyn"),
+                ),
+                pairs=tuple(pairs),
+            ),
+        )
 
     def _emit_pcc_args_list(
         self,

@@ -179,6 +179,14 @@ def emit_typed_initializer(
                     f"x86_64 self backend expected {ty.count} bytes in c-string initializer for {global_name!r}, got {len(data)}"
                 )
             return emit_byte_data(data)
+        # LLVM vector types (`<N x T>`) are parsed into array TypeDescs, but
+        # their constant initializers use angle-bracket delimiters
+        # (`<i32 1, i32 2, ...>`) rather than the square-bracket array form.
+        # Normalize a top-level vector literal to the array literal form so the
+        # element loop below emits each lane exactly like an array element.
+        # This mirrors aggregate_literal_to_bytes() in self_backend_parse.py.
+        if init.startswith("<") and init.endswith(">"):
+            init = "[" + init[1:-1].strip() + "]"
         if not (init.startswith("[") and init.endswith("]")):
             raise BackendUnavailable(
                 f"x86_64 self backend expected array initializer for {global_name!r}, got {init!r}"

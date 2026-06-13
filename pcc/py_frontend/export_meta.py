@@ -14,6 +14,7 @@ from .py_ast import (
     ListType,
     MemoryViewType,
     NoneType,
+    SetType,
     StrType,
     TupleType,
     Type,
@@ -50,6 +51,8 @@ def encode_type(ty: Type | None):
         return ("memoryview",)
     if isinstance(ty, ListType):
         return ("list", encode_type(ty.elem))
+    if isinstance(ty, SetType):
+        return (ty.name, encode_type(ty.elem))
     if isinstance(ty, DictType):
         return ("dict", encode_type(ty.key), encode_type(ty.value))
     if isinstance(ty, TupleType):
@@ -135,6 +138,8 @@ def _decode_type_uncached(desc):
         return MemoryViewType("memoryview")
     if tag == "list":
         return ListType(name="list", elem=decode_type(desc[1]))
+    if tag in ("set", "frozenset"):
+        return SetType(name=tag, elem=decode_type(desc[1]))
     if tag == "dict":
         return DictType(
             name="dict",

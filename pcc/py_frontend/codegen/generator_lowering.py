@@ -1,6 +1,9 @@
 """Generator lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
+import os
+import sys
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
@@ -28,7 +31,6 @@ from ..py_ast import (
 from . import marshal
 from .errors import L1CodegenError
 from .runtime_abi import declare_runtime_global
-
 
 _I1 = ir.IntType(1)
 _I8 = ir.IntType(8)
@@ -167,6 +169,7 @@ class GeneratorLoweringMixin:
                     stack.append(value)
         self._funcdef_yield_sentinel_cache[cache_key] = False
         return False
+
     def _yield_sentinel_call(self, expr: Expr) -> Optional[tuple[str, Call]]:
         if (
             isinstance(expr, Call)
@@ -183,12 +186,15 @@ class GeneratorLoweringMixin:
                 return ("yield_from", expr)
             return ("yield", expr)
         return None
+
     def _generator_yield_from_iter_name(self, expr: Expr) -> str:
         span = expr.span
         return f"__pcc_yield_from_iter_{span.line}_{span.col}"
+
     def _generator_for_iter_name(self, stmt: For) -> str:
         span = stmt.span
         return f"__pcc_for_iter_{span.line}_{span.col}"
+
     def _generator_enum_cnt_name(self, stmt: For) -> str:
         # ``for ... in enumerate(...)`` desugars (in _normalise_for_enumerate)
         # to a synthetic running counter that is created *during* _emit_for,
@@ -198,6 +204,7 @@ class GeneratorLoweringMixin:
         # survives yields (otherwise the index resets to NULL on resume).
         span = stmt.span
         return f"__pcc_enum_cnt_{span.line}_{span.col}"
+
     def _collect_generator_target_names(
         self,
         names: list[str],
@@ -215,6 +222,7 @@ class GeneratorLoweringMixin:
             if isinstance(cur, TupleExpr):
                 for item in cur.elems:
                     stack.append(item)
+
     def _collect_generator_frame_names(self, fd: FuncDef) -> list[str]:
         names: list[str] = []
 
@@ -299,6 +307,7 @@ class GeneratorLoweringMixin:
                     work.append(item)
 
         return names
+
     def _emit_generator_wrapper_function(
         self,
         fd: FuncDef,
@@ -307,7 +316,21 @@ class GeneratorLoweringMixin:
         class_info=None,
         method_kind: Optional[str] = None,
     ) -> None:
+        worker_timing = str(
+            os.environ.get("PCC_PY_FRONTEND_WORKER_TIMING", "") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
         frame_names = self._collect_generator_frame_names(fd)
+        if worker_timing:
+            sys.stderr.write(
+                "pcc frontend generator frames function="
+                + fd.name
+                + " count="
+                + str(len(frame_names))
+                + "\n"
+            )
+            sys.stderr.write(
+                "pcc frontend generator resume start function=" + fd.name + "\n"
+            )
         resume_fn = self._emit_generator_resume_function(
             fd,
             frame_names,
@@ -315,6 +338,10 @@ class GeneratorLoweringMixin:
             class_info,
             method_kind,
         )
+        if worker_timing:
+            sys.stderr.write(
+                "pcc frontend generator resume done function=" + fd.name + "\n"
+            )
 
         saved_builder = self.builder
         saved_fn = self.current_function
@@ -377,6 +404,8 @@ class GeneratorLoweringMixin:
         self._gc_release(frame)
         self.builder.ret(gen)
 
+        self._strict_stub_user_function_with_cpy_fallback(resume_fn, fd)
+
         self.builder = saved_builder
         self.current_function = saved_fn
         self.current_func_def = saved_fd
@@ -385,6 +414,7 @@ class GeneratorLoweringMixin:
         self._box_int_locals = saved_box_int_locals
         self._exact_int_env_flags = saved_exact_int_flags
         self._current_global_names = saved_global_names
+
     def _emit_generator_resume_function(
         self,
         fd: FuncDef,
@@ -415,6 +445,23 @@ class GeneratorLoweringMixin:
         saved_box_int_locals = self._box_int_locals
         saved_exact_int_flags = self._exact_int_env_flags
         saved_global_names = self._current_global_names
+        saved_current_param_names = self._current_param_names
+        saved_owned_local_names = self._owned_local_names
+        saved_owned_local_has_value = self._owned_local_has_value
+        saved_owned_local_flag_slots = self._owned_local_flag_slots
+        saved_owned_local_flag_allocas = getattr(
+            self,
+            "_owned_local_flag_allocas",
+            {},
+        )
+        saved_gc_rooted_local_names = self._gc_rooted_local_names
+        saved_gc_rooted_local_order = getattr(self, "_gc_rooted_local_order", [])
+        saved_borrowed_gc_rooted_local_names = getattr(
+            self,
+            "_borrowed_gc_rooted_local_names",
+            set(),
+        )
+        saved_pinned_gc_rooted_local_names = self._pinned_gc_rooted_local_names
         saved_class = self.current_class
         saved_method_kind = self.current_method_kind
 
@@ -430,6 +477,15 @@ class GeneratorLoweringMixin:
         self._box_int_locals = self._should_box_python_ints()
         self._exact_int_env_flags = {}
         self._current_global_names = self._collect_explicit_global_names(fd.body)
+        self._current_param_names = set()
+        self._owned_local_names = set()
+        self._owned_local_has_value = set()
+        self._owned_local_flag_slots = {}
+        self._owned_local_flag_allocas = {}
+        self._gc_rooted_local_names = set()
+        self._gc_rooted_local_order = []
+        self._borrowed_gc_rooted_local_names = set()
+        self._pinned_gc_rooted_local_names = set()
         self.current_class = class_info
         self.current_method_kind = method_kind
 
@@ -446,6 +502,11 @@ class GeneratorLoweringMixin:
             self.builder.store(item, slot)
             self.env[local_name] = (slot, _CSTR, DynType(name="dyn"))
             frame_slots[local_name] = (idx, slot)
+            self._owned_local_names.add(local_name)
+            self._owned_local_has_value.add(local_name)
+            flag = self._ensure_owned_local_flag(local_name, slot)
+            self.builder.store(ir.Constant(_I1, 1), flag)
+            self._ensure_owned_local_gc_root(local_name, slot, _CSTR)
 
         dispatch_bb = fn.append_basic_block(name="gen.dispatch")
         start_bb = fn.append_basic_block(name="gen.start")
@@ -458,16 +519,29 @@ class GeneratorLoweringMixin:
         )
         switch_inst = self.builder.switch(state, start_bb)
         self.builder.position_at_end(start_bb)
-        self._generator_ctx_stack.append({
-            "gen": fn.args[0],
-            "frame": fn.args[1],
-            "frame_slots": frame_slots,
-            "dispatch_bb": dispatch_bb,
-            "switch": switch_inst,
-            "next_state": 1,
-        })
+        self._generator_ctx_stack.append(
+            {
+                "gen": fn.args[0],
+                "frame": fn.args[1],
+                "frame_slots": frame_slots,
+                "dispatch_bb": dispatch_bb,
+                "switch": switch_inst,
+                "next_state": 1,
+            }
+        )
 
+        worker_timing = str(
+            os.environ.get("PCC_PY_FRONTEND_WORKER_TIMING", "") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if worker_timing:
+            sys.stderr.write(
+                "pcc frontend generator body start function=" + fd.name + "\n"
+            )
         self._emit_stmts(fd.body)
+        if worker_timing:
+            sys.stderr.write(
+                "pcc frontend generator body done function=" + fd.name + "\n"
+            )
         if not self._builder_block_is_terminated():
             self._emit_generator_finish()
 
@@ -482,10 +556,20 @@ class GeneratorLoweringMixin:
         self._box_int_locals = saved_box_int_locals
         self._exact_int_env_flags = saved_exact_int_flags
         self._current_global_names = saved_global_names
+        self._current_param_names = saved_current_param_names
+        self._owned_local_names = saved_owned_local_names
+        self._owned_local_has_value = saved_owned_local_has_value
+        self._owned_local_flag_slots = saved_owned_local_flag_slots
+        self._owned_local_flag_allocas = saved_owned_local_flag_allocas
+        self._gc_rooted_local_names = saved_gc_rooted_local_names
+        self._gc_rooted_local_order = saved_gc_rooted_local_order
+        self._borrowed_gc_rooted_local_names = saved_borrowed_gc_rooted_local_names
+        self._pinned_gc_rooted_local_names = saved_pinned_gc_rooted_local_names
         self._generator_ctx_stack.pop()
         self.current_class = saved_class
         self.current_method_kind = saved_method_kind
         return fn
+
     def _emit_generator_add_case(
         self,
         state_id: int,
@@ -496,15 +580,25 @@ class GeneratorLoweringMixin:
         self.builder.position_at_end(ctx["dispatch_bb"])
         ctx["switch"].add_case(ir.Constant(_I64, state_id), target)
         self.builder.position_at_end(cur)
+
     def _emit_generator_save_frame(self) -> None:
         ctx = self._generator_ctx_stack[-1]
         frame = ctx["frame"]
-        for _name, (idx, slot) in ctx["frame_slots"].items():
+        # cpy for-loop targets hold raw libpython pointers while their
+        # loop is being emitted; those must never be stored into the
+        # frame py_list (its barriers/dealloc dereference pcc headers).
+        # The cpy for lowering proves the name is not read across a
+        # suspension before registering it here.
+        skip_names = ctx.get("cpy_skip_save_names", ())
+        for name, (idx, slot) in ctx["frame_slots"].items():
+            if name in skip_names:
+                continue
             value = self.builder.load(slot, name=self._fresh("gen.save"))
             self.builder.call(
                 self.runtime["py_list_set"],
                 [frame, ir.Constant(_I64, idx), value],
             )
+
     def _emit_generator_stop_iteration(
         self,
         value: Optional[ir.Value] = None,
@@ -525,32 +619,51 @@ class GeneratorLoweringMixin:
             )
         self.builder.call(self.runtime["py_raise"], [exc])
         self.builder.ret(ir.Constant(_CSTR, None))
+
     def _emit_generator_finish(
         self,
         value: Optional[ir.Value] = None,
     ) -> None:
         ctx = self._generator_ctx_stack[-1]
         self._emit_generator_save_frame()
+        self._emit_owned_local_cleanup()
         self.builder.call(self.runtime["py_gen_set_done"], [ctx["gen"]])
         self._emit_generator_stop_iteration(value)
+
     def _emit_generator_return(self, stmt: Return) -> None:
         value = None
         if stmt.value is not None:
             value = self._emit_as_object(stmt.value)
         self._emit_generator_finish(value)
+
     def _emit_generator_yield_value(self, value: ir.Value) -> None:
         ctx = self._generator_ctx_stack[-1]
+        worker_timing = str(
+            os.environ.get("PCC_PY_FRONTEND_WORKER_TIMING", "") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
         state_id = ctx["next_state"]
         ctx["next_state"] = state_id + 1
         cont_bb = self.current_function.append_basic_block(
             name=self._fresh(f"gen.resume.{state_id}"),
         )
+        if worker_timing:
+            sys.stderr.write("pcc frontend generator yield save-frame start\n")
         self._emit_generator_save_frame()
+        if worker_timing:
+            sys.stderr.write("pcc frontend generator yield save-frame done\n")
+            sys.stderr.write("pcc frontend generator yield cleanup start\n")
+        self._emit_owned_local_cleanup()
+        if worker_timing:
+            sys.stderr.write("pcc frontend generator yield cleanup done\n")
         self.builder.call(
             self.runtime["py_gen_set_state"],
             [ctx["gen"], ir.Constant(_I64, state_id)],
         )
+        if worker_timing:
+            sys.stderr.write("pcc frontend generator yield add-case start\n")
         self._emit_generator_add_case(state_id, cont_bb)
+        if worker_timing:
+            sys.stderr.write("pcc frontend generator yield add-case done\n")
         self.builder.ret(value)
         self.builder.position_at_end(cont_bb)
         pending = self.builder.call(
@@ -572,6 +685,7 @@ class GeneratorLoweringMixin:
             err_target = self._ensure_fn_err_exit()
         self.builder.cbranch(has_pending, err_target, ok_bb)
         self.builder.position_at_end(ok_bb)
+
     def _emit_generator_take_send(self) -> ir.Value:
         ctx = self._generator_ctx_stack[-1]
         return self.builder.call(
@@ -579,21 +693,55 @@ class GeneratorLoweringMixin:
             [ctx["gen"]],
             name=self._fresh("gen.send.value"),
         )
+
     def _emit_generator_discard_send(self) -> None:
         value = self._emit_generator_take_send()
         self._gc_release(value)
+
+    def _generator_yield_value_needs_retain(
+        self,
+        value: ir.Value,
+        expr: Expr,
+    ) -> bool:
+        if not isinstance(value.type, ir.PointerType):
+            return False
+        if value in getattr(self, "_cpy_values", ()):
+            return False
+        if self._expr_returns_unsafe_raw_pointer(expr):
+            return False
+        if isinstance(expr, Name):
+            if expr.ident in getattr(self, "_owned_local_names", set()):
+                return True
+            if expr.ident in getattr(self, "_current_param_names", set()):
+                return True
+            if expr.ident in getattr(self, "_module_globals", {}):
+                return True
+            if expr.ident in self.env:
+                return True
+        if self._expr_returns_owned_object(expr):
+            return False
+        expr_ty = getattr(expr, "ty", None)
+        return expr_ty is not None and self._is_object(expr_ty)
+
     def _emit_generator_yield_expr(self, expr: Call) -> ir.Value:
         if len(expr.args) > 1:
             raise NotImplementedError("yield accepts at most one value")
         if expr.args:
             value = self._emit_as_object(expr.args[0])
+            if self._generator_yield_value_needs_retain(value, expr.args[0]):
+                value = self._gc_retain(
+                    value,
+                    name=self._fresh("gen.yield.retain"),
+                )
         else:
             value = self._emit_none_literal()
         self._emit_generator_yield_value(value)
         return self._emit_generator_take_send()
+
     def _emit_generator_yield(self, expr: Call) -> None:
         sent = self._emit_generator_yield_expr(expr)
         self._gc_release(sent)
+
     def _emit_generator_yield_from(self, expr: Call) -> None:
         if len(expr.args) != 1:
             raise NotImplementedError("yield from expects one iterable")

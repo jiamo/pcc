@@ -17,7 +17,12 @@ from .self_backend_aarch64_darwin_slots import (
     store_value_to_address,
     zero_address,
 )
-from .self_backend_ir import ParsedFunction, TypeDesc, _align_to
+from .self_backend_ir import (
+    ParsedFunction,
+    TypeDesc,
+    _align_to,
+    text_key_mapping_get,
+)
 from .self_backend_module_symbols import PreparedModuleSymbols
 from .self_backend_parse import is_aggregate_literal_value
 
@@ -73,6 +78,42 @@ def emit_bit_count_intrinsic_call(
     return lines
 
 
+def _order_scalar_phi_copies(func, assignments):
+    """Order scalar phi copies for safe direct slot-to-slot stores.
+
+    A copy ``dest_i <- src_i`` must read ``slot(src_i)`` before any other copy
+    overwrites that slot by writing its own destination. We emit a copy only
+    once no *other* pending copy still reads the slot it is about to write;
+    coalesced self-copies (source already in the destination slot) are dropped
+    as no-ops. Returns the ordered ``(phi, match)`` list, or ``None`` if the
+    copies form a cycle (a true swap) that no ordering can satisfy — the caller
+    then falls back to the temp-buffered path.
+    """
+    copies = []
+    for phi, match, _offset in assignments:
+        dest_off = func.value_slots[phi.dest].offset
+        src_slot = text_key_mapping_get(func.value_slots, match.value)
+        src_off = src_slot.offset if src_slot is not None else None
+        if src_off == dest_off:
+            continue  # coalesced self-copy: no instruction needed
+        copies.append((phi, match, dest_off, src_off))
+
+    ordered = []
+    pending = list(copies)
+    while pending:
+        ready = [
+            c
+            for c in pending
+            if not any(other is not c and other[3] == c[2] for other in pending)
+        ]
+        if not ready:
+            return None  # cycle: caller uses the temp-buffered path
+        for c in ready:
+            ordered.append((c[0], c[1]))
+            pending.remove(c)
+    return ordered
+
+
 def emit_phi_assignments(
     func: ParsedFunction,
     *,
@@ -80,7 +121,12 @@ def emit_phi_assignments(
     target_block: str,
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
-    target = func.block_map.get(target_block)
+    target = text_key_mapping_get(func.block_map, target_block)
+    if target is None:
+        for block in func.blocks:
+            if block.name == target_block:
+                target = block
+                break
     if target is None:
         raise BackendUnavailable(
             f"self backend branch targets unknown block {target_block!r} in {func.name!r}"
@@ -108,19 +154,26 @@ def emit_phi_assignments(
     if not assignments:
         return []
 
-    dest_names = {phi.dest for phi, _match, _offset in assignments}
-    can_store_directly = all(
-        not phi.type.is_array
-        and not phi.type.is_struct
-        and match.value not in dest_names
-        for phi, match, _offset in assignments
-    )
-    if can_store_directly:
-        lines: list[str] = []
-        for phi, match, _offset in assignments:
-            lines.extend(materialize_value(func, match.value, phi.type, 9, module_symbols))
-            lines.extend(store_value_regs_to_slot(func.value_slots[phi.dest], 9))
-        return lines
+    # Scalar phi copies can be lowered as direct slot-to-slot stores when they
+    # can be *ordered* so that no copy overwrites a slot another copy still
+    # needs to read. Slot coalescing can put a phi source in the same physical
+    # slot as a *different* phi's destination, so the safe order is computed
+    # from slot offsets, not SSA names. When the copies form a cycle (a true
+    # swap), no ordering is safe and we fall through to the temp-buffered path
+    # below, which stages every source before writing any destination.
+    if all(
+        not phi.type.is_array and not phi.type.is_struct
+        for phi, _match, _offset in assignments
+    ):
+        ordered = _order_scalar_phi_copies(func, assignments)
+        if ordered is not None:
+            lines: list[str] = []
+            for phi, match in ordered:
+                lines.extend(
+                    materialize_value(func, match.value, phi.type, 9, module_symbols)
+                )
+                lines.extend(store_value_regs_to_slot(func.value_slots[phi.dest], 9))
+            return lines
 
     total_temp = _align_to(temp_offset, 16)
     lines: list[str] = []
@@ -134,7 +187,9 @@ def emit_phi_assignments(
 
     for phi, match, offset in assignments:
         lines.extend(_emit_temp_addr(offset))
-        if (phi.type.is_array or phi.type.is_struct) and not aggregate_fits_reg_abi(phi.type):
+        if (phi.type.is_array or phi.type.is_struct) and not aggregate_fits_reg_abi(
+            phi.type
+        ):
             if match.value == "zeroinitializer":
                 lines.extend(zero_address(temp_addr_reg, phi.type.slot_size))
             elif is_aggregate_literal_value(match.value):
@@ -147,16 +202,26 @@ def emit_phi_assignments(
                     )
                 )
             else:
-                lines.extend(materialize_aggregate_storage_address(func, match.value, phi.type, "x14"))
-                lines.extend(copy_address_to_address("x14", temp_addr_reg, phi.type.slot_size))
+                lines.extend(
+                    materialize_aggregate_storage_address(
+                        func, match.value, phi.type, "x14"
+                    )
+                )
+                lines.extend(
+                    copy_address_to_address("x14", temp_addr_reg, phi.type.slot_size)
+                )
             continue
         lines.extend(materialize_value(func, match.value, phi.type, 9, module_symbols))
         lines.extend(store_value_to_address(temp_addr_reg, phi.type, 9))
 
     for phi, _match, offset in assignments:
-        if (phi.type.is_array or phi.type.is_struct) and not aggregate_fits_reg_abi(phi.type):
+        if (phi.type.is_array or phi.type.is_struct) and not aggregate_fits_reg_abi(
+            phi.type
+        ):
             lines.extend(_emit_temp_addr(offset))
-            lines.extend(copy_address_to_slot(temp_addr_reg, func.value_slots[phi.dest]))
+            lines.extend(
+                copy_address_to_slot(temp_addr_reg, func.value_slots[phi.dest])
+            )
             continue
         lines.extend(_emit_temp_addr(offset))
         lines.extend(load_value_from_address(temp_addr_reg, phi.type, 9))

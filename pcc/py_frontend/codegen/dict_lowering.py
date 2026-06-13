@@ -36,14 +36,7 @@ _DYN_DICT_METHOD_NATIVE = frozenset(
 
 
 def _dict_method_box(host, e: Expr) -> ir.Value:
-    v = host._emit_expr(e)
-    return marshal.marshal_to_object(
-        host.builder,
-        host.module,
-        host.runtime,
-        v,
-        e.ty,
-    )
+    return host._emit_expr_as_pcc_object(e)
 
 
 class DictLoweringMixin:
@@ -55,12 +48,156 @@ class DictLoweringMixin:
         assert isinstance(attr, Attr)
         if attr.name not in _DYN_DICT_METHOD_NATIVE:
             return None
+        if attr.name == "pop":
+            return self._emit_dyn_pop_method_with_runtime_guard(expr)
         dict_ty = DictType(
             name="dict",
             key=DynType(name="dyn"),
             value=DynType(name="dyn"),
         )
         return self._maybe_emit_dict_method(expr, dict_ty)
+
+    def _emit_dyn_pop_method_with_runtime_guard(
+        self,
+        expr: Call,
+    ) -> Optional[ir.Value]:
+        attr = expr.func
+        assert isinstance(attr, Attr)
+        if attr.name != "pop" or expr.kwargs or len(expr.args) > 2:
+            return None
+        if self.current_function is None:
+            return None
+
+        recv = self._emit_expr(attr.obj)
+        if recv in getattr(self, "_cpy_values", ()):
+            return self._emit_cpy_method_call_src(
+                recv,
+                attr.name,
+                expr.args,
+                kwargs=expr.kwargs,
+            )
+
+        tag = self.builder.call(
+            self.runtime["py_obj_type_tag"],
+            [recv],
+            name=self._fresh("dyn.pop.recv.tag"),
+        )
+        is_list = self.builder.icmp_signed(
+            "==",
+            tag,
+            ir.Constant(_I64, 5),
+            name=self._fresh("dyn.pop.recv.is_list"),
+        )
+
+        fn = self.current_function
+        list_bb = fn.append_basic_block(name=self._fresh("dyn.pop.list"))
+        non_list_bb = fn.append_basic_block(name=self._fresh("dyn.pop.non_list"))
+        dict_bb = fn.append_basic_block(name=self._fresh("dyn.pop.dict"))
+        generic_bb = fn.append_basic_block(name=self._fresh("dyn.pop.generic"))
+        done_bb = fn.append_basic_block(name=self._fresh("dyn.pop.done"))
+        self.builder.cbranch(is_list, list_bb, non_list_bb)
+
+        self.builder.position_at_end(list_bb)
+        if len(expr.args) <= 1:
+            if len(expr.args) == 0:
+                idx_val = ir.Constant(_I64, -1)
+            else:
+                idx_val = self._emit_expr_as_i64(expr.args[0])
+            list_result = self.builder.call(
+                self.runtime["py_list_pop"],
+                [recv, idx_val],
+                name=self._fresh("dyn.pop.list.result"),
+            )
+        else:
+            list_result = self._emit_generic_dyn_method_call_on_value(
+                recv,
+                attr.name,
+                expr,
+            )
+        list_exit = self.builder.block
+        self.builder.branch(done_bb)
+
+        self.builder.position_at_end(non_list_bb)
+        is_dict = self.builder.icmp_signed(
+            "==",
+            tag,
+            ir.Constant(_I64, 6),
+            name=self._fresh("dyn.pop.recv.is_dict"),
+        )
+        self.builder.cbranch(is_dict, dict_bb, generic_bb)
+
+        self.builder.position_at_end(dict_bb)
+        if len(expr.args) == 1:
+            dict_result = self.builder.call(
+                self.runtime["py_dict_pop"],
+                [recv, _dict_method_box(self, expr.args[0])],
+                name=self._fresh("dyn.pop.dict.result"),
+            )
+            self._emit_post_call_err_check(expr.span)
+        elif len(expr.args) == 2:
+            k_obj = _dict_method_box(self, expr.args[0])
+            default_obj = _dict_method_box(self, expr.args[1])
+            existing = self.builder.call(
+                self.runtime["py_dict_get"],
+                [recv, k_obj],
+                name=self._fresh("dyn.pop.dict.get"),
+            )
+            null_p = ir.Constant(_CSTR, None)
+            is_missing = self.builder.icmp_signed(
+                "==",
+                existing,
+                null_p,
+                name=self._fresh("dyn.pop.dict.miss"),
+            )
+            hit_bb = fn.append_basic_block(name=self._fresh("dyn.pop.dict.hit"))
+            miss_bb = fn.append_basic_block(name=self._fresh("dyn.pop.dict.miss"))
+            dict_join_bb = fn.append_basic_block(
+                name=self._fresh("dyn.pop.dict.join"),
+            )
+            self.builder.cbranch(is_missing, miss_bb, hit_bb)
+            self.builder.position_at_end(hit_bb)
+            self.builder.call(
+                self.runtime["py_dict_del"],
+                [recv, k_obj],
+                name=self._fresh("dyn.pop.dict.del"),
+            )
+            hit_exit = self.builder.block
+            self.builder.branch(dict_join_bb)
+            self.builder.position_at_end(miss_bb)
+            miss_exit = self.builder.block
+            self.builder.branch(dict_join_bb)
+            self.builder.position_at_end(dict_join_bb)
+            dict_result = self.builder.phi(
+                _CSTR,
+                name=self._fresh("dyn.pop.dict.result"),
+            )
+            dict_result.add_incoming(existing, hit_exit)
+            dict_result.add_incoming(default_obj, miss_exit)
+        else:
+            dict_result = self._emit_generic_dyn_method_call_on_value(
+                recv,
+                attr.name,
+                expr,
+            )
+        dict_exit = self.builder.block
+        self.builder.branch(done_bb)
+
+        self.builder.position_at_end(generic_bb)
+        generic_result = self._emit_generic_dyn_method_call_on_value(
+            recv,
+            attr.name,
+            expr,
+        )
+        generic_exit = self.builder.block
+        self.builder.branch(done_bb)
+
+        self.builder.position_at_end(done_bb)
+        result = self.builder.phi(_CSTR, name=self._fresh("dyn.pop.result"))
+        result.add_incoming(list_result, list_exit)
+        result.add_incoming(dict_result, dict_exit)
+        result.add_incoming(generic_result, generic_exit)
+        return result
+
     def _maybe_emit_dict_method(
         self,
         expr: Call,
@@ -124,6 +261,16 @@ class DictLoweringMixin:
                 [recv],
                 name=self._fresh("dict.items"),
             )
+        if name == "popitem":
+            if expr.args:
+                return None
+            result = self.builder.call(
+                self.runtime["py_dict_popitem"],
+                [recv],
+                name=self._fresh("dict.popitem"),
+            )
+            self._emit_post_call_err_check(expr.span)
+            return result
         if name == "clear":
             if expr.args:
                 return None
@@ -158,14 +305,26 @@ class DictLoweringMixin:
                     name=self._fresh("dict.update.kw"),
                 )
             return self._emit_none_literal()
-        if name == "setdefault" and len(expr.args) == 2:
+        if name == "setdefault" and len(expr.args) in (1, 2):
             # ``d.setdefault(k, default)`` — if ``k`` exists, return
             # its value; otherwise insert and return ``default``.
+            # ``d.setdefault(k)`` is the 1-arg form: ``default`` is
+            # ``None`` (CPython inserts ``{k: None}`` and returns None).
             # Compile to: existing = py_dict_get(d, k); if existing is
             # NULL then py_dict_set(d, k, default); existing = default;
             # return existing.
+            one_arg = len(expr.args) == 1
             k_obj = _dict_method_box(self, expr.args[0])
-            default_obj = _dict_method_box(self, expr.args[1])
+            if one_arg:
+                # 1-arg form: default is ``None``. Load the immortal
+                # singleton here (borrowed); it is incref'd on the miss
+                # branch only, where it is actually inserted+returned, so
+                # the phi result is an *owned* reference on both edges
+                # (the hit edge returns the owned ref from py_dict_get),
+                # mirroring the ownership contract of py_dict_get_default.
+                default_obj = self._emit_none_literal()
+            else:
+                default_obj = _dict_method_box(self, expr.args[1])
             fn = self.current_function
             existing = self.builder.call(
                 self.runtime["py_dict_get"],
@@ -188,6 +347,13 @@ class DictLoweringMixin:
             cur_bb = self.builder._block
             self.builder.cbranch(is_missing, miss_bb, join_bb)
             self.builder.position_at_end(miss_bb)
+            if one_arg:
+                # Make the returned None an owned reference (only on the
+                # miss edge; a hit returns py_dict_get's owned value).
+                self.builder.call(
+                    self.runtime["py_incref"],
+                    [default_obj],
+                )
             self.builder.call(
                 self.runtime["py_dict_set"],
                 [recv, k_obj, default_obj],

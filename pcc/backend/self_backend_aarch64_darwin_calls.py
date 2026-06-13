@@ -29,7 +29,13 @@ from .self_backend_aarch64_darwin_slots import (
     store_value_to_address,
 )
 from .self_backend_aarch64_darwin_symbols import asm_symbol
-from .self_backend_ir import ArgInfo, ParsedFunction, TypeDesc, _align_to
+from .self_backend_ir import (
+    ArgInfo,
+    ParsedFunction,
+    TypeDesc,
+    _align_to,
+    parsed_function_value_slot,
+)
 from .self_backend_module_symbols import PreparedModuleSymbols
 from .self_backend_parse import (
     aggregate_literal_to_bytes,
@@ -40,7 +46,11 @@ from .self_backend_parse import (
 
 
 def _vector_lane_stride(vector_type: TypeDesc):
-    if not vector_type.is_array or vector_type.elem is None or not vector_type.elem.is_int:
+    if (
+        not vector_type.is_array
+        or vector_type.elem is None
+        or not vector_type.elem.is_int
+    ):
         raise BackendUnavailable(
             f"self backend vector intrinsic currently expects integer vector lanes, got {vector_type.describe()}"
         )
@@ -94,7 +104,11 @@ def emit_va_arg(
 
 
 def _can_spill_aggregate_constant(value: str) -> bool:
-    return value in {"zeroinitializer", "poison", "undef"} or is_aggregate_literal_value(value)
+    return value in {
+        "zeroinitializer",
+        "poison",
+        "undef",
+    } or is_aggregate_literal_value(value)
 
 
 def emit_vararg_stack_arg(
@@ -122,7 +136,9 @@ def emit_vararg_stack_arg(
                 )
             )
             return lines
-        lines.extend(materialize_aggregate_storage_address(func, value, arg_type, "x12"))
+        lines.extend(
+            materialize_aggregate_storage_address(func, value, arg_type, "x12")
+        )
         lines.extend(copy_address_to_address("x12", addr_reg, arg_type.slot_size))
         return lines
     if arg_type.is_void:
@@ -177,7 +193,10 @@ def emit_minmax_intrinsic_call(
         )
     lhs_type, lhs = args[0]
     rhs_type, rhs = args[1]
-    if lhs_type.describe() != rhs_type.describe() or lhs_type.describe() != ret_type.describe():
+    if (
+        lhs_type.describe() != rhs_type.describe()
+        or lhs_type.describe() != ret_type.describe()
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic type mismatch in {func.name!r}"
         )
@@ -193,7 +212,9 @@ def emit_minmax_intrinsic_call(
             selected_cc = cc
             break
     if selected_cc is None:
-        raise BackendUnavailable(f"self backend intrinsic not translated yet in {func.name!r}: {callee}")
+        raise BackendUnavailable(
+            f"self backend intrinsic not translated yet in {func.name!r}: {callee}"
+        )
     is_signed = callee.startswith(("llvm.smax.", "llvm.smin."))
     if lhs_type.is_array and lhs_type.elem is not None and lhs_type.elem.is_int:
         return _emit_vector_minmax_intrinsic_call(
@@ -245,10 +266,18 @@ def _emit_vector_minmax_intrinsic_call(
     lhs_addr: str | None = None
     rhs_addr: str | None = None
     if lhs in func.value_slots:
-        lines.extend(emit_add_offset("x15", "x29", -func.value_slots[lhs].offset, scratch_reg="x14"))
+        lines.extend(
+            emit_add_offset(
+                "x15", "x29", -func.value_slots[lhs].offset, scratch_reg="x14"
+            )
+        )
         lhs_addr = "x15"
     if rhs in func.value_slots:
-        lines.extend(emit_add_offset("x16", "x29", -func.value_slots[rhs].offset, scratch_reg="x14"))
+        lines.extend(
+            emit_add_offset(
+                "x16", "x29", -func.value_slots[rhs].offset, scratch_reg="x14"
+            )
+        )
         rhs_addr = "x16"
     lines.extend(emit_add_offset("x17", "x29", -dest_slot.offset, scratch_reg="x14"))
     for lane_index in range(ret_type.count):
@@ -256,8 +285,16 @@ def _emit_vector_minmax_intrinsic_call(
         if lane_index:
             lines.extend(emit_add_offset("x14", "x17", lane_index * lane_stride))
             dst_addr = "x14"
-        lines.extend(_emit_vector_minmax_lane_value(func, lhs, ret_type, lane_type, lane_index, 9, lhs_addr, module_symbols))
-        lines.extend(_emit_vector_minmax_lane_value(func, rhs, ret_type, lane_type, lane_index, 10, rhs_addr, module_symbols))
+        lines.extend(
+            _emit_vector_minmax_lane_value(
+                func, lhs, ret_type, lane_type, lane_index, 9, lhs_addr, module_symbols
+            )
+        )
+        lines.extend(
+            _emit_vector_minmax_lane_value(
+                func, rhs, ret_type, lane_type, lane_index, 10, rhs_addr, module_symbols
+            )
+        )
         lhs_reg = reg_name(lane_type, 9)
         rhs_reg = reg_name(lane_type, 10)
         dst_reg = reg_name(lane_type, 11)
@@ -284,21 +321,31 @@ def _emit_vector_minmax_lane_value(
         source_addr = addr_reg
         if lane_index:
             temp_reg = "x12" if addr_reg != "x12" else "x13"
-            lines = emit_add_offset(temp_reg, addr_reg, lane_index * _align_to(lane_type.slot_size, lane_type.align))
+            lines = emit_add_offset(
+                temp_reg,
+                addr_reg,
+                lane_index * _align_to(lane_type.slot_size, lane_type.align),
+            )
             lines.extend(load_value_from_address(temp_reg, lane_type, dest_reg_index))
             return lines
         return load_value_from_address(source_addr, lane_type, dest_reg_index)
     const_value = const_int_from_value(value)
     if const_value is not None:
-        return emit_const_to_reg(lane_type, reg_name(lane_type, dest_reg_index), const_value)
+        return emit_const_to_reg(
+            lane_type, reg_name(lane_type, dest_reg_index), const_value
+        )
     if value == "zeroinitializer":
         return emit_const_to_reg(lane_type, reg_name(lane_type, dest_reg_index), 0)
     if is_aggregate_literal_value(value):
         literal_bytes = aggregate_literal_to_bytes(vector_type, value)
         stride = _align_to(lane_type.slot_size, lane_type.align)
-        lane_bytes = literal_bytes[lane_index * stride : lane_index * stride + lane_type.slot_size]
-        lane_value = int.from_bytes(lane_bytes, byteorder="little", signed=False)
-        return emit_const_to_reg(lane_type, reg_name(lane_type, dest_reg_index), lane_value)
+        lane_bytes = literal_bytes[
+            lane_index * stride : lane_index * stride + lane_type.slot_size
+        ]
+        lane_value = int.from_bytes(lane_bytes, "little")
+        return emit_const_to_reg(
+            lane_type, reg_name(lane_type, dest_reg_index), lane_value
+        )
     return materialize_value(func, value, lane_type, dest_reg_index, module_symbols)
 
 
@@ -348,9 +395,16 @@ def _emit_vector_storage_address_with_scratch(
     reg: str,
 ) -> list[str]:
     if value in func.value_slots:
-        return emit_add_offset(reg, "x29", -func.value_slots[value].offset, scratch_reg="x14")
-    if value in func.alloca_slots and func.alloca_slots[value].allocated_type.describe() == value_type.describe():
-        return emit_add_offset(reg, "x29", -func.alloca_slots[value].offset, scratch_reg="x14")
+        return emit_add_offset(
+            reg, "x29", -func.value_slots[value].offset, scratch_reg="x14"
+        )
+    if (
+        value in func.alloca_slots
+        and func.alloca_slots[value].allocated_type.describe() == value_type.describe()
+    ):
+        return emit_add_offset(
+            reg, "x29", -func.alloca_slots[value].offset, scratch_reg="x14"
+        )
     raise BackendUnavailable(
         f"self backend can only materialize vector storage from local slots right now in {func.name!r}: {value}"
     )
@@ -482,7 +536,11 @@ def emit_vector_reduce_add_intrinsic_call(
             f"self backend {callee} intrinsic expects 1 arg in {func.name!r}"
         )
     vector_type, value = args[0]
-    if not vector_type.is_array or vector_type.elem is None or not vector_type.elem.is_int:
+    if (
+        not vector_type.is_array
+        or vector_type.elem is None
+        or not vector_type.elem.is_int
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently only supports integer vectors in {func.name!r}"
         )
@@ -521,7 +579,11 @@ def emit_vector_reduce_mul_intrinsic_call(
             f"self backend {callee} intrinsic expects 1 arg in {func.name!r}"
         )
     vector_type, value = args[0]
-    if not vector_type.is_array or vector_type.elem is None or not vector_type.elem.is_int:
+    if (
+        not vector_type.is_array
+        or vector_type.elem is None
+        or not vector_type.elem.is_int
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently only supports integer vectors in {func.name!r}"
         )
@@ -560,7 +622,11 @@ def emit_vector_reduce_or_intrinsic_call(
             f"self backend {callee} intrinsic expects 1 arg in {func.name!r}"
         )
     vector_type, value = args[0]
-    if not vector_type.is_array or vector_type.elem is None or not vector_type.elem.is_int:
+    if (
+        not vector_type.is_array
+        or vector_type.elem is None
+        or not vector_type.elem.is_int
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently only supports integer vectors in {func.name!r}"
         )
@@ -599,7 +665,11 @@ def emit_vector_reduce_umax_intrinsic_call(
             f"self backend {callee} intrinsic expects 1 arg in {func.name!r}"
         )
     vector_type, value = args[0]
-    if not vector_type.is_array or vector_type.elem is None or not vector_type.elem.is_int:
+    if (
+        not vector_type.is_array
+        or vector_type.elem is None
+        or not vector_type.elem.is_int
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently only supports integer vectors in {func.name!r}"
         )
@@ -636,7 +706,9 @@ def emit_ucmp_intrinsic_call(
     if dest is None or dest not in func.value_slots:
         return []
     if len(args) != 2:
-        raise BackendUnavailable(f"self backend {callee} intrinsic expects 2 args in {func.name!r}")
+        raise BackendUnavailable(
+            f"self backend {callee} intrinsic expects 2 args in {func.name!r}"
+        )
     lhs_type, lhs = args[0]
     rhs_type, rhs = args[1]
     if (
@@ -674,7 +746,10 @@ def emit_usub_sat_intrinsic_call(
         )
     lhs_type, lhs = args[0]
     rhs_type, rhs = args[1]
-    if lhs_type.describe() != rhs_type.describe() or lhs_type.describe() != ret_type.describe():
+    if (
+        lhs_type.describe() != rhs_type.describe()
+        or lhs_type.describe() != ret_type.describe()
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic type mismatch in {func.name!r}"
         )
@@ -683,7 +758,9 @@ def emit_usub_sat_intrinsic_call(
         lines.extend(materialize_value(func, rhs, rhs_type, 10, module_symbols))
         dst_reg = "x11" if ret_type.width > 32 else "w11"
         zero_reg = "xzr" if ret_type.width > 32 else "wzr"
-        lines.append(f"  subs {dst_reg}, {reg_name(ret_type, 9)}, {reg_name(ret_type, 10)}")
+        lines.append(
+            f"  subs {dst_reg}, {reg_name(ret_type, 9)}, {reg_name(ret_type, 10)}"
+        )
         lines.append(f"  csel {dst_reg}, {dst_reg}, {zero_reg}, hs")
         lines.extend(store_value_regs_to_slot(func.value_slots[dest], 11))
         return lines
@@ -707,7 +784,9 @@ def emit_usub_sat_intrinsic_call(
             dst_addr = "x14"
         lines.extend(load_value_from_address(lhs_addr, lane_type, 9))
         lines.extend(load_value_from_address(rhs_addr, lane_type, 10))
-        lines.append(f"  subs {dst_reg}, {reg_name(lane_type, 9)}, {reg_name(lane_type, 10)}")
+        lines.append(
+            f"  subs {dst_reg}, {reg_name(lane_type, 9)}, {reg_name(lane_type, 10)}"
+        )
         lines.append(f"  csel {dst_reg}, {dst_reg}, {zero_reg}, hs")
         lines.extend(store_value_to_address(dst_addr, lane_type, 11))
     return lines
@@ -729,7 +808,10 @@ def emit_uadd_sat_intrinsic_call(
         )
     lhs_type, lhs = args[0]
     rhs_type, rhs = args[1]
-    if lhs_type.describe() != rhs_type.describe() or lhs_type.describe() != ret_type.describe():
+    if (
+        lhs_type.describe() != rhs_type.describe()
+        or lhs_type.describe() != ret_type.describe()
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic type mismatch in {func.name!r}"
         )
@@ -738,7 +820,9 @@ def emit_uadd_sat_intrinsic_call(
         lines.extend(materialize_value(func, rhs, rhs_type, 10, module_symbols))
         dst_reg = "x11" if ret_type.width > 32 else "w11"
         zero_reg = "xzr" if ret_type.width > 32 else "wzr"
-        lines.append(f"  adds {dst_reg}, {reg_name(ret_type, 9)}, {reg_name(ret_type, 10)}")
+        lines.append(
+            f"  adds {dst_reg}, {reg_name(ret_type, 9)}, {reg_name(ret_type, 10)}"
+        )
         lines.append(f"  csinv {dst_reg}, {dst_reg}, {zero_reg}, lo")
         lines.extend(store_value_regs_to_slot(func.value_slots[dest], 11))
         return lines
@@ -762,7 +846,9 @@ def emit_uadd_sat_intrinsic_call(
             dst_addr = "x14"
         lines.extend(load_value_from_address(lhs_addr, lane_type, 9))
         lines.extend(load_value_from_address(rhs_addr, lane_type, 10))
-        lines.append(f"  adds {dst_reg}, {reg_name(lane_type, 9)}, {reg_name(lane_type, 10)}")
+        lines.append(
+            f"  adds {dst_reg}, {reg_name(lane_type, 9)}, {reg_name(lane_type, 10)}"
+        )
         lines.append(f"  csinv {dst_reg}, {dst_reg}, {zero_reg}, lo")
         lines.extend(store_value_to_address(dst_addr, lane_type, 11))
     return lines
@@ -797,7 +883,11 @@ def emit_umul_overflow_intrinsic_call(
             f"self backend {callee} intrinsic expected {{ value, overflow }} return in {func.name!r}"
         )
     value_type, overflow_type = ret_type.fields
-    if value_type.describe() != lhs_type.describe() or not overflow_type.is_int or overflow_type.width != 1:
+    if (
+        value_type.describe() != lhs_type.describe()
+        or not overflow_type.is_int
+        or overflow_type.width != 1
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic return shape mismatch in {func.name!r}: {ret_type.describe()}"
         )
@@ -835,7 +925,11 @@ def emit_uadd_overflow_intrinsic_call(
         )
     lhs_type, lhs = args[0]
     rhs_type, rhs = args[1]
-    if lhs_type.describe() != rhs_type.describe() or not lhs_type.is_int or lhs_type.width not in (32, 64):
+    if (
+        lhs_type.describe() != rhs_type.describe()
+        or not lhs_type.is_int
+        or lhs_type.width not in (32, 64)
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently expects i32/i64 same-width integer args in {func.name!r}"
         )
@@ -844,7 +938,11 @@ def emit_uadd_overflow_intrinsic_call(
             f"self backend {callee} intrinsic expected {{ value, overflow }} return in {func.name!r}"
         )
     value_type, overflow_type = ret_type.fields
-    if value_type.describe() != lhs_type.describe() or not overflow_type.is_int or overflow_type.width != 1:
+    if (
+        value_type.describe() != lhs_type.describe()
+        or not overflow_type.is_int
+        or overflow_type.width != 1
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic return shape mismatch in {func.name!r}: {ret_type.describe()}"
         )
@@ -877,7 +975,11 @@ def emit_smul_overflow_intrinsic_call(
         )
     lhs_type, lhs = args[0]
     rhs_type, rhs = args[1]
-    if lhs_type.describe() != rhs_type.describe() or not lhs_type.is_int or lhs_type.width not in (32, 64):
+    if (
+        lhs_type.describe() != rhs_type.describe()
+        or not lhs_type.is_int
+        or lhs_type.width not in (32, 64)
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently expects i32/i64 same-width integer args in {func.name!r}"
         )
@@ -886,7 +988,11 @@ def emit_smul_overflow_intrinsic_call(
             f"self backend {callee} intrinsic expected {{ value, overflow }} return in {func.name!r}"
         )
     value_type, overflow_type = ret_type.fields
-    if value_type.describe() != lhs_type.describe() or not overflow_type.is_int or overflow_type.width != 1:
+    if (
+        value_type.describe() != lhs_type.describe()
+        or not overflow_type.is_int
+        or overflow_type.width != 1
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic return shape mismatch in {func.name!r}: {ret_type.describe()}"
         )
@@ -955,7 +1061,14 @@ def emit_fshl_intrinsic_call(
     dst_reg = reg_name(ret_type, 14)
     lhs_reg = reg_name(lhs_type, 9)
     rhs_reg = reg_name(rhs_type, 10)
-    shift_reg = reg_name(shift_type if shift_type.width <= lhs_type.width else TypeDesc("int", lhs_type.width), 11)
+    shift_reg = reg_name(
+        (
+            shift_type
+            if shift_type.width <= lhs_type.width
+            else TypeDesc("int", lhs_type.width)
+        ),
+        11,
+    )
     lines = materialize_value(func, lhs, lhs_type, 9, module_symbols)
     lines.extend(materialize_value(func, rhs, rhs_type, 10, module_symbols))
     lines.extend(materialize_value(func, shift, shift_type, 11, module_symbols))
@@ -987,7 +1100,7 @@ def _emit_vector_funnel_shift_intrinsic_call(
     if (
         lane_type is None
         or not lane_type.is_int
-        or lane_type.width not in (16, 32, 64)
+        or lane_type.width not in (8, 16, 32, 64)
         or lhs_type.describe() != rhs_type.describe()
         or lhs_type.describe() != ret_type.describe()
         or shift_lane_type is None
@@ -995,7 +1108,7 @@ def _emit_vector_funnel_shift_intrinsic_call(
         or (shift_type.is_array and shift_type.count != ret_type.count)
     ):
         raise BackendUnavailable(
-            f"self backend llvm.{direction} vector intrinsic currently expects matching i16/i32/i64 vector operands in {func.name!r}"
+            f"self backend llvm.{direction} vector intrinsic currently expects matching i8/i16/i32/i64 vector operands in {func.name!r}"
         )
     lane_stride = _align_to(lane_type.slot_size, lane_type.align)
     width_mask = lane_type.width - 1
@@ -1006,22 +1119,38 @@ def _emit_vector_funnel_shift_intrinsic_call(
     shift_addr: str | None = None
     lines: list[str] = []
     if lhs in func.value_slots or lhs in func.alloca_slots:
-        lines.extend(_emit_vector_storage_address_with_scratch(func, lhs, lhs_type, "x15"))
+        lines.extend(
+            _emit_vector_storage_address_with_scratch(func, lhs, lhs_type, "x15")
+        )
         lhs_addr = "x15"
     if rhs in func.value_slots or rhs in func.alloca_slots:
-        lines.extend(_emit_vector_storage_address_with_scratch(func, rhs, rhs_type, "x16"))
+        lines.extend(
+            _emit_vector_storage_address_with_scratch(func, rhs, rhs_type, "x16")
+        )
         rhs_addr = "x16"
     if shift in func.value_slots or shift in func.alloca_slots:
-        lines.extend(_emit_vector_storage_address_with_scratch(func, shift, shift_type, "x8"))
+        lines.extend(
+            _emit_vector_storage_address_with_scratch(func, shift, shift_type, "x8")
+        )
         shift_addr = "x8"
-    lines.extend(emit_add_offset("x17", "x29", -func.value_slots[dest].offset, scratch_reg="x14"))
+    lines.extend(
+        emit_add_offset("x17", "x29", -func.value_slots[dest].offset, scratch_reg="x14")
+    )
     for lane_index in range(ret_type.count):
         dst_addr = "x17"
         if lane_index:
             lines.extend(emit_add_offset("x14", "x17", lane_index * lane_stride))
             dst_addr = "x14"
-        lines.extend(_emit_vector_minmax_lane_value(func, lhs, lhs_type, lane_type, lane_index, 9, lhs_addr, module_symbols))
-        lines.extend(_emit_vector_minmax_lane_value(func, rhs, rhs_type, lane_type, lane_index, 10, rhs_addr, module_symbols))
+        lines.extend(
+            _emit_vector_minmax_lane_value(
+                func, lhs, lhs_type, lane_type, lane_index, 9, lhs_addr, module_symbols
+            )
+        )
+        lines.extend(
+            _emit_vector_minmax_lane_value(
+                func, rhs, rhs_type, lane_type, lane_index, 10, rhs_addr, module_symbols
+            )
+        )
         lines.extend(
             _emit_vector_minmax_lane_value(
                 func,
@@ -1034,7 +1163,10 @@ def _emit_vector_funnel_shift_intrinsic_call(
                 module_symbols,
             )
         )
-        shift_reg = reg_name(shift_lane_type if shift_lane_type.width <= lane_type.width else lane_type, 11)
+        shift_reg = reg_name(
+            shift_lane_type if shift_lane_type.width <= lane_type.width else lane_type,
+            11,
+        )
         lhs_reg = reg_name(lane_type, 9)
         rhs_reg = reg_name(lane_type, 10)
         lines.append(f"  and {shift_reg}, {shift_reg}, #{width_mask}")
@@ -1097,7 +1229,14 @@ def emit_fshr_intrinsic_call(
     dst_reg = reg_name(ret_type, 14)
     lhs_reg = reg_name(lhs_type, 9)
     rhs_reg = reg_name(rhs_type, 10)
-    shift_reg = reg_name(shift_type if shift_type.width <= lhs_type.width else TypeDesc("int", lhs_type.width), 11)
+    shift_reg = reg_name(
+        (
+            shift_type
+            if shift_type.width <= lhs_type.width
+            else TypeDesc("int", lhs_type.width)
+        ),
+        11,
+    )
     lines = materialize_value(func, lhs, lhs_type, 9, module_symbols)
     lines.extend(materialize_value(func, rhs, rhs_type, 10, module_symbols))
     lines.extend(materialize_value(func, shift, shift_type, 11, module_symbols))
@@ -1127,7 +1266,11 @@ def emit_abs_intrinsic_call(
         )
     value_type, value = args[0]
     _poison_type, _poison_flag = args[1]
-    if value_type.describe() != ret_type.describe() or not value_type.is_int or value_type.width not in (8, 16, 32, 64):
+    if (
+        value_type.describe() != ret_type.describe()
+        or not value_type.is_int
+        or value_type.width not in (8, 16, 32, 64)
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently expects i8/i16/i32/i64 same-type results in {func.name!r}"
         )
@@ -1157,7 +1300,10 @@ def emit_copysign_intrinsic_call(
         )
     lhs_type, lhs = args[0]
     rhs_type, rhs = args[1]
-    if lhs_type.describe() != rhs_type.describe() or lhs_type.describe() != ret_type.describe():
+    if (
+        lhs_type.describe() != rhs_type.describe()
+        or lhs_type.describe() != ret_type.describe()
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic type mismatch in {func.name!r}"
         )
@@ -1208,7 +1354,11 @@ def emit_fabs_intrinsic_call(
             f"self backend {callee} intrinsic expects 1 arg in {func.name!r}"
         )
     value_type, value = args[0]
-    if value_type.describe() != ret_type.describe() or not value_type.is_fp or value_type.width not in (32, 64):
+    if (
+        value_type.describe() != ret_type.describe()
+        or not value_type.is_fp
+        or value_type.width not in (32, 64)
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently only supports float/double in {func.name!r}"
         )
@@ -1226,7 +1376,9 @@ def emit_floor_intrinsic_call(
     args: tuple[tuple[TypeDesc, str], ...],
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
-    return _emit_frint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols, "frintm")
+    return _emit_frint_intrinsic_call(
+        func, dest, ret_type, callee, args, module_symbols, "frintm"
+    )
 
 
 def emit_ceil_intrinsic_call(
@@ -1237,7 +1389,9 @@ def emit_ceil_intrinsic_call(
     args: tuple[tuple[TypeDesc, str], ...],
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
-    return _emit_frint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols, "frintp")
+    return _emit_frint_intrinsic_call(
+        func, dest, ret_type, callee, args, module_symbols, "frintp"
+    )
 
 
 def emit_trunc_intrinsic_call(
@@ -1248,7 +1402,9 @@ def emit_trunc_intrinsic_call(
     args: tuple[tuple[TypeDesc, str], ...],
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
-    return _emit_frint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols, "frintz")
+    return _emit_frint_intrinsic_call(
+        func, dest, ret_type, callee, args, module_symbols, "frintz"
+    )
 
 
 def emit_rint_intrinsic_call(
@@ -1260,7 +1416,9 @@ def emit_rint_intrinsic_call(
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
     # llvm.rint / llvm.nearbyint round-to-nearest-even.
-    return _emit_frint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols, "frintn")
+    return _emit_frint_intrinsic_call(
+        func, dest, ret_type, callee, args, module_symbols, "frintn"
+    )
 
 
 def _emit_frint_intrinsic_call(
@@ -1279,7 +1437,11 @@ def _emit_frint_intrinsic_call(
             f"self backend {callee} intrinsic expects 1 arg in {func.name!r}"
         )
     value_type, value = args[0]
-    if value_type.describe() != ret_type.describe() or not value_type.is_fp or value_type.width not in (32, 64):
+    if (
+        value_type.describe() != ret_type.describe()
+        or not value_type.is_fp
+        or value_type.width not in (32, 64)
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently only supports float/double in {func.name!r}"
         )
@@ -1304,7 +1466,11 @@ def emit_sqrt_intrinsic_call(
             f"self backend {callee} intrinsic expects 1 arg in {func.name!r}"
         )
     value_type, value = args[0]
-    if value_type.describe() != ret_type.describe() or not value_type.is_fp or value_type.width not in (32, 64):
+    if (
+        value_type.describe() != ret_type.describe()
+        or not value_type.is_fp
+        or value_type.width not in (32, 64)
+    ):
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently only supports float/double in {func.name!r}"
         )
@@ -1332,13 +1498,17 @@ def emit_is_fpclass_intrinsic_call(
     mask_type, mask_value = args[1]
     mask = const_int_from_value(mask_value)
     if not ret_type.is_int or ret_type.width != 1:
-        raise BackendUnavailable(f"self backend {callee} intrinsic expects i1 result in {func.name!r}")
+        raise BackendUnavailable(
+            f"self backend {callee} intrinsic expects i1 result in {func.name!r}"
+        )
     if not value_type.is_fp or value_type.width not in (32, 64) or not mask_type.is_int:
         raise BackendUnavailable(
             f"self backend {callee} intrinsic currently supports float/double with integer mask in {func.name!r}"
         )
     if mask is None:
-        raise BackendUnavailable(f"self backend {callee} intrinsic expects constant fpclass mask in {func.name!r}")
+        raise BackendUnavailable(
+            f"self backend {callee} intrinsic expects constant fpclass mask in {func.name!r}"
+        )
     int_type = TypeDesc("int", value_type.width)
     bits_reg = "x12" if value_type.width > 32 else "w12"
     mask_reg = "x13" if value_type.width > 32 else "w13"
@@ -1471,14 +1641,22 @@ def emit_call_instruction(
         raise BackendUnavailable(
             f"self backend saw malformed variadic call in {func.name!r}: fixed args exceed actual args"
         )
-    if not is_indirect and callee.startswith(("llvm.ctlz.", "llvm.cttz.", "llvm.ctpop.")):
-        return emit_bit_count_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+    if not is_indirect and callee.startswith(
+        ("llvm.ctlz.", "llvm.cttz.", "llvm.ctpop.")
+    ):
+        return emit_bit_count_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.trap"):
         if args:
-            raise BackendUnavailable(f"self backend llvm.trap expects 0 args in {func.name!r}")
+            raise BackendUnavailable(
+                f"self backend llvm.trap expects 0 args in {func.name!r}"
+            )
         return ["  brk #0"]
     if not is_indirect and callee.startswith("llvm.bswap."):
-        return emit_bswap_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_bswap_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.memcpy."):
         return emit_memcpy_intrinsic_call(func, args, module_symbols)
     if not is_indirect and callee.startswith("llvm.memmove."):
@@ -1492,53 +1670,97 @@ def emit_call_instruction(
     if not is_indirect and callee.startswith("llvm.vector.reduce.or."):
         return emit_vector_reduce_or_intrinsic_call(func, dest, ret_type, callee, args)
     if not is_indirect and callee.startswith("llvm.vector.reduce.umax."):
-        return emit_vector_reduce_umax_intrinsic_call(func, dest, ret_type, callee, args)
+        return emit_vector_reduce_umax_intrinsic_call(
+            func, dest, ret_type, callee, args
+        )
     if not is_indirect and callee.startswith("llvm.ucmp."):
-        return emit_ucmp_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_ucmp_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.usub.sat."):
-        return emit_usub_sat_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_usub_sat_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.uadd.sat."):
-        return emit_uadd_sat_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_uadd_sat_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.umul.with.overflow."):
-        return emit_umul_overflow_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_umul_overflow_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.uadd.with.overflow."):
-        return emit_uadd_overflow_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_uadd_overflow_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.smul.with.overflow."):
-        return emit_smul_overflow_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_smul_overflow_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.fshl."):
-        return emit_fshl_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_fshl_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.fshr."):
-        return emit_fshr_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_fshr_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.abs."):
-        return emit_abs_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_abs_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.copysign."):
-        return emit_copysign_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_copysign_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.fabs."):
-        return emit_fabs_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_fabs_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.floor."):
-        return emit_floor_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_floor_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.ceil."):
-        return emit_ceil_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_ceil_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.trunc."):
-        return emit_trunc_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_trunc_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith(("llvm.rint.", "llvm.nearbyint.")):
-        return emit_rint_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_rint_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.sqrt."):
-        return emit_sqrt_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_sqrt_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.is.fpclass."):
-        return emit_is_fpclass_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
-    if not is_indirect and callee.startswith(("llvm.smax.", "llvm.smin.", "llvm.umax.", "llvm.umin.")):
-        return emit_minmax_intrinsic_call(func, dest, ret_type, callee, args, module_symbols)
+        return emit_is_fpclass_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
+    if not is_indirect and callee.startswith(
+        ("llvm.smax.", "llvm.smin.", "llvm.umax.", "llvm.umin.")
+    ):
+        return emit_minmax_intrinsic_call(
+            func, dest, ret_type, callee, args, module_symbols
+        )
     if (not is_indirect) and callee.startswith("llvm.va_start"):
         if len(args) != 1:
-            raise BackendUnavailable(f"self backend llvm.va_start expects 1 arg in {func.name!r}")
+            raise BackendUnavailable(
+                f"self backend llvm.va_start expects 1 arg in {func.name!r}"
+            )
         _arg_type, ap_ptr = args[0]
         return emit_vararg_start(func, ap_ptr, module_symbols)
     if (not is_indirect) and callee.startswith("llvm.va_end"):
         return []
     if (not is_indirect) and callee.startswith("llvm.assume"):
         return []
-    if (not is_indirect) and callee.startswith(("llvm.lifetime.start", "llvm.lifetime.end")):
+    if (not is_indirect) and callee.startswith(
+        ("llvm.lifetime.start", "llvm.lifetime.end")
+    ):
         return []
 
     lines: list[str] = []
@@ -1557,7 +1779,9 @@ def emit_call_instruction(
                 ptr_offset = stack_offset
                 stack_offset += stack_arg_storage_size(arg_type)
                 if _can_spill_aggregate_constant(value):
-                    pending_indirect_stack_literals.append((ptr_offset, arg_type, value))
+                    pending_indirect_stack_literals.append(
+                        (ptr_offset, arg_type, value)
+                    )
                 else:
                     indirect_stack_ptr_entries.append((ptr_offset, arg_type, value))
                 continue
@@ -1568,9 +1792,15 @@ def emit_call_instruction(
             if _can_spill_aggregate_constant(value):
                 pending_indirect_reg_literals.append((arg_type, value, regs[0]))
                 continue
-            lines.extend(materialize_indirect_aggregate_arg_pointer(func, value, arg_type, regs[0]))
+            lines.extend(
+                materialize_indirect_aggregate_arg_pointer(
+                    func, value, arg_type, regs[0]
+                )
+            )
             continue
-        lines.extend(materialize_value(func, value, arg_type, int(regs[0][1:]), module_symbols))
+        lines.extend(
+            materialize_value(func, value, arg_type, int(regs[0][1:]), module_symbols)
+        )
     for arg_type, value in vararg_args:
         stack_arg_entries.append((stack_offset, arg_type, value))
         stack_offset += variadic_stack_arg_storage_size(arg_type)
@@ -1585,14 +1815,19 @@ def emit_call_instruction(
         stack_offset = _align_to(stack_offset, arg_type.align)
         temp_offset = stack_offset
         stack_offset += arg_type.slot_size
-        indirect_stack_literal_entries.append((ptr_offset, temp_offset, arg_type, value))
+        indirect_stack_literal_entries.append(
+            (ptr_offset, temp_offset, arg_type, value)
+        )
     stack_size = _align_to(stack_offset, 16) if stack_offset else 0
     if aggregate_returned_indirect(ret_type):
-        if dest is None or dest not in func.value_slots:
+        dest_slot = None
+        if dest is not None:
+            dest_slot = parsed_function_value_slot(func, dest)
+        if dest_slot is None:
             raise BackendUnavailable(
                 f"self backend needs a materialized destination slot for large aggregate return in {func.name!r}"
             )
-        lines.extend(emit_slot_base_address(func.value_slots[dest], "x8"))
+        lines.extend(emit_slot_base_address(dest_slot, "x8"))
     if stack_size:
         lines.extend(emit_add_offset("sp", "sp", -stack_size, scratch_reg="x15"))
         for temp_offset, arg_type, value, reg in indirect_reg_literal_entries:
@@ -1620,19 +1855,27 @@ def emit_call_instruction(
                 )
             )
             if ptr_offset:
-                lines.extend(emit_add_offset("x14", "sp", ptr_offset, scratch_reg="x15"))
+                lines.extend(
+                    emit_add_offset("x14", "sp", ptr_offset, scratch_reg="x15")
+                )
                 lines.append("  str x12, [x14]")
             else:
                 lines.append("  str x12, [sp]")
         for ptr_offset, arg_type, value in indirect_stack_ptr_entries:
-            lines.extend(materialize_indirect_aggregate_arg_pointer(func, value, arg_type, "x12"))
+            lines.extend(
+                materialize_indirect_aggregate_arg_pointer(func, value, arg_type, "x12")
+            )
             if ptr_offset:
-                lines.extend(emit_add_offset("x14", "sp", ptr_offset, scratch_reg="x15"))
+                lines.extend(
+                    emit_add_offset("x14", "sp", ptr_offset, scratch_reg="x15")
+                )
                 lines.append("  str x12, [x14]")
             else:
                 lines.append("  str x12, [sp]")
         for offset, arg_type, value in stack_arg_entries:
-            lines.extend(emit_vararg_stack_arg(func, arg_type, value, offset, module_symbols))
+            lines.extend(
+                emit_vararg_stack_arg(func, arg_type, value, offset, module_symbols)
+            )
     if is_indirect:
         lines.extend(materialize_pointer(func, callee, 12, module_symbols))
         lines.append("  blr x12")
@@ -1641,6 +1884,9 @@ def emit_call_instruction(
         lines.append(f"  bl {asm_symbol(callee, module_symbols)}")
     if stack_size:
         lines.extend(emit_add_offset("sp", "sp", stack_size, scratch_reg="x15"))
-    if dest is not None and dest in func.value_slots and not aggregate_returned_indirect(ret_type):
-        lines.extend(store_value_regs_to_slot(func.value_slots[dest], 0))
+    dest_slot = None
+    if dest is not None:
+        dest_slot = parsed_function_value_slot(func, dest)
+    if dest_slot is not None and not aggregate_returned_indirect(ret_type):
+        lines.extend(store_value_regs_to_slot(dest_slot, 0))
     return lines

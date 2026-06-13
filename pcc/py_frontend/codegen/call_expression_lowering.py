@@ -18,7 +18,6 @@ from ..py_ast import (
     FloatType,
     IntLit,
     IntType,
-    Lambda,
     ListExpr,
     ListType,
     Name,
@@ -30,8 +29,10 @@ from ..py_ast import (
     Subscript,
     TupleExpr,
     TupleType,
+    ValueArrayType,
 )
 from . import marshal
+from .builtin_exceptions import BUILTIN_EXC_TAG as _BUILTIN_EXC_TAG
 from .errors import L1CodegenError
 
 _I1 = ir.IntType(1)
@@ -39,53 +40,6 @@ _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _DOUBLE = ir.DoubleType()
 _CSTR = ir.IntType(8).as_pointer()
-_BUILTIN_EXC_TAG = {
-    "BaseException": 0,
-    "Exception": 1,
-    "ValueError": 2,
-    "TypeError": 3,
-    "KeyError": 4,
-    "IndexError": 5,
-    "AttributeError": 6,
-    "SyntaxError": 1,
-    "RuntimeError": 7,
-    "StopIteration": 8,
-    "ZeroDivisionError": 9,
-    "NameError": 10,
-    "NotImplementedError": 11,
-    "ArithmeticError": 12,
-    "LookupError": 13,
-    "OSError": 14,
-    "IOError": 14,
-    "OverflowError": 15,
-    "AssertionError": 16,
-    "ReferenceError": 18,
-    "FileNotFoundError": 14,
-    "FileExistsError": 14,
-    "IsADirectoryError": 14,
-    "NotADirectoryError": 14,
-    "PermissionError": 14,
-    "BrokenPipeError": 14,
-    "ConnectionError": 14,
-    "ConnectionAbortedError": 14,
-    "ConnectionRefusedError": 14,
-    "ConnectionResetError": 14,
-    "BlockingIOError": 14,
-    "ChildProcessError": 14,
-    "InterruptedError": 14,
-    "TimeoutError": 14,
-    "UnicodeError": 2,
-    "UnicodeDecodeError": 2,
-    "UnicodeEncodeError": 2,
-    "RecursionError": 7,
-    "ImportError": 1,
-    "ModuleNotFoundError": 1,
-    "EOFError": 1,
-    "SystemExit": 0,
-    "KeyboardInterrupt": 0,
-    "GeneratorExit": 0,
-    "StopAsyncIteration": 17,
-}
 _CPY_BUILTIN_FALLBACK = frozenset(
     {
         "open",
@@ -105,7 +59,6 @@ _CPY_BUILTIN_FALLBACK = frozenset(
         "dir",
         "vars",
         "locals",
-        "globals",
     }
 )
 
@@ -254,6 +207,305 @@ class CallExpressionLoweringMixin:
             return expr.span
         except AttributeError:
             return None
+
+    def _maybe_emit_value_array_constructor(self, expr: Call) -> ir.Value | None:
+        array_ty = expr.ty
+        if not isinstance(array_ty, ValueArrayType):
+            return None
+        if not isinstance(expr.func, Subscript) or expr.kwargs:
+            return None
+        payload_ty = self._value_array_payload_ir_type(array_ty)
+        if payload_ty is None or len(expr.args) != array_ty.length:
+            return None
+
+        payload_slot = self._alloca_in_entry(
+            payload_ty,
+            name=self._fresh("value.array.tmp"),
+        )
+        zero = ir.Constant(_I32, 0)
+        for index, arg_expr in enumerate(expr.args):
+            elem_value = self._maybe_emit_valueclass_constructor_payload(
+                array_ty.elem,
+                arg_expr,
+            )
+            if elem_value is None:
+                raw_value = self._emit_expr(arg_expr)
+                elem_value = self._coerce(raw_value, arg_expr.ty, array_ty.elem)
+            elem_ptr = self.builder.gep(
+                payload_slot,
+                [zero, ir.Constant(_I32, index)],
+                inbounds=True,
+                name=self._fresh(f"value.array.elem{index}"),
+            )
+            self.builder.store(elem_value, elem_ptr)
+        return self.builder.load(
+            payload_slot,
+            name=self._fresh("value.array.payload"),
+        )
+
+    def _literal_method_dispatch_result_object(self, result, result_ty) -> ir.Value:
+        if isinstance(result.type, ir.VoidType):
+            return self._emit_none_literal()
+        if isinstance(result.type, ir.PointerType):
+            return result
+        return marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            result,
+            result_ty,
+        )
+
+    def _maybe_emit_literal_self_method_dict_dispatch_call(
+        self,
+        expr: Call,
+    ) -> ir.Value | None:
+        """Fast path for ``d[name](...)`` where ``d`` is a literal self-method map.
+
+        This keeps Python semantics for unknown keys by falling back to the
+        original dict lookup + dynamic call. It deliberately only optimizes
+        maps whose values are ``self.<method>`` so the bound receiver cannot be
+        invalidated by local rebinding.
+        """
+
+        if expr.kwargs:
+            return None
+        if not isinstance(expr.func, Subscript):
+            return None
+        sub = expr.func
+        if not isinstance(sub.obj, Name):
+            return None
+        literal_map = getattr(self, "_literal_dict_expr_bindings", {}).get(
+            sub.obj.ident
+        )
+        if not isinstance(literal_map, DictExpr) or not literal_map.pairs:
+            return None
+
+        receiver_class = self._self_receiver_class_name()
+        current_class = getattr(self, "current_class", None)
+        if receiver_class is None and current_class is not None:
+            receiver_class = current_class.name
+        if receiver_class is None or "self" not in self.env:
+            return None
+
+        resolved = self._literal_self_method_dispatch_entries(literal_map)
+        if not resolved:
+            return None
+
+        is_virtual = sub.obj.ident in getattr(
+            self,
+            "_virtual_literal_dict_expr_bindings",
+            set(),
+        )
+        key_obj = self._emit_as_object(sub.idx)
+        self_val = self.builder.load(self.env["self"][0], name=self._fresh("self"))
+        merge_bb = self.builder.function.append_basic_block(
+            name=self._fresh("method.dict.dispatch.end")
+        )
+        incoming: list[tuple[ir.Value, ir.Block]] = []
+
+        for key, method_info, method_fn, method_name in resolved:
+            match_bb = self.builder.function.append_basic_block(
+                name=self._fresh(f"method.dict.{method_name}")
+            )
+            next_bb = self.builder.function.append_basic_block(
+                name=self._fresh("method.dict.next")
+            )
+            key_lit = self._emit_str_literal(key)
+            eq = self.builder.call(
+                self.runtime["py_str_eq"],
+                [key_obj, key_lit],
+                name=self._fresh("method.dict.key.eq"),
+            )
+            cond = self.builder.icmp_unsigned(
+                "!=",
+                eq,
+                ir.Constant(_I64, 0),
+                name=self._fresh("method.dict.key.hit"),
+            )
+            self.builder.cbranch(cond, match_bb, next_bb)
+
+            self.builder.position_at_end(match_bb)
+            result = self._emit_direct_method_call(
+                method_fn,
+                self_val,
+                method_info,
+                method_name,
+                expr.args,
+                kwargs=(),
+            )
+            if not self.builder.block.is_terminated:
+                method_def = self.class_lowering._find_method_def(
+                    method_info.name,
+                    method_name,
+                )
+                result_ty = (
+                    method_def.return_ty
+                    if method_def is not None
+                    else DynType(name="dyn")
+                )
+                result_obj = self._literal_method_dispatch_result_object(
+                    result,
+                    result_ty,
+                )
+                incoming.append((result_obj, self.builder.block))
+                self.builder.branch(merge_bb)
+
+            self.builder.position_at_end(next_bb)
+
+        if is_virtual:
+            exc = self.builder.call(
+                self.runtime["py_exc_new_with_value"],
+                [
+                    ir.Constant(_I64, _BUILTIN_EXC_TAG["KeyError"]),
+                    key_obj,
+                ],
+                name=self._fresh("method.dict.keyerror"),
+            )
+            self.builder.call(self.runtime["py_raise"], [exc])
+            self._gc_release(exc)
+            frame_exc = self.builder.call(
+                self.runtime["py_current_exception"],
+                [],
+                name=self._fresh("method.dict.frame.exc"),
+            )
+            self._emit_exception_frame(frame_exc, self._expr_span_or_none(expr))
+            err_target = self._current_try_err_block()
+            if err_target is None:
+                err_target = self._ensure_fn_err_exit()
+            self.builder.branch(err_target)
+        else:
+            dict_obj = self.builder.load(
+                self.env[sub.obj.ident][0],
+                name=self._fresh(f"{sub.obj.ident}.dispatch.dict"),
+            )
+            fn_val = self.builder.call(
+                self.runtime["py_dict_get"],
+                [dict_obj, key_obj],
+                name=self._fresh("method.dict.fallback.fn"),
+            )
+            args_owned = not self._is_starred_unpack(expr.args)
+            args_tuple = self._emit_dynamic_call_args_tuple(expr.args)
+            kwargs_obj = self._emit_dynamic_call_kwargs_object(
+                (),
+                None,
+                self._expr_span_or_none(expr),
+            )
+            fallback_result = self.builder.call(
+                self.runtime["py_obj_call"],
+                [fn_val, args_tuple, kwargs_obj],
+                name=self._fresh("method.dict.fallback.call"),
+            )
+            if args_owned:
+                self._gc_release(args_tuple)
+            self._gc_release(fn_val)
+            if not self.builder.block.is_terminated:
+                incoming.append((fallback_result, self.builder.block))
+                self.builder.branch(merge_bb)
+
+        self.builder.position_at_end(merge_bb)
+        phi = self.builder.phi(_CSTR, name=self._fresh("method.dict.dispatch.result"))
+        for value, block in incoming:
+            phi.add_incoming(value, block)
+        return phi
+
+    def _emit_globals_builtin(self) -> ir.Value:
+        module_name = self.ast_module.name or "__main__"
+        module_name_ptr = self._ptr_to_cstr(
+            self._cstr_global(
+                module_name,
+                self._fresh(".globals.module"),
+            )
+        )
+        globals_dict = self.builder.call(
+            self.runtime["py_module_attrs_dict"],
+            [module_name_ptr, ir.Constant(_I64, 1)],
+            name=self._fresh("globals.dict"),
+        )
+
+        for global_name, (gv, declared_ty) in self._module_globals.items():
+            if getattr(self, "_cpy_module_flags", {}).get(global_name, False):
+                continue
+            init_flag = self._module_global_init_flags.get(global_name)
+            continue_bb = None
+            if init_flag is not None:
+                initialized = self.builder.load(
+                    init_flag,
+                    name=self._fresh(f"globals.{global_name}.initialized"),
+                )
+                publish_bb = self.current_function.append_basic_block(
+                    self._fresh(f"globals.{global_name}.publish")
+                )
+                continue_bb = self.current_function.append_basic_block(
+                    self._fresh(f"globals.{global_name}.continue")
+                )
+                self.builder.cbranch(initialized, publish_bb, continue_bb)
+                self.builder.position_at_end(publish_bb)
+            raw = self.builder.load(gv, name=self._fresh(f"globals.{global_name}"))
+            obj = marshal.marshal_to_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                raw,
+                declared_ty,
+            )
+            self.builder.call(
+                self.runtime["py_module_attr_set"],
+                [module_name_ptr, self._attr_name_ptr(global_name), obj],
+                name=self._fresh(f"globals.set.{global_name}"),
+            )
+            if continue_bb is not None:
+                self.builder.branch(continue_bb)
+                self.builder.position_at_end(continue_bb)
+
+        # Import statements create ordinary module-namespace bindings too.
+        # Native extension and compiled-sibling module objects live in the
+        # shared import-object registry rather than ``_module_globals``; publish
+        # each binding that actually executed, while leaving untaken
+        # conditional imports absent from the namespace.
+        for import_name, gv in getattr(
+            self,
+            "_native_extension_module_env",
+            {},
+        ).items():
+            imported = self.builder.load(
+                gv,
+                name=self._fresh(f"globals.import.{import_name}"),
+            )
+            is_bound = self.builder.icmp_unsigned(
+                "!=",
+                imported,
+                ir.Constant(imported.type, None),
+                name=self._fresh(f"globals.import.{import_name}.bound"),
+            )
+            publish_bb = self.current_function.append_basic_block(
+                self._fresh(f"globals.import.{import_name}.publish")
+            )
+            continue_bb = self.current_function.append_basic_block(
+                self._fresh(f"globals.import.{import_name}.continue")
+            )
+            self.builder.cbranch(is_bound, publish_bb, continue_bb)
+            self.builder.position_at_end(publish_bb)
+            self.builder.call(
+                self.runtime["py_module_attr_set"],
+                [module_name_ptr, self._attr_name_ptr(import_name), imported],
+                name=self._fresh(f"globals.set.import.{import_name}"),
+            )
+            self.builder.branch(continue_bb)
+            self.builder.position_at_end(continue_bb)
+
+        for class_name, info in self.class_lowering.classes.items():
+            cls_obj = self.builder.load(
+                info.global_var,
+                name=self._fresh(f"globals.cls.{class_name}"),
+            )
+            self.builder.call(
+                self.runtime["py_module_attr_set"],
+                [module_name_ptr, self._attr_name_ptr(class_name), cls_obj],
+                name=self._fresh(f"globals.set.cls.{class_name}"),
+            )
+
+        return globals_dict
 
     def _function_arg_ir_type_or_none(self, fn, index: int, ir_arg):
         try:
@@ -431,6 +683,35 @@ class CallExpressionLoweringMixin:
         self.builder.position_at_end(end_bb)
         return out
 
+    def _name_binds_cpy_returning_callable(self, name: str) -> bool:
+        """True if ``name`` is bound (in the current function or module scope)
+        to a callable — e.g. a lambda or a function ref — whose body returns a
+        CPython object. The indirect ``py_obj_call`` of such a value must tag
+        its result cpy (mirrors the direct-funcdef path)."""
+        bodies = []
+        cur = getattr(self, "current_func_def", None)
+        if cur is not None and getattr(cur, "body", None):
+            bodies.append(cur.body)
+        mod = getattr(self, "ast_module", None)
+        if mod is not None and getattr(mod, "body", None):
+            bodies.append(mod.body)
+        for body in bodies:
+            for stmt in body:
+                targets = getattr(stmt, "targets", None)
+                if (
+                    targets
+                    and len(targets) == 1
+                    and isinstance(targets[0], Name)
+                    and targets[0].ident == name
+                    and hasattr(stmt, "value")
+                ):
+                    try:
+                        if self._callable_expr_returns_cpython(stmt.value):
+                            return True
+                    except Exception:
+                        pass
+        return False
+
     def _emit_call(self, expr: Call) -> ir.Value:
         if self.module.name == "pcc.parse.py_lift":
             import os
@@ -458,6 +739,9 @@ class CallExpressionLoweringMixin:
                     + str(raw_name)
                     + "\n"
                 )
+        value_array = self._maybe_emit_value_array_constructor(expr)
+        if value_array is not None:
+            return value_array
         func_expr = expr.func
         func_name = _call_name_ident(func_expr)
         func_attr_name = _call_attr_name(func_expr)
@@ -465,8 +749,7 @@ class CallExpressionLoweringMixin:
         if (
             (func_name == "cast")
             or (
-                func_attr_name == "cast"
-                and _call_name_ident(func_attr_obj) == "typing"
+                func_attr_name == "cast" and _call_name_ident(func_attr_obj) == "typing"
             )
         ) and len(expr.args) == 2:
             return self._emit_expr(expr.args[1])
@@ -481,9 +764,28 @@ class CallExpressionLoweringMixin:
             dunder_class_ctor = self._maybe_emit_known_dunder_class_constructor(expr)
             if dunder_class_ctor is not None:
                 return dunder_class_ctor
+        if (
+            func_attr_name == "__setattr__"
+            and _call_name_ident(func_attr_obj) == "object"
+            and "object" not in self.env
+            and len(expr.args) == 3
+            and not expr.kwargs
+        ):
+            # ``object.__setattr__`` is the standard frozen-dataclass escape
+            # used during ``__post_init__``.  It has the same three-operand
+            # object/name/value ABI as builtin ``setattr`` for pcc-native
+            # instances; lowering it before generic attribute-call dispatch
+            # avoids importing CPython's builtin ``object`` in no-libpython
+            # closures.  A user binding named ``object`` remains dynamic.
+            return self._emit_setattr_builtin(expr)
         if _call_is_attr(func_expr):
             return self._emit_method_call(expr)
         if func_name is None:
+            literal_dispatch = self._maybe_emit_literal_self_method_dict_dispatch_call(
+                expr
+            )
+            if literal_dispatch is not None:
+                return literal_dispatch
             fn_val = self._emit_expr(func_expr)
             if fn_val in getattr(self, "_cpy_values", ()):
                 if expr.kwargs:
@@ -515,6 +817,7 @@ class CallExpressionLoweringMixin:
                 self._gc_release(args_tuple)
             if expr.kwargs:
                 self._gc_release(kwargs_obj)
+            self._emit_post_call_err_check(self._expr_span_or_none(expr))
             return result
         name = func_name
         unsafe_intrinsic = self._unsafe_intrinsic_for_name(name)
@@ -551,6 +854,28 @@ class CallExpressionLoweringMixin:
                     self._expr_span_or_none(expr),
                 )
                 return ir.Constant(_CSTR, None)
+        if name == "__import__" and not expr.kwargs and 1 <= len(expr.args) <= 5:
+            if len(expr.args) == 5:
+                level = expr.args[4]
+                if not isinstance(level, IntLit) or level.value != 0:
+                    raise NotImplementedError(
+                        "Layer 1 builtin __import__() supports only absolute level 0"
+                    )
+            evaluated_args = []
+            for arg in expr.args:
+                evaluated_args.append(self._emit_as_object(arg))
+            fromlist = (
+                evaluated_args[3]
+                if len(evaluated_args) >= 4
+                else self._emit_none_literal()
+            )
+            result = self.builder.call(
+                self.runtime["py_builtin_import"],
+                [evaluated_args[0], fromlist],
+                name=self._fresh("builtin.import"),
+            )
+            self._emit_post_call_err_check()
+            return result
         if name == "open":
             native_open = self._emit_native_open_call(expr)
             if native_open is not None:
@@ -558,6 +883,29 @@ class CallExpressionLoweringMixin:
         native_fileinput = self._emit_native_fileinput_call(expr)
         if native_fileinput is not None:
             return native_fileinput
+        if name == "slice":
+            if expr.kwargs or len(expr.args) < 1 or len(expr.args) > 3:
+                raise NotImplementedError(
+                    "Layer 1 builtin slice() supports 1 to 3 positional args"
+                )
+            none_obj = self._emit_none_literal()
+            if len(expr.args) == 1:
+                start_obj = none_obj
+                stop_obj = self._emit_as_object(expr.args[0])
+                step_obj = none_obj
+            else:
+                start_obj = self._emit_as_object(expr.args[0])
+                stop_obj = self._emit_as_object(expr.args[1])
+                step_obj = (
+                    self._emit_as_object(expr.args[2])
+                    if len(expr.args) == 3
+                    else none_obj
+                )
+            return self.builder.call(
+                self.runtime["py_slice_new"],
+                [start_obj, stop_obj, step_obj],
+                name=self._fresh("slice.new"),
+            )
         # Builtins below don't support kwargs — reject early.
         if expr.kwargs and name in ("range", "xrange", "len", "str", "isinstance"):
             raise NotImplementedError(
@@ -576,7 +924,16 @@ class CallExpressionLoweringMixin:
             result = self._maybe_emit_int_builtin(expr)
             if result is not None:
                 return result
-        if builtin_value in ("math.floor", "math.sqrt", "math.pow"):
+        if builtin_value in (
+            "math.floor",
+            "math.ceil",
+            "math.sqrt",
+            "math.pow",
+            "math.trunc",
+            "math.gcd",
+            "math.factorial",
+            "math.isqrt",
+        ):
             result = self._emit_native_math_value_call(
                 builtin_value,
                 expr.args,
@@ -584,7 +941,7 @@ class CallExpressionLoweringMixin:
             )
             if result is not None:
                 return result
-        if builtin_value in ("re.match", "re.search"):
+        if builtin_value in ("re.match", "re.search", "re.fullmatch"):
             result = self._emit_native_re_value_call(
                 builtin_value,
                 expr.args,
@@ -679,6 +1036,10 @@ class CallExpressionLoweringMixin:
                 [ir.Constant(_I64, 0)],
                 name=self._fresh("tuple.new"),
             )
+        if name == "enumerate":
+            result = self._emit_enumerate_builtin(expr)
+            if result is not None:
+                return result
         if name == "isinstance":
             return self._emit_isinstance_call(expr)
         # ``field(default_factory=F)`` from ``dataclasses.field``
@@ -791,11 +1152,24 @@ class CallExpressionLoweringMixin:
             lhs = self._emit_expr(expr.args[0])
             rhs = self._emit_expr(expr.args[1])
             if isinstance(expr.ty, FloatType):
-                return self._emit_binop_float("**", lhs, rhs)
-            return self._emit_binop_int(
+                # ``pow(2, 0.5)``: a float result needs both operands as
+                # doubles. _emit_binop_float expects doubles, so coerce here
+                # (the ``**`` operator path does the same via _to_double); a raw
+                # boxed-int operand otherwise emits invalid 'ptr' vs 'double' IR.
+                lf = self._to_double(lhs, expr.args[0].ty)
+                rf = self._to_double(rhs, expr.args[1].ty)
+                return self._emit_binop_float("**", lf, rf)
+            # Route through the same object path the ``**`` operator uses
+            # (py_int_pow, result kept as an object) rather than _emit_binop_int,
+            # which force-unboxes to i64. A NEGATIVE integer exponent makes
+            # py_int_pow return a float (pow(2, -2) == 0.25); the i64 unbox
+            # truncated that to 0. Non-negative exponents still yield an int.
+            return self._emit_runtime_int_binop_value(
                 "**",
-                self._to_int64(lhs, expr.args[0].ty),
-                self._to_int64(rhs, expr.args[1].ty),
+                lhs,
+                expr.args[0].ty,
+                rhs,
+                expr.args[1].ty,
             )
         if name == "pow" and not expr.kwargs and len(expr.args) == 3:
             # 3-arg pow(b, e, mod): modular exponentiation. Box the three int
@@ -863,24 +1237,35 @@ class CallExpressionLoweringMixin:
                 self._gc_release(fq_obj)
                 self._gc_release(fr_obj)
                 return fout
-            lhs = self._emit_expr_as_i64(expr.args[0])
-            rhs = self._emit_expr_as_i64(expr.args[1])
-            q_val = self._python_floordiv_i64(lhs, rhs)
-            r_val = self._python_mod_i64(lhs, rhs)
+            # int/dyn divmod: route through the object floordiv/mod runtime.
+            # int//int delegates to py_int_floordiv/py_int_mod (bignum-aware),
+            # so divmod(10**20, 7) is exact; the old i64 path reduced each
+            # operand via _emit_expr_as_i64, truncating a bignum to its low 64
+            # bits -> (0, 0). py_obj_* also handles any numeric/dunder operand
+            # exactly like the // and % operators.
+            lhs_obj = self._emit_as_object(expr.args[0])
+            rhs_obj = self._emit_as_object(expr.args[1])
+            q_obj = self.builder.call(
+                self.runtime["py_obj_floordiv"],
+                [lhs_obj, rhs_obj],
+                name=self._fresh("divmod.q"),
+            )
+            # py_obj_floordiv raises for float-zero / type errors; int//int
+            # returns NULL without raising on a zero divisor (deferred), so
+            # surface that as ZeroDivisionError like the // operator does.
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            self._emit_zero_division_if_null(q_obj, "division by zero")
+            r_obj = self.builder.call(
+                self.runtime["py_obj_mod"],
+                [lhs_obj, rhs_obj],
+                name=self._fresh("divmod.r"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            self._emit_zero_division_if_null(r_obj, "division by zero")
             out = self.builder.call(
                 self.runtime["py_tuple_new"],
                 [ir.Constant(_I64, 2)],
                 name=self._fresh("divmod.tuple"),
-            )
-            q_obj = self.builder.call(
-                self.runtime["py_int_from_i64"],
-                [q_val],
-                name=self._fresh("divmod.q"),
-            )
-            r_obj = self.builder.call(
-                self.runtime["py_int_from_i64"],
-                [r_val],
-                name=self._fresh("divmod.r"),
             )
             self.builder.call(
                 self.runtime["py_tuple_set_item"],
@@ -906,6 +1291,27 @@ class CallExpressionLoweringMixin:
             )
             self._emit_post_call_err_check(self._expr_span_or_none(expr))
             return result
+        if name == "callable" and len(expr.args) == 1 and not expr.kwargs:
+            # callable(x) -> py_True/py_False. The arg is boxed so any type
+            # (tagged int, function, class, instance) routes natively; the
+            # runtime classifies callability the same way py_obj_call
+            # dispatches. Never raises, so no post-call err check is needed.
+            # A bare user-function argument (``callable(f)``) must lower to
+            # the NATIVE py_func value (tag PY_TYPE_FUNC), not the
+            # ``py_cpy_wrap_pcc_*`` PyCFunction wrap — the cpy wrap drags
+            # libpython back in and strict --python-libpython=off rejects
+            # the whole compile ("generated IR still calls py_cpy_*").
+            old_prefer_native = self._prefer_native_callable_values
+            self._prefer_native_callable_values = True
+            try:
+                arg_obj = self._emit_as_object(expr.args[0])
+            finally:
+                self._prefer_native_callable_values = old_prefer_native
+            return self.builder.call(
+                self.runtime["py_builtin_callable"],
+                [arg_obj],
+                name=self._fresh("callable"),
+            )
         if name in ("any", "all") and len(expr.args) == 1:
             result = self._maybe_emit_any_all_literal(expr, name)
             if result is not None:
@@ -918,6 +1324,8 @@ class CallExpressionLoweringMixin:
             result = self._maybe_emit_zip_builtin(expr)
             if result is not None:
                 return result
+        if name == "globals" and not expr.args and not expr.kwargs:
+            return self._emit_globals_builtin()
         if name == "iter":
             result = self._maybe_emit_iter_builtin(expr)
             if result is not None:
@@ -939,8 +1347,25 @@ class CallExpressionLoweringMixin:
         if name == "bool" and not expr.args:
             return ir.Constant(_I1, 0)
         if name == "format" and not expr.kwargs and 1 <= len(expr.args) <= 2:
-            value_obj = self._emit_as_object(expr.args[0])
+            value_obj = self._emit_expr_as_pcc_object(expr.args[0])
             if len(expr.args) == 2:
+                if (
+                    isinstance(expr.args[0].ty, StrType)
+                    and isinstance(expr.args[1], StrLit)
+                    and expr.args[1].value == ""
+                ):
+                    # ``format(exact_str, "")`` is the bare-field f-string
+                    # path.  Preserve the owned-result contract with
+                    # ``py_obj_str`` while avoiding the generic formatter.
+                    # The latter can only add custom ``__format__`` behavior
+                    # for non-str/class values, which do not have StrType.
+                    result = self.builder.call(
+                        self.runtime["py_obj_str"],
+                        [value_obj],
+                        name=self._fresh("format.str.empty"),
+                    )
+                    self._emit_post_call_err_check(self._expr_span_or_none(expr))
+                    return result
                 spec_obj = self._emit_as_object(expr.args[1])
             else:
                 spec_obj = self._emit_str_literal("")
@@ -970,6 +1395,16 @@ class CallExpressionLoweringMixin:
                     [v],
                     name=self._fresh("chr"),
                 )
+            codepoint = self.builder.call(
+                self.runtime["py_obj_index_i64"],
+                [self._emit_expr_as_pcc_object(expr.args[0])],
+                name=self._fresh("chr.index"),
+            )
+            return self.builder.call(
+                self.runtime["py_chr_from_i64"],
+                [codepoint],
+                name=self._fresh("chr"),
+            )
         if name == "float" and len(expr.args) == 1:
             arg = expr.args[0]
             ty = arg.ty
@@ -986,15 +1421,48 @@ class CallExpressionLoweringMixin:
                 folded = _maybe_fold_str_to_float(arg.value)
                 if folded is not None:
                     return ir.Constant(_DOUBLE, folded)
-            # DynType receiver — unbox via the pcc-native runtime helper
-            # (``py_float_to_f64`` for native dyn pointers, ``py_cpy_to_f64``
-            # for already-CPython refs). Without this branch ``float(<dyn>)``
-            # falls through to ``py_cpy_import('builtins') + py_cpy_getattr +
-            # py_cpy_call1`` which reintroduces libpython linkage.
+            # ``float(<str>)`` (non-literal): parse the string at runtime via the
+            # str-aware py_float_value_of (raises ValueError on a bad string).
+            # Without this, a str routed through py_float_to_f64 wrongly yielded
+            # 0.0.
+            if isinstance(ty, StrType):
+                arg_obj = self._emit_as_object(arg)
+                result = self.builder.call(
+                    self.runtime["py_float_value_of"],
+                    [arg_obj],
+                    name=self._fresh("float.str"),
+                )
+                self._emit_post_call_err_check(getattr(expr, "span", None))
+                return result
+            # DynType receiver — unbox via the pcc-native runtime helper.
+            # py_float_value_of is str-aware (parses a runtime str, else unboxes
+            # int/float/bool); py_cpy_to_f64 handles already-CPython refs.
             if isinstance(ty, DynType):
                 v = self._emit_expr(arg)
                 if isinstance(v.type, ir.PointerType):
-                    return self._to_double(v, ty)
+                    if v in getattr(self, "_cpy_values", ()):
+                        return self._to_double(v, ty)
+                    result = self.builder.call(
+                        self.runtime["py_float_value_of"],
+                        [v],
+                        name=self._fresh("float.value_of"),
+                    )
+                    self._emit_post_call_err_check(getattr(expr, "span", None))
+                    return result
+        if name == "complex" and not expr.kwargs and len(expr.args) <= 2:
+            real = ir.Constant(_DOUBLE, 0.0)
+            imag = ir.Constant(_DOUBLE, 0.0)
+            if len(expr.args) >= 1:
+                real_raw = self._emit_expr(expr.args[0])
+                real = self._to_double(real_raw, expr.args[0].ty)
+            if len(expr.args) == 2:
+                imag_raw = self._emit_expr(expr.args[1])
+                imag = self._to_double(imag_raw, expr.args[1].ty)
+            return self.builder.call(
+                self.runtime["py_complex_new"],
+                [real, imag],
+                name=self._fresh("complex.new"),
+            )
         if name == "round" and not expr.kwargs and 1 <= len(expr.args) <= 2:
             raw = self._emit_expr(expr.args[0])
             value = self._to_double(raw, expr.args[0].ty)
@@ -1018,30 +1486,30 @@ class CallExpressionLoweringMixin:
                 )
             digits_raw = self._emit_expr(expr.args[1])
             digits_i64 = self._to_int64(digits_raw, expr.args[1].ty)
-            digits_f = self.builder.sitofp(
-                digits_i64,
-                _DOUBLE,
-                name=self._fresh("round.ndigits.f64"),
-            )
-            scale = self.builder.call(
-                self._get_pow_function(),
-                [ir.Constant(_DOUBLE, 10.0), digits_f],
-                name=self._fresh("round.scale"),
-            )
-            scaled = self.builder.fmul(value, scale, name=self._fresh("round.mul"))
-            # banker's rounding (round half to even) via libm rint(), matching
-            # CPython's round(x, ndigits) tie behaviour.
             rounded = self.builder.call(
-                self._get_rint_function(),
-                [scaled],
-                name=self._fresh("round.scaled.rint"),
-            )
-            out = self.builder.fdiv(rounded, scale, name=self._fresh("round.div"))
-            return self.builder.call(
-                self.runtime["py_float_from_f64"],
-                [out],
+                self.runtime["py_float_round_ndigits"],
+                [value, digits_i64],
                 name=self._fresh("round.float"),
             )
+            if isinstance(expr.args[0].ty, (IntType, BoolType)):
+                # round(int, ndigits) returns an int in CPython (round(12345,-2)
+                # == 12300, not 12300.0). py_float_round_ndigits gives the right
+                # value as a float object; convert back to int. Exact for the
+                # common range (|value| < 2**53); huge ints lose precision (rare).
+                rounded_d = self.builder.call(
+                    self.runtime["py_float_to_f64"],
+                    [rounded],
+                    name=self._fresh("round.int.f64"),
+                )
+                as_i64 = self.builder.fptosi(
+                    rounded_d, _I64, name=self._fresh("round.int.i64")
+                )
+                return self.builder.call(
+                    self.runtime["py_int_from_i64"],
+                    [as_i64],
+                    name=self._fresh("round.int.box"),
+                )
+            return rounded
         if name in ("set", "frozenset") and len(expr.args) <= 1:
             # pcc has no distinct ``frozenset`` runtime type; treat
             # as ``set`` — immutable vs mutable doesn't matter for
@@ -1117,24 +1585,24 @@ class CallExpressionLoweringMixin:
             # key= (first-class function) and a non-constant reverse fall
             # through to the libpython path.
             reverse_const = None
-            key_lambda = None
+            key_expr = None
             other_kwarg = False
-            for kw_name, kw_val in (expr.kwargs or ()):
+            for kw_name, kw_val in expr.kwargs or ():
                 if kw_name == "reverse" and isinstance(kw_val, BoolLit):
                     reverse_const = bool(kw_val.value)
-                elif kw_name == "key" and isinstance(kw_val, Lambda):
-                    key_lambda = kw_val
+                elif kw_name == "key":
+                    key_expr = kw_val
                 else:
                     other_kwarg = True
-            # sorted(xs, key=<simple attr/index lambda>): inline the key
-            # extraction (no first-class-function boxing). A non-simple key
-            # lambda (or any other kwarg) yields None / falls through to the
-            # libpython path — we must NOT run the plain py_obj_sorted below,
-            # which would silently ignore the key.
-            if key_lambda is not None:
+            # sorted(xs, key=<supported inline callable>): inline the key
+            # extraction (no first-class-function boxing). An unsupported key
+            # (or any other kwarg) yields None / falls through to the libpython
+            # path — we must NOT run plain py_obj_sorted below, which would
+            # silently ignore the key.
+            if key_expr is not None:
                 if not other_kwarg:
                     keyed = self._emit_sorted_with_key_lambda(
-                        expr, key_lambda, reverse_const
+                        expr, key_expr, reverse_const
                     )
                     if keyed is not None:
                         return keyed
@@ -1149,13 +1617,10 @@ class CallExpressionLoweringMixin:
                 # sorted-min-max-custom-lt-not-used-no-libpython.md.
                 elem_hint = self._list_elem_class_hint_for_expr(expr.args[0])
                 if elem_hint is None and isinstance(expr.args[0], Name):
-                    elem_hint = self.env_list_elem_class_hint.get(
-                        expr.args[0].ident
-                    )
+                    elem_hint = self.env_list_elem_class_hint.get(expr.args[0].ident)
                 if (
                     elem_hint is not None
-                    and self._resolve_method_mro(elem_hint, "__lt__")
-                    is not None
+                    and self._resolve_method_mro(elem_hint, "__lt__") is not None
                 ):
                     src_obj = marshal.marshal_to_object(
                         self.builder,
@@ -1178,9 +1643,7 @@ class CallExpressionLoweringMixin:
                         if isinstance(expr.args[0].ty, ListType)
                         else DynType(name="dyn")
                     )
-                    self._emit_list_sort_with_dunder_lt(
-                        new_list, elem_hint, elem_ty
-                    )
+                    self._emit_list_sort_with_dunder_lt(new_list, elem_hint, elem_ty)
                     if reverse_const:
                         self.builder.call(
                             self.runtime["py_list_reverse"],
@@ -1211,19 +1674,19 @@ class CallExpressionLoweringMixin:
         if name == "repr" and len(expr.args) == 1:
             return self.builder.call(
                 self.runtime["py_obj_repr"],
-                [self._emit_as_object(expr.args[0])],
+                [self._emit_expr_as_pcc_object(expr.args[0])],
                 name=self._fresh("repr"),
             )
         if name == "ascii" and len(expr.args) == 1:
             return self.builder.call(
                 self.runtime["py_obj_ascii"],
-                [self._emit_as_object(expr.args[0])],
+                [self._emit_expr_as_pcc_object(expr.args[0])],
                 name=self._fresh("ascii"),
             )
         if name == "hash" and len(expr.args) == 1:
             result = self.builder.call(
                 self.runtime["py_obj_hash"],
-                [self._emit_as_object(expr.args[0])],
+                [self._emit_expr_as_pcc_object(expr.args[0])],
                 name=self._fresh("hash"),
             )
             self._emit_post_call_err_check(self._expr_span_or_none(expr))
@@ -1315,6 +1778,14 @@ class CallExpressionLoweringMixin:
             phi.add_incoming(ir.Constant(_I1, 0), missing_exit)
             phi.add_incoming(ir.Constant(_I1, 1), present_exit)
             return phi
+        if name == "vars" and len(expr.args) == 1 and not expr.kwargs:
+            result = self.builder.call(
+                self.runtime["py_obj_vars"],
+                [self._emit_expr_as_pcc_object(expr.args[0])],
+                name=self._fresh("vars"),
+            )
+            self._emit_post_call_err_check(self._expr_span_or_none(expr))
+            return result
         if name == "issubclass" and len(expr.args) == 2:
             result = self._maybe_emit_issubclass_builtin(expr)
             if result is not None:
@@ -1466,6 +1937,27 @@ class CallExpressionLoweringMixin:
                         "__init__",
                     )
             if init_fd is None:
+                new_info = self._resolve_method_mro(class_name, "__new__")
+                if new_info is None and class_info is not None:
+                    if "__new__" in class_info.methods:
+                        new_info = class_info
+                if new_info is not None:
+                    new_fn = new_info.methods.get("__new__")
+                    if new_fn is not None:
+                        cls_ptr = self.builder.load(
+                            class_info.global_var,
+                            name=self._fresh(f"cls.{class_name}.__new__"),
+                        )
+                        return attach_hoisted_class_captures(
+                            self._emit_direct_method_call(
+                                new_fn,
+                                cls_ptr,
+                                new_info,
+                                "__new__",
+                                expr.args,
+                                kwargs=expr.kwargs,
+                            )
+                        )
                 inst = self._emit_no_init_field_instance(
                     class_name,
                     expr.args,
@@ -1556,14 +2048,34 @@ class CallExpressionLoweringMixin:
         # Runtime bindings shadow same-named FuncDefs. This matters for
         # Python patterns such as ``f = obj.f; return f(...)`` inside a
         # function named ``f``.
-        if name in self.env or name in getattr(self, "_module_globals", {}):
-            fn_val = self._emit_name(
-                Name(
-                    span=self._expr_span_or_none(expr),
-                    ty=DynType(name="dyn"),
-                    ident=name,
-                ),
-            )
+        semantic_cross_module = name in getattr(
+            self,
+            "_cross_module_semantic_functions",
+            {},
+        )
+        if (
+            name in self.env
+            or name in getattr(self, "_module_globals", {})
+            or semantic_cross_module
+        ):
+            if semantic_cross_module:
+                semantic_gv = self._native_extension_modules().get(name)
+                if semantic_gv is None:
+                    raise NotImplementedError(
+                        "semantic cross-module function has no runtime binding: " + name
+                    )
+                fn_val = self.builder.load(
+                    semantic_gv,
+                    name=self._fresh(f"decorated.import.{name}"),
+                )
+            else:
+                fn_val = self._emit_name(
+                    Name(
+                        span=self._expr_span_or_none(expr),
+                        ty=DynType(name="dyn"),
+                        ident=name,
+                    ),
+                )
             is_cpy_local = (
                 fn_val in getattr(self, "_cpy_values", ())
                 or getattr(self, "_cpy_env_flags", {}).get(name, False)
@@ -1599,10 +2111,45 @@ class CallExpressionLoweringMixin:
                 self._gc_release(args_tuple)
             if expr.kwargs:
                 self._gc_release(kwargs_obj)
+            self._emit_post_call_err_check(self._expr_span_or_none(expr))
+            # If ``name`` is bound to a callable (e.g. a lambda) that returns a
+            # CPython object, tag the indirect-call result cpy so downstream
+            # attribute/op lowering uses py_cpy_* (a native getattr on a raw
+            # PyObject* segfaults). Mirrors the direct-funcdef path below.
+            if self._name_binds_cpy_returning_callable(name):
+                if not hasattr(self, "_cpy_values"):
+                    self._cpy_values = set()
+                self._cpy_values.add(result)
             return result
 
         fn = self.functions.get(name)
         if fn is None:
+            native_star_val = self._load_from_native_extension_star_imports(name)
+            if native_star_val is not None:
+                kwdict_unpack = self._split_starstar_kwargs_unpack(expr.args)
+                arg_exprs = expr.args
+                kwargs_expr = None
+                if kwdict_unpack is not None:
+                    arg_exprs, kwargs_expr = kwdict_unpack
+                args_owned = not self._is_starred_unpack(arg_exprs)
+                args_tuple = self._emit_dynamic_call_args_tuple(arg_exprs)
+                kwargs_obj = self._emit_dynamic_call_kwargs_object(
+                    expr.kwargs,
+                    kwargs_expr,
+                    self._expr_span_or_none(expr),
+                )
+                result = self.builder.call(
+                    self.runtime["py_obj_call"],
+                    [native_star_val, args_tuple, kwargs_obj],
+                    name=self._fresh(f"{name}.native.star.call"),
+                )
+                if args_owned:
+                    self._gc_release(args_tuple)
+                if expr.kwargs:
+                    self._gc_release(kwargs_obj)
+                self._gc_release(native_star_val)
+                self._emit_post_call_err_check(self._expr_span_or_none(expr))
+                return result
             # CPython-backed callable (e.g. a ``from .sibling import
             # foo`` where ``foo`` isn't a native-sibling FuncDef)
             # dispatches via PyObject_Call. Pulls libpython but is
@@ -1695,6 +2242,7 @@ class CallExpressionLoweringMixin:
                     self._gc_release(args_tuple)
                 if expr.kwargs:
                     self._gc_release(kwargs_obj)
+                self._emit_post_call_err_check(self._expr_span_or_none(expr))
                 return result
             # Python resolves function names at runtime. If the compiler
             # cannot statically bind the callable, emit a normal name load
@@ -1730,6 +2278,7 @@ class CallExpressionLoweringMixin:
                 self._gc_release(args_tuple)
             if expr.kwargs:
                 self._gc_release(kwargs_obj)
+            self._emit_post_call_err_check(self._expr_span_or_none(expr))
             return result
         ast_func_def = self._find_user_funcdef(name)
         if ast_func_def.is_async:
@@ -1740,6 +2289,15 @@ class CallExpressionLoweringMixin:
                 expr.args,
                 expr.kwargs,
             )
+        cached_result = self._maybe_emit_lru_cached_user_function_call(
+            name=name,
+            fn=fn,
+            ast_func_def=ast_func_def,
+            args=expr.args,
+            kwargs=expr.kwargs,
+        )
+        if cached_result is not None:
+            return cached_result
         if self._decorators_are_native_functions(ast_func_def):
             return self._emit_decorated_user_function_call(
                 name=name,
@@ -1830,6 +2388,7 @@ class CallExpressionLoweringMixin:
                 runtime_formals.append(a)
             i += 1
         args_ir: list[ir.Value] = []
+        owned_arg_temps: list[ir.Value] = []
         i = 0
         while i < len(resolved_args) and i < len(runtime_formals) and i < len(fn.args):
             ast_arg = resolved_args[i]
@@ -1843,6 +2402,12 @@ class CallExpressionLoweringMixin:
                     box_int_abi=self._should_box_python_ints(),
                 )
             v = self._emit_arg_for_abi_param(ast_arg, target_ty, param_ir_ty)
+            if (
+                getattr(self, "_last_call_arg_owned_temp", False)
+                and isinstance(v.type, ir.PointerType)
+                and v not in getattr(self, "_cpy_values", ())
+            ):
+                owned_arg_temps.append(v)
             args_ir.append(v)
             i += 1
         call_name = (
@@ -1850,17 +2415,24 @@ class CallExpressionLoweringMixin:
             if isinstance(fn.function_type.return_type, ir.VoidType)
             else self._fresh(f"{name}_ret")
         )
+        returns_cpython = self._user_func_returns_cpython(
+            ast_func_def,
+            runtime_formals,
+            resolved_args,
+        )
         result = self._call_user(
             fn,
             args_ir,
             call_name,
             span=self._expr_span_or_none(expr),
+            root_result=self._is_object(ast_func_def.return_ty) and not returns_cpython,
         )
-        if self._user_func_returns_cpython(
-            ast_func_def,
-            runtime_formals,
-            resolved_args,
-        ):
+        for owned_arg in owned_arg_temps:
+            self._gc_release(
+                owned_arg,
+                self._release_context_label("direct_call_arg"),
+            )
+        if returns_cpython:
             if not hasattr(self, "_cpy_values"):
                 self._cpy_values = set()
             self._cpy_values.add(result)

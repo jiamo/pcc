@@ -4,10 +4,10 @@ Minimal surface: env, getcwd, listdir, exists, the ``os.path``
 helpers pcc uses (join, basename, dirname, exists). Heavy lifting
 delegates to extern libc.
 """
+
 from __future__ import annotations
 
 from pcc.extern import extern, c_int, c_int64, c_str, c_ptr
-
 
 _getenv = extern("getenv", (c_str,), c_str)
 _setenv = extern("setenv", (c_str, c_str, c_int), c_int)
@@ -56,6 +56,26 @@ def exists(path: str) -> bool:
     return _access(path, F_OK) == 0
 
 
+class PathLike:
+    """Base protocol for objects that provide a filesystem path."""
+
+    def __fspath__(self):
+        raise NotImplementedError("PathLike subclasses must define __fspath__")
+
+
+def fspath(path):
+    """Return the filesystem representation of a path-like object."""
+    if isinstance(path, (str, bytes)):
+        return path
+    try:
+        result = path.__fspath__()
+    except AttributeError:
+        raise TypeError("expected str, bytes or os.PathLike object")
+    if not isinstance(result, (str, bytes)):
+        raise TypeError("__fspath__() must return str or bytes")
+    return result
+
+
 class _path:
     """``os.path`` namespace."""
 
@@ -81,7 +101,7 @@ class _path:
         i = len(p) - 1
         while i >= 0 and p[i] != "/":
             i = i - 1
-        return p[i + 1:]
+        return p[i + 1 :]
 
     @staticmethod
     def dirname(p: str) -> str:

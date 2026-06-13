@@ -1,4 +1,5 @@
 """Enum and dynamic type helper lowering for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -7,7 +8,6 @@ from pcc.llvm_capi.compat import ir
 
 from ..py_ast import Attr, Call, DictExpr, Name, StrLit, TupleExpr
 from . import marshal
-
 
 _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
@@ -18,10 +18,7 @@ class DynamicTypeLoweringMixin:
     def _maybe_emit_enum_member_attr(self, expr: Attr) -> Optional[ir.Value]:
         if expr.name not in ("name", "value"):
             return None
-        if not (
-            isinstance(expr.obj, Attr)
-            and isinstance(expr.obj.obj, Name)
-        ):
+        if not (isinstance(expr.obj, Attr) and isinstance(expr.obj.obj, Name)):
             return None
         class_name = expr.obj.obj.ident
         member_name = expr.obj.name
@@ -29,10 +26,13 @@ class DynamicTypeLoweringMixin:
         if info is None:
             return None
         enum_members = getattr(info, "enum_members", {})
-        if member_name not in enum_members:
+        enum_string_members = getattr(info, "enum_string_members", {})
+        if member_name not in enum_members and member_name not in enum_string_members:
             return None
         if expr.name == "name":
             return self._emit_str_literal(member_name)
+        if member_name in enum_string_members:
+            return self._emit_str_literal(enum_string_members[member_name])
         return ir.Constant(_I64, int(enum_members[member_name]))
 
     def _maybe_emit_dynamic_type_constructor(self, expr: Call) -> Optional[ir.Value]:
@@ -40,7 +40,16 @@ class DynamicTypeLoweringMixin:
             return None
         name_expr, bases_expr, ns_expr = expr.args
         if not isinstance(name_expr, StrLit):
-            return None
+            name_obj = self._emit_as_object(name_expr)
+            bases_obj = self._emit_as_object(bases_expr)
+            ns_obj = self._emit_as_object(ns_expr)
+            result = self.builder.call(
+                self.runtime["py_class_new_from_objects"],
+                [name_obj, bases_obj, ns_obj],
+                name=self._fresh("type.dynamic"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
         if not isinstance(bases_expr, TupleExpr):
             return None
         ns_runtime_expr = None

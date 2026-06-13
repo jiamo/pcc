@@ -1035,6 +1035,58 @@ def _emit_sqrt_intrinsic_call(
     return lines
 
 
+def _emit_smul_overflow_intrinsic_call(
+    func: ParsedFunction,
+    dest: str | None,
+    ret_type: TypeDesc,
+    callee: str,
+    args: tuple[tuple[TypeDesc, str], ...],
+) -> list[str]:
+    if dest is None or dest not in func.value_slots:
+        return []
+    if len(args) != 2:
+        raise BackendUnavailable(
+            f"x86_64 self backend {callee} intrinsic expects 2 args in {func.name!r}"
+        )
+    lhs_type, lhs = args[0]
+    rhs_type, rhs = args[1]
+    if (
+        lhs_type.describe() != rhs_type.describe()
+        or not lhs_type.is_int
+        or lhs_type.width != 64
+    ):
+        raise BackendUnavailable(
+            f"x86_64 self backend {callee} intrinsic currently expects i64 "
+            f"same-width integer args in {func.name!r}"
+        )
+    if not ret_type.is_struct or len(ret_type.fields) != 2:
+        raise BackendUnavailable(
+            f"x86_64 self backend {callee} intrinsic expected "
+            f"{{ value, overflow }} return in {func.name!r}"
+        )
+    value_type, overflow_type = ret_type.fields
+    if (
+        value_type.describe() != lhs_type.describe()
+        or not overflow_type.is_int
+        or overflow_type.width != 1
+    ):
+        raise BackendUnavailable(
+            f"x86_64 self backend {callee} intrinsic return shape mismatch "
+            f"in {func.name!r}: {ret_type.describe()}"
+        )
+    slot_offset = func.value_slots[dest].offset
+    lines = _materialize_value(func, lhs, lhs_type, "r10")
+    lines.extend(_materialize_value(func, rhs, rhs_type, "r11"))
+    # Two-operand signed imul sets OF on signed overflow; the {i64, i1}
+    # slot layout matches the generic call path (value at +0, flag at +8).
+    lines.append("  imul r10, r11")
+    lines.append("  seto r11b")
+    lines.append("  movzx r11, r11b")
+    lines.extend(_store_reg_to_slot("r10", slot_offset, value_type))
+    lines.append(f"  mov QWORD PTR [rbp - {slot_offset - 8}], r11")
+    return lines
+
+
 def _sign_extend_reg_to_r10(src_type: TypeDesc) -> list[str]:
     if src_type.width <= 8:
         return ["  movsx r10, r10b"]
@@ -1533,6 +1585,11 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
             lines.extend(["  setne al", "  setp bl", "  or al, bl"])
         elif cond == "uno":
             lines.append("  setp al")
+        elif cond == "ord":
+            # Ordered: true when NEITHER operand is NaN. ucomiss/ucomisd set
+            # PF on an unordered compare (a NaN present), so setnp yields 1
+            # exactly when both operands are ordered.
+            lines.append("  setnp al")
         else:
             raise BackendUnavailable(
                 f"x86_64 self backend fcmp predicate {cond!r} not translated yet in {func.name!r}"
@@ -1604,12 +1661,83 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
             lines.append(f"  {cvt_op} {dst_reg}, {src_reg}")
             lines.extend(_store_reg_to_slot(dst_reg, func.value_slots[dest].offset, dst_type))
             return lines
+        if op == "uitofp" and src_type.is_int and dst_type.is_fp:
+            dst_reg = _reg_name(dst_type, 10)
+            cvt_op = "cvtsi2ss" if dst_type.width <= 32 else "cvtsi2sd"
+            lines = _materialize_value(func, value, src_type, _reg_name(src_type, 10))
+            if src_type.width < 64:
+                # Zero-extend the source into the full 64-bit r10 so its
+                # unsigned value is a NON-negative signed 64-bit integer; then
+                # a plain signed cvtsi2s{s,d} is exact (matches clang's
+                # `mov eax, edi` / `cvtsi2sd xmm, rax` lowering).
+                if src_type.width <= 8:
+                    lines.append("  movzx r10, r10b")
+                elif src_type.width <= 16:
+                    lines.append("  movzx r10, r10w")
+                else:
+                    # Writing r10d already zeroes the upper 32 bits of r10.
+                    lines.append("  mov r10d, r10d")
+                lines.append(f"  {cvt_op} {dst_reg}, r10")
+            else:
+                # 64-bit unsigned: values with the high bit set are negative as
+                # signed, so cvtsi2s{s,d} would be wrong. Branch on sign and, in
+                # the high-bit case, halve (odd-rounded) then double after the
+                # conversion. Mirrors clang's u64->fp fixup and is valid for
+                # both float and double results.
+                fixup_label = _value_label(func.name, dest, "uitofp_fixup")
+                done_label = _value_label(func.name, dest, "uitofp_done")
+                add_op = "addss" if dst_type.width <= 32 else "addsd"
+                lines.extend(
+                    [
+                        "  test r10, r10",
+                        f"  js {fixup_label}",
+                        f"  {cvt_op} {dst_reg}, r10",
+                        f"  jmp {done_label}",
+                        f"{fixup_label}:",
+                        "  mov r11, r10",
+                        "  shr r11, 1",
+                        "  and r10, 1",
+                        "  or r11, r10",
+                        f"  {cvt_op} {dst_reg}, r11",
+                        f"  {add_op} {dst_reg}, {dst_reg}",
+                        f"{done_label}:",
+                    ]
+                )
+            lines.extend(_store_reg_to_slot(dst_reg, func.value_slots[dest].offset, dst_type))
+            return lines
         if op == "fptosi" and src_type.is_fp and dst_type.is_int:
             src_reg = _reg_name(src_type, 10)
             cvt_dst_reg = "r10" if dst_type.width > 32 else "r10d"
             lines = _materialize_value(func, value, src_type, src_reg)
             cvt_op = "cvttss2si" if src_type.width <= 32 else "cvttsd2si"
             lines.append(f"  {cvt_op} {cvt_dst_reg}, {src_reg}")
+            lines.extend(_store_reg_to_slot(_reg_name(dst_type, 10), func.value_slots[dest].offset, dst_type))
+            return lines
+        if op == "fptoui" and src_type.is_fp and dst_type.is_int:
+            src_reg = _reg_name(src_type, 10)
+            cvt_op = "cvttss2si" if src_type.width <= 32 else "cvttsd2si"
+            lines = _materialize_value(func, value, src_type, src_reg)
+            if dst_type.width <= 32:
+                # Any in-range u32 value fits in a positive signed 64-bit int,
+                # so a 64-bit signed truncating convert is exact; the low
+                # width bits are the unsigned result (matches clang emitting a
+                # 64-bit cvttsd2si then killing the high dword).
+                lines.append(f"  {cvt_op} r10, {src_reg}")
+            else:
+                # 64-bit unsigned: cvttsd2si saturates to INT64_MIN for values
+                # >= 2^63. Subtract 2^63, convert the remainder, and OR the
+                # saturated high bit back in only when the value overflowed the
+                # signed range. Mirrors clang's u64 fptoui fixup.
+                two63 = "9223372036854775808.0"
+                lines.append(f"  {cvt_op} rax, {src_reg}")
+                lines.append("  mov rbx, rax")
+                lines.append("  sar rbx, 63")
+                lines.extend(_materialize_fp_constant(two63, src_type, "xmm11"))
+                sub_op = "subss" if src_type.width <= 32 else "subsd"
+                lines.append(f"  {sub_op} {src_reg}, xmm11")
+                lines.append(f"  {cvt_op} r10, {src_reg}")
+                lines.append("  and r10, rbx")
+                lines.append("  or r10, rax")
             lines.extend(_store_reg_to_slot(_reg_name(dst_type, 10), func.value_slots[dest].offset, dst_type))
             return lines
         if op == "fptrunc" and src_type.is_fp and dst_type.is_fp and src_type.width > dst_type.width:
@@ -1811,6 +1939,10 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
             return _emit_floor_intrinsic_call(func, dest, ret_type, callee, args)
         if not is_indirect and callee.startswith("llvm.sqrt."):
             return _emit_sqrt_intrinsic_call(func, dest, ret_type, callee, args)
+        if not is_indirect and callee.startswith("llvm.smul.with.overflow."):
+            return _emit_smul_overflow_intrinsic_call(
+                func, dest, ret_type, callee, args
+            )
         if not is_indirect and callee.startswith("llvm.va_start"):
             if len(args) != 1:
                 raise BackendUnavailable(f"x86_64 self backend llvm.va_start expects 1 arg in {func.name!r}")
@@ -1882,6 +2014,16 @@ def _emit_compute_instruction(func: ParsedFunction, kind: str, data: tuple) -> l
                     return lines
             raise BackendUnavailable(
                 f"x86_64 self backend intrinsic not translated yet in {func.name!r}: {callee}"
+            )
+        if not is_indirect and callee.startswith("llvm."):
+            # Fail fast: an un-lowered LLVM intrinsic must never fall
+            # through to a plain `call llvm.foo.i64` — the assembler
+            # accepts the dotted symbol and the error only surfaces at
+            # link time (or worse). Seen with llvm.smul.with.overflow
+            # from the typed-int fast path (INT-P0-PROJ).
+            raise BackendUnavailable(
+                f"x86_64 self backend has no native lowering for "
+                f"intrinsic {callee!r} in {func.name!r}"
             )
         lines: list[str] = []
         hidden_sret = _aggregate_returned_indirect(ret_type)

@@ -1,14 +1,34 @@
 """Direct/static Python method call lowering for L1CodeGen."""
+
 from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import DynType, Expr, Type
+from ..py_ast import DynType, Expr, Name, Type
 from . import marshal
 from .errors import L1CodegenError
 
 
 class MethodCallLoweringMixin:
+    def _method_arg_prefers_native_callable_value(self, expr: Expr) -> bool:
+        if not isinstance(expr, Name):
+            return False
+        if self._name_returns_owned_function_value(expr.ident):
+            return True
+        return self._name_returns_native_builtin_callable_value(expr.ident)
+
+    def _emit_method_arg_as_pcc_object(self, expr: Expr) -> ir.Value:
+        if self._method_arg_prefers_native_callable_value(expr):
+            value = self._emit_expr_with_native_callable_values(expr)
+            return marshal.marshal_to_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                value,
+                expr.ty,
+            )
+        return self._emit_expr_as_pcc_object(expr)
+
     def _emit_data_descriptor_get(
         self,
         class_name: str,
@@ -104,17 +124,12 @@ class MethodCallLoweringMixin:
         declared = ast_fd.args if ast_fd else ()
         args_ir: list[ir.Value] = []
         for i, arg_expr in enumerate(arg_exprs):
-            v = self._emit_expr(arg_expr)
-            if i < len(declared) and declared[i].annotation is not None:
-                v = self._coerce(v, arg_expr.ty, declared[i].annotation)
+            declared_ty = declared[i].annotation if i < len(declared) else None
+            if declared_ty is not None and not isinstance(declared_ty, DynType):
+                v = self._emit_expr(arg_expr)
+                v = self._coerce(v, arg_expr.ty, declared_ty)
             else:
-                v = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    v,
-                    arg_expr.ty,
-                )
+                v = self._emit_method_arg_as_pcc_object(arg_expr)
             args_ir.append(v)
         ret_ty = method_fn.function_type.return_type
         call_name = (
@@ -122,7 +137,12 @@ class MethodCallLoweringMixin:
             if isinstance(ret_ty, ir.VoidType)
             else self._fresh(f"{info.name}.{method_name}.ret")
         )
-        return self._call_user(method_fn, args_ir, call_name)
+        return self._call_user(
+            method_fn,
+            args_ir,
+            call_name,
+            root_result=ast_fd is not None and self._is_object(ast_fd.return_ty),
+        )
 
     def _emit_direct_method_call(
         self,
@@ -133,8 +153,21 @@ class MethodCallLoweringMixin:
         arg_exprs: tuple[Expr, ...],
         kwargs: tuple = (),
     ) -> ir.Value:
-        args_ir: list[ir.Value] = [self_val]
         ast_fd = self.class_lowering._find_method_def(info.name, method_name)
+        if ast_fd is not None and ast_fd.args:
+            receiver_ty = ast_fd.args[0].annotation
+            if (
+                receiver_ty is not None
+                and self._is_valueclass_payload_type(receiver_ty)
+                and isinstance(self_val.type, ir.PointerType)
+            ):
+                payload = self._emit_object_to_valueclass_payload(
+                    self_val,
+                    receiver_ty,
+                )
+                if payload is not None:
+                    self_val = payload
+        args_ir: list[ir.Value] = [self_val]
         # Always resolve positional → full arg list so defaults land on
         # omitted trailing params, not just when kwargs were supplied.
         # The earlier ``if kwargs:`` gate let calls like
@@ -195,17 +228,12 @@ class MethodCallLoweringMixin:
                 args_tuple,
             )
         for i, arg_expr in enumerate(arg_exprs):
-            v = self._emit_expr(arg_expr)
-            if i < len(declared) and declared[i].annotation is not None:
-                v = self._coerce(v, arg_expr.ty, declared[i].annotation)
+            declared_ty = declared[i].annotation if i < len(declared) else None
+            if declared_ty is not None and not isinstance(declared_ty, DynType):
+                v = self._emit_expr(arg_expr)
+                v = self._coerce(v, arg_expr.ty, declared_ty)
             else:
-                v = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    v,
-                    arg_expr.ty,
-                )
+                v = self._emit_method_arg_as_pcc_object(arg_expr)
             args_ir.append(v)
         ret_ty = method_fn.function_type.return_type
         call_name = (
@@ -213,7 +241,12 @@ class MethodCallLoweringMixin:
             if isinstance(ret_ty, ir.VoidType)
             else self._fresh(f"{info.name}.{method_name}.ret")
         )
-        return self._call_user(method_fn, args_ir, call_name)
+        return self._call_user(
+            method_fn,
+            args_ir,
+            call_name,
+            root_result=ast_fd is not None and self._is_object(ast_fd.return_ty),
+        )
 
     def _emit_static_method_ptr_call(
         self,
@@ -241,17 +274,12 @@ class MethodCallLoweringMixin:
         declared = ast_fd.args if ast_fd else ()
         args_ir: list[ir.Value] = []
         for i, arg_expr in enumerate(arg_exprs):
-            v = self._emit_expr(arg_expr)
-            if i < len(declared) and declared[i].annotation is not None:
-                v = self._coerce(v, arg_expr.ty, declared[i].annotation)
+            declared_ty = declared[i].annotation if i < len(declared) else None
+            if declared_ty is not None and not isinstance(declared_ty, DynType):
+                v = self._emit_expr(arg_expr)
+                v = self._coerce(v, arg_expr.ty, declared_ty)
             else:
-                v = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    v,
-                    arg_expr.ty,
-                )
+                v = self._emit_method_arg_as_pcc_object(arg_expr)
             args_ir.append(v)
         callee = self.builder.bitcast(
             method_ptr,
@@ -264,7 +292,12 @@ class MethodCallLoweringMixin:
             if isinstance(ret_ty, ir.VoidType)
             else self._fresh(f"{info.name}.{method_name}.ret")
         )
-        return self._call_user(callee, args_ir, call_name)
+        return self._call_user(
+            callee,
+            args_ir,
+            call_name,
+            root_result=ast_fd is not None and self._is_object(ast_fd.return_ty),
+        )
 
     def _emit_direct_method_ptr_call(
         self,
@@ -291,33 +324,103 @@ class MethodCallLoweringMixin:
             raise NotImplementedError(
                 f"method {info.name}.{method_name} with kwargs needs a "
                 "FuncDef to resolve parameter names"
-            )
+        )
         declared = [a for a in ast_fd.args[1:] if a.name != ""] if ast_fd else []
+        arg_values: list[tuple[ir.Value, Type]] = []
         for i, arg_expr in enumerate(arg_exprs):
-            v = self._emit_expr(arg_expr)
-            if i < len(declared) and declared[i].annotation is not None:
-                v = self._coerce(v, arg_expr.ty, declared[i].annotation)
+            declared_ty = declared[i].annotation if i < len(declared) else None
+            if declared_ty is not None and not isinstance(declared_ty, DynType):
+                v = self._emit_expr(arg_expr)
+                v = self._coerce(v, arg_expr.ty, declared_ty)
+                value_ty = declared_ty
             else:
-                v = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    v,
-                    arg_expr.ty,
-                )
+                v = self._emit_method_arg_as_pcc_object(arg_expr)
+                value_ty = DynType(name="dyn")
             args_ir.append(v)
+            arg_values.append((v, value_ty))
         callee = self.builder.bitcast(
             method_ptr,
             method_fn.type,
             name=self._fresh(f"{info.name}.{method_name}.super.fn"),
         )
         ret_ty = method_fn.function_type.return_type
+        if isinstance(ret_ty, (ir.PointerType, ir.VoidType)):
+            is_func = self.builder.icmp_signed(
+                "==",
+                self.builder.call(
+                    self.runtime["py_obj_type_tag"],
+                    [method_ptr],
+                    name=self._fresh(f"{info.name}.{method_name}.super.tag"),
+                ),
+                ir.Constant(ir.IntType(64), 9),
+                name=self._fresh(f"{info.name}.{method_name}.super.is_func"),
+            )
+            parent_fn = self.current_function
+            raw_bb = parent_fn.append_basic_block(
+                name=self._fresh(f"{info.name}.{method_name}.super.raw")
+            )
+            func_bb = parent_fn.append_basic_block(
+                name=self._fresh(f"{info.name}.{method_name}.super.pyfunc")
+            )
+            done_bb = parent_fn.append_basic_block(
+                name=self._fresh(f"{info.name}.{method_name}.super.done")
+            )
+            self.builder.cbranch(is_func, func_bb, raw_bb)
+
+            self.builder.position_at_end(func_bb)
+            full_args = self._emit_object_tuple_from_values(
+                ((self_val, DynType(name="dyn")),) + tuple(arg_values),
+                name=f"{info.name}.{method_name}.super.pyfunc.args",
+            )
+            func_result = self.builder.call(
+                self.runtime["py_func_call"],
+                [method_ptr, full_args],
+                name=(
+                    ""
+                    if isinstance(ret_ty, ir.VoidType)
+                    else self._fresh(f"{info.name}.{method_name}.super.pyfunc.ret")
+                ),
+            )
+            self._gc_release(full_args)
+            self._emit_post_call_err_check(None)
+            if isinstance(ret_ty, ir.VoidType):
+                self._gc_release(func_result)
+            func_exit = self.builder.block
+            self.builder.branch(done_bb)
+
+            self.builder.position_at_end(raw_bb)
+            raw_call_name = (
+                ""
+                if isinstance(ret_ty, ir.VoidType)
+                else self._fresh(f"{info.name}.{method_name}.ret")
+            )
+            raw_result = self._call_user(
+                callee,
+                args_ir,
+                raw_call_name,
+                root_result=ast_fd is not None and self._is_object(ast_fd.return_ty),
+            )
+            raw_exit = self.builder.block
+            self.builder.branch(done_bb)
+
+            self.builder.position_at_end(done_bb)
+            if isinstance(ret_ty, ir.VoidType):
+                return self._emit_none_literal()
+            result = self.builder.phi(ret_ty, name=self._fresh(f"{info.name}.{method_name}.super.ret"))
+            result.add_incoming(func_result, func_exit)
+            result.add_incoming(raw_result, raw_exit)
+            return result
         call_name = (
             ""
             if isinstance(ret_ty, ir.VoidType)
             else self._fresh(f"{info.name}.{method_name}.ret")
         )
-        return self._call_user(callee, args_ir, call_name)
+        return self._call_user(
+            callee,
+            args_ir,
+            call_name,
+            root_result=ast_fd is not None and self._is_object(ast_fd.return_ty),
+        )
 
     def _emit_direct_method_value_call(
         self,
@@ -367,4 +470,9 @@ class MethodCallLoweringMixin:
             if isinstance(ret_ty, ir.VoidType)
             else self._fresh(f"{info.name}.{method_name}.ret")
         )
-        return self._call_user(method_fn, args_ir, call_name)
+        return self._call_user(
+            method_fn,
+            args_ir,
+            call_name,
+            root_result=ast_fd is not None and self._is_object(ast_fd.return_ty),
+        )

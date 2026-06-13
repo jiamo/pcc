@@ -1,4 +1,5 @@
 """Native file-object lowering helpers."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -7,10 +8,10 @@ from pcc.llvm_capi.compat import ir
 
 from ..py_ast import Attr, Call, DynType, Name, StrType, With
 
-
+_I1 = ir.IntType(1)
 _I8 = ir.IntType(8)
+_I64 = ir.IntType(64)
 _CSTR = _I8.as_pointer()
-
 
 
 class NativeFilesLoweringMixin:
@@ -86,6 +87,54 @@ class NativeFilesLoweringMixin:
                 [recv, text_obj],
                 name=self._fresh("file.write"),
             )
+        if attr.name == "readline" and len(expr.args) <= 1:
+            if expr.args:
+                limit_v = self._emit_expr(expr.args[0])
+                limit_i64 = self._to_int64(limit_v, expr.args[0].ty)
+            else:
+                limit_i64 = ir.Constant(_I64, -1)
+            result = self.builder.call(
+                self.runtime["py_file_readline"],
+                [recv, limit_i64],
+                name=self._fresh("file.readline"),
+            )
+            # Raises ValueError on a closed file.
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
+        if attr.name == "seek" and 1 <= len(expr.args) <= 2:
+            offset_v = self._emit_expr(expr.args[0])
+            offset_i64 = self._to_int64(offset_v, expr.args[0].ty)
+            if len(expr.args) == 2:
+                whence_v = self._emit_expr(expr.args[1])
+                whence_i64 = self._to_int64(whence_v, expr.args[1].ty)
+            else:
+                whence_i64 = ir.Constant(_I64, 0)
+            result = self.builder.call(
+                self.runtime["py_file_seek"],
+                [recv, offset_i64, whence_i64],
+                name=self._fresh("file.seek"),
+            )
+            # Raises ValueError (closed file) / OSError (bad seek).
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
+        if attr.name == "tell" and not expr.args:
+            result = self.builder.call(
+                self.runtime["py_file_tell"],
+                [recv],
+                name=self._fresh("file.tell"),
+            )
+            # Raises ValueError on a closed file.
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
+        if attr.name == "flush" and not expr.args:
+            result = self.builder.call(
+                self.runtime["py_file_flush"],
+                [recv],
+                name=self._fresh("file.flush"),
+            )
+            # Raises ValueError on a closed file.
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
         if attr.name == "close" and not expr.args:
             self.builder.call(self.runtime["py_file_close"], [recv])
             return self._emit_none_literal()
@@ -124,7 +173,9 @@ class NativeFilesLoweringMixin:
             return None
         if not isinstance(attr.obj, Name):
             return None
-        if not getattr(self, "_native_fileinput_env_flags", {}).get(attr.obj.ident, False):
+        if not getattr(self, "_native_fileinput_env_flags", {}).get(
+            attr.obj.ident, False
+        ):
             return None
         helpers = {
             "readline": "py_fileinput_readline",
@@ -162,13 +213,50 @@ class NativeFilesLoweringMixin:
             alloca = self._alloca_in_entry(_CSTR, name=f"{as_expr.ident}.addr")
             self.env[as_expr.ident] = (alloca, _CSTR, DynType(name="dyn"))
             slot = self.env[as_expr.ident]
+
+        # ``with open(...) as f`` bypasses the normal Assign lowering, but
+        # the binding still owns a GC-managed file object.  Register the
+        # alloca as an updateable frame root before the body can allocate;
+        # otherwise tracing backend #1 can sweep the file during a long
+        # write loop, while moving backends can leave ``f`` pointing at the
+        # pre-relocation object.  Keep the ordinary owned-local flag/release
+        # contract as well so the closed file object is released when the
+        # function binding dies.
+        self._ensure_owned_local_gc_root(as_expr.ident, slot[0], _CSTR)
+        replacing_owned = as_expr.ident in getattr(
+            self, "_owned_local_names", set()
+        ) and as_expr.ident in getattr(self, "_owned_local_has_value", set())
+        if replacing_owned:
+            # The context expression is evaluated before its ``as`` target
+            # is rebound.  Pin the newly opened file while releasing the old
+            # binding so a collector step in that release cannot move it
+            # before it reaches the rooted slot.
+            self.builder.call(self.runtime["pcc_gc_pin"], [file_val])
+            self._release_existing_owned_local(as_expr.ident)
         self.builder.store(file_val, slot[0])
+        # Re-add compile-time rooted-name bookkeeping after replacement;
+        # _release_existing_owned_local deliberately discards the name while
+        # leaving the alloca registration alive for the whole frame.
+        self._ensure_owned_local_gc_root(as_expr.ident, slot[0], _CSTR)
+        self.builder.call(
+            self.runtime["pcc_gc_note_write_barrier"],
+            [ir.Constant(_CSTR, None), file_val],
+        )
+        if replacing_owned:
+            self.builder.call(self.runtime["pcc_gc_unpin"], [file_val])
+        self._owned_local_names.add(as_expr.ident)
+        self._owned_local_has_value.add(as_expr.ident)
+        owned_flag = self._ensure_owned_local_flag(as_expr.ident, slot[0])
+        self.builder.store(ir.Constant(_I1, 1), owned_flag)
         self._native_file_env_flags[as_expr.ident] = True
         self._cpy_env_flags.pop(as_expr.ident, None)
 
         self._emit_stmts(stmt.body)
         if not self._builder_block_is_terminated():
-            self.builder.call(self.runtime["py_file_close"], [file_val])
+            # Reload through the root/update barrier: GC3/GC4 may have moved
+            # the file while lowering calls in the with-body were running.
+            current_file = self._emit_name(as_expr)
+            self.builder.call(self.runtime["py_file_close"], [current_file])
         return True
 
     def _emit_native_tempdir_with(self, stmt: With) -> bool:

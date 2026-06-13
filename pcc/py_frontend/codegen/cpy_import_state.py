@@ -1,10 +1,10 @@
 """CPython import fallback state helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
-
 
 _I8 = ir.IntType(8)
 _CSTR = _I8.as_pointer()
@@ -47,6 +47,38 @@ class CpyImportStateMixin:
         if not hasattr(self, "_native_extension_module_env"):
             self._native_extension_module_env = {}
         return self._native_extension_module_env
+
+    def _native_extension_star_modules(self) -> dict[str, ir.GlobalVariable]:
+        if not hasattr(self, "_native_extension_star_module_env"):
+            self._native_extension_star_module_env = {}
+        return self._native_extension_star_module_env
+
+    def _native_extension_star_module_global(
+        self, module_name: str
+    ) -> ir.GlobalVariable:
+        star_modules = self._native_extension_star_modules()
+        gv = star_modules.get(module_name)
+        if gv is not None:
+            return gv
+        gv = self._native_extension_module_global(f"starimport.{module_name}")
+        star_modules[module_name] = gv
+        return gv
+
+    def _load_from_native_extension_star_imports(self, name: str) -> Optional[ir.Value]:
+        if not getattr(self, "_native_extension_star_module_env", {}):
+            return None
+        module_name = self.ast_module.name or "__main__"
+        module_name_ptr = self._ptr_to_cstr(
+            self._cstr_global(module_name, f".pcc.ext.star.module.{module_name}")
+        )
+        attr_ptr = self._ptr_to_cstr(
+            self._cstr_global(name, f".pcc.ext.star.attr.{name}")
+        )
+        return self.builder.call(
+            self.runtime["py_module_attr_get"],
+            [module_name_ptr, attr_ptr],
+            name=self._fresh(f"pcc.ext.star.{name}"),
+        )
 
     def _cpy_star_modules(self) -> dict[str, ir.GlobalVariable]:
         """Globals storing modules imported via ``from x import *``."""

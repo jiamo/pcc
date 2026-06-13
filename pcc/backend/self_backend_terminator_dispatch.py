@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from typing import Callable
 
 from . import BackendUnavailable
 from .self_backend_ir import ParsedBlock, ParsedFunction, ParsedInstr, TypeDesc

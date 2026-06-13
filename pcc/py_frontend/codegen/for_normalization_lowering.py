@@ -350,7 +350,10 @@ class ForNormalizationLoweringMixin:
             op="+=",
             value=one_lit,
         )
-        new_body = prelude + tuple(stmt.body) + (incr_stmt,)
+        # The increment runs right after the index binding, BEFORE the
+        # user body: a ``continue`` in the body must not skip it, or the
+        # counter stops matching the iteration number.
+        new_body = prelude + (incr_stmt,) + tuple(stmt.body)
 
         # Emit the counter alloca + zero-store *now* so the rewritten
         # for-loop body sees ``__enum_i__`` already bound in ``self.env``.

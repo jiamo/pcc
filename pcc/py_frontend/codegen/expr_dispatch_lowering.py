@@ -38,6 +38,8 @@ from .runtime_abi import declare_runtime_global
 _I1 = ir.IntType(1)
 _I64 = ir.IntType(64)
 _DOUBLE = ir.DoubleType()
+_NATIVE_DEFAULT_FUNC_SENTINEL = "__pcc_native_default_func_ref__"
+_NATIVE_DEFAULT_GLOBAL_SENTINEL = "__pcc_native_default_global_ref__"
 
 
 def _is_class_type_for_expr_dispatch(ty) -> bool:
@@ -99,6 +101,36 @@ def _expr_is_call(expr: Expr, kind: str) -> bool:
             and _expr_has_attr(expr, "kwargs")
         )
     )
+
+
+def _expr_native_default_func_ref(expr: Expr):
+    if not isinstance(expr, Call):
+        return None
+    func = expr.func
+    if not isinstance(func, Name) or func.ident != _NATIVE_DEFAULT_FUNC_SENTINEL:
+        return None
+    if len(expr.args) != 2 or expr.kwargs:
+        return None
+    module_expr = expr.args[0]
+    name_expr = expr.args[1]
+    if not isinstance(module_expr, StrLit) or not isinstance(name_expr, StrLit):
+        return None
+    return module_expr.value, name_expr.value
+
+
+def _expr_native_default_global_ref(expr: Expr):
+    if not isinstance(expr, Call):
+        return None
+    func = expr.func
+    if not isinstance(func, Name) or func.ident != _NATIVE_DEFAULT_GLOBAL_SENTINEL:
+        return None
+    if len(expr.args) != 2 or expr.kwargs:
+        return None
+    module_expr = expr.args[0]
+    name_expr = expr.args[1]
+    if not isinstance(module_expr, StrLit) or not isinstance(name_expr, StrLit):
+        return None
+    return module_expr.value, name_expr.value
 
 
 def _expr_is_attr(expr: Expr, kind: str) -> bool:
@@ -346,9 +378,18 @@ class ExprDispatchLoweringMixin:
                     "%": "__rmod__",
                     "**": "__rpow__",
                 }.get(expr.op)
-                if reflected_dunder is not None and _is_class_type_for_expr_dispatch(
-                    expr.rhs.ty
+                if (
+                    reflected_dunder is not None
+                    and _is_class_type_for_expr_dispatch(expr.rhs.ty)
+                    and not (
+                        expr.op == "%"
+                        and self._is_valueclass_payload_type(expr.rhs.ty)
+                    )
                 ):
+                    # str %% valueclass falls through to the str-mod branch
+                    # below with a projected operand; valueclasses define no
+                    # user __rmod__, and the reflected receiver path would
+                    # materialize an identity instance.
                     return self._emit_dynamic_binary_dunder_call(
                         expr.rhs,
                         reflected_dunder,
@@ -358,13 +399,63 @@ class ExprDispatchLoweringMixin:
                 # generically by py_obj_truediv in _emit_binop_value below: a
                 # DynType may box a number at runtime, so it must not route to
                 # the __truediv__ dunder (a tagged int has no such attribute).
+            if (
+                expr.op == "**"
+                and isinstance(expr.lhs, IntLit)
+                and isinstance(expr.rhs, IntLit)
+                and expr.rhs.value >= 0
+            ):
+                folded = pow(expr.lhs.value, expr.rhs.value)
+                if -(1 << 63) <= folded <= (1 << 63) - 1:
+                    return ir.Constant(_I64, folded)
+
             lhs = self._emit_expr(expr.lhs)
-            rhs = self._emit_expr(expr.rhs)
+            if expr.op == "%" and self._is_valueclass_payload_type(expr.rhs.ty):
+                # direct valueclass constructors in %-format operands project
+                # to boxed valueboxes, not identity instances
+                rhs = self._emit_expr_as_pcc_object(expr.rhs)
+            else:
+                rhs = self._emit_expr(expr.rhs)
+            lhs_pin = False
+            if (
+                isinstance(lhs.type, ir.PointerType)
+                and lhs not in getattr(self, "_cpy_values", ())
+                and self._raw_scaffold_object_rhs_is_owned(expr.lhs)
+                and self._expr_returns_owned_object(expr.lhs)
+                and _expr_is_binop(expr.lhs, _expr_dispatch_kind_name(expr.lhs))
+            ):
+                self.builder.call(self.runtime["pcc_gc_pin"], [lhs])
+                lhs_pin = True
+            rhs_pin = False
+            if (
+                isinstance(rhs.type, ir.PointerType)
+                and rhs not in getattr(self, "_cpy_values", ())
+                and self._raw_scaffold_object_rhs_is_owned(expr.rhs)
+                and self._expr_returns_owned_object(expr.rhs)
+                and _expr_is_binop(expr.rhs, _expr_dispatch_kind_name(expr.rhs))
+            ):
+                self.builder.call(self.runtime["pcc_gc_pin"], [rhs])
+                rhs_pin = True
             result = self._emit_binop_value(
                 expr.op, lhs, expr.lhs.ty, rhs, expr.rhs.ty, result_ty=expr.ty
             )
+            result_pin = False
+            if (
+                isinstance(result.type, ir.PointerType)
+                and result not in getattr(self, "_cpy_values", ())
+                and self._raw_scaffold_object_rhs_is_owned(expr)
+                and self._expr_returns_owned_object(expr)
+            ):
+                self.builder.call(self.runtime["pcc_gc_pin"], [result])
+                result_pin = True
+            if lhs_pin:
+                self.builder.call(self.runtime["pcc_gc_unpin"], [lhs])
+            if rhs_pin:
+                self.builder.call(self.runtime["pcc_gc_unpin"], [rhs])
             self._gc_release_if_owned(lhs, expr.lhs)
             self._gc_release_if_owned(rhs, expr.rhs)
+            if result_pin:
+                self.builder.call(self.runtime["pcc_gc_unpin"], [result])
             return result
         if _expr_is_unary(expr, expr_kind):
             return self._emit_unary(expr)
@@ -373,6 +464,31 @@ class ExprDispatchLoweringMixin:
         if _expr_is_bool(expr, expr_kind):
             return self._emit_boolexpr(expr)
         if _expr_is_call(expr, expr_kind):
+            native_default_func = _expr_native_default_func_ref(expr)
+            if native_default_func is not None:
+                return self._emit_native_default_func_ref(
+                    native_default_func[0],
+                    native_default_func[1],
+                )
+            native_default_global = _expr_native_default_global_ref(expr)
+            if native_default_global is not None:
+                resolved = self._emit_native_default_global_ref(
+                    native_default_global[0],
+                    native_default_global[1],
+                    expr.span,
+                )
+                if resolved is not None:
+                    return resolved
+                # Not resolvable through the exports table — fall back to
+                # the pre-sentinel behavior (emit the bare Name in the
+                # caller's context).
+                return self._emit_expr(
+                    Name(
+                        span=expr.span,
+                        ty=expr.ty,
+                        ident=native_default_global[1],
+                    )
+                )
             return self._emit_call(expr)
         if _expr_is_if(expr, expr_kind):
             return self._emit_if_expr(expr)

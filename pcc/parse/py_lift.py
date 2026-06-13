@@ -83,6 +83,18 @@ def _pow10f_lift(exp: int) -> float:
     return out
 
 
+def _pow10i_lift(exp: int) -> int:
+    # 10**exp as an EXACT integer (bignum); scales the mantissa without float
+    # error. Mirrors _pow10i in py_parse.py.
+    out = 1
+    ten = 10
+    i = 0
+    while i < exp:
+        out = out * ten
+        i += 1
+    return out
+
+
 def _parse_float_literal_lift(text: str) -> float:
     exp = 0
     lower = text.lower()
@@ -105,13 +117,23 @@ def _parse_float_literal_lift(text: str) -> float:
         digits = mantissa[:]
     if not digits:
         digits = "0"
-    value = float(int(digits, 10))
-    if frac_len > 0:
-        value = value / _pow10f_lift(frac_len)
-    if exp > 0:
-        value = value * _pow10f_lift(exp)
-    elif exp < 0:
-        value = value / _pow10f_lift(-exp)
+    # value = int(digits) * 10**(exp - frac_len), scaled in EXACT integer space
+    # for the common range (the old repeated float-mult lost precision:
+    # 1e100 -> 1.0000000000000006e+100). Stay within the double range so float()
+    # never raises; extreme tails fall back to the graceful float-mult.
+    # Mirrors _parse_float_literal in py_parse.py.
+    m = int(digits, 10)
+    net = exp - frac_len
+    ndig = len(digits)
+    if net >= 0 and ndig + net <= 308:
+        return float(m * _pow10i_lift(net))
+    if net < 0 and ndig <= 308 and -net <= 308:
+        return float(m) / float(_pow10i_lift(-net))
+    value = float(m)
+    if net > 0:
+        value = value * _pow10f_lift(net)
+    elif net < 0:
+        value = value / _pow10f_lift(-net)
     return value
 
 
@@ -362,6 +384,8 @@ class _Lifter:
             kind, name, ann, default = param
         kmap = {
             "pos": "pos",
+            "pos_only": "pos_only",
+            "kw_only": "kw_only",
             "*args": "*args",
             "**kwargs": "**kwargs",
             "pos-only-sep": "pos_only",
@@ -694,12 +718,7 @@ class _Lifter:
         k = 1
         while k < len(s):
             c = s[k]
-            ok = (
-                c == "_"
-                or ("a" <= c <= "z")
-                or ("A" <= c <= "Z")
-                or ("0" <= c <= "9")
-            )
+            ok = c == "_" or ("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9")
             if not ok:
                 return False
             k += 1
@@ -737,13 +756,11 @@ class _Lifter:
                     j += 1
                 if j >= n:
                     return None
-                field = spec_text[i + 1:j].strip()
+                field = spec_text[i + 1 : j].strip()
                 if not self._spec_field_is_ident(field):
                     return None
                 if lit:
-                    parts.append(
-                        pa.StrLit(span, pa.StrType("str"), "".join(lit))
-                    )
+                    parts.append(pa.StrLit(span, pa.StrType("str"), "".join(lit)))
                     lit = []
                 parts.append(
                     pa.Call(
@@ -855,17 +872,26 @@ class _Lifter:
             self.lift_expr(e.rhs),
         )
 
-    def _e_BoolOp(self, e: pp._BoolOp) -> pa.BoolExpr:
-        # pcc AST models BoolExpr as binary — fold left for 3+ operands.
+    def _e_BoolOp(self, e: pp._BoolOp) -> pa.Expr:
         vals = []
         for v in e.values:
             vals.append(self.lift_expr(v))
         span = self._span(e.line)
-        node = vals[0]
         op = _node_op(e.op)
-        for rhs in vals[1:]:
-            node = pa.BoolExpr(span, _DYN, op, node, rhs)
-        return node
+        return self._build_balanced_bool_expr(vals, span, op)
+
+    def _build_balanced_bool_expr(
+        self,
+        values: list[pa.Expr],
+        span: pa.SourceSpan,
+        op: str,
+    ) -> pa.Expr:
+        if len(values) == 1:
+            return values[0]
+        mid = len(values) // 2
+        left = self._build_balanced_bool_expr(values[:mid], span, op)
+        right = self._build_balanced_bool_expr(values[mid:], span, op)
+        return pa.BoolExpr(span, _DYN, op, left, right)
 
     def _e_Call(self, e: pp._Call) -> pa.Call:
         args: list[pa.Expr] = []
@@ -1074,14 +1100,10 @@ _TYPE_NAME_MAP = {
     "None": pa.NoneType("None"),
     "object": _DYN,
     "Any": _DYN,
-    # Tag set/frozenset annotations with their container shape so
-    # ``_is_native_set_dyn`` and similar codegen-side dispatch can
-    # recognize ``acc: set`` parameters as set-typed receivers.
-    # ``DynType(name="dyn")`` is the type-level identity; the ``set``/
-    # ``frozenset`` names here are pure dispatch hints and don't change
-    # subtyping semantics.
-    "set": pa.DynType("set"),
-    "frozenset": pa.DynType("frozenset"),
+    # Preserve the mutable/immutable container projection at parse time.
+    # Type inference still canonicalizes older DynType(name=...) snapshots.
+    "set": pa.SetType("set", _DYN),
+    "frozenset": pa.SetType("frozenset", _DYN),
 }
 
 
@@ -1129,6 +1151,19 @@ def _lift_type(node) -> pa.Type:
         if base_name:
             if base_name in ("list", "List"):
                 return pa.ListType("list", _lift_type(node.idx))
+            if base_name == "array":
+                inner = node.idx
+                if not isinstance(inner, pp._Tuple) or len(inner.elems) != 2:
+                    return pa.ValueArrayType("pcc.array", _DYN, -1)
+                element_node = inner.elems[0]
+                length_node = inner.elems[1]
+                if not isinstance(length_node, pp._Num) or not length_node.is_int:
+                    return pa.ValueArrayType("pcc.array", _lift_type(element_node), -2)
+                return pa.ValueArrayType(
+                    "pcc.array",
+                    _lift_type(element_node),
+                    int(length_node.text, 0),
+                )
             if base_name in ("tuple", "Tuple"):
                 inner = node.idx
                 # ``tuple[T, ...]`` — homogeneous variadic tuple.
@@ -1160,7 +1195,12 @@ def _lift_type(node) -> pa.Type:
                         "dict", _lift_type(inner.elems[0]), _lift_type(inner.elems[1])
                     )
             if base_name in ("set", "Set", "frozenset", "FrozenSet"):
-                return pa.DynType("set")
+                name = (
+                    "frozenset"
+                    if base_name in ("frozenset", "FrozenSet")
+                    else "set"
+                )
+                return pa.SetType(name, _lift_type(node.idx))
             if base_name == "Optional":
                 # PEP 484 ``Optional[T]`` ≡ ``T | None``. We unwrap
                 # ``Optional[<non-primitive>]`` (class shells, ir.X,

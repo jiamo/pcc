@@ -150,16 +150,26 @@ class NativeVirtualThreadLoweringMixin:
                 name=self._fresh(f"vthread.slot.{idx}"),
             )
             loaded_slots.append(slot_obj)
-            bind_ty = formal.annotation or DynType(name="dyn")
-            call_args.append(
-                marshal.marshal_from_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    slot_obj,
-                    bind_ty,
+            if isinstance(fn.args[idx].type, ir.PointerType):
+                # The spawned function was lowered with the boxed (ptr) calling
+                # convention — it is passed to vt.spawn as a first-class value,
+                # so its params are boxed PyObjects, not the annotation's native
+                # scalar. Hand it the boxed slot object directly; unboxing to
+                # i64/double/i1 here would pass a scalar where a ptr is declared
+                # (an LLVM type error). The callee borrows the boxed arg; the
+                # resume owns the slots and releases them after the call below.
+                call_args.append(slot_obj)
+            else:
+                bind_ty = formal.annotation or DynType(name="dyn")
+                call_args.append(
+                    marshal.marshal_from_object(
+                        self.builder,
+                        self.module,
+                        self.runtime,
+                        slot_obj,
+                        bind_ty,
+                    )
                 )
-            )
 
         ret_ty = ast_func_def.return_ty
         if ret_ty is None or isinstance(ret_ty, NoneType):
@@ -175,6 +185,12 @@ class NativeVirtualThreadLoweringMixin:
 
         if ret_ty is None or isinstance(ret_ty, NoneType):
             result_obj = self._emit_none_literal()
+        elif isinstance(result_val.type, ir.PointerType):
+            # Boxed-convention worker already returns a boxed PyObject; pass it
+            # straight to py_virtual_thread_complete. Re-boxing via
+            # marshal_to_object would treat the ptr as the annotation's native
+            # scalar (e.g. ptrtoint of an int box), corrupting the result.
+            result_obj = result_val
         else:
             result_obj = marshal.marshal_to_object(
                 self.builder,

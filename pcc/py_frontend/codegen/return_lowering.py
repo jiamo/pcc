@@ -1,4 +1,5 @@
 """Return-statement lowering for L1CodeGen."""
+
 from __future__ import annotations
 
 import os
@@ -17,18 +18,10 @@ class ReturnLoweringMixin:
             return
         mod_name = self.ast_module.name or "<module>"
         func_name = (
-            self.current_func_def.name
-            if self.current_func_def is not None
-            else "<top>"
+            self.current_func_def.name if self.current_func_def is not None else "<top>"
         )
         sys.stderr.write(
-            "[pcc.codegen] "
-            + mod_name
-            + ":"
-            + func_name
-            + ":return "
-            + label
-            + "\n"
+            "[pcc.codegen] " + mod_name + ":" + func_name + ":return " + label + "\n"
         )
 
     def _emit_pending_finally_blocks(self) -> None:
@@ -80,9 +73,8 @@ class ReturnLoweringMixin:
                 return True
         if self._expr_returns_owned_object(expr):
             return False
-        if (
-            getattr(self, "_module_has_c_abi_export", False)
-            and getattr(self, "_module_uses_raw_int_scaffold", False)
+        if getattr(self, "_module_has_c_abi_export", False) and getattr(
+            self, "_module_uses_raw_int_scaffold", False
         ):
             return False
         expr_ty = getattr(expr, "ty", None)
@@ -94,9 +86,77 @@ class ReturnLoweringMixin:
         value: ir.Value,
         stmt: Return,
     ) -> ir.Value:
+        if getattr(self, "_suppress_borrowed_return_retain", False):
+            return value
         if not self._return_value_needs_retain(value, stmt):
             return value
         return self._gc_retain(value, name=self._fresh("ret.retain"))
+
+    def _return_value_needs_cleanup_root(
+        self,
+        value: ir.Value,
+        stmt: Return,
+        *,
+        force_object: bool = False,
+    ) -> bool:
+        if getattr(self, "_suppress_implicit_gc_roots", False):
+            return False
+        mod_name = self.ast_module.name or ""
+        if mod_name.startswith("pcc.py_runtime.py."):
+            return False
+        if stmt.value is None:
+            return False
+        if not isinstance(value.type, ir.PointerType):
+            return False
+        if value in getattr(self, "_cpy_values", ()):
+            return False
+        if self._expr_returns_unsafe_raw_pointer(stmt.value):
+            return False
+        if force_object:
+            return True
+        expr_ty = getattr(stmt.value, "ty", None)
+        ret_decl_ty = getattr(self.current_func_def, "return_ty", None)
+        return self._is_object(expr_ty) or self._is_object(ret_decl_ty)
+
+    def _enter_return_cleanup_root(
+        self,
+        value: ir.Value,
+        stmt: Return,
+        *,
+        force_object: bool = False,
+    ):
+        if not self._return_value_needs_cleanup_root(
+            value,
+            stmt,
+            force_object=force_object,
+        ):
+            return None, None
+        slot = self.builder.alloca(value.type, name=self._fresh("ret.tmp.root"))
+        self.builder.store(ir.Constant(value.type, None), slot)
+        slot_ptr = self._as_gc_ptr(slot, name=self._fresh("ret.tmp.root.ptr"))
+        self.builder.call(self.runtime["pcc_gc_store_root"], [slot_ptr, value])
+        self._emit_current_gc_frame_enter_lifo(self._gc_one_slot_frame_map(), slot)
+        return slot, slot_ptr
+
+    def _leave_return_cleanup_root(
+        self,
+        value: ir.Value,
+        slot: ir.Value,
+        slot_ptr: ir.Value,
+    ) -> ir.Value:
+        if slot is None or slot_ptr is None:
+            return value
+        current = self.builder.call(
+            self.runtime["pcc_gc_load_ptr"],
+            [ir.Constant(value.type, None), slot_ptr],
+            name=self._fresh("ret.tmp.current"),
+        )
+        self.builder.call(
+            self.runtime["pcc_gc_store_root"],
+            [slot_ptr, ir.Constant(value.type, None)],
+        )
+        self._emit_gc_frame_leave_lifo_for_slot(slot)
+        return current
 
     def _emit_return(self, stmt: Return) -> None:
         self._return_log("begin")
@@ -135,7 +195,9 @@ class ReturnLoweringMixin:
             self._return_log("bare nonvoid cleanup")
             self._emit_owned_local_cleanup()
             if isinstance(ret_ty, ir.PointerType):
-                self.builder.ret(ir.Constant(ret_ty, None))
+                # A bare Python return is a successful ``None`` result. NULL
+                # is reserved for the C-API failure sentinel.
+                self.builder.ret(self._emit_none_literal())
             elif isinstance(ret_ty, ir.IntType):
                 self.builder.ret(ir.Constant(ret_ty, 0))
             elif isinstance(ret_ty, (ir.FloatType, ir.DoubleType)):
@@ -171,22 +233,65 @@ class ReturnLoweringMixin:
                 self._return_log("exact int terminated")
                 return
             skip_name = stmt.value.ident if isinstance(stmt.value, Name) else None
+            ret_root_slot, ret_root_ptr = self._enter_return_cleanup_root(
+                value,
+                stmt,
+                force_object=True,
+            )
             self._return_log("exact int cleanup")
             self._emit_owned_local_cleanup(skip_name=skip_name)
+            value = self._leave_return_cleanup_root(
+                value,
+                ret_root_slot,
+                ret_root_ptr,
+            )
             self.builder.ret(value)
             self._return_log("exact int end")
             return
         self._return_log("value emit expr")
+        valueclass_target_ty = self.current_func_def.return_ty
+        if not self._is_valueclass_payload_type(
+            valueclass_target_ty
+        ) and self._is_valueclass_payload_type(stmt.value.ty):
+            valueclass_target_ty = stmt.value.ty
         valueclass_payload = self._maybe_emit_valueclass_constructor_payload(
-            self.current_func_def.return_ty,
+            valueclass_target_ty,
             stmt.value,
         )
+        valueclass_payload_fields_owned = False
         if valueclass_payload is not None:
             value = valueclass_payload
+            valueclass_payload_fields_owned = (
+                self._valueclass_payload_expr_fields_are_owned(stmt.value)
+            )
+        elif isinstance(stmt.value, Name) and self._name_returns_owned_function_value(
+            stmt.value.ident
+        ):
+            value = self._emit_expr_with_native_callable_values(stmt.value)
         else:
             value = self._emit_expr(stmt.value)
         self._return_log("value coerce")
-        value = self._coerce(value, stmt.value.ty, self.current_func_def.return_ty)
+        if (
+            self._is_valueclass_payload_type(valueclass_target_ty)
+            and isinstance(ret_ty, ir.PointerType)
+            and self._is_object(self.current_func_def.return_ty)
+            and not isinstance(value.type, ir.PointerType)
+        ):
+            boxed_valueclass = self._emit_valueclass_payload_to_object(
+                value,
+                valueclass_target_ty,
+                consume_fields=valueclass_payload_fields_owned,
+            )
+            if boxed_valueclass is not None:
+                value = boxed_valueclass
+            else:
+                value = self._coerce(
+                    value,
+                    stmt.value.ty,
+                    self.current_func_def.return_ty,
+                )
+        else:
+            value = self._coerce(value, stmt.value.ty, self.current_func_def.return_ty)
         if value.type != ret_ty:
             self._return_log("value fix ret type")
             if isinstance(ret_ty, ir.IntType) and isinstance(value.type, ir.IntType):
@@ -226,8 +331,10 @@ class ReturnLoweringMixin:
             self._return_log("value terminated")
             return
         skip_name = stmt.value.ident if isinstance(stmt.value, Name) else None
+        ret_root_slot, ret_root_ptr = self._enter_return_cleanup_root(value, stmt)
         self._return_log("value cleanup")
         self._emit_owned_local_cleanup(skip_name=skip_name)
+        value = self._leave_return_cleanup_root(value, ret_root_slot, ret_root_ptr)
         self._return_log("value ret")
         self.builder.ret(value)
         self._return_log("value end")

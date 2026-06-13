@@ -1,4 +1,5 @@
 """Pure support helpers and static metadata for layer1 codegen."""
+
 from __future__ import annotations
 
 from dataclasses import replace as _replace
@@ -42,6 +43,7 @@ from ..py_ast import (
     Lambda,
     ListExpr,
     ListType,
+    SetType,
     MemoryViewType,
     Module,
     Name,
@@ -62,6 +64,7 @@ from ..py_ast import (
     TupleType,
     Type,
     UnaryOp,
+    ValueArrayType,
     ValueClassType,
     While,
     With,
@@ -69,6 +72,7 @@ from ..py_ast import (
 
 _Import = Import
 _ImportFrom = ImportFrom
+
 
 def _import_names_from_stmt(stmt):
     """Return ``((mod_name, as_name), ...)`` preserving ``as_name=None``
@@ -91,10 +95,12 @@ def _import_names_from_stmt(stmt):
         elif isinstance(raw_name, (tuple, list)) and len(raw_name) >= 1:
             pairs.append((raw_name[0], None))
         elif hasattr(raw_name, "asname") or hasattr(raw_name, "name"):
-            pairs.append((
-                getattr(raw_name, "name", None),
-                getattr(raw_name, "asname", None),
-            ))
+            pairs.append(
+                (
+                    getattr(raw_name, "name", None),
+                    getattr(raw_name, "asname", None),
+                )
+            )
         elif isinstance(raw_name, str):
             pairs.append((raw_name, None))
     return tuple(pairs)
@@ -225,6 +231,8 @@ _PY_AST_STATIC_CLASS_FIELDS = {
     "ByteArrayType": ("name",),
     "MemoryViewType": ("name",),
     "ListType": ("name", "elem"),
+    "SetType": ("name", "elem"),
+    "ValueArrayType": ("name", "elem", "length"),
     "DictType": ("name", "key", "value"),
     "TupleType": ("name", "elems"),
     "FuncType": ("name", "params", "ret"),
@@ -326,6 +334,132 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
     "pcc.py_frontend.py_ast_contract": {
         "PY_AST_FIELD_NAME_OVERRIDES": _dict_str_dyn_global_export(),
     },
+    # ``cli_bootstrap.py`` imports the shared parser choices from this module.
+    # Keep the standalone fallback probe on the same static surface as the
+    # closed-world pcc1 build.
+    "pcc.cli_contract": {
+        "BACKEND_CHOICES": _string_tuple_global_export(),
+        "PYTHON_LIBPYTHON_CHOICES": _string_tuple_global_export(),
+        "IR_SCAFFOLD_CHOICES": _string_tuple_global_export(),
+        "DIAGNOSTIC_FORMAT_CHOICES": _string_tuple_global_export(),
+        "DEFAULT_EMIT_LL": _str_constant_export("__PCC_DEFAULT_LL__"),
+    },
+    # ``cli_bootstrap.py`` consumes this self-host-safe package contract in
+    # standalone as well as closed-world builds.  Keep the imported constants
+    # and helpers native in the raw per-module probe; otherwise every call is
+    # inferred as ``Dyn`` and silently reintroduces ``py_cpy_*`` despite the
+    # same two modules compiling cleanly together.
+    "pcc.package_schema": {
+        "PACKAGE_MANIFEST_SCHEMA": _str_constant_export("pcc.package-manifest.v1"),
+        "PACKAGE_MANIFEST_SCHEMA_VERSION": {
+            "kind": "constant",
+            "value_kind": "int",
+            "value": 1,
+        },
+        "PCC_CAPI_HEADERS": _string_tuple_global_export(),
+        "campaign_profile": _function_export(
+            ("dyn",),
+            (("str",),),
+            (_export_arg("name", ("str",)),),
+        ),
+        "capability_profile": _function_export(
+            ("dict", ("str",), ("dyn",)),
+            (("str",), ("bool",), ("bool",), ("bool",)),
+            (
+                _export_arg("abi_mode", ("str",)),
+                _export_arg("has_artifact_scan", ("bool",)),
+                _export_arg("links_libpython", ("bool",)),
+                _export_arg("uses_cpython_extension_abi", ("bool",)),
+            ),
+        ),
+        "pcc_native_extension_suffix": _function_export(
+            ("str",),
+            (("str",),),
+            (_export_arg("platform_tag", ("str",)),),
+        ),
+        "pcc_native_wheel_tag": _function_export(
+            ("str",),
+            (("str",),),
+            (_export_arg("platform_tag", ("str",)),),
+        ),
+        "wheel_tag_fields": _function_export(
+            ("list", ("str",)),
+            (("str",),),
+            (_export_arg("path", ("str",)),),
+        ),
+    },
+    # The strict AArch64 self path is linked into pcc1 and called in-process;
+    # these three signatures keep pipeline.py's independent diagnostic probe
+    # on the same native edge as the real closed-world compiler.
+    "pcc.backend.self_backend_aarch64_darwin": {
+        "emit_aarch64_darwin_asm": _function_export(
+            ("str",),
+            (("str",), ("bool",)),
+            (
+                _export_arg("ir_text", ("str",)),
+                _export_arg("optimize", ("bool",)),
+            ),
+        ),
+    },
+    "pcc.backend.self_backend_parse": {
+        "parse_self_backend_target_triple": _function_export(
+            ("str",),
+            (("str",),),
+            (_export_arg("ir_text", ("str",)),),
+        ),
+    },
+    # Self-backend lowering helpers are imported by independently compiled
+    # emitter modules as well as the closed-world compiler. Keep their raw
+    # per-module calls native so correctness hardening does not grow the
+    # libpython fallback surface.
+    "pcc.backend.self_backend_ir": {
+        "_align_to": _function_export(
+            ("int",),
+            (("int",), ("int",)),
+            (
+                _export_arg("value", ("int",)),
+                _export_arg("alignment", ("int",)),
+            ),
+        ),
+        "_dot_numeric_text_key_id": _function_export(
+            ("int",),
+            (("str",),),
+            (_export_arg("text", ("str",)),),
+        ),
+        "text_key_mapping_get": _function_export(
+            ("dyn",),
+            (("dyn",), ("str",)),
+            (
+                _export_arg("mapping", ("dyn",)),
+                _export_arg("key", ("str",)),
+            ),
+        ),
+        "parsed_function_value_slot": _function_export(
+            ("dyn",),
+            (("dyn",), ("str",)),
+            (
+                _export_arg("func", ("dyn",)),
+                _export_arg("key", ("str",)),
+            ),
+        ),
+    },
+    "pcc.backend.self_backend_target_match": {
+        "is_aarch64_darwin_triple": _function_export(
+            ("bool",),
+            (("str",),),
+            (_export_arg("triple", ("str",)),),
+        ),
+    },
+    # ``class_gen._builtin_exception_tag_for_base_name`` calls the shared
+    # exception-tag metadata helper; without a static export the standalone
+    # per-module compile bridges it via py_cpy_import/getattr/call.
+    "pcc.py_frontend.codegen.builtin_exceptions": {
+        "builtin_exc_tag_or_missing": _function_export(
+            ("int",),
+            (("str",),),
+            (_export_arg("name", ("str",)),),
+        ),
+    },
     "pcc.llvm_capi.ir": {
         "IRBuilder_current_instruction_count": _function_export(
             ("int",),
@@ -408,9 +542,7 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                     "kind": "instance",
                     "return_ty": ("dyn",),
                     "param_types": (("dyn",),),
-                    "call_sig": (
-                        _export_arg("self"),
-                    ),
+                    "call_sig": (_export_arg("self"),),
                     "box_int_abi": False,
                 },
             ),
@@ -472,14 +604,17 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
     "pcc.parse.py_parse": dict(
         [
             ("ParseError", _class_export("ParseError")),
-            ("parse", _function_export(
-                ("dyn",),
-                (("str",), ("str",)),
-                (
-                    _export_arg("src", ("str",)),
-                    _export_arg("filename", ("str",), has_default=True),
+            (
+                "parse",
+                _function_export(
+                    ("dyn",),
+                    (("str",), ("str",)),
+                    (
+                        _export_arg("src", ("str",)),
+                        _export_arg("filename", ("str",), has_default=True),
+                    ),
                 ),
-            )),
+            ),
         ]
         + [
             (name, _class_export(name, fields))
@@ -498,59 +633,70 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 #    for c in [getattr(pp, n)]
                 #    if isinstance(c, type) and dataclasses.is_dataclass(c)
                 #    and len(n) > 1 and n[0] == '_' and n[1].isupper()]"
-                ("_Assert", ('test', 'msg', 'line')),
-                ("_Assign", ('target', 'value', 'annotation', 'line')),
-                ("_Attr", ('obj', 'name', 'line')),
-                ("_AugAssign", ('target', 'op', 'value', 'line')),
-                ("_Await", ('value', 'line')),
-                ("_BinOp", ('op', 'lhs', 'rhs', 'line')),
-                ("_Bool", ('value', 'line')),
-                ("_BoolOp", ('op', 'values', 'line')),
-                ("_Break", ('line',)),
-                ("_Bytes", ('parts', 'line')),
-                ("_Call", ('func', 'args', 'line')),
-                ("_ClassDef", ('name', 'bases', 'body', 'decorators', 'line')),
-                ("_Comp", ('kind', 'elt', 'generators', 'line')),
-                ("_Compare", ('op', 'lhs', 'rhs', 'line')),
-                ("_ComplexNum", ('text', 'line')),
-                ("_Continue", ('line',)),
-                ("_Del", ('targets', 'line')),
-                ("_Dict", ('keys', 'values', 'line')),
-                ("_DictCompElt", ('key', 'value', 'line')),
-                ("_Expr", ('expr', 'line')),
-                ("_FString", ('parts', 'line')),
-                ("_FStringExprParts", ('expr', 'conversion', 'spec')),
-                ("_FStringFormat", ('expr', 'conversion', 'spec', 'line')),
-                ("_FStringText", ('text', 'is_raw', 'line')),
-                ("_For", ('target', 'iter', 'body', 'else_body', 'line', 'is_async')),
-                ("_FuncDef", ('name', 'params', 'body', 'line', 'decorators', 'returns', 'is_async')),
-                ("_Global", ('names', 'line')),
-                ("_If", ('cond', 'body', 'else_body', 'line')),
-                ("_Import", ('names', 'line')),
-                ("_ImportFrom", ('module', 'names', 'level', 'line')),
-                ("_Lambda", ('params', 'body', 'line')),
-                ("_List", ('elems', 'line')),
-                ("_MatchAs", ('pattern', 'name', 'line')),
-                ("_Module", ('body',)),
-                ("_Name", ('ident', 'line')),
-                ("_None", ('line',)),
-                ("_Nonlocal", ('names', 'line')),
-                ("_Num", ('text', 'line', 'is_int')),
-                ("_Pass", ('line',)),
-                ("_Raise", ('exc', 'cause', 'line')),
-                ("_Return", ('value', 'line')),
-                ("_Set", ('elems', 'line')),
-                ("_Slice", ('lo', 'hi', 'step', 'line')),
-                ("_Starred", ('value', 'is_kw', 'line')),
-                ("_Str", ('parts', 'line')),
-                ("_Subscript", ('obj', 'idx', 'line')),
-                ("_Ternary", ('then_expr', 'cond', 'else_expr', 'line')),
-                ("_Try", ('body', 'handlers', 'else_body', 'finally_body', 'line')),
-                ("_Tuple", ('elems', 'line')),
-                ("_UnaryOp", ('op', 'operand', 'line')),
-                ("_While", ('cond', 'body', 'else_body', 'line')),
-                ("_With", ('items', 'body', 'line', 'is_async')),
-                ("_Yield", ('value', 'is_from', 'line')),
+                ("_Assert", ("test", "msg", "line")),
+                ("_Assign", ("target", "value", "annotation", "line")),
+                ("_Attr", ("obj", "name", "line")),
+                ("_AugAssign", ("target", "op", "value", "line")),
+                ("_Await", ("value", "line")),
+                ("_BinOp", ("op", "lhs", "rhs", "line")),
+                ("_Bool", ("value", "line")),
+                ("_BoolOp", ("op", "values", "line")),
+                ("_Break", ("line",)),
+                ("_Bytes", ("parts", "line")),
+                ("_Call", ("func", "args", "line")),
+                ("_ClassDef", ("name", "bases", "body", "decorators", "line")),
+                ("_Comp", ("kind", "elt", "generators", "line")),
+                ("_Compare", ("op", "lhs", "rhs", "line")),
+                ("_ComplexNum", ("text", "line")),
+                ("_Continue", ("line",)),
+                ("_Del", ("targets", "line")),
+                ("_Dict", ("keys", "values", "line")),
+                ("_DictCompElt", ("key", "value", "line")),
+                ("_Expr", ("expr", "line")),
+                ("_FString", ("parts", "line")),
+                ("_FStringExprParts", ("expr", "conversion", "spec")),
+                ("_FStringFormat", ("expr", "conversion", "spec", "line")),
+                ("_FStringText", ("text", "is_raw", "line")),
+                ("_For", ("target", "iter", "body", "else_body", "line", "is_async")),
+                (
+                    "_FuncDef",
+                    (
+                        "name",
+                        "params",
+                        "body",
+                        "line",
+                        "decorators",
+                        "returns",
+                        "is_async",
+                    ),
+                ),
+                ("_Global", ("names", "line")),
+                ("_If", ("cond", "body", "else_body", "line")),
+                ("_Import", ("names", "line")),
+                ("_ImportFrom", ("module", "names", "level", "line")),
+                ("_Lambda", ("params", "body", "line")),
+                ("_List", ("elems", "line")),
+                ("_MatchAs", ("pattern", "name", "line")),
+                ("_Module", ("body",)),
+                ("_Name", ("ident", "line")),
+                ("_None", ("line",)),
+                ("_Nonlocal", ("names", "line")),
+                ("_Num", ("text", "line", "is_int")),
+                ("_Pass", ("line",)),
+                ("_Raise", ("exc", "cause", "line")),
+                ("_Return", ("value", "line")),
+                ("_Set", ("elems", "line")),
+                ("_Slice", ("lo", "hi", "step", "line")),
+                ("_Starred", ("value", "is_kw", "line")),
+                ("_Str", ("parts", "line")),
+                ("_Subscript", ("obj", "idx", "line")),
+                ("_Ternary", ("then_expr", "cond", "else_expr", "line")),
+                ("_Try", ("body", "handlers", "else_body", "finally_body", "line")),
+                ("_Tuple", ("elems", "line")),
+                ("_UnaryOp", ("op", "operand", "line")),
+                ("_While", ("cond", "body", "else_body", "line")),
+                ("_With", ("items", "body", "line", "is_async")),
+                ("_Yield", ("value", "is_from", "line")),
             )
         ]
     ),
@@ -589,6 +735,13 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
     },
     "pcc.py_frontend.codegen.errors": {
         "L1CodegenError": _class_export("L1CodegenError"),
+        "CodegenDiagnosticError": _class_export("CodegenDiagnosticError"),
+    },
+    "pcc.diagnostics": {
+        "DiagnosticSpan": _class_export(
+            "DiagnosticSpan",
+            ("file", "line", "col", "end_line", "end_col"),
+        ),
     },
     "pcc.py_frontend.codegen.user_function_lowering": {
         "_low_ir_emit_function_to_llvm": _function_export(
@@ -616,6 +769,13 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (),
         ),
     },
+    "pcc.cli_bootstrap_array_core": {
+        "_run_native_package_array_core_from_pcc1": _function_export(
+            ("int",),
+            (("dyn",),),
+            (_export_arg("module_args", ("dyn",)),),
+        ),
+    },
     # ``pcc/cli_bootstrap.py`` reaches into pipeline for the two
     # entry points it actually calls.  Static exports here avoid the
     # standalone per-module ``py_cpy_import + py_cpy_getattr`` for
@@ -627,9 +787,16 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
         "compile_python": _function_export(
             ("dyn",),
             (
-                ("str",), ("str",),
-                ("dyn",), ("dyn",), ("dyn",), ("dyn",),
-                ("dyn",), ("dyn",), ("dyn",), ("dyn",),
+                ("str",),
+                ("str",),
+                ("dyn",),
+                ("dyn",),
+                ("dyn",),
+                ("dyn",),
+                ("dyn",),
+                ("dyn",),
+                ("dyn",),
+                ("dyn",),
             ),
             (
                 _export_arg("src_path", ("str",)),
@@ -805,9 +972,7 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
     },
     "pcc.py_frontend.codegen.host_contract": {
         "PROBE_POLICY_STANDALONE": _str_constant_export("standalone"),
-        "PROBE_POLICY_CONTEXTUAL_MIXIN": _str_constant_export(
-            "contextual-mixin"
-        ),
+        "PROBE_POLICY_CONTEXTUAL_MIXIN": _str_constant_export("contextual-mixin"),
         "L1_CODEGEN_HOST_CLASS": _str_constant_export(
             "pcc.py_frontend.codegen.layer1.L1CodeGen"
         ),
@@ -839,9 +1004,7 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
         "COMPILE_TIME_ONLY_IMPORT_FROMS": _dict_str_dyn_global_export(),
         "COMPILE_TIME_ONLY_MODULES": _string_tuple_global_export(),
         "EXTERN_SCAFFOLD_MODULES": _string_tuple_global_export(),
-        "IR_RUNTIME_COMPAT_MODULE": _str_constant_export(
-            "pcc.llvm_capi.compat"
-        ),
+        "IR_RUNTIME_COMPAT_MODULE": _str_constant_export("pcc.llvm_capi.compat"),
         "TEST_FACADE_IMPORT_MODULES": _string_tuple_global_export(),
         "UNSAFE_SCAFFOLD_MODULES": _string_tuple_global_export(),
     },
@@ -1164,11 +1327,15 @@ _PCC_FRONTEND_STATIC_NATIVE_MODULES = frozenset(
         "pcc.py_frontend.type_infer",
         "pcc.py_frontend.types",
         "pcc.cli_bootstrap",
+        "pcc.cli_bootstrap_array_core",
         "pcc.py_frontend.codegen._l1_codegen_static_methods",
+        "pcc.backend.self_backend_aarch64_darwin_flow",
+        "pcc.backend.self_backend_stackprep",
         "pcc.parse.py_lex",
         "pcc.parse.py_lift",
         "pcc.parse.py_parse",
         "pcc.py_frontend.export_meta",
+        "pcc.package_schema",
         "pcc.__main__",
     }
 )
@@ -1221,17 +1388,20 @@ def _default_native_module_exports(module_name: str | None):
         or module_name == "pcc.py_frontend.type_infer"
         or module_name == "pcc.py_frontend.types"
         or module_name == "pcc.cli_bootstrap"
+        or module_name == "pcc.cli_bootstrap_array_core"
         or module_name == "pcc.py_frontend.codegen._l1_codegen_static_methods"
+        or module_name == "pcc.backend.self_backend_aarch64_darwin_flow"
+        or module_name == "pcc.backend.self_backend_stackprep"
         or module_name == "pcc.__main__"
         or module_name == "pcc.parse.py_lex"
         or module_name == "pcc.parse.py_lift"
         or module_name == "pcc.parse.py_parse"
         or module_name == "pcc.py_frontend.export_meta"
+        or module_name == "pcc.package_schema"
+        or module_name == "pcc.cli_contract"
     ):
         return None
     return _PCC_FRONTEND_STATIC_NATIVE_EXPORTS
-
-
 
 
 def _maybe_fold_str_to_float(s: str):
@@ -1374,6 +1544,10 @@ def _dataclass_field_names(obj):
         return ("name",)
     if isinstance(obj, ListType):
         return ("name", "elem")
+    if isinstance(obj, SetType):
+        return ("name", "elem")
+    if isinstance(obj, ValueArrayType):
+        return ("name", "elem", "length")
     if isinstance(obj, DictType):
         return ("name", "key", "value")
     if isinstance(obj, TupleType):
@@ -1522,6 +1696,10 @@ def _type_kind_key(ty: Type) -> str:
         return "MemoryViewType"
     if isinstance(ty, ListType):
         return "ListType"
+    if isinstance(ty, SetType):
+        return "SetType"
+    if isinstance(ty, ValueArrayType):
+        return "ValueArrayType"
     if isinstance(ty, DictType):
         return "DictType"
     if isinstance(ty, TupleType):

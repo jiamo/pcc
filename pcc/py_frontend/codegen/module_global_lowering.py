@@ -1,4 +1,5 @@
 """Module-global and top-level prescan helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
@@ -14,10 +15,12 @@ from ..py_ast import (
     Import,
     ImportFrom,
     IntType,
+    ListExpr,
     Name,
     Stmt,
     Try,
     Type,
+    TupleExpr,
     While,
     With,
 )
@@ -27,8 +30,9 @@ from .import_lowering import (
 )
 from .layer1_support import _import_from_module_or_empty
 
-
 _I8 = ir.IntType(8)
+_I1 = ir.IntType(1)
+_I32 = ir.IntType(32)
 _CSTR = _I8.as_pointer()
 
 
@@ -43,10 +47,12 @@ def _import_names_from_stmt(stmt):
         elif isinstance(raw_name, (tuple, list)) and len(raw_name) >= 1:
             pairs.append((raw_name[0], None))
         elif hasattr(raw_name, "asname") or hasattr(raw_name, "name"):
-            pairs.append((
-                getattr(raw_name, "name", None),
-                getattr(raw_name, "asname", None),
-            ))
+            pairs.append(
+                (
+                    getattr(raw_name, "name", None),
+                    getattr(raw_name, "asname", None),
+                )
+            )
         elif isinstance(raw_name, str):
             pairs.append((raw_name, None))
     return tuple(pairs)
@@ -93,6 +99,8 @@ def _zero_initializer_for(ir_ty):
         return 0.0
     if isinstance(ir_ty, ir.PointerType):
         return None
+    if isinstance(ir_ty, ir.LiteralStructType):
+        return tuple(_zero_initializer_for(elem_ty) for elem_ty in ir_ty.elements)
     return 0
 
 
@@ -159,6 +167,21 @@ class ModuleGlobalLoweringMixin:
                         s,
                         self._resolve_relative_import(s),
                     ):
+                        continue
+                    resolved_extension = self._resolve_relative_import(s)
+                    if (
+                        self._resolve_pcc_native_extension_path(resolved_extension)
+                        is not None
+                    ):
+                        for attr_name, as_name in _import_names_from_stmt(s):
+                            if attr_name == "*":
+                                self._native_extension_star_module_global(
+                                    resolved_extension
+                                )
+                                continue
+                            local_name = as_name or attr_name
+                            gv = self._native_extension_module_global(local_name)
+                            self._native_extension_modules()[local_name] = gv
                         continue
                     # Multi-file native cross-module pre-declare —
                     # mirror generation_lowering.py:315-367's top-level
@@ -237,7 +260,8 @@ class ModuleGlobalLoweringMixin:
                     if self._is_test_facade_import_module(mod_name):
                         continue
                     if (
-                        mod_name.split(".")[0] in ("__future__", "typing", "abc", "click")
+                        mod_name.split(".")[0]
+                        in ("__future__", "typing", "abc", "click")
                         or mod_name == "pcc.extern"
                     ):
                         continue
@@ -249,7 +273,6 @@ class ModuleGlobalLoweringMixin:
                         "string",
                         "platform",
                         "subprocess",
-                        "asyncio",
                         "tempfile",
                         "fileinput",
                         "shutil",
@@ -269,6 +292,8 @@ class ModuleGlobalLoweringMixin:
                         "importlib",
                         "inspect",
                         "contextlib",
+                        "contextvars",
+                        "enum",
                         "warnings",
                         "textwrap",
                     ):
@@ -403,7 +428,11 @@ class ModuleGlobalLoweringMixin:
         existing = self._module_globals.get(name)
         if existing is not None:
             return existing
-        if not (self._is_scalar(target_ty) or self._is_object(target_ty)):
+        if not (
+            self._is_scalar(target_ty)
+            or self._is_object(target_ty)
+            or self._is_valueclass_payload_type(target_ty)
+        ):
             raise NotImplementedError(
                 f"Layer 1/2 cannot allocate module global {name!r} "
                 f"of type {type(target_ty).__name__}"
@@ -422,7 +451,26 @@ class ModuleGlobalLoweringMixin:
         )
         gv.initializer = ir.Constant(ir_ty, _zero_initializer_for(ir_ty))
         self._module_globals[name] = (gv, target_ty)
+        init_flag = ir.GlobalVariable(
+            self.module,
+            _I1,
+            name=self._module_global_symbol_name(
+                self.ast_module.name or self.module.name or "mod",
+                name + ".initialized",
+            ),
+        )
+        init_flag.initializer = ir.Constant(_I1, 0)
+        self._module_global_init_flags[name] = init_flag
         return self._module_globals[name]
+
+    def _mark_module_global_initialized(self, gv: ir.GlobalVariable) -> None:
+        for name, (candidate, _declared_ty) in self._module_globals.items():
+            if candidate is not gv:
+                continue
+            flag = self._module_global_init_flags.get(name)
+            if flag is not None:
+                self.builder.store(ir.Constant(_I1, 1), flag)
+            return
 
     def _prescan_function_module_globals(self, fd: FuncDef) -> None:
         """Seed module-global storage for names assigned under
@@ -462,7 +510,10 @@ class ModuleGlobalLoweringMixin:
                     for mod_name, as_name in s.names:
                         bound = as_name or mod_name.split(".", 1)[0]
                         if bound in global_names:
-                            if self._resolve_pcc_native_extension_path(mod_name) is not None:
+                            if (
+                                self._resolve_pcc_native_extension_path(mod_name)
+                                is not None
+                            ):
                                 gv = self._native_extension_module_global(bound)
                                 self._native_extension_modules()[bound] = gv
                                 continue
@@ -501,25 +552,44 @@ class ModuleGlobalLoweringMixin:
                     pending.append(s.body)
 
     def _declare_module_globals_for(self, stmt: Assign) -> None:
-        """Allocate a module-level global for each simple Name target of
-        a module-scope assignment so user functions can later load
-        the same binding."""
-        target_ty = stmt.annotation if stmt.annotation is not None else stmt.value.ty
-        for t in stmt.targets:
+        """Allocate globals for every name bound by a module assignment.
+
+        Tuple/list destructuring binds each leaf at module scope just like a
+        simple assignment.  Declaring only the aggregate target left those
+        leaves as function-local allocas during module initialisation, so a
+        compiled sibling module could not import them through the module
+        namespace proxy.
+        """
+        pending_targets = list(stmt.targets)
+        while pending_targets:
+            t = pending_targets.pop()
+            if isinstance(t, (TupleExpr, ListExpr)):
+                pending_targets.extend(reversed(t.elems))
+                continue
             if not isinstance(t, Name):
                 continue
-            if not (self._is_scalar(target_ty) or self._is_object(target_ty)):
+            target_ty = (
+                stmt.annotation
+                if stmt.annotation is not None and len(stmt.targets) == 1
+                else t.ty
+            )
+            if not (
+                self._is_scalar(target_ty)
+                or self._is_object(target_ty)
+                or self._is_valueclass_payload_type(target_ty)
+            ):
                 continue
             self._ensure_module_global_name(t.ident, target_ty)
+            if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], Name):
+                continue
             threading_kind = self._threading_constructor_kind_for_expr(stmt.value)
             if threading_kind is not None:
                 self._threading_env_flags[t.ident] = threading_kind
             else:
                 self._threading_env_flags.pop(t.ident, None)
-            threading_elem_kind = (
-                self._threading_list_elem_kind_for_type(target_ty)
-                or self._threading_list_elem_kind_for_expr(stmt.value)
-            )
+            threading_elem_kind = self._threading_list_elem_kind_for_type(
+                target_ty
+            ) or self._threading_list_elem_kind_for_expr(stmt.value)
             if threading_elem_kind is not None:
                 self._threading_list_elem_flags[t.ident] = threading_elem_kind
             else:
@@ -529,6 +599,11 @@ class ModuleGlobalLoweringMixin:
                 self._weak_dict_env_flags[t.ident] = weak_dict_kind
             else:
                 self._weak_dict_env_flags.pop(t.ident, None)
+            weakref_kind = self._weakref_constructor_kind_for_expr(stmt.value)
+            if weakref_kind is not None:
+                self._weakref_env_flags[t.ident] = True
+            else:
+                self._weakref_env_flags.pop(t.ident, None)
 
     def _module_global_needs_teardown(
         self,
@@ -545,14 +620,23 @@ class ModuleGlobalLoweringMixin:
         gv: ir.GlobalVariable,
         value: ir.Value,
         *,
+        declared_ty: Type | None = None,
         value_is_owned: bool = False,
         is_cpy_value: bool = False,
     ) -> None:
         if (
-            is_cpy_value
-            or not isinstance(value.type, ir.PointerType)
+            not is_cpy_value
+            and declared_ty is not None
+            and self._is_valueclass_payload_type(declared_ty)
         ):
+            self._clear_module_global_valueclass_payload_roots(gv, declared_ty)
             self.builder.store(value, gv)
+            self._refresh_module_global_valueclass_payload_roots(gv, declared_ty)
+            self._mark_module_global_initialized(gv)
+            return
+        if is_cpy_value or not isinstance(value.type, ir.PointerType):
+            self.builder.store(value, gv)
+            self._mark_module_global_initialized(gv)
             return
         old_value = self.builder.load(
             gv,
@@ -567,13 +651,90 @@ class ModuleGlobalLoweringMixin:
                 value,
             ],
         )
+        self._mark_module_global_initialized(gv)
         if value_is_owned:
             self._gc_release(value, self._release_context_label("module_store_tmp"))
+
+    def _module_global_valueclass_payload_field_slot(
+        self,
+        gv: ir.GlobalVariable,
+        field_path: tuple[int, ...],
+        *,
+        name: str,
+    ) -> ir.Value:
+        indices = [ir.Constant(_I32, 0)]
+        for idx in field_path:
+            indices.append(ir.Constant(_I32, idx))
+        return self.builder.gep(
+            gv,
+            indices,
+            inbounds=True,
+            name=self._fresh(name),
+        )
+
+    def _clear_module_global_valueclass_payload_roots(
+        self,
+        gv: ir.GlobalVariable,
+        declared_ty: Type,
+    ) -> None:
+        for path in self._valueclass_payload_pointer_field_paths(declared_ty):
+            field_slot = self._module_global_valueclass_payload_field_slot(
+                gv,
+                path,
+                name="mod.global.value.clear",
+            )
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [
+                    self._as_gc_ptr(
+                        field_slot,
+                        name=self._fresh("mod.global.value.clear.slot"),
+                    ),
+                    ir.Constant(_CSTR, None),
+                ],
+            )
+
+    def _refresh_module_global_valueclass_payload_roots(
+        self,
+        gv: ir.GlobalVariable,
+        declared_ty: Type,
+    ) -> None:
+        for path in self._valueclass_payload_pointer_field_paths(declared_ty):
+            field_slot = self._module_global_valueclass_payload_field_slot(
+                gv,
+                path,
+                name="mod.global.value.refresh",
+            )
+            value = self.builder.load(
+                field_slot,
+                name=self._fresh("mod.global.value.refresh.value"),
+            )
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [
+                    self._as_gc_ptr(
+                        field_slot,
+                        name=self._fresh("mod.global.value.refresh.slot"),
+                    ),
+                    value,
+                ],
+            )
 
     def _emit_module_global_root_enters(self) -> None:
         frame_map = self._gc_one_slot_frame_map()
         for _name, item in self._module_globals.items():
             gv, declared_ty = item
+            if self._is_valueclass_payload_type(declared_ty):
+                for path in self._valueclass_payload_pointer_field_paths(
+                    declared_ty,
+                ):
+                    field_slot = self._module_global_valueclass_payload_field_slot(
+                        gv,
+                        path,
+                        name=f"mod.global.value.root.{_name}",
+                    )
+                    self._emit_current_gc_frame_enter(frame_map, field_slot)
+                continue
             if not self._module_global_needs_teardown(gv, declared_ty):
                 continue
             self._emit_current_gc_frame_enter(frame_map, gv)

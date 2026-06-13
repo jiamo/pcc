@@ -82,6 +82,6 @@ class Path(PurePath):
         with open(self._raw, "r", encoding=encoding) as f:
             return f.read()
 
-    def write_text(self, s: str) -> int:
-        with open(self._raw, "w", encoding="utf-8") as f:
+    def write_text(self, s: str, encoding: str = "utf-8") -> int:
+        with open(self._raw, "w", encoding=encoding) as f:
             return f.write(s)

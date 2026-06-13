@@ -95,14 +95,7 @@ class NativeDataclassesLoweringMixin:
                 )
                 self.builder.store(self._ptr_to_cstr(name_gv), ngep)
 
-                raw_v = self._emit_expr(kw_expr)
-                val_obj = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    raw_v,
-                    kw_expr.ty,
-                )
+                val_obj = self._emit_expr_as_pcc_object(kw_expr)
                 vgep = self.builder.gep(
                     vals_arr,
                     [ir.Constant(_I32, 0), ir.Constant(_I32, i)],

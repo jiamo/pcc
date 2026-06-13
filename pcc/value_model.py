@@ -5,9 +5,11 @@ and class lowering.  This module also exposes host-side projection helpers used
 by planning tests. These helpers are not the production C runtime ValueBox,
 unboxed ABI, field-flattening, or specialization implementation.
 """
+
 from __future__ import annotations
 
 import inspect
+import operator
 import sys
 from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, Callable, Iterable, TypeVar, get_type_hints
@@ -64,7 +66,71 @@ class GenericSpecialization:
     payload_abi: str
 
 
-def valueclass(cls: type[T] | None = None, **kwargs: Any) -> type[T] | Callable[[type[T]], type[T]]:
+class _ValueArrayAlias:
+    def __init__(self, element_type: type[Any], length: int) -> None:
+        if not isinstance(element_type, type) or not is_valueclass(element_type):
+            raise TypeError("pcc.array element type must be a valueclass")
+        if not isinstance(length, int):
+            raise TypeError("pcc.array length must be an integer literal")
+        if length < 1 or length > 7:
+            raise ValueError("pcc.array length must be between 1 and 7")
+        self.element_type = element_type
+        self.length = length
+
+    def __call__(self, *values: Any) -> "array":
+        return array._from_spec(self.element_type, self.length, values)
+
+
+class array:
+    """Host oracle for the fixed-length compiler-owned value array surface."""
+
+    def __init__(self, *values: Any) -> None:
+        raise TypeError("construct value arrays as pcc.array[ValueClass, N](...)")
+
+    @classmethod
+    def __class_getitem__(cls, params: object) -> _ValueArrayAlias:
+        if not isinstance(params, tuple) or len(params) != 2:
+            raise TypeError("pcc.array needs an element type and literal length")
+        return _ValueArrayAlias(params[0], params[1])
+
+    @classmethod
+    def _from_spec(
+        cls,
+        element_type: type[Any],
+        length: int,
+        values: tuple[Any, ...],
+    ) -> "array":
+        if len(values) != length:
+            raise TypeError(f"pcc.array expects exactly {length} elements")
+        for index, value in enumerate(values):
+            if type(value) is not element_type:
+                raise TypeError(
+                    f"pcc.array element {index + 1} has type "
+                    f"{type(value).__name__}, expected {element_type.__name__}"
+                )
+        instance = object.__new__(cls)
+        instance.element_type = element_type
+        instance.length = length
+        instance.values = tuple(values)
+        return instance
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: object) -> Any:
+        integer = operator.index(index)
+        if integer < -sys.maxsize - 1 or integer > sys.maxsize:
+            raise OverflowError("pcc.array index does not fit in a machine index")
+        if integer < 0:
+            integer += self.length
+        if integer < 0 or integer >= self.length:
+            raise IndexError("pcc.array index out of range")
+        return self.values[integer]
+
+
+def valueclass(
+    cls: type[T] | None = None, **kwargs: Any
+) -> type[T] | Callable[[type[T]], type[T]]:
     """Mark a class as identity-free and immutable.
 
     Host Python receives a frozen dataclass for ergonomics; pcc's compiler also
@@ -139,7 +205,9 @@ def _resolved_type_hints(cls: type[Any]) -> dict[str, Any]:
 def value_payload_layout(cls: type[Any]) -> ValueClassDescriptor:
     hints = _resolved_type_hints(cls)
     if is_dataclass(cls):
-        ordered = tuple((f.name, _type_name(hints.get(f.name, Any))) for f in fields(cls))
+        ordered = tuple(
+            (f.name, _type_name(hints.get(f.name, Any))) for f in fields(cls)
+        )
     else:
         ordered = tuple((name, _type_name(ty)) for name, ty in hints.items())
     return ValueClassDescriptor(cls.__name__, cls.__module__, ordered)
@@ -186,7 +254,9 @@ def specialized_array(values: Iterable[Any]) -> SpecializedArray:
     return SpecializedArray(descriptor, payloads)
 
 
-def specialize_generic_signature(name: str, *type_args: type[Any] | str) -> GenericSpecialization:
+def specialize_generic_signature(
+    name: str, *type_args: type[Any] | str
+) -> GenericSpecialization:
     names = tuple(_type_name(arg) for arg in type_args)
     abi = name + "[" + ",".join(names) + "]::value_payload"
     return GenericSpecialization(name, names, abi)
@@ -195,8 +265,8 @@ def specialize_generic_signature(name: str, *type_args: type[Any] | str) -> Gene
 def value_model_status() -> dict[str, object]:
     return {
         "implemented_through": (
-            "V1-direct-scalar-payload-checked-marshal-eq-"
-            "v2-pointer-boundary-partial"
+            "V1-direct-scalar-and-nested-payload-eq-checked-marshal-"
+            "v2-pointer-and-nested-dyn-boundary-partial"
         ),
         "scaffolding_through": "V6",
         "production_runtime": False,
@@ -207,8 +277,10 @@ def value_model_status() -> dict[str, object]:
             "V0 source-shape diagnostics for unsupported valueclass forms",
             "V1 scalar-field value payload lowering for local constructor assignment and field reads",
             "V1 direct function argument and constructor-return payload ABI for scalar-field valueclasses",
+            "V1 non-recursive nested valueclass direct payload ABI for focused typed calls/returns",
             "V1 direct method receiver payload ABI for scalar-field valueclasses",
             "V1 fieldwise equality for direct scalar-field valueclass payloads",
+            "V1 recursive fieldwise equality for non-recursive nested valueclass direct payloads",
             "V1 scalar-field value payload to ordinary pcc object boxing at Dyn/object boundaries",
             "V1 ordinary pcc object to scalar-field value payload unboxing at typed boundaries",
             "V1 type-checked ordinary pcc object to scalar-field value payload unboxing failure path",
@@ -218,6 +290,14 @@ def value_model_status() -> dict[str, object]:
             "V2 selected pointer-field valueclass equality using object equality",
             "V2 selected boxed valueclass equality across Dyn/object boundaries",
             "V2 selected boxed valueclass hash aligned with boxed equality",
+            "V2 selected nested valueclass constructor returns to Any/Dyn "
+            "through ValueBox projection",
+            "V2 selected dataclasses.replace keyword override projection "
+            "through ValueBox",
+            "V2 selected membership needle and dict-object subscript getitem "
+            "key projection through ValueBox",
+            "V2 selected builtin hash/repr/str/format/type object-boundary "
+            "projection through ValueBox",
             "C runtime PyValueBox object and GC tracing",
             "V1 diagnostics rejecting recursive and mutually-recursive valueclass payloads",
             "host-side ValuePayload/ValueBox projection helpers for planning tests",
@@ -230,7 +310,7 @@ def value_model_status() -> dict[str, object]:
         ],
         "not_implemented": [
             "full direct LLVM struct/value payload ABI for identity escapes, "
-            "complete boxing boundaries, nested valueclasses, and full "
+            "complete boxing boundaries, recursive/broader nested valueclasses, and full "
             "non-scalar payload coverage",
             "full marshal_value_to_object / marshal_object_to_value coverage "
             "for all object/value boundaries",

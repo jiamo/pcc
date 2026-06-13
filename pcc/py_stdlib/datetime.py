@@ -6,6 +6,8 @@ subset of Python stdlib modules from ``pcc/py_stdlib``. The real Python
 needed by current self-host test cases.
 """
 
+import time
+
 
 class datetime:
     """Minimal stand-in for :class:`datetime.datetime`.
@@ -20,3 +22,6 @@ class datetime:
     @classmethod
     def now(cls) -> "datetime":
         return cls(2026)
+
+    def strftime(self, fmt: str) -> str:
+        return time.strftime(fmt)

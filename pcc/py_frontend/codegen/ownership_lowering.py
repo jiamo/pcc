@@ -120,20 +120,75 @@ class OwnershipLoweringMixin:
     def _expr_returns_owned_object(self, expr: Expr) -> bool:
         if self._expr_returns_unsafe_raw_pointer(expr):
             return False
+        expr_ty = getattr(expr, "ty", None)
+        if expr_ty is not None and self._is_valueclass_payload_type(expr_ty):
+            return True
+        if isinstance(expr, Call):
+            if self._weakref_constructor_kind_for_expr(expr) is not None:
+                return True
+            if self._weakref_call_expr_returns_owned_object(expr):
+                return True
+            if isinstance(expr.func, Name) and expr.func.ident == "__await__":
+                return True
+            if isinstance(expr_ty, (NoneType, BoolType, IntType, FloatType)):
+                return False
+            if expr_ty is not None and not isinstance(expr_ty, DynType):
+                return self._is_object(expr_ty)
+            if isinstance(expr.func, Name) and expr.func.ident == "_dataclass_field_value":
+                return False
+            if isinstance(expr.func, Attr):
+                method_ret_ty = self._method_call_return_type(expr)
+                if method_ret_ty is not None:
+                    return self._user_return_type_is_owned_object(method_ret_ty)
+            if isinstance(expr.func, Name):
+                callee = expr.func.ident
+                if (
+                    hasattr(self, "class_lowering")
+                    and callee in self.class_lowering.classes
+                ):
+                    return True
+                if callee in getattr(self, "functions", {}):
+                    try:
+                        ast_func_def = self._find_user_funcdef(callee)
+                    except Exception:
+                        ast_func_def = None
+                    if ast_func_def is not None:
+                        if callee in getattr(
+                            self, "_generator_func_names", set()
+                        ) or self._funcdef_has_yield_sentinel(ast_func_def):
+                            return True
+                        return self._user_return_type_is_owned_object(
+                            ast_func_def.return_ty
+                        )
+                    return False
+                env_entry = self.env.get(callee)
+                if env_entry is not None and len(env_entry) >= 3:
+                    callable_ty = env_entry[2]
+                    if self._is_object(callable_ty):
+                        return True
+                if callee in {
+                    "bytes",
+                    "dict",
+                    "frozenset",
+                    "list",
+                    "set",
+                    "str",
+                    "tuple",
+                }:
+                    return True
+                if callee == "next" and len(expr.args) == 1:
+                    return True
+            func_ty = getattr(expr.func, "ty", None)
+            if isinstance(func_ty, ClassType):
+                return True
+            return False
         if isinstance(expr, Name) and self._name_returns_owned_function_value(
             expr.ident
         ):
             return True
-        if (
-            isinstance(expr, Call)
-            and isinstance(expr.func, Name)
-            and expr.func.ident == "_dataclass_field_value"
-        ):
-            return False
         if isinstance(
             expr,
             (
-                Call,
                 ListExpr,
                 DictExpr,
                 TupleExpr,
@@ -145,26 +200,102 @@ class OwnershipLoweringMixin:
             return True
         if isinstance(expr, BinOp) and isinstance(
             expr.ty,
-            (StrType, ListType, TupleType),
+            (StrType, ListType, TupleType, DynType),
         ):
             return True
         if isinstance(expr, Attr):
             return self._attr_expr_returns_owned_object(expr)
         return False
 
+    def _return_type_is_owned_object(self, ty: Optional[Type]) -> bool:
+        if ty is None:
+            return False
+        if isinstance(ty, (NoneType, BoolType, IntType, FloatType, DynType)):
+            return False
+        return self._is_object(ty)
+
+    def _user_return_type_is_owned_object(self, ty: Optional[Type]) -> bool:
+        if ty is None or isinstance(ty, DynType):
+            return True
+        return self._return_type_is_owned_object(ty)
+
+    def _method_call_return_type(self, expr: Call) -> Optional[Type]:
+        func = expr.func
+        if not isinstance(func, Attr):
+            return None
+        receiver_hint = self._class_hint_for_expr(func.obj)
+        if receiver_hint is None:
+            receiver_ty = getattr(func.obj, "ty", None)
+            if isinstance(receiver_ty, ClassType):
+                receiver_hint = self._ensure_class_type_registered(receiver_ty)
+                if receiver_hint is None:
+                    receiver_hint = receiver_ty.name
+        if receiver_hint is None:
+            return None
+        owner_info = self._resolve_method_mro(receiver_hint, func.name)
+        if owner_info is None:
+            owner_info = self.class_lowering.classes.get(receiver_hint)
+        if owner_info is None:
+            return None
+        fd = self.class_lowering._find_method_def(owner_info.name, func.name)
+        if fd is None:
+            return None
+        return fd.return_ty
+
     def _attr_expr_returns_owned_object(self, expr: Attr) -> bool:
         """Return true for attribute loads known to produce a new ref."""
+        obj_ty = getattr(expr.obj, "ty", None)
+        if self._is_valueclass_payload_type(obj_ty):
+            return False
+        if isinstance(expr.obj, Name):
+            slot = self.env.get(expr.obj.ident)
+            if slot is not None:
+                _alloca, _ir_ty, declared_ty = slot
+                if self._is_valueclass_payload_type(declared_ty):
+                    return False
+            if hasattr(self, "class_lowering") and expr.name is not None:
+                hinted = self.env_class_hint.get(expr.obj.ident)
+                if hinted is not None:
+                    info = self.class_lowering.classes.get(hinted)
+                    if (
+                        info is not None
+                        and info.valueclass
+                        and expr.name in info.field_names
+                    ):
+                        return True
+                else:
+                    for info in self.class_lowering.classes.values():
+                        if (
+                            info.valueclass
+                            and expr.name in info.field_names
+                        ):
+                            return True
+            hint = self._class_hint_for_expr(expr.obj)
+            if hint is not None:
+                property_owner = self._resolve_property_mro(hint, expr.name)
+                if property_owner is not None:
+                    getter_def = self.class_lowering._find_method_def(
+                        property_owner.name,
+                        expr.name,
+                    )
+                    if getter_def is None:
+                        return True
+                    return self._user_return_type_is_owned_object(
+                        getter_def.return_ty
+                    )
+
         current_class = self.current_class
         if (
             current_class is not None
             and isinstance(expr.obj, Name)
             and expr.obj.ident == "self"
         ):
-            if (
-                self.class_lowering.lookup_field_index(current_class, expr.name)
-                is not None
-            ):
-                return True
+            field_idx = self.class_lowering.lookup_field_index(current_class, expr.name)
+            if field_idx is not None:
+                field_ty = getattr(current_class, "field_types", {}).get(expr.name)
+                if field_ty is None or isinstance(field_ty, DynType):
+                    return False
+                return self._is_object(field_ty)
             if (
                 self.class_lowering.lookup_class_attr(current_class, expr.name)
                 is not None
@@ -180,7 +311,12 @@ class OwnershipLoweringMixin:
                     and self.class_lowering.lookup_field_index(class_info, expr.name)
                     is not None
                 ):
-                    return True
+                    field_ty = getattr(class_info, "field_types", {}).get(expr.name)
+                    if field_ty is None or isinstance(field_ty, DynType):
+                        return False
+                    return self._is_object(field_ty)
+        if isinstance(expr.obj, (Attr, Call, Subscript)):
+            return True
         return False
 
     def _name_returns_owned_function_value(self, ident: str) -> bool:
@@ -231,14 +367,24 @@ class OwnershipLoweringMixin:
         if isinstance(expr, (ListExpr, DictExpr, TupleExpr, StrLit, BytesLit)):
             return True
         if isinstance(expr, Subscript):
-            return False
+            return self._return_type_is_owned_object(getattr(expr, "ty", None))
         if self._expr_returns_unsafe_raw_pointer(expr):
             return False
         if not isinstance(expr, Call):
             return self._expr_returns_owned_object(expr)
+        if (
+            self._weakref_constructor_kind_for_expr(expr) is not None
+            or self._weakref_call_expr_returns_owned_object(expr)
+        ):
+            return True
+        if isinstance(expr.func, Attr):
+            expr_ty = getattr(expr, "ty", None)
+            return self._return_type_is_owned_object(expr_ty)
 
         if isinstance(expr.func, Name):
             callee = expr.func.ident
+            if callee == "next" and len(expr.args) == 1:
+                return True
             if (
                 hasattr(self, "class_lowering")
                 and callee in self.class_lowering.classes
@@ -258,10 +404,29 @@ class OwnershipLoweringMixin:
             "tuple",
             "set",
             "frozenset",
+            "str",
+            "bytes",
         }:
+            # Keep this in sync with the builtin-constructor set in
+            # _expr_returns_owned_object: omitting one (str was missing
+            # until 2026-06-12) makes raw-scaffold modules skip
+            # release-on-rebind for that constructor's results and leak
+            # one object per call.
             return True
 
         return False
+
+    def _valueclass_payload_expr_fields_are_owned(self, expr: Expr) -> bool:
+        expr_ty = getattr(expr, "ty", None)
+        if expr_ty is None or not self._is_valueclass_payload_type(expr_ty):
+            return False
+        if not isinstance(expr, Call) or not isinstance(expr.func, Name):
+            return False
+        if not hasattr(self, "class_lowering"):
+            return False
+        class_name = self._resolve_class_alias(expr.func.ident)
+        info = self.class_lowering.classes.get(class_name)
+        return info is not None and bool(getattr(info, "valueclass", False))
 
     def _mark_owned_local_if_object(
         self,
@@ -376,6 +541,30 @@ class OwnershipLoweringMixin:
             [frame_map_ptr, slots_ptr],
         )
 
+    def _emit_current_gc_frame_enter_lifo(
+        self,
+        frame_map: ir.Value,
+        slots: ir.Value,
+    ) -> None:
+        frame_map_ptr = frame_map
+        if frame_map_ptr.type != _CSTR:
+            frame_map_ptr = self.builder.bitcast(
+                frame_map,
+                _CSTR,
+                name=self._fresh("gc.frame.lifo.map.ptr"),
+            )
+        slots_ptr = slots
+        if slots_ptr.type != _CSTR:
+            slots_ptr = self.builder.bitcast(
+                slots,
+                _CSTR,
+                name=self._fresh("gc.frame.lifo.slots.ptr"),
+            )
+        self.builder.call(
+            self.runtime["pcc_gc_frame_enter_lifo"],
+            [frame_map_ptr, slots_ptr],
+        )
+
     def _gc_one_slot_frame_map(self) -> ir.GlobalVariable:
         name = ".pcc.gc.frame.map.1"
         existing = self.module.globals.get(name)
@@ -387,6 +576,17 @@ class OwnershipLoweringMixin:
         gv.initializer = ir.Constant(_I32, 1)
         return gv
 
+    def _gc_one_slot_borrowed_frame_map(self) -> ir.GlobalVariable:
+        name = ".pcc.gc.frame.map.borrowed.1"
+        existing = self.module.globals.get(name)
+        if existing is not None:
+            return existing
+        gv = ir.GlobalVariable(self.module, _I32, name=name)
+        gv.linkage = "internal"
+        gv.global_constant = True
+        gv.initializer = ir.Constant(_I32, -1)
+        return gv
+
     def _ensure_owned_local_gc_root(
         self,
         name: str,
@@ -395,20 +595,90 @@ class OwnershipLoweringMixin:
     ) -> None:
         if self.current_func_def is None:
             return
-        if name in getattr(self, "_gc_rooted_local_names", set()):
-            return
         if name in getattr(self, "_current_global_names", set()):
             return
         if name in getattr(self, "_current_param_names", set()):
+            return
+        self._ensure_local_gc_frame_root(
+            name,
+            alloca,
+            ir_ty,
+            self._gc_one_slot_frame_map(),
+        )
+
+    def _ensure_borrowed_local_gc_root(
+        self,
+        name: str,
+        alloca: ir.Value,
+        ir_ty: ir.Type,
+    ) -> None:
+        self._ensure_local_gc_frame_root(
+            name,
+            alloca,
+            ir_ty,
+            self._gc_one_slot_borrowed_frame_map(),
+        )
+        if name in getattr(self, "_gc_rooted_local_names", set()):
+            if not hasattr(self, "_borrowed_gc_rooted_local_names"):
+                self._borrowed_gc_rooted_local_names = set()
+            self._borrowed_gc_rooted_local_names.add(name)
+
+    def _ensure_local_gc_frame_root(
+        self,
+        name: str,
+        alloca: ir.Value,
+        ir_ty: ir.Type,
+        frame_map: ir.Value | None = None,
+    ) -> None:
+        if self.current_func_def is None:
+            return
+        if name in getattr(self, "_current_global_names", set()):
             return
         if not isinstance(ir_ty, ir.PointerType):
             return
         if not self._ir_type_matches(ir_ty, _CSTR):
             return
-        frame_map = self._gc_one_slot_frame_map()
+        fn = self.current_function
+        if fn is None:
+            return
+        # Registration is ALLOCA-keyed per function, not name-keyed. A local
+        # name can be re-bound to a fresh alloca inside one function (scope
+        # pop -> new slot); the old name-keyed dedup skipped frame_enter for
+        # the new alloca while owned-flag management kept releasing through
+        # it. Moving backends (#3/#4) then never healed that slot during
+        # relocation remap, and the flag-guarded release decref'd a stale
+        # pre-relocation pointer once the source memory was reused
+        # (pproxy pcc1 worker BAD_INCREF, gc3/gc4).
+        #
+        # Dedup by OBJECT IDENTITY, never by value-name strings: alloca
+        # name uniquification timing differs between the host compiler and
+        # the self-hosted stages, and a name-string key made pcc1 emit a
+        # different enter/leave count than pcc0/pcc2 (pcc2/pcc3 byte drift).
+        if not hasattr(self, "_fn_gc_root_slot_registry"):
+            self._fn_gc_root_slot_registry = {}
+        registry = self._fn_gc_root_slot_registry.setdefault(fn.name, [])
+        for entry in registry:
+            if entry[1] is alloca:
+                if name not in getattr(self, "_gc_rooted_local_names", set()):
+                    self._gc_rooted_local_names.add(name)
+                return
+        if frame_map is None:
+            frame_map = self._gc_one_slot_frame_map()
         self._emit_entry_gc_frame_enter(frame_map, alloca)
+        registry.append((name, alloca))
         self._gc_rooted_local_names.add(name)
+        if not hasattr(self, "_gc_rooted_local_order"):
+            self._gc_rooted_local_order = []
+        self._gc_rooted_local_order.append(name)
         self._patch_fn_err_exit_gc_root_leave(name, alloca)
+        # Entry enters always run, so every exit must leave every slot:
+        # retro-patch this slot's leave into exit sites whose cleanup was
+        # emitted before this slot existed (e.g. an early `return` lowered
+        # before a later re-binding created this alloca).
+        if hasattr(self, "_fn_gc_root_exit_sites"):
+            if fn.name in self._fn_gc_root_exit_sites:
+                for site in self._fn_gc_root_exit_sites[fn.name]:
+                    self._insert_gc_frame_leave_before_terminator(site, alloca)
 
     def _emit_gc_frame_leave_for_slot(self, alloca: ir.Value) -> None:
         self.builder.call(
@@ -421,6 +691,35 @@ class OwnershipLoweringMixin:
             ],
         )
 
+    def _emit_gc_frame_leave_lifo_for_slot(self, alloca: ir.Value) -> None:
+        self.builder.call(
+            self.runtime["pcc_gc_frame_leave_lifo"],
+            [
+                self._as_gc_ptr(
+                    alloca,
+                    name=self._fresh("gc.frame.lifo.leave.ptr"),
+                )
+            ],
+        )
+
+    def _insert_gc_frame_leave_before_terminator(
+        self,
+        block: ir.Block,
+        alloca: ir.Value,
+    ) -> bool:
+        terminator = None
+        for instr in reversed(block._instrs):
+            if self._instruction_is_terminator(instr):
+                terminator = instr
+                break
+        if terminator is None:
+            return False
+        save_block = self.builder._block
+        self.builder.position_before(terminator)
+        self._emit_gc_frame_leave_for_slot(alloca)
+        self.builder.position_at_end(save_block)
+        return True
+
     def _patch_fn_err_exit_gc_root_leave(
         self,
         name: str,
@@ -432,43 +731,73 @@ class OwnershipLoweringMixin:
         err_bb = self._fn_err_exit_blocks.get(fn.name)
         if err_bb is None:
             return
-        patched = self._fn_err_exit_gc_root_names.setdefault(fn.name, set())
-        if name in patched:
+        # Dedup by SLOT IDENTITY, not by local name (a re-bound name's
+        # second alloca needs its own err-exit leave) and not by value-name
+        # string (name uniquification timing differs between host and
+        # self-hosted stages and would drift the emitted leave count).
+        if not hasattr(self, "_fn_err_exit_gc_root_slots"):
+            self._fn_err_exit_gc_root_slots = {}
+        patched = self._fn_err_exit_gc_root_slots.setdefault(fn.name, [])
+        for done in patched:
+            if done is alloca:
+                return
+        if not self._insert_gc_frame_leave_before_terminator(err_bb, alloca):
             return
-        terminator = None
-        for instr in reversed(err_bb._instrs):
-            if self._instruction_is_terminator(instr):
-                terminator = instr
-                break
-        if terminator is None:
-            return
-        save_block = self.builder._block
-        self.builder.position_before(terminator)
-        self._emit_gc_frame_leave_for_slot(alloca)
-        self.builder.position_at_end(save_block)
-        patched.add(name)
+        patched.append(alloca)
 
     def _discard_owned_local_gc_root(self, name: str, alloca: ir.Value) -> None:
+        # Compile-time bookkeeping only — do NOT emit a mid-function
+        # frame_leave. The slot is an entry-block alloca (valid for the
+        # whole call, always object-or-null), so staying registered is safe;
+        # the per-slot registry emits the balancing leave at every function
+        # exit. A mid-function leave here unregistered slots that re-entered
+        # owned management on a later path/iteration, leaving them invisible
+        # to the moving-GC relocation remap (gc3/gc4 stale-release UAF).
         if name not in getattr(self, "_gc_rooted_local_names", set()):
             return
-        self._emit_gc_frame_leave_for_slot(alloca)
         self._gc_rooted_local_names.discard(name)
+        if hasattr(self, "_borrowed_gc_rooted_local_names"):
+            self._borrowed_gc_rooted_local_names.discard(name)
 
-    def _ensure_owned_local_flag(self, name: str) -> ir.Value:
+    def _ensure_owned_local_flag(
+        self,
+        name: str,
+        alloca: Optional[ir.Value] = None,
+    ) -> ir.Value:
+        if not hasattr(self, "_owned_local_flag_allocas"):
+            self._owned_local_flag_allocas = {}
         flag = self._owned_local_flag_slots.get(name)
-        if flag is not None:
+        flag_alloca = self._owned_local_flag_allocas.get(name)
+        if flag is not None and (alloca is None or flag_alloca is alloca):
             return flag
         flag = self._alloca_in_entry(_I1, name=f"{name}.owned")
         self._store_entry_initializer(flag, ir.Constant(_I1, 0))
         self._owned_local_flag_slots[name] = flag
+        if alloca is not None:
+            self._owned_local_flag_allocas[name] = alloca
+        else:
+            self._owned_local_flag_allocas.pop(name, None)
         return flag
+
+    def _owned_local_flag_for(
+        self,
+        name: str,
+        alloca: Optional[ir.Value] = None,
+    ) -> Optional[ir.Value]:
+        flag = self._owned_local_flag_slots.get(name)
+        if flag is None or alloca is None:
+            return flag
+        flag_alloca = getattr(self, "_owned_local_flag_allocas", {}).get(name)
+        if flag_alloca is alloca:
+            return flag
+        return None
 
     def _emit_release_owned_local_if_flagged(
         self,
         name: str,
         alloca: ir.Value,
     ) -> None:
-        flag = self._ensure_owned_local_flag(name)
+        flag = self._ensure_owned_local_flag(name, alloca)
         is_owned = self.builder.load(
             flag,
             name=self._fresh(f"{name}.owned.load"),
@@ -478,11 +807,18 @@ class OwnershipLoweringMixin:
         cont_bb = fn.append_basic_block(name=self._fresh(f"{name}.owned.cont"))
         self.builder.cbranch(is_owned, release_bb, cont_bb)
         self.builder.position_at_end(release_bb)
-        old_value = self.builder.load(
-            alloca,
-            name=self._fresh(f"{name}.overwrite"),
+        old_value = self.builder.call(
+            self.runtime["pcc_gc_load_ptr"],
+            [
+                ir.Constant(_CSTR, None),
+                self._as_gc_ptr(
+                    alloca,
+                    name=self._fresh(f"{name}.release.gc.slot"),
+                ),
+            ],
+            name=self._fresh(f"{name}.release.current"),
         )
-        self._gc_release(old_value)
+        self._gc_release(old_value, self._release_context_label(f"local:{name}"))
         self.builder.store(ir.Constant(_I1, 0), flag)
         self.builder.branch(cont_bb)
         self.builder.position_at_end(cont_bb)
@@ -585,16 +921,20 @@ class OwnershipLoweringMixin:
                 continue
             if name in self._owned_local_has_value and name != skip_name:
                 self._emit_release_owned_local_if_flagged(name, alloca)
-            if name in getattr(self, "_gc_rooted_local_names", set()):
-                self._emit_gc_frame_leave_for_slot(alloca)
-        if not getattr(self, "_runtime_threads_enabled", False):
-            return
-        for name in sorted(getattr(self, "_gc_rooted_local_names", set())):
+        rooted_names = getattr(self, "_gc_rooted_local_names", set())
+        root_order = list(getattr(self, "_gc_rooted_local_order", []))
+        for name in sorted(rooted_names.difference(set(root_order))):
+            root_order.append(name)
+        emitted_root_unpins: set[str] = set()
+        for name in reversed(root_order):
+            if name in emitted_root_unpins:
+                continue
+            if name not in rooted_names:
+                continue
+            emitted_root_unpins.add(name)
             if name in getattr(self, "_owned_local_names", set()):
                 continue
             if name in getattr(self, "_current_global_names", set()):
-                continue
-            if name in getattr(self, "_current_param_names", set()):
                 continue
             slot = self.env.get(name)
             if slot is None:
@@ -604,22 +944,57 @@ class OwnershipLoweringMixin:
                 continue
             if not self._ir_type_matches(ir_ty, _CSTR):
                 continue
-            pinned = self.builder.load(
-                alloca,
-                name=self._fresh("gc.root.cleanup.unpin"),
-            )
-            self.builder.call(self.runtime["pcc_gc_unpin"], [pinned])
-            self.builder.call(
-                self.runtime["pcc_gc_store_root"],
-                [
-                    self._as_gc_ptr(
-                        alloca,
-                        name=self._fresh("gc.root.cleanup.ptr"),
-                    ),
-                    ir.Constant(_CSTR, None),
-                ],
-            )
-            self._emit_gc_frame_leave_for_slot(alloca)
+            if name in getattr(self, "_pinned_gc_rooted_local_names", set()):
+                pinned = self.builder.load(
+                    alloca,
+                    name=self._fresh("gc.root.cleanup.unpin"),
+                )
+                self.builder.call(self.runtime["pcc_gc_unpin"], [pinned])
+                self.builder.call(
+                    self.runtime["pcc_gc_store_root"],
+                    [
+                        self._as_gc_ptr(
+                            alloca,
+                            name=self._fresh("gc.root.cleanup.ptr"),
+                        ),
+                        ir.Constant(_CSTR, None),
+                    ],
+                )
+        # Leave every slot this function ever frame-registered, newest
+        # first, exactly once per slot. Leaves are driven by the per-slot
+        # registry (not by name-keyed sets resolved through env) so a name
+        # re-bound to a fresh alloca leaves BOTH slots and the enter/leave
+        # ledger stays balanced on every exit path.
+        fn = self.current_function
+        registry: list = []
+        if fn is not None and hasattr(self, "_fn_gc_root_slot_registry"):
+            if fn.name in self._fn_gc_root_slot_registry:
+                registry = self._fn_gc_root_slot_registry[fn.name]
+        emitted_slot_leaves: list = []
+        for entry in reversed(registry):
+            entry_alloca = entry[1]
+            already = False
+            for done in emitted_slot_leaves:
+                if done is entry_alloca:
+                    already = True
+            if already:
+                continue
+            emitted_slot_leaves.append(entry_alloca)
+            self._emit_gc_frame_leave_for_slot(entry_alloca)
+        # Record this exit so slots registered AFTER this cleanup was
+        # emitted retro-patch their leave into it (their entry enter always
+        # runs, so this exit must leave them too).
+        if fn is not None:
+            if not hasattr(self, "_fn_gc_root_exit_sites"):
+                self._fn_gc_root_exit_sites = {}
+            sites = self._fn_gc_root_exit_sites.setdefault(fn.name, [])
+            block = self.builder._block
+            recorded = False
+            for site in sites:
+                if site is block:
+                    recorded = True
+            if not recorded:
+                sites.append(block)
 
     def _store_entry_initializer(self, ptr: ir.Value, value: ir.Value) -> None:
         # Use self.builder rather than ``tmp_builder = ir.IRBuilder(entry)``:

@@ -166,17 +166,33 @@ class LiteralLoweringMixin:
         if persistent_thread_root:
             root_name = self._fresh(label + ".tmp.root.local")
             self.env[root_name] = (slot, _CSTR, DynType(name="dyn"))
-            self._gc_rooted_local_names.add(root_name)
-            self._emit_entry_gc_frame_enter(self._gc_one_slot_frame_map(), slot)
+            self._pinned_gc_rooted_local_names.add(root_name)
+            # Route through the per-slot registry (not a raw entry enter) so
+            # every function exit emits the balancing frame_leave for this
+            # slot; cleanup no longer leaves roots by name.
+            self._ensure_local_gc_frame_root(
+                root_name,
+                slot,
+                _CSTR,
+                self._gc_one_slot_frame_map(),
+            )
         else:
-            self._emit_current_gc_frame_enter(self._gc_one_slot_frame_map(), slot)
+            self._emit_current_gc_frame_enter_lifo(
+                self._gc_one_slot_frame_map(),
+                slot,
+            )
         return slot
 
     def _leave_container_temp_root(self, slot: ir.Value) -> None:
         if isinstance(slot, ir.Constant):
             return
-        pinned = self.builder.load(
+        slot_ptr = self._as_gc_ptr(
             slot,
+            name=self._fresh("container.tmp.root.ptr"),
+        )
+        pinned = self.builder.call(
+            self.runtime["pcc_gc_load_ptr"],
+            [ir.Constant(_CSTR, None), slot_ptr],
             name=self._fresh("container.tmp.unpin"),
         )
         if (
@@ -187,11 +203,11 @@ class LiteralLoweringMixin:
         self.builder.call(
             self.runtime["pcc_gc_store_root"],
             [
-                self._as_gc_ptr(slot, name=self._fresh("container.tmp.root.ptr")),
+                slot_ptr,
                 ir.Constant(_CSTR, None),
             ],
         )
-        self._emit_gc_frame_leave_for_slot(slot)
+        self._emit_gc_frame_leave_lifo_for_slot(slot)
         self.builder.call(self.runtime["pcc_gc_unpin"], [pinned])
 
     def _emit_list_literal(self, expr: ListExpr) -> ir.Value:
@@ -237,38 +253,23 @@ class LiteralLoweringMixin:
                     [lst, v_obj],
                 )
                 if self._container_store_temp_needs_release(el, el.ty, False):
-                    self._gc_release(v_obj)
+                    self._gc_release(
+                        v_obj,
+                        self._release_expr_label("container", el),
+                    )
             self._leave_container_temp_root(lst_root)
             return lst
 
-        ops: list[tuple[str, ir.Value, Type, bool, Expr]] = []
+        ops: list[tuple[str, ir.Value, Type, bool, Expr, bool]] = []
         cpy_values = self._cpy_values
         cpy_extend = False
-        # Syntactic fallback: when the list literal's *every* element
-        # is a bare ``Name`` referring to a known user FuncDef in this
-        # module, route through the native callable-value path
-        # regardless of the inferred element type. This catches the
-        # ``tests = [test_arith, test_str]`` shape under the pcc1
-        # closure where ``isinstance(expr.ty.elem, FuncType)`` doesn't
-        # cross the module-identity boundary the same way as on host
-        # Python (see iter 23 investigation notes on pcc1
-        # class-identity).  The host path still hits the
-        # type-system branch first; this is a belt-and-braces add.
+        # ListType/FuncType are canonical across compiled-module boundaries;
+        # callable materialization is therefore driven by the inferred type,
+        # not by a syntax-only list-of-function-names exception.
         prefer_native_callables = isinstance(expr.ty, ListType) and isinstance(
             expr.ty.elem,
             FuncType,
         )
-        if not prefer_native_callables and isinstance(expr.ty, ListType):
-            all_func_names = bool(expr.elems)
-            for _el in expr.elems:
-                if not isinstance(_el, Name):
-                    all_func_names = False
-                    break
-                if _el.ident not in self.functions:
-                    all_func_names = False
-                    break
-            if all_func_names:
-                prefer_native_callables = True
         for el in expr.elems:
             if (
                 isinstance(el, Call)
@@ -278,27 +279,55 @@ class LiteralLoweringMixin:
             ):
                 inner = self._emit_expr(el.args[0])
                 is_cpy = inner in cpy_values
-                ops.append(("extend", inner, el.args[0].ty, is_cpy, el.args[0]))
+                pinned = False
+                if isinstance(inner.type, ir.PointerType) and not is_cpy:
+                    self.builder.call(self.runtime["pcc_gc_pin"], [inner])
+                    pinned = True
+                ops.append(
+                    ("extend", inner, el.args[0].ty, is_cpy, el.args[0], pinned)
+                )
                 if is_cpy:
                     cpy_extend = True
                 continue
             if prefer_native_callables:
                 v = self._emit_expr_with_native_callable_values(el)
             else:
-                v = self._emit_expr(el)
-            ops.append(("append", v, el.ty, v in cpy_values, el))
+                valueclass_payload = self._maybe_emit_valueclass_constructor_payload(
+                    el.ty,
+                    el,
+                )
+                if valueclass_payload is not None:
+                    v = valueclass_payload
+                else:
+                    v = self._emit_expr(el)
+            is_cpy = v in cpy_values
+            pinned = False
+            if isinstance(v.type, ir.PointerType) and not is_cpy:
+                self.builder.call(self.runtime["pcc_gc_pin"], [v])
+                pinned = True
+            ops.append(("append", v, el.ty, is_cpy, el, pinned))
         # Build a real CPython list when the literal SPREADS a cpy iterable
-        # (``cpy_extend``) OR contains any cpy ELEMENT (e.g. ``[a, a]`` of numpy
-        # arrays passed to ``np.concatenate([...])``). The native pcc-list path
-        # below would bridge each cpy element to a pcc object
-        # (``_emit_value_as_pcc_object_or_bridge``), round-tripping a real
-        # CPython object cpy->pcc->cpy and losing it. ``_emit_cpython_list_ops``
-        # marshals each element correctly (cpy borrowed, native converted) and
-        # tags the result cpy. Gated on a cpy element => inert for native lists
-        # (no cpy => bootstrap unaffected).
-        cpy_any = cpy_extend or any(op[3] for op in ops)
+        # (``cpy_extend``) OR when EVERY element is a cpy value (e.g. ``[a, a]``
+        # of numpy arrays passed to ``np.concatenate([...])``): bridging those
+        # cpy elements to pcc objects would round-trip a real CPython object
+        # cpy->pcc->cpy and lose it, so ``_emit_cpython_list_ops`` keeps them
+        # borrowed. A MIXED literal — at least one native element, e.g.
+        # ``[p, x, p]`` with a native ``str`` ``p`` — is a native pcc list: the
+        # path below builds ``py_list_new``/``py_list_append`` and bridges only
+        # the cpy elements via ``py_cpy_to_pcc_obj``. (A native element cannot be
+        # kept cpy without a native->cpy round-trip anyway, so its presence
+        # signals native-list intent.) Inert for all-native lists / no cpy
+        # values => bootstrap unaffected.
+        cpy_all_elems = bool(ops) and all(op[3] for op in ops)
+        cpy_any = cpy_extend or cpy_all_elems
         if cpy_any:
-            return self._emit_cpython_list_ops([(k, v, t) for (k, v, t, _, _) in ops])
+            result = self._emit_cpython_list_ops(
+                [(k, v, t) for (k, v, t, _, _, _) in ops]
+            )
+            for _op_kind, value, _value_ty, _is_cpy, _src_expr, pinned in ops:
+                if pinned:
+                    self.builder.call(self.runtime["pcc_gc_unpin"], [value])
+            return result
         n_val = ir.Constant(_I64, len(expr.elems))
         lst = self.builder.call(
             self.runtime["py_list_new"],
@@ -306,24 +335,33 @@ class LiteralLoweringMixin:
             name=self._fresh("list.new"),
         )
         lst_root = self._enter_container_temp_root(lst, "list")
-        for op_kind, value, value_ty, is_cpy, src_expr in ops:
+        for op_kind, value, value_ty, is_cpy, src_expr, pinned in ops:
             if op_kind == "extend":
                 self.builder.call(
                     self.runtime["py_list_extend"],
                     [lst, value],
                 )
+                if pinned:
+                    self.builder.call(self.runtime["pcc_gc_unpin"], [value])
                 continue
             v_obj = self._emit_value_as_pcc_object_or_bridge(
                 value,
                 value_ty,
                 "cpy.list.elem" if is_cpy else "list.elem",
+                consume_valueclass_payload_fields=
+                    self._valueclass_payload_expr_fields_are_owned(src_expr),
             )
             self.builder.call(
                 self.runtime["py_list_append"],
                 [lst, v_obj],
             )
             if self._container_store_temp_needs_release(src_expr, value_ty, is_cpy):
-                self._gc_release(v_obj)
+                self._gc_release(
+                    v_obj,
+                    self._release_expr_label("container", src_expr),
+                )
+            if pinned:
+                self.builder.call(self.runtime["pcc_gc_unpin"], [value])
         self._leave_container_temp_root(lst_root)
         return lst
 
@@ -344,10 +382,33 @@ class LiteralLoweringMixin:
                     [d, m_obj],
                     name=self._fresh("dict.splat.update"),
                 )
+                if self._container_store_temp_needs_release(
+                    v_expr, v_expr.ty, False
+                ):
+                    self._gc_release(
+                        m_obj,
+                        self._release_expr_label("container", v_expr),
+                    )
             else:
                 k_obj = self._emit_expr_as_pcc_object(k_expr)
                 v_obj = self._emit_expr_as_pcc_object(v_expr)
                 self.builder.call(self.runtime["py_dict_set"], [d, k_obj, v_obj])
+                # py_dict_set borrows (balanced store); owned key/value
+                # temps must be released here, mirroring py_list_append.
+                if self._container_store_temp_needs_release(
+                    k_expr, k_expr.ty, False
+                ):
+                    self._gc_release(
+                        k_obj,
+                        self._release_expr_label("container", k_expr),
+                    )
+                if self._container_store_temp_needs_release(
+                    v_expr, v_expr.ty, False
+                ):
+                    self._gc_release(
+                        v_obj,
+                        self._release_expr_label("container", v_expr),
+                    )
         self._leave_container_temp_root(dict_root)
         return d
 
@@ -383,23 +444,57 @@ class LiteralLoweringMixin:
                     self.runtime["py_dict_set"],
                     [d, k_obj, v_obj],
                 )
+                # py_dict_set borrows (balanced store); owned key/value
+                # temps must be released here, mirroring py_list_append.
+                if self._container_store_temp_needs_release(
+                    k_expr, k_expr.ty, False
+                ):
+                    self._gc_release(
+                        k_obj,
+                        self._release_expr_label("container", k_expr),
+                    )
+                if self._container_store_temp_needs_release(
+                    v_expr, v_expr.ty, False
+                ):
+                    self._gc_release(
+                        v_obj,
+                        self._release_expr_label("container", v_expr),
+                    )
             self._leave_container_temp_root(dict_root)
             return d
 
-        items: list[tuple[ir.Value, Type, bool, ir.Value, Type, bool]] = []
+        items: list[
+            tuple[ir.Value, Type, bool, ir.Value, Type, bool, Expr, Expr]
+        ] = []
         has_cpy_key = False
         cpy_values = self._cpy_values
         for k_expr, v_expr in expr.pairs:
-            k = self._emit_expr(k_expr)
-            v = self._emit_expr_with_native_callable_values(v_expr)
+            k_payload = self._maybe_emit_valueclass_constructor_payload(
+                k_expr.ty,
+                k_expr,
+            )
+            if k_payload is not None:
+                k = k_payload
+            else:
+                k = self._emit_expr(k_expr)
+            v_payload = self._maybe_emit_valueclass_constructor_payload(
+                v_expr.ty,
+                v_expr,
+            )
+            if v_payload is not None:
+                v = v_payload
+            else:
+                v = self._emit_expr_with_native_callable_values(v_expr)
             k_is_cpy = k in cpy_values
             v_is_cpy = v in cpy_values
-            items.append((k, k_expr.ty, k_is_cpy, v, v_expr.ty, v_is_cpy))
+            items.append(
+                (k, k_expr.ty, k_is_cpy, v, v_expr.ty, v_is_cpy, k_expr, v_expr)
+            )
             if k_is_cpy:
                 has_cpy_key = True
         if has_cpy_key:
             return self._emit_cpython_dict_items(
-                [(k, k_ty, v, v_ty) for (k, k_ty, _, v, v_ty, _) in items]
+                [(k, k_ty, v, v_ty) for (k, k_ty, _, v, v_ty, _, _, _) in items]
             )
         d = self.builder.call(
             self.runtime["py_dict_new"],
@@ -407,21 +502,37 @@ class LiteralLoweringMixin:
             name=self._fresh("dict.new"),
         )
         dict_root = self._enter_container_temp_root(d, "dict")
-        for k, k_ty, _k_is_cpy, v, v_ty, v_is_cpy in items:
+        for k, k_ty, k_is_cpy, v, v_ty, v_is_cpy, k_expr, v_expr in items:
             k_obj = self._emit_value_as_pcc_object_or_bridge(
                 k,
                 k_ty,
                 "dict.key",
+                consume_valueclass_payload_fields=
+                    self._valueclass_payload_expr_fields_are_owned(k_expr),
             )
             v_obj = self._emit_value_as_pcc_object_or_bridge(
                 v,
                 v_ty,
                 "cpy.dict.val" if v_is_cpy else "dict.val",
+                consume_valueclass_payload_fields=
+                    self._valueclass_payload_expr_fields_are_owned(v_expr),
             )
             self.builder.call(
                 self.runtime["py_dict_set"],
                 [d, k_obj, v_obj],
             )
+            # py_dict_set borrows (balanced store); owned key/value temps
+            # must be released here, mirroring the list-literal path.
+            if self._container_store_temp_needs_release(k_expr, k_ty, k_is_cpy):
+                self._gc_release(
+                    k_obj,
+                    self._release_expr_label("container", k_expr),
+                )
+            if self._container_store_temp_needs_release(v_expr, v_ty, v_is_cpy):
+                self._gc_release(
+                    v_obj,
+                    self._release_expr_label("container", v_expr),
+                )
         self._leave_container_temp_root(dict_root)
         return d
 
@@ -439,14 +550,7 @@ class LiteralLoweringMixin:
         if len(expr.args) == 0:
             for kw_name, kw_expr in expr.kwargs:
                 key_obj = self._emit_str_literal(kw_name)
-                raw_val = self._emit_expr(kw_expr)
-                val_obj = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    raw_val,
-                    kw_expr.ty,
-                )
+                val_obj = self._emit_expr_as_pcc_object(kw_expr)
                 self.builder.call(
                     self.runtime["py_dict_set"],
                     [out, key_obj, val_obj],
@@ -539,14 +643,7 @@ class LiteralLoweringMixin:
         self.builder.position_at_end(end_bb)
         for kw_name, kw_expr in expr.kwargs:
             key_obj = self._emit_str_literal(kw_name)
-            raw_val = self._emit_expr(kw_expr)
-            val_obj = marshal.marshal_to_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                raw_val,
-                kw_expr.ty,
-            )
+            val_obj = self._emit_expr_as_pcc_object(kw_expr)
             self.builder.call(
                 self.runtime["py_dict_set"],
                 [out, key_obj, val_obj],
@@ -589,14 +686,29 @@ class LiteralLoweringMixin:
                         el.ty,
                         v_obj in self._cpy_values,
                     ):
-                        self._gc_release(v_obj)
+                        self._gc_release(
+                            v_obj,
+                            self._release_expr_label("container", el),
+                        )
                 self._leave_container_temp_root(tup_root)
                 return tup
 
-            ops: list[tuple[str, ir.Value, Type, bool]] = []
+            ops: list[tuple[str, ir.Value, Type, bool, bool]] = []
             for el in expr.elems:
-                v = self._emit_expr(el)
-                ops.append(("append", v, el.ty, v in self._cpy_values))
+                valueclass_payload = self._maybe_emit_valueclass_constructor_payload(
+                    el.ty,
+                    el,
+                )
+                if valueclass_payload is not None:
+                    v = valueclass_payload
+                else:
+                    v = self._emit_expr(el)
+                is_cpy = v in self._cpy_values
+                pinned = False
+                if isinstance(v.type, ir.PointerType) and not is_cpy:
+                    self.builder.call(self.runtime["pcc_gc_pin"], [v])
+                    pinned = True
+                ops.append(("append", v, el.ty, is_cpy, pinned))
             n = len(ops)
             n_val = ir.Constant(_I64, n)
             tup = self.builder.call(
@@ -605,11 +717,13 @@ class LiteralLoweringMixin:
                 name=self._fresh("tup.new"),
             )
             tup_root = self._enter_container_temp_root(tup, "tuple")
-            for i, (_op_kind, value, value_ty, is_cpy) in enumerate(ops):
+            for i, (_op_kind, value, value_ty, is_cpy, pinned) in enumerate(ops):
                 v_obj = self._emit_value_as_pcc_object_or_bridge(
                     value,
                     value_ty,
                     "cpy.tup.elem" if is_cpy else "tup.elem",
+                    consume_valueclass_payload_fields=
+                        self._valueclass_payload_expr_fields_are_owned(expr.elems[i]),
                 )
                 idx = ir.Constant(_I64, i)
                 self.builder.call(
@@ -619,11 +733,16 @@ class LiteralLoweringMixin:
                 if self._container_store_temp_needs_release(
                     expr.elems[i], value_ty, is_cpy
                 ):
-                    self._gc_release(v_obj)
+                    self._gc_release(
+                        v_obj,
+                        self._release_expr_label("container", expr.elems[i]),
+                    )
+                if pinned:
+                    self.builder.call(self.runtime["pcc_gc_unpin"], [value])
             self._leave_container_temp_root(tup_root)
             return tup
 
-        ops: list[tuple[str, ir.Value, Type, bool]] = []
+        ops: list[tuple[str, ir.Value, Type, bool, bool]] = []
         cpy_extend = False
         for el in expr.elems:
             if (
@@ -634,28 +753,50 @@ class LiteralLoweringMixin:
             ):
                 inner = self._emit_expr(el.args[0])
                 is_cpy = inner in self._cpy_values
-                ops.append(("extend", inner, el.args[0].ty, is_cpy))
+                pinned = False
+                if isinstance(inner.type, ir.PointerType) and not is_cpy:
+                    self.builder.call(self.runtime["pcc_gc_pin"], [inner])
+                    pinned = True
+                ops.append(("extend", inner, el.args[0].ty, is_cpy, pinned))
                 if is_cpy:
                     cpy_extend = True
                 continue
-            v = self._emit_expr(el)
-            ops.append(("append", v, el.ty, v in self._cpy_values))
-        if cpy_extend:
-            return self._emit_cpython_tuple_ops(
-                [(kind, value, ty) for kind, value, ty, _ in ops]
+            valueclass_payload = self._maybe_emit_valueclass_constructor_payload(
+                el.ty,
+                el,
             )
+            if valueclass_payload is not None:
+                v = valueclass_payload
+            else:
+                v = self._emit_expr(el)
+            is_cpy = v in self._cpy_values
+            pinned = False
+            if isinstance(v.type, ir.PointerType) and not is_cpy:
+                self.builder.call(self.runtime["pcc_gc_pin"], [v])
+                pinned = True
+            ops.append(("append", v, el.ty, is_cpy, pinned))
+        if cpy_extend:
+            result = self._emit_cpython_tuple_ops(
+                [(kind, value, ty) for kind, value, ty, _, _ in ops]
+            )
+            for _op_kind, value, _value_ty, _is_cpy, pinned in ops:
+                if pinned:
+                    self.builder.call(self.runtime["pcc_gc_unpin"], [value])
+            return result
         lst = self.builder.call(
             self.runtime["py_list_new"],
             [ir.Constant(_I64, 0)],
             name=self._fresh("tup.splat.list"),
         )
         lst_root = self._enter_container_temp_root(lst, "tuple.splat.list")
-        for op_kind, value, value_ty, is_cpy in ops:
+        for op_kind, value, value_ty, is_cpy, pinned in ops:
             if op_kind == "extend":
                 self.builder.call(
                     self.runtime["py_list_extend"],
                     [lst, value],
                 )
+                if pinned:
+                    self.builder.call(self.runtime["pcc_gc_unpin"], [value])
                 continue
             v_obj = self._emit_value_as_pcc_object_or_bridge(
                 value,
@@ -666,6 +807,8 @@ class LiteralLoweringMixin:
                 self.runtime["py_list_append"],
                 [lst, v_obj],
             )
+            if pinned:
+                self.builder.call(self.runtime["pcc_gc_unpin"], [value])
         n_val = self.builder.call(
             self.runtime["py_list_len"],
             [lst],

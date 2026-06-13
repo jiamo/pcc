@@ -1,4 +1,5 @@
 """User-function declaration helpers for Layer-1 Python codegen."""
+
 from __future__ import annotations
 
 import os
@@ -7,7 +8,6 @@ import sys
 from pcc.llvm_capi.compat import ir
 
 from ..py_ast import FuncDef, IntType, Name, NoneType
-
 
 _I8 = ir.IntType(8)
 _CSTR = _I8.as_pointer()
@@ -25,7 +25,7 @@ class UserFunctionDeclLoweringMixin:
         # Normalise dotted module names so the mangled symbol is a
         # valid LLVM identifier (dots in LLVM identifiers work when
         # quoted but read oddly).
-        sanitized = mod_name.replace(".", "_").replace("-", "_")
+        sanitized: str = mod_name.replace(".", "_").replace("-", "_")
         return f"user_{sanitized}_{name}"
 
     def _func_decorators(self, fd: FuncDef) -> tuple:
@@ -58,7 +58,17 @@ class UserFunctionDeclLoweringMixin:
                 + "\n"
             )
         c_abi_sym: str | None = self._func_c_abi_export_symbol(fd)
+        if debug_bootstrap:
+            sys.stderr.write("debug: declare_user_function c_abi resolved\n")
         decorators = self._func_decorators(fd)
+        if debug_bootstrap:
+            sys.stderr.write(
+                "debug: declare_user_function decorators type="
+                + type(decorators).__name__
+                + " count="
+                + str(len(decorators))
+                + "\n"
+            )
         if decorators:
             unrecognised = []
             i = 0
@@ -69,7 +79,10 @@ class UserFunctionDeclLoweringMixin:
                     i += 1
                     continue
                 if not self._decorator_is_noop_whitelist(d):
-                    if not (isinstance(d, Name) and d.ident in self.functions):
+                    if not (
+                        (isinstance(d, Name) and d.ident in self.functions)
+                        or self._decorator_is_runtime_partial_factory(d)
+                    ):
                         unrecognised.append(d)
                 i += 1
             if unrecognised:
@@ -84,6 +97,8 @@ class UserFunctionDeclLoweringMixin:
             fd,
             c_abi_sym=c_abi_sym,
         )
+        if debug_bootstrap:
+            sys.stderr.write("debug: declare_user_function abi resolved\n")
         param_types: list[ir.Type] = []
         for arg_index, arg in enumerate(fd.args):
             if debug_bootstrap:

@@ -23,6 +23,7 @@ not rebuilding all of CPython.
 | `functools` | skeleton | lru_cache, wraps, partial |
 | `itertools` | skeleton | chain, repeat, islice |
 | `collections` | skeleton | OrderedDict, defaultdict, namedtuple, deque |
+| `decimal` | skeleton | Decimal type identity; construction fails explicitly |
 | `pathlib` | skeleton | PurePath, Path |
 | `hashlib` | stub | binds OpenSSL via extern |
 | `time` | stub | binds libc via extern (time, monotonic, sleep) |
@@ -32,6 +33,7 @@ not rebuilding all of CPython.
 | `typing` | noop+ | Generic/Protocol/TypeVar/NewType/Annotated markers, get_origin/get_args |
 | `types` | skeleton | SimpleNamespace, ModuleType, MappingProxyType, marker type aliases |
 | `abc` | skeleton+ | ABCMeta, abstract decorators, register/cache token |
+| `numbers` | skeleton+ | numeric ABC hierarchy and registration surface |
 | `enum` | skeleton+ | Enum/IntEnum, auto, unique, iteration/value lookup |
 | `inspect` | skeleton | signature, predicates, getmembers/getdoc/unwrap |
 | `weakref` | skeleton | ref/proxy/WeakValueDictionary/WeakKeyDictionary/WeakSet/finalize |

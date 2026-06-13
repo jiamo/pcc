@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..ast import c_ast
+from ..c_abi_layout import builtin_scalar_layout, pointer_scalar_layout
 from .ir import (
     SSABinaryOp,
     SSABlock,
@@ -3735,7 +3736,7 @@ class SSABuilder:
             if isinstance(inner, c_ast.Enum):
                 return 4
         if isinstance(resolved, c_ast.PtrDecl):
-            return 8
+            return pointer_scalar_layout().size
         if isinstance(resolved, c_ast.ArrayDecl):
             return self._array_type_count(resolved) * self._ast_type_size(resolved.type)
         if isinstance(resolved, c_ast.Struct):
@@ -3761,7 +3762,7 @@ class SSABuilder:
             if isinstance(inner, c_ast.Enum):
                 return 4
         if isinstance(resolved, c_ast.PtrDecl):
-            return 8
+            return pointer_scalar_layout().alignment
         if isinstance(resolved, c_ast.ArrayDecl):
             return self._ast_type_align(resolved.type)
         if isinstance(resolved, c_ast.Struct):
@@ -3829,39 +3830,17 @@ class SSABuilder:
 
     @staticmethod
     def _builtin_type_size(names: list[str]) -> int:
-        normalized = tuple(sorted(name for name in names if name != "signed"))
-        if normalized in {("char",), ("char", "unsigned")}:
-            return 1
-        if normalized in {("short",), ("short", "unsigned"), ("int", "short"), ("int", "short", "unsigned")}:
-            return 2
-        if normalized in {("int",), ("int", "unsigned"), ("unsigned",)}:
-            return 4
-        if normalized in {("long",), ("long", "unsigned"), ("int", "long"), ("int", "long", "unsigned")}:
-            return 8
-        if normalized in {
-            ("long", "long"),
-            ("long", "long", "unsigned"),
-            ("int", "long", "long"),
-            ("int", "long", "long", "unsigned"),
-        }:
-            return 8
-        if normalized == ("float",):
-            return 4
-        if normalized == ("double",):
-            return 8
-        if normalized == ("long", "double"):
-            return 16
-        if normalized == ("_Bool",):
-            return 1
-        if normalized == ("void",):
-            raise SSAConstructionError("unsupported sizeof(void)")
-        if normalized == ("wchar_t",):
-            return 4
-        raise SSAConstructionError("unsupported builtin sizeof target")
+        try:
+            return builtin_scalar_layout(names).size
+        except ValueError as exc:
+            raise SSAConstructionError("unsupported builtin sizeof target") from exc
 
-    @classmethod
-    def _builtin_type_align(cls, names: list[str]) -> int:
-        return cls._builtin_type_size(names)
+    @staticmethod
+    def _builtin_type_align(names: list[str]) -> int:
+        try:
+            return builtin_scalar_layout(names).alignment
+        except ValueError as exc:
+            raise SSAConstructionError("unsupported builtin align target") from exc
 
     @staticmethod
     def _int_literal_type_name(raw: str) -> str:

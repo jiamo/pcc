@@ -8,6 +8,7 @@ from ..py_ast import (
     Assign,
     Attr,
     AugAssign,
+    BoolExpr,
     BoolType,
     ByteArrayType,
     BytesType,
@@ -19,6 +20,7 @@ from ..py_ast import (
     Expr,
     FloatType,
     FuncType,
+    IfExpr,
     IntType,
     ListExpr,
     ListType,
@@ -42,6 +44,13 @@ _CSTR = ir.IntType(8).as_pointer()
 
 def _assign_has_attr(obj, name: str) -> bool:
     return hasattr(obj, name)
+
+
+def _assign_dataclass_field_names(obj):
+    fields = getattr(obj, "__dataclass_fields__", None)
+    if fields is None:
+        return ()
+    return fields.keys()
 
 
 def _assign_expr_type_name(obj) -> str:
@@ -129,8 +138,7 @@ def _assign_is_list_type(ty) -> bool:
 def _assign_is_tuple_type(ty) -> bool:
     name = _assign_type_name(ty)
     return isinstance(ty, TupleType) or (
-        _assign_has_attr(ty, "elems")
-        and (name == "tuple" or name == "tuple_variadic")
+        _assign_has_attr(ty, "elems") and (name == "tuple" or name == "tuple_variadic")
     )
 
 
@@ -151,6 +159,129 @@ def _assign_list_elem(ty):
 
 
 class AssignmentStatementLoweringMixin:
+    def _literal_self_method_dispatch_entries(self, dict_expr: DictExpr):
+        if not isinstance(dict_expr, DictExpr) or not dict_expr.pairs:
+            return None
+        receiver_class = self._self_receiver_class_name()
+        current_class = getattr(self, "current_class", None)
+        if receiver_class is None and current_class is not None:
+            receiver_class = current_class.name
+        if receiver_class is None or "self" not in self.env:
+            return None
+
+        entries = []
+        seen_keys = set()
+        for key_expr, value_expr in dict_expr.pairs:
+            if not isinstance(key_expr, StrLit):
+                return None
+            if key_expr.value in seen_keys:
+                return None
+            seen_keys.add(key_expr.value)
+            if not isinstance(value_expr, Attr):
+                return None
+            if not isinstance(value_expr.obj, Name) or value_expr.obj.ident != "self":
+                return None
+            method_info = self._resolve_method_mro(receiver_class, value_expr.name)
+            if method_info is None or value_expr.name not in method_info.methods:
+                return None
+            if method_info.method_kinds.get(value_expr.name, "instance") != "instance":
+                return None
+            entries.append(
+                (
+                    key_expr.value,
+                    method_info,
+                    method_info.methods[value_expr.name],
+                    value_expr.name,
+                )
+            )
+        return tuple(entries)
+
+    def _literal_dispatch_name_uses_are_call_only(self, name: str) -> bool:
+        current_func = getattr(self, "current_func_def", None)
+        body = getattr(current_func, "body", None)
+        if body is None:
+            return False
+
+        seen_dispatch_call = False
+        saw_bad_use = False
+
+        def visit(node) -> None:
+            nonlocal seen_dispatch_call, saw_bad_use
+            if saw_bad_use or node is None:
+                return
+            if isinstance(node, Name):
+                if node.ident == name:
+                    saw_bad_use = True
+                return
+            if isinstance(node, Call):
+                func = node.func
+                if (
+                    isinstance(func, Subscript)
+                    and isinstance(func.obj, Name)
+                    and func.obj.ident == name
+                ):
+                    seen_dispatch_call = True
+                    visit(func.idx)
+                    for arg in node.args:
+                        visit(arg)
+                    for _kw_name, kw_expr in node.kwargs:
+                        visit(kw_expr)
+                    return
+            if isinstance(node, Assign):
+                for target in node.targets:
+                    if not (isinstance(target, Name) and target.ident == name):
+                        visit(target)
+                visit(node.value)
+                return
+            if isinstance(node, AugAssign):
+                visit(node.target)
+                visit(node.value)
+                return
+            if isinstance(node, (tuple, list)):
+                for item in node:
+                    visit(item)
+                return
+            for field_name in _assign_dataclass_field_names(node):
+                if field_name in ("span", "ty", "annotation"):
+                    continue
+                visit(getattr(node, field_name))
+
+        visit(body)
+        return seen_dispatch_call and not saw_bad_use
+
+    def _maybe_emit_virtual_literal_dispatch_assign(
+        self,
+        target: Name,
+        value_expr: Expr,
+        target_ty,
+    ) -> bool:
+        if not isinstance(value_expr, DictExpr):
+            return False
+        if self.env.get(target.ident) is not None:
+            return False
+        if self._literal_self_method_dispatch_entries(value_expr) is None:
+            return False
+        if not self._literal_dispatch_name_uses_are_call_only(target.ident):
+            return False
+        alloca = self._alloca_in_entry(
+            _CSTR,
+            name=f"{target.ident}.addr",
+            init_null=True,
+        )
+        self.env[target.ident] = (alloca, _CSTR, target_ty)
+        self.builder.store(ir.Constant(_CSTR, None), alloca)
+        virtual = getattr(self, "_virtual_literal_dict_expr_bindings", None)
+        if virtual is None:
+            self._virtual_literal_dict_expr_bindings = set()
+            virtual = self._virtual_literal_dict_expr_bindings
+        virtual.add(target.ident)
+        self._cpy_env_flags.pop(target.ident, None)
+        self._weak_dict_env_flags.pop(target.ident, None)
+        self._weakref_env_flags.pop(target.ident, None)
+        self._owned_local_names.discard(target.ident)
+        self._owned_local_has_value.discard(target.ident)
+        return True
+
     def _maybe_emit_valueclass_constructor_payload(
         self,
         target_ty,
@@ -205,7 +336,17 @@ class AssignmentStatementLoweringMixin:
         for idx, ((_field_name, field_ty), arg_expr) in enumerate(
             zip(fields, resolved_args)
         ):
-            if isinstance(field_ty, IntType):
+            if self._is_valueclass_payload_type(field_ty):
+                nested_payload = self._maybe_emit_valueclass_constructor_payload(
+                    field_ty,
+                    arg_expr,
+                )
+                if nested_payload is not None:
+                    field_value = nested_payload
+                else:
+                    raw_value = self._emit_expr(arg_expr)
+                    field_value = self._coerce(raw_value, arg_expr.ty, field_ty)
+            elif isinstance(field_ty, IntType):
                 field_value = self._emit_expr_as_i64(arg_expr)
             else:
                 raw_value = self._emit_expr(arg_expr)
@@ -256,10 +397,12 @@ class AssignmentStatementLoweringMixin:
 
         # Subscript target: ``lst[i] = v`` / ``d[k] = v``.
         if _assign_is_subscript(target):
+            # ``os.environ[key] = value`` store hook (native_os.py):
+            # CPython mapping semantics via py_os_environ_setitem.
+            if self._emit_native_os_environ_setitem_store(target, stmt.value):
+                return
             if isinstance(target.obj, Name):
-                tracked_dict = self._literal_dict_expr_bindings.get(
-                    target.obj.ident
-                )
+                tracked_dict = self._literal_dict_expr_bindings.get(target.obj.ident)
                 if tracked_dict is not None and isinstance(target.idx, StrLit):
                     updated_dict = _assign_update_dict_literal_pair(
                         tracked_dict,
@@ -275,6 +418,9 @@ class AssignmentStatementLoweringMixin:
                             )
                 elif target.obj.ident in self._literal_dict_expr_bindings:
                     self._literal_dict_expr_bindings = {}
+                getattr(self, "_virtual_literal_dict_expr_bindings", set()).discard(
+                    target.obj.ident
+                )
             self._emit_subscript_store(target, stmt.value)
             return
 
@@ -301,10 +447,11 @@ class AssignmentStatementLoweringMixin:
         if isinstance(stmt.value, DictExpr):
             literal_dict_expr = stmt.value
         elif isinstance(stmt.value, Name):
-            literal_dict_expr = self._literal_dict_expr_bindings.get(
-                stmt.value.ident
-            )
+            literal_dict_expr = self._literal_dict_expr_bindings.get(stmt.value.ident)
         self._literal_dict_expr_bindings.pop(target.ident, None)
+        getattr(self, "_virtual_literal_dict_expr_bindings", set()).discard(
+            target.ident
+        )
         if literal_dict_expr is not None:
             self._literal_dict_expr_bindings[target.ident] = literal_dict_expr
 
@@ -327,6 +474,7 @@ class AssignmentStatementLoweringMixin:
             self.env_class_object_hint.pop(target_ident, None)
             self._cpy_env_flags.pop(target_ident, None)
             self._weak_dict_env_flags.pop(target_ident, None)
+            self._weakref_env_flags.pop(target_ident, None)
             return
 
         optional_arg_name = self._typing_optional_arg_name(stmt.value)
@@ -340,10 +488,14 @@ class AssignmentStatementLoweringMixin:
             self.env_class_object_hint.pop(target_ident, None)
             self._cpy_env_flags.pop(target_ident, None)
             self._weak_dict_env_flags.pop(target_ident, None)
+            self._weakref_env_flags.pop(target_ident, None)
             return
 
-        if self._typing_metadata_alias_expr(stmt.value):
+        if self._typing_type_alias_annotation(
+            stmt.annotation
+        ) or self._typing_metadata_alias_expr(stmt.value):
             target_ident = target.ident
+            self._typing_metadata_aliases.add(target_ident)
             self._native_builtin_value_aliases.pop(target_ident, None)
             self._native_module_object_aliases.pop(target_ident, None)
             self.env.pop(target_ident, None)
@@ -351,6 +503,7 @@ class AssignmentStatementLoweringMixin:
             self.env_class_object_hint.pop(target_ident, None)
             self._cpy_env_flags.pop(target_ident, None)
             self._weak_dict_env_flags.pop(target_ident, None)
+            self._weakref_env_flags.pop(target_ident, None)
             return
 
         imported_native_module = self._native_importlib_literal_module(stmt.value)
@@ -374,6 +527,7 @@ class AssignmentStatementLoweringMixin:
             if hasattr(self, "_cpy_env_flags"):
                 self._cpy_env_flags.pop(target.ident, None)
             self._weak_dict_env_flags.pop(target.ident, None)
+            self._weakref_env_flags.pop(target.ident, None)
             return
         self._clear_native_module_object_alias(target.ident)
         self._clear_native_builtin_module_alias(target.ident)
@@ -390,12 +544,50 @@ class AssignmentStatementLoweringMixin:
             if hasattr(self, "_cpy_env_flags"):
                 self._cpy_env_flags.pop(target.ident, None)
             self._weak_dict_env_flags.pop(target.ident, None)
-            return
-        self._clear_native_builtin_value_alias(target.ident)
+            self._weakref_env_flags.pop(target.ident, None)
+            module_global_alias = target.ident in self._module_globals and (
+                self.current_func_def is None
+                or target.ident in self._current_global_names
+            )
+            if not module_global_alias:
+                return
+            # A module-level alias is both useful compiler metadata and a real
+            # Python binding.  Falling out of this branch materializes and
+            # publishes the builtin object below.  Returning here left the
+            # corresponding ``.modvar`` null, so a sibling's
+            # ``from mod import alias`` raised AttributeError even though the
+            # assignment had executed (for example ``binary_type = bytes``).
+        else:
+            self._clear_native_builtin_value_alias(target.ident)
+
+        if getattr(self, "current_func_def", None) is None:
+            static_re_flags = self._native_re_static_flags_value(stmt.value)
+            re_flag_aliases = getattr(self, "_native_re_static_flag_aliases", None)
+            if re_flag_aliases is None:
+                self._native_re_static_flag_aliases = {}
+                re_flag_aliases = self._native_re_static_flag_aliases
+            if static_re_flags is None:
+                re_flag_aliases.pop(target.ident, None)
+            else:
+                re_flag_aliases[target.ident] = static_re_flags
 
         re_compile_alias = self._native_re_compile_alias_info(stmt.value)
         current_func = getattr(self, "current_func_def", None)
-        re_scope_body = None if current_func is None else getattr(current_func, "body", None)
+        re_scope_body = (
+            None if current_func is None else getattr(current_func, "body", None)
+        )
+        if (
+            re_compile_alias is not None
+            and (re_compile_alias[1] & ~26) == 0
+            and (self._re_engine_subset_supported(re_compile_alias[0]))
+        ):
+            # Engine-subset flags==0 patterns get a REAL pattern object from
+            # the re.compile expression lowering (py_re_compile_obj), so the
+            # variable must be a normal assignment: skipping emission here
+            # left the modvar null for any use the compile-time rewriting
+            # did not intercept (e.g. method calls lowered inside function
+            # bodies), which surfaced as AttributeError at runtime.
+            re_compile_alias = None
         if re_compile_alias is not None and (
             current_func is None or re_scope_body is not None
         ):
@@ -426,6 +618,7 @@ class AssignmentStatementLoweringMixin:
                 if hasattr(self, "_cpy_env_flags"):
                     self._cpy_env_flags.pop(target.ident, None)
                 self._weak_dict_env_flags.pop(target.ident, None)
+                self._weakref_env_flags.pop(target.ident, None)
                 return
         if current_func is None:
             getattr(self, "_native_re_compile_aliases", {}).pop(target.ident, None)
@@ -463,10 +656,8 @@ class AssignmentStatementLoweringMixin:
             # Any other RHS invalidates the class hint.
             self.env_class_hint.pop(target.ident, None)
         class_object_hint = None
-        if isinstance(stmt.value, Name) and hasattr(self, "class_lowering"):
-            candidate = self._resolve_class_alias(stmt.value.ident)
-            if candidate in self.class_lowering.classes:
-                class_object_hint = candidate
+        if hasattr(self, "class_lowering"):
+            class_object_hint = self._class_object_hint_for_expr(stmt.value)
         if class_object_hint is not None:
             self.env_class_object_hint[target.ident] = class_object_hint
         else:
@@ -496,6 +687,11 @@ class AssignmentStatementLoweringMixin:
             self._weak_dict_env_flags[target.ident] = weak_dict_kind
         else:
             self._weak_dict_env_flags.pop(target.ident, None)
+        weakref_kind = self._weakref_constructor_kind_for_expr(stmt.value)
+        if weakref_kind is not None:
+            self._weakref_env_flags[target.ident] = True
+        else:
+            self._weakref_env_flags.pop(target.ident, None)
         inspect_signature = self._inspect_signature_metadata_for_call(stmt.value)
         if inspect_signature is not None:
             self._inspect_signature_aliases[target.ident] = inspect_signature
@@ -504,6 +700,12 @@ class AssignmentStatementLoweringMixin:
             self._inspect_fullargspec_aliases[target.ident] = inspect_fullargspec
 
         target_ty = stmt.annotation if stmt.annotation is not None else target.ty
+        if self._maybe_emit_virtual_literal_dispatch_assign(
+            target,
+            stmt.value,
+            target_ty,
+        ):
+            return
         boxed_int_target = (
             isinstance(target_ty, IntType) and self._int_exprs_are_boxed()
         )
@@ -514,20 +716,40 @@ class AssignmentStatementLoweringMixin:
             target_ty, IntType
         ) and self._int_expr_needs_exact_object_boundary(stmt.value):
             exact_int_value = self._maybe_emit_exact_int_object(stmt.value)
+        valueclass_target_ty = target_ty
+        if not self._is_valueclass_payload_type(
+            valueclass_target_ty
+        ) and self._is_valueclass_payload_type(stmt.value.ty):
+            valueclass_target_ty = stmt.value.ty
         valueclass_payload = self._maybe_emit_valueclass_constructor_payload(
-            target_ty,
+            valueclass_target_ty,
             stmt.value,
         )
         if valueclass_payload is not None:
             value = valueclass_payload
+            local_target_ty = valueclass_target_ty
         elif exact_int_value is not None:
             value = exact_int_value
+            local_target_ty = target_ty
         elif isinstance(target_ty, FuncType) and isinstance(stmt.value.ty, FuncType):
             value = self._emit_expr_with_native_callable_values(stmt.value)
+            local_target_ty = target_ty
+        elif (
+            self._is_object(target_ty)
+            and isinstance(stmt.value, IfExpr)
+            and self._is_valueclass_payload_type(stmt.value.ty)
+        ):
+            value = self._emit_expr_as_pcc_object(stmt.value)
+            local_target_ty = target_ty
+        elif self._is_object(target_ty) and isinstance(stmt.value, BoolExpr):
+            value = self._emit_expr_as_pcc_object(stmt.value)
+            local_target_ty = target_ty
         else:
             value = self._emit_expr(stmt.value)
+            local_target_ty = target_ty
 
-        if value in self._native_file_values:
+        rhs_native_file_is_owned = value in self._native_file_values
+        if rhs_native_file_is_owned:
             self._native_file_env_flags[target.ident] = True
         else:
             self._native_file_env_flags.pop(target.ident, None)
@@ -575,9 +797,16 @@ class AssignmentStatementLoweringMixin:
                 self._raw_scaffold_object_rhs_is_owned(stmt.value)
                 and self._expr_returns_owned_object(stmt.value)
             )
+            self._publish_module_global_assignment(
+                target.ident,
+                value,
+                declared_ty,
+                is_cpy_value=is_cpy_value,
+            )
             self._store_module_global_root_value(
                 gv,
                 value,
+                declared_ty=declared_ty,
                 value_is_owned=value_is_owned,
                 is_cpy_value=is_cpy_value,
             )
@@ -587,18 +816,18 @@ class AssignmentStatementLoweringMixin:
         if slot is None:
             # First assignment — allocate.
             if not (
-                self._is_scalar(target_ty)
-                or self._is_object(target_ty)
-                or self._is_valueclass_payload_type(target_ty)
+                self._is_scalar(local_target_ty)
+                or self._is_object(local_target_ty)
+                or self._is_valueclass_payload_type(local_target_ty)
             ):
                 raise NotImplementedError(
                     f"Layer 1/2 cannot allocate variable "
-                    f"{target.ident!r} of type {type(target_ty).__name__}"
+                    f"{target.ident!r} of type {type(local_target_ty).__name__}"
                 )
             ir_ty = (
                 _CSTR
                 if (boxed_int_target or exact_int_value is not None)
-                else self._storage_ir_type(target_ty)
+                else self._storage_ir_type(local_target_ty)
             )
             init_null = isinstance(ir_ty, ir.PointerType) and self._ir_type_matches(
                 ir_ty, _CSTR
@@ -608,31 +837,32 @@ class AssignmentStatementLoweringMixin:
                 name=f"{target.ident}.addr",
                 init_null=init_null,
             )
-            self.env[target.ident] = (alloca, ir_ty, target_ty)
+            self.env[target.ident] = (alloca, ir_ty, local_target_ty)
             slot = self.env[target.ident]
 
         alloca, ir_ty, declared_ty = slot
         target_storage_ty = (
             _CSTR
             if (boxed_int_target or exact_int_value is not None)
-            else self._storage_ir_type(target_ty)
+            else self._storage_ir_type(local_target_ty)
         )
         if (
             not (boxed_int_target or exact_int_value is not None)
             and self._ir_type_matches(ir_ty, target_storage_ty)
-            and _assign_type_name(declared_ty) != _assign_type_name(target_ty)
+            and _assign_type_name(declared_ty) != _assign_type_name(local_target_ty)
         ):
             # Python locals are rebindable. When the storage ABI stays the
             # same PyObject* shape, keep the existing alloca but update the
             # codegen type so later loads/augassigns use the current inferred
             # type instead of the first assignment's type.
-            declared_ty = target_ty
+            declared_ty = local_target_ty
             self.env[target.ident] = (alloca, ir_ty, declared_ty)
         if (
             (boxed_int_target or exact_int_value is not None)
             and not self._ir_type_matches(ir_ty, _CSTR)
             and exact_int_value is not None
         ):
+            declared_ty = local_target_ty
             alloca = self._alloca_in_entry(
                 _CSTR,
                 name=f"{target.ident}.obj.addr",
@@ -653,7 +883,35 @@ class AssignmentStatementLoweringMixin:
         else:
             self._exact_int_env_flags.pop(target.ident, None)
             value = self._coerce(value, stmt.value.ty, declared_ty)
-        rhs_is_safe_owned_in_raw = self._raw_scaffold_object_rhs_is_owned(stmt.value)
+        rhs_local_copy_is_owned = False
+        if (
+            isinstance(stmt.value, Name)
+            and (
+                stmt.value.ident in getattr(self, "_owned_local_names", set())
+                or stmt.value.ident in getattr(self, "_except_binding_names", set())
+            )
+            and isinstance(value.type, ir.PointerType)
+            and self._ir_type_matches(ir_ty, _CSTR)
+            and value not in getattr(self, "_cpy_values", ())
+        ):
+            # `except ... as e` stores a retained handler exception but does
+            # not register `e` as a normal owned local because handler cleanup
+            # releases it at block exit. A surviving copy (`saved = e`) must
+            # take its own ref and then use the normal owned-local root path.
+            value = self._gc_retain(
+                value,
+                name=self._fresh(target.ident + ".local.copy.retain"),
+            )
+            rhs_local_copy_is_owned = True
+        rhs_is_safe_owned_in_raw = (
+            rhs_local_copy_is_owned
+            or self._raw_scaffold_object_rhs_is_owned(stmt.value)
+        )
+        rhs_returns_owned_object = (
+            rhs_local_copy_is_owned
+            or rhs_native_file_is_owned
+            or self._expr_returns_owned_object(stmt.value)
+        )
         in_raw_scaffold = self._module_uses_raw_int_scaffold
         # In raw-scaffold mode, only enable owned-local management when the
         # local was already tracked (e.g. previously bound to a tracked
@@ -668,7 +926,7 @@ class AssignmentStatementLoweringMixin:
             and (
                 target.ident in getattr(self, "_owned_local_names", set())
                 or (
-                    self._expr_returns_owned_object(stmt.value)
+                    rhs_returns_owned_object
                     and (not in_raw_scaffold or rhs_is_safe_owned_in_raw)
                 )
             )
@@ -676,6 +934,18 @@ class AssignmentStatementLoweringMixin:
         if manages_owned_local:
             self._emit_release_owned_local_if_flagged(target.ident, alloca)
             self._owned_local_names.discard(target.ident)
+        if (
+            manages_owned_local
+            and rhs_returns_owned_object
+            and isinstance(value.type, ir.PointerType)
+            and self._ir_type_matches(ir_ty, _CSTR)
+            and value not in getattr(self, "_cpy_values", ())
+        ):
+            value = self.builder.call(
+                self.runtime["pcc_gc_resolve_owned_ptr"],
+                [value],
+                name=self._fresh(target.ident + ".owned.resolve"),
+            )
         if (
             (
                 manages_owned_local
@@ -688,7 +958,11 @@ class AssignmentStatementLoweringMixin:
                 self.runtime["pcc_gc_note_write_barrier"],
                 [ir.Constant(_CSTR, None), value],
             )
-        if isinstance(value.type, ir.IntType) and isinstance(ir_ty, ir.IntType) and value.type.width != ir_ty.width:
+        if (
+            isinstance(value.type, ir.IntType)
+            and isinstance(ir_ty, ir.IntType)
+            and value.type.width != ir_ty.width
+        ):
             if value.type.width < ir_ty.width:
                 is_unsigned = False
                 rhs_type = getattr(stmt.value, "type", None)
@@ -701,13 +975,19 @@ class AssignmentStatementLoweringMixin:
             else:
                 value = self.builder.trunc(value, ir_ty, name=self._fresh("trunc"))
         self.builder.store(value, alloca)
-        self._mark_owned_local_if_object(target.ident, ir_ty, stmt.value)
+        if self._is_valueclass_payload_type(declared_ty):
+            self._ensure_valueclass_payload_gc_roots(target.ident, alloca, declared_ty)
+        if rhs_local_copy_is_owned or rhs_native_file_is_owned:
+            self._owned_local_names.add(target.ident)
+            self._ensure_owned_local_gc_root(target.ident, alloca, ir_ty)
+        else:
+            self._mark_owned_local_if_object(target.ident, ir_ty, stmt.value)
         if target.ident in self._owned_local_names:
-            flag = self._ensure_owned_local_flag(target.ident)
+            flag = self._ensure_owned_local_flag(target.ident, alloca)
             self.builder.store(ir.Constant(_I1, 1), flag)
             self._owned_local_has_value.add(target.ident)
         else:
-            flag = self._owned_local_flag_slots.get(target.ident)
+            flag = self._owned_local_flag_for(target.ident, alloca)
             if flag is not None:
                 self.builder.store(ir.Constant(_I1, 0), flag)
             self._owned_local_has_value.discard(target.ident)
@@ -726,6 +1006,18 @@ class AssignmentStatementLoweringMixin:
                 # sweeps its message. See
                 # gc-5backend-exception-referent-roots-no-libpython.md.
                 self._ensure_owned_local_gc_root(target.ident, alloca, ir_ty)
+            elif (
+                not getattr(self, "_suppress_implicit_gc_roots", False)
+                and isinstance(value.type, ir.PointerType)
+                and self._ir_type_matches(ir_ty, _CSTR)
+                and value not in getattr(self, "_cpy_values", ())
+                and self._is_object(stmt.value.ty)
+                and not self._expr_returns_unsafe_raw_pointer(stmt.value)
+            ):
+                # Ownership and rootability are separate. A borrowed object
+                # local must remain an updateable GC root if it lives across
+                # later allocations; only the owned flag controls release.
+                self._ensure_borrowed_local_gc_root(target.ident, alloca, ir_ty)
             else:
                 self._discard_owned_local_gc_root(target.ident, alloca)
 
@@ -756,17 +1048,83 @@ class AssignmentStatementLoweringMixin:
             return self._emit_starred_unpack_assign(stmt, target, star_indices)
 
         rhs = stmt.value
+        if _assign_is_tuple_expr(rhs) and any(
+            self._is_starred_unpack_expr(e) for e in rhs.elems
+        ):
+            tup_val = self._emit_expr(rhs)
+            elem_ty = DynType(name="dyn")
+            for i, lhs in enumerate(target.elems):
+                elem_obj = self.builder.call(
+                    self.runtime["py_tuple_get"],
+                    [tup_val, ir.Constant(_I64, i)],
+                    name=self._fresh(f"unpack.splat.{i}"),
+                )
+                self._store_unpack_target(
+                    lhs,
+                    elem_obj,
+                    elem_ty,
+                    value_is_owned=True,
+                )
+            self._gc_release_if_owned(tup_val, rhs)
+            return
         if _assign_is_tuple_expr(rhs):
             if len(rhs.elems) != len(target.elems):
                 raise L1CodegenError(
                     f"tuple unpack arity mismatch: {len(target.elems)} "
                     f"targets, {len(rhs.elems)} values"
                 )
+            safe_fresh_names = True
+            i = 0
+            while i < len(target.elems):
+                lhs = target.elems[i]
+                if not _assign_is_name(lhs):
+                    safe_fresh_names = False
+                    break
+                ident = lhs.ident
+                if ident in self.env:
+                    safe_fresh_names = False
+                    break
+                if ident in getattr(self, "_current_global_names", set()):
+                    safe_fresh_names = False
+                    break
+                if ident in getattr(self, "_current_param_names", set()):
+                    safe_fresh_names = False
+                    break
+                j = 0
+                while j < i:
+                    prev = target.elems[j]
+                    if _assign_is_name(prev) and prev.ident == ident:
+                        safe_fresh_names = False
+                        break
+                    j += 1
+                if not safe_fresh_names:
+                    break
+                i += 1
+            if safe_fresh_names:
+                i = 0
+                while i < len(target.elems):
+                    elem = rhs.elems[i]
+                    self._store_unpack_target(
+                        target.elems[i],
+                        self._emit_expr(elem),
+                        elem.ty,
+                    )
+                    i += 1
+                return
+
             rhs_vals: list = []
+            rhs_tys: list = []
             for e in rhs.elems:
-                rhs_vals.append((self._emit_expr(e), e.ty))
-            for lhs, (val, val_ty) in zip(target.elems, rhs_vals):
-                self._store_unpack_target(lhs, val, val_ty)
+                rhs_vals.append(self._emit_expr(e))
+                rhs_tys.append(e.ty)
+            i = 0
+            while i < len(target.elems):
+                self._store_unpack_target(
+                    target.elems[i],
+                    rhs_vals[i],
+                    rhs_tys[i],
+                )
+                i += 1
             return
 
         rhs_ty = rhs.ty
@@ -1098,14 +1456,49 @@ class AssignmentStatementLoweringMixin:
                     self._cpy_values = set()
                 self._cpy_values.add(cur)
             rhs = self._emit_expr(stmt.value)
-            result = self._emit_binop_value(
-                op_bare,
-                cur,
-                declared_ty,
-                rhs,
-                stmt.value.ty,
-                result_ty=declared_ty,
-            )
+            # CPython augmented assignment tries type(a).__iop__ FIRST;
+            # the plain binop only runs when __iop__ is missing or
+            # returns NotImplemented. Dyn pointer targets route through
+            # py_obj_inplace_op (instances dispatch __iadd__ etc.);
+            # everything else keeps the static binop path.
+            _inplace_code = {
+                "+": 0,
+                "-": 1,
+                "*": 2,
+                "/": 3,
+                "//": 4,
+                "%": 5,
+            }.get(op_bare)
+            if (
+                _inplace_code is not None
+                and isinstance(declared_ty, (DynType, ClassType))
+                and isinstance(cur.type, ir.PointerType)
+                and cur not in getattr(self, "_cpy_values", ())
+            ):
+                rhs_obj = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    rhs,
+                    stmt.value.ty,
+                )
+                result = self.builder.call(
+                    self.runtime["py_obj_inplace_op"],
+                    [cur, rhs_obj, ir.Constant(_I64, _inplace_code)],
+                    name=self._fresh("augassign.inplace"),
+                )
+                # __iop__/binop can raise; without this check the
+                # pending exception skips enclosing try/except blocks
+                self._emit_post_call_err_check(getattr(stmt, "span", None))
+            else:
+                result = self._emit_binop_value(
+                    op_bare,
+                    cur,
+                    declared_ty,
+                    rhs,
+                    stmt.value.ty,
+                    result_ty=declared_ty,
+                )
             result = self._coerce(result, declared_ty, declared_ty)
             self._store_value_at_name(
                 stmt.target,
@@ -1166,14 +1559,18 @@ class AssignmentStatementLoweringMixin:
                     [obj_as_obj, lo_obj, hi_obj, step_obj, result_raw],
                 )
                 return
-            idx_val = self._emit_expr(stmt.target.idx)
-            idx_obj = marshal.marshal_to_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                idx_val,
-                stmt.target.idx.ty,
-            )
+            # Exact list receivers use the raising typed accessors with a
+            # single i64 index evaluation; everything else keeps the generic
+            # object-key dispatchers. Load and store branch together so the
+            # inplace/binop middle stays shared.
+            idx_i64 = None
+            idx_obj = None
+            if isinstance(obj_ty, ListType) and isinstance(
+                stmt.target.idx.ty, (IntType, BoolType)
+            ):
+                idx_i64 = self._emit_index_expr_as_i64(stmt.target.idx)
+            else:
+                idx_obj = self._emit_subscript_key_object(stmt.target.idx)
             obj_as_obj = marshal.marshal_to_object(
                 self.builder,
                 self.module,
@@ -1181,11 +1578,23 @@ class AssignmentStatementLoweringMixin:
                 obj_val,
                 obj_ty,
             )
-            cur_obj = self.builder.call(
-                self.runtime["py_obj_getitem"],
-                [obj_as_obj, idx_obj],
-                name=self._fresh("augassign.cur"),
-            )
+            if idx_i64 is not None:
+                cur_obj = self.builder.call(
+                    self.runtime["py_list_getitem"],
+                    [obj_as_obj, idx_i64],
+                    name=self._fresh("augassign.list.cur"),
+                )
+            else:
+                cur_obj = self.builder.call(
+                    self.runtime["py_obj_getitem"],
+                    [obj_as_obj, idx_obj],
+                    name=self._fresh("augassign.cur"),
+                )
+            # The load raises for out-of-range/missing keys (IndexError /
+            # KeyError) BEFORE the RHS is evaluated (CPython aug-assign
+            # order); without this check the pending exception skips the
+            # enclosing try/except and the inplace op runs on NULL.
+            self._emit_post_call_err_check(getattr(stmt, "span", None))
             rhs = self._emit_expr(stmt.value)
             rhs_obj = marshal.marshal_to_object(
                 self.builder,
@@ -1194,14 +1603,33 @@ class AssignmentStatementLoweringMixin:
                 rhs,
                 stmt.value.ty,
             )
-            result_raw = self._emit_binop_value(
-                op_bare,
-                cur_obj,
-                DynType(name="dyn"),
-                rhs_obj,
-                DynType(name="dyn"),
-                result_ty=DynType(name="dyn"),
-            )
+            _ip_code = {
+                "+": 0,
+                "-": 1,
+                "*": 2,
+                "/": 3,
+                "//": 4,
+                "%": 5,
+            }.get(op_bare)
+            if _ip_code is not None:
+                # CPython tries type(cur).__iop__ first (instances);
+                # plain values fall through to the binary dispatchers
+                # inside py_obj_inplace_op.
+                result_raw = self.builder.call(
+                    self.runtime["py_obj_inplace_op"],
+                    [cur_obj, rhs_obj, ir.Constant(_I64, _ip_code)],
+                    name=self._fresh("augassign.inplace"),
+                )
+                self._emit_post_call_err_check(getattr(stmt, "span", None))
+            else:
+                result_raw = self._emit_binop_value(
+                    op_bare,
+                    cur_obj,
+                    DynType(name="dyn"),
+                    rhs_obj,
+                    DynType(name="dyn"),
+                    result_ty=DynType(name="dyn"),
+                )
             # Box if not already a PyObject* (Dyn int binops return
             # i64).
             if not self._ir_type_matches(result_raw.type, _CSTR):
@@ -1212,10 +1640,20 @@ class AssignmentStatementLoweringMixin:
                     result_raw,
                     IntType(name="int"),
                 )
-            self.builder.call(
-                self.runtime["py_obj_setitem"],
-                [obj_as_obj, idx_obj, result_raw],
-            )
+            if idx_i64 is not None:
+                self.builder.call(
+                    self.runtime["py_list_setitem"],
+                    [obj_as_obj, idx_i64, result_raw],
+                )
+            else:
+                self.builder.call(
+                    self.runtime["py_obj_setitem"],
+                    [obj_as_obj, idx_obj, result_raw],
+                )
+            # The store-back shares the raising user-visible contract
+            # (out-of-range list store -> IndexError, user __setitem__ can
+            # raise).
+            self._emit_post_call_err_check(getattr(stmt, "span", None))
             return
         if isinstance(stmt.target, Attr):
             # ``self.x += rhs`` — load via attr, op, store back.
@@ -1235,14 +1673,33 @@ class AssignmentStatementLoweringMixin:
                 rhs,
                 stmt.value.ty,
             )
-            result_raw = self._emit_binop_value(
-                op_bare,
-                cur_obj,
-                DynType(name="dyn"),
-                rhs_obj,
-                DynType(name="dyn"),
-                result_ty=DynType(name="dyn"),
-            )
+            _ip_code = {
+                "+": 0,
+                "-": 1,
+                "*": 2,
+                "/": 3,
+                "//": 4,
+                "%": 5,
+            }.get(op_bare)
+            if _ip_code is not None:
+                # CPython tries type(cur).__iop__ first (instances);
+                # plain values fall through to the binary dispatchers
+                # inside py_obj_inplace_op.
+                result_raw = self.builder.call(
+                    self.runtime["py_obj_inplace_op"],
+                    [cur_obj, rhs_obj, ir.Constant(_I64, _ip_code)],
+                    name=self._fresh("augassign.inplace"),
+                )
+                self._emit_post_call_err_check(getattr(stmt, "span", None))
+            else:
+                result_raw = self._emit_binop_value(
+                    op_bare,
+                    cur_obj,
+                    DynType(name="dyn"),
+                    rhs_obj,
+                    DynType(name="dyn"),
+                    result_ty=DynType(name="dyn"),
+                )
             if not self._ir_type_matches(result_raw.type, _CSTR):
                 result_raw = marshal.marshal_to_object(
                     self.builder,

@@ -1,4 +1,5 @@
 """Core LLVM/helper utilities for L1CodeGen."""
+
 from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
@@ -72,7 +73,7 @@ class CoreHelperMixin:
         return _instruction_is_terminator_text(instr)
 
     def _builder_block_is_terminated(self) -> bool:
-        block = self.builder._block
+        block = getattr(self.builder, "_block", None)
         if block is None:
             return True
         instrs = block._instrs
@@ -88,6 +89,8 @@ class CoreHelperMixin:
         if isinstance(ir_ty, ir.PointerType):
             # NULL pointer — used as a safe fall-through return for
             # object-typed functions.
+            return ir.Constant(ir_ty, None)
+        if isinstance(ir_ty, ir.LiteralStructType):
             return ir.Constant(ir_ty, None)
         raise NotImplementedError(f"no zero value for type {ir_ty}")
 
@@ -159,8 +162,10 @@ class CoreHelperMixin:
         ``_emit_entry_gc_frame_enter`` and ``_store_entry_initializer``.
         """
         fn = self.current_function
-        entry = fn.blocks[0]
-        saved_block = self.builder._block
+        entry = getattr(self, "_current_entry_block", None)
+        if entry is None:
+            entry = fn.blocks[0]
+        saved_block = getattr(self.builder, "_block", None)
         # Position at the end of entry, but before the first non-alloca
         # instruction if entry already has body content.
         insert_before = None
@@ -168,9 +173,11 @@ class CoreHelperMixin:
         cached_instr = getattr(self, "_entry_alloca_insert_before_instr", None)
         if cached_fn is fn and cached_instr is not None:
             insert_before = cached_instr
-        elif len(entry._instrs) > 0 and self._instruction_opname_text(
-            entry._instrs[len(entry._instrs) - 1]
-        ) != "alloca":
+        elif (
+            len(entry._instrs) > 0
+            and self._instruction_opname_text(entry._instrs[len(entry._instrs) - 1])
+            != "alloca"
+        ):
             for instr in entry._instrs:
                 if self._instruction_opname_text(instr) != "alloca":
                     insert_before = instr
@@ -192,5 +199,6 @@ class CoreHelperMixin:
                     alloca,
                 )
         # Restore the main builder's insertion point.
-        self.builder.position_at_end(saved_block)
+        if saved_block is not None:
+            self.builder.position_at_end(saved_block)
         return alloca

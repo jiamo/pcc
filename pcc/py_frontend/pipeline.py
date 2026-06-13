@@ -17,7 +17,9 @@ Phase 1 scope.
 
 from __future__ import annotations
 
+import gc
 import os
+import importlib
 import json
 import shlex
 import shutil
@@ -27,6 +29,15 @@ import tempfile
 import time
 from typing import Optional
 
+from ..backend.self_backend_aarch64_darwin import (
+    emit_aarch64_darwin_asm as _emit_aarch64_darwin_asm_native,
+)
+from ..backend.self_backend_parse import (
+    parse_self_backend_target_triple as _parse_self_backend_target_triple_native,
+)
+from ..backend.self_backend_target_match import (
+    is_aarch64_darwin_triple as _is_aarch64_darwin_triple_native,
+)
 from .export_meta import encode_type
 from .codegen.host_contract import (
     L1_CODEGEN_HOST_ATTRS,
@@ -39,13 +50,10 @@ from .codegen.host_contract import (
     l1_codegen_lowering_host_contract,
     per_module_probe_policy,
 )
-
-# Resolve pcc/py_runtime/ at import time. In CPython source mode this
-# file lives under ``.../pcc/py_frontend/``; in compiled bootstrap mode
-# ``__file__`` can already point one level higher. Probe a small set of
-# stable layouts and keep the first directory that exists.
-_PIPELINE_DIR = str(os.path.dirname(os.path.abspath(__file__)))
-_PCC_DIR = str(os.path.dirname(_PIPELINE_DIR))
+from .codegen.layer1_support import (
+    _dataclass_field_names as _self_host_ast_field_names,
+    _default_native_module_exports,
+)
 
 
 def _runtime_dir_has_runtime_files(path: str) -> bool:
@@ -55,6 +63,111 @@ def _runtime_dir_has_runtime_files(path: str) -> bool:
     makefile = os.path.isfile(os.path.join(path, "Makefile"))
     maybe_lib = os.path.isfile(os.path.join(path, "libpy_runtime.a"))
     return include_h or makefile or maybe_lib
+
+
+def _load_pcc_gpu_kernel_module():
+    return importlib.import_module("pcc.gpu_kernel")
+
+
+def _load_pcc_gpu_metal_module():
+    return importlib.import_module("pcc.gpu_metal")
+
+
+def _bootstrap_append_unique_path(paths: list[str], path: Optional[str]) -> None:
+    if path is None:
+        return
+    path = str(path or "").strip()
+    if not path:
+        return
+    path = os.path.abspath(path)
+    for existing in paths:
+        if existing == path:
+            return
+    paths.append(path)
+
+
+def _bootstrap_append_pcc_dir_candidate(paths: list[str], path: Optional[str]) -> None:
+    if path is None:
+        return
+    path = str(path or "").strip()
+    if not path:
+        return
+    path = os.path.abspath(path)
+    _bootstrap_append_unique_path(paths, path)
+    _bootstrap_append_unique_path(paths, os.path.join(path, "pcc"))
+    name = os.path.basename(path)
+    if name in ("py_frontend", "py_runtime", "py_stdlib", "stdlib", "backend"):
+        _bootstrap_append_unique_path(paths, os.path.dirname(path))
+
+
+def _bootstrap_append_pcc_dir_ancestors(
+    paths: list[str],
+    path: Optional[str],
+) -> None:
+    if path is None:
+        return
+    path = str(path or "").strip()
+    if not path:
+        return
+    cur = os.path.abspath(path)
+    if os.path.isfile(cur):
+        cur = os.path.dirname(cur)
+    while cur:
+        _bootstrap_append_pcc_dir_candidate(paths, cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+
+def _pcc_dir_has_source_files(path: str) -> bool:
+    return (
+        os.path.isfile(os.path.join(path, "__init__.py"))
+        and os.path.isfile(os.path.join(path, "backend", "self_backend_dispatch.py"))
+        and (
+            os.path.isfile(os.path.join(path, "py_stdlib", "__init__.py"))
+            or _runtime_dir_has_runtime_files(os.path.join(path, "py_runtime"))
+        )
+    )
+
+
+def _resolve_pcc_dir_from_environment() -> str:
+    raw_pipeline_dir = str(os.path.dirname(os.path.abspath(__file__)))
+    raw_pcc_dir = str(os.path.dirname(raw_pipeline_dir))
+    candidates: list[str] = []
+    _bootstrap_append_pcc_dir_candidate(candidates, os.environ.get("PCC_SOURCE_ROOT"))
+    _bootstrap_append_pcc_dir_candidate(candidates, os.environ.get("PCC_REPO_ROOT"))
+    _bootstrap_append_pcc_dir_candidate(
+        candidates, os.environ.get("PCC_PY_STDLIB_ROOT")
+    )
+    _bootstrap_append_pcc_dir_candidate(candidates, raw_pcc_dir)
+    _bootstrap_append_pcc_dir_candidate(candidates, raw_pipeline_dir)
+    try:
+        if len(sys.argv) > 0:
+            _bootstrap_append_pcc_dir_ancestors(candidates, sys.argv[0])
+    except Exception:
+        pass
+    try:
+        _bootstrap_append_pcc_dir_ancestors(candidates, sys.executable)
+    except Exception:
+        pass
+    for candidate in candidates:
+        if _pcc_dir_has_source_files(candidate):
+            return candidate
+    return raw_pcc_dir
+
+
+# Resolve pcc/py_runtime/ at import time. In CPython source mode this
+# file lives under ``.../pcc/py_frontend/``. In compiled bootstrap mode
+# ``__file__`` is synthetic and can resolve to the user's current working
+# directory, so derive the package root from stable stage-binary ancestors.
+_PCC_DIR = str(_resolve_pcc_dir_from_environment())
+_PIPELINE_DIR_CANDIDATE = str(os.path.join(_PCC_DIR, "py_frontend"))
+_PIPELINE_DIR = (
+    _PIPELINE_DIR_CANDIDATE
+    if os.path.isdir(_PIPELINE_DIR_CANDIDATE)
+    else str(os.path.dirname(os.path.abspath(__file__)))
+)
 
 
 _PY_RUNTIME_DIR_CANDIDATE_1 = str(os.path.join(_PCC_DIR, "pcc", "py_runtime"))
@@ -74,6 +187,7 @@ _PY_RUNTIME_DIR_CANDIDATE_5 = str(
         "py_runtime",
     )
 )
+_PY_RUNTIME_DIR_FALLBACK = str(os.path.join(_PCC_DIR, "py_runtime"))
 _PY_RUNTIME_DIR = str(
     _PY_RUNTIME_DIR_CANDIDATE_1
     if _runtime_dir_has_runtime_files(_PY_RUNTIME_DIR_CANDIDATE_1)
@@ -86,7 +200,11 @@ _PY_RUNTIME_DIR = str(
             else (
                 _PY_RUNTIME_DIR_CANDIDATE_4
                 if _runtime_dir_has_runtime_files(_PY_RUNTIME_DIR_CANDIDATE_4)
-                else _PY_RUNTIME_DIR_CANDIDATE_5
+                else (
+                    _PY_RUNTIME_DIR_CANDIDATE_5
+                    if _runtime_dir_has_runtime_files(_PY_RUNTIME_DIR_CANDIDATE_5)
+                    else _PY_RUNTIME_DIR_FALLBACK
+                )
             )
         )
     )
@@ -150,17 +268,33 @@ _PYTHON_IR_PASS_SKIP_MODULE_PREFIXES_ENV = "PCC_PYTHON_IR_PASS_SKIP_MODULE_PREFI
 _PY_FRONTEND_JOBS_ENV = "PCC_PY_FRONTEND_JOBS"
 _PY_FRONTEND_WORKER_TIMING_ENV = "PCC_PY_FRONTEND_WORKER_TIMING"
 _PY_FRONTEND_WORKER_ARG = "--pcc-python-multi-codegen-worker"
+_SELF_BACKEND_EMIT_WORKER_ARG = "--pcc-self-backend-emit-worker"
+_SELF_BACKEND_SPLIT_WORKER_ARG = "--pcc-self-backend-split-worker"
 _PY_FRONTEND_WORKER_MANIFEST_V1 = "pcc.py_frontend.codegen_worker.v1"
 _PY_FRONTEND_WORKER_MANIFEST_V2 = "pcc.py_frontend.codegen_worker.v2"
 _PY_FRONTEND_WORKER_MANIFEST_V3 = "pcc.py_frontend.codegen_worker.v3"
+_PY_FRONTEND_WORKER_MANIFEST_V4 = "pcc.py_frontend.codegen_worker.v4"
+_PY_FRONTEND_AST_WIRE_ENV = "PCC_PY_FRONTEND_AST_WIRE"
+_PY_AST_WIRE_SCHEMA = "pcc.py_frontend.py_ast.v1"
+_PY_AST_WIRE_NODE_KEY = "__pcc_py_ast_v1__"
+_PY_AST_WIRE_BYTES_KEY = "__pcc_bytes_v1__"
 _PY_RUNTIME_CC_ENV = "PCC_RUNTIME_CC"
 _PY_RUNTIME_HIGH_ENV = "PCC_RUNTIME_HIGH"
+_PY_RUNTIME_ARCHIVE_ENV = "PCC_RUNTIME_ARCHIVE"
+_PY_RUNTIME_DIR_ENV = "PCC_RUNTIME_DIR"
+_GPU_BACKEND_ENV = "PCC_GPU_BACKEND"
+_DEFAULT_GPU_BACKEND = "none"
+_KNOWN_GPU_BACKENDS = ("metal", "none")
 _SELF_BACKEND_JOBS_ENV = "PCC_SELF_BACKEND_JOBS"
 _SELF_BACKEND_SKIP_LL_TEMP_ENV = "PCC_SELF_BACKEND_SKIP_LL_TEMP"
 _SELF_BACKEND_SPLIT_LARGE_MODULES_ENV = "PCC_SELF_BACKEND_SPLIT_LARGE_MODULES"
 _SELF_BACKEND_SPLIT_THRESHOLD_BYTES_ENV = "PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES"
 _SELF_BACKEND_SPLIT_SHARD_BYTES_ENV = "PCC_SELF_BACKEND_SPLIT_SHARD_BYTES"
 _SELF_BACKEND_PUBLISH_SYNC_ENV = "PCC_SELF_BACKEND_PUBLISH_SYNC"
+_SELF_BACKEND_OBJECT_CACHE_ENV = "PCC_SELF_BACKEND_OBJECT_CACHE"
+_SELF_BACKEND_OBJECT_CACHE_DIR_ENV = "PCC_SELF_BACKEND_OBJECT_CACHE_DIR"
+_SELF_BACKEND_OBJECT_CACHE_IDENTITY_ENV = "PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY"
+_SELF_BACKEND_OBJECT_CACHE_VERSION = "pcc.self-backend-object-cache.v2"
 _COMPILE_TIME_ONLY_IMPORT_FROMS = {
     "abc": frozenset({"ABC", "abstractmethod"}),
     "dataclasses": frozenset({"dataclass", "field", "replace"}),
@@ -192,7 +326,6 @@ _NATIVE_BUILTIN_IMPORTS = frozenset(
         "string",
         "platform",
         "subprocess",
-        "asyncio",
         "tempfile",
         "shutil",
         "shlex",
@@ -211,6 +344,12 @@ _NATIVE_BUILTIN_IMPORTS = frozenset(
         "importlib",
         "inspect",
         "contextlib",
+        "contextvars",
+        # ``textwrap.dedent`` has a dedicated native lowering.  Treat the
+        # module consistently with import lowering instead of recursively
+        # compiling the host ``textwrap.py`` implementation (whose class-body
+        # regex setup is unrelated to the supported native surface).
+        "textwrap",
         # ``enum`` has native ``Enum`` / ``IntEnum`` / ``auto`` support
         # via ``pcc/py_frontend/codegen/class_gen.py::_is_enum_like_class``
         # + ``_enum_member_value`` and the
@@ -223,10 +362,25 @@ _NATIVE_BUILTIN_IMPORTS = frozenset(
     }
 )
 _NATIVE_IMPORT_FROMS = {
-    "builtins": frozenset({"int"}),
-    "sys": frozenset({"exit", "stdout", "stderr"}),
+    "builtins": frozenset(
+        {
+            "bool",
+            "bytes",
+            "bytearray",
+            "complex",
+            "dict",
+            "float",
+            "int",
+            "list",
+            "memoryview",
+            "object",
+            "str",
+            "tuple",
+        }
+    ),
+    "sys": frozenset({"exit", "stdin", "stdout", "stderr"}),
     "os": frozenset({"path", "sep", "linesep", "altsep"}),
-    "time": frozenset({"monotonic"}),
+    "time": frozenset({"monotonic", "perf_counter", "time", "strftime"}),
     "functools": frozenset({"partial"}),
     "string": frozenset(
         {
@@ -244,7 +398,12 @@ _NATIVE_IMPORT_FROMS = {
     "math": frozenset(
         {
             "floor",
+            "ceil",
             "sqrt",
+            "trunc",
+            "gcd",
+            "factorial",
+            "isqrt",
             "pow",
             "pi",
             "e",
@@ -253,7 +412,7 @@ _NATIVE_IMPORT_FROMS = {
             "nan",
         }
     ),
-    "re": frozenset({"match"}),
+    "re": frozenset({"match", "search", "fullmatch"}),
     "gc": frozenset(
         {
             "collect",
@@ -300,8 +459,8 @@ _NATIVE_IMPORT_FROMS = {
             "block_on_fd",
         }
     ),
-    "asyncio": frozenset({"run", "sleep"}),
     "contextlib": frozenset({"contextmanager"}),
+    "contextvars": frozenset({"ContextVar"}),
     "pcc": frozenset({"valueclass"}),
     "enum": frozenset({"Enum", "IntEnum", "auto"}),
     "typing": frozenset(
@@ -424,6 +583,26 @@ def _profile_counter(profile, name: str, value) -> None:
         counters[name] = value
 
 
+def _normalize_gpu_backend_name(value: Optional[str]) -> str:
+    if value is None:
+        return _DEFAULT_GPU_BACKEND
+    candidate = str(value or "").strip().lower()
+    if not candidate:
+        return _DEFAULT_GPU_BACKEND
+    if candidate in ("off", "disabled", "host", "cpu"):
+        return "none"
+    return candidate
+
+
+def _resolve_gpu_backend_kind(requested: Optional[str]) -> str:
+    env_raw = os.environ.get(_GPU_BACKEND_ENV)
+    kind = _normalize_gpu_backend_name(requested if requested is not None else env_raw)
+    if kind not in _KNOWN_GPU_BACKENDS:
+        known = ", ".join(sorted(_KNOWN_GPU_BACKENDS))
+        raise ValueError(f"unknown gpu backend {kind!r}; expected one of: {known}")
+    return kind
+
+
 def _self_backend_publish_sync_enabled() -> bool:
     value = os.environ.get(_SELF_BACKEND_PUBLISH_SYNC_ENV, "").strip().lower()
     if value in ("0", "false", "no", "off"):
@@ -433,11 +612,18 @@ def _self_backend_publish_sync_enabled() -> bool:
 
 _SELF_BACKEND_HOST_CODE = (
     "import sys\n"
+    "import os\n"
+    "pcc_source_root = sys.argv[1]\n"
+    "if pcc_source_root and pcc_source_root not in sys.path:\n"
+    "    sys.path.insert(0, pcc_source_root)\n"
+    "if pcc_source_root:\n"
+    "    os.environ.setdefault('PCC_SOURCE_ROOT', pcc_source_root)\n"
+    "    os.environ.setdefault('PCC_REPO_ROOT', pcc_source_root)\n"
     "from pcc.backend.self_backend_dispatch import emit_self_asm, "
     "self_backend_target_identity\n"
     "from pcc.backend.self_backend_parse import "
     "parse_self_backend_target_triple\n"
-    "path = sys.argv[1]\n"
+    "path = sys.argv[2]\n"
     "with open(path, 'r', encoding='utf-8') as f:\n"
     "    text = f.read()\n"
     "triple = parse_self_backend_target_triple(text)\n"
@@ -454,6 +640,12 @@ _SELF_BACKEND_HOST_MANY_CODE = (
     "import subprocess\n"
     "import sys\n"
     "import time\n"
+    "pcc_source_root = sys.argv[1]\n"
+    "if pcc_source_root and pcc_source_root not in sys.path:\n"
+    "    sys.path.insert(0, pcc_source_root)\n"
+    "if pcc_source_root:\n"
+    "    os.environ.setdefault('PCC_SOURCE_ROOT', pcc_source_root)\n"
+    "    os.environ.setdefault('PCC_REPO_ROOT', pcc_source_root)\n"
     "from pcc.backend.self_backend_dispatch import emit_self_asm, "
     "self_backend_target_identity\n"
     "from pcc.backend.self_backend_parse import "
@@ -600,11 +792,11 @@ _SELF_BACKEND_HOST_MANY_CODE = (
     "    _populate_object_cache(cache_path, obj_path)\n"
     "    return idx, target_id, obj_path, emit_ms, cc_ms, len(text), cache_status\n"
     "\n"
-    "jobs = int(sys.argv[1])\n"
-    "cc = sys.argv[2]\n"
-    "split_large_modules = sys.argv[3] == '1'\n"
-    "result_path = sys.argv[4]\n"
-    "paths = list(sys.argv[5:])\n"
+    "jobs = int(sys.argv[2])\n"
+    "cc = sys.argv[3]\n"
+    "split_large_modules = sys.argv[4] == '1'\n"
+    "result_path = sys.argv[5]\n"
+    "paths = list(sys.argv[6:])\n"
     "if split_large_modules:\n"
     "    _pipeline = __import__('pcc.py_frontend.pipeline', "
     "fromlist=['_split_self_backend_large_ir_modules'])\n"
@@ -644,6 +836,120 @@ _SELF_BACKEND_HOST_MANY_CODE = (
     "with open(result_path, 'w', encoding='utf-8') as out:\n"
     "    for idx, target_id, obj_path, emit_ms, cc_ms, byte_len, cache_status in sorted(results):\n"
     "        out.write(str(idx) + '\\t' + target_id + '\\t' + obj_path + '\\t' + str(emit_ms) + '\\t' + str(cc_ms) + '\\t' + str(byte_len) + '\\t' + cache_status + '\\n')\n"
+)
+
+
+_SELF_BACKEND_OBJECT_CACHE_PLAN_CODE = (
+    "import hashlib\n"
+    "import os\n"
+    "import shutil\n"
+    "import subprocess\n"
+    "import sys\n"
+    "version = sys.argv[1]\n"
+    "identity = sys.argv[2]\n"
+    "target_id = sys.argv[3]\n"
+    "cc = sys.argv[4]\n"
+    "cache_dir = sys.argv[5]\n"
+    "manifest_path = sys.argv[6]\n"
+    "plan_path = sys.argv[7]\n"
+    "platform_id = sys.platform + ':' + (os.uname().machine or '')\n"
+    "try:\n"
+    "    cc_identity = subprocess.check_output([cc, '--version'], stderr=subprocess.STDOUT)\n"
+    "except Exception:\n"
+    "    cc_identity = b'<unknown-toolchain>'\n"
+    "rows = []\n"
+    "with open(manifest_path, 'r', encoding='utf-8') as f:\n"
+    "    manifest_lines = f.read().splitlines()\n"
+    "for line in manifest_lines:\n"
+    "    parts = line.split('\\t')\n"
+    "    if len(parts) != 4:\n"
+    "        raise RuntimeError('invalid self-backend object-cache manifest')\n"
+    "    index_text, ir_path, result_path, obj_path = parts\n"
+    "    h = hashlib.sha256()\n"
+    "    for value in (version, identity, platform_id, target_id, cc):\n"
+    "        h.update(value.encode('utf-8'))\n"
+    "        h.update(b'\\0')\n"
+    "    h.update(cc_identity)\n"
+    "    h.update(b'\\0')\n"
+    "    with open(ir_path, 'rb') as ir_file:\n"
+    "        while True:\n"
+    "            block = ir_file.read(1024 * 1024)\n"
+    "            if not block:\n"
+    "                break\n"
+    "            h.update(block)\n"
+    "    digest = h.hexdigest()\n"
+    "    cache_path = os.path.join(cache_dir, digest[:2], digest + '.o')\n"
+    "    checksum_path = cache_path + '.sha256'\n"
+    "    status = 'miss'\n"
+    "    cache_valid = False\n"
+    "    if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0 and os.path.isfile(checksum_path):\n"
+    "        try:\n"
+    "            with open(checksum_path, 'r', encoding='utf-8') as checksum_file:\n"
+    "                expected_checksum = checksum_file.read().strip()\n"
+    "            object_hash = hashlib.sha256()\n"
+    "            with open(cache_path, 'rb') as cache_file:\n"
+    "                while True:\n"
+    "                    block = cache_file.read(1024 * 1024)\n"
+    "                    if not block:\n"
+    "                        break\n"
+    "                    object_hash.update(block)\n"
+    "            cache_valid = len(expected_checksum) == 64 and object_hash.hexdigest() == expected_checksum\n"
+    "        except OSError:\n"
+    "            cache_valid = False\n"
+    "    if cache_valid:\n"
+    "        try:\n"
+    "            shutil.copyfile(cache_path, obj_path)\n"
+    "            with open(result_path, 'w', encoding='utf-8') as result_file:\n"
+    "                result_file.write(target_id + '\\n')\n"
+    "                result_file.write(obj_path + '\\n')\n"
+    "                result_file.write('hit\\n')\n"
+    "            status = 'hit'\n"
+    "        except OSError:\n"
+    "            status = 'miss'\n"
+    "    rows.append(index_text + '\\t' + cache_path + '\\t' + status)\n"
+    "with open(plan_path, 'w', encoding='utf-8') as f:\n"
+    "    f.write('\\n'.join(rows))\n"
+    "    if rows:\n"
+    "        f.write('\\n')\n"
+)
+
+
+_SELF_BACKEND_OBJECT_CACHE_PUBLISH_CODE = (
+    "import hashlib\n"
+    "import os\n"
+    "import shutil\n"
+    "import sys\n"
+    "manifest_path = sys.argv[1]\n"
+    "with open(manifest_path, 'r', encoding='utf-8') as f:\n"
+    "    rows = f.read().splitlines()\n"
+    "for index, row in enumerate(rows):\n"
+    "    parts = row.split('\\t')\n"
+    "    if len(parts) != 2:\n"
+    "        raise RuntimeError('invalid self-backend object-cache publish manifest')\n"
+    "    cache_path, obj_path = parts\n"
+    "    os.makedirs(os.path.dirname(cache_path), exist_ok=True)\n"
+    "    tmp_path = cache_path + '.' + str(os.getpid()) + '.' + str(index) + '.tmp'\n"
+    "    checksum_path = cache_path + '.sha256'\n"
+    "    checksum_tmp_path = tmp_path + '.sha256'\n"
+    "    try:\n"
+    "        shutil.copyfile(obj_path, tmp_path)\n"
+    "        object_hash = hashlib.sha256()\n"
+    "        with open(tmp_path, 'rb') as object_file:\n"
+    "            while True:\n"
+    "                block = object_file.read(1024 * 1024)\n"
+    "                if not block:\n"
+    "                    break\n"
+    "                object_hash.update(block)\n"
+    "        with open(checksum_tmp_path, 'w', encoding='utf-8') as checksum_file:\n"
+    "            checksum_file.write(object_hash.hexdigest() + '\\n')\n"
+    "        os.replace(tmp_path, cache_path)\n"
+    "        os.replace(checksum_tmp_path, checksum_path)\n"
+    "    finally:\n"
+    "        for leftover_path in (tmp_path, checksum_tmp_path):\n"
+    "            try:\n"
+    "                os.unlink(leftover_path)\n"
+    "            except OSError:\n"
+    "                pass\n"
 )
 
 
@@ -979,6 +1285,17 @@ def _package_site_package_root_for_src(src_path: str) -> Optional[str]:
     return None
 
 
+def _package_site_package_root_for_module_name(module_name: str) -> Optional[str]:
+    top = str(module_name or "").split(".", 1)[0]
+    if not top:
+        return None
+    for site_root in _package_site_roots():
+        pkg_root = str(os.path.join(site_root, top))
+        if os.path.isfile(os.path.join(pkg_root, "pcc-package.json")):
+            return pkg_root
+    return None
+
+
 def _package_root_no_libpython_diagnostic(root: str) -> Optional[tuple[str, str]]:
     queue = [str(root)]
     queue_i = 0
@@ -1022,9 +1339,44 @@ def _validate_package_site_no_libpython_abi(
     for src in src_paths:
         root = _package_site_package_root_for_src(src)
         if root is None or root in seen:
-            continue
-        seen.add(root)
-        roots.append(root)
+            pass
+        else:
+            seen.add(root)
+            roots.append(root)
+        try:
+            with open(src, "r", encoding="utf-8") as f:
+                source = f.read()
+        except OSError:
+            source = ""
+        for import_name in _iter_source_import_specs(
+            source,
+            top_level_only=False,
+        ):
+            root = _package_site_package_root_for_module_name(import_name)
+            if root is None or root in seen:
+                continue
+            seen.add(root)
+            roots.append(root)
+        for module_spec, imported_names in _iter_source_import_from_specs(
+            source,
+            top_level_only=False,
+        ):
+            root = _package_site_package_root_for_module_name(module_spec)
+            if root is not None and root not in seen:
+                seen.add(root)
+                roots.append(root)
+            if module_spec.startswith("."):
+                continue
+            for imported_name in imported_names:
+                if not imported_name or imported_name == "*":
+                    continue
+                root = _package_site_package_root_for_module_name(
+                    module_spec + "." + imported_name
+                )
+                if root is None or root in seen:
+                    continue
+                seen.add(root)
+                roots.append(root)
     if not roots:
         return
     for root in roots:
@@ -1091,11 +1443,66 @@ def _top_level_import_targets(
     return targets
 
 
+def _source_module_scope_lines(source: str) -> list[tuple[str, bool]]:
+    """Classify source lines as module-scope, including control-flow suites.
+
+    Package initialization commonly nests imports under a module-level
+    ``try``/``if``/``else``.  Leading whitespace alone cannot distinguish
+    those eager imports from lazy imports inside a function or class.  This
+    small bootstrap-safe indentation scanner masks function/class suites while
+    retaining module-level control-flow suites for closure discovery.
+    """
+    out: list[tuple[str, bool]] = []
+    blocked_indent = -1
+    blocked_header_complete = False
+    blocked_paren_depth = 0
+    for raw_line in source.splitlines():
+        stripped = raw_line.strip()
+        indent = len(raw_line) - len(raw_line.lstrip())
+        if blocked_indent >= 0:
+            if not blocked_header_complete:
+                code = stripped.split("#", 1)[0].rstrip()
+                blocked_paren_depth += code.count("(") - code.count(")")
+                if blocked_paren_depth <= 0 and code.endswith(":"):
+                    blocked_header_complete = True
+                out.append((raw_line, False))
+                continue
+            if not stripped or stripped.startswith("#"):
+                out.append((raw_line, False))
+                continue
+            if indent > blocked_indent:
+                out.append((raw_line, False))
+                continue
+            blocked_indent = -1
+            blocked_header_complete = False
+            blocked_paren_depth = 0
+
+        code = stripped.split("#", 1)[0].rstrip()
+        opens_local_scope = (
+            code.startswith("def ")
+            or code.startswith("async def ")
+            or code.startswith("class ")
+        )
+        if opens_local_scope:
+            blocked_indent = indent
+            blocked_paren_depth = code.count("(") - code.count(")")
+            blocked_header_complete = blocked_paren_depth <= 0 and code.endswith(":")
+            out.append((raw_line, False))
+            continue
+        out.append((raw_line, True))
+    return out
+
+
 def _iter_source_import_specs(source: str, *, top_level_only: bool) -> list[str]:
     """Return module names from simple ``import mod[, other]`` lines."""
     out: list[str] = []
-    for raw_line in source.splitlines():
-        if top_level_only and raw_line[:1].isspace():
+    lines = (
+        _source_module_scope_lines(source)
+        if top_level_only
+        else [(line, True) for line in source.splitlines()]
+    )
+    for raw_line, at_module_scope in lines:
+        if top_level_only and not at_module_scope:
             continue
         stripped = raw_line.strip()
         if not stripped.startswith("import "):
@@ -1128,8 +1535,13 @@ def _iter_source_importlib_literal_specs(
     """
     out: list[str] = []
     marker = "importlib.import_module("
-    for raw_line in source.splitlines():
-        if top_level_only and raw_line[:1].isspace():
+    lines = (
+        _source_module_scope_lines(source)
+        if top_level_only
+        else [(line, True) for line in source.splitlines()]
+    )
+    for raw_line, at_module_scope in lines:
+        if top_level_only and not at_module_scope:
             continue
         stripped = raw_line.strip()
         if "#" in stripped:
@@ -1206,12 +1618,17 @@ def _iter_source_import_from_specs(
     pending_active = False
     paren_depth = 0
 
-    for raw_line in source.splitlines():
+    lines = (
+        _source_module_scope_lines(source)
+        if top_level_only
+        else [(line, True) for line in source.splitlines()]
+    )
+    for raw_line, at_module_scope in lines:
         stripped = raw_line.strip()
         if not pending_active:
             if not stripped:
                 continue
-            if top_level_only and raw_line[:1].isspace():
+            if top_level_only and not at_module_scope:
                 continue
             if not stripped.startswith("from "):
                 continue
@@ -1235,6 +1652,38 @@ def _iter_source_import_from_specs(
     if pending_active:
         _append_source_import_from_spec(specs, pending)
     return specs
+
+
+def _without_attribute_error_handler_imports(source: str) -> str:
+    """Leave strict package fallback imports for runtime diagnostics.
+
+    Compatibility shims commonly try a modern attribute and import a legacy
+    module only from ``except AttributeError``. Pulling that legacy module into
+    the closed-world source set makes an unreachable Python-2 fallback part of
+    the no-libpython claim. The import statement remains in compiled code; if
+    the primary path really is unavailable it raises the normal strict import
+    diagnostic instead of silently disappearing.
+    """
+    out: list[str] = []
+    handler_indent = -1
+    for raw_line in source.splitlines(keepends=True):
+        stripped = raw_line.strip()
+        indent = len(raw_line) - len(raw_line.lstrip())
+        if handler_indent >= 0 and stripped and indent <= handler_indent:
+            handler_indent = -1
+        if stripped.startswith("except AttributeError") and stripped.endswith(":"):
+            handler_indent = indent
+            out.append(raw_line)
+            continue
+        if (
+            handler_indent >= 0
+            and indent > handler_indent
+            and (stripped.startswith("import ") or stripped.startswith("from "))
+        ):
+            out.append("\n" if raw_line.endswith("\n") else "")
+            continue
+        out.append(raw_line)
+    return "".join(out)
 
 
 def _package_import_targets(
@@ -1263,6 +1712,7 @@ def _package_import_targets(
 
     with open(src_path, "r", encoding="utf-8") as f:
         source = f.read()
+    source = _without_attribute_error_handler_imports(source)
 
     current_pkg = _package_parts_for_module(src_path, mod_name)
     package_root = mod_name.split(".")[0]
@@ -1294,10 +1744,21 @@ def _package_import_targets(
                         )
                     )
             else:
+                # ``from . import name`` may bind an attribute exported by the
+                # package ``__init__.py`` rather than a sibling module.  Add
+                # the package only when at least one imported name does not
+                # resolve as a real module; otherwise preserve the bounded
+                # sibling-only closure used by bootstrap.
+                package_attribute_needed = not imported_names
                 for imported_name in imported_names:
-                    candidate_mods.append(
-                        _join_dotted_parts(base_pkg + imported_name.split("."))
+                    imported_mod = _join_dotted_parts(
+                        base_pkg + imported_name.split(".")
                     )
+                    candidate_mods.append(imported_mod)
+                    if _resolve_module_src_for_import(root_dir, imported_mod) is None:
+                        package_attribute_needed = True
+                if package_attribute_needed:
+                    candidate_mods.insert(0, _join_dotted_parts(base_pkg))
         elif module_name and include_same_package_absolute:
             mod_parts = module_name.split(".")
             if mod_parts and mod_parts[0] == package_root:
@@ -1347,9 +1808,12 @@ def _collect_relative_module_closure(
             # real module file under the source root, so a missing / optional
             # C-extension import inside a ``try`` is still left to
             # ``py_cpy_import`` (its runtime ImportError is caught as usual).
-            # Discovered (non-entry) modules keep ``top_level_only=True`` to
-            # bound the closure and self-host blast radius.  See investigation
-            # docs/investigations/python-conditional-indented-import-no-libpython.md
+            # The entry retains its existing all-indentation scan for lazy
+            # imports.  Discovered dependencies use the module-scope scanner:
+            # it includes eager imports nested in try/if/else suites while
+            # excluding function/class-body lazy imports that are outside the
+            # initialization claim.  Resolution remains bounded to real files
+            # under root_dir / PCC_PACKAGE_SITE.
             is_entry = mod_name == entry_mod
             for target_src, target_mod in _top_level_import_targets(
                 root_dir,
@@ -1368,6 +1832,7 @@ def _collect_relative_module_closure(
                 src_path,
                 mod_name,
                 root_dir=local_root,
+                top_level_only=not is_entry,
                 include_relative=True,
                 include_same_package_absolute=True,
             ):
@@ -1429,8 +1894,15 @@ def _collect_multi_source_relative_closure(
     *,
     recursive_stdlib: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Return explicit multi-file sources plus one-hop relative-import
-    siblings referenced by those explicit sources.
+    """Return explicit sources plus their package-local source closure.
+
+    Relative imports retain the historical recursive scan used by the
+    bootstrap compiler closure.  Module-scope absolute imports rooted in the
+    same top-level package are included too; without that second edge,
+    ``from pcc.diagnostics import DiagnosticSpan`` could emit an external class
+    reference while omitting the module that owns its definition.  Absolute
+    imports inside functions stay lazy and stdlib/third-party packages remain
+    outside this closure.
 
     When ``recursive_stdlib=True`` (Issue 11.B.1), also pulls in any
     pure-Python stdlib module that's transitively imported by the seed
@@ -1455,13 +1927,24 @@ def _collect_multi_source_relative_closure(
         if "." not in mod_name:
             continue
         root_dir = _module_root_from_src(src_path, mod_name)
-        for target_src, target_mod in _package_import_targets(
+        targets = _package_import_targets(
             src_path,
             mod_name,
             root_dir=root_dir,
             include_relative=True,
             include_same_package_absolute=False,
-        ):
+        )
+        targets.extend(
+            _package_import_targets(
+                src_path,
+                mod_name,
+                root_dir=root_dir,
+                top_level_only=True,
+                include_relative=False,
+                include_same_package_absolute=True,
+            )
+        )
+        for target_src, target_mod in targets:
             if target_mod in seen:
                 continue
             target_src = str(os.path.abspath(target_src))
@@ -1472,6 +1955,12 @@ def _collect_multi_source_relative_closure(
 
     if recursive_stdlib:
         _expand_recursive_stdlib(ordered_srcs, ordered_mods, seen)
+
+    _expand_native_extension_module_object_ports(
+        ordered_srcs,
+        ordered_mods,
+        seen,
+    )
 
     return ordered_srcs, ordered_mods
 
@@ -1548,15 +2037,168 @@ def _filter_ir_scaffold_closure(
 def _host_find_spec_origin(mod_name: str) -> str:
     py_cmd = str(os.environ.get("PCC_HOST_PYTHON", "") or "python3").strip()
     probe = (
-        "import importlib.util,sys; "
-        "spec=importlib.util.find_spec(sys.argv[1]); "
-        "origin='' if spec is None or spec.origin is None else spec.origin; "
+        "import importlib.util,sys\n"
+        "try:\n"
+        "    spec=importlib.util.find_spec(sys.argv[1])\n"
+        "except ModuleNotFoundError:\n"
+        "    spec=None\n"
+        "origin='' if spec is None or spec.origin is None else spec.origin\n"
         "print(origin)"
     )
-    return subprocess.check_output(
-        [py_cmd, "-c", probe, mod_name],
-        text=True,
-    ).strip()
+    try:
+        out = subprocess.check_output([py_cmd, "-c", probe, mod_name], text=True)
+    except Exception:
+        return ""
+    return out.strip()
+
+
+_HOST_STDLIB_ROOTS_CACHE: Optional[list[str]] = None
+_HOST_SITE_ROOTS_CACHE: Optional[list[str]] = None
+
+
+def _host_sysconfig_roots(keys: list[str]) -> list[str]:
+    py_cmd = str(os.environ.get("PCC_HOST_PYTHON", "") or "python3").strip()
+    probe = (
+        "import os,sys,sysconfig\n"
+        "paths=sysconfig.get_paths()\n"
+        "for key in sys.argv[1:]:\n"
+        "    value=paths.get(key,'') or ''\n"
+        "    if value:\n"
+        "        print(os.path.realpath(os.path.abspath(value)))"
+    )
+    try:
+        out = subprocess.check_output([py_cmd, "-c", probe] + list(keys), text=True)
+    except Exception:
+        return []
+    roots: list[str] = []
+    for raw in out.splitlines():
+        value = str(raw or "").strip()
+        if value:
+            _append_unique_path(roots, value)
+    return roots
+
+
+def _host_stdlib_roots() -> list[str]:
+    global _HOST_STDLIB_ROOTS_CACHE
+    if _HOST_STDLIB_ROOTS_CACHE is None:
+        _HOST_STDLIB_ROOTS_CACHE = _host_sysconfig_roots(["stdlib", "platstdlib"])
+    return list(_HOST_STDLIB_ROOTS_CACHE)
+
+
+def _host_site_roots() -> list[str]:
+    global _HOST_SITE_ROOTS_CACHE
+    if _HOST_SITE_ROOTS_CACHE is None:
+        _HOST_SITE_ROOTS_CACHE = _host_sysconfig_roots(["purelib", "platlib"])
+    return list(_HOST_SITE_ROOTS_CACHE)
+
+
+def _append_unique_path(paths: list[str], path: Optional[str]) -> None:
+    if path is None:
+        return
+    path = str(path or "").strip()
+    if not path:
+        return
+    path = os.path.abspath(path)
+    for existing in paths:
+        if existing == path:
+            return
+    paths.append(path)
+
+
+def _path_is_under(path: str, root: str) -> bool:
+    if not path or not root:
+        return False
+    normalized = os.path.realpath(os.path.abspath(path))
+    normalized_root = os.path.realpath(os.path.abspath(root))
+    try:
+        return os.path.commonpath([normalized_root, normalized]) == normalized_root
+    except ValueError:
+        return False
+
+
+def _path_is_under_any(path: str, roots: list[str]) -> bool:
+    for root in roots:
+        if _path_is_under(path, root):
+            return True
+    return False
+
+
+def _host_origin_is_stdlib_py(origin: str) -> bool:
+    if origin == "" or origin == "built-in":
+        return False
+    if not origin.endswith(".py"):
+        return False
+    if _path_is_under_any(origin, _host_site_roots()):
+        return False
+    return _path_is_under_any(origin, _host_stdlib_roots())
+
+
+def _append_pcc_package_dir_candidate(paths: list[str], path: Optional[str]) -> None:
+    if path is None:
+        return
+    path = str(path or "").strip()
+    if not path:
+        return
+    path = os.path.abspath(path)
+    _append_unique_path(paths, path)
+    _append_unique_path(paths, os.path.join(path, "pcc"))
+    if os.path.basename(path) == "py_stdlib":
+        _append_unique_path(paths, os.path.dirname(path))
+
+
+def _append_pcc_package_dir_ancestors(paths: list[str], path: Optional[str]) -> None:
+    if path is None:
+        return
+    path = str(path or "").strip()
+    if not path:
+        return
+    cur = os.path.abspath(path)
+    if os.path.isfile(cur):
+        cur = os.path.dirname(cur)
+    while cur:
+        _append_pcc_package_dir_candidate(paths, cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+
+def _pcc_package_dir_has_native_stdlib(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, "py_stdlib", "__init__.py"))
+
+
+def _pcc_package_dir_candidates() -> list[str]:
+    candidates: list[str] = []
+    _append_pcc_package_dir_candidate(
+        candidates,
+        os.environ.get("PCC_PY_STDLIB_ROOT"),
+    )
+    _append_pcc_package_dir_candidate(
+        candidates,
+        os.environ.get("PCC_SOURCE_ROOT"),
+    )
+    _append_pcc_package_dir_candidate(
+        candidates,
+        os.environ.get("PCC_REPO_ROOT"),
+    )
+    _append_pcc_package_dir_candidate(candidates, _PCC_DIR)
+    _append_pcc_package_dir_candidate(candidates, _PIPELINE_DIR)
+    _append_pcc_package_dir_candidate(candidates, os.path.dirname(_PY_RUNTIME_DIR))
+    try:
+        if len(sys.argv) > 0:
+            _append_pcc_package_dir_ancestors(candidates, sys.argv[0])
+    except Exception:
+        pass
+    try:
+        _append_pcc_package_dir_ancestors(candidates, sys.executable)
+    except Exception:
+        pass
+    _append_pcc_package_dir_ancestors(candidates, os.getcwd())
+    out: list[str] = []
+    for candidate in candidates:
+        if _pcc_package_dir_has_native_stdlib(candidate):
+            _append_unique_path(out, candidate)
+    return out
 
 
 def _locate_stdlib_module_source(mod_name: str) -> Optional[str]:
@@ -1573,7 +2215,6 @@ def _locate_stdlib_module_source(mod_name: str) -> Optional[str]:
     Returns ``None`` for built-ins, C extensions, or modules that
     can't be located.
     """
-    repo_pcc_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def _port_candidates(root: str) -> list[str]:
         rel = mod_name.replace(".", os.sep)
@@ -1584,39 +2225,38 @@ def _locate_stdlib_module_source(mod_name: str) -> Optional[str]:
             os.path.join(root, f"{mod_name}.py"),
         ]
 
-    pcc_py_stdlib_dir = os.path.join(repo_pcc_dir, "py_stdlib")
-    for pcc_port in _port_candidates(pcc_py_stdlib_dir):
-        if os.path.isfile(pcc_port):
-            return pcc_port
-    pcc_stdlib_dir = os.path.join(
-        repo_pcc_dir,
-        "stdlib",
-    )
-    for pcc_port in _port_candidates(pcc_stdlib_dir):
-        if os.path.isfile(pcc_port):
-            return pcc_port
+    for pcc_package_dir in _pcc_package_dir_candidates():
+        pcc_py_stdlib_dir = os.path.join(pcc_package_dir, "py_stdlib")
+        for pcc_port in _port_candidates(pcc_py_stdlib_dir):
+            if os.path.isfile(pcc_port):
+                return pcc_port
+        pcc_stdlib_dir = os.path.join(
+            pcc_package_dir,
+            "stdlib",
+        )
+        for pcc_port in _port_candidates(pcc_stdlib_dir):
+            if os.path.isfile(pcc_port):
+                return pcc_port
     try:
         origin = _host_find_spec_origin(mod_name)
     except Exception:
         return None
-    if origin == "" or origin == "built-in":
-        return None
-    if not origin.endswith(".py"):
+    if not _host_origin_is_stdlib_py(origin):
         return None
     return origin
 
 
 def _native_stdlib_root_for_path(path: str) -> Optional[str]:
-    repo_pcc_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     normalized = os.path.abspath(path)
-    for dirname in ("py_stdlib", "stdlib"):
-        root = os.path.abspath(os.path.join(repo_pcc_dir, dirname))
-        try:
-            common = os.path.commonpath([root, normalized])
-        except ValueError:
-            continue
-        if common == root:
-            return root
+    for pcc_package_dir in _pcc_package_dir_candidates():
+        for dirname in ("py_stdlib", "stdlib"):
+            root = os.path.abspath(os.path.join(pcc_package_dir, dirname))
+            try:
+                common = os.path.commonpath([root, normalized])
+            except ValueError:
+                continue
+            if common == root:
+                return root
     return None
 
 
@@ -1790,14 +2430,228 @@ def _classify_python_import(
 
 
 def _source_uses_native_stdlib(src_path: str) -> bool:
-    for mod_name in _stdlib_absolute_imports_in(src_path):
+    # A package can call a small factory during module initialization whose
+    # body imports a pcc-owned stdlib port (simplejson's OrderedDict chooser is
+    # one real shape).  Scan function bodies for the bounded decision to turn
+    # on recursive stdlib closure; the closure itself still admits lazy
+    # imports only when their provider is owned under pcc/py_stdlib.
+    for mod_name in _stdlib_absolute_imports_in(
+        src_path,
+        include_function_bodies=True,
+    ):
         if _classify_python_import(mod_name) == "native_stdlib":
             return True
     return False
 
 
-def _stdlib_absolute_imports_in(src_path: str) -> list[str]:
-    """Return absolute imports found anywhere in a source file."""
+def _sources_use_native_stdlib(src_paths: list[str]) -> bool:
+    for src_path in src_paths:
+        if _source_uses_native_stdlib(src_path):
+            return True
+    return False
+
+
+def _source_pcc_native_extension_paths(src_path: str) -> list[str]:
+    """Installed pcc-native extension artifacts named by one source file."""
+    try:
+        with open(src_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except OSError:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add_module(module_name: str) -> None:
+        path = _resolve_pcc_native_extension_path(module_name)
+        if path is None or path in seen:
+            return
+        seen.add(path)
+        out.append(path)
+
+    for module_name in _iter_source_import_specs(
+        source,
+        top_level_only=False,
+    ):
+        add_module(module_name)
+    for module_name, imported_names in _iter_source_import_from_specs(
+        source,
+        top_level_only=False,
+    ):
+        if module_name.startswith("."):
+            continue
+        add_module(module_name)
+        for imported_name in imported_names:
+            add_module(module_name + "." + imported_name)
+    return out
+
+
+def _source_imports_pcc_native_extension(src_path: str) -> bool:
+    """Whether source names an installed pcc-native extension module."""
+    return bool(_source_pcc_native_extension_paths(src_path))
+
+
+def _is_ascii_module_candidate(text: str) -> bool:
+    if not text or len(text) > 512:
+        return False
+    parts = text.split(".")
+    for part in parts:
+        if not part:
+            return False
+        first = part[0]
+        if not (first == "_" or ("a" <= first <= "z") or ("A" <= first <= "Z")):
+            return False
+        for ch in part[1:]:
+            if not (
+                ch == "_"
+                or ("a" <= ch <= "z")
+                or ("A" <= ch <= "Z")
+                or ("0" <= ch <= "9")
+            ):
+                return False
+    return True
+
+
+def _native_extension_literal_module_candidates(path: str) -> list[str]:
+    """Extract bounded ASCII identifier tokens from a native artifact.
+
+    The result is only a candidate set. The closure caller requires a real
+    Python source provider under a configured package root before accepting a
+    token, which filters C symbols, source filenames, diagnostics, and other
+    binary strings without relying on an external ``strings`` process.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    token_chars: list[str] = []
+    token_too_long = False
+    i = 0
+    while i <= len(data):
+        byte = data[i] if i < len(data) else 0
+        is_token_byte = (
+            byte == 46
+            or byte == 95
+            or 48 <= byte <= 57
+            or 65 <= byte <= 90
+            or 97 <= byte <= 122
+        )
+        if is_token_byte:
+            if len(token_chars) < 512:
+                token_chars.append(chr(byte))
+            else:
+                token_too_long = True
+            i += 1
+            continue
+        if token_chars and not token_too_long:
+            candidate = "".join(token_chars)
+            if candidate not in seen and _is_ascii_module_candidate(candidate):
+                seen.add(candidate)
+                out.append(candidate)
+        token_chars = []
+        token_too_long = False
+        i += 1
+    return out
+
+
+def _expand_native_extension_module_object_ports(
+    ordered_srcs: list[str],
+    ordered_mods: list[str],
+    seen: dict[str, str],
+) -> None:
+    """Publish explicitly imported builtin ports beside native extensions.
+
+    Compiler-recognized builtins normally lower directly and therefore do not
+    need runtime module objects.  A pcc-native C extension can observe them via
+    ``PyImport_ImportModule``, though.  When such an extension is in the source
+    graph, add only builtin modules explicitly imported by that graph and only
+    when a pcc-Python port exists.  They then use the ordinary compiled-sibling
+    registry; no requesting-package dispatch or C semantic module is added.
+    """
+    extension_paths: list[str] = []
+    seen_extension_paths: set[str] = set()
+    for src in ordered_srcs:
+        for path in _source_pcc_native_extension_paths(src):
+            if path in seen_extension_paths:
+                continue
+            seen_extension_paths.add(path)
+            extension_paths.append(path)
+    if not extension_paths:
+        return
+
+    package_queue: list[tuple[str, str]] = []
+    for extension_path in extension_paths:
+        for module_name in _native_extension_literal_module_candidates(extension_path):
+            # A dotted spelling plus a source provider under an explicit
+            # package root is the minimum evidence that a binary token is a
+            # module dependency rather than a C symbol or diagnostic word.
+            if "." not in module_name or module_name in seen:
+                continue
+            provider = None
+            for site_root in _package_site_roots():
+                provider = _resolve_module_src(site_root, module_name)
+                if provider is not None:
+                    break
+            if provider is None:
+                continue
+            provider = str(os.path.abspath(provider))
+            seen[module_name] = provider
+            ordered_srcs.append(provider)
+            ordered_mods.append(module_name)
+            package_queue.append((provider, module_name))
+
+    queue_i = 0
+    while queue_i < len(package_queue):
+        src_path, mod_name = package_queue[queue_i]
+        queue_i += 1
+        root_dir = _module_root_from_src(src_path, mod_name)
+        for target_src, target_mod in _package_import_targets(
+            src_path,
+            mod_name,
+            root_dir=root_dir,
+            top_level_only=True,
+            include_relative=True,
+            include_same_package_absolute=True,
+        ):
+            if target_mod in seen:
+                continue
+            target_src = str(os.path.abspath(target_src))
+            seen[target_mod] = target_src
+            ordered_srcs.append(target_src)
+            ordered_mods.append(target_mod)
+            package_queue.append((target_src, target_mod))
+
+    seed_srcs = list(ordered_srcs)
+    for src_path in seed_srcs:
+        for module_name in _stdlib_absolute_imports_in(src_path):
+            top = module_name.split(".", 1)[0]
+            if module_name in seen or top not in _NATIVE_BUILTIN_IMPORTS:
+                continue
+            provider = _locate_stdlib_module_source(module_name)
+            if provider is None or _native_stdlib_root_for_path(provider) is None:
+                continue
+            provider = str(os.path.abspath(provider))
+            seen[module_name] = provider
+            ordered_srcs.append(provider)
+            ordered_mods.append(module_name)
+
+
+def _stdlib_absolute_imports_in(
+    src_path: str,
+    *,
+    include_function_bodies: bool = False,
+) -> list[str]:
+    """Return absolute imports reachable during module initialization.
+
+    Function bodies are normally excluded because eagerly pulling every lazy
+    import turns a small package into the transitive closure of optional
+    helpers (for example pydoc -> http.server -> email).  Callers may request
+    them for the narrower pcc-owned-provider scan; host stdlib expansion still
+    uses the default module-initialization boundary.
+    """
     from .py_ast import ClassDef as _ClassDef
     from .py_ast import ExceptHandler as _ExceptHandler
     from .py_ast import For as _For
@@ -1850,8 +2704,8 @@ def _stdlib_absolute_imports_in(src_path: str) -> list[str]:
                             out.append(module)
                     else:
                         out.append(module)
-            if _closed_world_is_node(
-                stmt, (_FuncDef, _ClassDef, _With, _ExceptHandler)
+            if _closed_world_is_node(stmt, (_ClassDef, _With, _ExceptHandler)) or (
+                include_function_bodies and _closed_world_is_node(stmt, _FuncDef)
             ):
                 pending.append(_py_ast_field_value(stmt, "body", ()))
             elif _closed_world_is_node(stmt, (_If, _While, _For)):
@@ -1867,6 +2721,8 @@ def _stdlib_absolute_imports_in(src_path: str) -> list[str]:
 
 def _stdlib_module_compiles(src_path: str, mod_name: str) -> bool:
     """Fail-soft recursive-stdlib codegen probe."""
+    if _native_stdlib_root_for_path(src_path) is not None:
+        return True
     from .type_infer import infer_module
     from .codegen.layer1 import L1CodeGen
     from ..parse.py_lift import parse_and_lift
@@ -1899,15 +2755,33 @@ def _expand_recursive_stdlib(
     codegen are excluded; their importers fall back to
     ``py_cpy_import`` for them.
     """
-    queue = list(ordered_mods)
-    failures: set[str] = set()
+    queue = []
+    for mod_name in ordered_mods:
+        queue.append(mod_name)
+    failures: list[str] = []
 
     while queue:
         cur_mod = queue.pop(0)
         cur_src = seen.get(cur_mod)
         if cur_src is None:
             continue
-        for import_name in _stdlib_absolute_imports_in(cur_src):
+        import_names = _stdlib_absolute_imports_in(cur_src)
+        # Include lazy imports only for first-class pcc-owned stdlib providers.
+        # This covers module-init factories without admitting arbitrary host
+        # stdlib/optional dependency trees into the no-libpython closure.
+        for lazy_name in _stdlib_absolute_imports_in(
+            cur_src,
+            include_function_bodies=True,
+        ):
+            if lazy_name in import_names:
+                continue
+            lazy_provider = _locate_stdlib_module_source(lazy_name)
+            if (
+                lazy_provider is not None
+                and _native_stdlib_root_for_path(lazy_provider) is not None
+            ):
+                import_names.append(lazy_name)
+        for import_name in import_names:
             top = import_name.split(".")[0]
             if (
                 import_name in seen
@@ -1931,7 +2805,7 @@ def _expand_recursive_stdlib(
                 # Issue 11.B.2: parse-OK but codegen-FAIL. Fall back to
                 # py_cpy_import for this module by NOT adding it to
                 # the native closure.
-                failures.add(import_name)
+                failures.append(import_name)
                 continue
             seen[import_name] = target_src
             ordered_srcs.append(target_src)
@@ -1966,6 +2840,31 @@ def _order_module_init_deps_for(
         return cached
     src_path = module_to_src[mod_name]
     deps: list[str] = []
+    try:
+        with open(src_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except OSError:
+        source = ""
+
+    def add_dep(dep_mod: str) -> None:
+        if dep_mod in module_set and dep_mod != mod_name and dep_mod not in deps:
+            deps.append(dep_mod)
+
+    for dep_mod in _iter_source_import_specs(source, top_level_only=True):
+        add_dep(dep_mod)
+        top_mod = dep_mod.split(".", 1)[0]
+        add_dep(top_mod)
+    for module_spec, imported_names in _iter_source_import_from_specs(
+        source,
+        top_level_only=True,
+    ):
+        if module_spec.startswith("."):
+            continue
+        add_dep(module_spec)
+        for imported_name in imported_names:
+            if imported_name and imported_name != "*":
+                add_dep(module_spec + "." + imported_name)
+
     for _dep_src, dep_mod in _relative_import_targets(
         src_path,
         mod_name,
@@ -2064,9 +2963,31 @@ def _export_return_type(ret_ty):
     return encode_type(ret_ty)
 
 
-def _export_typed_int_unboxed_abi_enabled() -> bool:
+def _export_typed_int_unboxed_abi_mode() -> str:
     mode = os.environ.get("PCC_PYTHON_TYPED_INT_ABI", "auto").strip().lower()
-    return mode not in ("0", "off", "false", "boxed")
+    if mode == "0":
+        return "off"
+    if mode == "off":
+        return "off"
+    if mode == "false":
+        return "off"
+    if mode == "boxed":
+        return "off"
+    if mode == "unsafe-i64":
+        return "unsafe-i64"
+    if mode == "unsafe_i64":
+        return "unsafe-i64"
+    if mode == "raw-i64":
+        return "unsafe-i64"
+    if mode == "raw_i64":
+        return "unsafe-i64"
+    if mode == "i64":
+        return "unsafe-i64"
+    return "auto"
+
+
+def _export_typed_int_unboxed_abi_enabled() -> bool:
+    return _export_typed_int_unboxed_abi_mode() != "off"
 
 
 def _export_int_literal_fits_i64(expr) -> bool:
@@ -2130,6 +3051,7 @@ _PY_AST_FIELD_NAME_OVERRIDES = {
     "ByteArrayType": ("name",),
     "MemoryViewType": ("name",),
     "ListType": ("name", "elem"),
+    "SetType": ("name", "elem"),
     "DictType": ("name", "key", "value"),
     "TupleType": ("name", "elems"),
     "FuncType": ("name", "params", "ret"),
@@ -2214,6 +3136,7 @@ _PY_AST_BASE_NAME_OVERRIDES = {
     "ByteArrayType": ("Type",),
     "MemoryViewType": ("Type",),
     "ListType": ("Type",),
+    "SetType": ("Type",),
     "DictType": ("Type",),
     "TupleType": ("Type",),
     "FuncType": ("Type",),
@@ -2283,6 +3206,7 @@ _PY_AST_FIELD_TYPE_OVERRIDES = {
     "ByteArrayType": {"name": "str"},
     "MemoryViewType": {"name": "str"},
     "ListType": {"name": "str", "elem": "Type"},
+    "SetType": {"name": "str", "elem": "Type"},
     "DictType": {"name": "str", "key": "Type", "value": "Type"},
     "TupleType": {"name": "str", "elems": "tuple[Type, ...]"},
     "FuncType": {"name": "str", "params": "tuple[Type, ...]", "ret": "Type"},
@@ -2593,6 +3517,477 @@ def _py_ast_field_type_override(class_name: str, field_name: str):
     return None
 
 
+def _py_ast_bytes_to_wire(value):
+    items = []
+    i = 0
+    while i < len(value):
+        items.append(int(value[i]))
+        i += 1
+    return {_PY_AST_WIRE_BYTES_KEY: items}
+
+
+def _py_ast_to_wire(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        return _py_ast_bytes_to_wire(value)
+    kind = _closed_world_node_kind(value)
+    if kind == "bytes":
+        return _py_ast_bytes_to_wire(value)
+    if isinstance(value, (tuple, list)):
+        return [_py_ast_to_wire(item) for item in value]
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            out[str(key)] = _py_ast_to_wire(item)
+        return out
+    field_names = _PY_AST_FIELD_NAME_OVERRIDES.get(kind)
+    if field_names is None:
+        raise PyPipelineError("cannot serialize py_ast node kind " + kind)
+    fields = {}
+    for field_name in field_names:
+        fields[field_name] = _py_ast_to_wire(
+            _py_ast_field_value(value, field_name, None)
+        )
+    return {_PY_AST_WIRE_NODE_KEY: kind, "fields": fields}
+
+
+def _py_ast_wire_bytes(items):
+    if items is None:
+        return b""
+    raw = []
+    for item in items:
+        raw.append(int(item))
+    return bytes(raw)
+
+
+def _py_ast_wire_field(fields, name: str, default=None):
+    if not isinstance(fields, dict):
+        return default
+    if name not in fields:
+        return default
+    return _py_ast_from_wire(fields.get(name))
+
+
+def _py_ast_wire_tuple_field(fields, name: str):
+    value = _py_ast_wire_field(fields, name, ())
+    return () if value is None else value
+
+
+def _py_ast_wire_bool_field(fields, name: str, default: bool):
+    value = _py_ast_wire_field(fields, name, default)
+    return default if value is None else value
+
+
+def _py_ast_from_wire(value):
+    if isinstance(value, dict):
+        if _PY_AST_WIRE_BYTES_KEY in value:
+            return _py_ast_wire_bytes(value.get(_PY_AST_WIRE_BYTES_KEY))
+        kind = value.get(_PY_AST_WIRE_NODE_KEY)
+        if isinstance(kind, str) and kind:
+            return _py_ast_node_from_wire(kind, value.get("fields", {}))
+        out = {}
+        for key, item in value.items():
+            out[str(key)] = _py_ast_from_wire(item)
+        return out
+    if isinstance(value, list):
+        return tuple(_py_ast_from_wire(item) for item in value)
+    return value
+
+
+def _py_ast_node_from_wire(kind: str, fields):
+    from . import py_ast as _pa
+
+    if kind == "SourceSpan":
+        return _pa.SourceSpan(
+            _py_ast_wire_field(fields, "file", ""),
+            _py_ast_wire_field(fields, "line", 0),
+            _py_ast_wire_field(fields, "col", 0),
+            _py_ast_wire_field(fields, "end_line", 0),
+            _py_ast_wire_field(fields, "end_col", 0),
+        )
+    if kind == "Type":
+        return _pa.Type(_py_ast_wire_field(fields, "name", ""))
+    if kind == "IntType":
+        return _pa.IntType(
+            _py_ast_wire_field(fields, "name", "int"),
+            _py_ast_wire_field(fields, "width", 64),
+            _py_ast_wire_field(fields, "signed", True),
+        )
+    if kind == "FloatType":
+        return _pa.FloatType(
+            _py_ast_wire_field(fields, "name", "float"),
+            _py_ast_wire_field(fields, "width", 64),
+        )
+    if kind == "ComplexType":
+        return _pa.ComplexType(_py_ast_wire_field(fields, "name", "complex"))
+    if kind == "BoolType":
+        return _pa.BoolType(_py_ast_wire_field(fields, "name", "bool"))
+    if kind == "NoneType":
+        return _pa.NoneType(_py_ast_wire_field(fields, "name", "None"))
+    if kind == "StrType":
+        return _pa.StrType(_py_ast_wire_field(fields, "name", "str"))
+    if kind == "BytesType":
+        return _pa.BytesType(_py_ast_wire_field(fields, "name", "bytes"))
+    if kind == "ByteArrayType":
+        return _pa.ByteArrayType(_py_ast_wire_field(fields, "name", "bytearray"))
+    if kind == "MemoryViewType":
+        return _pa.MemoryViewType(_py_ast_wire_field(fields, "name", "memoryview"))
+    if kind == "ListType":
+        return _pa.ListType(
+            _py_ast_wire_field(fields, "name", "list"),
+            _py_ast_wire_field(fields, "elem"),
+        )
+    if kind == "SetType":
+        return _pa.SetType(
+            _py_ast_wire_field(fields, "name", "set"),
+            _py_ast_wire_field(fields, "elem"),
+        )
+    if kind == "DictType":
+        return _pa.DictType(
+            _py_ast_wire_field(fields, "name", "dict"),
+            _py_ast_wire_field(fields, "key"),
+            _py_ast_wire_field(fields, "value"),
+        )
+    if kind == "TupleType":
+        return _pa.TupleType(
+            _py_ast_wire_field(fields, "name", "tuple"),
+            _py_ast_wire_field(fields, "elems", ()),
+        )
+    if kind == "FuncType":
+        return _pa.FuncType(
+            _py_ast_wire_field(fields, "name", "func"),
+            _py_ast_wire_field(fields, "params", ()),
+            _py_ast_wire_field(fields, "ret"),
+        )
+    if kind == "ClassType":
+        return _pa.ClassType(
+            _py_ast_wire_field(fields, "name", ""),
+            _py_ast_wire_field(fields, "module", ""),
+            _py_ast_wire_tuple_field(fields, "fields"),
+            _py_ast_wire_tuple_field(fields, "bases"),
+            _py_ast_wire_tuple_field(fields, "properties"),
+            _py_ast_wire_bool_field(fields, "valueclass", False),
+        )
+    if kind == "ValueClassType":
+        return _pa.ValueClassType(
+            _py_ast_wire_field(fields, "name", ""),
+            _py_ast_wire_field(fields, "module", ""),
+            _py_ast_wire_tuple_field(fields, "fields"),
+            _py_ast_wire_tuple_field(fields, "bases"),
+            _py_ast_wire_tuple_field(fields, "properties"),
+            _py_ast_wire_bool_field(fields, "valueclass", True),
+            _py_ast_wire_bool_field(fields, "flattened", True),
+            _py_ast_wire_bool_field(fields, "nullable_fields", False),
+        )
+    if kind == "DynType":
+        return _pa.DynType(_py_ast_wire_field(fields, "name", "dyn"))
+    if kind == "IntLit":
+        return _pa.IntLit(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "value", 0),
+        )
+    if kind == "FloatLit":
+        return _pa.FloatLit(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "value", 0.0),
+        )
+    if kind == "ComplexLit":
+        return _pa.ComplexLit(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "real", 0.0),
+            _py_ast_wire_field(fields, "imag", 0.0),
+        )
+    if kind == "BoolLit":
+        return _pa.BoolLit(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "value", False),
+        )
+    if kind == "NoneLit":
+        return _pa.NoneLit(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+        )
+    if kind == "StrLit":
+        return _pa.StrLit(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "value", ""),
+        )
+    if kind == "BytesLit":
+        return _pa.BytesLit(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "value", b""),
+        )
+    if kind == "Name":
+        return _pa.Name(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "ident", ""),
+        )
+    if kind == "BinOp":
+        return _pa.BinOp(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "op", ""),
+            _py_ast_wire_field(fields, "lhs"),
+            _py_ast_wire_field(fields, "rhs"),
+        )
+    if kind == "UnaryOp":
+        return _pa.UnaryOp(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "op", ""),
+            _py_ast_wire_field(fields, "operand"),
+        )
+    if kind == "Compare":
+        return _pa.Compare(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "op", ""),
+            _py_ast_wire_field(fields, "lhs"),
+            _py_ast_wire_field(fields, "rhs"),
+        )
+    if kind == "BoolExpr":
+        return _pa.BoolExpr(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "op", ""),
+            _py_ast_wire_field(fields, "left"),
+            _py_ast_wire_field(fields, "right"),
+        )
+    if kind == "Call":
+        return _pa.Call(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "func"),
+            _py_ast_wire_field(fields, "args", ()),
+            _py_ast_wire_field(fields, "kwargs", ()),
+        )
+    if kind == "Attr":
+        return _pa.Attr(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "obj"),
+            _py_ast_wire_field(fields, "name", ""),
+        )
+    if kind == "Subscript":
+        return _pa.Subscript(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "obj"),
+            _py_ast_wire_field(fields, "idx"),
+        )
+    if kind == "Slice":
+        return _pa.Slice(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "lo"),
+            _py_ast_wire_field(fields, "hi"),
+            _py_ast_wire_field(fields, "step"),
+        )
+    if kind == "ListExpr":
+        return _pa.ListExpr(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "elems", ()),
+        )
+    if kind == "DictExpr":
+        return _pa.DictExpr(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "pairs", ()),
+        )
+    if kind == "TupleExpr":
+        return _pa.TupleExpr(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "elems", ()),
+        )
+    if kind == "IfExpr":
+        return _pa.IfExpr(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "cond"),
+            _py_ast_wire_field(fields, "then_e"),
+            _py_ast_wire_field(fields, "else_e"),
+        )
+    if kind == "Lambda":
+        return _pa.Lambda(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "ty"),
+            _py_ast_wire_field(fields, "params", ()),
+            _py_ast_wire_field(fields, "body"),
+        )
+    if kind == "Assign":
+        return _pa.Assign(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "targets", ()),
+            _py_ast_wire_field(fields, "value"),
+            _py_ast_wire_field(fields, "annotation"),
+        )
+    if kind == "AugAssign":
+        return _pa.AugAssign(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "target"),
+            _py_ast_wire_field(fields, "op", ""),
+            _py_ast_wire_field(fields, "value"),
+        )
+    if kind == "ExprStmt":
+        return _pa.ExprStmt(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "expr"),
+        )
+    if kind == "If":
+        return _pa.If(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "cond"),
+            _py_ast_wire_field(fields, "body", ()),
+            _py_ast_wire_field(fields, "else_body", ()),
+        )
+    if kind == "While":
+        return _pa.While(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "cond"),
+            _py_ast_wire_field(fields, "body", ()),
+            _py_ast_wire_field(fields, "else_body", ()),
+        )
+    if kind == "For":
+        return _pa.For(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "target"),
+            _py_ast_wire_field(fields, "iter"),
+            _py_ast_wire_field(fields, "body", ()),
+            _py_ast_wire_field(fields, "else_body", ()),
+            _py_ast_wire_field(fields, "is_async", False),
+        )
+    if kind == "Return":
+        return _pa.Return(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "value"),
+        )
+    if kind == "Pass":
+        return _pa.Pass(_py_ast_wire_field(fields, "span"))
+    if kind == "Break":
+        return _pa.Break(_py_ast_wire_field(fields, "span"))
+    if kind == "Continue":
+        return _pa.Continue(_py_ast_wire_field(fields, "span"))
+    if kind == "Raise":
+        return _pa.Raise(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "exc"),
+            _py_ast_wire_field(fields, "cause"),
+        )
+    if kind == "Try":
+        return _pa.Try(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "body", ()),
+            _py_ast_wire_field(fields, "handlers", ()),
+            _py_ast_wire_field(fields, "else_body", ()),
+            _py_ast_wire_field(fields, "finally_body", ()),
+        )
+    if kind == "ExceptHandler":
+        return _pa.ExceptHandler(
+            _py_ast_wire_field(fields, "exc_type"),
+            _py_ast_wire_field(fields, "name"),
+            _py_ast_wire_field(fields, "body", ()),
+            _py_ast_wire_field(fields, "span"),
+        )
+    if kind == "With":
+        return _pa.With(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "items", ()),
+            _py_ast_wire_field(fields, "body", ()),
+            _py_ast_wire_field(fields, "is_async", False),
+        )
+    if kind == "Import":
+        return _pa.Import(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "names", ()),
+        )
+    if kind == "ImportFrom":
+        return _pa.ImportFrom(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "module", ""),
+            _py_ast_wire_field(fields, "names", ()),
+            _py_ast_wire_field(fields, "level", 0),
+        )
+    if kind == "Global":
+        return _pa.Global(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "names", ()),
+        )
+    if kind == "Nonlocal":
+        return _pa.Nonlocal(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "names", ()),
+        )
+    if kind == "Delete":
+        return _pa.Delete(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "targets", ()),
+        )
+    if kind == "Arg":
+        return _pa.Arg(
+            _py_ast_wire_field(fields, "name", ""),
+            _py_ast_wire_field(fields, "annotation"),
+            _py_ast_wire_field(fields, "default"),
+            _py_ast_wire_field(fields, "kind", "pos"),
+            _py_ast_wire_field(fields, "has_default", False),
+        )
+    if kind == "FuncDef":
+        return _pa.FuncDef(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "name", ""),
+            _py_ast_wire_field(fields, "args", ()),
+            _py_ast_wire_field(fields, "return_ty"),
+            _py_ast_wire_field(fields, "body", ()),
+            _py_ast_wire_field(fields, "decorators", ()),
+            _py_ast_wire_field(fields, "is_method", False),
+            _py_ast_wire_field(fields, "is_async", False),
+        )
+    if kind == "ClassDef":
+        return _pa.ClassDef(
+            _py_ast_wire_field(fields, "span"),
+            _py_ast_wire_field(fields, "name", ""),
+            _py_ast_wire_field(fields, "bases", ()),
+            _py_ast_wire_field(fields, "keywords", ()),
+            _py_ast_wire_field(fields, "body", ()),
+            _py_ast_wire_field(fields, "decorators", ()),
+        )
+    if kind == "Module":
+        return _pa.Module(
+            _py_ast_wire_field(fields, "name", ""),
+            _py_ast_wire_field(fields, "body", ()),
+            _py_ast_wire_field(fields, "docstring"),
+        )
+    raise PyPipelineError("unknown py_ast wire node kind " + kind)
+
+
+def _write_py_ast_wire(path: str, ast_mod) -> None:
+    payload = {"schema": _PY_AST_WIRE_SCHEMA, "module": _py_ast_to_wire(ast_mod)}
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload))
+
+
+def _read_py_ast_wire(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.loads(f.read())
+    schema = payload.get("schema") if isinstance(payload, dict) else None
+    if schema != _PY_AST_WIRE_SCHEMA:
+        raise PyPipelineError(
+            "invalid frontend py_ast wire file " + path + " schema=" + str(schema)
+        )
+    return _py_ast_from_wire(payload.get("module"))
+
+
 def _export_default_is_native_typed_int_shape(expr) -> bool:
     from .py_ast import BoolLit as _BoolLit
     from .py_ast import IntLit as _IntLit
@@ -2612,9 +4007,11 @@ def _export_func_uses_unboxed_typed_int_abi(fd) -> bool:
     pcc_multi+pipeline closure and reintroduces no-libpython fallback.
     """
     from .py_ast import BoolType as _BoolType
+    from .py_ast import FloatType as _FloatType
     from .py_ast import IntType as _IntType
 
-    if not _export_typed_int_unboxed_abi_enabled():
+    mode = _export_typed_int_unboxed_abi_mode()
+    if mode == "off":
         return False
     if (
         _py_ast_field_value(fd, "is_async", False)
@@ -2622,8 +4019,15 @@ def _export_func_uses_unboxed_typed_int_abi(fd) -> bool:
         or len(_py_ast_field_value(fd, "decorators", ())) != 0
     ):
         return False
-    if not _closed_world_is_node(_export_return_ty_or_none(fd), _IntType):
-        return False
+    if mode == "unsafe-i64":
+        if not _closed_world_is_node(
+            _export_return_ty_or_none(fd),
+            (_IntType, _FloatType),
+        ):
+            return False
+    else:
+        if not _closed_world_is_node(_export_return_ty_or_none(fd), _FloatType):
+            return False
     for arg in _py_ast_field_value(fd, "args", ()):
         arg_name = _py_ast_field_value(arg, "name", "")
         if arg_name == "":
@@ -2634,11 +4038,15 @@ def _export_func_uses_unboxed_typed_int_abi(fd) -> bool:
             "kw_only",
         ):
             return False
-        if not _closed_world_is_node(
-            _export_annotation_or_none(arg),
-            (_IntType, _BoolType),
-        ):
-            return False
+        if mode == "unsafe-i64":
+            if not _closed_world_is_node(
+                _export_annotation_or_none(arg),
+                (_IntType, _BoolType, _FloatType),
+            ):
+                return False
+        else:
+            if not _closed_world_is_node(_export_annotation_or_none(arg), _FloatType):
+                return False
         arg_default = _py_ast_field_value(arg, "default", None)
         if arg_default is not None and not _export_default_is_native_typed_int_shape(
             arg_default
@@ -2658,6 +4066,7 @@ def _export_static_literal_type(expr):
     """
     from .py_ast import BoolLit as _BoolLit
     from .py_ast import BoolType as _BoolType
+    from .py_ast import Call as _Call
     from .py_ast import DictExpr as _DictExpr
     from .py_ast import DictType as _DictType
     from .py_ast import DynType as _DynType
@@ -2667,6 +4076,7 @@ def _export_static_literal_type(expr):
     from .py_ast import IntType as _IntType
     from .py_ast import ListExpr as _ListExpr
     from .py_ast import ListType as _ListType
+    from .py_ast import SetType as _SetType
     from .py_ast import Attr as _Attr
     from .py_ast import Name as _Name
     from .py_ast import NoneLit as _NoneLit
@@ -2700,6 +4110,13 @@ def _export_static_literal_type(expr):
         # AttributeError.  See investigation
         # ``docs/investigations/python-native-module-alias-module-global-attr-attribute-error.md``.
         return _DynType("dyn")
+    if _closed_world_is_node(expr, _Call):
+        func = _py_ast_field_value(expr, "func", None)
+        if _closed_world_is_node(func, _Name):
+            func_name = _py_ast_field_value(func, "ident", "")
+            if func_name in ("set", "frozenset", "_set_comp", "__setcomp__"):
+                set_name = "frozenset" if func_name == "frozenset" else "set"
+                return _SetType(name=set_name, elem=_DynType("dyn"))
     if _closed_world_is_node(expr, _TupleExpr):
         elems = []
         for item in _py_ast_field_value(expr, "elems", ()):
@@ -2725,6 +4142,39 @@ def _export_static_literal_type(expr):
             key=_export_common_static_type(tuple(key_types)),
             value=_export_common_static_type(tuple(value_types)),
         )
+    return None
+
+
+def _export_static_all_names(expr):
+    from .py_ast import BinOp as _BinOp
+    from .py_ast import ListExpr as _ListExpr
+    from .py_ast import StrLit as _StrLit
+    from .py_ast import TupleExpr as _TupleExpr
+
+    if _closed_world_is_node(expr, (_ListExpr, _TupleExpr)):
+        names = []
+        for item in _py_ast_field_value(expr, "elems", ()):
+            if not _closed_world_is_node(item, _StrLit):
+                return None
+            value = _export_literal_value_or_none(item)
+            if not isinstance(value, str):
+                return None
+            names.append(value)
+        return tuple(names)
+    if (
+        _closed_world_is_node(expr, _BinOp)
+        and _py_ast_field_value(
+            expr,
+            "op",
+            "",
+        )
+        == "+"
+    ):
+        lhs = _export_static_all_names(_py_ast_field_value(expr, "lhs", None))
+        rhs = _export_static_all_names(_py_ast_field_value(expr, "rhs", None))
+        if lhs is None or rhs is None:
+            return None
+        return lhs + rhs
     return None
 
 
@@ -2793,6 +4243,7 @@ def _normalise_export_annotation_text(text: str):
     from .py_ast import FloatType as _FloatType
     from .py_ast import IntType as _IntType
     from .py_ast import ListType as _ListType
+    from .py_ast import SetType as _SetType
     from .py_ast import MemoryViewType as _MemoryViewType
     from .py_ast import NoneType as _NoneType
     from .py_ast import StrType as _StrType
@@ -2807,6 +4258,9 @@ def _normalise_export_annotation_text(text: str):
         text = text[len("typing.") :]
     if text == "list" or text == "List":
         return _ListType("list", _DynType("dyn"))
+    if text in ("set", "Set", "frozenset", "FrozenSet"):
+        name = "frozenset" if text in ("frozenset", "FrozenSet") else "set"
+        return _SetType(name, _DynType("dyn"))
     if text == "dict" or text == "Dict":
         return _DictType("dict", _DynType("dyn"), _DynType("dyn"))
     if text == "tuple" or text == "Tuple":
@@ -2843,6 +4297,12 @@ def _normalise_export_annotation_text(text: str):
                 _normalise_export_annotation_text(args[0]) if len(args) == 1 else None
             )
             return _ListType("list", elem or _DynType("dyn"))
+        if head in ("set", "Set", "frozenset", "FrozenSet"):
+            elem = (
+                _normalise_export_annotation_text(args[0]) if len(args) == 1 else None
+            )
+            name = "frozenset" if head in ("frozenset", "FrozenSet") else "set"
+            return _SetType(name, elem or _DynType("dyn"))
         if head == "dict" or head == "Dict":
             key = _normalise_export_annotation_text(args[0]) if len(args) == 2 else None
             value = (
@@ -2890,6 +4350,10 @@ def _normalise_export_annotation(ann):
             from .py_ast import ListType as _ListType
 
             return _ListType("list", _DynType("dyn"))
+        if class_name in ("set", "frozenset"):
+            from .py_ast import SetType as _SetType
+
+            return _SetType(class_name, _DynType("dyn"))
         if class_name == "dict":
             from .py_ast import DictType as _DictType
 
@@ -2928,19 +4392,86 @@ def _class_is_dataclass(cd) -> bool:
     return False
 
 
-def _export_call_sig(args):
+def _export_default_native_func_ref(expr, owning_module, top_level_func_names):
+    if expr is None or not owning_module:
+        return None
+    from .py_ast import Name as _Name
+
+    if not _closed_world_is_node(expr, _Name):
+        return None
+    ident = str(_py_ast_field_value(expr, "ident", ""))
+    if ident not in top_level_func_names:
+        return None
+    return {
+        "owning_module": str(owning_module),
+        "name": ident,
+    }
+
+
+def _export_default_native_global_ref(expr, owning_module, top_level_func_names):
+    """Record a default rooted at the defining module's own global.
+
+    This covers both ``def f(x=MODULE_CONST)`` and attribute chains such as
+    ``def f(match=WHITESPACE.match)``.  A cross-module caller cannot re-emit
+    the bare root Name in its own namespace; it must load the defining
+    module's export first and then apply the recorded attributes.
+    """
+    if expr is None or not owning_module:
+        return None
+    from .py_ast import Attr as _Attr
+    from .py_ast import Name as _Name
+
+    attrs = []
+    root = expr
+    while _closed_world_is_node(root, _Attr):
+        attr_name = str(_py_ast_field_value(root, "name", ""))
+        if not attr_name:
+            return None
+        attrs.append(attr_name)
+        root = _py_ast_field_value(root, "obj", None)
+    if not _closed_world_is_node(root, _Name):
+        return None
+    ident = str(_py_ast_field_value(root, "ident", ""))
+    if not ident or ident in top_level_func_names:
+        return None
+    ref = {
+        "owning_module": str(owning_module),
+        "name": ident,
+    }
+    if attrs:
+        ref["attrs"] = tuple(reversed(attrs))
+    return ref
+
+
+def _export_call_sig(args, owning_module=None, top_level_func_names=()):
     sig = []
+    top_level_func_names = set(top_level_func_names or ())
     for a in args:
         ann = _export_annotation_or_none(a)
-        sig.append(
-            {
-                "name": _py_ast_field_value(a, "name", ""),
-                "kind": _py_ast_field_value(a, "kind", "pos"),
-                "annotation": encode_type(ann),
-                "default": _py_ast_field_value(a, "default", None),
-                "has_default": _py_ast_field_value(a, "has_default", False),
-            }
+        default = _py_ast_field_value(a, "default", None)
+        item = {
+            "name": _py_ast_field_value(a, "name", ""),
+            "kind": _py_ast_field_value(a, "kind", "pos"),
+            "annotation": encode_type(ann),
+            "default": default,
+            "has_default": _py_ast_field_value(a, "has_default", False),
+        }
+        default_native_func = _export_default_native_func_ref(
+            default,
+            owning_module,
+            top_level_func_names,
         )
+        if default_native_func is not None:
+            item["default_native_func"] = default_native_func
+        else:
+            default_native_global = _export_default_native_global_ref(
+                default,
+                owning_module,
+                top_level_func_names,
+            )
+            if default_native_global is not None:
+                item["default_native_global"] = default_native_global
+        sig.append(item)
     return tuple(sig)
 
 
@@ -3012,9 +4543,14 @@ def _export_default_to_wire(expr):
         }
     if isinstance(expr, _BytesLit):
         raw = _py_ast_field_value(expr, "value", b"")
+        values = []
+        i = 0
+        while i < len(raw):
+            values.append(int(raw[i]))
+            i += 1
         return {
             _EXPORT_DEFAULT_WIRE_KEY: "bytes",
-            "value": list(raw),
+            "value": values,
         }
     if isinstance(expr, _TupleExpr):
         elems = []
@@ -3037,10 +4573,9 @@ def _export_default_to_wire(expr):
         for key, item in _py_ast_field_value(expr, "pairs", ()):
             key_wire = _export_default_to_wire(key)
             item_wire = _export_default_to_wire(item)
-            if (
-                not _export_default_wire_is_safe(key_wire)
-                or not _export_default_wire_is_safe(item_wire)
-            ):
+            if not _export_default_wire_is_safe(
+                key_wire
+            ) or not _export_default_wire_is_safe(item_wire):
                 return {_EXPORT_DEFAULT_WIRE_KEY: "complex"}
             pairs.append((key_wire, item_wire))
         return {_EXPORT_DEFAULT_WIRE_KEY: "dict", "pairs": pairs}
@@ -3059,10 +4594,9 @@ def _export_default_wire_is_safe(wire) -> bool:
                 return False
     if kind == "dict":
         for key, item in wire.get("pairs", ()):
-            if (
-                not _export_default_wire_is_safe(key)
-                or not _export_default_wire_is_safe(item)
-            ):
+            if not _export_default_wire_is_safe(
+                key
+            ) or not _export_default_wire_is_safe(item):
                 return False
     return True
 
@@ -3123,15 +4657,11 @@ def _export_default_from_wire(wire):
     if kind == "bytes":
         return _BytesLit(span, _BytesType("bytes"), bytes(wire.get("value", ())))
     if kind == "tuple":
-        elems = tuple(
-            _export_default_from_wire(elem) for elem in wire.get("elems", ())
-        )
+        elems = tuple(_export_default_from_wire(elem) for elem in wire.get("elems", ()))
         elem_types = tuple(getattr(elem, "ty", _DynType("dyn")) for elem in elems)
         return _TupleExpr(span, _TupleType("tuple", elem_types), elems)
     if kind == "list":
-        elems = tuple(
-            _export_default_from_wire(elem) for elem in wire.get("elems", ())
-        )
+        elems = tuple(_export_default_from_wire(elem) for elem in wire.get("elems", ()))
         elem_ty = getattr(elems[0], "ty", _DynType("dyn")) if elems else _DynType("dyn")
         return _ListExpr(span, _ListType("list", elem_ty), elems)
     if kind == "dict":
@@ -3182,7 +4712,10 @@ def _native_export_to_wire(value):
             out[str(key)] = _native_export_to_wire(item)
         return out
     if isinstance(value, (tuple, list)):
-        return [_native_export_to_wire(item) for item in value]
+        out = []
+        for item in value:
+            out.append(_native_export_to_wire(item))
+        return out
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
@@ -3205,23 +4738,33 @@ def _write_native_exports_wire(
     path: str,
     native_exports,
     derived_class_map,
+    function_object_uses=(),
 ) -> None:
+    native_exports_wire = _native_export_to_wire(native_exports)
+    derived_class_map_wire = _native_export_to_wire(derived_class_map)
     payload = {
         "schema": "pcc.py_frontend.native_exports.v1",
-        "native_exports": _native_export_to_wire(native_exports),
-        "derived_class_map": _native_export_to_wire(derived_class_map),
+        "native_exports": native_exports_wire,
+        "derived_class_map": derived_class_map_wire,
+        "function_object_uses": _native_export_to_wire(function_object_uses),
     }
+    text = json.dumps(payload)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(json.dumps(payload))
+        f.write(text)
 
 
-def _read_native_exports_wire(path: str):
+def _read_native_exports_wire(path: str, include_function_object_uses: bool = False):
     with open(path, "r", encoding="utf-8") as f:
         payload = json.loads(f.read())
     if payload.get("schema") != "pcc.py_frontend.native_exports.v1":
         raise PyPipelineError("invalid frontend native exports file")
     native_exports = _native_export_from_wire(payload.get("native_exports", {}))
     derived_class_map = _native_export_from_wire(payload.get("derived_class_map", {}))
+    if include_function_object_uses:
+        function_object_uses = _native_export_from_wire(
+            payload.get("function_object_uses", ())
+        )
+        return native_exports, derived_class_map, function_object_uses
     return native_exports, derived_class_map
 
 
@@ -3251,6 +4794,93 @@ def _resolve_ast_import_from_module(src_path: str, mod_name: str, stmt) -> str:
     if module:
         return _join_dotted_parts(base + module.split("."))
     return _join_dotted_parts(base)
+
+
+def _closed_world_star_export_items(src_exports):
+    all_info = src_exports.get("__all__")
+    all_names = None
+    if isinstance(all_info, dict):
+        all_names = all_info.get("export_names")
+    if all_names is not None:
+        items = []
+        for export_name in all_names:
+            info = src_exports.get(export_name)
+            if info is not None:
+                items.append((export_name, info))
+        return items
+    items = []
+    for export_name, info in src_exports.items():
+        if export_name.startswith("_"):
+            continue
+        items.append((export_name, info))
+    return items
+
+
+def _closed_world_module_block_assign_targets(stmt):
+    from .py_ast import Assign as _Assign
+    from .py_ast import ClassDef as _ClassDef
+    from .py_ast import For as _For
+    from .py_ast import FuncDef as _FuncDef
+    from .py_ast import If as _If
+    from .py_ast import ListExpr as _ListExpr
+    from .py_ast import Name as _Name
+    from .py_ast import Try as _Try
+    from .py_ast import TupleExpr as _TupleExpr
+    from .py_ast import While as _While
+    from .py_ast import With as _With
+
+    names = []
+    pending = [stmt]
+    while pending:
+        s = pending.pop()
+        if _closed_world_is_node(s, (_FuncDef, _ClassDef)):
+            continue
+        if _closed_world_is_node(s, _Assign):
+            pending_targets = list(_py_ast_field_value(s, "targets", ()))
+            while pending_targets:
+                target = pending_targets.pop()
+                if _closed_world_is_node(target, (_TupleExpr, _ListExpr)):
+                    pending_targets.extend(
+                        reversed(_py_ast_field_value(target, "elems", ()))
+                    )
+                    continue
+                if _closed_world_is_node(target, _Name):
+                    target_name = _py_ast_field_value(target, "ident", "")
+                    if target_name:
+                        names.append(target_name)
+            continue
+        if _closed_world_is_node(s, (_If, _While, _For)):
+            for child in _py_ast_field_value(s, "else_body", ()):
+                pending.append(child)
+            for child in _py_ast_field_value(s, "body", ()):
+                pending.append(child)
+            continue
+        if _closed_world_is_node(s, _Try):
+            for child in _py_ast_field_value(s, "finally_body", ()):
+                pending.append(child)
+            for child in _py_ast_field_value(s, "else_body", ()):
+                pending.append(child)
+            for handler in _py_ast_field_value(s, "handlers", ()):
+                for child in _py_ast_field_value(handler, "body", ()):
+                    pending.append(child)
+            for child in _py_ast_field_value(s, "body", ()):
+                pending.append(child)
+            continue
+        if _closed_world_is_node(s, _With):
+            for child in _py_ast_field_value(s, "body", ()):
+                pending.append(child)
+    return tuple(names)
+
+
+def _closed_world_dyn_module_global_export(mod_name: str, target_name: str) -> dict:
+    from .py_ast import DynType as _DynType
+
+    return {
+        "kind": "module_global",
+        "owning_module": mod_name,
+        "export_name": target_name,
+        "value_ty": encode_type(_DynType("dyn")),
+    }
 
 
 def _merge_closed_world_reexports(
@@ -3299,9 +4929,9 @@ def _merge_closed_world_reexports(
                         src_exports = native_exports.get(src_mod)
                         if not src_exports:
                             continue
-                        for export_name, info in src_exports.items():
-                            if export_name.startswith("_"):
-                                continue
+                        for export_name, info in _closed_world_star_export_items(
+                            src_exports
+                        ):
                             if export_name in exports:
                                 continue
                             exports[export_name] = info
@@ -3319,7 +4949,9 @@ def _merge_closed_world_reexports(
                         continue
 
 
-def _closed_world_reexport_edges(parsed_modules, module_names, src_paths, all_module_names):
+def _closed_world_reexport_edges(
+    parsed_modules, module_names, src_paths, all_module_names
+):
     from .py_ast import ImportFrom as _ImportFrom
 
     module_set = set(all_module_names)
@@ -3359,15 +4991,233 @@ def _merge_closed_world_reexport_edges(module_names, native_exports, edges):
                 if not src_exports:
                     continue
                 if is_star:
-                    for export_name, info in src_exports.items():
-                        if export_name.startswith("_") or export_name in exports:
+                    for export_name, info in _closed_world_star_export_items(
+                        src_exports
+                    ):
+                        if export_name in exports:
                             continue
                         exports[export_name] = info
                         changed = True
                     continue
-                if attr_name in src_exports and exports.get(local_name) is not src_exports[attr_name]:
+                if (
+                    attr_name in src_exports
+                    and exports.get(local_name) is not src_exports[attr_name]
+                ):
                     exports[local_name] = src_exports[attr_name]
                     changed = True
+
+
+def _repair_closed_world_default_global_owners(native_exports) -> None:
+    """Point exported function defaults through their original module.
+
+    A module may import ``NAME`` and then use it in a method default. The
+    closed-world call signature is built before re-export merging, so its
+    initial owner is the importing module even though that module has no
+    ``.modvar`` definition for the name. Rebind such references after the
+    export graph has converged.
+    """
+    seen: set[int] = set()
+
+    def visit(value) -> None:
+        if isinstance(value, dict):
+            marker = id(value)
+            if marker in seen:
+                return
+            seen.add(marker)
+            ref = value.get("default_native_global")
+            if isinstance(ref, dict):
+                owner = str(ref.get("owning_module", ""))
+                name = str(ref.get("name", ""))
+                source = native_exports.get(owner, {}).get(name)
+                if isinstance(source, dict):
+                    source_owner = str(source.get("owning_module", owner))
+                    source_name = str(source.get("export_name", name))
+                    if source_owner != owner or source_name != name:
+                        repaired = {
+                            "owning_module": source_owner,
+                            "name": source_name,
+                        }
+                        attrs = ref.get("attrs")
+                        if attrs:
+                            repaired["attrs"] = tuple(attrs)
+                        value["default_native_global"] = repaired
+            for child in value.values():
+                visit(child)
+            return
+        if isinstance(value, (tuple, list)):
+            for child in value:
+                visit(child)
+
+    visit(native_exports)
+
+
+def _mark_closed_world_function_object_exports(
+    parsed_modules,
+    module_names,
+    src_paths,
+    native_exports,
+    known_module_names=None,
+):
+    """Mark function exports that must exist as runtime objects.
+
+    Direct native calls can use an exported entry point without allocating a
+    ``PyFunc``.  Module attribute reads and explicit ``from`` imports cannot:
+    they observe a stable Python function object.  Record only those uses so
+    metadata-decorated package functions are published when required without
+    eagerly wrapping every decorated function in the closed world.
+    """
+    from .py_ast import Attr as _Attr
+    from .py_ast import Import as _Import
+    from .py_ast import ImportFrom as _ImportFrom
+    from .py_ast import Name as _Name
+    from .py_ast import Type as _Type
+
+    # This table is small (one entry per closed-world module), and a list is
+    # the reliable self-host projection here.  pcc1's set construction can
+    # lose string members, causing relative module imports such as
+    # ``from . import provider`` to be mistaken for value imports; later
+    # ``provider.fn`` reads then never mark ``fn`` as needing a PyFunc object.
+    known_modules = list(known_module_names or native_exports.keys())
+    uses = []
+    use_keys = set()
+
+    def mark(module_name: str, attr_name: str) -> None:
+        key = module_name + "\x00" + attr_name
+        if key not in use_keys:
+            use_keys.add(key)
+            uses.append((module_name, attr_name))
+        info = native_exports.get(module_name, {}).get(attr_name)
+        if isinstance(info, dict) and info.get("kind") == "function":
+            info["needs_object"] = True
+
+    def collect_nodes(root):
+        pending = [root]
+        seen = set()
+        out = []
+        while pending:
+            node = pending.pop()
+            if node is None or isinstance(node, _Type):
+                continue
+            if isinstance(node, (tuple, list)):
+                pending.extend(node)
+                continue
+            marker = id(node)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            out.append(node)
+            for field_name in _py_ast_field_names(node):
+                if field_name in ("annotation", "return_ty", "ty", "span"):
+                    continue
+                pending.append(_py_ast_field_value(node, field_name, None))
+        return out
+
+    def attr_parts(node):
+        parts = []
+        current = node
+        while isinstance(current, _Attr):
+            parts.append(_py_ast_field_value(current, "name", ""))
+            current = _py_ast_field_value(current, "obj", None)
+        if not isinstance(current, _Name):
+            return None
+        parts.append(_py_ast_field_value(current, "ident", ""))
+        parts.reverse()
+        return parts
+
+    for ast_mod, mod_name, src_path in zip(
+        parsed_modules,
+        module_names,
+        src_paths,
+    ):
+        module_aliases = {}
+        body = _py_ast_field_value(ast_mod, "body", ())
+        nodes = collect_nodes(body)
+        for node in nodes:
+            if isinstance(node, _Import):
+                for imported_name, as_name in _py_ast_field_value(
+                    node,
+                    "names",
+                    (),
+                ):
+                    local_name = as_name or imported_name.split(".")[0]
+                    target_module = (
+                        imported_name
+                        if as_name is not None
+                        else imported_name.split(".")[0]
+                    )
+                    alias_targets = module_aliases.get(local_name)
+                    if alias_targets is None:
+                        alias_targets = []
+                        module_aliases[local_name] = alias_targets
+                    if target_module not in alias_targets:
+                        alias_targets.append(target_module)
+                continue
+            if not isinstance(node, _ImportFrom):
+                continue
+            resolved = _resolve_ast_import_from_module(src_path, mod_name, node)
+            for imported_name, as_name in _py_ast_field_value(
+                node,
+                "names",
+                (),
+            ):
+                if imported_name == "*":
+                    mark(resolved, "*")
+                    for export_name, info in native_exports.get(resolved, {}).items():
+                        if isinstance(info, dict) and info.get("kind") == "function":
+                            mark(resolved, export_name)
+                    continue
+                local_name = as_name or imported_name
+                candidate_module = _join_dotted_parts([resolved, imported_name])
+                if candidate_module in known_modules:
+                    alias_targets = module_aliases.get(local_name)
+                    if alias_targets is None:
+                        alias_targets = []
+                        module_aliases[local_name] = alias_targets
+                    if candidate_module not in alias_targets:
+                        alias_targets.append(candidate_module)
+                    continue
+                mark(resolved, imported_name)
+
+        for node in nodes:
+            if not isinstance(node, _Attr):
+                continue
+            parts = attr_parts(node)
+            if not parts or len(parts) < 2:
+                continue
+            for root_module in module_aliases.get(parts[0], ()):
+                owner_module = root_module
+                if len(parts) > 2:
+                    candidate_module = _join_dotted_parts([root_module] + parts[1:-1])
+                    if candidate_module in known_modules:
+                        owner_module = candidate_module
+                mark(owner_module, parts[-1])
+    return tuple(uses)
+
+
+def _apply_closed_world_function_object_uses(native_exports, uses) -> None:
+    for module_name, attr_name in uses:
+        exports = native_exports.get(module_name, {})
+        if attr_name == "*":
+            for info in exports.values():
+                if isinstance(info, dict) and info.get("kind") == "function":
+                    info["needs_object"] = True
+            continue
+        info = exports.get(attr_name)
+        if isinstance(info, dict) and info.get("kind") == "function":
+            info["needs_object"] = True
+
+
+def _closed_world_function_object_exports(native_exports, module_name: str):
+    out = {}
+    for export_name, info in native_exports.get(module_name, {}).items():
+        if not isinstance(info, dict):
+            continue
+        if info.get("kind") != "function" or not info.get("needs_object"):
+            continue
+        if info.get("owning_module", module_name) != module_name:
+            continue
+        out[export_name] = True
+    return out
 
 
 def _write_reexport_edges_wire(path: str, edges) -> None:
@@ -3395,11 +5245,7 @@ def _closed_world_shallow_func_body(lifter, raw_func, include_assigns: bool):
     out = []
     for raw_stmt in raw_func.body:
         raw_type = type(raw_stmt)
-        if (
-            raw_type is _PPExpr
-            and type(raw_stmt.expr) is _PPStr
-            and not out
-        ):
+        if raw_type is _PPExpr and type(raw_stmt.expr) is _PPStr and not out:
             out.append(lifter.lift_stmt(raw_stmt))
             continue
         if include_assigns and raw_type is _PPAssign:
@@ -3409,6 +5255,7 @@ def _closed_world_shallow_func_body(lifter, raw_func, include_assigns: bool):
 
 def _closed_world_shallow_func(lifter, raw_func, body):
     from . import py_ast as _pa
+
     args_list = []
     for param in raw_func.params:
         args_list.append(lifter._lift_arg(param))
@@ -3509,7 +5356,11 @@ def _closed_world_shallow_lift_module(raw_mod, filename: str, module_name: str):
         bases = []
         keywords = []
         for base in raw_stmt.bases:
-            if isinstance(base, tuple) and len(base) == 4 and base[0] == "__pcc_kwarg__":
+            if (
+                isinstance(base, tuple)
+                and len(base) == 4
+                and base[0] == "__pcc_kwarg__"
+            ):
                 keywords.append((base[1], lifter.lift_expr(base[2])))
                 continue
             bases.append(lifter.lift_expr(base))
@@ -3527,6 +5378,45 @@ def _closed_world_shallow_lift_module(raw_mod, filename: str, module_name: str):
             )
         )
     return _pa.Module(module_name, tuple(body), docstring)
+
+
+def _closed_world_is_identity_decorator(stmt) -> bool:
+    """Whether a function can only return its first argument unchanged.
+
+    Imported bare decorators are normally semantic and must not be discarded.
+    A narrow metadata-decorator shape is safe for native callable publication:
+    straight-line expression/assignment side effects followed by
+    ``return <first positional argument>``.  This covers decorators that set
+    documentation or registration metadata while preserving call identity,
+    without treating arbitrary sibling decorators as no-ops.
+    """
+    from .py_ast import Assign as _Assign
+    from .py_ast import ExprStmt as _ExprStmt
+    from .py_ast import Name as _Name
+    from .py_ast import Return as _Return
+
+    args = _py_ast_field_value(stmt, "args", ())
+    if not args:
+        return False
+    first_arg = args[0]
+    if _py_ast_field_value(first_arg, "kind", "") not in ("pos", "pos_only"):
+        return False
+    first_name = _py_ast_field_value(first_arg, "name", "")
+    if not first_name:
+        return False
+    body = _py_ast_field_value(stmt, "body", ())
+    if not body:
+        return False
+    for prefix_stmt in body[:-1]:
+        if not _closed_world_is_node(prefix_stmt, (_ExprStmt, _Assign)):
+            return False
+    final_stmt = body[-1]
+    if not _closed_world_is_node(final_stmt, _Return):
+        return False
+    return_value = _py_ast_field_value(final_stmt, "value", None)
+    return _closed_world_is_node(return_value, _Name) and (
+        _py_ast_field_value(return_value, "ident", "") == first_name
+    )
 
 
 def build_closed_world_context(
@@ -3549,15 +5439,20 @@ def build_closed_world_context(
     import_t = _profile_begin(profile)
     from .py_ast import Assign as _Assign
     from .py_ast import Attr as _Attr
+    from .py_ast import BinOp as _BinOp
     from .py_ast import BoolLit as _BoolLit
+    from .py_ast import Call as _Call
     from .py_ast import ClassDef as _ClassDef
     from .py_ast import ExprStmt as _ExprStmt
     from .py_ast import FuncDef as _FuncDef
+    from .py_ast import Import as _Import
+    from .py_ast import ImportFrom as _ImportFrom
     from .py_ast import IntLit as _IntLit
     from .py_ast import ListExpr as _ListExpr
     from .py_ast import Name as _Name
     from .py_ast import NoneLit as _NoneLit
     from .py_ast import StrLit as _StrLit
+    from .py_ast import Subscript as _Subscript
     from .py_ast import TupleExpr as _TupleExpr
 
     _profile_end(profile, "build_closed_world_context_import_py_ast", import_t)
@@ -3609,9 +5504,138 @@ def build_closed_world_context(
         class_field_names = {}
         top_level_func_names = set()
         ast_body = _py_ast_field_value(ast_mod, "body", ())
+        typing_metadata_bindings = {}
+        typing_module_aliases = set()
+        typing_metadata_exports = (
+            "Any",
+            "Callable",
+            "ClassVar",
+            "Dict",
+            "Final",
+            "Generic",
+            "Iterable",
+            "Iterator",
+            "List",
+            "Literal",
+            "Mapping",
+            "NoReturn",
+            "Optional",
+            "Protocol",
+            "Sequence",
+            "Set",
+            "SupportsIndex",
+            "Tuple",
+            "Type",
+            "TypeAlias",
+            "TypeAliasType",
+            "TypedDict",
+            "TypeVar",
+            "Union",
+        )
+        for stmt in ast_body:
+            if _closed_world_is_node(stmt, _ImportFrom) and (
+                _py_ast_field_value(stmt, "module", "") == "typing"
+                and not _py_ast_field_value(stmt, "level", 0)
+            ):
+                for attr_name, as_name in _py_ast_field_value(stmt, "names", ()):
+                    if attr_name in typing_metadata_exports:
+                        typing_metadata_bindings[as_name or attr_name] = attr_name
+                continue
+            if not _closed_world_is_node(stmt, _Import):
+                continue
+            for imported_module, as_name in _py_ast_field_value(stmt, "names", ()):
+                if imported_module == "typing":
+                    typing_module_aliases.add(as_name or "typing")
+
+        def is_typing_metadata_expr(expr):
+            if _closed_world_is_node(expr, _Name):
+                return (
+                    _py_ast_field_value(expr, "ident", "")
+                    in typing_metadata_bindings
+                )
+            if _closed_world_is_node(expr, _Attr):
+                obj = _py_ast_field_value(expr, "obj", None)
+                return (
+                    _closed_world_is_node(obj, _Name)
+                    and _py_ast_field_value(obj, "ident", "")
+                    in typing_module_aliases
+                    and _py_ast_field_value(expr, "name", "")
+                    in typing_metadata_exports
+                )
+            if _closed_world_is_node(expr, _Subscript):
+                return is_typing_metadata_expr(
+                    _py_ast_field_value(expr, "obj", None)
+                )
+            if _closed_world_is_node(expr, _Call):
+                return is_typing_metadata_expr(
+                    _py_ast_field_value(expr, "func", None)
+                )
+            if _closed_world_is_node(expr, _BinOp) and _py_ast_field_value(
+                expr,
+                "op",
+                "",
+            ) == "|":
+                return is_typing_metadata_expr(
+                    _py_ast_field_value(expr, "lhs", None)
+                ) or is_typing_metadata_expr(
+                    _py_ast_field_value(expr, "rhs", None)
+                )
+            if _closed_world_is_node(expr, _TupleExpr):
+                for elem in _py_ast_field_value(expr, "elems", ()):
+                    if is_typing_metadata_expr(elem):
+                        return True
+            return False
+
         for stmt in ast_body:
             if _closed_world_is_node(stmt, _FuncDef):
                 top_level_func_names.add(_py_ast_field_value(stmt, "name", ""))
+
+        def decorator_root_name(expr):
+            if _closed_world_is_node(expr, _Call):
+                return decorator_root_name(_py_ast_field_value(expr, "func", None))
+            current = expr
+            while _closed_world_is_node(current, _Attr):
+                current = _py_ast_field_value(current, "obj", None)
+            if _closed_world_is_node(current, _Name):
+                return _py_ast_field_value(current, "ident", "")
+            return ""
+
+        partial_decorator_factories = set()
+        for stmt in ast_body:
+            if not _closed_world_is_node(stmt, _Assign):
+                continue
+            targets = _py_ast_field_value(stmt, "targets", ())
+            if len(targets) != 1 or not _closed_world_is_node(targets[0], _Name):
+                continue
+            value = _py_ast_field_value(stmt, "value", None)
+            if not _closed_world_is_node(value, _Call):
+                continue
+            partial_func = _py_ast_field_value(value, "func", None)
+            is_partial = (
+                _closed_world_is_node(partial_func, _Name)
+                and _py_ast_field_value(partial_func, "ident", "") == "partial"
+            ) or (
+                _closed_world_is_node(partial_func, _Attr)
+                and _py_ast_field_value(partial_func, "name", "") == "partial"
+            )
+            if is_partial:
+                partial_decorator_factories.add(
+                    _py_ast_field_value(targets[0], "ident", "")
+                )
+
+        def has_semantic_native_decorator(stmt):
+            for decorator in _py_ast_field_value(stmt, "decorators", ()):
+                if _closed_world_is_node(decorator, _Call):
+                    if decorator_root_name(decorator) in partial_decorator_factories:
+                        return True
+                    continue
+                if _closed_world_is_node(decorator, _Name):
+                    if (
+                        _py_ast_field_value(decorator, "ident", "")
+                        in top_level_func_names
+                    ):
+                        return True
+            return False
 
         module_box_int_abi = not (
             mod_name == "pcc"
@@ -3645,10 +5669,23 @@ def build_closed_world_context(
                     "export_name": stmt_name,
                     "return_ty": _export_return_type(_export_return_ty_or_none(stmt)),
                     "param_types": _export_param_types(stmt_args),
-                    "call_sig": _export_call_sig(stmt_args),
+                    "call_sig": _export_call_sig(
+                        stmt_args,
+                        mod_name,
+                        top_level_func_names,
+                    ),
+                    "is_async": bool(_py_ast_field_value(stmt, "is_async", False)),
                     "box_int_abi": function_box_int_abi,
                     "docstring": docstring,
                 }
+                if has_semantic_native_decorator(stmt):
+                    # The public module binding is the decorator result, not
+                    # the undecorated ``user_<module>_<name>`` entry point.
+                    # Cross-module callers must load that stable object.
+                    exports[stmt_name]["semantic_decorator"] = True
+                    exports[stmt_name]["needs_object"] = True
+                if _closed_world_is_identity_decorator(stmt):
+                    exports[stmt_name]["identity_decorator"] = True
                 continue
 
             if _closed_world_is_node(stmt, _Assign):
@@ -3656,9 +5693,27 @@ def build_closed_world_context(
                 if len(stmt_targets) != 1 or not _closed_world_is_node(
                     stmt_targets[0], _Name
                 ):
+                    for target_name in _closed_world_module_block_assign_targets(stmt):
+                        exports[target_name] = _closed_world_dyn_module_global_export(
+                            mod_name,
+                            target_name,
+                        )
                     continue
                 target_name = _py_ast_field_value(stmt_targets[0], "ident", "")
                 value = _py_ast_field_value(stmt, "value", None)
+                annotation = _py_ast_field_value(stmt, "annotation", None)
+                annotation_name = _py_ast_field_value(annotation, "name", "")
+                if (
+                    typing_metadata_bindings.get(annotation_name) == "TypeAlias"
+                    or is_typing_metadata_expr(value)
+                ):
+                    exports[target_name] = {
+                        "kind": "typing_metadata",
+                        "owning_module": mod_name,
+                        "export_name": target_name,
+                    }
+                    typing_metadata_bindings[target_name] = "alias"
+                    continue
                 if _closed_world_is_node(value, _StrLit):
                     literal_value = _export_literal_value_or_none(value)
                     if literal_value is None:
@@ -3725,7 +5780,19 @@ def build_closed_world_context(
                             "export_name": target_name,
                             "value_ty": encode_type(value_ty),
                         }
+                if target_name == "__all__" and target_name in exports:
+                    all_names = _export_static_all_names(value)
+                    if all_names is not None:
+                        exports[target_name]["export_names"] = all_names
                 continue
+
+            for target_name in _closed_world_module_block_assign_targets(stmt):
+                if target_name in exports:
+                    continue
+                exports[target_name] = _closed_world_dyn_module_global_export(
+                    mod_name,
+                    target_name,
+                )
 
             if not _closed_world_is_node(stmt, _ClassDef):
                 continue
@@ -3881,7 +5948,14 @@ def build_closed_world_context(
                             _export_return_ty_or_none(body_stmt)
                         ),
                         "param_types": _export_param_types(body_stmt_args),
-                        "call_sig": _export_call_sig(body_stmt_args),
+                        "call_sig": _export_call_sig(
+                            body_stmt_args,
+                            mod_name,
+                            top_level_func_names,
+                        ),
+                        "is_async": bool(
+                            _py_ast_field_value(body_stmt, "is_async", False)
+                        ),
                         "box_int_abi": module_box_int_abi,
                     }
                 )
@@ -4025,8 +6099,16 @@ def build_closed_world_context(
             src_paths,
             native_exports,
         )
+        _repair_closed_world_default_global_owners(native_exports)
         _merge_l1_mixin_stack_methods(native_exports)
         _merge_l1_codegen_methods(native_exports)
+
+    _mark_closed_world_function_object_exports(
+        parsed_modules,
+        module_names,
+        src_paths,
+        native_exports,
+    )
 
     derived_class_map = _closed_world_derived_class_map(native_exports)
     return parsed_modules, native_exports, derived_class_map
@@ -4155,14 +6237,7 @@ def _copy_native_module_exports(exports):
 
 
 def _module_uses_default_native_exports(module_name: str) -> bool:
-    return (
-        module_name == "pcc.py_frontend.pipeline"
-        or module_name == "pcc.py_frontend.codegen.layer1_support"
-        or module_name == "pcc.py_frontend.codegen.host_contract"
-        or module_name == "pcc.py_frontend.codegen.layer1_constants"
-        or module_name == "pcc.py_frontend.codegen.layer1"
-        or module_name == "pcc.py_frontend.codegen.class_gen"
-    )
+    return _default_native_module_exports(module_name) is not None
 
 
 PROBE_POLICY_STANDALONE = "standalone"
@@ -4174,6 +6249,9 @@ def compile_contextual_per_module_fallback_counts(
     contextual_modules,
     *,
     ir_scaffold_mode: str,
+    strict_no_libpython: bool = False,
+    emit_ir_dir: Optional[str] = None,
+    entry_module: Optional[str] = None,
 ):
     """Return ``py_cpy_*`` call counts for modules under closed-world context.
 
@@ -4220,6 +6298,10 @@ def compile_contextual_per_module_fallback_counts(
                 emit_cpy_main_exitcode=False,
                 ir_scaffold_mode=ir_scaffold_mode,
             )
+            codegen._strict_no_libpython = strict_no_libpython
+            codegen._prefer_native_callable_values = strict_no_libpython
+            if entry_module is not None:
+                codegen._skip_program_main = mod_name != entry_module
             if _module_uses_default_native_exports(mod_name):
                 codegen_exports = _copy_native_module_exports(
                     codegen._native_module_exports
@@ -4230,9 +6312,25 @@ def compile_contextual_per_module_fallback_counts(
                 if k != mod_name:
                     codegen_exports[k] = v
             codegen._native_module_exports = codegen_exports
-            out[mod_name] = count_py_cpy_fallback_calls(
-                str(codegen.generate(typed_mod))
+            codegen._native_function_object_exports = (
+                _closed_world_function_object_exports(native_exports, mod_name)
             )
+            ir_text = str(codegen.generate(typed_mod))
+            out[mod_name] = count_py_cpy_fallback_calls(ir_text)
+            if emit_ir_dir is not None:
+                # ponytail: caller must pre-create emit_ir_dir. os.makedirs has
+                # no no-libpython lowering, and this debug-only IR-dump path
+                # would otherwise reintroduce a py_cpy_* fallback into
+                # pipeline.py's own per-module ratchet (this function is a
+                # test/diagnostic helper — no production caller passes
+                # emit_ir_dir). Native os.makedirs is tracked separately.
+                ir_name = mod_name.replace(".", "_") + ".ll"
+                with open(
+                    os.path.join(emit_ir_dir, ir_name),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(ir_text)
         except Exception:
             out[mod_name] = -1
     return out
@@ -4241,20 +6339,24 @@ def compile_contextual_per_module_fallback_counts(
 def _runtime_archive_stale(archive: str) -> bool:
     if not os.path.isfile(archive):
         return True
-    stamp = _runtime_archive_target_stamp(archive)
-    if not os.path.isfile(stamp):
-        return True
-    try:
-        with open(stamp, "r", encoding="utf-8") as f:
-            if f.read().strip() != _runtime_archive_target_id():
-                return True
-    except OSError:
+    if not _runtime_archive_target_matches(archive):
         return True
     archive_mtime = os.path.getmtime(archive)
     archive_base = str(os.path.basename(archive))
+    if _runtime_archive_compiler_sources_newer_than(archive_base, archive_mtime):
+        return True
     archive_uses_libpython = archive_base in (
         "libpy_runtime_libpython.a",
         "libpy_runtime_pcc_py_libpython.a",
+    )
+    archive_uses_pcc_python = archive_base in (
+        "libpy_runtime_pcc_py.a",
+        "libpy_runtime_pcc_py_libpython.a",
+    )
+    replaced_c_modules = (
+        _runtime_pcc_python_replaced_c_modules()
+        if archive_uses_pcc_python
+        else set()
     )
     header = os.path.join(_PY_RUNTIME_DIR, "include", "py_runtime.h")
     if os.path.isfile(header) and os.path.getmtime(header) > archive_mtime:
@@ -4265,6 +6367,8 @@ def _runtime_archive_stale(archive: str) -> bool:
             if not name.endswith(".c"):
                 continue
             if name == "py_libpython.c" and not archive_uses_libpython:
+                continue
+            if name[:-2] in replaced_c_modules:
                 continue
             path = os.path.join(src_dir, name)
             if os.path.isfile(path) and os.path.getmtime(path) > archive_mtime:
@@ -4292,8 +6396,139 @@ def _runtime_archive_stale(archive: str) -> bool:
     return os.path.isfile(makefile) and os.path.getmtime(makefile) > archive_mtime
 
 
+def _runtime_makefile_variable_words(name: str) -> list[str]:
+    """Read one simple make variable without duplicating its module list."""
+    makefile = os.path.join(_PY_RUNTIME_DIR, "Makefile")
+    if not os.path.isfile(makefile):
+        return []
+    try:
+        with open(makefile, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not (line.startswith(name + " =") or line.startswith(name + " +=")):
+            i += 1
+            continue
+        line = line.split("=", 1)[1].strip()
+        while True:
+            continued = line.endswith("\\")
+            if continued:
+                line = line[:-1].strip()
+            if line:
+                out.extend(line.split())
+            if not continued:
+                break
+            i += 1
+            if i >= len(lines):
+                break
+            line = lines[i].strip()
+        i += 1
+    return out
+
+
+def _runtime_pcc_python_replaced_c_modules() -> set[str]:
+    py_modules = set(_runtime_makefile_variable_words("PY_MODULES"))
+    replaced = set()
+    for word in _runtime_makefile_variable_words("PY_REPLACED_C_MODULES"):
+        if word == "$(PY_MODULES)":
+            replaced.update(py_modules)
+        else:
+            replaced.add(word)
+    return replaced
+
+
+def _runtime_archive_compiler_sources_newer_than(
+    archive_base: str,
+    archive_mtime: float,
+) -> bool:
+    if archive_base not in (
+        "libpy_runtime_pcc.a",
+        "libpy_runtime_pcc_py.a",
+        "libpy_runtime_pcc_py_libpython.a",
+    ):
+        return False
+    roots = (
+        os.path.join(_PCC_DIR, "backend"),
+        os.path.join(_PCC_DIR, "codegen"),
+        os.path.join(_PCC_DIR, "evaluater"),
+        os.path.join(_PCC_DIR, "llvm_capi"),
+        os.path.join(_PCC_DIR, "parse"),
+        os.path.join(_PCC_DIR, "py_frontend"),
+        os.path.join(_PCC_DIR, "tools"),
+        os.path.join(_PCC_DIR, "__main__.py"),
+        os.path.join(_PCC_DIR, "api.py"),
+        os.path.join(_PCC_DIR, "cli_core.py"),
+        os.path.join(_PCC_DIR, "pcc.py"),
+        os.path.join(_PCC_DIR, "project.py"),
+    )
+    for root in roots:
+        if os.path.isfile(root):
+            if os.path.getmtime(root) > archive_mtime:
+                return True
+            continue
+        if not os.path.isdir(root):
+            continue
+        pending_dirs = [root]
+        while pending_dirs:
+            dirpath = pending_dirs.pop()
+            try:
+                names = os.listdir(dirpath)
+            except OSError:
+                continue
+            for filename in names:
+                if (
+                    filename == "__pycache__"
+                    or filename == ".pytest_cache"
+                    or filename.startswith(".")
+                ):
+                    continue
+                path = os.path.join(dirpath, filename)
+                if os.path.isdir(path):
+                    pending_dirs.append(path)
+                    continue
+                if not (
+                    filename.endswith(".py")
+                    or filename.endswith(".c")
+                    or filename.endswith(".h")
+                ):
+                    continue
+                if os.path.isfile(path) and os.path.getmtime(path) > archive_mtime:
+                    return True
+    return False
+
+
+def _is_py_runtime_library_source(src_path: str) -> bool:
+    runtime_py_dir = os.path.abspath(os.path.join(_PY_RUNTIME_DIR, "py"))
+    source_path = os.path.abspath(src_path)
+    if source_path.startswith(runtime_py_dir + os.sep):
+        return True
+    parts = source_path.split(os.sep)
+    for i, part in enumerate(parts):
+        if part != "py" or i == 0:
+            continue
+        parent = parts[i - 1]
+        if parent == "py_runtime" or parent.startswith("py_runtime_"):
+            return True
+    return False
+
+
 def _runtime_archive_target_stamp(archive: str) -> str:
     return str(archive) + ".target"
+
+
+def _runtime_archive_target_matches(archive: str) -> bool:
+    stamp = _runtime_archive_target_stamp(archive)
+    if not os.path.isfile(stamp):
+        return False
+    try:
+        with open(stamp, "r", encoding="utf-8") as f:
+            return f.read().strip() == _runtime_archive_target_id()
+    except OSError:
+        return False
 
 
 def _runtime_archive_target_id() -> str:
@@ -4368,6 +6603,13 @@ def _runtime_high_mode() -> str:
     return "py"
 
 
+def _runtime_host_python_for_make() -> str:
+    exe = _host_python_command()
+    if exe and not os.path.isabs(exe):
+        return os.path.abspath(exe)
+    return exe
+
+
 def _ensure_runtime(
     verbose: bool,
     *,
@@ -4380,6 +6622,25 @@ def _ensure_runtime(
     clang invocation can surface a concrete missing-file/link error
     instead of silently omitting the runtime archive.
     """
+    explicit_archive = str(
+        os.environ.get(_PY_RUNTIME_ARCHIVE_ENV, "") or ""
+    ).strip()
+    if explicit_archive:
+        explicit_archive = os.path.abspath(explicit_archive)
+        if not os.path.isfile(explicit_archive):
+            raise PyPipelineError(
+                "explicit runtime archive not found: " + explicit_archive
+            )
+        _log(verbose, "runtime archive (explicit): " + explicit_archive)
+        return explicit_archive
+
+    runtime_dir = str(os.environ.get(_PY_RUNTIME_DIR_ENV, "") or "").strip()
+    runtime_dir = (
+        os.path.abspath(runtime_dir) if runtime_dir else _PY_RUNTIME_DIR
+    )
+    if not os.path.isdir(runtime_dir):
+        raise PyPipelineError("explicit runtime directory not found: " + runtime_dir)
+
     cc_mode = _runtime_cc_mode()
     high_mode = _runtime_high_mode()
     if cc_mode == "pcc":
@@ -4402,11 +6663,13 @@ def _ensure_runtime(
         archive = (
             _PY_RUNTIME_ARCHIVE_LIBPYTHON if needs_libpython else _PY_RUNTIME_ARCHIVE
         )
+    if runtime_dir != _PY_RUNTIME_DIR:
+        archive = os.path.join(runtime_dir, os.path.basename(archive))
     debug = bool(str(os.environ.get("PCC_DEBUG_RUNTIME", "")).strip())
     if debug:
-        _log(True, "[runtime] _PY_RUNTIME_DIR=" + _PY_RUNTIME_DIR)
+        _log(True, "[runtime] runtime_dir=" + runtime_dir)
         _log(True, "[runtime] archive=" + str(archive))
-        _log(True, "[runtime] makefile=" + os.path.join(_PY_RUNTIME_DIR, "Makefile"))
+        _log(True, "[runtime] makefile=" + os.path.join(runtime_dir, "Makefile"))
         _log(True, "[runtime] needs_libpython=" + str(needs_libpython))
         _log(True, "[runtime] cc_mode=" + str(cc_mode))
         _log(True, "[runtime] high_mode=" + str(high_mode))
@@ -4418,14 +6681,17 @@ def _ensure_runtime(
         _log(
             True,
             "[runtime] makefile_exists="
-            + str(os.path.isfile(os.path.join(_PY_RUNTIME_DIR, "Makefile"))),
+            + str(os.path.isfile(os.path.join(runtime_dir, "Makefile"))),
         )
 
-    if os.path.isfile(archive) and not _runtime_archive_stale(archive):
+    archive_stale = True
+    if os.path.isfile(archive):
+        archive_stale = _runtime_archive_stale(archive)
+    if os.path.isfile(archive) and not archive_stale:
         _log(verbose, "runtime archive: " + archive)
         return archive
 
-    makefile = os.path.join(_PY_RUNTIME_DIR, "Makefile")
+    makefile = os.path.join(runtime_dir, "Makefile")
     if debug:
         try:
             with open("/tmp/pcc_runtime_debug_probe.txt", "a", encoding="utf-8") as f:
@@ -4447,11 +6713,23 @@ def _ensure_runtime(
             str(os.environ.get("PCC_WITH_THREADS", "")).strip()
             or str(os.environ.get("PCC_REFCOUNT_KIND", "")).strip()
         )
-        make_cmd = (
-            ["make", "-B", "-C", _PY_RUNTIME_DIR]
-            if runtime_config_forces_rebuild
-            else ["make", "-C", _PY_RUNTIME_DIR]
+        # A changed runtime source/header/Makefile should use make's normal
+        # dependency graph and rebuild only the affected objects. Historically
+        # every stale archive selected ``make -B`` here, recompiling every
+        # pcc-Python runtime module even when one C-kernel helper changed.
+        # Reserve a full rebuild for configuration, target, or pcc compiler
+        # changes that can invalidate every emitted object.
+        archive_mtime = os.path.getmtime(archive) if os.path.isfile(archive) else 0.0
+        full_rebuild = (
+            runtime_config_forces_rebuild
+            or not _runtime_archive_target_matches(archive)
+            or _runtime_archive_compiler_sources_newer_than(
+                str(os.path.basename(archive)), archive_mtime
+            )
         )
+        make_cmd = ["make", "-C", runtime_dir]
+        if full_rebuild:
+            make_cmd.insert(1, "-B")
         if cc_mode == "pcc":
             if high_mode == "py":
                 make_cmd.append(
@@ -4473,7 +6751,7 @@ def _ensure_runtime(
             pcc_bin = _resolve_pcc_binary()
             if pcc_bin and high_mode == "py":
                 make_cmd.append(f"PCC={pcc_bin}")
-                make_cmd.append(f"PYTHON={sys.executable}")
+                make_cmd.append(f"PYTHON={_runtime_host_python_for_make()}")
         elif needs_libpython:
             make_cmd.extend(
                 [
@@ -5128,14 +7406,14 @@ def _global_name_from_definition_line(line: str) -> str:
 def _rename_llvm_global_refs(text: str, rename_map: dict[str, str]) -> str:
     if not rename_map:
         return text
-    out = ""
+    pieces: list[str] = []
     index = 0
+    literal_start = 0
     in_quote = False
     escape = False
     while index < len(text):
         ch = text[index]
         if in_quote:
-            out += ch
             if escape:
                 escape = False
             elif ch == "\\":
@@ -5146,11 +7424,9 @@ def _rename_llvm_global_refs(text: str, rename_map: dict[str, str]) -> str:
             continue
         if ch == '"':
             in_quote = True
-            out += ch
             index += 1
             continue
         if ch != "@":
-            out += ch
             index += 1
             continue
         start = index + 1
@@ -5159,12 +7435,17 @@ def _rename_llvm_global_refs(text: str, rename_map: dict[str, str]) -> str:
             end += 1
         name = text[start:end]
         replacement = rename_map.get(name)
-        if replacement is None:
-            out += text[index:end]
-        else:
-            out += "@" + replacement
+        if replacement is not None:
+            if literal_start < index:
+                pieces.append(text[literal_start:index])
+            pieces.append("@" + replacement)
+            literal_start = end
         index = end
-    return out
+    if not pieces:
+        return text
+    if literal_start < len(text):
+        pieces.append(text[literal_start:])
+    return "".join(pieces)
 
 
 def _llvm_global_name_char(ch: str) -> bool:
@@ -5289,8 +7570,14 @@ def _apply_python_ir_pass_pipeline(
     host_code = (
         "import os\n"
         "import sys\n"
+        "pcc_source_root = sys.argv[1]\n"
+        "if pcc_source_root and pcc_source_root not in sys.path:\n"
+        "    sys.path.insert(0, pcc_source_root)\n"
+        "if pcc_source_root:\n"
+        "    os.environ.setdefault('PCC_SOURCE_ROOT', pcc_source_root)\n"
+        "    os.environ.setdefault('PCC_REPO_ROOT', pcc_source_root)\n"
         "from pcc.py_frontend.ir_pass_pipeline import run_python_ir_pass_pipeline\n"
-        "module_name, pass_csv, ir_path, out_path, strict_text, default_transport = sys.argv[1:7]\n"
+        "module_name, pass_csv, ir_path, out_path, strict_text, default_transport = sys.argv[2:8]\n"
         "if strict_text == '1':\n"
         "    os.environ['PCC_PYTHON_IR_PASS_STRICT_NO_LIBPYTHON'] = '1'\n"
         "if default_transport and not str(os.environ.get('PCC_PYTHON_IR_PASS_TRANSPORT', '') or '').strip():\n"
@@ -5314,6 +7601,7 @@ def _apply_python_ir_pass_pipeline(
             _host_python_command(),
             "-c",
             host_code,
+            _pcc_source_root_for_host_subprocess(),
             module_name,
             _join_strings(pass_names, ","),
             ir_path,
@@ -5321,12 +7609,20 @@ def _apply_python_ir_pass_pipeline(
             _python_ir_pass_strict_arg(strict_no_libpython=strict_no_libpython),
             str(default_transport or ""),
         ]
+        timeout_seconds = _python_ir_pass_timeout_seconds()
         try:
-            subprocess.run(
-                cmd,
-                check=True,
-                timeout=_python_ir_pass_timeout_seconds(),
-            )
+            if timeout_seconds is None:
+                subprocess.run(cmd, check=True)
+            else:
+                # Keep Optional[float] out of native subprocess lowering:
+                # compiled-stage Dyn-to-i64 coercion treats a boxed float as
+                # zero.  The explicit float conversion preserves fractional
+                # seconds and the branch preserves timeout=None semantics.
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    timeout=float(timeout_seconds),
+                )
         except subprocess.TimeoutExpired as e:
             timeout_text = _seconds_debug_text(e.timeout)
             raise PyPipelineError(
@@ -5404,6 +7700,12 @@ def _apply_python_ir_pass_pipeline_many(
         "import multiprocessing as mp\n"
         "import os\n"
         "import sys\n"
+        "pcc_source_root = sys.argv[1]\n"
+        "if pcc_source_root and pcc_source_root not in sys.path:\n"
+        "    sys.path.insert(0, pcc_source_root)\n"
+        "if pcc_source_root:\n"
+        "    os.environ.setdefault('PCC_SOURCE_ROOT', pcc_source_root)\n"
+        "    os.environ.setdefault('PCC_REPO_ROOT', pcc_source_root)\n"
         "from pcc.py_frontend.ir_pass_pipeline import run_python_ir_pass_pipeline\n"
         "_pipeline = __import__('pcc.py_frontend.pipeline', "
         "fromlist=['_split_large_modules_for_python_ir_passes', "
@@ -5425,17 +7727,17 @@ def _apply_python_ir_pass_pipeline_many(
         "    with open(out_path, 'w', encoding='utf-8') as f:\n"
         "        f.write(out)\n"
         "    return 0\n"
-        "jobs = int(sys.argv[1])\n"
-        "pass_csv = sys.argv[2]\n"
-        "split_large_modules = sys.argv[3] == '1'\n"
-        "result_path = sys.argv[4]\n"
-        "strict_text = sys.argv[5]\n"
-        "default_transport = sys.argv[6]\n"
+        "jobs = int(sys.argv[2])\n"
+        "pass_csv = sys.argv[3]\n"
+        "split_large_modules = sys.argv[4] == '1'\n"
+        "result_path = sys.argv[5]\n"
+        "strict_text = sys.argv[6]\n"
+        "default_transport = sys.argv[7]\n"
         "if strict_text == '1':\n"
         "    os.environ['PCC_PYTHON_IR_PASS_STRICT_NO_LIBPYTHON'] = '1'\n"
         "if default_transport and not str(os.environ.get('PCC_PYTHON_IR_PASS_TRANSPORT', '') or '').strip():\n"
         "    os.environ['PCC_PYTHON_IR_PASS_TRANSPORT'] = default_transport\n"
-        "skip_modules = set(name for name in sys.argv[7].split(',') if name)\n"
+        "skip_modules = set(name for name in sys.argv[8].split(',') if name)\n"
         "def _module_should_skip_passes(module_name):\n"
         "    if module_name in skip_modules:\n"
         "        return True\n"
@@ -5449,7 +7751,7 @@ def _apply_python_ir_pass_pipeline_many(
         "    if base_module != module_name and _python_ir_pass_should_skip_module(base_module):\n"
         "        return True\n"
         "    return False\n"
-        "items = sys.argv[8:]\n"
+        "items = sys.argv[9:]\n"
         "pass_names = tuple(name.strip() for name in pass_csv.split(',') "
         "if name.strip())\n"
         "if len(items) % 2 != 0:\n"
@@ -5510,6 +7812,7 @@ def _apply_python_ir_pass_pipeline_many(
             _host_python_command(),
             "-c",
             host_code,
+            _pcc_source_root_for_host_subprocess(),
             _small_int_decimal(_python_ir_pass_jobs(job_count_hint)),
             _join_strings(pass_names, ","),
             "1" if split_large_modules else "0",
@@ -5531,12 +7834,16 @@ def _apply_python_ir_pass_pipeline_many(
             with open(ir_path, "w", encoding="utf-8") as f:
                 f.write(str(ir_text))
             args.extend([module_name, ir_path])
+        timeout_seconds = _python_ir_pass_timeout_seconds()
         try:
-            subprocess.run(
-                args,
-                check=True,
-                timeout=_python_ir_pass_timeout_seconds(),
-            )
+            if timeout_seconds is None:
+                subprocess.run(args, check=True)
+            else:
+                subprocess.run(
+                    args,
+                    check=True,
+                    timeout=float(timeout_seconds),
+                )
         except subprocess.TimeoutExpired as e:
             timeout_text = _seconds_debug_text(e.timeout)
             raise PyPipelineError(
@@ -5634,6 +7941,8 @@ def _link_with_clang(
     *,
     needs_libpython: bool = False,
     needs_native_extension_exports: bool = False,
+    extra_link_inputs: tuple[str, ...] = (),
+    extra_link_args: tuple[str, ...] = (),
 ) -> None:
     """Link one or more ``.ll`` files into a native executable."""
     clang = str(os.environ.get("CC", "") or "").strip() or "clang"
@@ -5661,16 +7970,14 @@ def _link_with_clang(
     # the explicit ``-target`` below.
     # Runtime exceptions are return-code-based now (see py_exc.c);
     # libc++/libc++abi are no longer linked. libm stays for fp math.
-    cmd = [clang, *ll_paths]
+    cmd = [clang, *ll_paths, *extra_link_inputs]
     if target_triple is not None:
         cmd.extend(["-target", target_triple])
     cmd.extend(["-o", out_path, "-lm"])
+    cmd.extend(extra_link_args)
     cmd.extend(_native_extension_export_link_flags(needs_native_extension_exports))
-    if sys.platform == "darwin":
-        # Stable bootstrap compare on Mach-O: clang injects a fresh
-        # LC_UUID by default, which makes pcc2/pcc3 differ even when
-        # the linked inputs are otherwise identical.
-        cmd.append("-Wl,-no_uuid")
+    # Darwin dyld on current macOS rejects executables without LC_UUID.
+    # Bootstrap determinism is handled by compare-time UUID normalization.
     if runtime_archive is not None:
         # Put the archive after the .ll inputs so the linker pulls
         # its symbols in once the user objects have declared them.
@@ -5866,6 +8173,12 @@ def _host_python_command() -> str:
     return "python3"
 
 
+def _pcc_source_root_for_host_subprocess() -> str:
+    if os.path.basename(_PCC_DIR) == "pcc":
+        return os.path.dirname(_PCC_DIR)
+    return _PCC_DIR
+
+
 def _debug_dump_self_backend_ir_texts(ir_texts: list[str]) -> None:
     dump_dir = str(os.environ.get("PCC_DEBUG_SELF_IR_DUMP_DIR", "") or "").strip()
     if not dump_dir:
@@ -5884,6 +8197,9 @@ def _emit_self_asm_via_host_python(
     tmp_dir: str,
     index: int,
 ) -> tuple[str, str]:
+    native_result = _emit_self_asm_in_process(ir_text)
+    if native_result is not None:
+        return native_result
     ir_path = str(os.path.join(tmp_dir, f"self_backend_input_{index}.ll"))
     with open(ir_path, "w", encoding="utf-8") as f:
         f.write(_self_backend_ir_text(ir_text))
@@ -5891,7 +8207,13 @@ def _emit_self_asm_via_host_python(
     try:
         out = str(
             subprocess.check_output(
-                [host_py, "-c", _SELF_BACKEND_HOST_CODE, ir_path],
+                [
+                    host_py,
+                    "-c",
+                    _SELF_BACKEND_HOST_CODE,
+                    _pcc_source_root_for_host_subprocess(),
+                    ir_path,
+                ],
                 text=True,
             )
         )
@@ -5907,6 +8229,500 @@ def _emit_self_asm_via_host_python(
     return target_id, asm_text
 
 
+def _emit_self_asm_in_process(ir_text: str) -> Optional[tuple[str, str]]:
+    """Emit AArch64 Darwin assembly inside pcc1 without a host Python edge."""
+    triple = _parse_self_backend_target_triple_native(ir_text)
+    if triple == "unknown-unknown-unknown":
+        triple = _host_target_triple_for_self_backend()
+    if not _is_aarch64_darwin_triple_native(triple):
+        return None
+    return "self-aarch64-darwin-v0", _emit_aarch64_darwin_asm_native(ir_text, False)
+
+
+def _self_backend_object_cache_enabled() -> bool:
+    value = str(os.environ.get(_SELF_BACKEND_OBJECT_CACHE_ENV, "") or "")
+    if value.strip().lower() in ("0", "false", "no", "off", "disable", "disabled"):
+        return False
+    identity = str(
+        os.environ.get(_SELF_BACKEND_OBJECT_CACHE_IDENTITY_ENV, "") or ""
+    ).strip()
+    return bool(identity)
+
+
+def _self_backend_object_cache_dir() -> str:
+    configured = str(
+        os.environ.get(_SELF_BACKEND_OBJECT_CACHE_DIR_ENV, "") or ""
+    ).strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    return os.path.join(
+        os.path.expanduser("~"), ".cache", "pcc", "self-backend-object-cache"
+    )
+
+
+def _self_backend_object_cache_path_allowed(cache_path: str) -> bool:
+    if not cache_path or not _self_backend_object_cache_enabled():
+        return False
+    cache_root = os.path.abspath(_self_backend_object_cache_dir())
+    candidate = os.path.abspath(cache_path)
+    return candidate.startswith(cache_root + os.sep)
+
+
+def _plan_self_backend_object_cache(
+    worker_items: list[tuple[str, str, str]],
+    target_id: str,
+    cc: str,
+    tmp_dir: str,
+) -> list[tuple[str, str]]:
+    """Return ``(cache_path, status)`` rows aligned with worker_items."""
+    disabled: list[tuple[str, str]] = []
+    for _item in worker_items:
+        disabled.append(("", "off"))
+    if not worker_items or not _self_backend_object_cache_enabled():
+        return disabled
+    identity = str(
+        os.environ.get(_SELF_BACKEND_OBJECT_CACHE_IDENTITY_ENV, "") or ""
+    ).strip()
+    cache_dir = _self_backend_object_cache_dir()
+    manifest_path = str(os.path.join(tmp_dir, "self_backend_cache_inputs.tsv"))
+    plan_path = str(os.path.join(tmp_dir, "self_backend_cache_plan.tsv"))
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            for index, item in enumerate(worker_items):
+                result_path, obj_path, ir_path = item
+                f.write(
+                    _small_int_decimal(index)
+                    + "\t"
+                    + ir_path
+                    + "\t"
+                    + result_path
+                    + "\t"
+                    + obj_path
+                    + "\n"
+                )
+        subprocess.run(
+            [
+                _host_python_command(),
+                "-c",
+                _SELF_BACKEND_OBJECT_CACHE_PLAN_CODE,
+                _SELF_BACKEND_OBJECT_CACHE_VERSION,
+                identity,
+                target_id,
+                cc,
+                cache_dir,
+                manifest_path,
+                plan_path,
+            ],
+            check=True,
+        )
+        with open(plan_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return disabled
+    if len(lines) != len(worker_items):
+        return disabled
+    planned: list[tuple[str, str]] = []
+    for expected_index, line in enumerate(lines):
+        parts = line.split("\t")
+        if len(parts) != 3 or parts[0] != _small_int_decimal(expected_index):
+            return disabled
+        cache_path = parts[1]
+        status = parts[2]
+        if status not in ("hit", "miss"):
+            return disabled
+        if not _self_backend_object_cache_path_allowed(cache_path):
+            return disabled
+        planned.append((cache_path, status))
+    return planned
+
+
+def _publish_self_backend_object_cache(
+    worker_items: list[tuple[str, str, str]],
+    cache_plan: list[tuple[str, str]],
+    tmp_dir: str,
+) -> bool:
+    publish_rows: list[tuple[str, str]] = []
+    for index, item in enumerate(worker_items):
+        _result_path, obj_path, _ir_path = item
+        cache_path, cache_status = cache_plan[index]
+        if cache_status == "miss" and cache_path and os.path.isfile(obj_path):
+            publish_rows.append((cache_path, obj_path))
+    if not publish_rows:
+        return True
+    manifest_path = str(os.path.join(tmp_dir, "self_backend_cache_publish.tsv"))
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            for cache_path, obj_path in publish_rows:
+                f.write(cache_path + "\t" + obj_path + "\n")
+        subprocess.run(
+            [
+                _host_python_command(),
+                "-c",
+                _SELF_BACKEND_OBJECT_CACHE_PUBLISH_CODE,
+                manifest_path,
+            ],
+            check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def run_self_backend_emit_worker(
+    ir_path: str,
+    result_path: str,
+    obj_path: str = "",
+    cc: str = "",
+) -> int:
+    """Emit one self-backend module in a short-lived native stage process."""
+    try:
+        with open(ir_path, "r", encoding="utf-8") as f:
+            # Match the source/host worker path: some closed-world modules do
+            # not carry a target line of their own.  Native pcc1 workers used
+            # to pass those modules straight to the parser, while the host
+            # worker normalized them through ``_self_backend_ir_text``.  That
+            # split made stage2 fail once it reached native object emission.
+            ir_text = _self_backend_ir_text(f.read())
+        native_result = _emit_self_asm_in_process(ir_text)
+        if native_result is None:
+            raise PyPipelineError("native emitter does not support the module target")
+        target_id, asm_text = native_result
+        result_payload = asm_text
+        if obj_path:
+            if not cc:
+                raise PyPipelineError("self backend emit worker requires a compiler")
+            asm_path = result_path + ".s"
+            with open(asm_path, "w", encoding="utf-8") as f:
+                f.write(asm_text)
+            subprocess.run([cc, "-c", asm_path, "-o", obj_path], check=True)
+            result_payload = obj_path
+        with open(result_path, "w", encoding="utf-8") as f:
+            f.write(target_id + "\n")
+            f.write(result_payload)
+        return 0
+    except Exception as exc:
+        sys.stderr.write("self backend emit worker failed: " + str(exc) + "\n")
+        return 1
+
+
+def run_self_backend_split_worker(
+    ir_path: str,
+    result_path: str,
+    output_prefix: str,
+    export_prefix: str,
+    shard_bytes_text: str,
+) -> int:
+    """Split one large IR module in an isolated compiled-stage process."""
+    try:
+        with open(ir_path, "r", encoding="utf-8") as f:
+            ir_text = f.read()
+        shard_bytes = int(shard_bytes_text)
+        if shard_bytes <= 0:
+            raise PyPipelineError("self backend split worker requires shard bytes")
+        shards = _split_self_backend_ir_module_for_object_shards(
+            ir_text,
+            export_prefix=export_prefix,
+            shard_bytes=shard_bytes,
+        )
+        shard_paths: list[str] = []
+        for index, shard_text in enumerate(shards):
+            shard_path = output_prefix + _small_int_decimal(index) + ".ll"
+            with open(shard_path, "w", encoding="utf-8") as f:
+                f.write(shard_text)
+            shard_paths.append(shard_path)
+        with open(result_path, "w", encoding="utf-8") as f:
+            f.write("pcc.self_backend.split.v1\n")
+            for shard_path in shard_paths:
+                f.write(shard_path + "\n")
+        return 0
+    except Exception as exc:
+        sys.stderr.write("self backend split worker failed: " + str(exc) + "\n")
+        return 1
+
+
+def _emit_self_objects_many_in_process(
+    ir_texts: list[str],
+    tmp_dir: str,
+    cc: str,
+    *,
+    split_large_modules: bool,
+    profile: Optional[dict],
+) -> Optional[list[tuple[str, str]]]:
+    """Emit and assemble AArch64 modules without Python/pcc subprocesses."""
+    if not ir_texts:
+        return []
+    first_triple = _parse_self_backend_target_triple_native(ir_texts[0])
+    if first_triple == "unknown-unknown-unknown":
+        first_triple = _host_target_triple_for_self_backend()
+    if not _is_aarch64_darwin_triple_native(first_triple):
+        return None
+    pairs: list[tuple[str, str]] = []
+    native_worker = _python_frontend_worker_executable()
+    inputs = ir_texts
+    if not native_worker and split_large_modules:
+        inputs = _split_self_backend_large_ir_modules(ir_texts)
+    if native_worker:
+        worker_command_prefix = [native_worker]
+    elif _source_self_backend_emit_workers_worthwhile(inputs):
+        worker_command_prefix = _python_frontend_worker_command_prefix()
+    else:
+        worker_command_prefix = []
+    t = _profile_begin(profile)
+    parent_emitted_objects = not worker_command_prefix
+    if worker_command_prefix:
+        split_threshold = _self_backend_split_threshold_bytes()
+        split_shard_bytes = _self_backend_split_shard_bytes()
+        planned_inputs: list[tuple[str, str, int]] = []
+        split_worker_commands: list[str] = []
+        split_module_count = 0
+        for index, ir_text in enumerate(inputs):
+            ir_path = str(os.path.join(tmp_dir, f"self_backend_module_{index}.ll"))
+            with open(ir_path, "w", encoding="utf-8") as f:
+                f.write(ir_text)
+            input_bytes = len(ir_text)
+            if native_worker and split_large_modules and input_bytes >= split_threshold:
+                result_path = str(
+                    os.path.join(tmp_dir, f"self_backend_split_{index}.result")
+                )
+                output_prefix = str(
+                    os.path.join(tmp_dir, f"self_backend_split_{index}_shard_")
+                )
+                export_prefix = "__pco" + _small_int_decimal(index) + "_"
+                command_parts = []
+                for prefix_part in worker_command_prefix:
+                    command_parts.append(_shell_quote_arg(prefix_part))
+                command_parts.extend(
+                    [
+                        _shell_quote_arg(_SELF_BACKEND_SPLIT_WORKER_ARG),
+                        _shell_quote_arg(ir_path),
+                        _shell_quote_arg(result_path),
+                        _shell_quote_arg(output_prefix),
+                        _shell_quote_arg(export_prefix),
+                        _shell_quote_arg(_small_int_decimal(split_shard_bytes)),
+                    ]
+                )
+                split_worker_commands.append(_join_strings(command_parts, " "))
+                planned_inputs.append((result_path, output_prefix, -1))
+                split_module_count += 1
+            else:
+                planned_inputs.append((ir_path, "", input_bytes))
+
+        if split_worker_commands:
+            split_t = _profile_begin(profile)
+            _run_python_frontend_worker_commands(
+                split_worker_commands,
+                max_parallel=min(
+                    2,
+                    _self_backend_jobs(len(split_worker_commands)),
+                    len(split_worker_commands),
+                ),
+            )
+            _profile_end(profile, "link_self_native_split_workers", split_t)
+
+        worker_inputs: list[tuple[str, int]] = []
+        split_shard_count = 0
+        for input_path, output_prefix, input_bytes in planned_inputs:
+            if input_bytes >= 0:
+                worker_inputs.append((input_path, input_bytes))
+                continue
+            with open(input_path, "r", encoding="utf-8") as f:
+                manifest_lines = f.read().splitlines()
+            if not manifest_lines or manifest_lines[0] != "pcc.self_backend.split.v1":
+                raise PyPipelineError(
+                    "self backend split worker produced an invalid manifest"
+                )
+            shard_paths = manifest_lines[1:]
+            if not shard_paths:
+                raise PyPipelineError("self backend split worker produced no shards")
+            for shard_path in shard_paths:
+                if not shard_path.startswith(output_prefix) or not os.path.isfile(
+                    shard_path
+                ):
+                    raise PyPipelineError(
+                        "self backend split worker produced an invalid shard path"
+                    )
+                worker_inputs.append((shard_path, os.path.getsize(shard_path)))
+                split_shard_count += 1
+        _profile_counter(profile, "link_self_native_split_modules", split_module_count)
+        _profile_counter(profile, "link_self_native_split_shards", split_shard_count)
+
+        worker_items: list[tuple[str, str, str]] = []
+        worker_input_bytes: list[int] = []
+        for index, worker_input in enumerate(worker_inputs):
+            ir_path, input_bytes = worker_input
+            obj_path = str(os.path.join(tmp_dir, f"self_backend_native_{index}.o"))
+            result_path = str(
+                os.path.join(tmp_dir, f"self_backend_native_{index}.result")
+            )
+            worker_items.append((result_path, obj_path, ir_path))
+            worker_input_bytes.append(input_bytes)
+
+        cache_plan_t = _profile_begin(profile)
+        cache_plan = _plan_self_backend_object_cache(
+            worker_items,
+            "self-aarch64-darwin-v0",
+            cc,
+            tmp_dir,
+        )
+        _profile_end(profile, "link_self_native_object_cache_plan", cache_plan_t)
+
+        large_worker_commands: list[tuple[int, str]] = []
+        small_worker_commands: list[str] = []
+        for index, worker_item in enumerate(worker_items):
+            result_path, obj_path, ir_path = worker_item
+            input_bytes = worker_input_bytes[index]
+            cache_path, cache_status = cache_plan[index]
+            if cache_status == "hit":
+                continue
+            command_parts = []
+            for prefix_part in worker_command_prefix:
+                command_parts.append(_shell_quote_arg(prefix_part))
+            command_parts.extend(
+                [
+                    _shell_quote_arg(_SELF_BACKEND_EMIT_WORKER_ARG),
+                    _shell_quote_arg(ir_path),
+                    _shell_quote_arg(result_path),
+                    _shell_quote_arg(obj_path),
+                    _shell_quote_arg(cc),
+                ]
+            )
+            command = _join_strings(command_parts, " ")
+            if input_bytes >= 1_000_000:
+                insert_at = 0
+                while (
+                    insert_at < len(large_worker_commands)
+                    and large_worker_commands[insert_at][0] >= input_bytes
+                ):
+                    insert_at += 1
+                large_worker_commands.insert(insert_at, (input_bytes, command))
+            else:
+                small_worker_commands.append(command)
+        configured_jobs = _self_backend_jobs(len(worker_items))
+        if large_worker_commands:
+            huge_commands: list[str] = []
+            medium_commands: list[str] = []
+            for input_bytes, command in large_worker_commands:
+                if input_bytes >= 4_000_000:
+                    huge_commands.append(command)
+                else:
+                    medium_commands.append(command)
+            if huge_commands:
+                _run_python_frontend_worker_commands(
+                    huge_commands,
+                    max_parallel=min(2, configured_jobs, len(huge_commands)),
+                )
+            if medium_commands:
+                _run_python_frontend_worker_commands(
+                    medium_commands,
+                    max_parallel=min(8, configured_jobs, len(medium_commands)),
+                )
+        if small_worker_commands:
+            _run_python_frontend_worker_commands(
+                small_worker_commands,
+                max_parallel=min(12, configured_jobs, len(small_worker_commands)),
+            )
+        native_object_cache_hits = 0
+        native_object_cache_misses = 0
+        native_object_cache_disabled = 0
+        for worker_index, worker_item in enumerate(worker_items):
+            result_path, obj_path, _ir_path = worker_item
+            with open(result_path, "r", encoding="utf-8") as f:
+                worker_result = f.read()
+            worker_result_lines = worker_result.splitlines()
+            target_id = worker_result_lines[0] if worker_result_lines else ""
+            emitted_obj_path = (
+                worker_result_lines[1] if len(worker_result_lines) >= 2 else ""
+            )
+            if (
+                not target_id
+                or emitted_obj_path.strip() != obj_path
+                or not os.path.isfile(obj_path)
+            ):
+                raise PyPipelineError(
+                    "self backend emit worker produced an invalid result"
+                )
+            cache_status = (
+                worker_result_lines[2]
+                if len(worker_result_lines) >= 3
+                else cache_plan[worker_index][1]
+            )
+            if cache_status == "hit":
+                native_object_cache_hits += 1
+            elif cache_status == "miss":
+                native_object_cache_misses += 1
+            else:
+                native_object_cache_disabled += 1
+            pairs.append((target_id, obj_path))
+        cache_publish_t = _profile_begin(profile)
+        cache_publish_ok = _publish_self_backend_object_cache(
+            worker_items,
+            cache_plan,
+            tmp_dir,
+        )
+        _profile_end(profile, "link_self_native_object_cache_publish", cache_publish_t)
+        _profile_counter(
+            profile,
+            "link_self_native_object_cache_hits",
+            native_object_cache_hits,
+        )
+        _profile_counter(
+            profile,
+            "link_self_native_object_cache_misses",
+            native_object_cache_misses,
+        )
+        _profile_counter(
+            profile,
+            "link_self_native_object_cache_disabled",
+            native_object_cache_disabled,
+        )
+        _profile_counter(
+            profile,
+            "link_self_native_object_cache_publish_ok",
+            1 if cache_publish_ok else 0,
+        )
+    else:
+        for object_index, ir_text in enumerate(inputs):
+            asm_path = str(
+                os.path.join(tmp_dir, f"self_backend_native_{object_index}.s")
+            )
+            obj_path = str(
+                os.path.join(tmp_dir, f"self_backend_native_{object_index}.o")
+            )
+            native_result = _emit_self_asm_in_process(ir_text)
+            if native_result is None:
+                return None
+            target_id = native_result[0]
+            asm_text = native_result[1]
+            with open(asm_path, "w", encoding="utf-8") as f:
+                f.write(asm_text)
+            subprocess.run([cc, "-c", asm_path, "-o", obj_path], check=True)
+            pairs.append((target_id, obj_path))
+            # Source-mode stage1 emits hundreds of shards in this process.
+            if object_index % 4 == 3:
+                gc.collect()
+    collect_t = _profile_begin(profile)
+    if parent_emitted_objects:
+        gc.collect()
+    _profile_end(profile, "link_self_emit_objects_collect", collect_t)
+    _profile_counter(
+        profile,
+        "link_self_emit_objects_collect_skipped",
+        0 if parent_emitted_objects else 1,
+    )
+    _profile_end(profile, "link_self_emit_objects_native", t)
+    _profile_counter(profile, "link_self_native_object_count", len(pairs))
+    return pairs
+
+
+def _source_self_backend_emit_workers_worthwhile(ir_texts: list[str]) -> bool:
+    if len(ir_texts) >= 4:
+        return True
+    total_bytes = 0
+    for ir_text in ir_texts:
+        total_bytes += len(ir_text)
+    return total_bytes >= 1_000_000
+
+
 def _emit_self_objects_many_via_host_python(
     ir_texts: list[str],
     tmp_dir: str,
@@ -5915,6 +8731,15 @@ def _emit_self_objects_many_via_host_python(
     split_large_modules: bool = False,
     profile: Optional[dict] = None,
 ) -> list[tuple[str, str]]:
+    native_results = _emit_self_objects_many_in_process(
+        ir_texts,
+        tmp_dir,
+        cc,
+        split_large_modules=split_large_modules,
+        profile=profile,
+    )
+    if native_results is not None:
+        return native_results
     ir_paths = []
     t = _profile_begin(profile)
     for index, ir_text in enumerate(ir_texts):
@@ -5943,6 +8768,7 @@ def _emit_self_objects_many_via_host_python(
                 host_py,
                 "-c",
                 _SELF_BACKEND_HOST_MANY_CODE,
+                _pcc_source_root_for_host_subprocess(),
                 _small_int_decimal(jobs),
                 cc,
                 "1" if split_large_modules else "0",
@@ -6279,6 +9105,8 @@ def _link_with_self_backend(
     *,
     needs_libpython: bool = False,
     needs_native_extension_exports: bool = False,
+    extra_link_inputs: tuple[str, ...] = (),
+    extra_link_args: tuple[str, ...] = (),
     profile: Optional[dict] = None,
 ) -> None:
     """Lower ``.ll`` files through the self backend and link native asm."""
@@ -6305,6 +9133,8 @@ def _link_with_self_backend(
             verbose,
             needs_libpython=needs_libpython,
             needs_native_extension_exports=needs_native_extension_exports,
+            extra_link_inputs=extra_link_inputs,
+            extra_link_args=extra_link_args,
             tmp_dir=tmp,
             profile=profile,
         )
@@ -6364,6 +9194,8 @@ def _link_self_backend_ir_texts_run(
     *,
     needs_libpython: bool,
     needs_native_extension_exports: bool = False,
+    extra_link_inputs: tuple[str, ...] = (),
+    extra_link_args: tuple[str, ...] = (),
     tmp: str,
     profile,
 ) -> None:
@@ -6409,7 +9241,7 @@ def _link_self_backend_ir_texts_run(
                 needs_subsections_via_symbols = True
             obj_paths.append(obj_path)
         tmp_out_path = out_path + ".tmp"
-        cmd = [cc] + obj_paths
+        cmd = [cc] + obj_paths + list(extra_link_inputs)
         if runtime_archive is not None:
             cmd.extend(
                 _runtime_archive_link_args_for_native_extensions(
@@ -6418,11 +9250,10 @@ def _link_self_backend_ir_texts_run(
                 )
             )
         cmd.extend(["-o", tmp_out_path, "-lm"])
+        cmd.extend(extra_link_args)
         cmd.extend(_native_extension_export_link_flags(needs_native_extension_exports))
-        if sys.platform == "darwin":
-            cmd.append("-Wl,-no_uuid")
-            if needs_subsections_via_symbols:
-                cmd.append("-Wl,-dead_strip")
+        if sys.platform == "darwin" and needs_subsections_via_symbols:
+            cmd.append("-Wl,-dead_strip")
         cmd.extend(_platform_link_flags())
         if needs_libpython:
             _append_libpython_link_flags(cmd)
@@ -6466,12 +9297,11 @@ def _link_self_backend_ir_texts_run(
         f.write(asm_text)
     _profile_end(profile, "link_self_asm_join_write", t)
     tmp_out_path = out_path + ".tmp"
-    cmd = [cc, asm_path, "-o", tmp_out_path, "-lm"]
+    cmd = [cc, asm_path, *extra_link_inputs, "-o", tmp_out_path, "-lm"]
+    cmd.extend(extra_link_args)
     cmd.extend(_native_extension_export_link_flags(needs_native_extension_exports))
-    if sys.platform == "darwin":
-        cmd.append("-Wl,-no_uuid")
-        if needs_subsections_via_symbols:
-            cmd.append("-Wl,-dead_strip")
+    if sys.platform == "darwin" and needs_subsections_via_symbols:
+        cmd.append("-Wl,-dead_strip")
     cmd.extend(_platform_link_flags())
     if runtime_archive is not None:
         cmd[2:2] = _runtime_archive_link_args_for_native_extensions(
@@ -6504,6 +9334,8 @@ def _link_with_self_backend_ir_texts(
     *,
     needs_libpython: bool = False,
     needs_native_extension_exports: bool = False,
+    extra_link_inputs: tuple[str, ...] = (),
+    extra_link_args: tuple[str, ...] = (),
     tmp_dir: Optional[str] = None,
     profile: Optional[dict] = None,
 ) -> None:
@@ -6595,7 +9427,7 @@ def _link_with_self_backend_ir_texts(
                     needs_subsections_via_symbols = True
                 obj_paths.append(obj_path)
             tmp_out_path = out_path + ".tmp"
-            cmd = [cc] + obj_paths
+            cmd = [cc] + obj_paths + list(extra_link_inputs)
             if runtime_archive is not None:
                 cmd.extend(
                     _runtime_archive_link_args_for_native_extensions(
@@ -6604,13 +9436,12 @@ def _link_with_self_backend_ir_texts(
                     )
                 )
             cmd.extend(["-o", tmp_out_path, "-lm"])
+            cmd.extend(extra_link_args)
             cmd.extend(
                 _native_extension_export_link_flags(needs_native_extension_exports)
             )
-            if sys.platform == "darwin":
-                cmd.append("-Wl,-no_uuid")
-                if needs_subsections_via_symbols:
-                    cmd.append("-Wl,-dead_strip")
+            if sys.platform == "darwin" and needs_subsections_via_symbols:
+                cmd.append("-Wl,-dead_strip")
             cmd.extend(_platform_link_flags())
             if needs_libpython:
                 _append_libpython_link_flags(cmd)
@@ -6654,12 +9485,11 @@ def _link_with_self_backend_ir_texts(
             f.write(asm_text)
         _profile_end(profile, "link_self_asm_join_write", t)
         tmp_out_path = out_path + ".tmp"
-        cmd = [cc, asm_path, "-o", tmp_out_path, "-lm"]
+        cmd = [cc, asm_path, *extra_link_inputs, "-o", tmp_out_path, "-lm"]
+        cmd.extend(extra_link_args)
         cmd.extend(_native_extension_export_link_flags(needs_native_extension_exports))
-        if sys.platform == "darwin":
-            cmd.append("-Wl,-no_uuid")
-            if needs_subsections_via_symbols:
-                cmd.append("-Wl,-dead_strip")
+        if sys.platform == "darwin" and needs_subsections_via_symbols:
+            cmd.append("-Wl,-dead_strip")
         cmd.extend(_platform_link_flags())
         if runtime_archive is not None:
             cmd[2:2] = _runtime_archive_link_args_for_native_extensions(
@@ -6694,6 +9524,8 @@ def _link_with_self_backend_ir_texts(
                 verbose,
                 needs_libpython=needs_libpython,
                 needs_native_extension_exports=needs_native_extension_exports,
+                extra_link_inputs=extra_link_inputs,
+                extra_link_args=extra_link_args,
                 tmp=tmp,
                 profile=profile,
             )
@@ -6705,6 +9537,8 @@ def _link_with_self_backend_ir_texts(
             verbose,
             needs_libpython=needs_libpython,
             needs_native_extension_exports=needs_native_extension_exports,
+            extra_link_inputs=extra_link_inputs,
+            extra_link_args=extra_link_args,
             tmp=str(tmp_dir),
             profile=profile,
         )
@@ -6719,6 +9553,8 @@ def _link_native(
     backend,
     needs_libpython: bool = False,
     needs_native_extension_exports: bool = False,
+    extra_link_inputs: tuple[str, ...] = (),
+    extra_link_args: tuple[str, ...] = (),
     profile: Optional[dict] = None,
 ) -> None:
     kind = _native_backend_kind(backend)
@@ -6730,6 +9566,8 @@ def _link_native(
             verbose,
             needs_libpython=needs_libpython,
             needs_native_extension_exports=needs_native_extension_exports,
+            extra_link_inputs=extra_link_inputs,
+            extra_link_args=extra_link_args,
         )
         return
     if kind == "self":
@@ -6740,6 +9578,8 @@ def _link_native(
             verbose,
             needs_libpython=needs_libpython,
             needs_native_extension_exports=needs_native_extension_exports,
+            extra_link_inputs=extra_link_inputs,
+            extra_link_args=extra_link_args,
             profile=profile,
         )
         return
@@ -6762,10 +9602,11 @@ def _clang_link_compatible_python_ir(ir_text: str) -> str:
 
 
 def _py_ast_field_names(obj):
-    fields = getattr(obj, "__dataclass_fields__", None)
-    if fields is None:
-        return ()
-    return tuple(fields.keys())
+    # Fixed-layout pcc1 AST instances do not expose ``__dataclass_fields__``.
+    # Reuse codegen's explicit self-host schema instead of silently treating
+    # every statement/expression as a leaf; the latter drops nested module
+    # attribute reads from closed-world function-object publication analysis.
+    return tuple(_self_host_ast_field_names(obj))
 
 
 def _py_ast_field_value(obj, field_name, default=None):
@@ -6832,6 +9673,7 @@ def _module_needs_libpython(
     ast_module,
     native_modules=None,
     ir_scaffold_mode: str = "off",
+    strict_no_libpython: bool = False,
 ) -> bool:
     """Scan the parsed AST for any ``import`` statement; if present the
     link step must pull in libpython because codegen will emit
@@ -6911,7 +9753,8 @@ def _module_needs_libpython(
                             continue
                 if resolved in native_set:
                     continue
-                return True
+                if not strict_no_libpython:
+                    return True
             if isinstance(stmt, _Import):
                 remaining = []
                 for m, as_name in _py_ast_field_value(stmt, "names", ()):
@@ -6935,7 +9778,8 @@ def _module_needs_libpython(
                     remaining.append(m)
                 if not remaining:
                     continue
-                return True
+                if not strict_no_libpython:
+                    return True
             # Only descend into the body / handler / else branches of
             # statements we know carry a list of sub-stmts.
             body = _py_ast_field_value(stmt, "body", None)
@@ -6990,15 +9834,13 @@ def _module_imports_pcc_native_extension(
                     and _resolve_pcc_native_extension_path(resolved) is not None
                 ):
                     return True
-                if stmt_level and (stmt_module is None or stmt_module == ""):
-                    for alias_name, _ in _py_ast_field_value(stmt, "names", ()):
-                        candidate = _join_dotted_parts([resolved, alias_name])
-                        if (
-                            candidate not in native_set
-                            and _resolve_pcc_native_extension_path(candidate)
-                            is not None
-                        ):
-                            return True
+                for alias_name, _ in _py_ast_field_value(stmt, "names", ()):
+                    candidate = _join_dotted_parts([resolved, alias_name])
+                    if (
+                        candidate not in native_set
+                        and _resolve_pcc_native_extension_path(candidate) is not None
+                    ):
+                        return True
             elif isinstance(stmt, _Import):
                 for m, _as_name in _py_ast_field_value(stmt, "names", ()):
                     if (
@@ -7078,20 +9920,8 @@ def _ir_needs_libpython(ir_text: str) -> bool:
             continue
         stripped = line.lstrip()
         if stripped.startswith("call ") or stripped.startswith("tail call "):
-            if os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE"):
-                import sys
-
-                sys.stderr.write("debug: ir_needs_libpython prev2=" + prev2 + "\n")
-                sys.stderr.write("debug: ir_needs_libpython prev=" + prev + "\n")
-                sys.stderr.write("debug: ir_needs_libpython line=" + line + "\n")
             return True
         if " = call " in line or " = tail call " in line:
-            if os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE"):
-                import sys
-
-                sys.stderr.write("debug: ir_needs_libpython prev2=" + prev2 + "\n")
-                sys.stderr.write("debug: ir_needs_libpython prev=" + prev + "\n")
-                sys.stderr.write("debug: ir_needs_libpython line=" + line + "\n")
             return True
         prev2 = prev
         prev = line
@@ -7107,8 +9937,10 @@ def compile_python(
     libpython_mode: Optional[str] = None,
     ir_scaffold_mode: Optional[str] = None,
     backend: Optional[str] = None,
+    gpu_backend: Optional[str] = None,
     recursive_stdlib: bool = False,
     python_library: bool = False,
+    runtime_archive: Optional[str] = None,
     profile: Optional[dict] = None,
 ) -> None:
     """Compile a single ``.py`` file to a native executable.
@@ -7134,6 +9966,9 @@ def compile_python(
         for an embedding entrypoint to call. This is intended for
         pcc-Python runtime archives and must be paired with
         ``emit_llvm_only``.
+    runtime_archive:
+        Optional explicit native runtime archive for isolated builds/tests.
+        When omitted, the configured repository runtime is located or built.
     """
     if python_library and not emit_llvm_only:
         raise PyPipelineError("python_library mode requires emit_llvm_only=True")
@@ -7142,6 +9977,7 @@ def compile_python(
     total_start = _profile_begin(profile)
     libpython_mode = _resolve_libpython_mode(libpython_mode)
     ir_scaffold_mode = _resolve_ir_scaffold_mode(ir_scaffold_mode)
+    gpu_backend_kind = _resolve_gpu_backend_kind(gpu_backend)
 
     try:
         from .type_infer import infer_module as _infer_module
@@ -7157,6 +9993,19 @@ def compile_python(
         raise PyPipelineError(f"input file not found: {src_path}")
 
     module_name = _module_name_from_src(src_path)
+    gpu_source = None
+    gpu_source_has_kernels = False
+    gpu_artifact_dir: Optional[str] = None
+    gpu_metallib_path: Optional[str] = None
+    if gpu_backend_kind == "metal":
+        with open(src_path, "r", encoding="utf-8") as f:
+            gpu_source = f.read()
+        source_contains_gpu_kernel = getattr(
+            _load_pcc_gpu_kernel_module(),
+            "source_contains_gpu_kernel",
+        )
+
+        gpu_source_has_kernels = source_contains_gpu_kernel(gpu_source, src_path)
     should_auto_close = (not emit_llvm_only) or module_name.endswith(".__main__")
     t = _profile_begin(profile)
     auto_srcs, auto_mods = (
@@ -7177,6 +10026,14 @@ def compile_python(
     )
     _profile_end(profile, "filter_ir_scaffold_closure", t)
     t = _profile_begin(profile)
+    auto_seen = {mod_name: src_path for src_path, mod_name in zip(auto_srcs, auto_mods)}
+    _expand_native_extension_module_object_ports(
+        auto_srcs,
+        auto_mods,
+        auto_seen,
+    )
+    _profile_end(profile, "expand_native_extension_module_object_ports", t)
+    t = _profile_begin(profile)
     _validate_package_site_no_libpython_abi(
         auto_srcs,
         libpython_mode=libpython_mode,
@@ -7188,9 +10045,14 @@ def compile_python(
         not effective_recursive_stdlib
         and libpython_mode == "off"
         and not python_library
-        and _source_uses_native_stdlib(src_path)
+        and _sources_use_native_stdlib(auto_srcs)
     ):
         effective_recursive_stdlib = True
+    if gpu_source_has_kernels and effective_recursive_stdlib:
+        raise PyPipelineError(
+            "--gpu-backend=metal currently supports @gpu.kernel only in "
+            "single-file Python compiles"
+        )
     # Issue 11.B.1.2: when recursive_stdlib is on, force the multi-file
     # path so _expand_recursive_stdlib has a chance to pull pure-Python
     # stdlib into the native compile. The multi-file path also
@@ -7209,11 +10071,17 @@ def compile_python(
             ir_scaffold_mode=ir_scaffold_mode,
             backend=backend,
             recursive_stdlib=True,
+            runtime_archive=runtime_archive,
             profile=profile,
         )
         _profile_end(profile, "compile_python_total", total_start)
         return
     if len(auto_srcs) > 1:
+        if gpu_source_has_kernels:
+            raise PyPipelineError(
+                "--gpu-backend=metal currently supports @gpu.kernel only in "
+                "single-file Python compiles"
+            )
         if python_library:
             raise PyPipelineError(
                 "python_library mode only supports a single Python source"
@@ -7235,6 +10103,7 @@ def compile_python(
             ir_scaffold_mode=ir_scaffold_mode,
             backend=backend,
             recursive_stdlib=effective_recursive_stdlib,
+            runtime_archive=runtime_archive,
             profile=profile,
         )
         _profile_end(profile, "compile_python_total", total_start)
@@ -7243,9 +10112,37 @@ def compile_python(
     if verbose:
         _log(verbose, "reading " + src_path)
     t = _profile_begin(profile)
-    with open(src_path, "r", encoding="utf-8") as f:
-        source = f.read()
+    if gpu_source is None:
+        with open(src_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    else:
+        source = gpu_source
     _profile_end(profile, "read_source", t)
+    if gpu_source_has_kernels:
+        t = _profile_begin(profile)
+        prepare_gpu_kernels_for_source = getattr(
+            _load_pcc_gpu_kernel_module(),
+            "prepare_gpu_kernels_for_source",
+        )
+
+        artifact_dir = str(out_path) + ".gpu"
+        gpu_artifact_dir = artifact_dir
+        metallib_path = str(out_path) + ".metallib"
+        gpu_metallib_path = metallib_path
+        try:
+            source, gpu_artifacts = prepare_gpu_kernels_for_source(
+                source,
+                src_path,
+                backend=gpu_backend_kind,
+                artifact_dir=artifact_dir,
+                metallib_path=metallib_path,
+            )
+        except Exception as exc:
+            raise PyPipelineError(
+                "Metal GPU kernel lowering failed: " + str(exc)
+            ) from exc
+        _profile_counter(profile, "gpu_kernels", len(gpu_artifacts))
+        _profile_end(profile, "gpu_kernel_lowering", t)
 
     _log(verbose, "parse")
     # pcc.parse.py_parse + pcc.parse.py_lift is the bootstrap-safe
@@ -7267,6 +10164,7 @@ def compile_python(
     ast_needs_libpython = _module_needs_libpython(
         ast_mod,
         ir_scaffold_mode=ir_scaffold_mode,
+        strict_no_libpython=(libpython_mode == "off"),
     )
     _profile_end(profile, "detect_libpython_need", t)
     t = _profile_begin(profile)
@@ -7288,8 +10186,13 @@ def compile_python(
         (libpython_mode == "on" or (libpython_mode == "auto" and ast_needs_libpython)),
         ir_scaffold_mode,
     )
+    codegen._strict_no_libpython = libpython_mode == "off"
+    codegen._prefer_native_callable_values = libpython_mode == "off"
     if python_library:
         codegen._skip_program_main = True
+        if _is_py_runtime_library_source(src_path):
+            codegen._suppress_implicit_gc_roots = True
+            codegen._suppress_borrowed_return_retain = True
     # Layer1 codegen returns IR text here.  Do not defensively call
     # isinstance(..., str) or str(...) on the result: pcc1/pcc2 self-host can
     # hit a builtin-type class boundary after codegen has already returned.
@@ -7349,11 +10252,53 @@ def compile_python(
         _log(verbose, "native backend: " + str(native_backend))
 
     t = _profile_begin(profile)
-    runtime = _ensure_runtime(
-        verbose,
-        needs_libpython=needs_libpython,
-    )
+    if runtime_archive is not None:
+        runtime = os.path.abspath(str(runtime_archive))
+        if not os.path.isfile(runtime):
+            raise PyPipelineError("explicit runtime archive not found: " + runtime)
+    else:
+        runtime = _ensure_runtime(
+            verbose,
+            needs_libpython=needs_libpython,
+        )
     _profile_end(profile, "ensure_runtime", t)
+    extra_link_inputs: tuple[str, ...] = ()
+    extra_link_args: tuple[str, ...] = ()
+    if gpu_source_has_kernels and gpu_backend_kind == "metal":
+        if gpu_artifact_dir is None:
+            gpu_artifact_dir = str(out_path) + ".gpu"
+        t = _profile_begin(profile)
+        compile_metal_runtime_bridge = getattr(
+            _load_pcc_gpu_metal_module(),
+            "compile_metal_runtime_bridge",
+        )
+
+        try:
+            metal_bridge_obj = compile_metal_runtime_bridge(
+                os.path.join(gpu_artifact_dir, "pcc_metal_runtime.o"),
+            )
+        except Exception as exc:
+            raise PyPipelineError(
+                "Metal GPU host bridge compile failed: " + str(exc)
+            ) from exc
+        extra_link_inputs = (str(metal_bridge_obj),)
+        if gpu_metallib_path is None:
+            gpu_metallib_path = str(out_path) + ".metallib"
+        extra_link_args = (
+            "-Xlinker",
+            "-sectcreate",
+            "-Xlinker",
+            "__PCCMETAL",
+            "-Xlinker",
+            "__metallib",
+            "-Xlinker",
+            str(gpu_metallib_path),
+            "-framework",
+            "Foundation",
+            "-framework",
+            "Metal",
+        )
+        _profile_end(profile, "gpu_metal_bridge_compile", t)
     if native_backend == "self" and _self_backend_skip_ll_temp():
         if verbose:
             _log(
@@ -7368,6 +10313,8 @@ def compile_python(
             verbose,
             needs_libpython=needs_libpython,
             needs_native_extension_exports=ast_needs_native_extension_exports,
+            extra_link_inputs=extra_link_inputs,
+            extra_link_args=extra_link_args,
             profile=profile,
         )
         _profile_end(profile, "link_self_backend_ir_texts", t)
@@ -7395,6 +10342,8 @@ def compile_python(
             backend=native_backend,
             needs_libpython=needs_libpython,
             needs_native_extension_exports=ast_needs_native_extension_exports,
+            extra_link_inputs=extra_link_inputs,
+            extra_link_args=extra_link_args,
             profile=profile,
         )
         _profile_end(profile, "link_native", t)
@@ -7434,6 +10383,19 @@ def _python_frontend_jobs(job_count_hint: int) -> int:
 def _python_frontend_worker_timing_enabled() -> bool:
     raw = str(os.environ.get(_PY_FRONTEND_WORKER_TIMING_ENV, "") or "")
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _python_frontend_worker_env_prefix() -> str:
+    """Keep verbose worker timing separate from aggregate CLI profiling."""
+    prefix = "PCC_PY_FRONTEND_JOBS=1"
+    if _python_frontend_worker_timing_enabled():
+        prefix += " PCC_PY_FRONTEND_WORKER_TIMING=1"
+    return prefix
+
+
+def _python_frontend_ast_wire_enabled() -> bool:
+    raw = str(os.environ.get(_PY_FRONTEND_AST_WIRE_ENV, "") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _is_native_worker_executable(path: str) -> bool:
@@ -7548,10 +10510,24 @@ def _python_frontend_codegen_chunks(src_paths, jobs: int):
     return out
 
 
-def _python_frontend_codegen_chunk_count(src_count: int, jobs: int, worker_prefix) -> int:
+def _python_frontend_codegen_chunk_count(
+    src_count: int, jobs: int, worker_prefix
+) -> int:
     src_count = int(src_count)
     jobs = int(jobs)
-    if src_count <= 1 or jobs <= 1:
+    if src_count <= 1:
+        return 1
+    if worker_prefix:
+        worker_exe = str(worker_prefix[0])
+        worker_base = os.path.basename(worker_exe).lower()
+        if not worker_base.startswith("python") and _is_native_worker_executable(
+            worker_exe
+        ):
+            # A compiled frontend worker must own exactly one module. Reusing
+            # one native process across a chunk retained compiler graphs and
+            # eventually produced zero-byte IR for later modules.
+            return src_count
+    if jobs <= 1:
         return 1
     if jobs > src_count:
         return src_count
@@ -7563,6 +10539,7 @@ def _write_python_frontend_worker_manifest(
     result_path: str,
     ir_dir: str,
     exports_path: str,
+    ast_dir: str,
     src_paths,
     module_names,
     assigned_indices,
@@ -7575,11 +10552,12 @@ def _write_python_frontend_worker_manifest(
     job_kind: str = "codegen",
 ) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        f.write(_PY_FRONTEND_WORKER_MANIFEST_V3 + "\n")
+        f.write(_PY_FRONTEND_WORKER_MANIFEST_V4 + "\n")
         f.write(result_path + "\n")
         f.write(ir_dir + "\n")
         f.write(exports_path + "\n")
         f.write(job_kind + "\n")
+        f.write(ast_dir + "\n")
         f.write(entry_module + "\n")
         f.write(libpython_mode + "\n")
         f.write(ir_scaffold_mode + "\n")
@@ -7590,7 +10568,9 @@ def _write_python_frontend_worker_manifest(
         f.write(str(len(src_paths)) + "\n")
         i = 0
         while i < len(src_paths):
-            f.write(str(i) + "\t" + str(module_names[i]) + "\t" + str(src_paths[i]) + "\n")
+            f.write(
+                str(i) + "\t" + str(module_names[i]) + "\t" + str(src_paths[i]) + "\n"
+            )
             i += 1
         f.write(str(len(assigned_indices)) + "\n")
         for index in assigned_indices:
@@ -7605,6 +10585,7 @@ def _read_python_frontend_worker_manifest(path: str):
         _PY_FRONTEND_WORKER_MANIFEST_V1,
         _PY_FRONTEND_WORKER_MANIFEST_V2,
         _PY_FRONTEND_WORKER_MANIFEST_V3,
+        _PY_FRONTEND_WORKER_MANIFEST_V4,
     ):
         raise PyPipelineError("invalid frontend codegen worker manifest")
     version = lines[0]
@@ -7618,10 +10599,18 @@ def _read_python_frontend_worker_manifest(path: str):
         exports_path = lines[pos]
         pos += 1
     job_kind = "codegen"
+    ast_dir = ""
     if version == _PY_FRONTEND_WORKER_MANIFEST_V3:
         exports_path = lines[pos]
         pos += 1
         job_kind = lines[pos]
+        pos += 1
+    if version == _PY_FRONTEND_WORKER_MANIFEST_V4:
+        exports_path = lines[pos]
+        pos += 1
+        job_kind = lines[pos]
+        pos += 1
+        ast_dir = lines[pos]
         pos += 1
     entry_module = lines[pos]
     pos += 1
@@ -7664,6 +10653,7 @@ def _read_python_frontend_worker_manifest(path: str):
         "result_path": result_path,
         "ir_dir": ir_dir,
         "exports_path": exports_path,
+        "ast_dir": ast_dir,
         "job_kind": job_kind,
         "entry_module": entry_module,
         "libpython_mode": libpython_mode,
@@ -7680,6 +10670,28 @@ def _write_python_frontend_worker_error(result_path: str, message: str) -> None:
     safe = str(message).replace("\t", " ").replace("\n", " ")
     with open(result_path, "w", encoding="utf-8") as f:
         f.write("ERR\t" + safe + "\n")
+
+
+def _read_python_frontend_worker_ir(ir_path: str, module_name: str) -> str:
+    """Read one worker result and reject the silent empty-module failure."""
+    with open(ir_path, "r", encoding="utf-8") as f:
+        ir_text = f.read()
+    if len(ir_text) == 0:
+        raise PyPipelineError(
+            "frontend codegen worker produced empty LLVM IR for module "
+            + module_name
+        )
+    return ir_text
+
+
+def _safe_exception_text(exc) -> str:
+    try:
+        text = str(exc)
+    except Exception:
+        text = ""
+    if text is None:
+        return ""
+    return text
 
 
 def _shell_quote_arg(text: str) -> str:
@@ -7720,6 +10732,7 @@ def _run_python_multi_export_worker(manifest) -> int:
     total_t = time.monotonic() if worker_timing else 0.0
     result_path = str(manifest["result_path"])
     ir_dir = str(manifest["ir_dir"])
+    ast_dir = str(manifest.get("ast_dir", "") or "")
     src_paths = manifest["src_paths"]
     module_names = manifest["module_names"]
     assigned_indices = manifest["assigned_indices"]
@@ -7732,18 +10745,39 @@ def _run_python_multi_export_worker(manifest) -> int:
         subset_srcs,
         subset_names,
         profile=None,
-        lift_indices=[],
+        lift_indices=None,
         merge_exports=False,
     )
+    if ast_dir:
+        for local_i, ast_mod in enumerate(parsed_modules):
+            index = assigned_indices[local_i]
+            ast_path = os.path.join(ast_dir, "module_" + str(index) + ".json")
+            _write_py_ast_wire(ast_path, ast_mod)
     edges = _closed_world_reexport_edges(
         parsed_modules,
         subset_names,
         subset_srcs,
         module_names,
     )
-    exports_path = os.path.join(ir_dir, "exports_" + os.path.basename(result_path) + ".json")
-    edges_path = os.path.join(ir_dir, "reexports_" + os.path.basename(result_path) + ".json")
-    _write_native_exports_wire(exports_path, native_exports, {})
+    function_object_uses = _mark_closed_world_function_object_exports(
+        parsed_modules,
+        subset_names,
+        subset_srcs,
+        native_exports,
+        known_module_names=module_names,
+    )
+    exports_path = os.path.join(
+        ir_dir, "exports_" + os.path.basename(result_path) + ".json"
+    )
+    edges_path = os.path.join(
+        ir_dir, "reexports_" + os.path.basename(result_path) + ".json"
+    )
+    _write_native_exports_wire(
+        exports_path,
+        native_exports,
+        {},
+        function_object_uses=function_object_uses,
+    )
     _write_reexport_edges_wire(edges_path, edges)
     with open(result_path, "w", encoding="utf-8") as f:
         line = "EXPORT\t" + exports_path + "\t" + edges_path
@@ -7775,26 +10809,38 @@ def run_python_multi_codegen_worker(manifest_path: str) -> int:
         assigned_indices = manifest["assigned_indices"]
         ir_dir = str(manifest["ir_dir"])
         exports_path = str(manifest.get("exports_path", "") or "")
+        ast_dir = str(manifest.get("ast_dir", "") or "")
         worker_timing = _python_frontend_worker_timing_enabled()
         if exports_path:
-            native_exports, derived_class_map = _read_native_exports_wire(
-                exports_path
-            )
+            native_exports, derived_class_map = _read_native_exports_wire(exports_path)
             parsed_modules = [None for _src in src_paths]
             parse_ms_by_index = {}
-            from ..parse.py_lift import parse_and_lift as _parse_and_lift
-
-            for index in assigned_indices:
-                src = src_paths[index]
-                mod_name = module_names[index]
-                parse_t = time.monotonic() if worker_timing else 0.0
-                with open(src, "r", encoding="utf-8") as f:
-                    source = f.read()
-                parsed_modules[index] = _parse_and_lift(source, src, mod_name)
-                if worker_timing:
-                    parse_ms_by_index[index] = int(
-                        (time.monotonic() - parse_t) * 1000
+            if ast_dir:
+                for index in assigned_indices:
+                    parse_t = time.monotonic() if worker_timing else 0.0
+                    ast_path = os.path.join(
+                        ast_dir,
+                        "module_" + str(index) + ".json",
                     )
+                    parsed_modules[index] = _read_py_ast_wire(ast_path)
+                    if worker_timing:
+                        parse_ms_by_index[index] = int(
+                            (time.monotonic() - parse_t) * 1000
+                        )
+            else:
+                from ..parse.py_lift import parse_and_lift as _parse_and_lift
+
+                for index in assigned_indices:
+                    src = src_paths[index]
+                    mod_name = module_names[index]
+                    parse_t = time.monotonic() if worker_timing else 0.0
+                    with open(src, "r", encoding="utf-8") as f:
+                        source = f.read()
+                    parsed_modules[index] = _parse_and_lift(source, src, mod_name)
+                    if worker_timing:
+                        parse_ms_by_index[index] = int(
+                            (time.monotonic() - parse_t) * 1000
+                        )
         else:
             parse_ms_by_index = {}
             parsed_modules, native_exports, derived_class_map = (
@@ -7809,6 +10855,14 @@ def run_python_multi_codegen_worker(manifest_path: str) -> int:
         for index in assigned_indices:
             src = src_paths[index]
             mod_name = module_names[index]
+            if worker_timing:
+                sys.stderr.write(
+                    "pcc frontend worker start index="
+                    + str(index)
+                    + " module="
+                    + mod_name
+                    + "\n"
+                )
             ast_mod = parsed_modules[index]
             needs_native_extension_exports = _module_imports_pcc_native_extension(
                 ast_mod,
@@ -7833,9 +10887,23 @@ def run_python_multi_codegen_worker(manifest_path: str) -> int:
                 )
                 if worker_timing:
                     infer_ms = int((time.monotonic() - infer_t) * 1000)
+                    sys.stderr.write(
+                        "pcc frontend worker inferred index="
+                        + str(index)
+                        + " module="
+                        + mod_name
+                        + " infer_ms="
+                        + str(infer_ms)
+                        + "\n"
+                    )
             except Exception as exc:
                 raise PyPipelineError(
-                    "type_infer[" + mod_name + "]: " + str(exc)
+                    "type_infer["
+                    + mod_name
+                    + "]: "
+                    + type(exc).__name__
+                    + ": "
+                    + _safe_exception_text(exc)
                 ) from exc
             try:
                 codegen = _L1CodeGen(
@@ -7843,10 +10911,11 @@ def run_python_multi_codegen_worker(manifest_path: str) -> int:
                     (libpython_mode == "on"),
                     ir_scaffold_mode,
                 )
+                codegen._strict_no_libpython = libpython_mode == "off"
+                codegen._prefer_native_callable_values = libpython_mode == "off"
                 is_entry = mod_name == entry_module
                 codegen._skip_program_main = not is_entry
-                if is_entry:
-                    codegen._sibling_module_inits = sibling_inits
+                codegen._sibling_module_inits = sibling_inits
                 if _module_uses_default_native_exports(mod_name):
                     codegen_exports = _copy_native_module_exports(
                         codegen._native_module_exports
@@ -7857,6 +10926,9 @@ def run_python_multi_codegen_worker(manifest_path: str) -> int:
                     if k != mod_name:
                         codegen_exports[k] = v
                 codegen._native_module_exports = codegen_exports
+                codegen._native_function_object_exports = (
+                    _closed_world_function_object_exports(native_exports, mod_name)
+                )
             except Exception as exc:
                 raise PyPipelineError(
                     "codegen_prepare["
@@ -7864,7 +10936,7 @@ def run_python_multi_codegen_worker(manifest_path: str) -> int:
                     + "]: "
                     + type(exc).__name__
                     + ": "
-                    + str(exc)
+                    + _safe_exception_text(exc)
                 ) from exc
             if verbose:
                 _log(verbose, "worker codegen[" + mod_name + "]")
@@ -7876,7 +10948,12 @@ def run_python_multi_codegen_worker(manifest_path: str) -> int:
                     codegen_ms = int((time.monotonic() - codegen_t) * 1000)
             except Exception as exc:
                 raise PyPipelineError(
-                    "codegen[" + mod_name + "]: " + type(exc).__name__ + ": " + str(exc)
+                    "codegen["
+                    + mod_name
+                    + "]: "
+                    + type(exc).__name__
+                    + ": "
+                    + _safe_exception_text(exc)
                 ) from exc
             ir_path = os.path.join(ir_dir, "module_" + str(index) + ".ll")
             with open(ir_path, "w", encoding="utf-8") as f:
@@ -7904,25 +10981,42 @@ def run_python_multi_codegen_worker(manifest_path: str) -> int:
                     + "\t"
                     + str(codegen_ms)
                 )
+                sys.stderr.write(
+                    "pcc frontend worker done index="
+                    + str(index)
+                    + " module="
+                    + mod_name
+                    + " infer_ms="
+                    + str(infer_ms)
+                    + " codegen_ms="
+                    + str(codegen_ms)
+                    + "\n"
+                )
             result_lines.append(result_line)
         with open(result_path, "w", encoding="utf-8") as f:
             for line in result_lines:
                 f.write(line + "\n")
         return 0
     except Exception as exc:
+        exc_type = type(exc).__name__
+        if exc_type is None:
+            exc_type = "Exception"
+        message = exc_type + ": " + _safe_exception_text(exc)
         if result_path:
             try:
-                _write_python_frontend_worker_error(result_path, str(exc))
+                _write_python_frontend_worker_error(result_path, message)
             except Exception:
                 pass
         try:
-            sys.stderr.write("pcc frontend worker failed: " + str(exc) + "\n")
+            sys.stderr.write("pcc frontend worker failed: " + message + "\n")
         except Exception:
             pass
         return 1
 
 
-def _run_python_frontend_worker_commands(commands, max_parallel: Optional[int] = None) -> None:
+def _run_python_frontend_worker_commands(
+    commands, max_parallel: Optional[int] = None
+) -> None:
     commands = list(commands)
     if not commands:
         return
@@ -7940,17 +11034,17 @@ def _run_python_frontend_worker_commands(commands, max_parallel: Optional[int] =
     shell_lines = ["set -u", "status=0", "batch_pids=''", "batch_count=0"]
     for command in commands:
         shell_lines.append("(" + command + ") &")
-        shell_lines.append("batch_pids=\"$batch_pids $!\"")
+        shell_lines.append('batch_pids="$batch_pids $!"')
         shell_lines.append("batch_count=$((batch_count + 1))")
-        shell_lines.append("if [ \"$batch_count\" -ge " + str(max_parallel) + " ]; then")
+        shell_lines.append('if [ "$batch_count" -ge ' + str(max_parallel) + " ]; then")
         shell_lines.append("  for pid in $batch_pids; do")
-        shell_lines.append("    wait \"$pid\" || status=1")
+        shell_lines.append('    wait "$pid" || status=1')
         shell_lines.append("  done")
         shell_lines.append("  batch_pids=''")
         shell_lines.append("  batch_count=0")
         shell_lines.append("fi")
     shell_lines.append("for pid in $batch_pids; do")
-    shell_lines.append("  wait \"$pid\" || status=1")
+    shell_lines.append('  wait "$pid" || status=1')
     shell_lines.append("done")
     shell_lines.append("exit $status")
     subprocess.run(["/bin/sh", "-c", "\n".join(shell_lines)], check=True)
@@ -7969,6 +11063,7 @@ def _build_python_frontend_shared_exports_parallel(
     ir_scaffold_mode: str,
     verbose: bool,
     max_parallel: int,
+    ast_dir: str = "",
     profile: Optional[dict] = None,
 ) -> str:
     export_dir = os.path.join(tmp, "exports")
@@ -7984,6 +11079,7 @@ def _build_python_frontend_shared_exports_parallel(
             result_path,
             export_dir,
             "",
+            ast_dir,
             src_paths,
             module_names,
             chunk,
@@ -8000,9 +11096,7 @@ def _build_python_frontend_shared_exports_parallel(
             command_parts.append(_shell_quote_arg(part))
         command_parts.append(_shell_quote_arg(_PY_FRONTEND_WORKER_ARG))
         command_parts.append(_shell_quote_arg(manifest_path))
-        env_prefix = "PCC_PY_FRONTEND_JOBS=1"
-        if profile is not None:
-            env_prefix += " PCC_PY_FRONTEND_WORKER_TIMING=1"
+        env_prefix = _python_frontend_worker_env_prefix()
         commands.append(env_prefix + " " + _join_strings(command_parts, " "))
         worker_i += 1
 
@@ -8010,6 +11104,7 @@ def _build_python_frontend_shared_exports_parallel(
 
     native_exports = {}
     reexport_edges = []
+    function_object_uses = []
     export_worker_sum_ms = 0
     export_worker_max_ms = 0
     for result_path in result_paths:
@@ -8024,9 +11119,13 @@ def _build_python_frontend_shared_exports_parallel(
                 raise PyPipelineError(message)
             if parts[0] != "EXPORT" or len(parts) < 3:
                 raise PyPipelineError("invalid frontend export worker result")
-            shard_exports, _derived = _read_native_exports_wire(parts[1])
+            shard_exports, _derived, shard_object_uses = _read_native_exports_wire(
+                parts[1],
+                include_function_object_uses=True,
+            )
             for mod_name, exports in shard_exports.items():
                 native_exports[mod_name] = exports
+            function_object_uses.extend(shard_object_uses)
             for edge in _read_reexport_edges_wire(parts[2]):
                 reexport_edges.append(edge)
             if len(parts) >= 4:
@@ -8039,13 +11138,22 @@ def _build_python_frontend_shared_exports_parallel(
                     export_worker_max_ms = worker_ms
 
     _merge_closed_world_reexport_edges(module_names, native_exports, reexport_edges)
+    _repair_closed_world_default_global_owners(native_exports)
     _merge_l1_mixin_stack_methods(native_exports)
     _merge_l1_codegen_methods(native_exports)
+    _apply_closed_world_function_object_uses(
+        native_exports,
+        function_object_uses,
+    )
     derived_class_map = _closed_world_derived_class_map(native_exports)
     exports_path = os.path.join(tmp, "native_exports.json")
     _write_native_exports_wire(exports_path, native_exports, derived_class_map)
-    _profile_counter(profile, "multi_frontend_export_worker_sum_ms", export_worker_sum_ms)
-    _profile_counter(profile, "multi_frontend_export_worker_max_ms", export_worker_max_ms)
+    _profile_counter(
+        profile, "multi_frontend_export_worker_sum_ms", export_worker_sum_ms
+    )
+    _profile_counter(
+        profile, "multi_frontend_export_worker_max_ms", export_worker_max_ms
+    )
     return exports_path
 
 
@@ -8061,7 +11169,7 @@ def _compile_python_multi_codegen_parallel(
     verbose: bool,
     profile: Optional[dict] = None,
 ) -> Optional[tuple[list[tuple[str, str]], bool, bool, int, list[str]]]:
-    if jobs < 2:
+    if jobs < 1:
         return None
     if not _can_spawn_python_frontend_worker():
         return None
@@ -8074,13 +11182,20 @@ def _compile_python_multi_codegen_parallel(
         worker_prefix,
     )
     chunks = _python_frontend_codegen_chunks(src_paths, chunk_count)
-    if len(chunks) < 2:
+    if not chunks:
         return None
     _profile_counter(profile, "multi_frontend_chunks", len(chunks))
     _profile_counter(profile, "multi_frontend_worker_concurrency", jobs)
     with tempfile.TemporaryDirectory(prefix="pcc_py_frontend_workers_") as tmp:
         ir_dir = os.path.join(tmp, "ir")
         subprocess.run(["mkdir", "-p", ir_dir], check=True)
+        ast_dir = ""
+        if _python_frontend_ast_wire_enabled():
+            ast_dir = os.path.join(tmp, "ast")
+            subprocess.run(["mkdir", "-p", ast_dir], check=True)
+            _profile_counter(profile, "multi_frontend_ast_wire_enabled", 1)
+        else:
+            _profile_counter(profile, "multi_frontend_ast_wire_enabled", 0)
         t = _profile_begin(profile)
         exports_path = _build_python_frontend_shared_exports_parallel(
             tmp,
@@ -8094,6 +11209,7 @@ def _compile_python_multi_codegen_parallel(
             ir_scaffold_mode=ir_scaffold_mode,
             verbose=verbose,
             max_parallel=jobs,
+            ast_dir=ast_dir,
             profile=profile,
         )
         _profile_end(profile, "multi_frontend_export_parallel", t)
@@ -8111,6 +11227,7 @@ def _compile_python_multi_codegen_parallel(
                 result_path,
                 ir_dir,
                 exports_path,
+                ast_dir,
                 src_paths,
                 module_names,
                 chunk,
@@ -8126,9 +11243,7 @@ def _compile_python_multi_codegen_parallel(
                 command_parts.append(_shell_quote_arg(part))
             command_parts.append(_shell_quote_arg(_PY_FRONTEND_WORKER_ARG))
             command_parts.append(_shell_quote_arg(manifest_path))
-            env_prefix = "PCC_PY_FRONTEND_JOBS=1"
-            if profile is not None:
-                env_prefix += " PCC_PY_FRONTEND_WORKER_TIMING=1"
+            env_prefix = _python_frontend_worker_env_prefix()
             commands.append(env_prefix + " " + _join_strings(command_parts, " "))
             worker_i += 1
 
@@ -8175,8 +11290,7 @@ def _compile_python_multi_codegen_parallel(
                 except ValueError:
                     pass
                 ir_path = parts[6]
-                with open(ir_path, "r", encoding="utf-8") as f:
-                    ir_text = f.read()
+                ir_text = _read_python_frontend_worker_ir(ir_path, mod_name)
                 module_ir_by_index[index] = (mod_name, ir_text)
                 if len(parts) >= 10:
                     try:
@@ -8210,18 +11324,38 @@ def _compile_python_multi_codegen_parallel(
         while i < len(module_ir_by_index):
             item = module_ir_by_index[i]
             if item is None:
-                raise PyPipelineError("parallel frontend worker missed module " + str(i))
+                raise PyPipelineError(
+                    "parallel frontend worker missed module " + str(i)
+                )
             module_ir_texts.append(item)
             i += 1
-        _profile_counter(profile, "multi_frontend_worker_parse_sum_ms", worker_parse_sum_ms)
-        _profile_counter(profile, "multi_frontend_worker_parse_max_ms", worker_parse_max_ms)
-        _profile_counter(profile, "multi_frontend_worker_parse_max_index", worker_parse_max_index)
-        _profile_counter(profile, "multi_frontend_worker_infer_sum_ms", worker_infer_sum_ms)
-        _profile_counter(profile, "multi_frontend_worker_infer_max_ms", worker_infer_max_ms)
-        _profile_counter(profile, "multi_frontend_worker_infer_max_index", worker_infer_max_index)
-        _profile_counter(profile, "multi_frontend_worker_codegen_sum_ms", worker_codegen_sum_ms)
-        _profile_counter(profile, "multi_frontend_worker_codegen_max_ms", worker_codegen_max_ms)
-        _profile_counter(profile, "multi_frontend_worker_codegen_max_index", worker_codegen_max_index)
+        _profile_counter(
+            profile, "multi_frontend_worker_parse_sum_ms", worker_parse_sum_ms
+        )
+        _profile_counter(
+            profile, "multi_frontend_worker_parse_max_ms", worker_parse_max_ms
+        )
+        _profile_counter(
+            profile, "multi_frontend_worker_parse_max_index", worker_parse_max_index
+        )
+        _profile_counter(
+            profile, "multi_frontend_worker_infer_sum_ms", worker_infer_sum_ms
+        )
+        _profile_counter(
+            profile, "multi_frontend_worker_infer_max_ms", worker_infer_max_ms
+        )
+        _profile_counter(
+            profile, "multi_frontend_worker_infer_max_index", worker_infer_max_index
+        )
+        _profile_counter(
+            profile, "multi_frontend_worker_codegen_sum_ms", worker_codegen_sum_ms
+        )
+        _profile_counter(
+            profile, "multi_frontend_worker_codegen_max_ms", worker_codegen_max_ms
+        )
+        _profile_counter(
+            profile, "multi_frontend_worker_codegen_max_index", worker_codegen_max_index
+        )
         _profile_end(profile, "multi_frontend_codegen_result_read", t)
         return (
             module_ir_texts,
@@ -8244,6 +11378,7 @@ def compile_python_multi(
     ir_scaffold_mode: Optional[str] = None,
     backend: Optional[str] = None,
     recursive_stdlib: bool = False,
+    runtime_archive: Optional[str] = None,
     profile: Optional[dict] = None,
 ) -> None:
     if verbose:
@@ -8273,6 +11408,9 @@ def compile_python_multi(
     entry_module:
         Dotted module name whose top-level ``main()`` is the
         executable entry. Defaults to the first file's module.
+    runtime_archive:
+        Optional explicit native runtime archive. This is propagated from
+        single-file compilation when package closure selects this path.
 
     The multi-compile API **does not** yet rewrite cross-module
     imports to extern references — step 2 of the spike plan
@@ -8332,9 +11470,10 @@ def compile_python_multi(
     native_backend = None
     if not emit_llvm_only:
         native_backend = _resolve_native_backend(backend)
-    reuse_export_ast = native_backend == "self" or (
+    emit_only_self_backend = (
         emit_llvm_only and _normalize_native_backend_name(backend) == "self"
     )
+    reuse_export_ast = native_backend == "self" or emit_only_self_backend
 
     # Decide which module is the entry (emits ``@main``). Default:
     # first source file in the list.
@@ -8356,7 +11495,7 @@ def compile_python_multi(
     parallel_codegen_result = None
     frontend_jobs = _python_frontend_jobs(len(src_paths))
     _profile_counter(profile, "multi_frontend_jobs", frontend_jobs)
-    if native_backend == "self" and frontend_jobs > 1:
+    if native_backend == "self" or emit_only_self_backend:
         t = _profile_begin(profile)
         parallel_codegen_result = _compile_python_multi_codegen_parallel(
             src_paths,
@@ -8438,6 +11577,8 @@ def compile_python_multi(
                     (libpython_mode == "on"),
                     ir_scaffold_mode,
                 )
+                codegen._strict_no_libpython = libpython_mode == "off"
+                codegen._prefer_native_callable_values = libpython_mode == "off"
             except Exception as exc:
                 raise PyPipelineError(
                     "codegen_init["
@@ -8452,9 +11593,8 @@ def compile_python_multi(
                 is_entry = mod_name == entry_module
                 prep_step = "skip_program_main"
                 codegen._skip_program_main = not is_entry
-                if is_entry:
-                    prep_step = "sibling_module_inits"
-                    codegen._sibling_module_inits = sibling_inits
+                prep_step = "sibling_module_inits"
+                codegen._sibling_module_inits = sibling_inits
                 # Preserve the baseline native export registry and add cross-module
                 # exports from other files, excluding this module to avoid
                 # sibling self-reference during multi-file inference/linking.
@@ -8471,6 +11611,9 @@ def compile_python_multi(
                         codegen_exports[k] = v
                 prep_step = "store_exports"
                 codegen._native_module_exports = codegen_exports
+                codegen._native_function_object_exports = (
+                    _closed_world_function_object_exports(native_exports, mod_name)
+                )
             except Exception as exc:
                 raise PyPipelineError(
                     "codegen_prepare["
@@ -8489,34 +11632,8 @@ def compile_python_multi(
                 ir_text = codegen.generate(typed_mod)
                 ir_text = str(ir_text)
             except Exception as exc:
-                try:
-                    debug = str(
-                        os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE", "") or ""
-                    ).strip().lower() in ("1", "true", "yes", "on")
-                except Exception:
-                    debug = False
-                if debug:
-                    try:
-                        import sys
-
-                        sys.stderr.write(
-                            "debug: codegen_failed mod="
-                            + mod_name
-                            + " type="
-                            + type(exc).__name__
-                            + " message="
-                            + str(exc)
-                            + "\n"
-                        )
-                    except Exception:
-                        pass
                 raise PyPipelineError(
-                    "codegen["
-                    + mod_name
-                    + "]: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
+                    "codegen[" + mod_name + "]: " + type(exc).__name__ + ": " + str(exc)
                 ) from exc
             _profile_end(profile, "multi_codegen_layer1", t, mod_name)
             if libpython_mode == "off" and _ir_needs_libpython(ir_text):
@@ -8605,10 +11722,15 @@ def compile_python_multi(
         _log(verbose, "native backend: " + str(native_backend))
 
     t = _profile_begin(profile)
-    runtime = _ensure_runtime(
-        verbose,
-        needs_libpython=any_needs_libpython,
-    )
+    if runtime_archive is not None:
+        runtime = os.path.abspath(str(runtime_archive))
+        if not os.path.isfile(runtime):
+            raise PyPipelineError("explicit runtime archive not found: " + runtime)
+    else:
+        runtime = _ensure_runtime(
+            verbose,
+            needs_libpython=any_needs_libpython,
+        )
     _profile_end(profile, "ensure_runtime", t)
     if native_backend == "self" and _self_backend_skip_ll_temp():
         total_bytes = 0

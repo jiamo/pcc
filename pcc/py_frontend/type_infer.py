@@ -89,6 +89,7 @@ from .py_ast import (
     Name,
     NoneLit,
     NoneType,
+    SetType,
     Nonlocal,
     Pass,
     Raise,
@@ -104,6 +105,7 @@ from .py_ast import (
     Try,
     Type,
     UnaryOp,
+    ValueArrayType,
     While,
     With,
 )
@@ -125,6 +127,8 @@ TYPE_BYTES: BytesType = BytesType(name="bytes")
 TYPE_BYTEARRAY: ByteArrayType = ByteArrayType(name="bytearray")
 TYPE_MEMORYVIEW: MemoryViewType = MemoryViewType(name="memoryview")
 TYPE_DYN: DynType = DynType(name="dyn")
+TYPE_SET: SetType = SetType(name="set", elem=TYPE_DYN)
+TYPE_FROZENSET: SetType = SetType(name="frozenset", elem=TYPE_DYN)
 
 _CLASS_LOWERING_HOST_METHODS = (
     "_find_method_def",
@@ -155,6 +159,30 @@ def _make_dict_type(key: Type, value: Type) -> DictType:
 
 def _make_tuple_type(name: str, elems: tuple[Type, ...]) -> TupleType:
     return TupleType(name=name, elems=elems)
+
+
+def _canonical_dyn_type(ty: object) -> Optional[Type]:
+    """Canonicalize a DynType across compiled-module class boundaries.
+
+    A self-hosted compiler can receive an AST/type object whose ``DynType``
+    class was materialized by another compiled module.  Python-level
+    ``isinstance(ty, DynType)`` is then not a reliable discriminator even
+    though the wire variant and fields are valid.  Normalize that boundary
+    once, rather than teaching individual inference rules to inspect
+    ``DynType.name`` or keep syntax side tables.
+
+    Older parser snapshots also encode ``set``/``frozenset`` annotations as
+    ``DynType(name=...)``.  Promote those legacy encodings to the first-class
+    ``SetType`` projection here.
+    """
+    if not isinstance(ty, DynType) and ty.__class__.__name__ != "DynType":
+        return None
+    name = getattr(ty, "name", "dyn") or "dyn"
+    if name == "set":
+        return TYPE_SET
+    if name == "frozenset":
+        return TYPE_FROZENSET
+    return DynType(name=name)
 
 
 def _annotation_or_none(node):
@@ -278,25 +306,24 @@ _BUILTIN_TYPES: dict[str, Type] = {
     "type": FuncType(
         name="callable",
         params=(TYPE_DYN,),
-        ret=ClassType(
-            "type", "", (("__name__", TYPE_STR),), ()
-        ),
+        ret=ClassType("type", "", (("__name__", TYPE_STR),), ()),
     ),
     "set": FuncType(
         name="callable",
         params=(TYPE_DYN,),
-        ret=DynType(name="set"),
+        ret=TYPE_SET,
     ),
     "frozenset": FuncType(
         name="callable",
         params=(TYPE_DYN,),
-        ret=DynType(name="set"),
+        ret=TYPE_FROZENSET,
     ),
     "chr": FuncType(name="callable", params=(TYPE_INT,), ret=TYPE_STR),
     "abs": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
     "min": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
     "max": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
     "sum": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
+    "slice": FuncType(name="callable", params=(TYPE_DYN,), ret=DynType(name="slice")),
     "__await__": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
 }
 
@@ -415,6 +442,8 @@ class _InferCtx:
     derived_class_map: dict
     contextual_host_params: dict
     dataclasses_replace_aliases: set[str]
+    functools_module_aliases: set[str]
+    weakref_value_aliases: set[str]
     class_types: dict[str, ClassType]
     _l1_codegen_host_type: Optional[ClassType]
 
@@ -451,11 +480,45 @@ class _InferCtx:
         # pipeline and shared across every module's _InferCtx.
         self.derived_class_map = derived_class_map or {}
         self.contextual_host_params = contextual_host_params or {}
+        # Module-level type aliases (``Instruction = dict[Engine, list]``,
+        # ``Engine = Literal[...]``). An annotation naming one of these
+        # must resolve to the aliased type, not to a phantom
+        # ``ClassType`` — codegen would otherwise emit instance-field
+        # access on plain dict/list values. Seeded by
+        # ``_prepopulate_module_scope``.
+        self.type_aliases: dict[str, Type] = {}
+        self._alias_resolving: set[str] = set()
         # ``from dataclasses import replace as ...`` is common across
         # the frontend passes. Track the local aliases explicitly so
         # call-result inference can preserve the first argument's type
         # instead of collapsing the whole expression to DynType.
         self.dataclasses_replace_aliases: set[str] = set()
+        # Syntax-level module aliases stay reliable in a self-hosted
+        # inference pass even when a recursive provider export temporarily
+        # gives ``functools.partial`` a ClassType.  The lowered value is a
+        # runtime PyFuncObject, not an instance of the provider's scaffold
+        # ``class partial``.
+        self.functools_module_aliases: set[str] = set()
+        # ``pcc.extern`` is a compile-time declaration surface.  Track the
+        # imported factory and C type-marker aliases so an ``extern(...)``
+        # binding can carry the ABI-compatible return type into ordinary
+        # call inference.  Codegen already keeps the equivalent alias map in
+        # ``_extern_bindings``; without this frontend mirror a libm call emits
+        # ``double`` IR while the typed AST still claims it is a class object.
+        self.extern_factory_aliases: set[str] = set()
+        self.extern_ctype_aliases: dict[str, str] = {}
+        # ``from weakref import ref/proxy as ...`` names are identity
+        # observers just like ``weakref.ref``/``weakref.proxy``. Track
+        # only imports resolved to the real weakref module so ordinary
+        # user functions named ``ref`` are not treated specially.
+        self.weakref_value_aliases: set[str] = set()
+        # Locals of the function currently being inferred that receive a
+        # 1-arg ``d.setdefault(k)`` call somewhere in its body. CPython
+        # inserts ``None`` for a missing key, so an *inferred* scalar-valued
+        # dict binding for such a name must widen its value type to ``dyn``
+        # (annotated bindings are the user's contract and stay untouched).
+        # Set/restored per-FuncDef in ``_infer_funcdef``.
+        self.setdefault_none_widen_names: set = set()
         self.class_types: dict[str, ClassType] = {}
         self._l1_codegen_host_type: Optional[ClassType] = None
 
@@ -488,12 +551,19 @@ class _InferCtx:
             (),
             (),
         )
+        ir_builder_ty = _make_class_type(
+            "IRBuilder",
+            "pcc.llvm_capi.ir",
+            (),
+            (),
+        )
         method_returns = {
             "_fresh": TYPE_STR,
             "_ir_scaffold_enabled": TYPE_BOOL,
             "_class_is_subclass": TYPE_BOOL,
         }
         attr_types = {
+            "builder": ir_builder_ty,
             "class_lowering": class_lowering_ty,
         }
         fields: list[tuple[str, Type]] = []
@@ -527,6 +597,9 @@ class _InferCtx:
         """
         if ann is None:
             return TYPE_DYN
+        canonical_dyn = _canonical_dyn_type(ann)
+        if canonical_dyn is not None:
+            return canonical_dyn
         if isinstance(ann, Type):
             # During bootstrap, parser variants can sometimes emit the raw
             # ``Type`` base object for annotations that should normally be
@@ -545,9 +618,11 @@ class _InferCtx:
             # dynamic rather than a hard annotation failure.
             if isinstance(resolved, Type) and not resolved.name:
                 return TYPE_DYN
-            return resolved
+            return _validate_value_array_type(resolved, None)
         if isinstance(ann, Expr):
-            return self.resolve_type_refs(parse_annotation(ann))
+            return _validate_value_array_type(
+                self.resolve_type_refs(parse_annotation(ann)), ann.span
+            )
         # Unknown annotation payload — be defensive, don't crash.
         return TYPE_DYN
 
@@ -583,6 +658,14 @@ class _InferCtx:
             found = self.class_types.get(ty.name)
             if found is not None:
                 return found
+            if not ty_module and not ty_fields and not ty_bases:
+                alias = self.type_aliases.get(ty.name)
+                if alias is not None and ty.name not in self._alias_resolving:
+                    self._alias_resolving.add(ty.name)
+                    try:
+                        return self.resolve_type_refs(alias)
+                    finally:
+                        self._alias_resolving.discard(ty.name)
             fields = tuple(
                 (name, self.resolve_type_refs(field_ty)) for name, field_ty in ty_fields
             )
@@ -595,6 +678,11 @@ class _InferCtx:
             if elem == ty.elem:
                 return ty
             return _make_list_type(elem)
+        if isinstance(ty, ValueArrayType):
+            elem = self.resolve_type_refs(ty.elem)
+            if elem == ty.elem:
+                return ty
+            return ValueArrayType(name=ty.name, elem=elem, length=ty.length)
         if isinstance(ty, DictType):
             key = self.resolve_type_refs(ty.key)
             value = self.resolve_type_refs(ty.value)
@@ -657,6 +745,46 @@ def _ctx_module_name(ctx: _InferCtx) -> str:
         return ctx.module.name or ""
     except AttributeError:
         return ""
+
+
+def _flatten_bool_expr(expr: BoolExpr) -> tuple[Expr, ...]:
+    op = expr.op
+    values: list[Expr] = []
+    stack: list[Expr] = [expr]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, BoolExpr) and cur.op == op:
+            stack.append(cur.right)
+            stack.append(cur.left)
+        else:
+            values.append(cur)
+    return tuple(values)
+
+
+def _bool_result_type(left_ty: Type, right_ty: Type) -> Type:
+    result_ty = common_type(left_ty, right_ty)
+    if isinstance(left_ty, BoolType) and isinstance(right_ty, BoolType):
+        return TYPE_BOOL
+    return result_ty
+
+
+def _build_balanced_typed_bool_expr(
+    span: SourceSpan,
+    op: str,
+    values: tuple[Expr, ...],
+) -> Expr:
+    if len(values) == 1:
+        return values[0]
+    mid = len(values) // 2
+    left = _build_balanced_typed_bool_expr(span, op, values[:mid])
+    right = _build_balanced_typed_bool_expr(span, op, values[mid:])
+    return BoolExpr(
+        span,
+        _bool_result_type(left.ty, right.ty),
+        op,
+        left,
+        right,
+    )
 
 
 def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
@@ -737,27 +865,73 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
             )
         return replace(expr, lhs=lhs, rhs=rhs, ty=TYPE_BOOL)
     if isinstance(expr, BoolExpr):
-        left = _infer_expr(ctx, scope, expr.left)
-        right = _infer_expr(ctx, scope, expr.right)
-        # Python's ``a or b`` / ``a and b`` return one of the operand
-        # values (not a coerced bool), so the expression's type is the
-        # common type of the two branches. ``common_type`` keeps the
-        # BoolType fall-through for numeric operands while widening to
-        # Str/List/Dict/... for object operands — which is what
-        # ``self.name or "<anon>"`` idioms need.
-        result_ty = common_type(left.ty, right.ty)
-        # When both arms are numeric/bool the old invariant still holds
-        # (operand values do compare as booleans), so short-circuit to
-        # BoolType for back-compat with existing codegen expectations.
-        if isinstance(left.ty, BoolType) and isinstance(right.ty, BoolType):
-            result_ty = TYPE_BOOL
-        return replace(expr, left=left, right=right, ty=result_ty)
+        raw_values = _flatten_bool_expr(expr)
+        typed_values = tuple(_infer_expr(ctx, scope, v) for v in raw_values)
+        return _build_balanced_typed_bool_expr(expr.span, expr.op, typed_values)
 
     # Calls --------------------------------------------------------------
     if isinstance(expr, Call):
         callee = _infer_expr(ctx, scope, expr.func)
         new_args = tuple(_infer_expr(ctx, scope, a) for a in expr.args)
         new_kwargs = tuple((k, _infer_expr(ctx, scope, v)) for (k, v) in expr.kwargs)
+        value_array_ty = _value_array_type_from_surface(ctx, expr.func)
+        if value_array_ty is not None:
+            if new_kwargs:
+                _raise_frontend_error(
+                    expr.span,
+                    "pcc.array construction does not accept keyword arguments",
+                    "pass exactly the declared number of positional valueclass elements",
+                )
+            if len(new_args) != value_array_ty.length:
+                _raise_frontend_error(
+                    expr.span,
+                    f"pcc.array expects exactly {value_array_ty.length} elements",
+                    "make the constructor argument count match the declared length",
+                )
+            for index, arg in enumerate(new_args):
+                arg_ty = ctx.resolve_type_refs(arg.ty)
+                if not type_eq(arg_ty, value_array_ty.elem):
+                    _raise_frontend_error(
+                        arg.span,
+                        f"pcc.array element {index + 1} has type {arg_ty.name}, "
+                        f"expected {value_array_ty.elem.name}",
+                        "all elements must use the exact declared valueclass type",
+                    )
+            return replace(
+                expr,
+                func=callee,
+                args=new_args,
+                kwargs=new_kwargs,
+                ty=value_array_ty,
+            )
+        # Valhalla projection rule: value projections are identity-free,
+        # and weak references are an identity-lifetime observation (the
+        # CPython analogue: ``weakref.ref(3)`` raises TypeError). A box
+        # created at the call boundary would have an unpredictable
+        # lifetime, so reject statically-known valueclass arguments at
+        # compile time like the ``is`` diagnostic above.
+        if (
+            new_args
+            and _is_valueclass_type(new_args[0].ty)
+            and (
+                (
+                    isinstance(callee, Attr)
+                    and callee.name in ("ref", "proxy")
+                    and isinstance(callee.obj, Name)
+                    and _name_ident(callee.obj) == "weakref"
+                )
+                or (
+                    isinstance(callee, Name)
+                    and (_name_ident(callee) or "") in ctx.weakref_value_aliases
+                )
+            )
+        ):
+            _raise_frontend_error(
+                expr.span,
+                "cannot create a weak reference to a valueclass payload",
+                "valueclass payloads are identity-free; use an ordinary "
+                "class when weak referencing is required",
+            )
         # Comprehension sentinels: synthesise a concrete container type
         # so downstream ``for`` loops / subscripts see a real ListType /
         # DictType / SetType instead of plain DynType.
@@ -785,15 +959,14 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                     ty=ListType(name="list", elem=elt_ty),
                 )
             if sentinel in ("_set_comp", "__setcomp__"):
-                # py_ast has no first-class SetType yet. Preserve the
-                # container kind with DynType(name="set") so codegen does
-                # not route set operators through integer bitwise lowering.
+                elt = new_args[0] if new_args else None
+                elt_ty = ctx.resolve_type_refs(elt.ty) if elt is not None else TYPE_DYN
                 return replace(
                     expr,
                     func=callee,
                     args=new_args,
                     kwargs=new_kwargs,
-                    ty=DynType(name="set"),
+                    ty=SetType(name="set", elem=elt_ty),
                 )
             if sentinel in ("_dict_comp", "__dictcomp__"):
                 # Native: first arg is TupleExpr(k, v). CPython-AST:
@@ -830,6 +1003,55 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                     "call target missing identifier",
                     "upgrade the parser/frontend AST to use Name-style identifiers",
                 )
+            builtin_unshadowed = scope.lookup(bname) is None
+            if builtin_unshadowed and new_args and _is_valueclass_type(new_args[0].ty):
+                if bname == "vars":
+                    _raise_frontend_error(
+                        expr.span,
+                        "vars() is not supported for valueclass payloads in strict mode",
+                        "valueclass payloads have no instance dictionary; explicitly "
+                        "box into an ordinary identity object if a dictionary is required",
+                    )
+                if bname == "setattr" or bname == "delattr":
+                    _raise_frontend_error(
+                        expr.span,
+                        "attribute mutation is not supported for valueclass payloads in strict mode",
+                        "valueclass payloads are immutable; construct a new value or use "
+                        "an ordinary identity class",
+                    )
+                if (
+                    (bname == "getattr" or bname == "hasattr")
+                    and len(new_args) >= 2
+                    and isinstance(new_args[1], StrLit)
+                ):
+                    identity_attr = new_args[1].value
+                    if identity_attr == "__dict__":
+                        _raise_frontend_error(
+                            expr.span,
+                            "valueclass payload has no instance dictionary",
+                            "remove the __dict__ access or explicitly box into an "
+                            "ordinary identity object",
+                        )
+                    if identity_attr == "__weakref__":
+                        _raise_frontend_error(
+                            expr.span,
+                            "valueclass payload has no weak reference slot",
+                            "use an ordinary identity class when weak referencing is required",
+                        )
+            extern_ty = _extern_factory_call_type(
+                ctx,
+                callee,
+                new_args,
+                new_kwargs,
+            )
+            if extern_ty is not None:
+                return replace(
+                    expr,
+                    func=callee,
+                    args=new_args,
+                    kwargs=new_kwargs,
+                    ty=extern_ty,
+                )
             if bname in ctx.dataclasses_replace_aliases and len(new_args) == 1:
                 return replace(
                     expr,
@@ -837,6 +1059,14 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                     args=new_args,
                     kwargs=new_kwargs,
                     ty=new_args[0].ty,
+                )
+            if bname == "copy" and len(new_args) == 1 and not new_kwargs:
+                return replace(
+                    expr,
+                    func=callee,
+                    args=new_args,
+                    kwargs=new_kwargs,
+                    ty=ctx.resolve_type_refs(new_args[0].ty),
                 )
             if bname == "sum":
                 return replace(
@@ -979,7 +1209,9 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                 if not new_args:
                     ty = TupleType(name="tuple", elems=())
                 else:
-                    ty = _tuple_from_iterable_type(ctx.resolve_type_refs(new_args[0].ty))
+                    ty = _tuple_from_iterable_type(
+                        ctx.resolve_type_refs(new_args[0].ty)
+                    )
                 return replace(
                     expr,
                     func=callee,
@@ -1051,7 +1283,12 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                     ty=TYPE_STR,
                 )
             if bname in ("hash", "id"):
-                if bname == "id" and new_args and _is_valueclass_type(new_args[0].ty):
+                if (
+                    bname == "id"
+                    and builtin_unshadowed
+                    and new_args
+                    and _is_valueclass_type(new_args[0].ty)
+                ):
                     _raise_frontend_error(
                         expr.span,
                         "id() is not supported for valueclass payloads in strict mode",
@@ -1096,6 +1333,17 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
             recv_ty = ctx.resolve_type_refs(callee.obj.ty)
             method = callee.name
             inferred = _container_method_return_type(recv_ty, method)
+            if (
+                inferred is not None
+                and isinstance(recv_ty, DictType)
+                and method in ("get", "setdefault")
+                and len(new_args) == 1
+                and not new_kwargs
+                and _typeconf_storage_class(inferred) != "object"
+            ):
+                # 1-arg get/setdefault returns None for a missing key; a
+                # native-scalar static result type cannot represent that.
+                inferred = TYPE_DYN
             if inferred is not None:
                 return replace(
                     expr,
@@ -1103,6 +1351,24 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                     args=new_args,
                     kwargs=new_kwargs,
                     ty=inferred,
+                )
+            # ``functools.partial`` is represented by the native runtime as a
+            # PyFuncObject, even when recursive multi-file inference can see
+            # the pcc-Python provider's ``class partial`` export.  Keeping the
+            # provider ClassType here makes a later ``bound(...)`` emit a
+            # direct call to ``partial.__call__`` with that PyFuncObject as
+            # ``self``.  Preserve the callable's dynamic runtime projection.
+            if (
+                method == "partial"
+                and isinstance(callee.obj, Name)
+                and _name_ident(callee.obj) in ctx.functools_module_aliases
+            ):
+                return replace(
+                    expr,
+                    func=callee,
+                    args=new_args,
+                    kwargs=new_kwargs,
+                    ty=TYPE_DYN,
                 )
         ret_ty = _call_result_type(ctx, callee)
         return replace(
@@ -1117,6 +1383,20 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
     if isinstance(expr, Attr):
         obj = _infer_expr(ctx, scope, expr.obj)
         obj_ty = ctx.resolve_type_refs(obj.ty)
+        if _is_valueclass_type(obj_ty):
+            if expr.name == "__dict__":
+                _raise_frontend_error(
+                    expr.span,
+                    "valueclass payload has no instance dictionary",
+                    "remove the __dict__ access or explicitly box into an "
+                    "ordinary identity object",
+                )
+            if expr.name == "__weakref__":
+                _raise_frontend_error(
+                    expr.span,
+                    "valueclass payload has no weak reference slot",
+                    "use an ordinary identity class when weak referencing is required",
+                )
         # Module-aliased class reference: ``alias.ClassName`` where the
         # ``import alias`` statement registered the module's exports.
         # Returning the ClassType here lets the call-result inference
@@ -1173,6 +1453,8 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                 ty = TYPE_DYN
             return replace(expr, obj=obj, idx=idx, ty=ty)
         if isinstance(obj_ty, ListType):
+            ty = ctx.resolve_type_refs(obj_ty.elem)
+        elif isinstance(obj_ty, ValueArrayType):
             ty = ctx.resolve_type_refs(obj_ty.elem)
         elif isinstance(obj_ty, TupleType) and obj_ty.elems:
             # Phase 1: if all element types agree, use that; else dyn.
@@ -1279,6 +1561,11 @@ def _binop_result(op: str, a: Type, b: Type, span: SourceSpan) -> Type:
             return TYPE_STR
         if isinstance(b, StrType) and isinstance(a, (IntType, BoolType)):
             return TYPE_STR
+    if op == "+" and (
+        (isinstance(a, StrType) and is_numeric(b))
+        or (isinstance(b, StrType) and is_numeric(a))
+    ):
+        return TYPE_DYN
 
     # Reject obvious mismatches early with a friendly error.
     if op in ("+", "-", "*", "/", "//", "%", "**"):
@@ -1304,13 +1591,11 @@ def _binop_result(op: str, a: Type, b: Type, span: SourceSpan) -> Type:
         return TYPE_FLOAT
 
     if (
-        op in ("&", "|", "-")
-        and isinstance(a, DynType)
-        and isinstance(b, DynType)
-        and a.name in ("set", "frozenset")
-        and b.name in ("set", "frozenset")
+        op in ("&", "|", "-", "^")
+        and isinstance(a, SetType)
+        and isinstance(b, SetType)
     ):
-        return DynType(name="set")
+        return SetType(name=a.name, elem=common_type(a.elem, b.elem))
 
     # Bitwise / shift on int-like operands stays int.
     if op in ("&", "|", "^", "<<", ">>"):
@@ -1352,6 +1637,399 @@ def _call_result_type(ctx: _InferCtx, callee: Expr) -> Type:
     return TYPE_DYN
 
 
+def _extern_ctype_value_type(ctype_name: str) -> Type:
+    """Return a pcc type only when the C and pcc IR lanes are compatible.
+
+    Narrow C integers and ``float`` still need return-side ABI widening, so
+    they deliberately remain dynamic here.  ``double`` and signed ``int64``
+    already match pcc's native float/int representations exactly.
+    """
+    if ctype_name == "c_double":
+        return TYPE_FLOAT
+    if ctype_name in ("c_int64", "c_long"):
+        return TYPE_INT
+    if ctype_name == "c_bool":
+        return TYPE_BOOL
+    if ctype_name == "c_void":
+        return TYPE_NONE
+    return TYPE_DYN
+
+
+def _extern_factory_call_type(
+    ctx: _InferCtx,
+    callee: Expr,
+    args: tuple[Expr, ...],
+    kwargs: tuple[tuple[str, Expr], ...],
+) -> Optional[FuncType]:
+    """Recover an ``extern`` declaration's callable type from its markers."""
+    if not isinstance(callee, Name):
+        return None
+    callee_ident = _name_ident(callee)
+    if callee_ident not in ctx.extern_factory_aliases:
+        return None
+
+    argtypes_expr: Optional[Expr] = args[1] if len(args) >= 2 else None
+    restype_expr: Optional[Expr] = args[2] if len(args) >= 3 else None
+    for key, value in kwargs:
+        if key == "argtypes":
+            argtypes_expr = value
+        elif key == "restype":
+            restype_expr = value
+
+    params: list[Type] = []
+    if isinstance(argtypes_expr, TupleExpr):
+        for marker in argtypes_expr.elems:
+            marker_name = _name_ident(marker) if isinstance(marker, Name) else None
+            canonical = ctx.extern_ctype_aliases.get(marker_name or "", "")
+            params.append(_extern_ctype_value_type(canonical))
+
+    restype_name = "c_void"
+    if isinstance(restype_expr, Name):
+        marker_name = _name_ident(restype_expr)
+        restype_name = ctx.extern_ctype_aliases.get(marker_name or "", "")
+    return FuncType(
+        name="callable",
+        params=tuple(params),
+        ret=_extern_ctype_value_type(restype_name),
+    )
+
+
+def _expr_contains_yield_sentinel(expr: Expr) -> bool:
+    if isinstance(expr, Call):
+        if isinstance(expr.func, Name) and expr.func.ident in (
+            "_yield",
+            "__yield__",
+            "_yield_from",
+            "__yield_from__",
+        ):
+            return True
+        if _expr_contains_yield_sentinel(expr.func):
+            return True
+        for arg in expr.args:
+            if _expr_contains_yield_sentinel(arg):
+                return True
+        for _name, value in expr.kwargs:
+            if _expr_contains_yield_sentinel(value):
+                return True
+        return False
+    if isinstance(expr, Attr):
+        return _expr_contains_yield_sentinel(expr.obj)
+    if isinstance(expr, BinOp):
+        return _expr_contains_yield_sentinel(expr.lhs) or _expr_contains_yield_sentinel(
+            expr.rhs
+        )
+    if isinstance(expr, UnaryOp):
+        return _expr_contains_yield_sentinel(expr.operand)
+    if isinstance(expr, Compare):
+        return _expr_contains_yield_sentinel(expr.lhs) or _expr_contains_yield_sentinel(
+            expr.rhs
+        )
+    if isinstance(expr, BoolExpr):
+        return _expr_contains_yield_sentinel(
+            expr.left
+        ) or _expr_contains_yield_sentinel(expr.right)
+    if isinstance(expr, Subscript):
+        return _expr_contains_yield_sentinel(expr.obj) or _expr_contains_yield_sentinel(
+            expr.idx
+        )
+    if isinstance(expr, Slice):
+        for part in (expr.lo, expr.hi, expr.step):
+            if part is not None and _expr_contains_yield_sentinel(part):
+                return True
+        return False
+    if isinstance(expr, ListExpr):
+        return any(_expr_contains_yield_sentinel(item) for item in expr.elems)
+    if isinstance(expr, TupleExpr):
+        return any(_expr_contains_yield_sentinel(item) for item in expr.elems)
+    if isinstance(expr, DictExpr):
+        for key, value in expr.pairs:
+            if _expr_contains_yield_sentinel(key) or _expr_contains_yield_sentinel(
+                value
+            ):
+                return True
+        return False
+    if isinstance(expr, IfExpr):
+        return (
+            _expr_contains_yield_sentinel(expr.cond)
+            or _expr_contains_yield_sentinel(expr.then_e)
+            or _expr_contains_yield_sentinel(expr.else_e)
+        )
+    if isinstance(expr, Lambda):
+        return _expr_contains_yield_sentinel(expr.body)
+    return False
+
+
+def _stmt_contains_yield_sentinel(stmt: Stmt) -> bool:
+    if isinstance(stmt, Assign):
+        if _expr_contains_yield_sentinel(stmt.value):
+            return True
+        return any(_expr_contains_yield_sentinel(target) for target in stmt.targets)
+    if isinstance(stmt, AugAssign):
+        return _expr_contains_yield_sentinel(
+            stmt.target
+        ) or _expr_contains_yield_sentinel(stmt.value)
+    if isinstance(stmt, ExprStmt):
+        return _expr_contains_yield_sentinel(stmt.expr)
+    if isinstance(stmt, Return):
+        return stmt.value is not None and _expr_contains_yield_sentinel(stmt.value)
+    if isinstance(stmt, Raise):
+        return (stmt.exc is not None and _expr_contains_yield_sentinel(stmt.exc)) or (
+            stmt.cause is not None and _expr_contains_yield_sentinel(stmt.cause)
+        )
+    if isinstance(stmt, Delete):
+        return any(_expr_contains_yield_sentinel(target) for target in stmt.targets)
+    if isinstance(stmt, If):
+        return (
+            _expr_contains_yield_sentinel(stmt.cond)
+            or any(_stmt_contains_yield_sentinel(item) for item in stmt.body)
+            or any(_stmt_contains_yield_sentinel(item) for item in stmt.else_body)
+        )
+    if isinstance(stmt, While):
+        return (
+            _expr_contains_yield_sentinel(stmt.cond)
+            or any(_stmt_contains_yield_sentinel(item) for item in stmt.body)
+            or any(_stmt_contains_yield_sentinel(item) for item in stmt.else_body)
+        )
+    if isinstance(stmt, For):
+        return (
+            _expr_contains_yield_sentinel(stmt.target)
+            or _expr_contains_yield_sentinel(stmt.iter)
+            or any(_stmt_contains_yield_sentinel(item) for item in stmt.body)
+            or any(_stmt_contains_yield_sentinel(item) for item in stmt.else_body)
+        )
+    if isinstance(stmt, With):
+        for ctx_expr, as_var in stmt.items:
+            if _expr_contains_yield_sentinel(ctx_expr):
+                return True
+            if as_var is not None and _expr_contains_yield_sentinel(as_var):
+                return True
+        return any(_stmt_contains_yield_sentinel(item) for item in stmt.body)
+    if isinstance(stmt, Try):
+        if any(_stmt_contains_yield_sentinel(item) for item in stmt.body):
+            return True
+        if any(_stmt_contains_yield_sentinel(item) for item in stmt.else_body):
+            return True
+        if any(_stmt_contains_yield_sentinel(item) for item in stmt.finally_body):
+            return True
+        for handler in stmt.handlers:
+            if handler.exc_type is not None and _expr_contains_yield_sentinel(
+                handler.exc_type
+            ):
+                return True
+            if any(_stmt_contains_yield_sentinel(item) for item in handler.body):
+                return True
+        return False
+    if isinstance(stmt, FuncDef):
+        return False
+    if isinstance(stmt, ClassDef):
+        return False
+    return False
+
+
+def _funcdef_contains_yield_sentinel(fn: FuncDef) -> bool:
+    return any(_stmt_contains_yield_sentinel(stmt) for stmt in fn.body)
+
+
+# ---------------------------------------------------------------------------
+# Control-flow join widening (SEC-P1-TYPECONF)
+# ---------------------------------------------------------------------------
+#
+# When one simple local is assigned differing storage classes on the two arms
+# of an ``if``/``else`` (e.g. ``float`` on one branch and ``int`` on the
+# other), the two arms lower into different basic blocks that share a single
+# stack slot. The slot's IR type is fixed by whichever branch the inferencer
+# happened to type last, so the other branch stores an incompatible value into
+# it -- a float bit-pattern lands in a ``ptr`` slot (or vice-versa) and the
+# post-join read comes back as ``<null>``. That is a type confusion in the
+# sense of *Low-Level Software Security for Compiler Developers*: a value of
+# one type is observed through a slot typed for another.
+#
+# The fix is a *forced-object widening* layered on top of the existing
+# shared-scope inference: after both arms have been inferred exactly as before
+# (no change to what either arm sees while it is inferred, and no child-scope /
+# selective-propagation rework -- that variant broke pcc1->pcc2->pcc3), inspect
+# the already-typed arms. For any simple local whose two candidate types would
+# occupy *different* storage slots, rebind it in the shared scope to the
+# generic boxed-object type (``DynType`` -> ``PyObject*``). Both arms then box
+# into one uniform ``ptr`` slot and the join reads a real object. Names that
+# already share a slot (both objects, or a numeric pair the store path coerces)
+# are left untouched so the common case keeps its unboxed representation.
+
+
+def _typeconf_storage_class(ty: Type) -> str:
+    """Bucket ``ty`` by the storage slot the L1 codegen would give it.
+
+    The buckets mirror ``type_abi_lowering._map_type``: ``int``/``bool`` lower
+    to an integer slot, ``float`` to a double slot, and every object-shaped
+    type (str/bytes/list/dict/tuple/None/class/dyn/func/complex/...) to a
+    ``PyObject*`` slot. A ``dyn`` (already object) never needs widening.
+    """
+    if isinstance(ty, FloatType):
+        return "float"
+    if isinstance(ty, (IntType, BoolType)):
+        # int and bool share the numeric-scalar family; the assignment store
+        # path already coerces bool<->int, so they do not force widening.
+        return "int"
+    # Everything else -- str/bytes/list/dict/tuple/None/class/func/complex and
+    # DynType itself -- lives in a PyObject* slot.
+    return "object"
+
+
+def _typeconf_join_type(a: Optional[Type], b: Optional[Type]) -> Optional[Type]:
+    """Return a widened type when arms ``a`` and ``b`` need a unified slot.
+
+    Returns ``TYPE_DYN`` when the two candidate types would occupy different
+    storage slots (a genuine slot-ABI conflict), and ``None`` when no widening
+    is required (identical types, or two object-shaped types that already share
+    the single ``PyObject*`` slot).
+    """
+    if a is None or b is None:
+        return None
+    if type_eq(a, b):
+        return None
+    class_a = _typeconf_storage_class(a)
+    class_b = _typeconf_storage_class(b)
+    if class_a == class_b:
+        # Same storage family. Two objects already share one ptr slot; two
+        # numerics (int/bool) share the coercing store path. No confusion.
+        return None
+    # Different storage families across the branches (float-vs-int,
+    # scalar-vs-object, ...). Force a single boxed-object slot so both arms
+    # box uniformly rather than aliasing incompatible raw payloads.
+    return TYPE_DYN
+
+
+def _typeconf_collect_arm_assignments(body: tuple, out: dict, annotated: dict) -> None:
+    """Record ``name -> last-assigned type`` for simple locals in one arm.
+
+    Only top-level ``Assign``/``AugAssign`` statements whose target is a plain
+    ``Name`` are considered; the shared slot confusion this guards against only
+    arises for a simple rebindable local. Assignments nested inside further
+    control flow within the arm are intentionally skipped: this pass runs at
+    every ``If`` node, so an inner ``If`` widens its own join before the outer
+    one observes the (already-widened) binding through the scope.
+
+    ``annotated`` collects names carrying an explicit annotation on this arm.
+    An annotated local has a fixed declared type that the store path honours,
+    so it must never be silently force-widened -- an incompatible annotated
+    reassignment is a real type error, not a slot-ABI join to paper over.
+    """
+    for s in body:
+        if isinstance(s, Assign):
+            has_ann = _annotation_or_none(s) is not None
+            for tgt in s.targets:
+                if isinstance(tgt, Name):
+                    ident = _name_ident(tgt)
+                    if ident is not None:
+                        out[ident] = tgt.ty
+                        if has_ann:
+                            annotated[ident] = True
+        elif isinstance(s, AugAssign):
+            tgt = s.target
+            if isinstance(tgt, Name):
+                ident = _name_ident(tgt)
+                if ident is not None:
+                    out[ident] = tgt.ty
+
+
+def _typeconf_retarget_arm(body: tuple, widen: dict) -> tuple:
+    """Rebind conflicting simple-local assignment targets to ``DynType``.
+
+    ``widen`` maps ``name -> True`` for the locals whose control-flow join
+    forced an object slot. Rewriting the assignment *target* type (not the
+    RHS) makes the store path allocate one uniform ``PyObject*`` slot and box
+    each arm's payload into it, so the merged read observes a real object
+    rather than a raw ``double``/``i64`` aliased through a ``ptr`` slot.
+    """
+    changed = False
+    new_body: list = []
+    for s in body:
+        if isinstance(s, Assign):
+            new_targets: list = []
+            tgt_changed = False
+            for tgt in s.targets:
+                if isinstance(tgt, Name):
+                    ident = _name_ident(tgt)
+                    if (
+                        ident is not None
+                        and widen.get(ident)
+                        and not isinstance(tgt.ty, DynType)
+                    ):
+                        new_targets.append(_with_ty(tgt, TYPE_DYN))
+                        tgt_changed = True
+                        continue
+                new_targets.append(tgt)
+            if tgt_changed:
+                new_body.append(replace(s, targets=tuple(new_targets)))
+                changed = True
+            else:
+                new_body.append(s)
+        else:
+            new_body.append(s)
+    if not changed:
+        return body
+    return tuple(new_body)
+
+
+def _typeconf_widen_if_join(
+    scope: _Scope,
+    pre_types: dict,
+    body: tuple,
+    else_body: tuple,
+) -> tuple:
+    """Force-widen shared-scope locals whose two arms disagree on slot ABI.
+
+    ``pre_types`` is the type each involved local had *before* the ``if`` (used
+    when a name is assigned on only one arm, so the join is arm-type vs the
+    fall-through type). ``body``/``else_body`` are the already-inferred arms.
+
+    Returns the (possibly rewritten) ``(body, else_body)`` arms: the scope
+    binding for each widened local is set to ``DynType`` and its conflicting
+    assignment targets are retargeted to ``DynType`` so the store path builds a
+    single boxed-object slot.
+    """
+    then_assigned: dict = {}
+    else_assigned: dict = {}
+    annotated: dict = {}
+    _typeconf_collect_arm_assignments(body, then_assigned, annotated)
+    _typeconf_collect_arm_assignments(else_body, else_assigned, annotated)
+
+    names: list = []
+    for name in then_assigned:
+        if name not in names:
+            names.append(name)
+    for name in else_assigned:
+        if name not in names:
+            names.append(name)
+
+    widen: dict = {}
+    for name in names:
+        if annotated.get(name):
+            # Annotated locals keep their declared slot; a conflicting
+            # annotated reassignment is caught elsewhere as a type error.
+            continue
+        then_ty = then_assigned.get(name)
+        else_ty = else_assigned.get(name)
+        # A name assigned on only one arm joins against its pre-``if`` type on
+        # the fall-through path. If it was undefined before the ``if`` there is
+        # no cross-arm confusion (the other path leaves it unbound), so skip.
+        pre_ty = pre_types.get(name)
+        cand_then = then_ty if then_ty is not None else pre_ty
+        cand_else = else_ty if else_ty is not None else pre_ty
+        if cand_then is None or cand_else is None:
+            continue
+        widened = _typeconf_join_type(cand_then, cand_else)
+        if widened is not None:
+            scope.update(name, widened)
+            widen[name] = True
+
+    if not widen:
+        return (body, else_body)
+    new_body = _typeconf_retarget_arm(body, widen)
+    new_else = _typeconf_retarget_arm(else_body, widen)
+    return (new_body, new_else)
+
+
 # ---------------------------------------------------------------------------
 # Statement inference
 # ---------------------------------------------------------------------------
@@ -1389,8 +2067,27 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
     if isinstance(stmt, If):
         cond = _infer_expr(ctx, scope, stmt.cond)
         body_scope = _narrow_scope_for_cond(ctx, scope, cond)
+        # Snapshot the pre-``if`` types of every simple local either arm might
+        # rebind, so a name assigned on only one arm can be joined against its
+        # fall-through type. Captured before inference runs so it reflects the
+        # state both arms actually branch from.
+        pre_types: dict = {}
+        pre_annotated: dict = {}
+        _typeconf_collect_arm_assignments(stmt.body, pre_types, pre_annotated)
+        _typeconf_collect_arm_assignments(stmt.else_body, pre_types, pre_annotated)
+        pre_names: list = []
+        for name in pre_types:
+            pre_names.append(name)
+        for name in pre_names:
+            pre_types[name] = scope.lookup(name)
         body = tuple(_infer_stmt(ctx, body_scope, s) for s in stmt.body)
         else_body = tuple(_infer_stmt(ctx, scope, s) for s in stmt.else_body)
+        # Forced-object widening (SEC-P1-TYPECONF): if the two arms leave a
+        # shared local in incompatible storage slots, rebind it to a boxed
+        # object slot so the control-flow join reads a real value, not a
+        # type-confused raw payload. Applied to the shared ``scope`` only;
+        # the arms were inferred exactly as before this pass existed.
+        body, else_body = _typeconf_widen_if_join(scope, pre_types, body, else_body)
         return replace(stmt, cond=cond, body=body, else_body=else_body)
 
     if isinstance(stmt, While):
@@ -1467,46 +2164,67 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
         # AnnAssign lift) is an instance-field declaration, not a real
         # assignment, so don't run the usual compatibility check that
         # would otherwise reject ``None`` against the annotation.
-        class_scope = _Scope(parent=scope)
-        new_body: list = []
-        for s in stmt.body:
-            if (
-                isinstance(s, Assign)
-                and _annotation_or_none(s) is not None
-                and isinstance(s.value, NoneLit)
-                and len(s.targets) == 1
-                and isinstance(s.targets[0], Name)
-            ):
-                new_body.append(s)
-                continue
-            if isinstance(s, FuncDef):
-                self_ty = ctx.class_types.get(stmt.name)
-                # Mixin self_ty propagation: if the current class is a
-                # base of exactly one derived class anywhere in the
-                # multi-file closure, type-infer the mixin's method
-                # bodies with ``self_ty=derived_class`` so cross-module
-                # ``self.X`` resolves against the derived class's full
-                # field schema. The mixin's IR still lives in the mixin
-                # module — only the type used for resolution changes.
-                derived_entry = ctx.derived_class_map.get(stmt.name)
-                if derived_entry is not None:
-                    derived_mod, derived_name = derived_entry
-                    derived_ty = ctx.class_types.get(f"{derived_mod}.{derived_name}")
-                    if derived_ty is None:
-                        derived_ty = ctx.class_types.get(derived_name)
-                    if derived_ty is not None:
-                        self_ty = derived_ty
+        method_arg_overrides: dict[str, dict[int, Type]] = {}
+        final_body: tuple[Stmt, ...] = ()
+        for _round in range(4):
+            class_scope = _Scope(parent=scope)
+            new_body: list = []
+            for s in stmt.body:
                 if (
-                    self_ty is not None
-                    and per_module_probe_policy(_ctx_module_name(ctx))
-                    == PROBE_POLICY_CONTEXTUAL_MIXIN
-                    and self_ty.name != "L1CodeGen"
+                    isinstance(s, Assign)
+                    and _annotation_or_none(s) is not None
+                    and isinstance(s.value, NoneLit)
+                    and len(s.targets) == 1
+                    and isinstance(s.targets[0], Name)
                 ):
-                    self_ty = ctx.l1_codegen_host_type()
-                new_body.append(_infer_funcdef(ctx, class_scope, s, self_ty=self_ty))
-                continue
-            new_body.append(_infer_stmt(ctx, class_scope, s))
-        return replace(stmt, body=tuple(new_body))
+                    new_body.append(s)
+                    continue
+                if isinstance(s, FuncDef):
+                    self_ty = ctx.class_types.get(stmt.name)
+                    # Mixin self_ty propagation: if the current class is a
+                    # base of exactly one derived class anywhere in the
+                    # multi-file closure, type-infer the mixin's method
+                    # bodies with ``self_ty=derived_class`` so cross-module
+                    # ``self.X`` resolves against the derived class's full
+                    # field schema. The mixin's IR still lives in the mixin
+                    # module — only the type used for resolution changes.
+                    derived_entry = ctx.derived_class_map.get(stmt.name)
+                    if derived_entry is not None:
+                        derived_mod, derived_name = derived_entry
+                        derived_ty = ctx.class_types.get(
+                            f"{derived_mod}.{derived_name}"
+                        )
+                        if derived_ty is None:
+                            derived_ty = ctx.class_types.get(derived_name)
+                        if derived_ty is not None:
+                            self_ty = derived_ty
+                    if (
+                        self_ty is not None
+                        and per_module_probe_policy(_ctx_module_name(ctx))
+                        == PROBE_POLICY_CONTEXTUAL_MIXIN
+                        and self_ty.name != "L1CodeGen"
+                    ):
+                        self_ty = ctx.l1_codegen_host_type()
+                    new_body.append(
+                        _infer_funcdef(
+                            ctx,
+                            class_scope,
+                            s,
+                            self_ty=self_ty,
+                            arg_overrides=method_arg_overrides.get(s.name),
+                        )
+                    )
+                    continue
+                new_body.append(_infer_stmt(ctx, class_scope, s))
+            final_body = tuple(new_body)
+            collected = _collect_self_method_arg_overrides(ctx, final_body)
+            method_arg_overrides, changed = _merge_method_arg_overrides(
+                method_arg_overrides,
+                collected,
+            )
+            if not changed:
+                break
+        return replace(stmt, body=final_body)
 
     # Import/Global/Nonlocal/Pass/Break/Continue — mostly pass through.
     if isinstance(stmt, Import):
@@ -1515,6 +2233,10 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
                 local_name = as_name or mod_name.split(".", 1)[0]
                 scope.update(local_name, DynType(name="module:math"))
                 continue
+            if mod_name == "functools":
+                local_name = as_name or mod_name.split(".", 1)[0]
+                scope.update(local_name, DynType(name="module:functools"))
+                ctx.functools_module_aliases.add(local_name)
             # Cross-module class registration: when ``mod_name`` was
             # supplied through the multi-file pre-pass (or pulled in by
             # the recursive_stdlib walker), eagerly bind each exported
@@ -1568,15 +2290,22 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
                 ctx.dataclasses_replace_aliases.add(local_name)
                 scope.update(local_name, ft)
                 ctx.func_types[local_name] = ft
-        if resolved == "math":
+        if resolved == "weakref":
             for attr_name, as_name in stmt.names:
-                if attr_name not in ("floor", "sqrt"):
+                if attr_name not in ("ref", "proxy"):
                     continue
                 local_name = as_name or attr_name
-                ret_ty: Type = TYPE_INT if attr_name == "floor" else TYPE_FLOAT
+                ctx.weakref_value_aliases.add(local_name)
+        if resolved == "math":
+            for attr_name, as_name in stmt.names:
+                if attr_name not in ("floor", "ceil", "sqrt", "trunc", "gcd"):
+                    continue
+                local_name = as_name or attr_name
+                ret_ty: Type = TYPE_FLOAT if attr_name == "sqrt" else TYPE_INT
+                params = (TYPE_DYN, TYPE_DYN) if attr_name == "gcd" else (TYPE_DYN,)
                 ft = FuncType(
                     name="callable",
-                    params=(TYPE_DYN,),
+                    params=params,
                     ret=ret_ty,
                 )
                 scope.update(local_name, ft)
@@ -1606,9 +2335,28 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
                 )
                 scope.update(local_name, ft)
                 ctx.func_types[local_name] = ft
+        if resolved == "pcc.extern":
+            for attr_name, as_name in stmt.names:
+                local_name = as_name or attr_name
+                if attr_name == "extern":
+                    ctx.extern_factory_aliases.add(local_name)
+                elif attr_name.startswith("c_"):
+                    ctx.extern_ctype_aliases[local_name] = attr_name
         _bind_ir_compat_module_alias(ctx, scope, resolved, stmt.names)
         if ctx.external_exports:
             _bind_external_import_exports(ctx, scope, resolved, stmt.names)
+        if resolved == "functools":
+            for attr_name, as_name in stmt.names:
+                if attr_name != "partial":
+                    continue
+                local_name = as_name or attr_name
+                ft = FuncType(
+                    name="callable",
+                    params=(TYPE_DYN,),
+                    ret=TYPE_DYN,
+                )
+                scope.update(local_name, ft)
+                ctx.func_types[local_name] = ft
         return stmt
     if isinstance(stmt, (Import, Global, Nonlocal, Pass, Break, Continue)):
         return stmt
@@ -1658,8 +2406,10 @@ def _type_from_isinstance_arg(
     """
     if isinstance(expr, Name):
         expr_ident = _name_ident(expr)
-        if expr_ident is not None and expr_ident.startswith("_") and (
-            _ctx_module_name(ctx).startswith("pcc.py_frontend.")
+        if (
+            expr_ident is not None
+            and expr_ident.startswith("_")
+            and (_ctx_module_name(ctx).startswith("pcc.py_frontend."))
         ):
             py_ast_ty = ctx.class_types.get(expr_ident[1:])
             if (
@@ -2000,6 +2750,55 @@ def _is_valueclass_type(ty: Type) -> bool:
     return False
 
 
+def _validate_value_array_type(
+    ty: Type,
+    span: Optional[SourceSpan],
+) -> Type:
+    if not isinstance(ty, ValueArrayType):
+        return ty
+    if ty.length == -1:
+        _raise_frontend_error(
+            span,
+            "pcc.array needs an element type and literal length",
+            "use pcc.array[ValueClass, N] with N between 1 and 7",
+        )
+    if ty.length == -2:
+        _raise_frontend_error(
+            span,
+            "pcc.array length must be an integer literal",
+            "write a literal length between 1 and 7",
+        )
+    if ty.length < 1 or ty.length > 7:
+        _raise_frontend_error(
+            span,
+            "pcc.array length must be between 1 and 7",
+            "the selected self-backend aggregate ABI supports lengths 1..7",
+        )
+    if not _is_valueclass_type(ty.elem):
+        _raise_frontend_error(
+            span,
+            "pcc.array element type must be a valueclass",
+            "decorate the element class with @pcc.valueclass",
+        )
+    return ty
+
+
+def _value_array_type_from_surface(
+    ctx: _InferCtx,
+    surface: Expr,
+) -> Optional[ValueArrayType]:
+    if not isinstance(surface, Subscript):
+        return None
+    if _simple_decorator_name(surface.obj) not in ("pcc.array", "array"):
+        return None
+    parsed = parse_annotation(surface)
+    resolved = ctx.resolve_type_refs(parsed)
+    checked = _validate_value_array_type(resolved, surface.span)
+    if isinstance(checked, ValueArrayType):
+        return checked
+    return None
+
+
 def _valueclass_type_refs(
     ty: Type,
     valueclass_names: set[str],
@@ -2016,6 +2815,8 @@ def _valueclass_type_refs(
             refs.update(_valueclass_type_refs(field_ty, valueclass_names, module_name))
         return refs
     if isinstance(ty, ListType):
+        return _valueclass_type_refs(ty.elem, valueclass_names, module_name)
+    if isinstance(ty, ValueArrayType):
         return _valueclass_type_refs(ty.elem, valueclass_names, module_name)
     if isinstance(ty, DictType):
         refs.update(_valueclass_type_refs(ty.key, valueclass_names, module_name))
@@ -2190,6 +2991,51 @@ def _class_properties_from_def(
     return tuple(out)
 
 
+def _init_field_rhs_type(ctx: _InferCtx, scope: _Scope, value: Expr) -> Optional[Type]:
+    """Conservative RHS typing for ``self.x = ...`` inside ``__init__``.
+
+    This feeds only class field schemas.  Keep the accepted shapes narrow:
+    constructor calls, ``copy(arg)``, literals, containers, and comprehension
+    sentinels whose result type is already handled by ``_infer_expr``.  Avoid
+    arbitrary method calls here; turning those into fixed instance fields can
+    change ordinary dynamic-class behavior.
+    """
+    if isinstance(
+        value,
+        (
+            Name,
+            IntLit,
+            FloatLit,
+            ComplexLit,
+            BoolLit,
+            NoneLit,
+            StrLit,
+            BytesLit,
+            ListExpr,
+            TupleExpr,
+            DictExpr,
+        ),
+    ):
+        return ctx.resolve_type_refs(_infer_expr(ctx, scope, value).ty)
+    if isinstance(value, Call) and isinstance(value.func, Name):
+        callee_name = _name_ident(value.func) or ""
+        if (
+            callee_name == "copy"
+            or callee_name in ctx.class_types
+            or callee_name
+            in (
+                "_list_comp",
+                "__listcomp__",
+                "_dict_comp",
+                "__dictcomp__",
+                "_set_comp",
+                "__setcomp__",
+            )
+        ):
+            return ctx.resolve_type_refs(_infer_expr(ctx, scope, value).ty)
+    return None
+
+
 def _class_fields_from_def(
     ctx: _InferCtx, stmt: ClassDef
 ) -> tuple[tuple[str, Type], ...]:
@@ -2211,6 +3057,9 @@ def _class_fields_from_def(
                 for arg in body_stmt.args
                 if arg.name not in ("", "self", "cls")
             }
+            init_scope = _Scope(parent=ctx.globals)
+            for arg_name, arg_ty in arg_types.items():
+                init_scope.define(arg_name, arg_ty)
             for init_stmt in body_stmt.body:
                 if not isinstance(init_stmt, Assign):
                     continue
@@ -2228,6 +3077,10 @@ def _class_fields_from_def(
                     field_ty = explicit_ty
                     if field_ty is None and isinstance(init_stmt.value, Name):
                         field_ty = arg_types.get(_name_ident(init_stmt.value))
+                    if field_ty is None:
+                        field_ty = _init_field_rhs_type(
+                            ctx, init_scope, init_stmt.value
+                        )
                     if field_ty is None:
                         continue
                     _append_field(fields, target.name, field_ty)
@@ -2564,13 +3417,19 @@ def _py_ast_static_fields_for_export(
     if class_name == "Import":
         return (
             ("span", span),
-            ("names", _py_ast_tuple_of(_make_tuple_type("tuple", (TYPE_STR, TYPE_STR)))),
+            (
+                "names",
+                _py_ast_tuple_of(_make_tuple_type("tuple", (TYPE_STR, TYPE_STR))),
+            ),
         )
     if class_name == "ImportFrom":
         return (
             ("span", span),
             ("module", TYPE_STR),
-            ("names", _py_ast_tuple_of(_make_tuple_type("tuple", (TYPE_STR, TYPE_STR)))),
+            (
+                "names",
+                _py_ast_tuple_of(_make_tuple_type("tuple", (TYPE_STR, TYPE_STR))),
+            ),
             ("level", TYPE_INT),
         )
     if class_name == "Global" or class_name == "Nonlocal":
@@ -2773,7 +3632,11 @@ def _llvm_ir_static_fields_for_export(
             ("function", function),
         )
     if class_name == "FunctionType":
-        return (("return_type", ty), ("args", _make_tuple_type("tuple_variadic", (ty,))), ("var_arg", TYPE_BOOL))
+        return (
+            ("return_type", ty),
+            ("args", _make_tuple_type("tuple_variadic", (ty,))),
+            ("var_arg", TYPE_BOOL),
+        )
     if class_name == "PointerType":
         return (("pointee", ty), ("addrspace", TYPE_INT))
     if class_name == "IntType":
@@ -2793,7 +3656,11 @@ def _resolve_export_type_refs(
         ty_module = _class_type_module(ty)
         ty_fields = _class_type_fields(ty)
         ty_bases = _class_type_bases(ty)
-        if (not ty_module or ty_module == module_name) and not ty_fields and not ty_bases:
+        if (
+            (not ty_module or ty_module == module_name)
+            and not ty_fields
+            and not ty_bases
+        ):
             ref_info = module_exports.get(ty.name)
             if isinstance(ref_info, dict) and ref_info.get("kind") == "class":
                 return _class_type_from_export(
@@ -2805,7 +3672,9 @@ def _resolve_export_type_refs(
                 )
         return ty
     if isinstance(ty, ListType):
-        elem = _resolve_export_type_refs(ctx, module_name, module_exports, memo, ty.elem)
+        elem = _resolve_export_type_refs(
+            ctx, module_name, module_exports, memo, ty.elem
+        )
         if elem == ty.elem:
             return ty
         return _make_list_type(elem)
@@ -2907,6 +3776,8 @@ def _bind_external_import_exports(
                 _annotation_to_type(decode_type(info.get("value_ty"))),
             )
             scope.update(local_name, value_ty)
+        elif info["kind"] == "typing_metadata":
+            scope.update(local_name, TYPE_DYN)
         elif info["kind"] == "constant":
             value_kind = info.get("value_kind")
             if value_kind == "str":
@@ -2991,11 +3862,46 @@ def _preload_unique_external_classes(ctx: _InferCtx) -> None:
 def _infer_assign(ctx: _InferCtx, scope: _Scope, stmt: Assign) -> Assign:
     value = _infer_expr(ctx, scope, stmt.value)
     ann_ty = ctx.resolve_annotation(stmt.annotation)
-    if isinstance(ann_ty, DynType):
+    extern_marker_annotation = (
+        isinstance(value.ty, FuncType)
+        and isinstance(ann_ty, ClassType)
+        and ann_ty.name == "extern"
+        and isinstance(stmt.value, Call)
+        and isinstance(stmt.value.func, Name)
+        and _name_ident(stmt.value.func) in ctx.extern_factory_aliases
+    )
+    if extern_marker_annotation:
+        # ``x: extern = extern(...)`` uses ``extern`` as a declaration marker,
+        # not as the runtime result type of calling ``x``.
+        bind_ty = value.ty
+    elif stmt.annotation is None or isinstance(ann_ty, DynType):
+        # An absent annotation is a syntax-level fact and must not depend on
+        # runtime class identity.  In a self-hosted fixed-layout compiler the
+        # imported ``TYPE_DYN`` singleton can cross a compiled-module class
+        # boundary where ``isinstance(ann_ty, DynType)`` is false; the explicit
+        # ``stmt.annotation is None`` keeps an unannotated binding on the
+        # ``bind_ty = value.ty`` path instead of falling through to the
+        # annotation-compat branch and erasing the RHS type.
         bind_ty = value.ty
     else:
         _check_assign_compatible(ann_ty, value.ty, stmt.span)
         bind_ty = ann_ty
+
+    if (
+        isinstance(ann_ty, DynType)
+        and isinstance(bind_ty, DictType)
+        and _typeconf_storage_class(bind_ty.value) != "object"
+        and any(
+            isinstance(tgt, Name)
+            and _name_ident(tgt) in ctx.setdefault_none_widen_names
+            for tgt in stmt.targets
+        )
+    ):
+        # This local later receives a 1-arg ``setdefault`` (inserts None);
+        # an inferred native-scalar value type cannot represent that —
+        # ``is None`` on the stored slot would constant-fold to False.
+        bind_ty = replace(bind_ty, value=TYPE_DYN)
+        value = replace(value, ty=bind_ty)
 
     new_targets = []
     for tgt in stmt.targets:
@@ -3028,7 +3934,11 @@ def _infer_assign(ctx: _InferCtx, scope: _Scope, stmt: Assign) -> Assign:
             new_targets.append(_infer_expr(ctx, scope, tgt))
     # Preserve the resolved annotation as a ``Type`` in the node so the
     # codegen layer doesn't have to re-parse it.
-    new_annotation = ann_ty if not isinstance(ann_ty, DynType) else stmt.annotation
+    new_annotation = (
+        value.ty
+        if extern_marker_annotation
+        else ann_ty if not isinstance(ann_ty, DynType) else stmt.annotation
+    )
     return replace(
         stmt,
         targets=tuple(new_targets),
@@ -3073,12 +3983,427 @@ def _check_assign_compatible(ann: Type, rhs: Type, span: SourceSpan) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _collect_setdefault_none_expr(expr, found) -> None:
+    """Add receiver names of 1-arg ``<name>.setdefault(key)`` calls in
+    ``expr`` to ``found``. Traversal mirrors
+    ``_expr_contains_yield_sentinel`` (explicit node dispatch — the
+    self-hosted compiler has no dataclass field reflection)."""
+    if isinstance(expr, Call):
+        if (
+            isinstance(expr.func, Attr)
+            and expr.func.name == "setdefault"
+            and isinstance(expr.func.obj, Name)
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            ident = _name_ident(expr.func.obj)
+            if ident is not None:
+                found.add(ident)
+        _collect_setdefault_none_expr(expr.func, found)
+        for arg in expr.args:
+            _collect_setdefault_none_expr(arg, found)
+        for _name, value in expr.kwargs:
+            _collect_setdefault_none_expr(value, found)
+        return
+    if isinstance(expr, Attr):
+        _collect_setdefault_none_expr(expr.obj, found)
+        return
+    if isinstance(expr, BinOp):
+        _collect_setdefault_none_expr(expr.lhs, found)
+        _collect_setdefault_none_expr(expr.rhs, found)
+        return
+    if isinstance(expr, UnaryOp):
+        _collect_setdefault_none_expr(expr.operand, found)
+        return
+    if isinstance(expr, Compare):
+        _collect_setdefault_none_expr(expr.lhs, found)
+        _collect_setdefault_none_expr(expr.rhs, found)
+        return
+    if isinstance(expr, BoolExpr):
+        _collect_setdefault_none_expr(expr.left, found)
+        _collect_setdefault_none_expr(expr.right, found)
+        return
+    if isinstance(expr, Subscript):
+        _collect_setdefault_none_expr(expr.obj, found)
+        _collect_setdefault_none_expr(expr.idx, found)
+        return
+    if isinstance(expr, Slice):
+        for part in (expr.lo, expr.hi, expr.step):
+            if part is not None:
+                _collect_setdefault_none_expr(part, found)
+        return
+    if isinstance(expr, ListExpr):
+        for item in expr.elems:
+            _collect_setdefault_none_expr(item, found)
+        return
+    if isinstance(expr, TupleExpr):
+        for item in expr.elems:
+            _collect_setdefault_none_expr(item, found)
+        return
+    if isinstance(expr, DictExpr):
+        for key, value in expr.pairs:
+            _collect_setdefault_none_expr(key, found)
+            _collect_setdefault_none_expr(value, found)
+        return
+    if isinstance(expr, IfExpr):
+        _collect_setdefault_none_expr(expr.cond, found)
+        _collect_setdefault_none_expr(expr.then_e, found)
+        _collect_setdefault_none_expr(expr.else_e, found)
+        return
+    if isinstance(expr, Lambda):
+        _collect_setdefault_none_expr(expr.body, found)
+        return
+
+
+def _collect_setdefault_none_stmt(stmt, found) -> None:
+    if isinstance(stmt, Assign):
+        _collect_setdefault_none_expr(stmt.value, found)
+        for target in stmt.targets:
+            _collect_setdefault_none_expr(target, found)
+        return
+    if isinstance(stmt, AugAssign):
+        _collect_setdefault_none_expr(stmt.target, found)
+        _collect_setdefault_none_expr(stmt.value, found)
+        return
+    if isinstance(stmt, ExprStmt):
+        _collect_setdefault_none_expr(stmt.expr, found)
+        return
+    if isinstance(stmt, Return):
+        if stmt.value is not None:
+            _collect_setdefault_none_expr(stmt.value, found)
+        return
+    if isinstance(stmt, Raise):
+        if stmt.exc is not None:
+            _collect_setdefault_none_expr(stmt.exc, found)
+        if stmt.cause is not None:
+            _collect_setdefault_none_expr(stmt.cause, found)
+        return
+    if isinstance(stmt, Delete):
+        for target in stmt.targets:
+            _collect_setdefault_none_expr(target, found)
+        return
+    if isinstance(stmt, If):
+        _collect_setdefault_none_expr(stmt.cond, found)
+        for item in stmt.body:
+            _collect_setdefault_none_stmt(item, found)
+        for item in stmt.else_body:
+            _collect_setdefault_none_stmt(item, found)
+        return
+    if isinstance(stmt, While):
+        _collect_setdefault_none_expr(stmt.cond, found)
+        for item in stmt.body:
+            _collect_setdefault_none_stmt(item, found)
+        for item in stmt.else_body:
+            _collect_setdefault_none_stmt(item, found)
+        return
+    if isinstance(stmt, For):
+        _collect_setdefault_none_expr(stmt.target, found)
+        _collect_setdefault_none_expr(stmt.iter, found)
+        for item in stmt.body:
+            _collect_setdefault_none_stmt(item, found)
+        for item in stmt.else_body:
+            _collect_setdefault_none_stmt(item, found)
+        return
+    if isinstance(stmt, With):
+        for ctx_expr, as_var in stmt.items:
+            _collect_setdefault_none_expr(ctx_expr, found)
+            if as_var is not None:
+                _collect_setdefault_none_expr(as_var, found)
+        for item in stmt.body:
+            _collect_setdefault_none_stmt(item, found)
+        return
+    if isinstance(stmt, Try):
+        for item in stmt.body:
+            _collect_setdefault_none_stmt(item, found)
+        for item in stmt.else_body:
+            _collect_setdefault_none_stmt(item, found)
+        for item in stmt.finally_body:
+            _collect_setdefault_none_stmt(item, found)
+        for handler in stmt.handlers:
+            if handler.exc_type is not None:
+                _collect_setdefault_none_expr(handler.exc_type, found)
+            for item in handler.body:
+                _collect_setdefault_none_stmt(item, found)
+        return
+    if isinstance(stmt, FuncDef):
+        # A nested def may mutate an enclosing function's dict local
+        # through a closure; include its body so the outer binding widens.
+        for item in stmt.body:
+            _collect_setdefault_none_stmt(item, found)
+        return
+
+
+def _collect_setdefault_none_receivers(body) -> set:
+    """Names that receive a 1-arg ``<name>.setdefault(key)`` call in ``body``.
+
+    ``dict.setdefault`` with no default inserts ``None`` for a missing key,
+    so an inferred scalar-valued dict binding for these receivers must widen
+    its value type to ``dyn`` (see ``_infer_assign``).
+    """
+    found: set = set()
+    for stmt in body:
+        _collect_setdefault_none_stmt(stmt, found)
+    return found
+
+
+def _is_starred_arg_expr(expr: Expr) -> bool:
+    return (
+        isinstance(expr, Call)
+        and isinstance(expr.func, Name)
+        and expr.func.ident in ("*", "__starred__")
+    )
+
+
+def _record_self_method_call_arg_types(
+    ctx: _InferCtx,
+    out: dict[str, dict[int, Type]],
+    method_name: str,
+    args: tuple[Expr, ...],
+) -> None:
+    method_slots = out.setdefault(method_name, {})
+    for arg_index, arg in enumerate(args):
+        if _is_starred_arg_expr(arg):
+            continue
+        arg_ty = ctx.resolve_type_refs(arg.ty)
+        if isinstance(arg_ty, DynType):
+            continue
+        param_index = arg_index + 1  # bound ``self.method(...)`` skips self.
+        existing = method_slots.get(param_index)
+        if existing is None:
+            method_slots[param_index] = arg_ty
+        elif not type_eq(existing, arg_ty):
+            method_slots[param_index] = TYPE_DYN
+
+
+def _literal_self_method_dict(expr: Expr) -> tuple[str, ...]:
+    if not isinstance(expr, DictExpr):
+        return ()
+    methods: list[str] = []
+    for _key, value in expr.pairs:
+        if (
+            isinstance(value, Attr)
+            and isinstance(value.obj, Name)
+            and _name_ident(value.obj) == "self"
+        ):
+            methods.append(value.name)
+        else:
+            return ()
+    return tuple(methods)
+
+
+def _collect_self_method_arg_types_expr(
+    ctx: _InferCtx,
+    expr: Expr,
+    method_dicts: dict[str, tuple[str, ...]],
+    out: dict[str, dict[int, Type]],
+) -> None:
+    if isinstance(expr, Call):
+        if (
+            isinstance(expr.func, Attr)
+            and isinstance(expr.func.obj, Name)
+            and _name_ident(expr.func.obj) == "self"
+        ):
+            _record_self_method_call_arg_types(ctx, out, expr.func.name, expr.args)
+        elif isinstance(expr.func, Subscript) and isinstance(expr.func.obj, Name):
+            dispatch_name = _name_ident(expr.func.obj)
+            for method_name in method_dicts.get(dispatch_name or "", ()):
+                _record_self_method_call_arg_types(ctx, out, method_name, expr.args)
+        _collect_self_method_arg_types_expr(ctx, expr.func, method_dicts, out)
+        for arg in expr.args:
+            _collect_self_method_arg_types_expr(ctx, arg, method_dicts, out)
+        for _name, value in expr.kwargs:
+            _collect_self_method_arg_types_expr(ctx, value, method_dicts, out)
+        return
+    if isinstance(expr, Attr):
+        _collect_self_method_arg_types_expr(ctx, expr.obj, method_dicts, out)
+        return
+    if isinstance(expr, BinOp):
+        _collect_self_method_arg_types_expr(ctx, expr.lhs, method_dicts, out)
+        _collect_self_method_arg_types_expr(ctx, expr.rhs, method_dicts, out)
+        return
+    if isinstance(expr, UnaryOp):
+        _collect_self_method_arg_types_expr(ctx, expr.operand, method_dicts, out)
+        return
+    if isinstance(expr, Compare):
+        _collect_self_method_arg_types_expr(ctx, expr.lhs, method_dicts, out)
+        _collect_self_method_arg_types_expr(ctx, expr.rhs, method_dicts, out)
+        return
+    if isinstance(expr, BoolExpr):
+        _collect_self_method_arg_types_expr(ctx, expr.left, method_dicts, out)
+        _collect_self_method_arg_types_expr(ctx, expr.right, method_dicts, out)
+        return
+    if isinstance(expr, Subscript):
+        _collect_self_method_arg_types_expr(ctx, expr.obj, method_dicts, out)
+        _collect_self_method_arg_types_expr(ctx, expr.idx, method_dicts, out)
+        return
+    if isinstance(expr, Slice):
+        for part in (expr.lo, expr.hi, expr.step):
+            if part is not None:
+                _collect_self_method_arg_types_expr(ctx, part, method_dicts, out)
+        return
+    if isinstance(expr, ListExpr):
+        for item in expr.elems:
+            _collect_self_method_arg_types_expr(ctx, item, method_dicts, out)
+        return
+    if isinstance(expr, TupleExpr):
+        for item in expr.elems:
+            _collect_self_method_arg_types_expr(ctx, item, method_dicts, out)
+        return
+    if isinstance(expr, DictExpr):
+        for key, value in expr.pairs:
+            _collect_self_method_arg_types_expr(ctx, key, method_dicts, out)
+            _collect_self_method_arg_types_expr(ctx, value, method_dicts, out)
+        return
+    if isinstance(expr, IfExpr):
+        _collect_self_method_arg_types_expr(ctx, expr.cond, method_dicts, out)
+        _collect_self_method_arg_types_expr(ctx, expr.then_e, method_dicts, out)
+        _collect_self_method_arg_types_expr(ctx, expr.else_e, method_dicts, out)
+        return
+    if isinstance(expr, Lambda):
+        _collect_self_method_arg_types_expr(ctx, expr.body, method_dicts, out)
+        return
+
+
+def _collect_self_method_arg_types_stmt(
+    ctx: _InferCtx,
+    stmt: Stmt,
+    method_dicts: dict[str, tuple[str, ...]],
+    out: dict[str, dict[int, Type]],
+) -> None:
+    if isinstance(stmt, Assign):
+        for target in stmt.targets:
+            if isinstance(target, Name):
+                methods = _literal_self_method_dict(stmt.value)
+                target_name = _name_ident(target)
+                if target_name is not None and methods:
+                    method_dicts[target_name] = methods
+        _collect_self_method_arg_types_expr(ctx, stmt.value, method_dicts, out)
+        for target in stmt.targets:
+            _collect_self_method_arg_types_expr(ctx, target, method_dicts, out)
+        return
+    if isinstance(stmt, AugAssign):
+        _collect_self_method_arg_types_expr(ctx, stmt.target, method_dicts, out)
+        _collect_self_method_arg_types_expr(ctx, stmt.value, method_dicts, out)
+        return
+    if isinstance(stmt, ExprStmt):
+        _collect_self_method_arg_types_expr(ctx, stmt.expr, method_dicts, out)
+        return
+    if isinstance(stmt, Return):
+        if stmt.value is not None:
+            _collect_self_method_arg_types_expr(ctx, stmt.value, method_dicts, out)
+        return
+    if isinstance(stmt, Raise):
+        if stmt.exc is not None:
+            _collect_self_method_arg_types_expr(ctx, stmt.exc, method_dicts, out)
+        if stmt.cause is not None:
+            _collect_self_method_arg_types_expr(ctx, stmt.cause, method_dicts, out)
+        return
+    if isinstance(stmt, Delete):
+        for target in stmt.targets:
+            _collect_self_method_arg_types_expr(ctx, target, method_dicts, out)
+        return
+    if isinstance(stmt, If):
+        _collect_self_method_arg_types_expr(ctx, stmt.cond, method_dicts, out)
+        for item in stmt.body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        for item in stmt.else_body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        return
+    if isinstance(stmt, While):
+        _collect_self_method_arg_types_expr(ctx, stmt.cond, method_dicts, out)
+        for item in stmt.body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        for item in stmt.else_body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        return
+    if isinstance(stmt, For):
+        _collect_self_method_arg_types_expr(ctx, stmt.target, method_dicts, out)
+        _collect_self_method_arg_types_expr(ctx, stmt.iter, method_dicts, out)
+        for item in stmt.body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        for item in stmt.else_body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        return
+    if isinstance(stmt, With):
+        for ctx_expr, as_var in stmt.items:
+            _collect_self_method_arg_types_expr(ctx, ctx_expr, method_dicts, out)
+            if as_var is not None:
+                _collect_self_method_arg_types_expr(ctx, as_var, method_dicts, out)
+        for item in stmt.body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        return
+    if isinstance(stmt, Try):
+        for item in stmt.body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        for item in stmt.else_body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        for item in stmt.finally_body:
+            _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        for handler in stmt.handlers:
+            if handler.exc_type is not None:
+                _collect_self_method_arg_types_expr(
+                    ctx, handler.exc_type, method_dicts, out
+                )
+            for item in handler.body:
+                _collect_self_method_arg_types_stmt(ctx, item, dict(method_dicts), out)
+        return
+
+
+def _collect_self_method_arg_overrides(
+    ctx: _InferCtx, class_body: tuple[Stmt, ...]
+) -> dict[str, dict[int, Type]]:
+    out: dict[str, dict[int, Type]] = {}
+    for stmt in class_body:
+        if not isinstance(stmt, FuncDef):
+            continue
+        method_dicts: dict[str, tuple[str, ...]] = {}
+        for body_stmt in stmt.body:
+            _collect_self_method_arg_types_stmt(ctx, body_stmt, method_dicts, out)
+    return {
+        method_name: {
+            index: ty for index, ty in slots.items() if not isinstance(ty, DynType)
+        }
+        for method_name, slots in out.items()
+    }
+
+
+def _merge_method_arg_overrides(
+    old: dict[str, dict[int, Type]],
+    new: dict[str, dict[int, Type]],
+) -> tuple[dict[str, dict[int, Type]], bool]:
+    merged = {name: dict(slots) for name, slots in old.items()}
+    changed = False
+    for method_name, slots in new.items():
+        dst = merged.setdefault(method_name, {})
+        for index, ty in slots.items():
+            if isinstance(ty, DynType):
+                continue
+            existing = dst.get(index)
+            if existing is None:
+                dst[index] = ty
+                changed = True
+            elif not type_eq(existing, ty):
+                if not isinstance(existing, DynType):
+                    dst[index] = TYPE_DYN
+                    changed = True
+    return (
+        {
+            name: {
+                index: ty for index, ty in slots.items() if not isinstance(ty, DynType)
+            }
+            for name, slots in merged.items()
+        },
+        changed,
+    )
+
+
 def _infer_funcdef(
     ctx: _InferCtx,
     scope: _Scope,
     fn: FuncDef,
     *,
     self_ty: Optional[ClassType] = None,
+    arg_overrides: Optional[dict[int, Type]] = None,
 ) -> FuncDef:
     # Resolve argument annotations up-front.
     new_args: list[Arg] = []
@@ -3106,13 +4431,18 @@ def _infer_funcdef(
                 )
                 or (
                     self_ty_name == "L1CodeGenEntrypointMixin"
-                    and self_ty_module
-                    == "pcc.py_frontend.codegen.layer1_entrypoints"
+                    and self_ty_module == "pcc.py_frontend.codegen.layer1_entrypoints"
                 )
             ):
                 ty = ctx.l1_codegen_host_type()
         if a.annotation is None and a.name in host_param_names:
             ty = ctx.l1_codegen_host_type()
+        if (
+            arg_overrides is not None
+            and a.annotation is None
+            and index in arg_overrides
+        ):
+            ty = ctx.resolve_type_refs(arg_overrides[index])
         new_args.append(
             replace(
                 a,
@@ -3127,7 +4457,12 @@ def _infer_funcdef(
         param_scope.define(a.name, ty)
 
     ret_ty = ctx.resolve_annotation(fn.return_ty)
-    func_ret_ty = DynType(name="coroutine") if fn.is_async else ret_ty
+    if fn.is_async:
+        func_ret_ty = DynType(name="coroutine")
+    elif _funcdef_contains_yield_sentinel(fn):
+        func_ret_ty = DynType(name="generator")
+    else:
+        func_ret_ty = ret_ty
 
     # Record the function's full type in the module-level table *before*
     # walking the body so recursive calls see it.
@@ -3146,10 +4481,13 @@ def _infer_funcdef(
     param_scope.define(fn.name, ft)
     scope.update(fn.name, ft)
 
+    saved_widen_names = ctx.setdefault_none_widen_names
+    ctx.setdefault_none_widen_names = _collect_setdefault_none_receivers(fn.body)
     new_body_items: list[Stmt] = []
     for body_stmt in fn.body:
         new_body_items.append(_infer_stmt(ctx, param_scope, body_stmt))
     new_body = tuple(new_body_items)
+    ctx.setdefault_none_widen_names = saved_widen_names
 
     # Type-check ``return`` against ``ret_ty``.
     if not fn.is_async and not isinstance(ret_ty, DynType):
@@ -3181,7 +4519,20 @@ def _container_method_return_type(
     if isinstance(recv_ty, StrType):
         if method == "count":
             return IntType(name="int")
-        if method in ("isdigit", "isalpha", "isspace", "isalnum"):
+        if method in (
+            "isdigit",
+            "isalpha",
+            "isspace",
+            "isalnum",
+            "isupper",
+            "islower",
+            "isascii",
+            "isidentifier",
+            "isprintable",
+            "isnumeric",
+            "isdecimal",
+            "istitle",
+        ):
             return BoolType(name="bool")
         if method == "encode":
             return BytesType(name="bytes")
@@ -3208,8 +4559,15 @@ def _container_method_return_type(
     if isinstance(recv_ty, (BytesType, ByteArrayType)):
         if method == "decode":
             return StrType(name="str")
+        if method == "upper":
+            return recv_ty
+    if isinstance(recv_ty, ByteArrayType):
+        if method == "pop":
+            return IntType(name="int")
+        if method in ("append", "extend", "insert"):
+            return NoneType(name="None")
     if isinstance(recv_ty, DynType) and recv_ty.name == "module:math":
-        if method == "floor":
+        if method in ("floor", "ceil", "trunc", "gcd"):
             return TYPE_INT
         if method == "sqrt":
             return TYPE_FLOAT
@@ -3235,7 +4593,7 @@ def _container_method_return_type(
                     elems=(recv_ty.key, recv_ty.value),
                 ),
             )
-    if isinstance(recv_ty, DynType) and recv_ty.name in ("set", "frozenset"):
+    if isinstance(recv_ty, SetType):
         if method in ("issubset", "issuperset"):
             return BoolType(name="bool")
     return None
@@ -3314,6 +4672,8 @@ def _is_assignable(declared: Type, got: Type) -> bool:
     got_list_elem = _list_type_elem(got)
     if declared_list_elem is not None and got_list_elem is not None:
         return _is_assignable(declared_list_elem, got_list_elem)
+    if isinstance(declared, SetType) and isinstance(got, SetType):
+        return declared.name == got.name and _is_assignable(declared.elem, got.elem)
     declared_dict = _dict_type_parts(declared)
     got_dict = _dict_type_parts(got)
     if declared_dict is not None and got_dict is not None:
@@ -3543,6 +4903,33 @@ def _prepopulate_module_scope(ctx: _InferCtx, module: Module) -> None:
             )
             ctx.register_class_type(stmt.name, cls_ty)
             ctx.globals.define(stmt.name, cls_ty)
+
+    for stmt in module.body:
+        if not isinstance(stmt, Assign) or len(stmt.targets) != 1:
+            continue
+        target = stmt.targets[0]
+        if not isinstance(target, Name) or not isinstance(stmt.value, Subscript):
+            continue
+        # Module-level type alias: ``Instruction = dict[Engine, list]``,
+        # ``Engine = Literal[...]``. Record so annotations naming the
+        # alias resolve to the aliased type instead of a phantom
+        # ``ClassType`` (which would make codegen emit instance-field
+        # access on plain container values). ``parse_annotation`` returns
+        # ``dyn`` for runtime subscripts (``row = matrix[i]``), so those
+        # are never recorded; ``Literal[...]`` is recorded as ``dyn``
+        # explicitly since its parse is also ``dyn``.
+        head_obj = stmt.value.obj
+        head = None
+        if isinstance(head_obj, Name):
+            head = head_obj.ident
+        elif isinstance(head_obj, Attr) and isinstance(head_obj.obj, Name):
+            head = head_obj.obj.ident + "." + head_obj.name
+        if head in ("Literal", "typing.Literal"):
+            ctx.type_aliases[target.ident] = TYPE_DYN
+            continue
+        parsed = parse_annotation(stmt.value)
+        if not isinstance(parsed, DynType):
+            ctx.type_aliases[target.ident] = parsed
 
     for stmt in module.body:
         if isinstance(stmt, FuncDef):

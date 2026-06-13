@@ -1,4 +1,5 @@
 """Native lambda callback object lowering for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -8,15 +9,33 @@ from pcc.llvm_capi.compat import ir
 from ..py_ast import DynType, Lambda, Name
 from .runtime_abi import declare_runtime_global
 
-
 _I8 = ir.IntType(8)
 _I64 = ir.IntType(64)
 _CSTR = _I8.as_pointer()
-_PY_BUILTINS_NS = frozenset({
-    "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "len",
-    "list", "max", "min", "object", "print", "range", "set", "str", "sum",
-    "tuple", "zip",
-})
+_PY_BUILTINS_NS = frozenset(
+    {
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "dict",
+        "enumerate",
+        "float",
+        "int",
+        "len",
+        "list",
+        "max",
+        "min",
+        "object",
+        "print",
+        "range",
+        "set",
+        "str",
+        "sum",
+        "tuple",
+        "zip",
+    }
+)
 
 
 def _dataclass_field_value(obj, field_name: str, default=None):
@@ -45,6 +64,7 @@ class LambdaCallbackLoweringMixin:
             module_names.update(self.class_lowering.classes.keys())
         module_names.update(getattr(self, "_native_builtin_module_aliases", {}).keys())
         module_names.update(getattr(self, "_native_builtin_value_aliases", {}).keys())
+        module_names.update(getattr(self, "_native_extension_module_env", {}).keys())
 
         def collect_free_vars(e, bound: set, acc: set) -> None:
             if isinstance(e, Lambda):
@@ -88,9 +108,7 @@ class LambdaCallbackLoweringMixin:
         idx = self._native_lambda_callback_counter
         self._native_lambda_callback_counter += 1
         sym_base = f"__native_lambda_callback_{idx}"
-        fn_name = (
-            f"user_{(self.ast_module.name or 'mod').replace('.', '_')}_{sym_base}"
-        )
+        fn_name = f"user_{(self.ast_module.name or 'mod').replace('.', '_')}_{sym_base}"
         adapter_ty = ir.FunctionType(_CSTR, [_CSTR, _CSTR])
         adapter = ir.Function(self.module, adapter_ty, name=fn_name)
         adapter.linkage = "internal"
@@ -101,6 +119,7 @@ class LambdaCallbackLoweringMixin:
         saved_current_fn = self.current_function
         saved_current_fd = self.current_func_def
         saved_loops = getattr(self, "loop_stack", [])
+        saved_entry_block = getattr(self, "_current_entry_block", None)
 
         entry = adapter.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(entry)
@@ -109,6 +128,10 @@ class LambdaCallbackLoweringMixin:
         self.env = {}
         self.env_class_hint = {}
         self.loop_stack = []
+        # Keep _alloca_in_entry pointed at THIS function's entry, or
+        # comprehension target slots alloca into the enclosing function
+        # (cross-function alloca reference).
+        self._current_entry_block = entry
 
         param_objs: list[ir.Value] = []
         for i, pname in enumerate(param_names):
@@ -136,6 +159,7 @@ class LambdaCallbackLoweringMixin:
             self.current_function = saved_current_fn
             self.current_func_def = saved_current_fd
             self.loop_stack = saved_loops
+            self._current_entry_block = saved_entry_block
             return None
 
         self.builder = saved_builder
@@ -144,6 +168,7 @@ class LambdaCallbackLoweringMixin:
         self.current_function = saved_current_fn
         self.current_func_def = saved_current_fd
         self.loop_stack = saved_loops
+        self._current_entry_block = saved_entry_block
 
         captures = self.builder.call(
             self.runtime["py_tuple_new"],
@@ -157,4 +182,3 @@ class LambdaCallbackLoweringMixin:
         )
         self._gc_release(captures)
         return fn_obj
-

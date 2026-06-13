@@ -2,9 +2,8 @@ from __future__ import annotations
 
 """AArch64 Darwin register/immediate helpers for the self backend."""
 
-import struct
-
 from . import BackendUnavailable
+from .self_backend_float_bits import bits_to_float64, float32_to_bits, float64_to_bits
 from .self_backend_ir import TypeDesc
 
 _DIRECT_FP_IMMEDIATES = {
@@ -31,7 +30,9 @@ def pick_scratch_gpr(
     for reg in ("x15", "x14", "x13", "x12"):
         if reg not in excluded:
             return reg
-    raise BackendUnavailable("self backend ran out of scratch registers for stack address materialization")
+    raise BackendUnavailable(
+        "self backend ran out of scratch registers for stack address materialization"
+    )
 
 
 def emit_const_to_reg(value_type: TypeDesc, reg: str, value: int) -> list[str]:
@@ -41,9 +42,17 @@ def emit_const_to_reg(value_type: TypeDesc, reg: str, value: int) -> list[str]:
         bits = value_type.width if value_type.width <= 32 else 64
     else:
         bits = 32
-    mask = (1 << bits) - 1
-    unsigned = value & mask
-    chunks = [((unsigned >> shift) & 0xFFFF) for shift in range(0, bits, 16)]
+    # Arithmetic right shift plus a 16-bit mask produces the desired two's
+    # complement chunks for negative values without constructing ``1 << 64``.
+    # Keeping intermediates small is important because this emitter is also a
+    # pcc-compiled program.
+    chunks = []
+    for shift in range(0, bits, 16):
+        chunk_width = bits - shift
+        if chunk_width > 16:
+            chunk_width = 16
+        chunk_mask = (1 << chunk_width) - 1
+        chunks.append((value >> shift) & chunk_mask)
     first_index = 0
     while first_index < len(chunks) and chunks[first_index] == 0:
         first_index += 1
@@ -60,17 +69,19 @@ def emit_const_to_reg(value_type: TypeDesc, reg: str, value: int) -> list[str]:
 def emit_fp_hex_constant(value_type: TypeDesc, reg: str, token: str) -> list[str]:
     bits = int(token, 16)
     if not value_type.is_fp:
-        raise BackendUnavailable(f"self backend fp constant helper expects fp type, got {value_type.describe()}")
+        raise BackendUnavailable(
+            f"self backend fp constant helper expects fp type, got {value_type.describe()}"
+        )
     if value_type.width <= 32:
-        as_double = struct.unpack(">d", bits.to_bytes(8, byteorder="big", signed=False))[-1]
+        as_double = bits_to_float64(bits)
         immediate = _DIRECT_FP_IMMEDIATES.get(float(as_double))
         if immediate is not None:
             return [f"  fmov {reg}, #{immediate}"]
-        fp_bits = struct.unpack(">I", struct.pack(">f", float(as_double)))[0]
+        fp_bits = float32_to_bits(float(as_double))
         lines = emit_const_to_reg(TypeDesc("int", 32), "w12", fp_bits)
         lines.append(f"  fmov {reg}, w12")
         return lines
-    immediate = _DIRECT_FP_IMMEDIATES.get(struct.unpack(">d", bits.to_bytes(8, byteorder="big", signed=False))[0])
+    immediate = _DIRECT_FP_IMMEDIATES.get(bits_to_float64(bits))
     if immediate is not None:
         return [f"  fmov {reg}, #{immediate}"]
     lines = emit_const_to_reg(TypeDesc("int", 64), "x12", bits)
@@ -82,16 +93,18 @@ def emit_fp_constant(value_type: TypeDesc, reg: str, token: str) -> list[str]:
     if token.startswith("0x"):
         return emit_fp_hex_constant(value_type, reg, token)
     if not value_type.is_fp:
-        raise BackendUnavailable(f"self backend fp constant helper expects fp type, got {value_type.describe()}")
+        raise BackendUnavailable(
+            f"self backend fp constant helper expects fp type, got {value_type.describe()}"
+        )
     immediate = _DIRECT_FP_IMMEDIATES.get(float(token))
     if immediate is not None:
         return [f"  fmov {reg}, #{immediate}"]
     if value_type.width <= 32:
-        bits = struct.unpack("<I", struct.pack("<f", float(token)))[0]
+        bits = float32_to_bits(float(token))
         lines = emit_const_to_reg(TypeDesc("int", 32), "w12", bits)
         lines.append(f"  fmov {reg}, w12")
         return lines
-    bits = struct.unpack("<Q", struct.pack("<d", float(token)))[0]
+    bits = float64_to_bits(float(token))
     lines = emit_const_to_reg(TypeDesc("int", 64), "x12", bits)
     lines.append(f"  fmov {reg}, x12")
     return lines

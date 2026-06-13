@@ -389,24 +389,8 @@ class BinaryOpLoweringMixin:
             or isinstance(lhs_ty, DynType)
             or isinstance(rhs_ty, DynType)
         ):
-            lhs_obj = marshal.marshal_to_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                lhs,
-                lhs_ty,
-            )
-            rhs_obj = marshal.marshal_to_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                rhs,
-                rhs_ty,
-            )
-            return self.builder.call(
-                self.runtime["py_obj_add"],
-                [lhs_obj, rhs_obj],
-                name=self._fresh("obj.add"),
+            return self._emit_dyn_tagged_int_object_binop(
+                op, lhs, lhs_ty, rhs, rhs_ty
             )
 
         if op == "/" and (
@@ -478,19 +462,11 @@ class BinaryOpLoweringMixin:
             or isinstance(lhs_ty, DynType)
             or isinstance(rhs_ty, DynType)
         ):
-            lhs_obj = marshal.marshal_to_object(
-                self.builder, self.module, self.runtime, lhs, lhs_ty
-            )
-            rhs_obj = marshal.marshal_to_object(
-                self.builder, self.module, self.runtime, rhs, rhs_ty
-            )
-            return self.builder.call(
-                self.runtime["py_obj_sub"],
-                [lhs_obj, rhs_obj],
-                name=self._fresh("obj.sub"),
+            return self._emit_dyn_tagged_int_object_binop(
+                op, lhs, lhs_ty, rhs, rhs_ty
             )
 
-        if op == "*" and (
+        if op == "//" and (
             isinstance(result_ty, DynType)
             or isinstance(lhs_ty, DynType)
             or isinstance(rhs_ty, DynType)
@@ -501,10 +477,27 @@ class BinaryOpLoweringMixin:
             rhs_obj = marshal.marshal_to_object(
                 self.builder, self.module, self.runtime, rhs, rhs_ty
             )
-            return self.builder.call(
-                self.runtime["py_obj_mul"],
+            fdiv_res = self.builder.call(
+                self.runtime["py_obj_floordiv"],
                 [lhs_obj, rhs_obj],
-                name=self._fresh("obj.mul"),
+                name=self._fresh("obj.floordiv"),
+            )
+            # py_obj_floordiv raises (TypeError / user dunder errors) for most
+            # error cases, but INT // INT delegates to py_int_floordiv, which
+            # returns NULL *without* raising on a zero divisor (the raise is
+            # deferred to the caller, as for py_obj_mod). So a surviving NULL
+            # after the error check is a zero divisor → ZeroDivisionError.
+            self._emit_post_call_err_check(None)
+            self._emit_zero_division_if_null(fdiv_res, "division by zero")
+            return fdiv_res
+
+        if op == "*" and (
+            isinstance(result_ty, DynType)
+            or isinstance(lhs_ty, DynType)
+            or isinstance(rhs_ty, DynType)
+        ):
+            return self._emit_dyn_tagged_int_object_binop(
+                op, lhs, lhs_ty, rhs, rhs_ty
             )
 
         if (
@@ -579,7 +572,19 @@ class BinaryOpLoweringMixin:
             )
             return out
 
-        if op == "+" and (
+        _complex_binop = {
+            "+": "py_complex_add",
+            "-": "py_complex_sub",
+            "*": "py_complex_mul",
+            "/": "py_complex_div",
+            # ``**`` routes to a dedicated runtime helper that mirrors
+            # CPython's ``_Py_c_pow`` (integer fast path + exp/log/cos/sin
+            # general path). Without this the complex operand would fall
+            # through to ``_to_int64`` below and raise PCC-PY-COMPILE-001
+            # "cannot coerce ComplexType to int" at compile time.
+            "**": "py_complex_pow",
+        }.get(op)
+        if _complex_binop is not None and (
             isinstance(lhs_ty, ComplexType)
             or isinstance(rhs_ty, ComplexType)
             or isinstance(result_ty, ComplexType)
@@ -598,11 +603,16 @@ class BinaryOpLoweringMixin:
                 rhs,
                 rhs_ty,
             )
-            return self.builder.call(
-                self.runtime["py_complex_add"],
+            result = self.builder.call(
+                self.runtime[_complex_binop],
                 [lhs_obj, rhs_obj],
-                name=self._fresh("complex.add"),
+                name=self._fresh("complex.binop"),
             )
+            # py_complex_div and py_complex_pow both raise ZeroDivisionError
+            # on a zero divisor / zero-to-negative-or-complex-power.
+            if op in ("/", "**"):
+                self._emit_post_call_err_check(None)
+            return result
 
         if (
             self._int_exprs_are_boxed()
@@ -873,6 +883,43 @@ class BinaryOpLoweringMixin:
             name=self._fresh("divres_null"),
         )
         self._emit_zero_division_check(is_null, msg)
+    def _emit_dyn_tagged_int_object_binop(
+        self,
+        op: str,
+        lhs: ir.Value,
+        lhs_ty: Type,
+        rhs: ir.Value,
+        rhs_ty: Type,
+    ) -> ir.Value:
+        """Lower a DynType ``+``/``-``/``*`` with one fast/slow contract."""
+        runtime_fn = {
+            "+": "py_obj_add",
+            "-": "py_obj_sub",
+            "*": "py_obj_mul",
+        }.get(op)
+        if runtime_fn is None:
+            raise L1CodegenError(f"unsupported DynType tagged binop: {op}")
+
+        lhs_obj = marshal.marshal_to_object(
+            self.builder, self.module, self.runtime, lhs, lhs_ty
+        )
+        rhs_obj = marshal.marshal_to_object(
+            self.builder, self.module, self.runtime, rhs, rhs_ty
+        )
+        result = self._emit_inline_tagged_int_binop_or_call(
+            op,
+            lhs_obj,
+            rhs_obj,
+            runtime_fn,
+        )
+        if result is None:
+            raise L1CodegenError("DynType tagged binop requires an active function")
+        # The py_obj_* slow paths can raise through user dunders or unsupported
+        # operands. Keep the check after the joined fast/slow value so an
+        # enclosing try/except observes the runtime exception.
+        self._emit_post_call_err_check(None)
+        return result
+
     def _emit_inline_tagged_int_binop_or_call(
         self,
         op: str,
@@ -880,7 +927,7 @@ class BinaryOpLoweringMixin:
         rhs_obj: ir.Value,
         fn_name: str,
     ) -> ir.Value | None:
-        if op not in ("+", "-", "&", "|", "^"):
+        if op not in ("+", "-", "*", "&", "|", "^"):
             return None
 
         ptr_one = ir.Constant(_I64, 1)
@@ -957,6 +1004,31 @@ class BinaryOpLoweringMixin:
                 rhs_val,
                 name=self._fresh("tag.sub"),
             )
+        elif op == "*":
+            pair_type = ir.LiteralStructType([_I64, _I1])
+            intrinsic_name = "llvm.smul.with.overflow.i64"
+            intrinsic = self.module.globals.get(intrinsic_name)
+            if intrinsic is None:
+                intrinsic = ir.Function(
+                    self.module,
+                    ir.FunctionType(pair_type, [_I64, _I64]),
+                    name=intrinsic_name,
+                )
+            pair = self.builder.call(
+                intrinsic,
+                [lhs_val, rhs_val],
+                name=self._fresh("tag.mul.ov"),
+            )
+            raw = self.builder.extract_value(
+                pair,
+                [0],
+                name=self._fresh("tag.mul"),
+            )
+            mul_overflow = self.builder.extract_value(
+                pair,
+                [1],
+                name=self._fresh("tag.mul.overflow"),
+            )
         elif op == "&":
             raw = self.builder.and_(
                 lhs_val,
@@ -975,8 +1047,10 @@ class BinaryOpLoweringMixin:
                 rhs_val,
                 name=self._fresh("tag.xor"),
             )
+        if op != "*":
+            mul_overflow = None
 
-        if op in ("+", "-"):
+        if op in ("+", "-", "*"):
             min_tagged = ir.Constant(_I64, -(1 << 62))
             max_tagged = ir.Constant(_I64, (1 << 62) - 1)
             ge_min = self.builder.icmp_signed(
@@ -996,6 +1070,16 @@ class BinaryOpLoweringMixin:
                 le_max,
                 name=self._fresh("tag.fits"),
             )
+            if mul_overflow is not None:
+                no_overflow = self.builder.not_(
+                    mul_overflow,
+                    name=self._fresh("tag.mul.no_overflow"),
+                )
+                fits = self.builder.and_(
+                    no_overflow,
+                    fits,
+                    name=self._fresh("tag.mul.fits"),
+                )
             tag_bb = fn.append_basic_block(
                 name=self._fresh("int.tag.pack"),
             )

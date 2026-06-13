@@ -1,4 +1,5 @@
 """Tuple and zip builtin lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -17,7 +18,6 @@ from ..py_ast import (
     TupleType,
 )
 from . import marshal
-
 
 _I64 = ir.IntType(64)
 
@@ -59,29 +59,52 @@ def _dict_key_type(ty: object):
 
 class TupleZipLoweringMixin:
     def _maybe_emit_tuple_method(self, expr: Call) -> Optional[ir.Value]:
-        """``t.count(x)`` / ``t.index(x)`` for a tuple, via the runtime
-        py_tuple_count / py_tuple_index helpers (both return i64). index()
-        raises ValueError when absent. Other methods fall back."""
+        """``t.count(x)`` / ``t.index(x[, start[, stop]])`` for a tuple, via the
+        runtime py_tuple_count / py_tuple_index[_range] helpers (all return
+        i64). index() raises ValueError when absent (or absent within the
+        [start, stop) window). Other methods fall back."""
         attr = expr.func
         if not isinstance(attr, Attr):
             return None
-        if expr.kwargs or len(expr.args) != 1:
+        if expr.kwargs:
             return None
         name = attr.name
         if name not in ("count", "index"):
             return None
-        recv = self._emit_as_object(attr.obj)
-        item = self._emit_as_object(expr.args[0])
+        n_args = len(expr.args)
         if name == "count":
+            if n_args != 1:
+                return None
+            recv = self._emit_as_object(attr.obj)
+            item = self._emit_as_object(expr.args[0])
             return self.builder.call(
                 self.runtime["py_tuple_count"],
                 [recv, item],
                 name=self._fresh("tuple.count"),
             )
+        # name == "index": accept the 1-arg form and the 2/3-arg
+        # index(x, start[, stop]) form.
+        if n_args not in (1, 2, 3):
+            return None
+        recv = self._emit_as_object(attr.obj)
+        item = self._emit_as_object(expr.args[0])
+        if n_args == 1:
+            res = self.builder.call(
+                self.runtime["py_tuple_index"],
+                [recv, item],
+                name=self._fresh("tuple.index"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return res
+        # 2/3-arg range form. start is required here; stop is a NULL
+        # PyObject* when omitted, which the runtime treats as "to the end".
+        null_obj = ir.Constant(ir.IntType(8).as_pointer(), None)
+        start = self._emit_as_object(expr.args[1])
+        stop = self._emit_as_object(expr.args[2]) if n_args == 3 else null_obj
         res = self.builder.call(
-            self.runtime["py_tuple_index"],
-            [recv, item],
-            name=self._fresh("tuple.index"),
+            self.runtime["py_tuple_index_range"],
+            [recv, item, start, stop],
+            name=self._fresh("tuple.index.range"),
         )
         self._emit_post_call_err_check(getattr(expr, "span", None))
         return res
@@ -103,6 +126,22 @@ class TupleZipLoweringMixin:
                 name=self._fresh("tuple.new"),
             )
         arg = expr.args[0]
+        if isinstance(arg, Call):
+            tmp_list = self.builder.call(
+                self.runtime["py_list_new"],
+                [ir.Constant(_I64, 0)],
+                name=self._fresh("tuple.map.list"),
+            )
+            mapped = self._maybe_emit_list_from_map_filter(arg, tmp_list)
+            if mapped is not None:
+                result = self.builder.call(
+                    self.runtime["py_tuple_from_splat"],
+                    [mapped],
+                    name=self._fresh("tuple.from.map"),
+                )
+                self._gc_release(mapped)
+                return result
+            self._gc_release(tmp_list)
         elems = _expr_elems(arg)
         if self.module.name == "pcc.parse.py_lift":
             import os
@@ -139,14 +178,7 @@ class TupleZipLoweringMixin:
                 name=self._fresh("tuple.new"),
             )
             for i, el in enumerate(elems):
-                v = self._emit_expr(el)
-                v_obj = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    v,
-                    el.ty,
-                )
+                v_obj = self._emit_expr_as_pcc_object(el)
                 self.builder.call(
                     self.runtime["py_tuple_set_item"],
                     [tup, ir.Constant(_I64, i), v_obj],
@@ -221,7 +253,11 @@ class TupleZipLoweringMixin:
             # tuple(<custom iterator>) forced the libpython fallback.
             src_val = self._emit_expr(arg)
             src_obj = marshal.marshal_to_object(
-                self.builder, self.module, self.runtime, src_val, arg_ty,
+                self.builder,
+                self.module,
+                self.runtime,
+                src_val,
+                arg_ty,
             )
             tmp_list = self.builder.call(
                 self.runtime["py_list_new"],
@@ -229,7 +265,9 @@ class TupleZipLoweringMixin:
                 name=self._fresh("tuple.iter.list"),
             )
             self._emit_list_append_via_iter(
-                tmp_list, src_obj, getattr(arg, "span", None),
+                tmp_list,
+                src_obj,
+                getattr(arg, "span", None),
             )
             fn = self.current_function
             n_val = self.builder.call(
@@ -252,7 +290,10 @@ class TupleZipLoweringMixin:
             self.builder.position_at_end(cond_bb)
             cur = self.builder.load(idx_slot, name=self._fresh("tuple.iter.i"))
             cond = self.builder.icmp_signed(
-                "<", cur, n_val, name=self._fresh("tuple.iter.i1"),
+                "<",
+                cur,
+                n_val,
+                name=self._fresh("tuple.iter.i1"),
             )
             self.builder.cbranch(cond, body_bb, end_bb)
             self.builder.position_at_end(body_bb)
@@ -260,67 +301,6 @@ class TupleZipLoweringMixin:
                 self.runtime["py_list_get"],
                 [tmp_list, cur],
                 name=self._fresh("tuple.iter.elem"),
-            )
-            self.builder.call(
-                self.runtime["py_tuple_set_item"], [tup, cur, elem],
-            )
-            self.builder.branch(step_bb)
-            self.builder.position_at_end(step_bb)
-            nxt = self.builder.add(
-                cur, ir.Constant(_I64, 1), name=self._fresh("tuple.iter.next"),
-            )
-            self.builder.store(nxt, idx_slot)
-            self.builder.branch(cond_bb)
-            self.builder.position_at_end(end_bb)
-            return tup
-        if isinstance(arg_ty, (ListType, TupleType, DynType)) or _type_name(
-            arg_ty
-        ) in ("list", "tuple", "tuple_variadic", "dyn"):
-            src_val = self._emit_expr(arg)
-            src_obj = marshal.marshal_to_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                src_val,
-                arg_ty,
-            )
-            n_val = self.builder.call(
-                self.runtime["py_obj_len"],
-                [src_obj],
-                name=self._fresh("tuple.src.len"),
-            )
-            tup = self.builder.call(
-                self.runtime["py_tuple_new"],
-                [n_val],
-                name=self._fresh("tuple.new"),
-            )
-            fn = self.current_function
-            idx_slot = self._alloca_in_entry(_I64, name="tuple.idx.addr")
-            self.builder.store(ir.Constant(_I64, 0), idx_slot)
-            cond_bb = fn.append_basic_block(name=self._fresh("tuple.cond"))
-            body_bb = fn.append_basic_block(name=self._fresh("tuple.body"))
-            step_bb = fn.append_basic_block(name=self._fresh("tuple.step"))
-            end_bb = fn.append_basic_block(name=self._fresh("tuple.end"))
-            self.builder.branch(cond_bb)
-            self.builder.position_at_end(cond_bb)
-            cur = self.builder.load(idx_slot, name=self._fresh("tuple.idx"))
-            cond = self.builder.icmp_signed(
-                "<",
-                cur,
-                n_val,
-                name=self._fresh("tuple.cond.i1"),
-            )
-            self.builder.cbranch(cond, body_bb, end_bb)
-            self.builder.position_at_end(body_bb)
-            idx_box = self.builder.call(
-                self.runtime["py_int_from_i64"],
-                [cur],
-                name=self._fresh("tuple.idx.box"),
-            )
-            elem = self.builder.call(
-                self.runtime["py_obj_getitem"],
-                [src_obj, idx_box],
-                name=self._fresh("tuple.elem"),
             )
             self.builder.call(
                 self.runtime["py_tuple_set_item"],
@@ -331,13 +311,33 @@ class TupleZipLoweringMixin:
             nxt = self.builder.add(
                 cur,
                 ir.Constant(_I64, 1),
-                name=self._fresh("tuple.idx.next"),
+                name=self._fresh("tuple.iter.next"),
             )
             self.builder.store(nxt, idx_slot)
             self.builder.branch(cond_bb)
             self.builder.position_at_end(end_bb)
             return tup
+        if isinstance(arg_ty, (ListType, TupleType, DynType)) or _type_name(arg_ty) in (
+            "list",
+            "tuple",
+            "tuple_variadic",
+            "dyn",
+        ):
+            src_val = self._emit_expr(arg)
+            src_obj = marshal.marshal_to_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                src_val,
+                arg_ty,
+            )
+            return self.builder.call(
+                self.runtime["py_tuple_from_splat"],
+                [src_obj],
+                name=self._fresh("tuple.from.splat"),
+            )
         return None
+
     def _maybe_emit_zip_builtin(self, expr: Call) -> Optional[ir.Value]:
         """``zip(a, b, ...)`` materialised as a pcc-native list of tuples.
 

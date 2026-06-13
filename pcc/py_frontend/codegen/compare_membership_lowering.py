@@ -1,4 +1,5 @@
 """Comparison and membership lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -11,8 +12,10 @@ from ..py_ast import (
     BoolType,
     ByteArrayType,
     BytesType,
+    Call,
     ClassType,
     Compare,
+    ComplexType,
     DictType,
     DynType,
     Expr,
@@ -22,6 +25,7 @@ from ..py_ast import (
     IntType,
     ListType,
     MemoryViewType,
+    Name,
     NoneLit,
     NoneType,
     StrType,
@@ -30,7 +34,6 @@ from ..py_ast import (
     Type,
 )
 from . import marshal
-
 
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
@@ -43,13 +46,94 @@ def _same_type_kind(a: Type, b: Type) -> bool:
     return type(a) is type(b)
 
 
+_BUILTIN_TYPE_TAGS = {
+    "bool": 1,
+    "int": 2,
+    "float": 3,
+    "str": 4,
+    "list": 5,
+    "dict": 6,
+    "tuple": 7,
+    "set": 8,
+    "bytes": 17,
+    "bytearray": 18,
+}
+
+
 class CompareMembershipLoweringMixin:
+    def _emit_runtime_object_compare(
+        self,
+        expr: Compare,
+        lhs_obj: ir.Value,
+        rhs_obj: ir.Value,
+        name_prefix: str,
+    ) -> ir.Value:
+        """Emit one runtime object-comparison contract.
+
+        Object-vs-object comparisons and DynType ordering used to duplicate
+        runtime-symbol selection, the raising-call edge, and bool
+        normalization.  Operands are projected by the caller so evaluation
+        order and valueclass/CPython boundary policy stay outside this owner.
+        """
+        runtime_name = {
+            "==": "py_obj_eq",
+            "!=": "py_obj_eq",
+            "<": "py_obj_lt",
+            "<=": "py_obj_le",
+            ">": "py_obj_gt",
+            ">=": "py_obj_ge",
+        }.get(expr.op)
+        if runtime_name is None:
+            raise NotImplementedError(
+                f"Layer 2 does not handle object compare op {expr.op!r}"
+            )
+        compared = self.builder.call(
+            self.runtime[runtime_name],
+            [lhs_obj, rhs_obj],
+            name=self._fresh(name_prefix + ".cmp"),
+        )
+        self._emit_post_call_err_check(self._expr_span_or_none(expr))
+        result = self.builder.icmp_signed(
+            "!=",
+            compared,
+            ir.Constant(compared.type, 0),
+            name=self._fresh(name_prefix + ".cmp.i1"),
+        )
+        if expr.op == "!=":
+            return self.builder.not_(
+                result,
+                name=self._fresh(name_prefix + ".ne"),
+            )
+        return result
+
     def _emit_compare(self, expr: Compare) -> ir.Value:
+        builtin_type_cmp = self._emit_builtin_type_name_compare(expr)
+        if builtin_type_cmp is not None:
+            return builtin_type_cmp
+
         # Identity against None: pointer compare against @py_None.
         if expr.op in ("is", "is not"):
             return self._emit_identity_compare(expr)
         if expr.op in ("in", "not in"):
             return self._emit_membership(expr)
+
+        # Complex ordering is a hard TypeError in CPython. ``==``/``!=`` on a
+        # complex operand are valid (route to the equality paths below); only
+        # the relational operators ``<``/``<=``/``>``/``>=`` must raise. Guard
+        # here so a complex operand never falls through to the numeric
+        # fast paths (``_to_double`` has no complex case; ``_to_int64`` would
+        # misread the boxed pointer and yield a garbage bool).
+        complex_order = self._emit_complex_ordering_typeerror(expr)
+        if complex_order is not None:
+            return complex_order
+
+        # ``==``/``!=`` with a complex operand: py_obj_eq has no complex
+        # case, so two equal-valued complex boxes fell through to its
+        # identity-only default and compared unequal. Compare the
+        # (real, imag) component pairs instead.
+        complex_eq = self._emit_complex_value_equality(expr)
+        if complex_eq is not None:
+            return complex_eq
 
         if (
             self._int_exprs_are_boxed()
@@ -92,6 +176,34 @@ class CompareMembershipLoweringMixin:
         valueclass_eq = self._emit_valueclass_payload_eq(expr)
         if valueclass_eq is not None:
             return valueclass_eq
+
+        if expr.op in ("==", "!=") and (
+            self._is_valueclass_payload_type(expr.lhs.ty)
+            or self._is_valueclass_payload_type(expr.rhs.ty)
+        ):
+            # Mixed valueclass-vs-anything equality: project both operands
+            # (direct constructors become boxed valueboxes, scalars box as
+            # usual) and delegate to runtime value equality. Same-class
+            # pairs were handled by the payload fast path above.
+            lhs_obj = self._emit_expr_as_pcc_object(expr.lhs)
+            rhs_obj = self._emit_expr_as_pcc_object(expr.rhs)
+            eq = self.builder.call(
+                self.runtime["py_obj_eq"],
+                [lhs_obj, rhs_obj],
+                name=self._fresh("value.mixed.eq"),
+            )
+            eq_i1 = self.builder.icmp_signed(
+                "!=",
+                eq,
+                ir.Constant(_I32, 0),
+                name=self._fresh("value.mixed.eq.i1"),
+            )
+            if expr.op == "!=":
+                return self.builder.not_(
+                    eq_i1,
+                    name=self._fresh("value.mixed.ne"),
+                )
+            return eq_i1
 
         # Class-based comparison dunder fast path.
         cmp_dunder = {
@@ -215,6 +327,76 @@ class CompareMembershipLoweringMixin:
                     name=self._fresh("cpy.cmp.i1"),
                 )
 
+        if expr.op in ("==", "!="):
+            lhs_scalar = isinstance(lhs_ty, (IntType, BoolType, FloatType))
+            rhs_scalar = isinstance(rhs_ty, (IntType, BoolType, FloatType))
+            if (isinstance(lhs_ty, DynType) and rhs_scalar) or (
+                isinstance(rhs_ty, DynType) and lhs_scalar
+            ):
+                lhs = self._emit_expr(expr.lhs)
+                rhs = self._emit_expr(expr.rhs)
+                lhs_dyn_obj = isinstance(lhs_ty, DynType) and isinstance(
+                    lhs.type,
+                    ir.PointerType,
+                )
+                rhs_dyn_obj = isinstance(rhs_ty, DynType) and isinstance(
+                    rhs.type,
+                    ir.PointerType,
+                )
+                if lhs_dyn_obj or rhs_dyn_obj:
+                    lhs_obj = marshal.marshal_to_object(
+                        self.builder,
+                        self.module,
+                        self.runtime,
+                        lhs,
+                        lhs_ty,
+                    )
+                    rhs_obj = marshal.marshal_to_object(
+                        self.builder,
+                        self.module,
+                        self.runtime,
+                        rhs,
+                        rhs_ty,
+                    )
+                    eq = self.builder.call(
+                        self.runtime["py_obj_eq"],
+                        [lhs_obj, rhs_obj],
+                        name=self._fresh("obj.scalar.eq"),
+                    )
+                    eq_i1 = self.builder.icmp_signed(
+                        "!=",
+                        eq,
+                        ir.Constant(_I32, 0),
+                        name=self._fresh("obj.scalar.eq.i1"),
+                    )
+                    if expr.op == "!=":
+                        return self.builder.not_(
+                            eq_i1,
+                            name=self._fresh("obj.scalar.ne"),
+                        )
+                    return eq_i1
+                if isinstance(lhs_ty, FloatType) or isinstance(rhs_ty, FloatType):
+                    lf = self._to_double(lhs, lhs_ty)
+                    rf = self._to_double(rhs, rhs_ty)
+                    return self.builder.fcmp_ordered(
+                        expr.op,
+                        lf,
+                        rf,
+                        name=self._fresh("dyn.scalar.fcmp"),
+                    )
+                lv = self._to_int64(lhs, lhs_ty)
+                rv = self._to_int64(rhs, rhs_ty)
+                return self.builder.icmp_signed(
+                    expr.op,
+                    lv,
+                    rv,
+                    name=self._fresh("dyn.scalar.icmp"),
+                )
+
+        dyn_str_eq = self._emit_dyn_str_equality(expr)
+        if dyn_str_eq is not None:
+            return dyn_str_eq
+
         # String equality → runtime py_str_eq fast path. Relational str
         # ops fall through to the generic object compare helpers.
         if (
@@ -277,50 +459,11 @@ class CompareMembershipLoweringMixin:
 
         # Object-vs-object equality (for two boxed operands): delegate.
         if self._is_object(lhs_ty) and self._is_object(rhs_ty):
-            runtime_name = {
-                "==": "py_obj_eq",
-                "!=": "py_obj_eq",
-                "<": "py_obj_lt",
-                "<=": "py_obj_le",
-                ">": "py_obj_gt",
-                ">=": "py_obj_ge",
-            }.get(expr.op)
-            if runtime_name is None:
-                raise NotImplementedError(
-                    f"Layer 2 does not handle object compare op {expr.op!r}"
-                )
-            lhs = self._emit_expr(expr.lhs)
-            rhs = self._emit_expr(expr.rhs)
-            if not isinstance(lhs.type, ir.PointerType):
-                lhs = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    lhs,
-                    lhs_ty,
-                )
-            if not isinstance(rhs.type, ir.PointerType):
-                rhs = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    rhs,
-                    rhs_ty,
-                )
-            cmp_i32 = self.builder.call(
-                self.runtime[runtime_name],
-                [lhs, rhs],
-                name=self._fresh("obj.cmp"),
-            )
-            cmp_i1 = self.builder.icmp_signed(
-                "!=",
-                cmp_i32,
-                ir.Constant(_I32, 0),
-                name=self._fresh("obj.cmp.i1"),
-            )
-            if expr.op == "!=":
-                return self.builder.not_(cmp_i1, name=self._fresh("obj.ne"))
-            return cmp_i1
+            # direct valueclass constructors must project to boxed
+            # valueboxes here (value equality), not identity instances
+            lhs = self._emit_expr_as_pcc_object(expr.lhs)
+            rhs = self._emit_expr_as_pcc_object(expr.rhs)
+            return self._emit_runtime_object_compare(expr, lhs, rhs, "obj")
 
         lhs = self._emit_expr(expr.lhs)
         rhs = self._emit_expr(expr.rhs)
@@ -328,35 +471,194 @@ class CompareMembershipLoweringMixin:
             lf = self._to_double(lhs, lhs_ty)
             rf = self._to_double(rhs, rhs_ty)
             return self.builder.fcmp_ordered(expr.op, lf, rf, name=self._fresh("fcmp"))
-        if (
-            isinstance(lhs_ty, DynType) or isinstance(rhs_ty, DynType)
-        ) and expr.op in ("<", "<=", ">", ">="):
+        if (isinstance(lhs_ty, DynType) or isinstance(rhs_ty, DynType)) and expr.op in (
+            "<",
+            "<=",
+            ">",
+            ">=",
+        ):
             # A DynType operand may be a float at runtime; the int fast path
             # (_to_int64) would misread the boxed-float pointer. Route through
             # the runtime ordering compare (py_obj_lt/le/gt/ge ->
             # py_obj_cmp_threeway, which is float-aware). Mirrors the DynType
-            # arithmetic dispatch in binary_op_lowering.
-            runtime_name = {
-                "<": "py_obj_lt",
-                "<=": "py_obj_le",
-                ">": "py_obj_gt",
-                ">=": "py_obj_ge",
-            }[expr.op]
+            # arithmetic dispatch in binary_op_lowering. Set operands are
+            # DynType too, so ``set <= set`` reaches py_obj_le/lt/gt/ge, which
+            # dispatch SET&&SET to py_set_issubset/issuperset (subset order).
             lo = marshal.marshal_to_object(
                 self.builder, self.module, self.runtime, lhs, lhs_ty
             )
             ro = marshal.marshal_to_object(
                 self.builder, self.module, self.runtime, rhs, rhs_ty
             )
-            cmp_i64 = self.builder.call(
-                self.runtime[runtime_name], [lo, ro], name=self._fresh("dyn.cmp")
-            )
-            return self.builder.icmp_signed(
-                "!=", cmp_i64, ir.Constant(_I64, 0), name=self._fresh("dyn.cmp.i1")
-            )
+            return self._emit_runtime_object_compare(expr, lo, ro, "dyn")
         lv = self._to_int64(lhs, lhs_ty)
         rv = self._to_int64(rhs, rhs_ty)
         return self.builder.icmp_signed(expr.op, lv, rv, name=self._fresh("icmp"))
+
+    def _emit_dyn_str_equality(self, expr: Compare) -> Optional[ir.Value]:
+        if expr.op not in ("==", "!="):
+            return None
+        lhs_ty = expr.lhs.ty
+        rhs_ty = expr.rhs.ty
+        if isinstance(lhs_ty, DynType) and isinstance(rhs_ty, StrType):
+            dyn_expr = expr.lhs
+            str_expr = expr.rhs
+        elif isinstance(lhs_ty, StrType) and isinstance(rhs_ty, DynType):
+            dyn_expr = expr.rhs
+            str_expr = expr.lhs
+        else:
+            return None
+
+        dyn_val = self._emit_expr(dyn_expr)
+        str_val = self._emit_expr(str_expr)
+        dyn_obj = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            dyn_val,
+            dyn_expr.ty,
+        )
+        str_obj = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            str_val,
+            str_expr.ty,
+        )
+        dyn_tag = self.builder.call(
+            self.runtime["py_obj_type_tag"],
+            [dyn_obj],
+            name=self._fresh("dyn.str.tag"),
+        )
+        is_str = self.builder.icmp_signed(
+            "==",
+            dyn_tag,
+            ir.Constant(_I64, 4),
+            name=self._fresh("dyn.str.is_str"),
+        )
+
+        fn = self.current_function
+        str_bb = fn.append_basic_block(name=self._fresh("dyn.str.eq"))
+        not_str_bb = fn.append_basic_block(name=self._fresh("dyn.str.not_str"))
+        done_bb = fn.append_basic_block(name=self._fresh("dyn.str.done"))
+        self.builder.cbranch(is_str, str_bb, not_str_bb)
+
+        self.builder.position_at_end(str_bb)
+        eq_i64 = self.builder.call(
+            self.runtime["py_str_eq"],
+            [dyn_obj, str_obj],
+            name=self._fresh("dyn.str.eq.call"),
+        )
+        eq_i1 = self.builder.icmp_signed(
+            "!=",
+            eq_i64,
+            ir.Constant(_I64, 0),
+            name=self._fresh("dyn.str.eq.i1"),
+        )
+        self.builder.branch(done_bb)
+        str_end_bb = self.builder.block
+
+        self.builder.position_at_end(not_str_bb)
+        self.builder.branch(done_bb)
+        not_str_end_bb = self.builder.block
+
+        self.builder.position_at_end(done_bb)
+        result = self.builder.phi(_I1, name=self._fresh("dyn.str.result"))
+        result.add_incoming(eq_i1, str_end_bb)
+        result.add_incoming(ir.Constant(_I1, 0), not_str_end_bb)
+        if expr.op == "!=":
+            return self.builder.not_(result, name=self._fresh("dyn.str.ne"))
+        return result
+
+    def _emit_complex_ordering_typeerror(self, expr: Compare) -> Optional[ir.Value]:
+        """Raise ``TypeError`` for ``<``/``<=``/``>``/``>=`` on a complex operand.
+
+        ``complex`` supports ``==``/``!=`` but no ordering. CPython:
+        ``'<' not supported between instances of 'complex' and 'complex'``
+        (the second operand name reflects its actual type). We emit the raise
+        + branch to the active error target and return a dummy ``i1`` in a dead
+        continuation so the consumer of the compare result still has an SSA
+        value; it is unreachable at runtime.
+        """
+        if expr.op not in ("<", "<=", ">", ">="):
+            return None
+        lhs_ty = expr.lhs.ty
+        rhs_ty = expr.rhs.ty
+        if not isinstance(lhs_ty, ComplexType) and not isinstance(rhs_ty, ComplexType):
+            return None
+        lhs_name = getattr(lhs_ty, "name", None) or "complex"
+        rhs_name = getattr(rhs_ty, "name", None) or "complex"
+        message = (
+            f"'{expr.op}' not supported between instances of "
+            f"'{lhs_name}' and '{rhs_name}'"
+        )
+        self._emit_builtin_exception_and_branch(
+            "TypeError",
+            message,
+            getattr(expr, "span", None),
+            open_dead_continuation=True,
+        )
+        return ir.Constant(_I1, 0)
+
+    def _emit_complex_value_equality(self, expr: Compare) -> Optional[ir.Value]:
+        """``==``/``!=`` when an operand is statically complex.
+
+        CPython compares complex numbers component-wise
+        (``complex(1, 2) == complex(1, 2)`` is True). ``py_obj_eq`` has no
+        PY_TYPE_COMPLEX case, so without this path two equal-valued boxes
+        reached its identity-only default and compared unequal. A
+        non-complex int/float/bool side coerces exactly as the runtime's
+        py_complex_real/py_complex_imag helpers do (real=value, imag=0.0).
+        Non-numeric other sides (str, list, ...) stay on the generic object
+        path, which is already unequal-by-type.
+        """
+        if expr.op not in ("==", "!="):
+            return None
+        lhs_ty = expr.lhs.ty
+        rhs_ty = expr.rhs.ty
+        if not isinstance(lhs_ty, ComplexType) and not isinstance(rhs_ty, ComplexType):
+            return None
+        numeric = (ComplexType, IntType, FloatType, BoolType)
+        if not isinstance(lhs_ty, numeric) or not isinstance(rhs_ty, numeric):
+            return None
+        lhs_obj = self._emit_as_object(expr.lhs)
+        rhs_obj = self._emit_as_object(expr.rhs)
+        lhs_re = self._emit_complex_component_f64(lhs_obj, "py_complex_real", "re.l")
+        lhs_im = self._emit_complex_component_f64(lhs_obj, "py_complex_imag", "im.l")
+        rhs_re = self._emit_complex_component_f64(rhs_obj, "py_complex_real", "re.r")
+        rhs_im = self._emit_complex_component_f64(rhs_obj, "py_complex_imag", "im.r")
+        re_eq = self.builder.fcmp_ordered(
+            "==", lhs_re, rhs_re, name=self._fresh("complex.eq.re")
+        )
+        im_eq = self.builder.fcmp_ordered(
+            "==", lhs_im, rhs_im, name=self._fresh("complex.eq.im")
+        )
+        eq = self.builder.and_(re_eq, im_eq, name=self._fresh("complex.eq"))
+        if expr.op == "!=":
+            return self.builder.not_(eq, name=self._fresh("complex.ne"))
+        return eq
+
+    def _emit_complex_component_f64(
+        self, obj: ir.Value, helper: str, label: str
+    ) -> ir.Value:
+        """One (real or imag) component of ``obj`` as a raw double.
+
+        ``py_complex_real``/``py_complex_imag`` return an owned boxed float
+        (and coerce int/float/bool operands); unbox it and release the
+        temporary box.
+        """
+        box = self.builder.call(
+            self.runtime[helper],
+            [obj],
+            name=self._fresh(f"complex.{label}.box"),
+        )
+        part = self.builder.call(
+            self.runtime["py_float_to_f64"],
+            [box],
+            name=self._fresh(f"complex.{label}"),
+        )
+        self.builder.call(self.runtime["py_decref"], [box])
+        return part
 
     def _emit_valueclass_payload_eq(self, expr: Compare) -> Optional[ir.Value]:
         if expr.op not in ("==", "!="):
@@ -374,10 +676,54 @@ class CompareMembershipLoweringMixin:
         if len(lhs_ty.fields) != len(rhs_ty.fields):
             return None
 
-        lhs = self._emit_expr(expr.lhs)
-        rhs = self._emit_expr(expr.rhs)
+        lhs_payload = self._maybe_emit_valueclass_constructor_payload(
+            lhs_ty,
+            expr.lhs,
+        )
+        lhs = lhs_payload if lhs_payload is not None else self._emit_expr(expr.lhs)
+        rhs_payload = self._maybe_emit_valueclass_constructor_payload(
+            rhs_ty,
+            expr.rhs,
+        )
+        rhs = rhs_payload if rhs_payload is not None else self._emit_expr(expr.rhs)
+        if isinstance(lhs.type, ir.PointerType) or isinstance(rhs.type, ir.PointerType):
+            lhs_obj = self._emit_value_as_pcc_object_or_bridge(
+                lhs,
+                lhs_ty,
+                "value.eq.l.obj",
+            )
+            rhs_obj = self._emit_value_as_pcc_object_or_bridge(
+                rhs,
+                rhs_ty,
+                "value.eq.r.obj",
+            )
+            eq = self.builder.call(
+                self.runtime["py_obj_eq"],
+                [lhs_obj, rhs_obj],
+                name=self._fresh("value.eq.obj"),
+            )
+            eq_i1 = self.builder.icmp_signed(
+                "!=",
+                eq,
+                ir.Constant(eq.type, 0),
+                name=self._fresh("value.eq.obj.i1"),
+            )
+            if expr.op == "!=":
+                return self.builder.not_(eq_i1, name=self._fresh("value.ne.obj"))
+            return eq_i1
+        acc = self._emit_valueclass_payload_fields_eq(lhs, rhs, lhs_ty)
+        if expr.op == "!=":
+            return self.builder.not_(acc, name=self._fresh("value.ne"))
+        return acc
+
+    def _emit_valueclass_payload_fields_eq(
+        self,
+        lhs: ir.Value,
+        rhs: ir.Value,
+        ty: ClassType,
+    ) -> ir.Value:
         acc: Optional[ir.Value] = None
-        for idx, (_field_name, field_ty) in enumerate(lhs_ty.fields):
+        for idx, (_field_name, field_ty) in enumerate(ty.fields):
             lhs_field = self.builder.extract_value(
                 lhs,
                 [idx],
@@ -388,32 +734,11 @@ class CompareMembershipLoweringMixin:
                 [idx],
                 name=self._fresh("value.eq.r"),
             )
-            if isinstance(field_ty, FloatType):
-                field_eq = self.builder.fcmp_ordered(
-                    "==",
-                    lhs_field,
-                    rhs_field,
-                    name=self._fresh("value.eq.fcmp"),
-                )
-            elif isinstance(lhs_field.type, ir.PointerType):
-                obj_eq = self.builder.call(
-                    self.runtime["py_obj_eq"],
-                    [lhs_field, rhs_field],
-                    name=self._fresh("value.eq.obj"),
-                )
-                field_eq = self.builder.icmp_signed(
-                    "!=",
-                    obj_eq,
-                    ir.Constant(obj_eq.type, 0),
-                    name=self._fresh("value.eq.obj.i1"),
-                )
-            else:
-                field_eq = self.builder.icmp_signed(
-                    "==",
-                    lhs_field,
-                    rhs_field,
-                    name=self._fresh("value.eq.icmp"),
-                )
+            field_eq = self._emit_valueclass_payload_field_eq(
+                lhs_field,
+                rhs_field,
+                field_ty,
+            )
             if acc is None:
                 acc = field_eq
             else:
@@ -424,9 +749,94 @@ class CompareMembershipLoweringMixin:
                 )
         if acc is None:
             acc = ir.Constant(_I1, 1)
-        if expr.op == "!=":
-            return self.builder.not_(acc, name=self._fresh("value.ne"))
         return acc
+
+    def _emit_valueclass_payload_field_eq(
+        self,
+        lhs_field: ir.Value,
+        rhs_field: ir.Value,
+        field_ty: Type,
+    ) -> ir.Value:
+        if (
+            isinstance(field_ty, ClassType)
+            and bool(getattr(field_ty, "valueclass", False))
+            and self._is_valueclass_payload_type(field_ty)
+            and not isinstance(lhs_field.type, ir.PointerType)
+        ):
+            return self._emit_valueclass_payload_fields_eq(
+                lhs_field,
+                rhs_field,
+                field_ty,
+            )
+        if isinstance(field_ty, FloatType):
+            return self.builder.fcmp_ordered(
+                "==",
+                lhs_field,
+                rhs_field,
+                name=self._fresh("value.eq.fcmp"),
+            )
+        if isinstance(lhs_field.type, ir.PointerType):
+            obj_eq = self.builder.call(
+                self.runtime["py_obj_eq"],
+                [lhs_field, rhs_field],
+                name=self._fresh("value.eq.obj"),
+            )
+            return self.builder.icmp_signed(
+                "!=",
+                obj_eq,
+                ir.Constant(obj_eq.type, 0),
+                name=self._fresh("value.eq.obj.i1"),
+            )
+        return self.builder.icmp_signed(
+            "==",
+            lhs_field,
+            rhs_field,
+            name=self._fresh("value.eq.icmp"),
+        )
+
+    def _emit_builtin_type_name_compare(self, expr: Compare) -> Optional[ir.Value]:
+        if expr.op not in ("==", "!=", "is", "is not"):
+            return None
+
+        def type_call_arg(src: Expr) -> Optional[Expr]:
+            if (
+                isinstance(src, Call)
+                and isinstance(src.func, Name)
+                and src.func.ident == "type"
+                and len(src.args) == 1
+                and not src.kwargs
+            ):
+                return src.args[0]
+            return None
+
+        def builtin_type_tag(src: Expr) -> Optional[int]:
+            if isinstance(src, Name):
+                return _BUILTIN_TYPE_TAGS.get(src.ident)
+            return None
+
+        obj_expr = type_call_arg(expr.lhs)
+        tag = builtin_type_tag(expr.rhs)
+        if obj_expr is None or tag is None:
+            obj_expr = type_call_arg(expr.rhs)
+            tag = builtin_type_tag(expr.lhs)
+        if obj_expr is None or tag is None:
+            return None
+
+        obj = self._emit_expr_as_pcc_object(obj_expr)
+        actual = self.builder.call(
+            self.runtime["py_obj_type_tag"],
+            [obj],
+            name=self._fresh("type.tag"),
+        )
+        eq = self.builder.icmp_signed(
+            "==",
+            actual,
+            ir.Constant(_I64, tag),
+            name=self._fresh("type.eq.builtin"),
+        )
+        if expr.op in ("!=", "is not"):
+            return self.builder.not_(eq, name=self._fresh("type.ne.builtin"))
+        return eq
 
     def _emit_identity_compare(self, expr: Compare) -> ir.Value:
         """``is`` / ``is not`` — pointer compare, typically against None.
@@ -486,8 +896,32 @@ class CompareMembershipLoweringMixin:
         if identity_temp_needs_release(expr.rhs, rhs):
             self._gc_release(rhs_obj)
         return result
+
     def _emit_membership(self, expr: Compare) -> ir.Value:
         """``in`` / ``not in`` over str / list / dict / set / tuple."""
+        if self._is_os_environ_attr(expr.rhs):
+            key = self._emit_membership_needle_object(
+                expr.lhs,
+                "os.environ.in.key",
+            )
+            contains_i32 = self.builder.call(
+                self.runtime["py_os_environ_contains"],
+                [key],
+                name=self._fresh("os.environ.in"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            contains = self.builder.icmp_signed(
+                "!=",
+                contains_i32,
+                ir.Constant(_I32, 0),
+                name=self._fresh("os.environ.in.i1"),
+            )
+            if expr.op == "not in":
+                return self.builder.not_(
+                    contains,
+                    name=self._fresh("os.environ.notin"),
+                )
+            return contains
         container_ty = expr.rhs.ty
         weak_dict_kind = self._weak_dict_kind_for_expr(expr.rhs)
         rhs = self._emit_expr(expr.rhs)
@@ -523,13 +957,9 @@ class CompareMembershipLoweringMixin:
                     name=self._fresh("cpy.not_in"),
                 )
             return contains
-        lhs = self._emit_expr(expr.lhs)
-        lhs_ty = expr.lhs.ty
-
         if weak_dict_kind == "value":
-            key = self._emit_value_as_pcc_object_or_bridge(
-                lhs,
-                lhs_ty,
+            key = self._emit_membership_needle_object(
+                expr.lhs,
                 "weak.value.dict.in.key",
             )
             res_i32 = self.builder.call(
@@ -557,6 +987,8 @@ class CompareMembershipLoweringMixin:
             # where the comp-scope inference didn't propagate the
             # element type), we still have a ``PyObject*`` — py_str_*
             # helpers tolerate foreign types by length/bytes compare.
+            lhs = self._emit_expr(expr.lhs)
+            lhs_ty = expr.lhs.ty
             needle = lhs
             if not isinstance(lhs.type, ir.PointerType):
                 needle = marshal.marshal_to_object(
@@ -568,9 +1000,8 @@ class CompareMembershipLoweringMixin:
                 name=self._fresh("str.in"),
             )
         elif isinstance(container_ty, ListType):
-            needle = self._emit_value_as_pcc_object_or_bridge(
-                lhs,
-                lhs_ty,
+            needle = self._emit_membership_needle_object(
+                expr.lhs,
                 "cpy.list.in.key",
             )
             res_i32 = self.builder.call(
@@ -579,9 +1010,8 @@ class CompareMembershipLoweringMixin:
                 name=self._fresh("list.in"),
             )
         elif isinstance(container_ty, DictType):
-            key = self._emit_value_as_pcc_object_or_bridge(
-                lhs,
-                lhs_ty,
+            key = self._emit_membership_needle_object(
+                expr.lhs,
                 "cpy.dict.in.key",
             )
             res_i32 = self.builder.call(
@@ -596,11 +1026,12 @@ class CompareMembershipLoweringMixin:
             # tuple containers via linear scan.
             if isinstance(expr.rhs, TupleExpr):
                 return self._emit_membership_tuple_literal(
-                    lhs, lhs_ty, expr.rhs, negate=(expr.op == "not in")
+                    expr.lhs,
+                    expr.rhs,
+                    negate=(expr.op == "not in"),
                 )
-            key = self._emit_value_as_pcc_object_or_bridge(
-                lhs,
-                lhs_ty,
+            key = self._emit_membership_needle_object(
+                expr.lhs,
                 "cpy.tuple.in.key",
             )
             res_i32 = self.builder.call(
@@ -614,9 +1045,8 @@ class CompareMembershipLoweringMixin:
             # where Optional[dict] or getattr(...) inference collapses to the
             # abstract Type base; known concrete str/list/dict/tuple cases
             # above still keep their specialized fast paths.
-            key = self._emit_value_as_pcc_object_or_bridge(
-                lhs,
-                lhs_ty,
+            key = self._emit_membership_needle_object(
+                expr.lhs,
                 "cpy.obj.in.key",
             )
             res_i32 = self.builder.call(
@@ -637,9 +1067,8 @@ class CompareMembershipLoweringMixin:
                 )
             return result
         else:
-            key = self._emit_value_as_pcc_object_or_bridge(
-                lhs,
-                lhs_ty,
+            key = self._emit_membership_needle_object(
+                expr.lhs,
                 "cpy.obj.in.key",
             )
             res_i32 = self.builder.call(
@@ -666,20 +1095,39 @@ class CompareMembershipLoweringMixin:
         if expr.op == "not in":
             return self.builder.not_(res, name=self._fresh("not_in"))
         return res
+
+    def _emit_membership_needle_object(self, expr: Expr, name_hint: str) -> ir.Value:
+        valueclass_payload = self._maybe_emit_valueclass_constructor_payload(
+            expr.ty,
+            expr,
+        )
+        if valueclass_payload is not None:
+            boxed_valueclass = self._emit_valueclass_payload_to_object(
+                valueclass_payload,
+                expr.ty,
+            )
+            if boxed_valueclass is not None:
+                return boxed_valueclass
+        value = self._emit_expr(expr)
+        return self._emit_value_as_pcc_object_or_bridge(
+            value,
+            expr.ty,
+            name_hint,
+        )
+
     def _emit_membership_tuple_literal(
-        self, lhs: ir.Value, lhs_ty: Type, rhs: TupleExpr, negate: bool
+        self, lhs_expr: Expr, rhs: TupleExpr, negate: bool
     ) -> ir.Value:
         """Unroll ``x in (a, b, c)`` as ``x==a or x==b or x==c``."""
-        lhs_obj = self._emit_value_as_pcc_object_or_bridge(
-            lhs,
-            lhs_ty,
+        lhs_obj = self._emit_membership_needle_object(
+            lhs_expr,
             "cpy.tup.lit.in.key",
         )
         acc: Optional[ir.Value] = None
         for el in rhs.elems:
-            v = self._emit_expr(el)
-            v_obj = marshal.marshal_to_object(
-                self.builder, self.module, self.runtime, v, el.ty
+            v_obj = self._emit_membership_needle_object(
+                el,
+                "cpy.tup.lit.in.el",
             )
             eq_i32 = self.builder.call(
                 self.runtime["py_obj_eq"],
@@ -702,6 +1150,7 @@ class CompareMembershipLoweringMixin:
         if negate:
             return self.builder.not_(acc, name=self._fresh("tup.not_in"))
         return acc
+
     def _emit_boolexpr(self, expr: BoolExpr) -> ir.Value:
         # Short-circuit via branch. ``and`` / ``or`` return either the
         # left operand or the right operand; only the pure-bool case
@@ -757,4 +1206,45 @@ class CompareMembershipLoweringMixin:
         else:  # "or"
             phi.add_incoming(ir.Constant(_I1, 1), entry_bb)
             phi.add_incoming(rhs_b, rhs_exit)
+        return phi
+
+    def _emit_boolexpr_as_pcc_object(self, expr: BoolExpr) -> ir.Value:
+        # Object-boundary short-circuit keeps Python's selected-operand
+        # semantics while avoiding raw valueclass payload phis.
+        fn = self.current_function
+        dyn_ty = DynType(name="dyn")
+
+        old_prefer_native = self._prefer_native_callable_values
+        self._prefer_native_callable_values = True
+        try:
+            lhs_obj = self._emit_expr_as_pcc_object(expr.left)
+        finally:
+            self._prefer_native_callable_values = old_prefer_native
+        lhs_b = self._truthy(lhs_obj, dyn_ty)
+
+        rhs_bb = fn.append_basic_block(name=self._fresh("bool.obj.rhs"))
+        end_bb = fn.append_basic_block(name=self._fresh("bool.obj.end"))
+        entry_bb = self.builder._block
+
+        if expr.op == "and":
+            self.builder.cbranch(lhs_b, rhs_bb, end_bb)
+        elif expr.op == "or":
+            self.builder.cbranch(lhs_b, end_bb, rhs_bb)
+        else:
+            raise NotImplementedError(f"Layer 1 bool op {expr.op!r} not supported")
+
+        self.builder.position_at_end(rhs_bb)
+        old_prefer_native = self._prefer_native_callable_values
+        self._prefer_native_callable_values = True
+        try:
+            rhs_obj = self._emit_expr_as_pcc_object(expr.right)
+        finally:
+            self._prefer_native_callable_values = old_prefer_native
+        rhs_exit = self.builder._block
+        self.builder.branch(end_bb)
+
+        self.builder.position_at_end(end_bb)
+        phi = self.builder.phi(_CSTR, name=self._fresh(f"{expr.op}.obj"))
+        phi.add_incoming(lhs_obj, entry_bb)
+        phi.add_incoming(rhs_obj, rhs_exit)
         return phi

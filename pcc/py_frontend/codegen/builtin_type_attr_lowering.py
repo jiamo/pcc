@@ -1,4 +1,5 @@
 """Builtin type/attribute helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -21,12 +22,10 @@ from ..py_ast import (
 from . import marshal
 from .errors import L1CodegenError
 
-
 _I1 = ir.IntType(1)
 _I8 = ir.IntType(8)
 _I64 = ir.IntType(64)
 _CSTR = _I8.as_pointer()
-
 
 
 class BuiltinTypeAttrLoweringMixin:
@@ -47,7 +46,7 @@ class BuiltinTypeAttrLoweringMixin:
                 "getattr",
                 tuple(expr.args),
             )
-        obj_val = self._emit_as_object(expr.args[0])
+        obj_val = self._emit_expr_as_pcc_object(expr.args[0])
         name_expr = expr.args[1]
         if isinstance(name_expr, StrLit):
             name_ptr = self._attr_name_ptr(name_expr.value)
@@ -67,6 +66,15 @@ class BuiltinTypeAttrLoweringMixin:
                 [n_obj],
                 name=self._fresh("getattr.name"),
             )
+        # Python evaluates every call argument left-to-right before invoking
+        # the callable.  In particular, evaluate the default before
+        # py_obj_getattr can install the AttributeError that this three-arg
+        # form is responsible for swallowing.  Deferring default evaluation
+        # until after the lookup leaks that pending exception into any runtime
+        # calls made while constructing the default value.
+        default_obj = (
+            self._emit_as_object(expr.args[2]) if len(expr.args) == 3 else None
+        )
         got = self.builder.call(
             self.runtime["py_obj_getattr"],
             [obj_val, name_ptr],
@@ -74,7 +82,7 @@ class BuiltinTypeAttrLoweringMixin:
         )
         if len(expr.args) == 2:
             return got
-        default_obj = self._emit_as_object(expr.args[2])
+        assert default_obj is not None
         is_missing = self.builder.icmp_signed(
             "==",
             got,
@@ -99,7 +107,6 @@ class BuiltinTypeAttrLoweringMixin:
         phi.add_incoming(got, present_exit)
         return phi
 
-
     def _emit_attr_name_ptr_arg(self, expr: Expr, label: str) -> ir.Value:
         if isinstance(expr, StrLit):
             return self._attr_name_ptr(expr.value)
@@ -117,14 +124,39 @@ class BuiltinTypeAttrLoweringMixin:
             name=self._fresh(label),
         )
 
-
     def _emit_setattr_builtin(self, expr: Call) -> ir.Value:
+        target = expr.args[0]
+        if isinstance(target, Name):
+            module_name = getattr(self, "_native_module_aliases", {}).get(target.ident)
+            if module_name is not None:
+                name_ptr = self._emit_attr_name_ptr_arg(
+                    expr.args[1],
+                    "setattr.module.name",
+                )
+                value = self._emit_expr_as_pcc_object(expr.args[2])
+                module_name_ptr = self._ptr_to_cstr(
+                    self._cstr_global(
+                        module_name,
+                        f".setattr.module.{module_name}",
+                    )
+                )
+                status = self.builder.call(
+                    self.runtime["py_module_attr_set"],
+                    [module_name_ptr, name_ptr, value],
+                    name=self._fresh("setattr.module.rc"),
+                )
+                self._emit_attribute_error_if_status_failed(
+                    status,
+                    "module attribute",
+                    expr.span,
+                )
+                return self._emit_none_literal()
         obj = self._emit_as_object(expr.args[0])
         name_ptr = self._emit_attr_name_ptr_arg(
             expr.args[1],
             "setattr.name",
         )
-        value = self._emit_as_object(expr.args[2])
+        value = self._emit_expr_as_pcc_object(expr.args[2])
         status = self.builder.call(
             self.runtime["py_obj_setattr"],
             [obj, name_ptr, value],
@@ -136,7 +168,6 @@ class BuiltinTypeAttrLoweringMixin:
             expr.span,
         )
         return self._emit_none_literal()
-
 
     def _emit_delattr_builtin(self, expr: Call) -> ir.Value:
         obj = self._emit_as_object(expr.args[0])
@@ -150,7 +181,6 @@ class BuiltinTypeAttrLoweringMixin:
             name=self._fresh("delattr.rc"),
         )
         return self._emit_none_literal()
-
 
     def _emit_type_builtin(self, expr: Call) -> ir.Value:
         """``type(obj)`` — returns the runtime class PyObject*.
@@ -181,7 +211,6 @@ class BuiltinTypeAttrLoweringMixin:
             [obj_val, name_ptr],
             name=self._fresh("type"),
         )
-
 
     def _emit_len_call(self, expr: Call) -> ir.Value:
         """``len(x)`` → type-specialised runtime call.
@@ -245,28 +274,122 @@ class BuiltinTypeAttrLoweringMixin:
             self.runtime["py_obj_len"], [boxed], name=self._fresh("obj.len")
         )
 
-
     def _emit_str_builtin(self, expr: Call) -> ir.Value:
-        """``str(x)`` → ``py_obj_str``; pass-through on already-str."""
+        """``str(x)`` -> owned PCC string, matching CPython's new-ref result."""
+        if len(expr.args) in (2, 3) and not expr.kwargs:
+            source = self._emit_expr_as_pcc_object(expr.args[0])
+            encoding = self._emit_expr_as_pcc_object(expr.args[1])
+            errors = (
+                self._emit_expr_as_pcc_object(expr.args[2])
+                if len(expr.args) == 3
+                else self._emit_str_literal("strict")
+            )
+            return self.builder.call(
+                self.runtime["py_bytes_decode_with_encoding"],
+                [source, encoding, errors],
+                name=self._fresh("str.decode.bytes"),
+            )
         if len(expr.args) != 1:
             raise NotImplementedError("str() with multi-arg not supported")
         arg = expr.args[0]
-        v = self._emit_expr(arg)
-        if v in getattr(self, "_cpy_values", ()):
-            return self.builder.call(
-                self.runtime["py_cpy_to_pcc_str"],
-                [v],
-                name=self._fresh("cpy.to_pcc_str"),
-            )
         if isinstance(arg.ty, StrType):
-            return v
-        boxed = marshal.marshal_to_object(
-            self.builder, self.module, self.runtime, v, arg.ty
-        )
-        return self.builder.call(
+            v = self._emit_expr(arg)
+            if v in getattr(self, "_cpy_values", ()):
+                return self.builder.call(
+                    self.runtime["py_cpy_to_pcc_str"],
+                    [v],
+                    name=self._fresh("cpy.to_pcc_str"),
+                )
+            if self._expr_returns_owned_object(arg):
+                return v
+            return self._gc_retain(v, name=self._fresh("str.retain"))
+        if self._expr_looks_cpython(arg):
+            v = self._emit_expr(arg)
+            if v in getattr(self, "_cpy_values", ()):
+                return self.builder.call(
+                    self.runtime["py_cpy_to_pcc_str"],
+                    [v],
+                    name=self._fresh("cpy.to_pcc_str"),
+                )
+        boxed = self._emit_expr_as_pcc_object(arg)
+        result = self.builder.call(
             self.runtime["py_obj_str"], [boxed], name=self._fresh("obj.str")
         )
+        return self.builder.call(
+            self.runtime["pcc_gc_resolve_owned_ptr"],
+            [result],
+            name=self._fresh("obj.str.resolve"),
+        )
 
+    def _emit_enumerate_builtin(self, expr: Call) -> Optional[ir.Value]:
+        """Value-position ``enumerate(iterable[, start])`` -> eager
+        (index, item) tuple list via the C-only ``py_enumerate_list``
+        helper (the for-loop form never reaches here — for
+        normalization desugars it to a counter). Returns None for
+        shapes this lowering does not cover so the caller falls
+        through unchanged."""
+        start_expr = None
+        if len(expr.args) == 1 and not expr.kwargs:
+            pass
+        elif len(expr.args) == 2 and not expr.kwargs:
+            start_expr = expr.args[1]
+        elif (
+            len(expr.args) == 1
+            and len(expr.kwargs) == 1
+            and expr.kwargs[0][0] == "start"
+        ):
+            start_expr = expr.kwargs[0][1]
+        else:
+            return None
+        iter_obj = self._emit_as_object(expr.args[0])
+        if start_expr is not None:
+            start_val = self._emit_expr_as_i64(start_expr)
+        else:
+            start_val = ir.Constant(_I64, 0)
+        result = self.builder.call(
+            self.runtime["py_enumerate_list"],
+            [iter_obj, start_val],
+            name=self._fresh("enumerate.list"),
+        )
+        # py_obj_iter raises TypeError for non-iterables; iteration can
+        # propagate pending exceptions.
+        self._emit_post_call_err_check(getattr(expr, "span", None))
+        return result
+
+    # Encoding-name sets mirror the ``str.encode`` lowering in
+    # ``string_method_lowering.py`` so the two-arg ``bytes``/``bytearray``
+    # constructors accept exactly the encodings the encode helpers already
+    # cover natively; every other encoding falls through to libpython.
+    _UTF8_ENCODING_NAMES = ("utf-8", "utf8", "UTF-8", "UTF8")
+    _LATIN1_ENCODING_NAMES = ("latin-1", "latin1")
+
+    def _bytes_encoding_helper_for_arg(self, encoding_expr: Expr) -> Optional[str]:
+        """Return the runtime encode helper name for a ``bytes(str, encoding)``
+        encoding literal, or ``None`` when the encoding is dynamic / unsupported
+        (caller then falls through to the libpython fallback)."""
+        if not isinstance(encoding_expr, StrLit):
+            return None
+        if encoding_expr.value in self._UTF8_ENCODING_NAMES:
+            return "py_str_utf8_encode"
+        if encoding_expr.value in self._LATIN1_ENCODING_NAMES:
+            return "py_str_latin1_encode"
+        return None
+
+    def _emit_str_encode_to_bytes(
+        self,
+        str_expr: Expr,
+        helper: str,
+        label: str,
+    ) -> ir.Value:
+        """Encode a str expression to a bytes object via the given runtime
+        encode helper. The helper reads the raw ``PY_TYPE_STR`` layout, so the
+        argument must be materialized as a pcc str object."""
+        src = self._emit_expr_as_pcc_object(str_expr)
+        return self.builder.call(
+            self.runtime[helper],
+            [src],
+            name=self._fresh(label),
+        )
 
     def _emit_bytes_family_builtin(
         self,
@@ -289,7 +412,35 @@ class BuiltinTypeAttrLoweringMixin:
                     [ir.Constant(_CSTR, None), ir.Constant(_I64, 0)],
                     name=self._fresh("bytes.empty"),
                 )
+            if len(expr.args) == 2 and isinstance(expr.args[0].ty, StrType):
+                # bytes(str, encoding-literal) -> encode the str directly with
+                # the matching runtime helper. Only literal utf-8 / latin-1
+                # encodings are handled natively; anything else returns None so
+                # the caller falls through to the libpython fallback.
+                helper = self._bytes_encoding_helper_for_arg(expr.args[1])
+                if helper is not None:
+                    return self._emit_str_encode_to_bytes(
+                        expr.args[0], helper, "bytes.encode"
+                    )
             return None
+        if (
+            name == "bytearray"
+            and len(expr.args) == 2
+            and isinstance(expr.args[0].ty, StrType)
+        ):
+            # bytearray(str, encoding-literal) -> encode the str to bytes, then
+            # wrap the bytes object as a bytearray (mirrors CPython's
+            # bytearray(str, encoding) two-arg form).
+            helper = self._bytes_encoding_helper_for_arg(expr.args[1])
+            if helper is not None:
+                encoded = self._emit_str_encode_to_bytes(
+                    expr.args[0], helper, "bytearray.encode.bytes"
+                )
+                return self.builder.call(
+                    self.runtime["py_bytearray_from_obj"],
+                    [encoded],
+                    name=self._fresh("bytearray.encode"),
+                )
         if name == "bytearray" and len(expr.args) == 1:
             src = self._emit_as_object(expr.args[0])
             return self.builder.call(

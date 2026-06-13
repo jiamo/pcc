@@ -1,8 +1,8 @@
 """String/global constant helpers for Layer-1 Python codegen."""
+
 from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
-
 
 _I8 = ir.IntType(8)
 _I32 = ir.IntType(32)
@@ -70,29 +70,56 @@ class StringGlobalsLoweringMixin:
         intentionally distinct from :meth:`_cstr_literal` so a later
         optimiser can fold them if it wishes.
         """
-        existing = self._attr_pool.get(name)
+        # Contextual mixin ``self`` parameters are not yet described as an
+        # L1CodeGen object in the native function ABI, so they are not entered
+        # as borrowed GC roots.  Snapshot every heap object needed below into
+        # typed locals before the first allocation and never reload through a
+        # potentially relocated ``self`` pointer later in this routine.
+        stable_name: str = name
+        attr_pool: dict[str, ir.GlobalVariable] = self._attr_pool
+        module: ir.Module = self.module
+        name_bytes: list[int] = self._utf8_byte_values(stable_name)
+        existing = attr_pool.get(stable_name)
         if existing is None:
-            data = self._utf8_byte_values(name) + [0]
+            data = name_bytes + [0]
             arr_ty = ir.ArrayType(_I8, len(data))
-            sym = ".pyattr." + str(name)
+            sym = ".pyattr."
+            sym = sym + stable_name
             # Multiple distinct attrs may share a name; disambiguate.
-            if sym in self.module.globals:
-                sym = ".pyattr." + str(name) + "." + str(len(self._attr_pool))
-            gv = ir.GlobalVariable(self.module, arr_ty, name=sym)
+            if sym in module.globals:
+                attr_count_text = str(len(attr_pool))
+                sym = ".pyattr."
+                sym = sym + stable_name
+                sym = sym + "."
+                sym = sym + attr_count_text
+            gv = ir.GlobalVariable(module, arr_ty, name=sym)
             gv.linkage = "internal"
             gv.global_constant = True
             gv.initializer = ir.Constant(arr_ty, data)
-            self._attr_pool[name] = gv
+            attr_pool[stable_name] = gv
             existing = gv
-        expr = (
-            "getelementptr inbounds ("
-            + str(existing.value_type)
-            + ", "
-            + str(existing.type)
-            + " @"
-            + str(existing.name)
-            + ", i32 0, i32 0)"
-        )
+            name_text = sym
+        else:
+            typed_existing: ir.GlobalVariable = existing
+            name_text = typed_existing.name
+        # Keep each rendered component in a named local.  In pcc1-native
+        # code, inline ``str(existing.*)`` results are otherwise unrooted
+        # across the allocating concatenation chain and can become NULL late
+        # in a large module-top initializer.
+        array_count = len(name_bytes) + 1
+        array_count_text = str(array_count)
+        value_type_text = "["
+        value_type_text = value_type_text + array_count_text
+        value_type_text = value_type_text + " x i8]"
+        # String globals are always addrspace-0 opaque pointers.
+        pointer_type_text = "ptr"
+        expr = "getelementptr inbounds ("
+        expr = expr + value_type_text
+        expr = expr + ", "
+        expr = expr + pointer_type_text
+        expr = expr + " @"
+        expr = expr + name_text
+        expr = expr + ", i32 0, i32 0)"
         return ir.Value(ir.PointerType(_I8), expr)
 
     def _cstr_global(self, payload: str, name: str) -> ir.GlobalVariable:

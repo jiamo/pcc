@@ -7,6 +7,7 @@ from pcc.llvm_capi.compat import ir
 
 from ..py_ast import (
     BinOp,
+    BoolExpr,
     BoolLit,
     BoolType,
     Call,
@@ -14,6 +15,7 @@ from ..py_ast import (
     DictType,
     DynType,
     Expr,
+    IfExpr,
     IntLit,
     IntType,
     ListType,
@@ -49,6 +51,15 @@ class ExactIntLoweringMixin:
             if isinstance(value.type, ir.PointerType):
                 return value
         if isinstance(expr, BinOp):
+            if (
+                expr.op == "**"
+                and isinstance(expr.lhs, IntLit)
+                and isinstance(expr.rhs, IntLit)
+                and expr.rhs.value >= 0
+            ):
+                folded = pow(int(expr.lhs.value), int(expr.rhs.value))
+                if -(1 << 63) <= folded <= (1 << 63) - 1:
+                    return self._emit_int_literal_object(folded)
             fn_name = {
                 "+": "py_int_add",
                 "-": "py_int_sub",
@@ -249,7 +260,38 @@ class ExactIntLoweringMixin:
             exact = self._maybe_emit_exact_int_object(expr)
             if exact is not None:
                 return exact
+        if isinstance(expr, IfExpr):
+            return self._emit_if_expr_as_pcc_object(expr)
+        if isinstance(expr, BoolExpr):
+            return self._emit_boolexpr_as_pcc_object(expr)
+        valueclass_payload = self._maybe_emit_valueclass_constructor_payload(
+            expr.ty,
+            expr,
+        )
+        if valueclass_payload is not None:
+            boxed_valueclass = self._emit_valueclass_payload_to_object(
+                valueclass_payload,
+                expr.ty,
+                consume_fields=True,
+            )
+            if boxed_valueclass is not None:
+                return boxed_valueclass
         value = self._emit_expr(expr)
+        if value in getattr(self, "_cpy_values", ()):
+            # CPython-bridge result (e.g. ``random.randint(...)`` as a
+            # comprehension element) — convert to a pcc object before it
+            # is stored into a pcc container, or the raw foreign pointer
+            # would flow into native int/str ops and fail there.
+            bridged = self.builder.call(
+                self.runtime["py_cpy_to_pcc_obj"],
+                [value],
+                name=self._fresh("as_pcc.cpy.bridge"),
+            )
+            self.builder.call(self.runtime["py_cpy_decref"], [value])
+            return bridged
+        boxed_valueclass = self._emit_valueclass_payload_to_object(value, expr.ty)
+        if boxed_valueclass is not None:
+            return boxed_valueclass
         return marshal.marshal_to_object(
             self.builder,
             self.module,
@@ -268,41 +310,11 @@ class ExactIntLoweringMixin:
         obj = self._emit_expr(expr.obj)
         if obj in self._cpy_values:
             return None
-        if isinstance(obj_ty, ListType):
-            idx = self._emit_index_expr_as_i64(expr.idx)
-            got = self.builder.call(
-                self.runtime["py_list_getitem"],
-                [obj, idx],
-                name=self._fresh("list.getitem.obj"),
-            )
-            # py_list_getitem raises IndexError on out-of-range; emit the
-            # post-call err check so a surrounding try/except can catch it.
-            self._emit_post_call_err_check(getattr(expr, "span", None))
-            self._gc_release_if_owned(obj, expr.obj)
-            return got
-        if isinstance(obj_ty, TupleType):
-            idx = self._emit_index_expr_as_i64(expr.idx)
-            got = self.builder.call(
-                self.runtime["py_tuple_get"],
-                [obj, idx],
-                name=self._fresh("tup.get.obj"),
-            )
-            self._gc_release_if_owned(obj, expr.obj)
-            return got
-        if isinstance(obj_ty, DictType):
-            key_obj = self._emit_as_object(expr.idx)
-            got = self.builder.call(
-                self.runtime["py_dict_getitem"],
-                [obj, key_obj],
-                name=self._fresh("dict.getitem.obj"),
-            )
-            # py_dict_getitem raises KeyError (carrying the key) when missing;
-            # emit the post-call err check so try/except can catch it.
-            self._emit_post_call_err_check(getattr(expr, "span", None))
-            self._gc_release_if_owned(obj, expr.obj)
-            return got
+        exact_container = self._emit_exact_container_subscript_load_object(expr, obj)
+        if exact_container is not None:
+            return exact_container[0]
         if isinstance(obj_ty, DynType):
-            key_obj = self._emit_as_object(expr.idx)
+            key_obj = self._emit_subscript_key_object(expr.idx)
             got = self.builder.call(
                 self.runtime["py_obj_getitem"],
                 [obj, key_obj],

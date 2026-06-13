@@ -244,6 +244,20 @@ class ImportLoweringMixin:
         }
     )
 
+    def _strict_no_libpython_import_fallback_enabled(self) -> bool:
+        return bool(getattr(self, "_strict_no_libpython", False))
+
+    def _emit_strict_no_libpython_import_error(
+        self,
+        module_name: str,
+        span: Optional[SourceSpan],
+    ) -> None:
+        self._emit_builtin_exception_and_branch(
+            "ImportError",
+            "No module named " + repr(module_name),
+            span,
+        )
+
     def _is_extern_scaffold_import_module(
         self,
         module_name: Optional[str],
@@ -390,6 +404,10 @@ class ImportLoweringMixin:
                 "Dict",
                 "Set",
                 "Tuple",
+                "SupportsIndex",
+                "TypeAlias",
+                "TypeAliasType",
+                "TypedDict",
             ):
                 self._register_native_builtin_value_alias(
                     local_name,
@@ -433,7 +451,9 @@ class ImportLoweringMixin:
             base = os.path.join(site_root, rel)
             for suffix in suffixes:
                 candidate = base + suffix
-                if os.path.isfile(candidate) and not self._native_extension_name_uses_cpython_abi(candidate):
+                if os.path.isfile(
+                    candidate
+                ) and not self._native_extension_name_uses_cpython_abi(candidate):
                     return os.path.abspath(candidate)
             parent = os.path.dirname(base)
             leaf = os.path.basename(base)
@@ -456,6 +476,33 @@ class ImportLoweringMixin:
                 return os.path.abspath(full)
         return None
 
+    def _publish_module_scope_import_binding(
+        self,
+        local_name: str,
+        value: ir.Value,
+    ) -> None:
+        """Publish an executed module-scope import at statement time.
+
+        Imports are observable while a module is only partially initialized.
+        The end-of-module globals publication remains the final namespace
+        synchronization, but waiting for it here makes import cycles lose
+        bindings that CPython exposes as soon as their statement completes.
+        """
+        if self.current_func_def is not None:
+            return
+        current_module = self.ast_module.name or "__main__"
+        module_name_ptr = self._ptr_to_cstr(
+            self._cstr_global(
+                current_module,
+                f".pcc.import.binding.module.{current_module}",
+            )
+        )
+        self.builder.call(
+            self.runtime["py_module_attr_set"],
+            [module_name_ptr, self._attr_name_ptr(local_name), value],
+            name=self._fresh(f"pcc.import.binding.publish.{local_name}"),
+        )
+
     def _emit_native_extension_import(
         self,
         module_name: str,
@@ -477,6 +524,191 @@ class ImportLoweringMixin:
         gv = self._native_extension_module_global(local_name)
         self.builder.store(mod_val, gv)
         self._native_extension_modules()[local_name] = gv
+        self._publish_module_scope_import_binding(local_name, mod_val)
+
+    def _emit_compiled_module_import(
+        self,
+        module_name: str,
+        local_name: str,
+    ) -> None:
+        """Initialize a compiled sibling and bind its real module object.
+
+        Compiled-module initializers are registered before entry execution and
+        run on demand here.  This preserves statement order and partially
+        initialized package state across import cycles.
+        """
+        mod_ptr = self._ptr_to_cstr(
+            self._cstr_global(module_name, f".pcc.compiled.mod.{module_name}")
+        )
+        mod_val = self.builder.call(
+            self.runtime["py_compiled_module_import_by_name"],
+            [mod_ptr],
+            name=self._fresh(f"pcc.compiled.import.{module_name.replace('.', '_')}"),
+        )
+        self._emit_post_call_err_check()
+        gv = self._native_extension_module_global(local_name)
+        self.builder.store(mod_val, gv)
+        self._native_extension_modules()[local_name] = gv
+        self._publish_module_scope_import_binding(local_name, mod_val)
+
+    def _emit_compiled_module_ensure_initialized(self, module_name: str) -> None:
+        """Run a compiled sibling's guarded top-level initializer on import."""
+        mod_ptr = self._ptr_to_cstr(
+            self._cstr_global(module_name, f".pcc.compiled.ensure.{module_name}")
+        )
+        module = self.builder.call(
+            self.runtime["py_compiled_module_import_by_name"],
+            [mod_ptr],
+            name=self._fresh(f"pcc.compiled.ensure.{module_name.replace('.', '_')}"),
+        )
+        self._emit_post_call_err_check()
+        self._gc_release(module)
+
+    def _emit_native_extension_import_from(
+        self,
+        module_name: str,
+        extension_path: str,
+        names: list[tuple[str, Optional[str]]],
+        span=None,
+    ) -> None:
+        mod_ptr = self._ptr_to_cstr(
+            self._cstr_global(module_name, f".pcc.ext.from.mod.{module_name}")
+        )
+        path_ptr = self._ptr_to_cstr(
+            self._cstr_global(extension_path, f".pcc.ext.from.path.{module_name}")
+        )
+        module = self.builder.call(
+            self.runtime["py_native_extension_import"],
+            [mod_ptr, path_ptr],
+            name=self._fresh(f"pcc.ext.from.import.{module_name.replace('.', '_')}"),
+        )
+        self._emit_post_call_err_check()
+        for attr_name, as_name in names:
+            if attr_name == "*":
+                gv = self._native_extension_star_module_global(module_name)
+                self.builder.store(module, gv)
+                current_module = self.ast_module.name or "__main__"
+                current_module_ptr = self._ptr_to_cstr(
+                    self._cstr_global(
+                        current_module,
+                        f".pcc.ext.star.dest.{current_module}",
+                    )
+                )
+                self.builder.call(
+                    self.runtime["py_module_import_star"],
+                    [current_module_ptr, module],
+                    name=self._fresh("pcc.ext.star.import"),
+                )
+                self._emit_post_call_err_check()
+                continue
+            attr_ptr = self._attr_name_ptr(attr_name)
+            value = self.builder.call(
+                self.runtime["py_obj_getattr"],
+                [module, attr_ptr],
+                name=self._fresh(f"pcc.ext.from.{attr_name}"),
+            )
+            self._emit_post_call_err_check()
+            local_name = as_name or attr_name
+            if self.current_func_def is not None and local_name not in getattr(
+                self, "_current_global_names", set()
+            ):
+                # An import statement binds in the executing function's local
+                # scope.  A same-named module global declared elsewhere must
+                # not capture this value (for example a helper importing
+                # ``make_scanner`` before the module later assigns its public
+                # ``make_scanner`` alias).
+                self._store_unpack_target(
+                    Name(
+                        span=span,
+                        ty=DynType(name="dyn"),
+                        ident=local_name,
+                    ),
+                    value,
+                    DynType(name="dyn"),
+                    value_is_owned=True,
+                )
+                continue
+            gv = self._native_extension_module_global(local_name)
+            self.builder.store(value, gv)
+            self._native_extension_modules()[local_name] = gv
+            self._publish_module_scope_import_binding(local_name, value)
+        self._gc_release(module)
+
+    def _emit_compiled_module_import_from(
+        self,
+        module_name: str,
+        names: list[tuple[str, Optional[str]]],
+    ) -> None:
+        """Load dynamic exports from an initialized sibling module.
+
+        Static cross-module functions and classes are bound earlier through
+        the native export table.  This path covers exports used as ordinary
+        Python values, such as a class passed to ``isinstance`` or stored in a
+        keyword dictionary, without routing them through libpython.
+        """
+        mod_ptr = self._ptr_to_cstr(
+            self._cstr_global(module_name, f".pcc.compiled.from.mod.{module_name}")
+        )
+        module = self.builder.call(
+            self.runtime["py_compiled_module_import_by_name"],
+            [mod_ptr],
+            name=self._fresh(
+                f"pcc.compiled.from.import.{module_name.replace('.', '_')}"
+            ),
+        )
+        self._emit_post_call_err_check()
+        for attr_name, as_name in names:
+            if attr_name == "*":
+                raise NotImplementedError(
+                    "star import from compiled sibling module is not supported"
+                )
+            attr_ptr = self._attr_name_ptr(attr_name)
+            value = self.builder.call(
+                self.runtime["py_obj_getattr"],
+                [module, attr_ptr],
+                name=self._fresh(f"pcc.compiled.from.{attr_name}"),
+            )
+            self._emit_post_call_err_check()
+            local_name = as_name or attr_name
+            gv = self._native_extension_module_global(local_name)
+            self.builder.store(value, gv)
+            self._native_extension_modules()[local_name] = gv
+            self._publish_module_scope_import_binding(local_name, value)
+        self._gc_release(module)
+
+    def _emit_compiled_module_import_star(self, module_name: str) -> None:
+        """Copy a compiled sibling's runtime namespace for ``import *``.
+
+        The closed-world export table covers statically declared names.  Python
+        modules may also publish names dynamically through ``globals()`` and
+        extend ``__all__`` while executing; copy the live module dictionary so
+        those names participate in the same module object graph.
+        """
+        mod_ptr = self._ptr_to_cstr(
+            self._cstr_global(module_name, f".pcc.compiled.star.mod.{module_name}")
+        )
+        module = self.builder.call(
+            self.runtime["py_compiled_module_import_by_name"],
+            [mod_ptr],
+            name=self._fresh(
+                f"pcc.compiled.star.import.{module_name.replace('.', '_')}"
+            ),
+        )
+        self._emit_post_call_err_check()
+        current_module = self.ast_module.name or "__main__"
+        current_module_ptr = self._ptr_to_cstr(
+            self._cstr_global(
+                current_module,
+                f".pcc.compiled.star.dest.{current_module}",
+            )
+        )
+        self.builder.call(
+            self.runtime["py_module_import_star"],
+            [current_module_ptr, module],
+            name=self._fresh("pcc.compiled.star.copy"),
+        )
+        self._emit_post_call_err_check()
+        self._gc_release(module)
 
     def _emit_import(self, stmt: Import) -> None:
         """Lower ``import a`` / ``import a.b`` / ``import a.b as c`` via
@@ -493,7 +725,10 @@ class ImportLoweringMixin:
             if m == "typing":
                 self._register_native_builtin_module_alias(a or m, "typing")
                 continue
-            if m.split(".")[0] in ("__future__", "typing", "abc", "click") or m == "pcc.extern":
+            if (
+                m.split(".")[0] in ("__future__", "typing", "abc", "click")
+                or m == "pcc.extern"
+            ):
                 continue
             local_name = a or m.split(".")[0]
             if m in (
@@ -518,7 +753,6 @@ class ImportLoweringMixin:
                 "string",
                 "platform",
                 "subprocess",
-                "asyncio",
                 "tempfile",
                 "fileinput",
                 "shutil",
@@ -539,26 +773,48 @@ class ImportLoweringMixin:
                 "importlib",
                 "inspect",
                 "contextlib",
+                "contextvars",
+                "enum",
                 "warnings",
                 "textwrap",
+                "traceback",
             ):
+                if mod_name in getattr(self, "_sibling_module_inits", ()):
+                    self._emit_compiled_module_ensure_initialized(mod_name)
                 self._register_native_builtin_module_alias(
                     as_name or mod_name,
                     mod_name,
                 )
                 continue
             if native_table is not None and mod_name in native_table:
-                # Native sibling: register the alias and skip the
-                # CPython import call. ``module.X`` access goes
+                # Native sibling: initialize it at the import statement, then
+                # register the static alias. ``module.X`` access still goes
                 # through ``_native_module_alias_export_info``.
+                if mod_name in getattr(self, "_sibling_module_inits", ()):
+                    self._emit_compiled_module_ensure_initialized(mod_name)
                 local_name = as_name or mod_name.split(".")[0]
                 self._register_native_module_alias(local_name, mod_name)
+                continue
+            if mod_name in getattr(self, "_sibling_module_inits", ()):
+                local_name = as_name or mod_name.split(".")[0]
+                self._emit_compiled_module_import(mod_name, local_name)
                 continue
             extension_path = self._resolve_pcc_native_extension_path(mod_name)
             if extension_path is not None:
                 local_name = as_name or mod_name.split(".")[0]
                 self._emit_native_extension_import(mod_name, local_name, extension_path)
                 continue
+            if (
+                self._strict_no_libpython_import_fallback_enabled()
+                and mod_name not in self._ANNOTATION_ONLY_IMPORT_MODULES
+            ):
+                self._emit_strict_no_libpython_import_error(mod_name, stmt.span)
+                return
+            # llvmlite.binding / llvmlite.ir are pcc's own LLVM-backend deps:
+            # when actually used at runtime (annotation-only use is already
+            # dropped above) they import via CPython even in --python-libpython=off.
+            # The self-backend bootstrap closure never uses them at runtime, so
+            # this exemption stays inert there.
             self._ensure_cpy_init()
             cpy_modules = self._cpy_modules()
             # Always import the full dotted path so side-effect
@@ -600,6 +856,9 @@ class ImportLoweringMixin:
         local_name: str,
     ) -> None:
         """Bind ``local_name`` to a CPython module object."""
+        if self._strict_no_libpython_import_fallback_enabled():
+            self._emit_strict_no_libpython_import_error(module_name, None)
+            return
         self._ensure_cpy_init()
         cpy_modules = self._cpy_modules()
         mod_ptr = self._ptr_to_cstr(
@@ -743,7 +1002,11 @@ class ImportLoweringMixin:
         ``from . import parser`` / ``from .codegen import layer1`` when
         the surrounding package was not compiled natively into the same
         multi-file closure."""
-        if not _import_from_level_or_zero(stmt) or not import_module or attr_name == "*":
+        if (
+            not _import_from_level_or_zero(stmt)
+            or not import_module
+            or attr_name == "*"
+        ):
             return None
         src_file = stmt.span.file or ""
         cur_mod = self.ast_module.name or ""
@@ -791,8 +1054,29 @@ class ImportLoweringMixin:
         native_table = self._native_module_exports
         if native_table is not None:
             import_module = self._resolve_relative_import(stmt)
+            if import_module in getattr(self, "_sibling_module_inits", ()):
+                self._emit_compiled_module_ensure_initialized(import_module)
             remaining_names: list[tuple[str, Optional[str]]] = []
             for attr_name, as_name in stmt_names:
+                extension_submodule = None
+                extension_submodule_path = None
+                if import_module and attr_name != "*":
+                    extension_submodule = import_module + "." + attr_name
+                    extension_submodule_path = self._resolve_pcc_native_extension_path(
+                        extension_submodule
+                    )
+                if extension_submodule_path is not None:
+                    # ``from . import _native`` inside a package names the
+                    # extension submodule itself.  Extension modules are not
+                    # Python AST siblings and therefore do not appear in the
+                    # closed-world export table; resolve their pinned artifact
+                    # before treating a missing package export as ImportError.
+                    self._emit_native_extension_import(
+                        extension_submodule,
+                        as_name or attr_name,
+                        extension_submodule_path,
+                    )
+                    continue
                 full_submodule = self._native_import_from_submodule(
                     import_module,
                     attr_name,
@@ -804,8 +1088,19 @@ class ImportLoweringMixin:
                         attr_name,
                     )
                 if full_submodule is not None and full_submodule in native_table:
+                    local_name = as_name or attr_name
+                    if full_submodule in getattr(self, "_sibling_module_inits", ()):
+                        # Keep the real module object as the import binding as
+                        # well as the static alias used by direct cross-module
+                        # calls.  Module namespace publication later needs the
+                        # object so ``hasattr(wrapper, "submodule")`` observes
+                        # the binding created by this statement.
+                        self._emit_compiled_module_import(
+                            full_submodule,
+                            local_name,
+                        )
                     self._register_native_module_alias(
-                        as_name or attr_name,
+                        local_name,
                         full_submodule,
                     )
                     continue
@@ -854,6 +1149,18 @@ class ImportLoweringMixin:
                     f"[debug] _emit_import_from returning early for {import_module!r}\n"
                 )
             return
+        extension_path = self._resolve_pcc_native_extension_path(import_module)
+        if extension_path is not None:
+            self._emit_native_extension_import_from(
+                import_module,
+                extension_path,
+                stmt_names,
+                stmt.span,
+            )
+            return
+        if import_module in getattr(self, "_sibling_module_inits", ()):
+            self._emit_compiled_module_import_from(import_module, stmt_names)
+            return
         if os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE"):
             sys.stderr.write(
                 "debug: import_from_cpy_fallback module="
@@ -862,6 +1169,9 @@ class ImportLoweringMixin:
                 + ",".join((a or "") + ":" + (b or "") for a, b in stmt_names)
                 + "\n"
             )
+        if self._strict_no_libpython_import_fallback_enabled():
+            self._emit_strict_no_libpython_import_error(import_module, stmt.span)
+            return
         self._ensure_cpy_init()
         cpy_modules = self._cpy_modules()
         mod_ptr = self._ptr_to_cstr(

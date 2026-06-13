@@ -94,11 +94,27 @@ def set_struct_body(struct_ty, body, packed: bool = False) -> None:
         struct_ty.set_body(*body)
 
 
+def add_raw_function_attribute(function, attribute: str) -> None:
+    """Add one already-rendered LLVM function attribute across IR backends.
+
+    pcc's native IR builder accepts target string attributes directly.
+    llvmlite's public ``FunctionAttributes.add`` rejects target key/value
+    strings even though its renderer and LLVM accept them. Add those strings
+    to llvmlite's underlying set at IR-construction time; this is deliberately
+    not an IR-text rewrite.
+    """
+    attrs = function.attributes
+    try:
+        attrs.add(attribute)
+    except ValueError:
+        set.add(attrs, attribute)
+
+
 __all__ = [
     "ir", "binding",
     "ir_py", "binding_py",
     "ir_c", "binding_c",
     "ir_passes", "binding_passes",
     "USE_LLVMLITE_PY", "USE_LLVMLITE_C", "USE_LLVMLITE_PASSES",
-    "set_struct_body",
+    "add_raw_function_attribute", "set_struct_body",
 ]

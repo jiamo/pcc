@@ -3,6 +3,7 @@
 State-swapping lambda wrapping stays host-owned in layer1.py; this
 module only contains helper routines that do not assign to self fields.
 """
+
 from __future__ import annotations
 
 from typing import Optional
@@ -32,7 +33,6 @@ from .layer1_support import (
     _dataclass_field_value,
 )
 from . import marshal
-
 
 _I8 = ir.IntType(8)
 _I64 = ir.IntType(64)
@@ -215,10 +215,39 @@ class LambdaHelperLoweringMixin:
         if hasattr(self, "class_lowering"):
             module_names.update(self.class_lowering.classes.keys())
         module_names.update(getattr(self, "_cpy_module_env", {}).keys())
+        module_names.update(getattr(self, "_native_extension_module_env", {}).keys())
         module_names.update(getattr(self, "_native_module_aliases", {}).keys())
         module_names.update(getattr(self, "_native_module_object_aliases", {}).keys())
         module_names.update(getattr(self, "_native_builtin_module_aliases", {}).keys())
         module_names.update(getattr(self, "_native_builtin_value_aliases", {}).keys())
+
+        lexical_shadow_names = set(getattr(self, "_lambda_lexical_shadow_names", set()))
+        cur_fd = getattr(self, "current_func_def", None)
+        if cur_fd is not None:
+            for p in getattr(cur_fd, "params", ()) or ():
+                pname = getattr(p, "name", "")
+                if pname:
+                    lexical_shadow_names.add(pname)
+        current_fn = getattr(self, "current_function", None)
+        class_lowering = getattr(self, "class_lowering", None)
+        if current_fn is not None and class_lowering is not None:
+            for _class_name, info in getattr(class_lowering, "classes", {}).items():
+                matched_method_name = ""
+                for method_name, method_fn in getattr(info, "methods", {}).items():
+                    if method_fn is current_fn:
+                        matched_method_name = method_name
+                        break
+                if matched_method_name == "":
+                    continue
+                for method_name, method_fd in getattr(info, "method_defs", ()):
+                    if method_name != matched_method_name:
+                        continue
+                    for p in getattr(method_fd, "args", ()) or ():
+                        pname = getattr(p, "name", "")
+                        if pname:
+                            lexical_shadow_names.add(pname)
+                    break
+                break
 
         def collect(e, bound: set[str], acc: set[str]) -> None:
             def add_target_names(target, target_bound: set[str]) -> None:
@@ -290,9 +319,20 @@ class LambdaHelperLoweringMixin:
                     collect(body_expr, comp_bound, acc)
                 return
             if isinstance(e, Name):
+                if e.ident in bound:
+                    return
+                # A local/parameter in the current emitting function must
+                # shadow any module-level hoisted helper with the same name.
+                # pproxy's HTTP CONNECT path has ``accept(...): async def
+                # reply(...); return await self.http_accept(reply)`` and
+                # ``http_accept(self, reply): return lambda writer:
+                # reply(...)``.  The lambda must capture the ``reply``
+                # parameter, not resolve the older hoisted ``__nested_reply``.
+                if e.ident in self.env or e.ident in lexical_shadow_names:
+                    acc.add(e.ident)
+                    return
                 if (
-                    e.ident not in bound
-                    and e.ident not in builtins_ns
+                    e.ident not in builtins_ns
                     and e.ident not in module_names
                     and e.ident
                     not in (
@@ -334,10 +374,44 @@ class LambdaHelperLoweringMixin:
         if any(name == "" for name in param_names):
             return None
         free_vars = self._lambda_free_vars(expr, param_names)
+        # Recheck module-resolvable names at the native-lambda boundary.  The
+        # recursive collector above is a nested closure; in a self-hosted
+        # compiler its captured ``module_names`` set can conservatively report
+        # module globals/functions as free.  Load those through the normal
+        # module resolver instead of rejecting or capturing them as locals.
+        module_names = set(getattr(self, "_module_globals", {}).keys())
+        module_names.update(self.functions.keys())
+        module_names.update(getattr(self, "_hoist_wrap_caps", {}).keys())
+        if hasattr(self, "class_lowering"):
+            module_names.update(self.class_lowering.classes.keys())
+        module_names.update(getattr(self, "_cpy_module_env", {}).keys())
+        module_names.update(
+            getattr(self, "_native_extension_module_env", {}).keys()
+        )
+        module_names.update(getattr(self, "_native_module_aliases", {}).keys())
+        module_names.update(
+            getattr(self, "_native_module_object_aliases", {}).keys()
+        )
+        module_names.update(
+            getattr(self, "_native_builtin_module_aliases", {}).keys()
+        )
+        module_names.update(
+            getattr(self, "_native_builtin_value_aliases", {}).keys()
+        )
         for fv in free_vars:
-            if fv not in self.env:
+            if fv not in self.env and fv not in module_names:
                 return None
-        free_var_names = tuple(sorted(free_vars))
+        free_var_names = tuple(sorted(fv for fv in free_vars if fv in self.env))
+        default_params = tuple(
+            (i, p)
+            for i, p in enumerate(expr.params)
+            if getattr(p, "has_default", False)
+            and getattr(p, "default", None) is not None
+        )
+        default_capture_index = {
+            i: len(free_var_names) + default_i
+            for default_i, (i, _p) in enumerate(default_params)
+        }
 
         if not hasattr(self, "_native_lambda_func_counter"):
             self._native_lambda_func_counter = 0
@@ -356,9 +430,11 @@ class LambdaHelperLoweringMixin:
         saved_env_class_hint = getattr(self, "env_class_hint", {})
         saved_env_class_object_hint = getattr(self, "env_class_object_hint", {})
         saved_cpy_env_flags = dict(getattr(self, "_cpy_env_flags", {}))
+        saved_cpy_values = set(getattr(self, "_cpy_values", set()))
         saved_current_fn = self.current_function
         saved_current_fd = self.current_func_def
         saved_loops = getattr(self, "loop_stack", [])
+        saved_entry_block = getattr(self, "_current_entry_block", None)
 
         entry = adapter.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(entry)
@@ -368,7 +444,13 @@ class LambdaHelperLoweringMixin:
         self.env_class_hint = {}
         self.env_class_object_hint = {}
         self._cpy_env_flags = {}
+        self._cpy_values = set()
         self.loop_stack = []
+        # _alloca_in_entry targets _current_entry_block; without this switch
+        # a comprehension inside the lambda body allocas its target slot in
+        # the ENCLOSING function's entry (cross-function alloca reference ->
+        # "self backend expected pointer value 'st.addr.N'").
+        self._current_entry_block = entry
 
         for i, fv in enumerate(free_var_names):
             cap = self.builder.call(
@@ -380,14 +462,56 @@ class LambdaHelperLoweringMixin:
             self.builder.store(cap, slot)
             self.env[fv] = (slot, _CSTR, DynType(name="dyn"))
 
+        args_len = self.builder.call(
+            self.runtime["py_tuple_len"],
+            [adapter.args[1]],
+            name=self._fresh("lambda.args.len"),
+        )
         for i, pname in enumerate(param_names):
-            obj = self.builder.call(
-                self.runtime["py_tuple_get"],
-                [adapter.args[1], ir.Constant(_I64, i)],
-                name=self._fresh(f"{pname}.arg"),
-            )
             slot = self.builder.alloca(_CSTR, name=f"{pname}.addr")
-            self.builder.store(obj, slot)
+            if i in default_capture_index:
+                has_arg = self.builder.icmp_signed(
+                    ">",
+                    args_len,
+                    ir.Constant(_I64, i),
+                    name=self._fresh(f"{pname}.has_arg"),
+                )
+                arg_bb = adapter.append_basic_block(name=self._fresh(f"{pname}.arg"))
+                default_bb = adapter.append_basic_block(
+                    name=self._fresh(f"{pname}.default")
+                )
+                cont_bb = adapter.append_basic_block(name=self._fresh(f"{pname}.cont"))
+                self.builder.cbranch(has_arg, arg_bb, default_bb)
+
+                self.builder.position_at_end(arg_bb)
+                obj = self.builder.call(
+                    self.runtime["py_tuple_get"],
+                    [adapter.args[1], ir.Constant(_I64, i)],
+                    name=self._fresh(f"{pname}.arg"),
+                )
+                self.builder.store(obj, slot)
+                self.builder.branch(cont_bb)
+
+                self.builder.position_at_end(default_bb)
+                obj = self.builder.call(
+                    self.runtime["py_tuple_get"],
+                    [
+                        adapter.args[0],
+                        ir.Constant(_I64, default_capture_index[i]),
+                    ],
+                    name=self._fresh(f"{pname}.default"),
+                )
+                self.builder.store(obj, slot)
+                self.builder.branch(cont_bb)
+
+                self.builder.position_at_end(cont_bb)
+            else:
+                obj = self.builder.call(
+                    self.runtime["py_tuple_get"],
+                    [adapter.args[1], ir.Constant(_I64, i)],
+                    name=self._fresh(f"{pname}.arg"),
+                )
+                self.builder.store(obj, slot)
             self.env[pname] = (slot, _CSTR, DynType(name="dyn"))
 
         try:
@@ -417,9 +541,11 @@ class LambdaHelperLoweringMixin:
             self.env_class_hint = saved_env_class_hint
             self.env_class_object_hint = saved_env_class_object_hint
             self._cpy_env_flags = saved_cpy_env_flags
+            self._cpy_values = saved_cpy_values
             self.current_function = saved_current_fn
             self.current_func_def = saved_current_fd
             self.loop_stack = saved_loops
+            self._current_entry_block = saved_entry_block
             return None
 
         self.builder = saved_builder
@@ -427,13 +553,15 @@ class LambdaHelperLoweringMixin:
         self.env_class_hint = saved_env_class_hint
         self.env_class_object_hint = saved_env_class_object_hint
         self._cpy_env_flags = saved_cpy_env_flags
+        self._cpy_values = saved_cpy_values
         self.current_function = saved_current_fn
         self.current_func_def = saved_current_fd
         self.loop_stack = saved_loops
+        self._current_entry_block = saved_entry_block
 
         captures = self.builder.call(
             self.runtime["py_tuple_new"],
-            [ir.Constant(_I64, len(free_var_names))],
+            [ir.Constant(_I64, len(free_var_names) + len(default_params))],
             name=self._fresh("lambda.native.captures"),
         )
         for i, fv in enumerate(free_var_names):
@@ -462,6 +590,34 @@ class LambdaHelperLoweringMixin:
             self.builder.call(
                 self.runtime["py_tuple_set_item"],
                 [captures, ir.Constant(_I64, i), obj],
+            )
+        for default_i, (_param_i, param) in enumerate(default_params):
+            default_expr = param.default
+            if default_expr is None:
+                continue
+            raw = self._emit_expr(default_expr)
+            if raw in getattr(self, "_cpy_values", ()):
+                obj = self.builder.call(
+                    self.runtime["py_cpy_to_pcc_obj"],
+                    [raw],
+                    name=self._fresh("lambda.default.bridge"),
+                )
+                self.builder.call(self.runtime["py_cpy_decref"], [raw])
+            else:
+                obj = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    raw,
+                    default_expr.ty,
+                )
+            self.builder.call(
+                self.runtime["py_tuple_set_item"],
+                [
+                    captures,
+                    ir.Constant(_I64, len(free_var_names) + default_i),
+                    obj,
+                ],
             )
         fn_obj = self.builder.call(
             self.runtime["py_func_new"],
@@ -503,6 +659,18 @@ class LambdaHelperLoweringMixin:
                 and isinstance(val.type, ir.PointerType)
                 and not _native_capture_type(ty)
             ):
+                # J2': inside a generator the slot may hold a CpyHandle
+                # box — unbox before increfing the RAW foreign ref the
+                # lambda capture contract expects.
+                gen_stack = getattr(self, "_generator_ctx_stack", ())
+                if len(gen_stack) > 0 and name in gen_stack[-1].get(
+                    "cpy_boxed_names", ()
+                ):
+                    val = self.builder.call(
+                        self.runtime["py_cpy_handle_get"],
+                        [val],
+                        name=self._fresh(f"{name}.cpy.unbox"),
+                    )
                 self.builder.call(self.runtime["py_cpy_incref"], [val])
                 return val
             cpy_val, _ = self._marshal_to_cpython(val, ty)
@@ -632,6 +800,7 @@ class LambdaHelperLoweringMixin:
         if hasattr(self, "class_lowering"):
             module_names.update(self.class_lowering.classes.keys())
         module_names.update(getattr(self, "_cpy_module_env", {}).keys())
+        module_names.update(getattr(self, "_native_extension_module_env", {}).keys())
         from ..py_ast import Lambda as _Lambda
 
         def collect_free_vars(e, bound: set, acc: set) -> None:
@@ -718,9 +887,12 @@ class LambdaHelperLoweringMixin:
         saved_env = self.env
         saved_env_class_hint = getattr(self, "env_class_hint", {})
         saved_env_class_object_hint = getattr(self, "env_class_object_hint", {})
+        saved_cpy_env_flags = dict(getattr(self, "_cpy_env_flags", {}))
+        saved_cpy_values = set(getattr(self, "_cpy_values", set()))
         saved_current_fn = self.current_function
         saved_current_fd = self.current_func_def
         saved_loops = getattr(self, "loop_stack", [])
+        saved_entry_block = getattr(self, "_current_entry_block", None)
 
         entry = fn_ir.append_basic_block(name="entry")
         setattr(self, "builder", ir.IRBuilder(entry))
@@ -729,17 +901,19 @@ class LambdaHelperLoweringMixin:
         setattr(self, "env", {})
         setattr(self, "env_class_hint", {})
         setattr(self, "env_class_object_hint", {})
+        setattr(self, "_cpy_env_flags", {})
+        setattr(self, "_cpy_values", set())
         setattr(self, "loop_stack", [])
+        # _alloca_in_entry targets _current_entry_block; keep it in sync with
+        # the function being emitted or comprehension target slots land in
+        # the enclosing function's entry (cross-function alloca reference).
+        setattr(self, "_current_entry_block", entry)
 
         # Allocate a slot per lambda param, store each incoming arg,
         # tag both the stored value and subsequent loads as CPython —
         # the trampoline hands us CPython PyObject*s, so every
         # attr / method dispatch inside the body must take the CPython
         # path.
-        if not hasattr(self, "_cpy_env_flags"):
-            setattr(self, "_cpy_env_flags", {})
-        if not hasattr(self, "_cpy_values"):
-            setattr(self, "_cpy_values", set())
         for ir_arg, pname in zip(fn_ir.args, param_names):
             slot = self.builder.alloca(_CSTR, name=f"{pname}.addr")
             self.builder.store(ir_arg, slot)
@@ -807,9 +981,12 @@ class LambdaHelperLoweringMixin:
             setattr(self, "env", saved_env)
             setattr(self, "env_class_hint", saved_env_class_hint)
             setattr(self, "env_class_object_hint", saved_env_class_object_hint)
+            setattr(self, "_cpy_env_flags", saved_cpy_env_flags)
+            setattr(self, "_cpy_values", saved_cpy_values)
             setattr(self, "current_function", saved_current_fn)
             setattr(self, "current_func_def", saved_current_fd)
             setattr(self, "loop_stack", saved_loops)
+            setattr(self, "_current_entry_block", saved_entry_block)
             return None
 
         # Restore outer state now that the lambda body is fully emitted.
@@ -817,9 +994,12 @@ class LambdaHelperLoweringMixin:
         setattr(self, "env", saved_env)
         setattr(self, "env_class_hint", saved_env_class_hint)
         setattr(self, "env_class_object_hint", saved_env_class_object_hint)
+        setattr(self, "_cpy_env_flags", saved_cpy_env_flags)
+        setattr(self, "_cpy_values", saved_cpy_values)
         setattr(self, "current_function", saved_current_fn)
         setattr(self, "current_func_def", saved_current_fd)
         setattr(self, "loop_stack", saved_loops)
+        setattr(self, "_current_entry_block", saved_entry_block)
 
         # Before wrapping, store each captured outer-scope value into
         # its dedicated lambda-capture global. Next time the lambda

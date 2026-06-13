@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 """Asm-first self backend bootstrap for AArch64 Darwin.
 
 This backend consumes current LLVM IR text as a bootstrap input and lowers a
@@ -50,11 +52,10 @@ from .self_backend_ir import (
     ParsedInstr,
 )
 from .self_backend_module_symbols import PreparedModuleSymbols
-from .self_backend_prepare import prepare_module_for_target
+from .self_backend_prepare import PreparedSelfBackendModule, prepare_module_for_target
 from .self_backend_target_passes import run_self_target_memory_pass_pipeline
 from .self_backend_target_match import is_aarch64_darwin_triple
 from .self_backend_terminator_dispatch import emit_terminator_dispatch
-
 
 _MODULE_SYMBOLS = PreparedModuleSymbols(
     internal_prefix="",
@@ -63,21 +64,39 @@ _MODULE_SYMBOLS = PreparedModuleSymbols(
 )
 
 
-def emit_aarch64_darwin_asm(ir_text: str) -> str:
-    global _MODULE_SYMBOLS
+def emit_aarch64_darwin_asm(ir_text: str, optimize: bool = True) -> str:
+    # ``ir_text`` is a borrowed function parameter.  The self-compiled path
+    # forwards it through the prepare/parser stack.  Keep this wrapper short:
+    # the prepared module crosses the next call as an owned return value, while
+    # the large source string no longer shares a frame with every emit pass.
+    owned_ir_text = ir_text + ""
     prepared = prepare_module_for_target(
-        ir_text,
+        owned_ir_text,
         aggregate_returned_indirect=_aggregate_returned_indirect,
     )
+    return _emit_prepared_aarch64_darwin_module(prepared, optimize)
+
+
+def _emit_prepared_aarch64_darwin_module(
+    prepared: PreparedSelfBackendModule,
+    optimize: bool = True,
+) -> str:
+    global _MODULE_SYMBOLS
     triple = prepared.triple
-    if not is_aarch64_darwin_triple(triple):
+    if triple != "unknown-unknown-unknown" and not is_aarch64_darwin_triple(triple):
         raise BackendUnavailable(
             f"self backend asm MVP only supports AArch64 Darwin, got {triple!r}"
         )
-    prepared = run_self_target_memory_pass_pipeline(
-        prepared,
-        "self-aarch64-darwin-v0",
-    )
+    if (
+        str(os.environ.get("PCC_SELF_TARGET_PASS_TRANSPORT", "") or "").strip().lower()
+        == "memory"
+    ):
+        prepared = run_self_target_memory_pass_pipeline(
+            prepared,
+            "self-aarch64-darwin-v0",
+            raw_passes=None,
+            raw_transport="memory",
+        )
 
     globals_ = prepared.globals_
     functions = prepared.functions
@@ -88,23 +107,24 @@ def emit_aarch64_darwin_asm(ir_text: str) -> str:
         lines.append(".section __TEXT,__text,regular,pure_instructions")
         for func in functions:
             lines.extend(_emit_function(func))
-    lines = _forward_adjacent_stack_store_load(lines)
-    lines = _forward_one_intervening_stack_store_load(lines)
-    lines = _fold_zero_store_source(lines)
-    lines = _fold_mov_store_source(lines)
-    lines = _fold_zero_compare_immediate(lines)
-    lines = _fold_mov_compare_source(lines)
-    lines = _fold_mov_zero_branch_source(lines)
-    lines = _fold_mov_arith_self_update(lines)
-    lines = _fold_mov_mov_chain(lines)
-    lines = _fold_zero_test_branch(lines)
-    lines = _fold_forwarded_cset_branch(lines)
-    lines = _fold_cset_zero_branch(lines)
-    lines = _drop_dead_cset_branch_stores(lines)
-    lines = _thread_trampoline_branches(lines)
-    lines = _fold_cond_branch_to_fallthrough(lines)
-    lines = _drop_fallthrough_uncond_branches(lines)
-    lines = _drop_unreferenced_empty_local_labels(lines)
+    if optimize:
+        lines = _forward_adjacent_stack_store_load(lines)
+        lines = _forward_one_intervening_stack_store_load(lines)
+        lines = _fold_zero_store_source(lines)
+        lines = _fold_mov_store_source(lines)
+        lines = _fold_zero_compare_immediate(lines)
+        lines = _fold_mov_compare_source(lines)
+        lines = _fold_mov_zero_branch_source(lines)
+        lines = _fold_mov_arith_self_update(lines)
+        lines = _fold_mov_mov_chain(lines)
+        lines = _fold_zero_test_branch(lines)
+        lines = _fold_forwarded_cset_branch(lines)
+        lines = _fold_cset_zero_branch(lines)
+        lines = _drop_dead_cset_branch_stores(lines)
+        lines = _thread_trampoline_branches(lines)
+        lines = _fold_cond_branch_to_fallthrough(lines)
+        lines = _drop_fallthrough_uncond_branches(lines)
+        lines = _drop_unreferenced_empty_local_labels(lines)
     if lines:
         lines.append(".subsections_via_symbols")
     return "\n".join(lines) + "\n"
@@ -136,7 +156,21 @@ def _forward_move(dest_reg: str, src_reg: str) -> str | None:
     return None
 
 
-def _forward_stack_load_move(load_opcode: str, dest_reg: str, src_reg: str) -> str | None:
+def _register_alias_key(reg: str) -> str:
+    if len(reg) < 2:
+        return reg
+    prefix = reg[0]
+    index = reg[1:]
+    if prefix in ("w", "x"):
+        return "gpr:" + index
+    if prefix in ("s", "d"):
+        return "fp:" + index
+    return reg
+
+
+def _forward_stack_load_move(
+    load_opcode: str, dest_reg: str, src_reg: str
+) -> str | None:
     if load_opcode == "ldurb":
         if not dest_reg.startswith("w") or not src_reg.startswith("w"):
             return None
@@ -202,7 +236,8 @@ def _forward_one_intervening_stack_store_load(lines: list[str]) -> list[str]:
                     if (
                         store_offset == load_offset
                         and middle_offset != store_offset
-                        and middle_reg != store_reg
+                        and _register_alias_key(middle_reg)
+                        != _register_alias_key(store_reg)
                         and move is not None
                     ):
                         out.append(lines[index])
@@ -386,7 +421,18 @@ def _line_defines_reg(line: str, reg: str) -> bool:
     opcode, sep, rest = stripped.partition(" ")
     if not sep:
         return False
-    if opcode in ("cmp", "fcmp", "ret", "stur", "str", "sturb", "strb", "sturh", "strh", "stp"):
+    if opcode in (
+        "cmp",
+        "fcmp",
+        "ret",
+        "stur",
+        "str",
+        "sturb",
+        "strb",
+        "sturh",
+        "strh",
+        "stp",
+    ):
         return False
     dest, _sep, _tail = rest.partition(", ")
     return dest == reg
@@ -413,7 +459,9 @@ def _line_uses_reg_alias(line: str, reg: str) -> bool:
     return any(_line_uses_reg(line, alias) for alias in _reg_aliases(reg))
 
 
-def _can_drop_zero_mov_after_store(lines: list[str], start_index: int, reg: str) -> bool:
+def _can_drop_zero_mov_after_store(
+    lines: list[str], start_index: int, reg: str
+) -> bool:
     index = start_index
     while index < len(lines):
         line = lines[index]
@@ -448,7 +496,10 @@ def _fold_zero_store_source(lines: list[str]) -> list[str]:
                     and _is_aarch64_scratch_reg(zero_reg)
                     and _can_drop_zero_mov_after_store(lines, index + 2, zero_reg)
                 ):
-                    out.append(_replace_store_source(lines[index + 1], replacement_reg) or lines[index + 1])
+                    out.append(
+                        _replace_store_source(lines[index + 1], replacement_reg)
+                        or lines[index + 1]
+                    )
                     index += 2
                     continue
         out.append(lines[index])
@@ -486,7 +537,10 @@ def _fold_mov_store_source(lines: list[str]) -> list[str]:
                     and _is_aarch64_scratch_reg(dest_reg)
                     and _can_drop_zero_mov_after_store(lines, index + 2, dest_reg)
                 ):
-                    out.append(_replace_store_source(lines[index + 1], src_reg) or lines[index + 1])
+                    out.append(
+                        _replace_store_source(lines[index + 1], src_reg)
+                        or lines[index + 1]
+                    )
                     index += 2
                     continue
         out.append(lines[index])
@@ -518,7 +572,17 @@ def _fold_zero_compare_immediate(lines: list[str]) -> list[str]:
             cmp_regs = _parse_cmp_reg(lines[index + 1])
             if zero_reg is not None and cmp_regs is not None:
                 lhs, rhs = cmp_regs
-                if rhs == zero_reg:
+                # Folding away the `movz reg, #0` is only sound when nothing
+                # after the compare still reads that register. A min/max
+                # intrinsic emits `movz w10,#0; cmp w9,w10; csel w11,w9,w10,cc`
+                # — dropping the movz here would leave the csel reading an
+                # undefined w10. Mirror the liveness guard used by
+                # _fold_mov_compare_source.
+                if (
+                    rhs == zero_reg
+                    and lhs != zero_reg
+                    and _can_drop_zero_mov_after_store(lines, index + 2, zero_reg)
+                ):
                     out.append(f"  cmp {lhs}, #0")
                     index += 2
                     continue
@@ -714,11 +778,7 @@ def _fold_cset_zero_branch(lines: list[str]) -> list[str]:
                 branch_cond = cset_cond
                 if opcode == "cbz":
                     branch_cond = _invert_aarch64_cc(cset_cond) or ""
-                if (
-                    branch_cond
-                    and store_reg == cset_reg
-                    and branch_reg == cset_reg
-                ):
+                if branch_cond and store_reg == cset_reg and branch_reg == cset_reg:
                     out.append(lines[index])
                     out.append(lines[index + 1])
                     out.append(lines[index + 2])
@@ -765,18 +825,20 @@ def _branch_target(line: str) -> str | None:
     return None
 
 
-def _retarget_branch(line: str, target: str) -> str | None:
+def _retarget_branch(line: str, target: str) -> str:
+    target_text = str(target)
     zero_branch = _parse_cond_zero_branch(line)
     if zero_branch is not None:
-        opcode, reg, _old_target = zero_branch
-        return f"  {opcode} {reg}, {target}"
+        opcode_text = str(zero_branch[0])
+        reg_text = str(zero_branch[1])
+        return "  " + opcode_text + " " + reg_text + ", " + target_text
     if _parse_uncond_branch(line) is not None:
-        return f"  b {target}"
+        return "  b " + target_text
     parsed_cond = _parse_direct_cond_branch(line)
     if parsed_cond is not None:
-        cond, _old_target = parsed_cond
-        return f"  b.{cond} {target}"
-    return None
+        cond_text = str(parsed_cond[0])
+        return "  b." + cond_text + " " + target_text
+    return line
 
 
 def _is_function_label(line: str) -> bool:
@@ -896,8 +958,14 @@ def _thread_trampoline_branches(lines: list[str]) -> list[str]:
     if not trampolines:
         return lines
 
+    label_index: dict[str, int] = {}
+    for index, line in enumerate(lines):
+        label = _local_label_name(line)
+        if label is not None:
+            label_index[label] = index
+
     rewritten: list[str] = []
-    for line in lines:
+    for index, line in enumerate(lines):
         target = _branch_target(line)
         if target is None:
             rewritten.append(line)
@@ -906,8 +974,25 @@ def _thread_trampoline_branches(lines: list[str]) -> list[str]:
         if resolved == target:
             rewritten.append(line)
             continue
-        replacement = _retarget_branch(line, resolved)
-        rewritten.append(replacement if replacement is not None else line)
+        # Range guard: cbz/cbnz reach +/-32KB (8192 instructions) and
+        # b.cond +/-1MB; threading a short trampoline hop into a direct
+        # far branch overflows the fixup in huge functions ("fixup value
+        # out of range"). Line distance conservatively over-approximates
+        # instruction distance (labels/directives are 0 bytes), so skip
+        # the rewrite and keep the trampoline when the resolved target is
+        # too far. Unconditional `b` reaches +/-128MB and never needs the
+        # guard.
+        limit = 0
+        if _parse_cond_zero_branch(line) is not None:
+            limit = 6000
+        elif _parse_direct_cond_branch(line) is not None:
+            limit = 200000
+        if limit:
+            resolved_index = label_index.get(resolved)
+            if resolved_index is None or abs(resolved_index - index) > limit:
+                rewritten.append(line)
+                continue
+        rewritten.append(_retarget_branch(line, resolved))
 
     referenced = {
         target
@@ -956,6 +1041,11 @@ def _drop_fallthrough_uncond_branches(lines: list[str]) -> list[str]:
 
 
 def _fold_cond_branch_to_fallthrough(lines: list[str]) -> list[str]:
+    label_index: dict[str, int] = {}
+    for idx, line in enumerate(lines):
+        label = _local_label_name(line)
+        if label is not None:
+            label_index[label] = idx
     out: list[str] = []
     index = 0
     while index < len(lines):
@@ -968,10 +1058,18 @@ def _fold_cond_branch_to_fallthrough(lines: list[str]) -> list[str]:
                 j = index + 2
                 while j < len(lines) and not lines[j]:
                     j += 1
+                # Range guard: this rewrites a +/-128MB `b` into a +/-1MB
+                # b.cond; skip when the else target is too far (line
+                # distance conservatively over-approximates instructions).
+                else_index = label_index.get(else_target)
+                else_in_range = (
+                    else_index is not None and abs(else_index - index) <= 200000
+                )
                 if (
                     inverse is not None
                     and then_target.startswith("L_")
                     and else_target.startswith("L_")
+                    and else_in_range
                     and j < len(lines)
                     and _local_label_name(lines[j]) == then_target
                 ):
@@ -1021,7 +1119,9 @@ def _emit_function(func: ParsedFunction) -> list[str]:
     return lines
 
 
-def _emit_instruction(func: ParsedFunction, block: ParsedBlock, instr: ParsedInstr) -> list[str]:
+def _emit_instruction(
+    func: ParsedFunction, block: ParsedBlock, instr: ParsedInstr
+) -> list[str]:
     return emit_instruction_dispatch(
         func,
         block,
@@ -1040,7 +1140,9 @@ def _emit_compute_with_symbols(func: ParsedFunction, kind: str, data) -> list[st
 
 
 def _emit_return_with_symbols(
-    func: ParsedFunction, ret_type, value,
+    func: ParsedFunction,
+    ret_type,
+    value,
 ) -> list[str]:
     return _rets_emit_return_terminator(
         func,
@@ -1051,7 +1153,9 @@ def _emit_return_with_symbols(
 
 
 def _emit_branch_with_symbols(
-    func: ParsedFunction, source_block: str, target: str,
+    func: ParsedFunction,
+    source_block: str,
+    target: str,
 ) -> list[str]:
     return _terms_emit_branch_terminator(
         func,
@@ -1097,7 +1201,9 @@ def _emit_switch_with_symbols(
     )
 
 
-def _emit_terminator(func: ParsedFunction, block: ParsedBlock, term: ParsedInstr) -> list[str]:
+def _emit_terminator(
+    func: ParsedFunction, block: ParsedBlock, term: ParsedInstr
+) -> list[str]:
     return emit_terminator_dispatch(
         func,
         block,

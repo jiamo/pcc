@@ -28,6 +28,7 @@ docker run --rm \
   --platform linux/amd64 \
   -e UV_PROJECT_ENVIRONMENT=/tmp/pcc-linux-x86_64-venv \
   -e UV_LINK_MODE=copy \
+  -e PCC_BUILD_SKIP=1 \
   -v "${REPO_ROOT}:/workspace" \
   -w /workspace \
   "${IMAGE_TAG}" \

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from .self_backend_aarch64_darwin_abi import reg_name
+from .self_backend_aarch64_darwin_branch_protection import (
+    branch_protection_enabled,
+    epilogue_authenticate_and_return,
+)
 from .self_backend_aarch64_darwin_flow import emit_phi_assignments
 from .self_backend_aarch64_darwin_materialize import materialize_value
 from .self_backend_aarch64_darwin_regs import emit_const_to_reg, emit_stack_adjust
@@ -13,10 +17,15 @@ def emit_epilogue(func: ParsedFunction) -> list[str]:
     lines: list[str] = []
     if func.frame_size:
         lines.extend(emit_stack_adjust(func.frame_size))
-    lines.extend([
-        "  ldp x29, x30, [sp], #16",
-        "  ret",
-    ])
+    lines.append("  ldp x29, x30, [sp], #16")
+    # Reverse-edge protection: authenticate the signed LR before returning. When
+    # branch protection is on this emits ``autiasp`` + ``ret`` (SP is the same
+    # modifier used by the prologue ``paciasp`` because the frame save/restore is
+    # symmetric). With protection off it is a plain ``ret``.
+    if branch_protection_enabled():
+        lines.extend(epilogue_authenticate_and_return(func))
+    else:
+        lines.append("  ret")
     return lines
 
 

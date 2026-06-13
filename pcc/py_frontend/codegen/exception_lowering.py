@@ -1,4 +1,5 @@
 """Exception and error-exit lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 import os
@@ -27,7 +28,10 @@ from ..py_ast import (
     While,
     With,
 )
-
+from .builtin_exceptions import (
+    BUILTIN_EXC_TAG as _BUILTIN_EXC_TAG,
+    builtin_exc_tag_or_missing as _builtin_exc_tag_or_missing,
+)
 
 _I8 = ir.IntType(8)
 _I1 = ir.IntType(1)
@@ -36,148 +40,26 @@ _CSTR = _I8.as_pointer()
 _OPTIONAL_IMPORT_MISSING_NONE = "pcc.optional_import_missing.None"
 
 
-_BUILTIN_EXC_TAG = {
-    "BaseException": 0,
-    "Exception": 1,
-    "ValueError": 2,
-    "TypeError": 3,
-    "KeyError": 4,
-    "IndexError": 5,
-    "AttributeError": 6,
-    "SyntaxError": 1,
-    "RuntimeError": 7,
-    "StopIteration": 8,
-    "ZeroDivisionError": 9,
-    "NameError": 10,
-    "NotImplementedError": 11,
-    "ArithmeticError": 12,
-    "LookupError": 13,
-    "OSError": 14,
-    "IOError": 14,
-    "OverflowError": 15,
-    "AssertionError": 16,
-    "ReferenceError": 18,
-    "FileNotFoundError": 14,
-    "FileExistsError": 14,
-    "IsADirectoryError": 14,
-    "NotADirectoryError": 14,
-    "PermissionError": 14,
-    "BrokenPipeError": 14,
-    "ConnectionError": 14,
-    "ConnectionAbortedError": 14,
-    "ConnectionRefusedError": 14,
-    "ConnectionResetError": 14,
-    "BlockingIOError": 14,
-    "ChildProcessError": 14,
-    "InterruptedError": 14,
-    "TimeoutError": 14,
-    "UnicodeError": 2,
-    "UnicodeDecodeError": 2,
-    "UnicodeEncodeError": 2,
-    "RecursionError": 7,
-    "ImportError": 1,
-    "ModuleNotFoundError": 1,
-    "EOFError": 1,
-    "SystemExit": 0,
-    "KeyboardInterrupt": 0,
-    "GeneratorExit": 0,
-    "StopAsyncIteration": 17,
-}
-
-
-def _builtin_exc_tag_or_missing(name: str) -> int:
-    if name == "BaseException":
-        return 0
-    if name == "Exception":
-        return 1
-    if name == "ValueError":
-        return 2
-    if name == "TypeError":
-        return 3
-    if name == "KeyError":
-        return 4
-    if name == "IndexError":
-        return 5
-    if name == "AttributeError":
-        return 6
-    if name == "SyntaxError":
-        return 1
-    if name == "RuntimeError":
-        return 7
-    if name == "StopIteration":
-        return 8
-    if name == "ZeroDivisionError":
-        return 9
-    if name == "NameError":
-        return 10
-    if name == "NotImplementedError":
-        return 11
-    if name == "ArithmeticError":
-        return 12
-    if name == "LookupError":
-        return 13
-    if name == "OSError" or name == "IOError":
-        return 14
-    if name == "OverflowError":
-        return 15
-    if name == "AssertionError":
-        return 16
-    if name == "ReferenceError":
-        return 18
-    if name == "FileNotFoundError":
-        return 14
-    if name == "FileExistsError":
-        return 14
-    if name == "IsADirectoryError":
-        return 14
-    if name == "NotADirectoryError":
-        return 14
-    if name == "PermissionError":
-        return 14
-    if name == "BrokenPipeError":
-        return 14
-    if name == "ConnectionError":
-        return 14
-    if name == "ConnectionAbortedError":
-        return 14
-    if name == "ConnectionRefusedError":
-        return 14
-    if name == "ConnectionResetError":
-        return 14
-    if name == "BlockingIOError":
-        return 14
-    if name == "ChildProcessError":
-        return 14
-    if name == "InterruptedError":
-        return 14
-    if name == "TimeoutError":
-        return 14
-    if name == "UnicodeError":
-        return 2
-    if name == "UnicodeDecodeError":
-        return 2
-    if name == "UnicodeEncodeError":
-        return 2
-    if name == "RecursionError":
-        return 7
-    if name == "ImportError":
-        return 1
-    if name == "ModuleNotFoundError":
-        return 1
-    if name == "EOFError":
-        return 1
-    if name == "SystemExit":
-        return 0
-    if name == "KeyboardInterrupt":
-        return 0
-    if name == "GeneratorExit":
-        return 0
-    if name == "StopAsyncIteration":
-        return 17
-    return -1
-
-
 class ExceptionLoweringMixin:
+    def _active_handler_exception_for_current_function(self):
+        """Return the innermost handler exception owned by this IR function.
+
+        ``L1CodeGen`` is re-entrant while it emits nested functions and class
+        methods. Keep an explicit owner beside every handler value so a stale
+        outer entry can never cross an LLVM function boundary, including on
+        compiled-stage fixed-layout mixin calls.
+        """
+        active_stack = self._active_handler_excs
+        if not active_stack:
+            return None
+        entry = active_stack[-1]
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            return None
+        owner, active = entry
+        if owner is not self.current_function:
+            return None
+        return active
+
     def _push_try_err_block(self, err_bb):
         prev = self._try_err_block
         self._try_err_block = err_bb
@@ -230,7 +112,6 @@ class ExceptionLoweringMixin:
                 "string",
                 "platform",
                 "subprocess",
-                "asyncio",
                 "tempfile",
                 "shutil",
                 "shlex",
@@ -272,6 +153,7 @@ class ExceptionLoweringMixin:
             self.env_class_object_hint.pop(local_name, None)
             self._cpy_env_flags.pop(local_name, None)
             self._weak_dict_env_flags.pop(local_name, None)
+            self._weakref_env_flags.pop(local_name, None)
         return True
 
     def _emit_raise(self, stmt: Raise) -> None:
@@ -288,8 +170,8 @@ class ExceptionLoweringMixin:
                 [],
                 name=self._fresh("reraise.exc"),
             )
-            active_stack = getattr(self, "_active_handler_excs", ())
-            if active_stack:
+            active = self._active_handler_exception_for_current_function()
+            if active is not None:
                 null = ir.Constant(_CSTR, None)
                 has_cur = self.builder.icmp_signed(
                     "!=",
@@ -300,18 +182,35 @@ class ExceptionLoweringMixin:
                 cur = self.builder.select(
                     has_cur,
                     cur,
-                    active_stack[-1],
+                    active,
                     name=self._fresh("reraise.active"),
                 )
             self.builder.call(self.runtime["py_raise"], [cur])
         else:
             exc_val = self._build_exception_value(stmt.exc)
+            # PEP 3134 implicit chaining: when a new exception is raised while
+            # a handler exception is active (`raise Y` inside `except X:`), the
+            # new exception's __context__ is the exception being handled. The
+            # runtime `py_raise` auto-chains from TLS, but pcc clears TLS at
+            # handler entry (py_clear_exception) and tracks the active handler
+            # exception only in `_active_handler_excs`, so TLS is NULL here and
+            # the runtime auto-chain never fires. Set __context__ explicitly
+            # from the active handler exception. CPython sets __context__ even
+            # when an explicit `raise ... from ...` cause is present (it only
+            # flips __suppress_context__), so this runs regardless of cause.
+            self._emit_set_implicit_exception_context(exc_val)
             if stmt.cause is not None:
                 cause_val = self._emit_expr(stmt.cause)
                 self.builder.call(
                     self.runtime["py_exc_set_cause"], [exc_val, cause_val]
                 )
+                if self._raise_value_expr_returns_owned_object(stmt.cause):
+                    self._gc_release(
+                        cause_val, self._release_expr_label("owned", stmt.cause)
+                    )
             self.builder.call(self.runtime["py_raise"], [exc_val])
+            if self._raise_value_expr_returns_owned_object(stmt.exc):
+                self._gc_release(exc_val, self._release_expr_label("owned", stmt.exc))
 
         frame_exc = self.builder.call(
             self.runtime["py_current_exception"],
@@ -324,6 +223,39 @@ class ExceptionLoweringMixin:
         if err_target is None:
             err_target = self._ensure_fn_err_exit()
         self.builder.branch(err_target)
+
+    def _emit_set_implicit_exception_context(self, exc_val: ir.Value) -> None:
+        """Set ``exc_val.__context__`` to the active handler exception
+        (PEP 3134 implicit chaining) when raising a new exception inside
+        an ``except`` handler.
+
+        The active handler exception lives in ``_active_handler_excs``
+        (its top is the currently-handled exception). We guard against a
+        self-cycle: re-raising the caught exception by name (``raise e``)
+        would make ``exc_val`` identical to the active exception, and
+        CPython does not set ``__context__`` to the exception itself.
+        The runtime ``py_exc_set_context`` writes the ``context`` slot
+        unconditionally, so the identity guard is emitted here.
+        """
+        active = self._active_handler_exception_for_current_function()
+        if active is None:
+            return
+        # Only chain when the new exception is a distinct object from the
+        # exception being handled (avoid __context__ self-reference).
+        distinct = self.builder.icmp_signed(
+            "!=",
+            exc_val,
+            active,
+            name=self._fresh("exc.ctx.distinct"),
+        )
+        fn = self.current_function
+        set_bb = fn.append_basic_block(name=self._fresh("exc.ctx.set"))
+        cont_bb = fn.append_basic_block(name=self._fresh("exc.ctx.cont"))
+        self.builder.cbranch(distinct, set_bb, cont_bb)
+        self.builder.position_at_end(set_bb)
+        self.builder.call(self.runtime["py_exc_set_context"], [exc_val, active])
+        self.builder.branch(cont_bb)
+        self.builder.position_at_end(cont_bb)
 
     def _emit_try(self, stmt: Try) -> None:
         if self._maybe_emit_optional_missing_import_try(stmt):
@@ -340,13 +272,7 @@ class ExceptionLoweringMixin:
                 else "<top>"
             )
             sys.stderr.write(
-                "[pcc.codegen] "
-                + mod_name
-                + ":"
-                + func_name
-                + ":try "
-                + label
-                + "\n"
+                "[pcc.codegen] " + mod_name + ":" + func_name + ":try " + label + "\n"
             )
 
         try_log("begin")
@@ -416,43 +342,43 @@ class ExceptionLoweringMixin:
             try_log("dispatch end no handlers")
             return
 
-        def body_has_bare_raise(stmts: tuple) -> bool:
+        def body_has_raise(stmts: tuple, *, bare_only: bool) -> bool:
             for item in stmts:
                 if isinstance(item, Raise):
-                    if item.exc is None:
+                    if not bare_only or item.exc is None:
                         return True
                     continue
                 if isinstance(item, If):
-                    if body_has_bare_raise(item.body) or body_has_bare_raise(
-                        item.else_body
+                    if body_has_raise(item.body, bare_only=bare_only) or body_has_raise(
+                        item.else_body, bare_only=bare_only
                     ):
                         return True
                     continue
                 if isinstance(item, While):
-                    if body_has_bare_raise(item.body) or body_has_bare_raise(
-                        item.else_body
+                    if body_has_raise(item.body, bare_only=bare_only) or body_has_raise(
+                        item.else_body, bare_only=bare_only
                     ):
                         return True
                     continue
                 if isinstance(item, For):
-                    if body_has_bare_raise(item.body) or body_has_bare_raise(
-                        item.else_body
+                    if body_has_raise(item.body, bare_only=bare_only) or body_has_raise(
+                        item.else_body, bare_only=bare_only
                     ):
                         return True
                     continue
                 if isinstance(item, Try):
                     if (
-                        body_has_bare_raise(item.body)
-                        or body_has_bare_raise(item.else_body)
-                        or body_has_bare_raise(item.finally_body)
+                        body_has_raise(item.body, bare_only=bare_only)
+                        or body_has_raise(item.else_body, bare_only=bare_only)
+                        or body_has_raise(item.finally_body, bare_only=bare_only)
                     ):
                         return True
                     for nested_handler in item.handlers:
-                        if body_has_bare_raise(nested_handler.body):
+                        if body_has_raise(nested_handler.body, bare_only=bare_only):
                             return True
                     continue
                 if isinstance(item, With):
-                    if body_has_bare_raise(item.body):
+                    if body_has_raise(item.body, bare_only=bare_only):
                         return True
             return False
 
@@ -517,12 +443,29 @@ class ExceptionLoweringMixin:
                 self.builder.cbranch(cond, body_bb, propagate_bb)
                 next_test_bb = None
                 self.builder.position_at_end(propagate_bb)
-                outer = prev_err_block or self._ensure_fn_err_exit()
-                self.builder.branch(outer)
+                # No handler matched: the finally block must STILL run before
+                # the exception propagates to the outer handler (Python
+                # guarantees finally always executes). Mirrors the no-handlers
+                # path above; without this the finally was silently skipped on
+                # the unmatched-exception path.
+                if stmt.finally_body:
+                    self._emit_stmts(stmt.finally_body)
+                if not self._builder_block_is_terminated():
+                    outer = prev_err_block or self._ensure_fn_err_exit()
+                    self.builder.branch(outer)
 
             self.builder.position_at_end(body_bb)
             handler_exc = current_exc
-            retain_handler_exc = h.name is not None or body_has_bare_raise(h.body)
+            # Retain the handled exception across the handler body when:
+            #  - it is name-bound (`except X as e:`), or
+            #  - the body re-raises bare (`raise`), or
+            #  - the body raises a NEW exception (`raise Y`): PEP 3134 implicit
+            #    chaining sets the new exception's __context__ to the exception
+            #    being handled, so it must be kept alive and tracked in
+            #    `_active_handler_excs` for `_emit_set_implicit_exception_context`.
+            retain_handler_exc = h.name is not None or body_has_raise(
+                h.body, bare_only=False
+            )
             if retain_handler_exc:
                 handler_exc = self._gc_retain(handler_exc)
             self.builder.call(self.runtime["py_clear_exception"], [])
@@ -538,9 +481,9 @@ class ExceptionLoweringMixin:
                 binding_names = getattr(self, "_except_binding_names", None)
                 if binding_names is not None:
                     binding_names.add(h.name)
-            active_excs = list(getattr(self, "_active_handler_excs", ()))
+            active_excs = list(self._active_handler_excs)
             if retain_handler_exc:
-                active_excs.append(handler_exc)
+                active_excs.append((self.current_function, handler_exc))
                 self._active_handler_excs = active_excs
             if stmt.finally_body:
                 finally_stack = list(getattr(self, "_finally_stack", ()))
@@ -559,7 +502,7 @@ class ExceptionLoweringMixin:
                     if active_excs:
                         self._active_handler_excs = active_excs
                     else:
-                        self._active_handler_excs = ()
+                        self._active_handler_excs = []
             if not self._builder_block_is_terminated():
                 if stmt.finally_body:
                     self._emit_stmts(stmt.finally_body)
@@ -628,6 +571,26 @@ class ExceptionLoweringMixin:
         )
         self.builder.cbranch(missing, err_bb, ok_bb)
         self.builder.position_at_end(err_bb)
+        pending = self.builder.call(
+            self.runtime["py_err_occurred"],
+            [],
+            name=self._fresh(f"attr.{attr_name}.pending"),
+        )
+        has_pending = self.builder.icmp_signed(
+            "!=",
+            pending,
+            ir.Constant(_I64, 0),
+            name=self._fresh(f"attr.{attr_name}.has_pending"),
+        )
+        propagate_bb = self.current_function.append_basic_block(
+            name=self._fresh(f"attr.{attr_name}.propagate"),
+        )
+        raise_bb = self.current_function.append_basic_block(
+            name=self._fresh(f"attr.{attr_name}.raise"),
+        )
+        self.builder.cbranch(has_pending, propagate_bb, raise_bb)
+
+        self.builder.position_at_end(propagate_bb)
         frame_exc = self.builder.call(
             self.runtime["py_current_exception"],
             [],
@@ -638,6 +601,13 @@ class ExceptionLoweringMixin:
         if err_target is None:
             err_target = self._ensure_fn_err_exit()
         self.builder.branch(err_target)
+
+        self.builder.position_at_end(raise_bb)
+        self._emit_builtin_exception_and_branch(
+            "AttributeError",
+            f"object has no attribute {attr_name}",
+            span,
+        )
         self.builder.position_at_end(ok_bb)
 
     def _emit_attribute_error_if_status_failed(
@@ -724,7 +694,9 @@ class ExceptionLoweringMixin:
             first = msg_expr
             if isinstance(first, StrLit):
                 return self._pooled_cstr_ptr(first.value, ".exc.msg")
-            msg_obj = self._emit_as_object(first)
+            # direct valueclass constructors project to boxed valueboxes
+            # (consistent allocation model; str() output is identical)
+            msg_obj = self._emit_expr_as_pcc_object(first)
             msg_str = msg_obj
             if not isinstance(first.ty, StrType):
                 msg_str = self.builder.call(
@@ -773,10 +745,7 @@ class ExceptionLoweringMixin:
                 )
         # ``raise NotImplementedError`` (bare builtin exception name, no
         # call). Instantiate the exception with an empty message.
-        if (
-            isinstance(exc_expr, Name)
-            and exc_expr.ident not in self.env
-        ):
+        if isinstance(exc_expr, Name) and exc_expr.ident not in self.env:
             cls_name = exc_expr.ident
             tag = _builtin_exc_tag_or_missing(cls_name)
             if tag >= 0:
@@ -785,10 +754,7 @@ class ExceptionLoweringMixin:
                     [ir.Constant(_I64, tag), _message_cstr(())],
                     name=self._fresh(f"exc.{cls_name}"),
                 )
-        if (
-            isinstance(exc_expr, Name)
-            and exc_expr.ident not in self.env
-        ):
+        if isinstance(exc_expr, Name) and exc_expr.ident not in self.env:
             cls_name = exc_expr.ident
             info = self.class_lowering.classes.get(cls_name)
             if info is None:
@@ -804,6 +770,28 @@ class ExceptionLoweringMixin:
             )
         # Fallback: evaluate as an object (e.g. re-raising a bound var).
         return self._emit_as_object(exc_expr)
+
+    def _raise_value_expr_returns_owned_object(self, exc_expr: Expr) -> bool:
+        """Whether `_build_exception_value()` produced a new owned PyObject*.
+
+        `py_raise()` retains the object into TLS. When the raise expression
+        constructed an exception object just for the raise statement, the
+        lowering must release that temporary after `py_raise()` or every caught
+        exception remains at refcount 1 after `py_clear_exception()`.
+        """
+        if isinstance(exc_expr, Call) and isinstance(exc_expr.func, Name):
+            cls_name = exc_expr.func.ident
+            if _builtin_exc_tag_or_missing(cls_name) >= 0:
+                return True
+            if self.class_lowering.classes.get(cls_name) is not None:
+                return True
+        if isinstance(exc_expr, Name) and exc_expr.ident not in self.env:
+            cls_name = exc_expr.ident
+            if _builtin_exc_tag_or_missing(cls_name) >= 0:
+                return True
+            if self.class_lowering.classes.get(cls_name) is not None:
+                return True
+        return self._expr_returns_owned_object(exc_expr)
 
     def _emit_exception_class_ref(self, expr: Expr) -> ir.Value:
         """Build a PyObject* for an exception class used in
@@ -896,6 +884,8 @@ class ExceptionLoweringMixin:
     def _emit_post_call_err_check(
         self,
         span: Optional[SourceSpan] = None,
+        *,
+        release_on_error: tuple[ir.Value, ...] = (),
     ) -> None:
         """After any call that could raise a Python exception, emit
         `if (py_err_occurred()) goto err_target` where err_target is
@@ -937,11 +927,20 @@ class ExceptionLoweringMixin:
         )
         parent_fn = self.current_function
         cont = parent_fn.append_basic_block(name=self._fresh("call.cont"))
-        if span is None:
-            self.builder.cbranch(cmp, err_target, cont)
+        error_dest = err_target
+        if span is not None:
+            error_dest = self._ensure_post_call_frame_block(err_target, span)
+        if release_on_error:
+            cleanup = parent_fn.append_basic_block(
+                name=self._fresh("call.err.cleanup")
+            )
+            self.builder.cbranch(cmp, cleanup, cont)
+            self.builder.position_at_end(cleanup)
+            for value in release_on_error:
+                self.builder.call(self.runtime["pcc_gc_release"], [value])
+            self.builder.branch(error_dest)
         else:
-            frame_bb = self._ensure_post_call_frame_block(err_target, span)
-            self.builder.cbranch(cmp, frame_bb, cont)
+            self.builder.cbranch(cmp, error_dest, cont)
         self.builder.position_at_end(cont)
 
     def _ensure_post_call_frame_block(
@@ -1016,6 +1015,8 @@ class ExceptionLoweringMixin:
                 self.builder.ret(ir.Constant(ret_ty, 1))
             else:
                 self.builder.ret(ir.Constant(ret_ty, 0))
+        elif isinstance(ret_ty, ir.LiteralStructType):
+            self.builder.ret(self._zero_of(ret_ty))
         else:
             # Unsupported return type for error-path sentinel; fall
             # back to `unreachable` so at least the build surface fails
@@ -1023,15 +1024,16 @@ class ExceptionLoweringMixin:
             # current emitted types).
             self.builder.unreachable()
         self._fn_err_exit_blocks[fn_name] = err_bb
-        for name in sorted(getattr(self, "_gc_rooted_local_names", set())):
-            slot = self.env.get(name)
-            if slot is None:
-                continue
-            alloca, ir_ty, _decl_ty = slot
-            if not isinstance(ir_ty, ir.PointerType):
-                continue
-            if not self._ir_type_matches(ir_ty, _CSTR):
-                continue
-            self._patch_fn_err_exit_gc_root_leave(name, alloca)
+        # Back-patch every slot this function already frame-registered.
+        # Drive this from the per-slot registry, NOT from name->env lookups:
+        # a slot whose env entry was popped or re-bound (e.g. comprehension
+        # targets after their env save/restore) still has a live entry-block
+        # frame_enter and must be left on the error path too.
+        registry: list = []
+        if hasattr(self, "_fn_gc_root_slot_registry"):
+            if fn_name in self._fn_gc_root_slot_registry:
+                registry = self._fn_gc_root_slot_registry[fn_name]
+        for entry in registry:
+            self._patch_fn_err_exit_gc_root_leave(entry[0], entry[1])
         self.builder.position_at_end(save_block)
         return err_bb

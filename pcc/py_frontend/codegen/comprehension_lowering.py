@@ -1,6 +1,7 @@
 """Comprehension lowering helpers for L1CodeGen."""
 from __future__ import annotations
 
+from dataclasses import replace as _dataclass_replace
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
@@ -21,6 +22,7 @@ from ..py_ast import (
     ListType,
     MemoryViewType,
     Name,
+    SetType,
     StrType,
     Subscript,
     TupleExpr,
@@ -28,16 +30,15 @@ from ..py_ast import (
     Type,
 )
 from . import marshal
+from .builtin_exceptions import BUILTIN_EXC_TAG as _BUILTIN_EXC_TAG
 from .errors import L1CodegenError
+from .layer1_support import _dataclass_field_names, _dataclass_field_value
 
 
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _CSTR = ir.IntType(8).as_pointer()
-_BUILTIN_EXC_TAG = {
-    "StopIteration": 8,
-}
 
 
 def _same_type_kind(a: Type, b: Type) -> bool:
@@ -256,6 +257,77 @@ class ComprehensionLoweringMixin:
                 )
         generators = desugared
 
+        # Python 3 gives comprehensions their own scope: the loop target(s)
+        # (and any names bound by a tuple-unpack target) must NOT leak into
+        # the enclosing function scope, and must NOT overwrite an outer
+        # variable of the same name that is read after the comprehension.
+        # Collect every name that the loop bodies will bind into ``self.env``
+        # so we can save the outer binding and restore it once the whole
+        # comprehension has been emitted.
+        comp_bound_names: set[str] = set()
+        for (tgt, _iter_e, _ifs, _is_async), unpack in zip(
+            generators, tuple_unpacks
+        ):
+            if isinstance(tgt, Name):
+                comp_bound_names.add(tgt.ident)
+            if isinstance(unpack, Assign):
+                # A tuple-unpack target binds its element names; an
+                # attr/subscript target binds nothing new (it mutates an
+                # existing object), so only harvest plain Names.
+                self._collect_comprehension_target_names(
+                    unpack.targets[0], comp_bound_names
+                )
+
+        # CPython evaluates the OUTERMOST iterable in the *enclosing* scope
+        # (it is computed once, before the comprehension scope exists), so a
+        # name it references must resolve to the outer binding even when it
+        # collides with a comprehension target: ``[w for w in w]`` iterates
+        # the outer list ``w``. The loop-path helpers only evaluate the
+        # iterable *after* the outer bindings have been dropped below, which
+        # would mis-resolve such a collision into a runtime NameError.
+        # Pre-evaluate the level-0 iterable (or just the offending
+        # range()/enumerate() arguments, keeping those fast paths) into a
+        # fresh temp while the outer bindings are still live, and point the
+        # generator at the temp instead. Inner-level iterables are left
+        # alone: they are evaluated inside the outer loops, where the outer
+        # targets' fresh comprehension bindings are exactly what Python
+        # scoping requires them to see.
+        if generators:
+            tgt0, iter0, ifs0, async0 = generators[0]
+            iter0_safe = self._prehoist_outermost_comp_iter(
+                iter0, comp_bound_names
+            )
+            if iter0_safe is not iter0:
+                generators[0] = (tgt0, iter0_safe, ifs0, async0)
+
+        saved_env_entries: dict[str, object] = {}
+        saved_cpy_flags: dict[str, object] = {}
+        saved_exact_flags: dict[str, object] = {}
+        _MISSING = object()
+        cpy_flags = getattr(self, "_cpy_env_flags", None)
+        exact_flags = getattr(self, "_exact_int_env_flags", None)
+        for nm in comp_bound_names:
+            saved_env_entries[nm] = self.env.get(nm, _MISSING)
+            if cpy_flags is not None:
+                saved_cpy_flags[nm] = cpy_flags.get(nm, _MISSING)
+            else:
+                saved_cpy_flags[nm] = _MISSING
+            if exact_flags is not None:
+                saved_exact_flags[nm] = exact_flags.get(nm, _MISSING)
+            else:
+                saved_exact_flags[nm] = _MISSING
+            # Drop the outer binding up front so each loop path allocates a
+            # *fresh* slot for the comprehension target. Otherwise a fast
+            # path that reuses an existing same-type slot (e.g. the native
+            # ``range`` loop reusing an outer ``i64`` local) would write loop
+            # values into the outer variable's storage and corrupt it at
+            # runtime, defeating the compile-time env restore below.
+            self.env.pop(nm, None)
+            if cpy_flags is not None:
+                cpy_flags.pop(nm, None)
+            if exact_flags is not None:
+                exact_flags.pop(nm, None)
+
         # Allocate result container.
         if kind == "list":
             container = self.builder.call(
@@ -278,17 +350,147 @@ class ComprehensionLoweringMixin:
         else:
             raise NotImplementedError(f"comprehension kind {kind!r} not supported")
 
-        self._emit_comprehension_level(
-            kind,
-            container,
-            generators,
-            tuple_unpacks,
-            0,
-            elt_expr if kind != "dict" else None,
-            key_expr if kind == "dict" else None,
-            val_expr if kind == "dict" else None,
-        )
+        try:
+            self._emit_comprehension_level(
+                kind,
+                container,
+                generators,
+                tuple_unpacks,
+                0,
+                elt_expr if kind != "dict" else None,
+                key_expr if kind == "dict" else None,
+                val_expr if kind == "dict" else None,
+            )
+        finally:
+            # Restore the enclosing scope's bindings for every comprehension
+            # target name: delete names that did not exist before the
+            # comprehension, and reinstate the prior slot/type for names that
+            # shadowed an outer variable. This is what makes ``x = 99;
+            # [x for x in range(5)]; print(x)`` print ``99`` (Python 3),
+            # instead of leaking the last loop value.
+            cpy_flags = getattr(self, "_cpy_env_flags", None)
+            exact_flags = getattr(self, "_exact_int_env_flags", None)
+            for nm, prior in saved_env_entries.items():
+                current = self.env.get(nm)
+                if current is not None and self._is_valueclass_payload_type(current[2]):
+                    root_alloca, _root_ir_ty, root_ty = current
+                    zero = ir.Constant(_I32, 0)
+                    for path in self._valueclass_payload_pointer_field_paths(root_ty):
+                        indices = [zero]
+                        for path_idx in path:
+                            indices.append(ir.Constant(_I32, path_idx))
+                        field_slot = self.builder.gep(
+                            root_alloca,
+                            indices,
+                            inbounds=True,
+                            name=self._fresh(f"{nm}.comp.clear"),
+                        )
+                        self.builder.store(ir.Constant(_CSTR, None), field_slot)
+                if prior is _MISSING:
+                    self.env.pop(nm, None)
+                else:
+                    self.env[nm] = prior
+                if cpy_flags is not None:
+                    prior_flag = saved_cpy_flags.get(nm, _MISSING)
+                    if prior_flag is _MISSING:
+                        cpy_flags.pop(nm, None)
+                    else:
+                        cpy_flags[nm] = prior_flag
+                if exact_flags is not None:
+                    prior_exact = saved_exact_flags.get(nm, _MISSING)
+                    if prior_exact is _MISSING:
+                        exact_flags.pop(nm, None)
+                    else:
+                        exact_flags[nm] = prior_exact
         return container
+
+    def _collect_comprehension_target_names(self, target, out: set) -> None:
+        """Collect plain-``Name`` identifiers bound by a comprehension loop
+        target, recursing through nested tuple/list unpack targets. Attribute
+        and subscript targets bind no new local name (they mutate an existing
+        object), so they contribute nothing here."""
+        if isinstance(target, Name):
+            out.add(target.ident)
+        elif isinstance(target, (TupleExpr, ListExpr)):
+            for elem in target.elems:
+                self._collect_comprehension_target_names(elem, out)
+
+    def _comp_expr_references_names(self, node, names: set) -> bool:
+        """Generic dataclass-AST walk: does ``node`` reference any of
+        ``names`` via a plain ``Name`` expression? Conservative — used
+        only to decide whether the outermost comprehension iterable must
+        be pre-evaluated before the comp-bound names are dropped."""
+        if isinstance(node, Name):
+            return node.ident in names
+        if isinstance(node, Expr):
+            for field_name in _dataclass_field_names(node):
+                if self._comp_expr_references_names(
+                    _dataclass_field_value(node, field_name), names
+                ):
+                    return True
+            return False
+        if isinstance(node, tuple):
+            return any(
+                self._comp_expr_references_names(e, names) for e in node
+            )
+        return False
+
+    def _comp_hoist_iter_temp(self, expr: Expr) -> Name:
+        """Evaluate ``expr`` at the current position (the enclosing
+        scope's bindings are still live) into a fresh local temp and
+        return a ``Name`` reference carrying the original type, so the
+        typed loop fast paths still dispatch on it."""
+        tmp_ref = Name(
+            span=expr.span,
+            ty=expr.ty,
+            ident=self._fresh("comp_iter"),
+        )
+        self._emit_assign(
+            Assign(
+                span=expr.span,
+                targets=(tmp_ref,),
+                value=expr,
+                annotation=None,
+            )
+        )
+        return tmp_ref
+
+    def _prehoist_outermost_comp_iter(self, iter_e: Expr, bound: set) -> Expr:
+        """Return an iterable expression that is safe to evaluate after
+        the comp-bound names have been dropped from ``self.env``.
+
+        If ``iter_e`` does not reference any comp-bound name it is
+        returned unchanged. A ``range``/``xrange``/``enumerate`` call
+        keeps its call shape (so the dedicated loop fast paths still
+        fire) and only the offending arguments are pre-evaluated;
+        anything else is pre-evaluated wholesale into a temp."""
+        if not self._comp_expr_references_names(iter_e, bound):
+            return iter_e
+        if (
+            isinstance(iter_e, Call)
+            and isinstance(iter_e.func, Name)
+            and iter_e.func.ident in ("range", "xrange", "enumerate")
+        ):
+            new_args = tuple(
+                self._comp_hoist_iter_temp(a)
+                if self._comp_expr_references_names(a, bound)
+                else a
+                for a in iter_e.args
+            )
+            new_kwargs = tuple(
+                (
+                    kw,
+                    self._comp_hoist_iter_temp(v)
+                    if self._comp_expr_references_names(v, bound)
+                    else v,
+                )
+                for kw, v in iter_e.kwargs
+            )
+            return _dataclass_replace(
+                iter_e, args=new_args, kwargs=new_kwargs
+            )
+        return self._comp_hoist_iter_temp(iter_e)
+
     def _emit_comprehension_after_bind(
         self,
         kind: str,
@@ -545,14 +747,27 @@ class ComprehensionLoweringMixin:
         if isinstance(elem_ty, DynType):
             self.builder.store(elem_obj, alloca)
         else:
-            native_val = marshal.marshal_from_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                elem_obj,
+            native_val = None
+            if self._is_valueclass_payload_type(elem_ty):
+                native_val = self._emit_object_to_valueclass_payload(
+                    elem_obj,
+                    elem_ty,
+                )
+            if native_val is None:
+                native_val = marshal.marshal_from_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    elem_obj,
+                    elem_ty,
+                )
+            self.builder.store(native_val, alloca)
+        if self._is_valueclass_payload_type(elem_ty):
+            self._ensure_valueclass_payload_gc_roots(
+                target_ident,
+                alloca,
                 elem_ty,
             )
-            self.builder.store(native_val, alloca)
         self._emit_comprehension_after_bind(
             kind,
             container,
@@ -907,7 +1122,7 @@ class ComprehensionLoweringMixin:
                 val_expr,
             )
             return
-        if isinstance(iter_ty, DynType):
+        if isinstance(iter_ty, (DynType, SetType)):
             # Iterate DynType sources via the iterator protocol
             # (py_obj_iter/py_obj_next), matching the statement for-loop and
             # the ClassType arm below. The older len+py_obj_getitem path

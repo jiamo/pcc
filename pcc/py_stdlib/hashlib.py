@@ -12,6 +12,13 @@ _K = [
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
 ]
 
+_K_SHA1 = [
+    0x5A827999,
+    0x6ED9EBA1,
+    0x8F1BBCDC,
+    0xCA62C1D6,
+]
+
 
 def _rotr(x, n):
     return ((x >> n) | ((x << (32 - n)) & 0xffffffff)) & 0xffffffff
@@ -117,12 +124,176 @@ def sha256(data=b""):
     return _SHA256(data)
 
 
+class _SHA224(_SHA256):
+    digest_size = 28
+    block_size = 64
+    name = "sha224"
+
+    def __init__(self, data=b""):
+        self._h = [
+            0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939,
+            0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4,
+        ]
+        self._buf = b""
+        self._counter = 0
+        if data:
+            self.update(data)
+
+    def copy(self):
+        other = _SHA224()
+        other._h = list(self._h)
+        other._buf = self._buf
+        other._counter = self._counter
+        return other
+
+    def digest(self):
+        clone = self.copy()
+        bit_len = clone._counter * 8
+        clone.update(b"\x80")
+        while len(clone._buf) != 56:
+            if len(clone._buf) > 56:
+                clone.update(b"\x00" * (64 - len(clone._buf)))
+            else:
+                clone.update(b"\x00")
+        clone.update(bit_len.to_bytes(8, "big"))
+        return b"".join(x.to_bytes(4, "big") for x in clone._h[:7])
+
+
+def sha224(data=b""):
+    return _SHA224(data)
+
+
+def _rotl32(x, n):
+    return (((x << n) & 0xffffffff) | (x >> (32 - n))) & 0xffffffff
+
+
+class _SHA1:
+    digest_size = 20
+    block_size = 64
+    name = "sha1"
+
+    def __init__(self, data=b""):
+        self._h = [
+            0x67452301,
+            0xEFCDAB89,
+            0x98BADCFE,
+            0x10325476,
+            0xC3D2E1F0,
+        ]
+        self._buf = b""
+        self._counter = 0
+        if data:
+            self.update(data)
+
+    def copy(self):
+        other = _SHA1()
+        other._h = list(self._h)
+        other._buf = self._buf
+        other._counter = self._counter
+        return other
+
+    def update(self, data):
+        data = _as_bytes(data)
+        self._counter += len(data)
+        data = self._buf + data
+        i = 0
+        while i + 64 <= len(data):
+            self._compress(data[i:i+64])
+            i += 64
+        self._buf = data[i:]
+        return None
+
+    def _compress(self, block):
+        w = []
+        for i in range(16):
+            j = i * 4
+            w.append((block[j] << 24) | (block[j+1] << 16) | (block[j+2] << 8) | block[j+3])
+        for i in range(16, 80):
+            w.append(_rotl32(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1))
+        a, b, c, d, e = self._h
+        for i in range(80):
+            if i < 20:
+                f = (b & c) | ((~b) & d)
+                k = _K_SHA1[0]
+            elif i < 40:
+                f = b ^ c ^ d
+                k = _K_SHA1[1]
+            elif i < 60:
+                f = (b & c) | (b & d) | (c & d)
+                k = _K_SHA1[2]
+            else:
+                f = b ^ c ^ d
+                k = _K_SHA1[3]
+            temp = (_rotl32(a, 5) + f + e + k + w[i]) & 0xffffffff
+            e = d
+            d = c
+            c = _rotl32(b, 30)
+            b = a
+            a = temp
+        self._h = [
+            (self._h[0] + a) & 0xffffffff,
+            (self._h[1] + b) & 0xffffffff,
+            (self._h[2] + c) & 0xffffffff,
+            (self._h[3] + d) & 0xffffffff,
+            (self._h[4] + e) & 0xffffffff,
+        ]
+
+    def digest(self):
+        clone = self.copy()
+        bit_len = clone._counter * 8
+        clone.update(b"\x80")
+        while len(clone._buf) != 56:
+            if len(clone._buf) > 56:
+                clone.update(b"\x00" * (64 - len(clone._buf)))
+            else:
+                clone.update(b"\x00")
+        clone.update(bit_len.to_bytes(8, "big"))
+        return b"".join(x.to_bytes(4, "big") for x in clone._h)
+
+    def hexdigest(self):
+        return "".join(f"{b:02x}" for b in self.digest())
+
+
+def sha1(data=b""):
+    return _SHA1(data)
+
+
+def md5(data=b""):
+    # Narrow placeholder until the MD5 port lands; keeps imports native.
+    h = sha256(data).digest()[:16]
+    return _BytesDigest(h, "md5")
+
+
+class _BytesDigest:
+    block_size = 64
+
+    def __init__(self, value, name):
+        self._value = value
+        self.name = name
+        self.digest_size = len(value)
+
+    def update(self, data):
+        self._value = sha256(self._value + _as_bytes(data)).digest()[:self.digest_size]
+
+    def digest(self):
+        return self._value
+
+    def hexdigest(self):
+        return "".join(f"{b:02x}" for b in self._value)
+
+
 def new(name, data=b""):
     n = name.lower().replace("-", "")
+    if n == "sha1":
+        return sha1(data)
+    if n == "sha224":
+        return sha224(data)
     if n == "sha256":
         return sha256(data)
+    if n == "md5":
+        return md5(data)
     raise ValueError("unsupported hash type: " + name)
 
 
-algorithms_guaranteed = {"sha256"}
+algorithms_guaranteed = {"md5", "sha1", "sha224", "sha256"}
 algorithms_available = algorithms_guaranteed

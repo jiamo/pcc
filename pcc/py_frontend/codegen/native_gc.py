@@ -186,6 +186,20 @@ class NativeGcLoweringMixin:
         return None
 
     def _emit_gc_i64_3tuple(self, helper_name: str) -> ir.Value:
+        # Snapshot the counters before allocating the result tuple.  For
+        # gc.get_count() the tuple itself is tracked, so allocating first made
+        # the API observe (and report) its own return object.
+        values = []
+        i = 0
+        while i < 3:
+            values.append(
+                self.builder.call(
+                    self.runtime[helper_name],
+                    [ir.Constant(_I32, i)],
+                    name=self._fresh(f"gc.tuple.{i}.i64"),
+                )
+            )
+            i += 1
         out = self.builder.call(
             self.runtime["py_tuple_new"],
             [ir.Constant(_I64, 3)],
@@ -193,14 +207,9 @@ class NativeGcLoweringMixin:
         )
         i = 0
         while i < 3:
-            value = self.builder.call(
-                self.runtime[helper_name],
-                [ir.Constant(_I32, i)],
-                name=self._fresh(f"gc.tuple.{i}.i64"),
-            )
             obj = self.builder.call(
                 self.runtime["py_int_from_i64"],
-                [value],
+                [values[i]],
                 name=self._fresh(f"gc.tuple.{i}.obj"),
             )
             self.builder.call(

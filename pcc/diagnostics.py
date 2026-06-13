@@ -14,6 +14,64 @@ import json
 from typing import Any, Iterable, Optional
 
 
+def _json_dumps_pretty(value: Any) -> str:
+    """Return ``json.dumps(value, indent=2, sort_keys=True)`` shape.
+
+    pcc's native JSON ABI owns deterministic sorted compact output.  Keeping
+    indentation here makes the diagnostics presentation layer self-hostable
+    without weakening its public pretty-JSON contract or growing a second JSON
+    value encoder.  The scanner only inserts whitespace outside quoted strings,
+    preserving escaped quotes, backslashes, and punctuation inside values.
+    """
+    compact = json.dumps(value, sort_keys=True)
+    out: list[str] = []
+    depth = 0
+    in_string = False
+    escaped = False
+    i = 0
+    while i < len(compact):
+        ch = compact[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+            out.append(ch)
+        elif ch == "{" or ch == "[":
+            out.append(ch)
+            depth += 1
+            closing = "}" if ch == "{" else "]"
+            if i + 1 < len(compact) and compact[i + 1] != closing:
+                out.append("\n")
+                out.append("  " * depth)
+        elif ch == "}" or ch == "]":
+            depth -= 1
+            opening = "{" if ch == "}" else "["
+            if i > 0 and compact[i - 1] != opening:
+                out.append("\n")
+                out.append("  " * depth)
+            out.append(ch)
+        elif ch == ",":
+            out.append(ch)
+            out.append("\n")
+            out.append("  " * depth)
+            while i + 1 < len(compact) and compact[i + 1] == " ":
+                i += 1
+        elif ch == ":":
+            out.append(": ")
+            while i + 1 < len(compact) and compact[i + 1] == " ":
+                i += 1
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 class DiagnosticSeverity(str, Enum):
     INFO = "info"
     WARNING = "warning"
@@ -28,6 +86,20 @@ class DiagnosticSpan:
     col: int = 0
     end_line: int = 0
     end_col: int = 0
+
+    def format_compact(self) -> str:
+        """Return the stable source-range spelling used by debug traces."""
+        return (
+            self.file
+            + ":"
+            + str(self.line)
+            + ":"
+            + str(self.col)
+            + "-"
+            + str(self.end_line)
+            + ":"
+            + str(self.end_col)
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -135,7 +207,7 @@ class DiagnosticBag:
         }
 
     def format_json(self) -> str:
-        return json.dumps(self.to_json(), indent=2, sort_keys=True)
+        return _json_dumps_pretty(self.to_json())
 
     def format_text(self) -> str:
         return "\n".join(d.format_text() for d in self._diagnostics)
@@ -252,7 +324,7 @@ def diagnostics_to_sarif(bag: DiagnosticBag) -> str:
             }
         ],
     }
-    return json.dumps(sarif, indent=2, sort_keys=True)
+    return _json_dumps_pretty(sarif)
 
 
 def _sarif_level(severity: DiagnosticSeverity) -> str:

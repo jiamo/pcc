@@ -71,6 +71,7 @@ _PLAIN_TYPED_VAR_DECL = re.compile(
 _SIMPLE_RANGE_DESIGNATOR = re.compile(
     r"\{\s*\[\s*0\s*\.\.\.\s*(\d+)\s*\]\s*=\s*([^,{}]+?)\s*\}"
 )
+_FIXED_WIDTH_ENUM_BASE = re.compile(r"\benum\s*:\s*[A-Za-z_]\w*")
 _CPP11_ATTRIBUTE = re.compile(r"\[\[[\s\S]*?\]\]")
 _IGNORED_CLANG_PRAGMA = re.compile(r"(?m)^[ \t]*#\s*pragma\s+clang\b[^\n]*$")
 _EMBED_DIRECTIVE = re.compile(r"(?m)^[ \t]*#\s*embed\b[^\n]*$")
@@ -146,6 +147,29 @@ def _compile_cache_enabled(use_compile_cache):
         return False
     flag = os.environ.get("PCC_DISABLE_COMPILE_CACHE", "")
     return flag.lower() not in {"1", "true", "yes", "on"}
+
+
+def _normalize_fsanitize(fsanitize):
+    """Normalize the opt-in ``-fsanitize`` request to a tuple of check names.
+
+    SEC-P1-UBSAN. Accepts ``None`` / ``""`` (→ ``()``, everything OFF — the
+    default), a comma-separated Clang-style string (e.g.
+    ``"undefined"`` or ``"integer-divide-by-zero,shift"``), or an iterable of
+    names. Returns a de-duplicated, order-stable tuple so it can flow through
+    the artifact/compile chain as a plain value.
+    """
+    if not fsanitize:
+        return ()
+    if isinstance(fsanitize, str):
+        parts = fsanitize.split(",")
+    else:
+        parts = list(fsanitize)
+    seen = []
+    for name in parts:
+        name = str(name).strip()
+        if name and name not in seen:
+            seen.append(name)
+    return tuple(seen)
 
 
 def _normalize_compile_cache_dir(cache_dir):
@@ -485,12 +509,11 @@ def _compiler_cache_tracked_files():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     tracked_files = [
         os.path.abspath(__file__),
-        os.path.join(base_dir, "codegen", "c_codegen.py"),
         os.path.join(base_dir, "parse", "c_parser.py"),
         os.path.join(base_dir, "lex", "c_lexer.py"),
         os.path.join(base_dir, "preprocessor.py"),
     ]
-    for dirname in ("passes", "ssa", "llvm_capi", "backend"):
+    for dirname in ("codegen", "passes", "ir_passes", "ssa", "llvm_capi", "backend"):
         package_dir = os.path.join(base_dir, dirname)
         try:
             for root, dirs, files in os.walk(package_dir):
@@ -500,7 +523,7 @@ def _compiler_cache_tracked_files():
                         tracked_files.append(os.path.join(root, filename))
         except OSError:
             tracked_files.append(os.path.join(package_dir, "missing"))
-    return tuple(tracked_files)
+    return tuple(dict.fromkeys(tracked_files))
 
 
 def _compiler_cache_fingerprint():
@@ -1085,6 +1108,7 @@ def _normalize_preprocessed_source(codestr):
     codestr = _normalize_simple_typeof_identifiers(codestr)
     codestr = _normalize_typeof_declaration_fallbacks(codestr)
     codestr = _strip_gnu_asm_statements(codestr)
+    codestr = _FIXED_WIDTH_ENUM_BASE.sub("enum", codestr)
     codestr = _CPP11_ATTRIBUTE.sub("", codestr)
     codestr = _expand_simple_gnu_range_designators(codestr)
     return codestr
@@ -1167,6 +1191,7 @@ def _compile_preprocessed_translation_unit_artifact(
     pass_ctx=None,
     frontend_opt_level=None,
     target_triple=None,
+    fsanitize=None,
 ):
     from ..passes import PassContext, PassPipeline
 
@@ -1195,6 +1220,10 @@ def _compile_preprocessed_translation_unit_artifact(
         llvm.initialize_all_asmprinters()
         target_machine = llvm.Target.from_triple(target_triple).create_target_machine()
         codegen.set_target_machine(target_triple, target_machine)
+    # SEC-P1-UBSAN: opt-in `-fsanitize=undefined`-style trapping. OFF unless a
+    # non-empty check set is threaded down from evaluate()/build().
+    if fsanitize:
+        codegen.configure_ubsan(fsanitize, mode="trap")
     codegen.generate_code(ast)
 
     ir_text = postprocess_ir_text(str(codegen.module))
@@ -1248,6 +1277,7 @@ def _compile_translation_unit_artifact_job(
     frontend_opt_level=None,
     backend_sig=None,
     target_triple=None,
+    fsanitize=None,
 ):
     unit_base_dir = os.path.dirname(unit.path) if unit.path else base_dir
     codestr = _preprocess_translation_unit_source(
@@ -1257,6 +1287,14 @@ def _compile_translation_unit_artifact_job(
         include_dirs=include_dirs,
         cpp_args=cpp_args,
     )
+
+    # SEC-P1-UBSAN: when opt-in trapping is active the emitted IR differs from
+    # the cached un-instrumented artifact, so bypass the on-disk artifact cache
+    # rather than risk returning an un-guarded artifact for an instrumented
+    # request (or vice versa). The flag is off by default so this is inert for
+    # normal compilation.
+    if fsanitize:
+        use_compile_cache = False
 
     if _compile_cache_enabled(use_compile_cache):
         normalized_cache_dir = _normalize_compile_cache_dir(cache_dir)
@@ -1275,6 +1313,7 @@ def _compile_translation_unit_artifact_job(
             codestr,
             frontend_opt_level=frontend_opt_level,
             target_triple=target_triple,
+            fsanitize=fsanitize,
         )
         _store_compiled_artifact(normalized_cache_dir, cache_key, artifact)
         return artifact
@@ -1284,6 +1323,7 @@ def _compile_translation_unit_artifact_job(
         codestr,
         frontend_opt_level=frontend_opt_level,
         target_triple=target_triple,
+        fsanitize=fsanitize,
     )
 
 
@@ -1292,6 +1332,7 @@ def _invoke_compile_preprocessed_translation_unit_artifact(
     codestr,
     frontend_opt_level=None,
     target_triple=None,
+    fsanitize=None,
 ):
     """Call the compile helper with backward-compatible monkeypatch support.
 
@@ -1303,7 +1344,7 @@ def _invoke_compile_preprocessed_translation_unit_artifact(
     narrow wrappers.
     """
     fn = _compile_preprocessed_translation_unit_artifact
-    if frontend_opt_level is None and target_triple is None:
+    if frontend_opt_level is None and target_triple is None and not fsanitize:
         return fn(unit_name, codestr)
 
     try:
@@ -1311,19 +1352,19 @@ def _invoke_compile_preprocessed_translation_unit_artifact(
     except (TypeError, ValueError):
         params = {}
 
-    supports_frontend_opt_level = "frontend_opt_level" in params or any(
-        param.kind == inspect.Parameter.VAR_KEYWORD
-        for param in params.values()
-    )
-    supports_target_triple = "target_triple" in params or any(
-        param.kind == inspect.Parameter.VAR_KEYWORD
-        for param in params.values()
-    )
+    def _supports(param_name):
+        return param_name in params or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in params.values()
+        )
+
     kwargs = {}
-    if frontend_opt_level is not None and supports_frontend_opt_level:
+    if frontend_opt_level is not None and _supports("frontend_opt_level"):
         kwargs["frontend_opt_level"] = frontend_opt_level
-    if target_triple is not None and supports_target_triple:
+    if target_triple is not None and _supports("target_triple"):
         kwargs["target_triple"] = target_triple
+    if fsanitize and _supports("fsanitize"):
+        kwargs["fsanitize"] = fsanitize
     if kwargs:
         return fn(unit_name, codestr, **kwargs)
     return fn(unit_name, codestr)
@@ -1478,6 +1519,7 @@ class CEvaluator(object):
         link_args=None,
         use_compile_cache=True,
         cache_dir=None,
+        fsanitize=None,
     ):
         if not isinstance(codestr, str):
             raise TypeError(
@@ -1487,6 +1529,14 @@ class CEvaluator(object):
         if not codestr.strip():
             raise ValueError("evaluate() received empty source code")
 
+        # SEC-P1-UBSAN: normalize the opt-in `-fsanitize` check list. Empty /
+        # None keeps every guard OFF (the default) so lowering is unchanged.
+        fsanitize = _normalize_fsanitize(fsanitize)
+        if fsanitize:
+            # Instrumented IR differs from any un-instrumented cache entry, so
+            # skip all fast paths for a correct (never stale) instrumented run.
+            use_compile_cache = False
+
         opt_level = self._normalize_opt_level(optimize)
         cheap_passes = _resolve_cheap_llvm_pipeline_passes()
         opt_signature = _llvm_optimization_signature(opt_level, cheap_passes)
@@ -1494,7 +1544,7 @@ class CEvaluator(object):
 
         # Fast path 1: in-memory JIT cache keyed on source text + entry + opt.
         # Avoids ALL work — preprocessing, parsing, codegen, LLVM, and JIT.
-        if not llvmdump and not prog_args:
+        if not llvmdump and not prog_args and not fsanitize:
             src_hash = hashlib.sha256(codestr.encode("utf-8")).hexdigest()
             jit_key = (
                 src_hash,
@@ -1553,6 +1603,7 @@ class CEvaluator(object):
             use_compile_cache,
             opt_level,
             self.backend_sig,
+            fsanitize=fsanitize,
         )
         ir_text = artifact["ir_text"]
         pass_ctx = _pass_context_from_artifact(artifact)
@@ -1659,8 +1710,9 @@ class CEvaluator(object):
             fptr = CFUNCTYPE(return_type)(main_addr)
             if args is None:
                 args = []
-            # Cache the JIT state for future calls
-            if not llvmdump:
+            # Cache the JIT state for future calls. Never cache an
+            # instrumented result under the un-instrumented key (SEC-P1-UBSAN).
+            if not llvmdump and not fsanitize:
                 src_hash = hashlib.sha256(codestr.encode("utf-8")).hexdigest()
                 jit_key = (
                     src_hash,

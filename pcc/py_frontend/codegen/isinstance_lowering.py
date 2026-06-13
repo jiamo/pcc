@@ -1,4 +1,5 @@
 """``isinstance`` / ``issubclass`` helper bodies for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -13,16 +14,20 @@ from ..py_ast import (
     DynType,
     Expr,
     FloatType,
+    IntLit,
     IntType,
     ListType,
     Name,
     NoneLit,
     NoneType,
     StrType,
+    Subscript,
     TupleExpr,
     TupleType,
 )
+from .builtin_exceptions import BUILTIN_EXC_TAG as _BUILTIN_EXC_TAG
 from .errors import L1CodegenError
+from .runtime_abi import declare_runtime_global
 
 _I1 = ir.IntType(1)
 _I64 = ir.IntType(64)
@@ -46,7 +51,34 @@ _BUILTIN_TYPE_TAGS = {
     "list": 5,
     "dict": 6,
     "tuple": 7,
+    "FunctionType": 9,
 }
+
+
+def emit_code_type_runtime_isinstance_impl(
+    host,
+    obj_expr: Expr,
+    obj_val: Optional[ir.Value] = None,
+) -> ir.Value:
+    """Match native ``__code__`` objects against ``types.CodeType``."""
+    if obj_val is None:
+        obj_val = host._emit_as_object(obj_expr)
+    code_cls_gv = declare_runtime_global(host.module, "py_func_code_class_cache")
+    code_cls = host.builder.load(
+        code_cls_gv,
+        name=host._fresh("code.class"),
+    )
+    raw = host.builder.call(
+        host.runtime["py_obj_isinstance"],
+        [obj_val, code_cls],
+        name=host._fresh("isinstance.code"),
+    )
+    return host.builder.icmp_signed(
+        "!=",
+        raw,
+        ir.Constant(_I64, 0),
+        name=host._fresh("isinstance.code.i1"),
+    )
 
 
 def compile_time_isinstance_impl(
@@ -132,19 +164,33 @@ def emit_ir_scaffold_isinstance_impl(
 
 def maybe_emit_issubclass_builtin_impl(host, expr: Call) -> Optional[ir.Value]:
     lhs, rhs = expr.args
-    if not isinstance(lhs, Name) or not isinstance(rhs, Name):
-        return None
-    sub_name = host._resolve_class_alias(lhs.ident)
-    sup_name = host._resolve_class_alias(rhs.ident)
-    if not hasattr(host, "class_lowering"):
-        return None
-    if sub_name not in host.class_lowering.classes:
-        return None
-    if sup_name != "object" and sup_name not in host.class_lowering.classes:
-        return None
-    return ir.Constant(
-        _I1,
-        1 if host._class_is_subclass(sub_name, sup_name) else 0,
+    if (
+        isinstance(lhs, Name)
+        and isinstance(rhs, Name)
+        and hasattr(host, "class_lowering")
+    ):
+        sub_name = host._resolve_class_alias(lhs.ident)
+        sup_name = host._resolve_class_alias(rhs.ident)
+        if sub_name in host.class_lowering.classes and (
+            sup_name == "object" or sup_name in host.class_lowering.classes
+        ):
+            return ir.Constant(
+                _I1,
+                1 if host._class_is_subclass(sub_name, sup_name) else 0,
+            )
+    derived_obj = host._emit_as_object(lhs)
+    cls_obj = host._emit_as_object(rhs)
+    result = host.builder.call(
+        host.runtime["py_obj_issubclass"],
+        [derived_obj, cls_obj],
+        name=host._fresh("issubclass"),
+    )
+    host._emit_post_call_err_check(getattr(expr, "span", None))
+    return host.builder.icmp_signed(
+        "!=",
+        result,
+        ir.Constant(_I64, 0),
+        name=host._fresh("issubclass.bool"),
     )
 
 
@@ -215,7 +261,25 @@ def emit_isinstance_call_impl(
         obj_val: ir.Value,
         classinfo_expr: Expr,
     ) -> ir.Value:
-        cls_val = host._emit_expr(classinfo_expr)
+        if (
+            isinstance(classinfo_expr, Subscript)
+            and isinstance(classinfo_expr.obj, Name)
+            and isinstance(classinfo_expr.idx, IntLit)
+            and classinfo_expr.idx.value == 0
+        ):
+            # Closure conversion represents a captured/rebound value as a
+            # one-element list cell and rewrites reads to ``name[0]``. Going
+            # through generic Subscript dunder discovery here recursively
+            # re-enters isinstance lowering for captured classinfo. Load the
+            # well-defined cell representation directly.
+            cell = host._emit_expr(classinfo_expr.obj)
+            cls_val = host.builder.call(
+                host.runtime["py_list_getitem"],
+                [cell, ir.Constant(_I64, 0)],
+                name=host._fresh("isinstance.classinfo.cell"),
+            )
+        else:
+            cls_val = host._emit_expr(classinfo_expr)
         raw = host.builder.call(
             host.runtime["py_obj_isinstance"],
             [obj_val, cls_val],
@@ -296,6 +360,45 @@ def emit_isinstance_call_impl(
                     if obj_val is None:
                         obj_val = host._emit_as_object(expr.args[0])
                     ct = host.class_lowering.emit_isinstance(obj_val, nm)
+                elif nm in _BUILTIN_EXC_TAG:
+                    if obj_val is None:
+                        obj_val = host._emit_as_object(expr.args[0])
+                    exc_cls_val = host.builder.call(
+                        host.runtime["py_exc_builtin_class"],
+                        [ir.Constant(_I64, _BUILTIN_EXC_TAG[nm])],
+                        name=host._fresh("isinstance.exc_cls"),
+                    )
+                    exc_raw = host.builder.call(
+                        host.runtime["py_obj_isinstance"],
+                        [obj_val, exc_cls_val],
+                        name=host._fresh("isinstance.exc"),
+                    )
+                    ct = host.builder.icmp_signed(
+                        "!=",
+                        exc_raw,
+                        ir.Constant(_I64, 0),
+                        name=host._fresh("isinstance.exc.i1"),
+                    )
+                elif nm == "slice":
+                    if obj_val is None:
+                        obj_val = host._emit_as_object(expr.args[0])
+                    slice_raw = host.builder.call(
+                        host.runtime["py_obj_is_slice"],
+                        [obj_val],
+                        name=host._fresh("isinstance.slice"),
+                    )
+                    ct = host.builder.icmp_signed(
+                        "!=",
+                        slice_raw,
+                        ir.Constant(_I64, 0),
+                        name=host._fresh("isinstance.slice.i1"),
+                    )
+                elif nm == "CodeType":
+                    ct = emit_code_type_runtime_isinstance_impl(
+                        host,
+                        expr.args[0],
+                        obj_val,
+                    )
                 else:
                     ct = ir.Constant(_I1, 0)
             acc = (
@@ -313,13 +416,26 @@ def emit_isinstance_call_impl(
     # ``mod.Class`` second-arg: use tail token as the class name.
     cls_ident, ir_symbol = class_name_from_expr(class_arg)
     if cls_ident is None:
-        if is_dynamic_type_call(class_arg):
+        if is_dynamic_type_call(class_arg) or isinstance(class_arg, Subscript):
             obj_val = host._emit_as_object(expr.args[0])
             return emit_dynamic_classinfo_isinstance(obj_val, class_arg)
+        span = getattr(class_arg, "span", None)
+        where = ""
+        if span is not None:
+            where = f" at {span.file}:{span.line}:{span.col}"
+        detail = ""
+        if isinstance(class_arg, Subscript):
+            obj = class_arg.obj
+            idx_expr = class_arg.idx
+            detail = (
+                f" (obj={type(obj).__name__}:{getattr(obj, 'ident', '')}, "
+                f"idx={type(idx_expr).__name__}:"
+                f"{getattr(idx_expr, 'value', '')})"
+            )
         raise NotImplementedError(
             "isinstance second argument must be a bare class name, "
             "a tuple of bare class names, a module.attr chain, type(None), "
-            "or type(expr)"
+            f"or type(expr); got {type(class_arg).__name__}{detail}{where}"
         )
     cls_ident = host._resolve_class_alias(cls_ident)
     protocol_check = host._maybe_emit_protocol_isinstance(
@@ -338,6 +454,52 @@ def emit_isinstance_call_impl(
         obj_val = host._emit_as_object(expr.args[0])
         return host._emit_ir_scaffold_isinstance(obj_val, ir_symbol)
     if cls_ident not in host.class_lowering.classes:
+        if cls_ident == "slice":
+            # isinstance(x, slice): slices are instances of the runtime
+            # pcc_slice_cls (not a distinct type tag), so route to the
+            # dedicated predicate. Otherwise this fell through to constant
+            # False, breaking the common __getitem__(slice) dispatch idiom.
+            obj_val = host._emit_as_object(expr.args[0])
+            raw = host.builder.call(
+                host.runtime["py_obj_is_slice"],
+                [obj_val],
+                name=host._fresh("isinstance.slice"),
+            )
+            return host.builder.icmp_signed(
+                "!=",
+                raw,
+                ir.Constant(_I64, 0),
+                name=host._fresh("isinstance.slice.i1"),
+            )
+        if cls_ident == "CodeType":
+            return emit_code_type_runtime_isinstance_impl(
+                host,
+                expr.args[0],
+            )
+        if cls_ident in _BUILTIN_EXC_TAG:
+            # Builtin exception class (ValueError, KeyError, ...) — match the
+            # object's exc_class MRO at runtime. Previously this fell through to
+            # the constant-False return below, so isinstance(ValueError('x'),
+            # ValueError) was always False. Use ``in`` + subscript (self-host
+            # safe, like ``nm in _BUILTIN_TYPE_TAGS`` below), not ``.get()``
+            # which pcc1 mis-lowers to a KeyError-raising getitem.
+            obj_val = host._emit_as_object(expr.args[0])
+            cls_val = host.builder.call(
+                host.runtime["py_exc_builtin_class"],
+                [ir.Constant(_I64, _BUILTIN_EXC_TAG[cls_ident])],
+                name=host._fresh("isinstance.exc_cls"),
+            )
+            raw = host.builder.call(
+                host.runtime["py_obj_isinstance"],
+                [obj_val, cls_val],
+                name=host._fresh("isinstance.exc"),
+            )
+            return host.builder.icmp_signed(
+                "!=",
+                raw,
+                ir.Constant(_I64, 0),
+                name=host._fresh("isinstance.exc.i1"),
+            )
         if isinstance(class_arg, Name) and (
             class_arg.ident in host.env
             or class_arg.ident in getattr(host, "_module_globals", {})

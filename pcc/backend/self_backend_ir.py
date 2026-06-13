@@ -12,6 +12,53 @@ from dataclasses import dataclass, field
 from . import BackendUnavailable
 
 
+def _dot_numeric_text_key_id(text: str) -> int:
+    suffix = ""
+    if len(text) > 2 and text.startswith("%."):
+        suffix = text[2:]
+    elif len(text) > 1 and text.startswith("."):
+        suffix = text[1:]
+    if suffix and suffix.isdigit():
+        return int(suffix)
+    return -1
+
+
+def text_key_names_equal(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    left_id = _dot_numeric_text_key_id(left)
+    if left_id < 0:
+        return False
+    return left_id == _dot_numeric_text_key_id(right)
+
+
+def text_collection_contains(values, key: str) -> bool:
+    if key in values:
+        return True
+    key_id = _dot_numeric_text_key_id(key)
+    if key_id < 0:
+        return False
+    for existing in values:
+        if key_id == _dot_numeric_text_key_id(existing):
+            return True
+    return False
+
+
+def text_key_mapping_get(mapping, key: str):
+    """Return a text-keyed mapping value despite a false hash miss."""
+    result = mapping.get(key)
+    if result is not None:
+        return result
+    for existing_key, existing_value in mapping.items():
+        if text_key_names_equal(existing_key, key):
+            return existing_value
+    return None
+
+
+def parsed_function_value_slot(func, key: str):
+    return text_key_mapping_get(func.value_slots, key)
+
+
 def _align_to(value: int, alignment: int) -> int:
     if value == 0:
         return 0
@@ -69,16 +116,17 @@ class TypeDesc:
         if self.is_ptr or self.width > 32:
             return 8
         if self.is_array:
-            assert self.elem is not None
-            stride = _align_to(self.elem.slot_size, self.elem.align)
+            elem: TypeDesc = self.elem
+            assert elem is not None
+            stride = _align_to(elem.slot_size, elem.align)
             return stride * self.count
         if self.is_struct:
             offset = 0
             max_align = 1
-            for field in self.fields:
-                offset = _align_to(offset, field.align)
-                offset += field.slot_size
-                max_align = max(max_align, field.align)
+            for member in self.fields:
+                offset = _align_to(offset, member.align)
+                offset += member.slot_size
+                max_align = max(max_align, member.align)
             return _align_to(offset, max_align)
         if self.width <= 8:
             return 1
@@ -103,10 +151,15 @@ class TypeDesc:
         if self.is_void:
             return 1
         if self.is_array:
-            assert self.elem is not None
-            return self.elem.align
+            elem: TypeDesc = self.elem
+            assert elem is not None
+            return elem.align
         if self.is_struct:
-            return max((field.align for field in self.fields), default=1)
+            result = 1
+            for member in self.fields:
+                if member.align > result:
+                    result = member.align
+            return result
         if self.is_fp:
             return 4 if self.width <= 32 else 8
         if self.is_ptr or self.width > 32:
@@ -140,33 +193,45 @@ class TypeDesc:
         if self.is_fp:
             return "float" if self.width <= 32 else "double"
         if self.is_array:
-            assert self.elem is not None
-            return f"[{self.count} x {self.elem.describe()}]"
+            elem: TypeDesc = self.elem
+            assert elem is not None
+            return f"[{self.count} x {elem.describe()}]"
         if self.is_struct:
             return self.name or "<anon-struct>"
-        assert self.pointee is not None
-        return self.pointee.describe() + "*"
+        pointee: TypeDesc = self.pointee
+        assert pointee is not None
+        return pointee.describe() + "*"
 
     def field_offset(self, index: int) -> int:
         if not self.is_struct:
-            raise BackendUnavailable(f"field_offset requested on non-struct {self.describe()}")
+            raise BackendUnavailable(
+                f"field_offset requested on non-struct {self.describe()}"
+            )
         if index < 0 or index >= len(self.fields):
-            raise BackendUnavailable(f"struct field index {index} out of range for {self.describe()}")
+            raise BackendUnavailable(
+                f"struct field index {index} out of range for {self.describe()}"
+            )
         offset = 0
-        for field_index, field in enumerate(self.fields):
-            offset = _align_to(offset, field.align)
+        for field_index, member in enumerate(self.fields):
+            offset = _align_to(offset, member.align)
             if field_index == index:
                 return offset
-            offset += field.slot_size
-        raise BackendUnavailable(f"struct field index {index} out of range for {self.describe()}")
+            offset += member.slot_size
+        raise BackendUnavailable(
+            f"struct field index {index} out of range for {self.describe()}"
+        )
 
     def field_type(self, index: int) -> "TypeDesc":
         if not self.is_struct:
-            raise BackendUnavailable(f"field_type requested on non-struct {self.describe()}")
+            raise BackendUnavailable(
+                f"field_type requested on non-struct {self.describe()}"
+            )
         return self.fields[index]
 
 
-def aggregate_member_info(value_type: TypeDesc, indices: tuple[int, ...]) -> tuple[TypeDesc, int]:
+def aggregate_member_info(
+    value_type: TypeDesc, indices: tuple[int, ...]
+) -> tuple[TypeDesc, int]:
     current = value_type
     offset = 0
     for index in indices:
@@ -264,7 +329,9 @@ class ParsedFunction:
     value_slots: dict[str, SlotInfo] = field(default_factory=dict)
     alloca_slots: dict[str, AllocaInfo] = field(default_factory=dict)
     block_map: dict[str, ParsedBlock] = field(default_factory=dict)
-    used_values: set[str] = field(default_factory=set)
+    # Membership must be equality-based during native bootstrap.  A set lookup
+    # can falsely miss an equal text key produced through another runtime path.
+    used_values: list[str] = field(default_factory=list)
     hidden_sret_slot: SlotInfo | None = None
     frame_size: int = 0
 
@@ -286,4 +353,8 @@ __all__ = [
     "SlotInfo",
     "TypeDesc",
     "_align_to",
+    "parsed_function_value_slot",
+    "text_collection_contains",
+    "text_key_mapping_get",
+    "text_key_names_equal",
 ]

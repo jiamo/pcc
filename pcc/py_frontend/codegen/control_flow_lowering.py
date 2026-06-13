@@ -3,8 +3,12 @@ from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Assign, Attr, BoolLit, BoolType, Break, Compare, If, IfExpr, Name, NoneLit, NoneType, Try, While
+from ..py_ast import Assign, Attr, BoolLit, BoolType, Break, Compare, If, IfExpr, IntLit, Name, NoneLit, NoneType, Try, TupleExpr, While
 from . import marshal
+
+
+_CSTR = ir.IntType(8).as_pointer()
+_TARGET_SYS_VERSION_INFO = (3, 13, 0)
 
 
 class ControlFlowLoweringMixin:
@@ -35,7 +39,53 @@ class ControlFlowLoweringMixin:
             rhs_none = isinstance(expr.rhs, NoneLit) or isinstance(expr.rhs.ty, NoneType)
             if (lhs_missing and rhs_none) or (rhs_missing and lhs_none):
                 return expr.op == "is"
+        if isinstance(expr, Compare) and expr.op in (
+            "==",
+            "!=",
+            "<",
+            "<=",
+            ">",
+            ">=",
+        ):
+            lhs_is_version = (
+                isinstance(expr.lhs, Attr)
+                and expr.lhs.name == "version_info"
+                and isinstance(expr.lhs.obj, Name)
+                and self._native_builtin_module_for_name(expr.lhs.obj.ident) == "sys"
+            )
+            if lhs_is_version and isinstance(expr.rhs, TupleExpr):
+                rhs_values = []
+                for item in expr.rhs.elems:
+                    if not isinstance(item, IntLit):
+                        return None
+                    rhs_values.append(item.value)
+                rhs = tuple(rhs_values)
+                if expr.op == "==":
+                    return _TARGET_SYS_VERSION_INFO == rhs
+                if expr.op == "!=":
+                    return _TARGET_SYS_VERSION_INFO != rhs
+                if expr.op == "<":
+                    return _TARGET_SYS_VERSION_INFO < rhs
+                if expr.op == "<=":
+                    return _TARGET_SYS_VERSION_INFO <= rhs
+                if expr.op == ">":
+                    return _TARGET_SYS_VERSION_INFO > rhs
+                return _TARGET_SYS_VERSION_INFO >= rhs
         return None
+
+    def _emit_condition_value(self, cond_expr) -> ir.Value:
+        """Emit a condition expression for truthiness. A direct
+        valueclass constructor in condition position projects to a
+        payload (``_truthy``'s ClassType branch boxes it for
+        ``py_obj_truthy``) instead of allocating an identity
+        instance."""
+        payload = self._maybe_emit_valueclass_constructor_payload(
+            cond_expr.ty,
+            cond_expr,
+        )
+        if payload is not None:
+            return payload
+        return self._emit_expr(cond_expr)
 
     def _emit_if(self, stmt: If) -> None:
         static_cond = self._static_bool_condition(stmt.cond)
@@ -46,7 +96,7 @@ class ControlFlowLoweringMixin:
                 self._emit_stmts(stmt.else_body)
             return
 
-        cond = self._emit_expr(stmt.cond)
+        cond = self._emit_condition_value(stmt.cond)
         cond_i1 = self._truthy(cond, stmt.cond.ty)
         class_attr_state_before = dict(
             getattr(self, "_class_attr_runtime_state", {})
@@ -101,10 +151,13 @@ class ControlFlowLoweringMixin:
         if static_cond is not None:
             selected = expr.then_e if static_cond else expr.else_e
             selected_val = self._emit_expr(selected)
-            return self._coerce(selected_val, selected.ty, expr.ty)
+            coerced = self._coerce(selected_val, selected.ty, expr.ty)
+            if selected_val in getattr(self, "_cpy_values", ()):
+                return self._mark_cpy_value(coerced)
+            return coerced
 
         result_ty = expr.ty
-        cond_val = self._emit_expr(expr.cond)
+        cond_val = self._emit_condition_value(expr.cond)
         cond_b = self._truthy(cond_val, expr.cond.ty)
 
         fn = self.current_function
@@ -124,7 +177,26 @@ class ControlFlowLoweringMixin:
         else_exit = self.builder._block
 
         phi_ty = self._storage_ir_type(result_ty)
+        cpy_result = False
         if isinstance(phi_ty, ir.PointerType):
+            then_is_cpy = then_val in getattr(self, "_cpy_values", ())
+            else_is_cpy = else_val in getattr(self, "_cpy_values", ())
+            if then_is_cpy or else_is_cpy:
+                cpy_result = True
+                if not then_is_cpy:
+                    self.builder.position_at_end(then_exit)
+                    then_val, _ = self._marshal_to_cpython(
+                        then_val,
+                        expr.then_e.ty,
+                    )
+                    then_exit = self.builder._block
+                if not else_is_cpy:
+                    self.builder.position_at_end(else_exit)
+                    else_val, _ = self._marshal_to_cpython(
+                        else_val,
+                        expr.else_e.ty,
+                    )
+                    else_exit = self.builder._block
             if not isinstance(then_val.type, ir.PointerType):
                 self.builder.position_at_end(then_exit)
                 then_val = marshal.marshal_to_object(
@@ -153,6 +225,43 @@ class ControlFlowLoweringMixin:
 
         self.builder.position_at_end(join_bb)
         phi = self.builder.phi(phi_ty, name=self._fresh("ternary"))
+        phi.add_incoming(then_val, then_exit)
+        phi.add_incoming(else_val, else_exit)
+        if cpy_result:
+            return self._mark_cpy_value(phi)
+        return phi
+
+    def _emit_if_expr_as_pcc_object(self, expr: IfExpr) -> ir.Value:
+        """Lower a conditional expression whose result crosses an object boundary."""
+        static_cond = self._static_bool_condition(expr.cond)
+        if static_cond is not None:
+            selected = expr.then_e if static_cond else expr.else_e
+            return self._emit_expr_as_pcc_object(selected)
+
+        cond_val = self._emit_expr(expr.cond)
+        cond_b = self._truthy(cond_val, expr.cond.ty)
+
+        fn = self.current_function
+        then_bb = fn.append_basic_block(name=self._fresh("ternary_obj_true"))
+        else_bb = fn.append_basic_block(name=self._fresh("ternary_obj_false"))
+        join_bb = fn.append_basic_block(name=self._fresh("ternary_obj_end"))
+        self.builder.cbranch(cond_b, then_bb, else_bb)
+
+        self.builder.position_at_end(then_bb)
+        then_val = self._emit_expr_as_pcc_object(expr.then_e)
+        then_exit = self.builder._block
+
+        self.builder.position_at_end(else_bb)
+        else_val = self._emit_expr_as_pcc_object(expr.else_e)
+        else_exit = self.builder._block
+
+        self.builder.position_at_end(then_exit)
+        self.builder.branch(join_bb)
+        self.builder.position_at_end(else_exit)
+        self.builder.branch(join_bb)
+
+        self.builder.position_at_end(join_bb)
+        phi = self.builder.phi(_CSTR, name=self._fresh("ternary.obj"))
         phi.add_incoming(then_val, then_exit)
         phi.add_incoming(else_val, else_exit)
         return phi
@@ -269,11 +378,11 @@ class ControlFlowLoweringMixin:
 
         self.builder.branch(cond_bb)
         self.builder.position_at_end(cond_bb)
-        cond = self._emit_expr(stmt.cond)
+        cond = self._emit_condition_value(stmt.cond)
         cond_i1 = self._truthy(cond, stmt.cond.ty)
         self.builder.cbranch(cond_i1, body_bb, end_bb)
 
-        self.loop_stack.append((latch_bb, end_bb))
+        self.loop_stack.append((latch_bb, end_bb, self._loop_finally_base()))
         self.builder.position_at_end(body_bb)
         self._class_attr_runtime_state = dict(class_attr_state_before)
         old_class_attr_loop_depth = getattr(

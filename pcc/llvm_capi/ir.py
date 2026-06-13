@@ -71,6 +71,11 @@ def _float64_to_bits_ir(f: float) -> int:
     return (sign << 63) | (biased_exp << 52) | mantissa_bits
 
 
+def _coerce_float64_ir(value) -> float:
+    """Coerce a CPython/pcc float-like value to a native double."""
+    return value
+
+
 def _bits_to_float64_ir(bits: int) -> float:
     sign = (bits >> 63) & 1
     biased_exp = (bits >> 52) & 0x7FF
@@ -134,12 +139,54 @@ def _debug_ir_call_enabled_uncached() -> bool:
 
 
 def _join_text(parts, sep: str) -> str:
-    out_parts = []
+    all_text = True
     i = 0
     while i < len(parts):
-        out_parts.append(str(parts[i]))
+        if not isinstance(parts[i], str):
+            all_text = False
+            break
         i += 1
-    return sep.join(out_parts)
+    if all_text:
+        out_parts = parts
+    else:
+        out_parts = []
+        i = 0
+        while i < len(parts):
+            part = parts[i]
+            if isinstance(part, str):
+                out_parts.append(part)
+            else:
+                rendered = str(part)
+                if not isinstance(rendered, str):
+                    raise TypeError(
+                        "IR text join requires text: index="
+                        + str(i)
+                        + " value_type="
+                        + str(type(part).__name__)
+                    )
+                out_parts.append(rendered)
+            i += 1
+    if not out_parts:
+        return ""
+    # A single native join over several thousand IR fragments can allocate
+    # while a large compiler object graph is live.  Bound that temporary
+    # sequence and avoid the thousands of intermediate strings produced by a
+    # pairwise tree: join fixed-size chunks, then join the small chunk list.
+    chunk_limit = 128
+    if len(out_parts) <= chunk_limit:
+        return sep.join(out_parts)
+    chunks = []
+    chunk = []
+    i = 0
+    while i < len(out_parts):
+        chunk.append(out_parts[i])
+        if len(chunk) == chunk_limit:
+            chunks.append(sep.join(chunk))
+            chunk = []
+        i += 1
+    if chunk:
+        chunks.append(sep.join(chunk))
+    return sep.join(chunks)
 
 
 def _round_to_float32_ir(f: float) -> float:
@@ -275,7 +322,8 @@ class IntType(Type):
         self.width = width
 
     def __str__(self) -> str:
-        return "i" + str(self.width)
+        width_text = str(self.width)
+        return _join_text(["i", width_text], "")
 
     def __call__(self, value: int) -> "Constant":
         """``IntType(32)(0)`` shorthand for ``Constant(IntType(32), 0)``."""
@@ -352,7 +400,16 @@ class ArrayType(Type):
         self.count = count
 
     def __str__(self) -> str:
-        return "[" + str(self.count) + " x " + str(self.element) + "]"
+        count_text = str(self.count)
+        element_text = str(self.element)
+        if not count_text and count_text != "":
+            raise TypeError("ArrayType.__str__ NULL count_text")
+        if not element_text and element_text != "":
+            raise TypeError("ArrayType.__str__ NULL element_text")
+        result = _join_text(["[", count_text, " x ", element_text, "]"], "")
+        if not result and result != "":
+            raise TypeError("ArrayType.__str__ NULL join result")
+        return result
 
     def gep(self, indices) -> Type:
         """Type-level GEP — array has uniform element type, so any
@@ -563,6 +620,12 @@ class Value:
     )
 
     def __init__(self, ty: Type, ref: str) -> None:
+        # ``""`` is a valid operand spelling for void sentinels; a NULL
+        # pcc-native string is not.  Static StrType lowering can otherwise
+        # let NULL pass an ``isinstance(..., str)`` check and poison a later
+        # call-argument join far from the creator.
+        if not ref and ref != "":
+            raise TypeError("IR Value ref must be text, not NULL")
         self.type = ty
         self._ref = ref  # text used when this value is referenced as an operand
         self._instr = None
@@ -764,7 +827,12 @@ class Constant(Value):
                 return "1" if value else "0"
             return Constant._format_int(value)
         if isinstance(ty, (FloatType, DoubleType, HalfType)):
-            f = value * 1.0
+            # Do not coerce with ``value * 1.0``: during self-host this path can
+            # receive a boxed pcc float in a DynType slot, and dynamic ``*``
+            # would dispatch through ``__mul__`` while the compiler is merely
+            # trying to render a literal. The helper's float return type forces
+            # pcc to unbox to a native double.
+            f = _coerce_float64_ir(value)
             if isinstance(ty, FloatType):
                 f = _round_to_float32_ir(f)
             elif isinstance(ty, HalfType):
@@ -915,14 +983,26 @@ def _render_instruction_lines(
     start: int,
     end: int,
 ) -> str:
-    out = ""
+    chunks: list[str] = []
+    parts: list[str] = []
+    line_count = 0
     i = start
     while i < end:
-        out = out + "  "
-        out = out + str(lines[i])
-        out = out + "\n"
+        parts.append("  ")
+        # Block.append/insert already enforce text. Avoid str(existing_str):
+        # pcc1-native can lose that borrowed result while rendering a large
+        # module-top initializer.
+        parts.append(lines[i])
+        parts.append("\n")
+        line_count += 1
+        if line_count == 128:
+            chunks.append(_join_text(parts, ""))
+            parts = []
+            line_count = 0
         i += 1
-    return out
+    if parts:
+        chunks.append(_join_text(parts, ""))
+    return _join_text(chunks, "")
 
 
 class Block:
@@ -951,11 +1031,29 @@ class Block:
         return list(self._instrs)
 
     def append(self, line: str) -> None:
+        if line is None or not isinstance(line, str):
+            raise TypeError(
+                "IR block append requires text: function="
+                + str(self.parent.name)
+                + " block="
+                + str(self.name)
+                + " value_type="
+                + str(type(line).__name__)
+            )
         op = _opname_of(line)
         self._instrs.append(InstructionRecord(line, op, self))
         self._text_lines.append(line)
 
     def insert(self, idx: int, line: str) -> None:
+        if line is None or not isinstance(line, str):
+            raise TypeError(
+                "IR block insert requires text: function="
+                + str(self.parent.name)
+                + " block="
+                + str(self.name)
+                + " value_type="
+                + str(type(line).__name__)
+            )
         self._instrs.insert(
             idx,
             InstructionRecord(line, _opname_of(line), self),
@@ -974,10 +1072,7 @@ class Block:
     def render(self) -> str:
         """Render as ``name:\\n  instr1\\n  instr2\\n``."""
         header = str(self.name) + ":\n"
-        if (
-            _debug_ir_render_enabled()
-            and self.parent.name == "user_prog_Parser_make"
-        ):
+        if _debug_ir_render_enabled() and self.parent.name == "user_prog_Parser_make":
             try:
                 sys.stderr.write(
                     "[pcc.ir.block] "
@@ -1030,10 +1125,7 @@ class Block:
             except Exception:
                 pass
         body = _render_instruction_lines(self._text_lines, 0, len(self._text_lines))
-        if (
-            _debug_ir_render_enabled()
-            and self.parent.name == "user_prog_Parser_make"
-        ):
+        if _debug_ir_render_enabled() and self.parent.name == "user_prog_Parser_make":
             try:
                 sys.stderr.write(
                     "[pcc.ir.block] rendered "
@@ -1099,7 +1191,7 @@ class Block:
                 )
             except Exception:
                 pass
-        return header + body
+        return _join_text([header, body], "")
 
 
 class Function(Value):
@@ -1275,7 +1367,10 @@ class Function(Value):
                 + attrs_text
                 + "\n"
             )
-        if _debug_ir_render_enabled() and self.name == "user_pcc_parse_py_lex__is_digit_code":
+        if (
+            _debug_ir_render_enabled()
+            and self.name == "user_pcc_parse_py_lex__is_digit_code"
+        ):
             try:
                 entry_instrs = -1
                 first_text = "<none>"
@@ -1329,20 +1424,24 @@ class Function(Value):
                 )
             except Exception:
                 pass
-        out = "define "
-        out = out + linkage
-        out = out + str(ret_ty)
-        out = out + " @"
-        out = out + str(self.name)
-        out = out + "("
-        out = out + args_text
-        out = out + ")"
-        out = out + attrs_text
-        out = out + pers_text
-        out = out + " {\n"
-        out = out + body
-        out = out + "}\n"
-        return out
+        return _join_text(
+            [
+                "define ",
+                linkage,
+                str(ret_ty),
+                " @",
+                str(self.name),
+                "(",
+                args_text,
+                ")",
+                attrs_text,
+                pers_text,
+                " {\n",
+                body,
+                "}\n",
+            ],
+            "",
+        )
 
 
 def _value_ref(value) -> str:
@@ -1450,9 +1549,16 @@ class GlobalVariable(Value):
         name: str,
         addrspace: int = 0,
     ) -> None:
-        self.type = PointerType(ty, addrspace=addrspace)
-        self.value_type = ty
-        self.name = name
+        # Native method parameters are borrowed.  Snapshot the heap-valued
+        # inputs into local GC slots before PointerType/string/list/dict work
+        # can allocate; the final module index must not reload a stale raw
+        # ``name`` or ``module`` parameter.
+        stable_module = module
+        stable_type: Type = ty
+        stable_name: str = name
+        self.type = PointerType(stable_type, addrspace=addrspace)
+        self.value_type = stable_type
+        self.name = stable_name
         self.linkage = ""
         self.global_constant = False
         self.initializer: Optional[Value] = None
@@ -1460,9 +1566,9 @@ class GlobalVariable(Value):
         self.section = ""
         self.align: Optional[int] = None
         self.unnamed_addr = False
-        self._ref = "@" + str(name)
-        module._globals.append(self)
-        module.globals[name] = self
+        self._ref = "@" + stable_name
+        stable_module._globals.append(self)
+        stable_module.globals[stable_name] = self
 
     def gep(self, indices, inbounds: bool = True) -> Value:
         """Constant-expression GEP on this global — emits inline as
@@ -1783,9 +1889,10 @@ class IRBuilder:
         if fn is None:
             raise ValueError("IRBuilder has no current function")
         fn._name_counter += 1
+        counter_text = str(fn._name_counter)
         if name == "":
-            return "." + str(fn._name_counter)
-        return name + "." + str(fn._name_counter)
+            return _join_text([".", counter_text], "")
+        return _join_text([name, ".", counter_text], "")
 
     def _next(self, name: str, ty: Type) -> Value:
         """Produce a new local SSA value with ``name`` (or a fresh temp
@@ -1795,14 +1902,11 @@ class IRBuilder:
         if fn is None:
             raise ValueError("IRBuilder has no current function")
         fn._name_counter += 1
+        counter_text = str(fn._name_counter)
         if name == "":
-            ref = "%."
-            ref = ref + str(fn._name_counter)
+            ref = _join_text(["%.", counter_text], "")
         else:
-            ref = "%"
-            ref = ref + str(name)
-            ref = ref + "."
-            ref = ref + str(fn._name_counter)
+            ref = _join_text(["%", name, ".", counter_text], "")
         return Value(ty, ref)
 
     # ------------- return / branch / terminator -------------
@@ -1879,7 +1983,9 @@ class IRBuilder:
 
     def store(self, value: Value, ptr: Value, align: Optional[int] = None) -> Value:
         align_text = ", align " + str(align) if align else ""
-        stored_ty = ptr.type.pointee if isinstance(ptr.type, PointerType) else value.type
+        stored_ty = (
+            ptr.type.pointee if isinstance(ptr.type, PointerType) else value.type
+        )
         parts = [
             "store ",
             str(stored_ty),
@@ -2019,13 +2125,7 @@ class IRBuilder:
             return value
         v = self._next(name, ty)
         self._emit(
-            str(v)
-            + " = sext "
-            + str(value.type)
-            + " "
-            + str(value)
-            + " to "
-            + str(ty)
+            str(v) + " = sext " + str(value.type) + " " + str(value) + " to " + str(ty)
         )
         return v
 
@@ -2034,13 +2134,7 @@ class IRBuilder:
             return value
         v = self._next(name, ty)
         self._emit(
-            str(v)
-            + " = zext "
-            + str(value.type)
-            + " "
-            + str(value)
-            + " to "
-            + str(ty)
+            str(v) + " = zext " + str(value.type) + " " + str(value) + " to " + str(ty)
         )
         return v
 
@@ -2049,13 +2143,7 @@ class IRBuilder:
             return value
         v = self._next(name, ty)
         self._emit(
-            str(v)
-            + " = trunc "
-            + str(value.type)
-            + " "
-            + str(value)
-            + " to "
-            + str(ty)
+            str(v) + " = trunc " + str(value.type) + " " + str(value) + " to " + str(ty)
         )
         return v
 
@@ -2142,13 +2230,7 @@ class IRBuilder:
             return value
         v = self._next(name, ty)
         self._emit(
-            str(v)
-            + " = fpext "
-            + str(value.type)
-            + " "
-            + str(value)
-            + " to "
-            + str(ty)
+            str(v) + " = fpext " + str(value.type) + " " + str(value) + " to " + str(ty)
         )
         return v
 
@@ -2283,9 +2365,7 @@ class IRBuilder:
 
     def fneg(self, value: Value, name: str = "") -> Value:
         v = self._next(name, value.type)
-        rec = self._emit(
-            str(v) + " = fneg " + str(value.type) + " " + str(value)
-        )
+        rec = self._emit(str(v) + " = fneg " + str(value.type) + " " + str(value))
         v._instr = rec
         return v
 
@@ -2624,9 +2704,7 @@ def _irbuilder_call_from_args_list(
 ) -> Value:
     if _debug_ir_call_enabled():
         try:
-            sys.stderr.write(
-                "[pcc.ir.call] enter argc=" + str(len(args_list)) + "\n"
-            )
+            sys.stderr.write("[pcc.ir.call] enter argc=" + str(len(args_list)) + "\n")
         except Exception:
             pass
     expected_arg_types = []
@@ -2680,7 +2758,14 @@ def _irbuilder_call_from_args_list(
             arg_ty = expected_arg_types[i]
         else:
             arg_ty = a.type
-        arg_parts.append(str(arg_ty) + " " + _value_ref(a))
+        # Keep both owned text results in named locals across the allocating
+        # join.  An inline ``str(arg_ty) + ... + _value_ref(a)`` leaves the
+        # second call result as an unrooted SSA temporary in pcc1-native code;
+        # GC during concatenation can then store NULL into ``arg_parts``.
+        arg_ty_text = str(arg_ty)
+        arg_ref_text = _value_ref(a)
+        arg_text = _join_text([arg_ty_text, " ", arg_ref_text], "")
+        arg_parts.append(arg_text)
         i += 1
     args_text = ", ".join(arg_parts)
     tail_prefix = "tail " if tail else ""
@@ -3111,12 +3196,40 @@ def IRBuilder_instruction_text_at(builder, index: int) -> str:
     return block._instrs[index].text
 
 
+def IRBuilder_gep0(builder, ptr):
+    return ptr
+
+
 def IRBuilder_gep1(builder, ptr, idx0):
     return IRBuilder.gep(builder, ptr, (idx0,))
 
 
+def IRBuilder_gep1_inbounds(builder, ptr, idx0):
+    return IRBuilder.gep(builder, ptr, (idx0,), inbounds=True)
+
+
+def IRBuilder_gep2(builder, ptr, idx0, idx1):
+    return IRBuilder.gep(builder, ptr, (idx0, idx1))
+
+
 def IRBuilder_gep2_inbounds(builder, ptr, idx0, idx1):
     return IRBuilder.gep(builder, ptr, (idx0, idx1), inbounds=True)
+
+
+def IRBuilder_gep3(builder, ptr, idx0, idx1, idx2):
+    return IRBuilder.gep(builder, ptr, (idx0, idx1, idx2))
+
+
+def IRBuilder_gep3_inbounds(builder, ptr, idx0, idx1, idx2):
+    return IRBuilder.gep(builder, ptr, (idx0, idx1, idx2), inbounds=True)
+
+
+def IRBuilder_gep_dyn(builder, ptr, indices):
+    return IRBuilder.gep(builder, ptr, indices)
+
+
+def IRBuilder_gep_dyn_inbounds(builder, ptr, indices):
+    return IRBuilder.gep(builder, ptr, indices, inbounds=True)
 
 
 def IRBuilder_add_incoming(phi: PhiInstr, value: Value, block: Block):
@@ -3133,7 +3246,10 @@ def scaffold_SwitchInstr_add_case_i64(
     new_line = switch_inst._render()
     for blk in switch_inst.default.parent.blocks:
         for rec in blk._instrs:
-            if rec.text.startswith("switch ") and f"label %{switch_inst.default.name}" in rec.text:
+            if (
+                rec.text.startswith("switch ")
+                and f"label %{switch_inst.default.name}" in rec.text
+            ):
                 blk._replace_record_text(rec, new_line)
                 return
 

@@ -1,4 +1,5 @@
 """List builtin lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -10,14 +11,15 @@ from ..py_ast import (
     ClassType,
     DictType,
     DynType,
+    Lambda,
     ListExpr,
     ListType,
     Name,
+    NoneLit,
     TupleExpr,
     TupleType,
 )
 from . import marshal
-
 
 _I64 = ir.IntType(64)
 _CSTR = ir.IntType(8).as_pointer()
@@ -33,6 +35,16 @@ class ListBuiltinLoweringMixin:
             src_val,
             expr.args[0].ty,
         )
+        if isinstance(expr.args[0].ty, DictType):
+            # reversed(dict) iterates the KEYS in reverse insertion order.
+            # py_obj_getitem on a dict is key lookup (dict[i]), not positional,
+            # so the positional reverse loop below would index by integer and
+            # return <null>. Reverse the insertion-ordered keys list instead.
+            src_obj = self.builder.call(
+                self.runtime["py_dict_keys"],
+                [src_obj],
+                name=self._fresh("reversed.dict.keys"),
+            )
         fn = self.current_function
         n_val = self.builder.call(
             self.runtime["py_obj_len"],
@@ -90,6 +102,7 @@ class ListBuiltinLoweringMixin:
         self.builder.branch(cond_bb)
         self.builder.position_at_end(end_bb)
         return out
+
     def _maybe_emit_list_builtin(
         self,
         expr: Call,
@@ -115,14 +128,7 @@ class ListBuiltinLoweringMixin:
                 return mapped
         if isinstance(arg, (ListExpr, TupleExpr)):
             for el in arg.elems:
-                v = self._emit_expr(el)
-                v_obj = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    v,
-                    el.ty,
-                )
+                v_obj = self._emit_expr_as_pcc_object(el)
                 self.builder.call(
                     self.runtime["py_list_append"],
                     [new_list, v_obj],
@@ -310,7 +316,7 @@ class ListBuiltinLoweringMixin:
         )
         stop_cls = self.builder.call(
             self.runtime["py_exc_builtin_class"],
-            [ir.Constant(_I64, 8)],            # StopIteration
+            [ir.Constant(_I64, 8)],  # StopIteration
             name=self._fresh("list.iter.stop_cls"),
         )
         match_i64 = self.builder.call(
@@ -341,20 +347,54 @@ class ListBuiltinLoweringMixin:
         call: Call,
         out_list: ir.Value,
     ) -> Optional[ir.Value]:
+        # ``filter(None, iterable)`` keeps the truthy elements (no predicate
+        # function); args[0] is a NoneLit, not a Name.
+        filter_none = (
+            isinstance(call.func, Name)
+            and call.func.ident == "filter"
+            and not call.kwargs
+            and len(call.args) == 2
+            and isinstance(call.args[0], NoneLit)
+        )
+        # ``map``/``filter`` with an inline ``lambda`` (1 positional param):
+        # bind the param to each element and emit the lambda body inline (it
+        # closes over the current scope). args[0] is a Lambda, not a Name.
+        lam = None
         if (
-            not isinstance(call.func, Name)
-            or call.func.ident not in ("map", "filter")
-            or call.kwargs
-            or len(call.args) != 2
-            or not isinstance(call.args[0], Name)
+            not filter_none
+            and isinstance(call.func, Name)
+            and call.func.ident in ("map", "filter")
+            and not call.kwargs
+            and len(call.args) == 2
+            and isinstance(call.args[0], Lambda)
+            and len(call.args[0].params) == 1
+            and call.args[0].params[0].kind in ("pos", "pos_only")
         ):
-            return None
+            lam = call.args[0]
+        if not filter_none and lam is None:
+            if (
+                not isinstance(call.func, Name)
+                or call.func.ident not in ("map", "filter")
+                or call.kwargs
+                or len(call.args) != 2
+                or not isinstance(call.args[0], Name)
+            ):
+                return None
         mode = call.func.ident
-        func_name = call.args[0].ident
-        fn = self.functions.get(func_name)
-        if fn is None:
-            return None
-        ast_fd = self._find_user_funcdef(func_name)
+        if filter_none or lam is not None:
+            func_name = ""
+            fn = None
+            builtin_map_str = False
+        else:
+            func_name = call.args[0].ident
+            fn = self.functions.get(func_name)
+            builtin_map_str = mode == "map" and func_name == "str"
+            builtin_map_chr = mode == "map" and func_name == "chr"
+            if fn is None and not builtin_map_str and not builtin_map_chr:
+                return None
+        if filter_none or lam is not None:
+            builtin_map_chr = False
+        ast_fd = self._find_user_funcdef(func_name) if fn is not None else None
         src_expr = call.args[1]
         src_val = self._emit_expr(src_expr)
         src_obj = marshal.marshal_to_object(
@@ -370,9 +410,24 @@ class ListBuiltinLoweringMixin:
             name=self._fresh(f"{mode}.src.len"),
         )
         idx_slot = self._alloca_in_entry(_I64, name=f"{mode}.idx.addr")
-        item_slot = self._alloca_in_entry(_CSTR, name=f"{mode}.item.addr")
-        temp_name = f"__pcc_{mode}_item_{len(self.env)}"
-        self.env[temp_name] = (item_slot, _CSTR, DynType(name="dyn"))
+        item_slot = None
+        temp_name = ""
+        lam_param = ""
+        lam_saved = None
+        lam_had_binding = False
+        if lam is not None:
+            # Bind the lambda's single param to the per-element slot; restore the
+            # outer binding (if any) after the loop body is emitted.
+            item_slot = self._alloca_in_entry(_CSTR, name=f"{mode}.item.addr")
+            lam_param = lam.params[0].name
+            if lam_param in self.env:
+                lam_had_binding = True
+                lam_saved = self.env[lam_param]
+            self.env[lam_param] = (item_slot, _CSTR, DynType(name="dyn"))
+        elif fn is not None:
+            item_slot = self._alloca_in_entry(_CSTR, name=f"{mode}.item.addr")
+            temp_name = f"__pcc_{mode}_item_{len(self.env)}"
+            self.env[temp_name] = (item_slot, _CSTR, DynType(name="dyn"))
         self.builder.store(ir.Constant(_I64, 0), idx_slot)
 
         fn_cur = self.current_function
@@ -402,20 +457,49 @@ class ListBuiltinLoweringMixin:
             [src_obj, idx_box],
             name=self._fresh(f"{mode}.elem"),
         )
-        self.builder.store(elem, item_slot)
-        arg_expr = Name(
-            span=call.span,
-            ty=DynType(name="dyn"),
-            ident=temp_name,
-        )
-        result = self._emit_direct_user_function_call(
-            display_name=func_name,
-            fn=fn,
-            ast_func_def=ast_fd,
-            args=(arg_expr,),
-            kwargs=(),
-        )
-        result_ty = ast_fd.return_ty or DynType(name="dyn")
+        if lam is not None:
+            # Inline the lambda body with its param bound to the element.
+            self.builder.store(elem, item_slot)
+            result = self._emit_expr(lam.body)
+            result_ty = getattr(lam.body, "ty", None) or DynType(name="dyn")
+        elif filter_none:
+            # filter(None, ...): keep elements that are truthy themselves.
+            result = elem
+            result_ty = DynType(name="dyn")
+        elif fn is not None:
+            self.builder.store(elem, item_slot)
+            arg_expr = Name(
+                span=call.span,
+                ty=DynType(name="dyn"),
+                ident=temp_name,
+            )
+            result = self._emit_direct_user_function_call(
+                display_name=func_name,
+                fn=fn,
+                ast_func_def=ast_fd,
+                args=(arg_expr,),
+                kwargs=(),
+            )
+            result_ty = ast_fd.return_ty or DynType(name="dyn")
+        elif builtin_map_chr:
+            codepoint = self.builder.call(
+                self.runtime["py_obj_index_i64"],
+                [elem],
+                name=self._fresh("map.chr.index"),
+            )
+            result = self.builder.call(
+                self.runtime["py_chr_from_i64"],
+                [codepoint],
+                name=self._fresh("map.chr"),
+            )
+            result_ty = DynType(name="dyn")
+        else:
+            result = self.builder.call(
+                self.runtime["py_obj_str"],
+                [elem],
+                name=self._fresh("map.str"),
+            )
+            result_ty = DynType(name="dyn")
         if mode == "map":
             result_obj = self._emit_value_as_pcc_object_or_bridge(
                 result,
@@ -447,4 +531,10 @@ class ListBuiltinLoweringMixin:
         self.builder.store(nxt, idx_slot)
         self.builder.branch(cond_bb)
         self.builder.position_at_end(end_bb)
+        if lam is not None:
+            # Restore the outer binding for the lambda param name.
+            if lam_had_binding:
+                self.env[lam_param] = lam_saved
+            else:
+                self.env.pop(lam_param, None)
         return out_list

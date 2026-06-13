@@ -14,6 +14,7 @@ from ..py_ast import (
     BytesType,
     Call,
     ClassType,
+    ComplexType,
     DictType,
     DynType,
     Expr,
@@ -58,6 +59,7 @@ _DYN_DICT_METHOD_NATIVE = frozenset(
         "items",
         "setdefault",
         "pop",
+        "popitem",
     }
 )
 _DYN_SET_METHOD_NATIVE = frozenset(
@@ -66,6 +68,7 @@ _DYN_SET_METHOD_NATIVE = frozenset(
         "remove",
         "discard",
         "update",
+        "pop",
     }
 )
 _STR_METHOD_NATIVE = frozenset(
@@ -88,6 +91,34 @@ _STR_METHOD_NATIVE = frozenset(
         "isalpha",
         "isspace",
         "isalnum",
+        "isupper",
+        "islower",
+        "isascii",
+        "isidentifier",
+        "isprintable",
+        "isnumeric",
+        "isdecimal",
+        "istitle",
+    }
+)
+_BYTES_METHOD_NATIVE = frozenset(
+    {
+        "decode",
+        "find",
+        "hex",
+        "upper",
+        "translate",
+        "replace",
+    }
+)
+_RE_MATCH_OBJECT_METHOD_NATIVE = frozenset(
+    {
+        "group",
+        "groups",
+        "groupdict",
+        "start",
+        "end",
+        "span",
     }
 )
 
@@ -133,6 +164,18 @@ def _method_first_arg_name(class_lowering, class_name: str, method_name: str) ->
 
 
 class MethodCallExpressionLoweringMixin:
+    def _class_attr_needs_runtime_lookup(self, class_info, attr_name: str) -> bool:
+        if class_info is None:
+            return False
+        if self.class_lowering.lookup_class_attr(class_info, attr_name) is not None:
+            return True
+        class_attr_state = getattr(
+            self,
+            "_class_attr_runtime_state",
+            {},
+        ).get((class_info.name, attr_name))
+        return class_attr_state in ("live", "unknown", "deleted")
+
     def _emit_callable_attribute_call(
         self,
         obj_expr: Expr,
@@ -184,6 +227,45 @@ class MethodCallExpressionLoweringMixin:
         """
         attr = expr.func
         assert isinstance(attr, Attr)
+
+        if (
+            attr.name == "__str__"
+            and _method_is_name(attr.obj)
+            and _method_ident(attr.obj) == "str"
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            value = self._emit_as_object(expr.args[0])
+            tag = self.builder.call(
+                self.runtime["py_obj_type_tag"],
+                [value],
+                name=self._fresh("str.__str__.tag"),
+            )
+            is_str = self.builder.icmp_signed(
+                "==",
+                tag,
+                ir.Constant(_I64, 4),
+                name=self._fresh("str.__str__.is_str"),
+            )
+            ok_bb = self.current_function.append_basic_block(
+                name=self._fresh("str.__str__.ok")
+            )
+            err_bb = self.current_function.append_basic_block(
+                name=self._fresh("str.__str__.err")
+            )
+            self.builder.cbranch(is_str, ok_bb, err_bb)
+            self.builder.position_at_end(err_bb)
+            self._emit_builtin_exception_and_branch(
+                "TypeError",
+                "descriptor '__str__' requires a 'str' object",
+                self._expr_span_or_none(expr),
+            )
+            self.builder.position_at_end(ok_bb)
+            return self.builder.call(
+                self.runtime["py_obj_str"],
+                [value],
+                name=self._fresh("str.__str__"),
+            )
 
         if _method_is_name(attr.obj):
             module_name = self._native_builtin_module_for_name(_method_ident(attr.obj))
@@ -272,6 +354,12 @@ class MethodCallExpressionLoweringMixin:
             if scaffold_value is not None:
                 return scaffold_value
 
+        if attr.name in ("format", "format_map"):
+            if self._resolve_str_literal_value(attr.obj) is not None:
+                native = self._maybe_emit_str_method(expr)
+                if native is not None:
+                    return native
+
         # Typed-container method dispatch on pcc-native containers —
         # stays on pcc runtime so the produced binary has no libpython
         # dep. Only a curated method set is recognised; anything else
@@ -298,6 +386,18 @@ class MethodCallExpressionLoweringMixin:
             native = self._maybe_emit_str_method(expr)
             if native is not None:
                 return native
+        if (
+            isinstance(obj_ty0, ComplexType)
+            and attr.name == "conjugate"
+            and not expr.args
+            and not expr.kwargs
+        ):
+            recv = self._emit_as_object(attr.obj)
+            return self.builder.call(
+                self.runtime["py_complex_conjugate"],
+                [recv],
+                name=self._fresh("complex.conjugate"),
+            )
         if (
             isinstance(obj_ty0, DynType)
             and obj_ty0.name == "coroutine"
@@ -420,6 +520,10 @@ class MethodCallExpressionLoweringMixin:
                     kwargs=expr.kwargs,
                 )
 
+        compiled_builtin_call = self._maybe_emit_native_builtin_compiled_call(expr)
+        if compiled_builtin_call is not None:
+            return compiled_builtin_call
+
         # Case -1: ``<CPython value>.method(args)``.
         #
         # Chained access (``os.path.join``) lowers the inner attr chain
@@ -474,6 +578,19 @@ class MethodCallExpressionLoweringMixin:
                     expr.args,
                     kwargs=expr.kwargs,
                 )
+        if attr.name == "strftime" and len(expr.args) == 1 and not expr.kwargs:
+            # Native datetime/time-like ``obj.strftime(fmt)`` for values whose
+            # concrete class is not visible at the call site (for example a
+            # py_stdlib cross-module classmethod result). Evaluate the receiver
+            # for side effects, then delegate formatting to the runtime clock.
+            self._emit_as_object(attr.obj)
+            result = self.builder.call(
+                self.runtime["py_time_strftime"],
+                [self._emit_as_object(expr.args[0])],
+                name=self._fresh("dyn.strftime"),
+            )
+            self._emit_post_call_err_check(expr.span)
+            return result
         if isinstance(attr.obj, Call):
             # A method call on a CPython-call RESULT (e.g.
             # ``numpy.arange(10).sum()``): the result is a real CPython object,
@@ -492,9 +609,7 @@ class MethodCallExpressionLoweringMixin:
                 and isinstance(cfunc.obj, Name)
                 and (
                     cfunc.obj.ident in getattr(self, "_cpy_module_env", {})
-                    or getattr(self, "_cpy_env_flags", {}).get(
-                        cfunc.obj.ident, False
-                    )
+                    or getattr(self, "_cpy_env_flags", {}).get(cfunc.obj.ident, False)
                 )
             ):
                 return self._emit_cpy_method_call_src(
@@ -503,8 +618,42 @@ class MethodCallExpressionLoweringMixin:
                     expr.args,
                     kwargs=expr.kwargs,
                 )
-        if isinstance(attr.obj, (BinOp, Subscript, Call)) and self._expr_looks_cpython(
-            attr.obj
+            call_receiver_hint = self._class_hint_for_expr(attr.obj)
+            if (
+                call_receiver_hint is None
+                and isinstance(attr.obj.ty, DynType)
+                and attr.name in _BYTES_METHOD_NATIVE
+            ):
+                native = self._maybe_emit_bytes_method_via_dyn(expr)
+                if native is not None:
+                    return native
+            if (
+                call_receiver_hint is None
+                and isinstance(attr.obj.ty, DynType)
+                and attr.name in _STR_METHOD_NATIVE
+            ):
+                native = self._maybe_emit_str_method_via_dyn(expr)
+                if native is not None:
+                    return native
+        native_re_match_receiver = False
+        if isinstance(attr.obj, Call) and attr.name in _RE_MATCH_OBJECT_METHOD_NATIVE:
+            cfunc = attr.obj.func
+            if isinstance(cfunc, Attr) and isinstance(cfunc.obj, Name):
+                root_name = cfunc.obj.ident
+                if (
+                    cfunc.name in ("match", "search", "fullmatch")
+                    and self._native_builtin_module_for_name(root_name) == "re"
+                ):
+                    native_re_match_receiver = True
+                elif (
+                    cfunc.name in ("match", "search")
+                    and self._native_re_compile_alias_for_name(root_name) is not None
+                ):
+                    native_re_match_receiver = True
+        if (
+            isinstance(attr.obj, (BinOp, Subscript, Call))
+            and self._expr_looks_cpython(attr.obj)
+            and not native_re_match_receiver
         ):
             # A method call on a BINARY-OP, SUBSCRIPT, or (deep-chain) CALL result
             # that is itself a CPython value (e.g. ``(a + b).sum()``,
@@ -530,14 +679,13 @@ class MethodCallExpressionLoweringMixin:
                 kwargs=expr.kwargs,
             )
 
-        # Generator / coroutine intrinsics. The ``send``/``throw``/``close``
-        # method names are not unique to generators — user classes (e.g.
-        # ``io.StringIO.close``) define their own. Only short-circuit
-        # when the receiver type is unknown enough (``DynType``) that
-        # we can safely assume the caller meant the generator intrinsic.
-        # When the receiver has a concrete ClassType / typed-container
-        # type, dispatch falls through to the user-defined method.
-        gen_intrinsic_ok = isinstance(attr.obj.ty, DynType)
+        # Generator intrinsics. The ``send``/``throw``/``close`` names are
+        # common user methods, so only short-circuit when inference marked the
+        # receiver as a native generator. A generic DynType receiver must use
+        # normal dynamic dispatch.
+        gen_intrinsic_ok = (
+            isinstance(attr.obj.ty, DynType) and attr.obj.ty.name == "generator"
+        )
         if (
             gen_intrinsic_ok
             and attr.name == "send"
@@ -546,11 +694,16 @@ class MethodCallExpressionLoweringMixin:
         ):
             gen_obj = self._emit_as_object(attr.obj)
             value_obj = self._emit_as_object(expr.args[0])
-            return self.builder.call(
+            send_res = self.builder.call(
                 self.runtime["py_gen_send"],
                 [gen_obj, value_obj],
                 name=self._fresh("gen.send"),
             )
+            # py_gen_send raises (thrown-in exceptions, GeneratorExit
+            # escapes, errors inside the generator body); without
+            # this check they skip enclosing try/except blocks
+            self._emit_post_call_err_check(expr.span)
+            return send_res
         if (
             gen_intrinsic_ok
             and attr.name == "throw"
@@ -559,11 +712,16 @@ class MethodCallExpressionLoweringMixin:
         ):
             gen_obj = self._emit_as_object(attr.obj)
             exc_obj = self._emit_as_object(expr.args[0])
-            return self.builder.call(
+            throw_res = self.builder.call(
                 self.runtime["py_gen_throw"],
                 [gen_obj, exc_obj],
                 name=self._fresh("gen.throw"),
             )
+            # py_gen_throw raises (thrown-in exceptions, GeneratorExit
+            # escapes, errors inside the generator body); without
+            # this check they skip enclosing try/except blocks
+            self._emit_post_call_err_check(expr.span)
+            return throw_res
         if (
             gen_intrinsic_ok
             and attr.name == "close"
@@ -571,11 +729,16 @@ class MethodCallExpressionLoweringMixin:
             and not expr.kwargs
         ):
             gen_obj = self._emit_as_object(attr.obj)
-            return self.builder.call(
+            close_res = self.builder.call(
                 self.runtime["py_gen_close"],
                 [gen_obj],
                 name=self._fresh("gen.close"),
             )
+            # py_gen_close raises (thrown-in exceptions, GeneratorExit
+            # escapes, errors inside the generator body); without
+            # this check they skip enclosing try/except blocks
+            self._emit_post_call_err_check(expr.span)
+            return close_res
 
         # Case 0: ``super().method(args)`` inside a method body.
         # Resolve the method by walking the current class's declared
@@ -604,6 +767,77 @@ class MethodCallExpressionLoweringMixin:
                     else:
                         from_class_name = self._resolve_class_alias(from_expr.ident)
                     from_class = self.class_lowering.classes.get(from_class_name)
+            if (
+                from_class is not None
+                and attr.name == "__new__"
+                and "type" in self.class_lowering._class_declared_base_names(from_class)
+                and len(expr.args) >= 4
+                and not expr.kwargs
+            ):
+                # ``super().__new__(mcls, name, bases, ns)`` in a
+                # metaclass subclass is ``type.__new__``.  Builtin ``type``
+                # has no ClassInfo entry, so the ordinary super lookup below
+                # cannot resolve it and historically returned NULL.  Route
+                # the foreign builtin base through the same native class
+                # constructor used for an explicit ``type.__new__`` call.
+                name_obj = self._emit_as_object(expr.args[1])
+                bases_obj = self._emit_as_object(expr.args[2])
+                ns_obj = self._emit_as_object(expr.args[3])
+                result = self.builder.call(
+                    self.runtime["py_class_new_from_objects"],
+                    [name_obj, bases_obj, ns_obj],
+                    name=self._fresh("super.type.new"),
+                )
+                self._emit_post_call_err_check(self._expr_span_or_none(expr))
+                return result
+            if from_class is not None and attr.name == "__new__":
+                # Follow a single-inheritance chain until either a user class
+                # actually defines ``__new__`` or the chain reaches builtin
+                # object.  Looking only at the immediate base made
+                # ``class SingletonBase(Root): super().__new__(cls)`` return
+                # NULL when Root did not override object.__new__; the later
+                # class-attribute store then surfaced a misleading
+                # AttributeError.  Keep multiple/foreign bases on the generic
+                # super path because they require runtime C3 lookup.
+                delegates_to_object = False
+                candidate = from_class
+                seen_super_new_classes: set[str] = set()
+                while candidate is not None:
+                    candidate_name = getattr(candidate, "name", "")
+                    if candidate_name in seen_super_new_classes:
+                        break
+                    seen_super_new_classes.add(candidate_name)
+                    base_names = self.class_lowering._class_declared_base_names(
+                        candidate
+                    )
+                    if len(base_names) == 0 or base_names == ("object",):
+                        delegates_to_object = True
+                        break
+                    if len(base_names) != 1:
+                        break
+                    base_name = base_names[0]
+                    if base_name == "object":
+                        delegates_to_object = True
+                        break
+                    base_info = self.class_lowering.classes.get(base_name)
+                    if base_info is None or "__new__" in base_info.methods:
+                        break
+                    candidate = base_info
+                if delegates_to_object and len(expr.args) == 1 and not expr.kwargs:
+                    # ``super().__new__(cls)`` for an ordinary Python class is
+                    # builtin ``object.__new__``. ``object`` has no ClassInfo,
+                    # so the generic foreign-super fallback below cannot
+                    # resolve a callable and historically returned NULL. Use
+                    # the same native allocator as normal class construction,
+                    # preserving the runtime class argument for subclasses.
+                    cls_obj = self._emit_as_object(expr.args[0])
+                    result = self.builder.call(
+                        self.runtime["py_instance_new"],
+                        [cls_obj],
+                        name=self._fresh("super.object.new"),
+                    )
+                    self._emit_post_call_err_check(self._expr_span_or_none(expr))
+                    return result
             parent_info = (
                 self._resolve_super_method(from_class, attr.name)
                 if from_class is not None
@@ -653,11 +887,9 @@ class MethodCallExpressionLoweringMixin:
                         if isinstance(recv_expr, Name)
                         else None
                     )
-                    receiver_is_local_class_object = (
-                        isinstance(recv_expr, Name)
-                        and recv_expr.ident
-                        in getattr(self, "env_class_object_hint", {})
-                    )
+                    receiver_is_local_class_object = isinstance(
+                        recv_expr, Name
+                    ) and recv_expr.ident in getattr(self, "env_class_object_hint", {})
                     receiver_is_named_class = (
                         isinstance(recv_expr, Name)
                         and recv_class_name in self.class_lowering.classes
@@ -667,13 +899,10 @@ class MethodCallExpressionLoweringMixin:
                         )
                     )
                     receiver_is_class = (
-                        (
-                            current_method_kind == "classmethod"
-                            and isinstance(recv_expr, Name)
-                            and recv_expr.ident == receiver_name
-                        )
-                        or receiver_is_named_class
-                    )
+                        current_method_kind == "classmethod"
+                        and isinstance(recv_expr, Name)
+                        and recv_expr.ident == receiver_name
+                    ) or receiver_is_named_class
                 else:
                     recv_slot = self.env.get(receiver_name)
                     if recv_slot is None:
@@ -771,11 +1000,9 @@ class MethodCallExpressionLoweringMixin:
                         if isinstance(recv_expr, Name)
                         else None
                     )
-                    receiver_is_local_class_object = (
-                        isinstance(recv_expr, Name)
-                        and recv_expr.ident
-                        in getattr(self, "env_class_object_hint", {})
-                    )
+                    receiver_is_local_class_object = isinstance(
+                        recv_expr, Name
+                    ) and recv_expr.ident in getattr(self, "env_class_object_hint", {})
                     receiver_is_named_class = (
                         isinstance(recv_expr, Name)
                         and recv_class_name in self.class_lowering.classes
@@ -785,13 +1012,10 @@ class MethodCallExpressionLoweringMixin:
                         )
                     )
                     receiver_is_class = (
-                        (
-                            current_method_kind == "classmethod"
-                            and isinstance(recv_expr, Name)
-                            and recv_expr.ident == receiver_name
-                        )
-                        or receiver_is_named_class
-                    )
+                        current_method_kind == "classmethod"
+                        and isinstance(recv_expr, Name)
+                        and recv_expr.ident == receiver_name
+                    ) or receiver_is_named_class
                 else:
                     recv_slot = self.env.get(receiver_name)
                     if recv_slot is None:
@@ -994,8 +1218,7 @@ class MethodCallExpressionLoweringMixin:
             class_info = self.class_lowering.classes[obj_ident]
             info = self._resolve_method_mro(obj_ident, attr.name)
             class_attr_known = (
-                self.class_lowering.lookup_class_attr(class_info, attr.name)
-                is not None
+                self.class_lowering.lookup_class_attr(class_info, attr.name) is not None
             )
             class_attr_state = getattr(
                 self,
@@ -1059,11 +1282,15 @@ class MethodCallExpressionLoweringMixin:
                         )
             if info is not None:
                 kind = info.method_kinds.get(attr.name, "instance")
-                if kind == "instance" and _method_first_arg_name(
-                    self.class_lowering,
-                    info.name,
-                    attr.name,
-                ) == "cls":
+                if (
+                    kind == "instance"
+                    and _method_first_arg_name(
+                        self.class_lowering,
+                        info.name,
+                        attr.name,
+                    )
+                    == "cls"
+                ):
                     kind = "classmethod"
                 if kind == "static":
                     method_fn = info.methods[attr.name]
@@ -1111,6 +1338,24 @@ class MethodCallExpressionLoweringMixin:
                     expr.args,
                     kwargs=expr.kwargs,
                 )
+            # ``KnownClass.method(...)`` where the method is not resolvable
+            # on the natively-known MRO (e.g. the base class is
+            # CPython-backed, as in numpy's ``GnuFCompiler(FCompiler)``).
+            # The receiver is a CLASS object, so the name-scan instance
+            # fallbacks below must not run — they would match an unrelated
+            # same-named method and pass the class as ``self``. Dispatch
+            # dynamically instead: getattr on the class object, then call
+            # with all explicit args (CPython unbound-call semantics).
+            extern_ret = self._maybe_emit_class_lowering_extern_method(expr)
+            if extern_ret is not None:
+                return extern_ret
+            return self._emit_callable_attribute_call(
+                attr.obj,
+                attr.name,
+                expr.args,
+                expr.kwargs,
+                expr.span,
+            )
 
         native_external = self._maybe_emit_class_lowering_extern_method(expr)
         if native_external is not None:
@@ -1203,6 +1448,17 @@ class MethodCallExpressionLoweringMixin:
                         expr.args,
                         kwargs=expr.kwargs,
                     )
+                class_info = self.class_lowering.classes.get(hint)
+                if class_info is not None and self._class_attr_needs_runtime_lookup(
+                    class_info, attr.name
+                ):
+                    return self._emit_callable_attribute_call(
+                        attr.obj,
+                        attr.name,
+                        expr.args,
+                        expr.kwargs,
+                        expr.span,
+                    )
 
         receiver_hint = self._class_hint_for_expr(attr.obj)
         if receiver_hint is not None:
@@ -1240,6 +1496,17 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                )
+            class_info = self.class_lowering.classes.get(receiver_hint)
+            if class_info is not None and self._class_attr_needs_runtime_lookup(
+                class_info, attr.name
+            ):
+                return self._emit_callable_attribute_call(
+                    attr.obj,
+                    attr.name,
+                    expr.args,
+                    expr.kwargs,
+                    expr.span,
                 )
 
         if isinstance(attr.obj, Name):
@@ -1367,6 +1634,9 @@ class MethodCallExpressionLoweringMixin:
             native = self._maybe_emit_set_method_via_dyn(expr)
             if native is not None:
                 return native
+            native = self._maybe_emit_bytes_method_via_dyn(expr)
+            if native is not None:
+                return native
             # DynType receiver: when the method is a known pcc-native
             # str helper, dispatch through the runtime (assumes the
             # value really is a str at runtime — matches CPython
@@ -1404,6 +1674,28 @@ class MethodCallExpressionLoweringMixin:
                     [obj],
                     name=self._fresh("dyn.bit_length"),
                 )
+            if attr.name == "bit_count" and not expr.args and not expr.kwargs:
+                obj = self._emit_as_object(attr.obj)
+                return self.builder.call(
+                    self.runtime["py_int_bit_count"],
+                    [obj],
+                    name=self._fresh("dyn.bit_count"),
+                )
+            if attr.name == "to_bytes" and len(expr.args) == 2 and not expr.kwargs:
+                # n.to_bytes(length, byteorder) — unsigned form; raises
+                # OverflowError/ValueError per CPython (err check
+                # required). signed= falls through to dynamic dispatch
+                # (rejected honestly under --python-libpython=off).
+                obj = self._emit_as_object(attr.obj)
+                length_val = self._emit_expr_as_i64(expr.args[0])
+                order_obj = self._emit_as_object(expr.args[1])
+                result = self.builder.call(
+                    self.runtime["py_int_to_bytes"],
+                    [obj, length_val, order_obj],
+                    name=self._fresh("dyn.to_bytes"),
+                )
+                self._emit_post_call_err_check(getattr(expr, "span", None))
+                return result
             recv_obj = self._emit_as_object(attr.obj)
             method_obj = self.builder.call(
                 self.runtime["py_obj_getattr"],
@@ -1434,10 +1726,106 @@ class MethodCallExpressionLoweringMixin:
                 self._gc_release(kwargs_obj)
             self._emit_post_call_err_check(expr.span)
             return result
+        if (
+            isinstance(obj_ty, ByteArrayType)
+            and attr.name == "pop"
+            and len(expr.args) <= 1
+            and not expr.kwargs
+        ):
+            # bytearray.pop([index]) removes and returns the byte at index
+            # (default last) as an int, shrinking the receiver in place. No-arg
+            # form passes py_None; the runtime treats a None/non-int index as
+            # "last element". Raises IndexError on empty / out-of-range.
+            recv = self._emit_expr(attr.obj)
+            if expr.args:
+                index_obj = self._emit_as_object(expr.args[0])
+            else:
+                index_obj = self._emit_slice_bound_object(None)
+            result = self.builder.call(
+                self.runtime["py_bytearray_pop"],
+                [recv, index_obj],
+                name=self._fresh("bytearray.pop"),
+            )
+            self._emit_post_call_err_check(expr.span)
+            if expr.args:
+                self._gc_release_if_owned(index_obj, expr.args[0])
+            return result
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name in ("find", "rfind")
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            recv = self._emit_expr(attr.obj)
+            needle = self._emit_as_object(expr.args[0])
+            fn = "py_bytes_find" if attr.name == "find" else "py_bytes_rfind"
+            return self.builder.call(
+                self.runtime[fn],
+                [recv, needle],
+                name=self._fresh(f"bytes.{attr.name}"),
+            )
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name == "count"
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            # bytes/bytearray .count(sub): number of non-overlapping matches of
+            # a sub-bytes or single byte value. py_bytes_count reads the
+            # receiver + needle via bytes_data()/byte_from_obj() (same as
+            # find/rfind) and returns an i64 count without raising, so no
+            # py_err_occurred() check is needed. The raw i64 is boxed as an int
+            # object by the DynType-width-64 marshal path (expr.ty is DynType),
+            # mirroring how bytes .find/.rfind results already flow.
+            recv = self._emit_expr(attr.obj)
+            needle = self._emit_as_object(expr.args[0])
+            return self.builder.call(
+                self.runtime["py_bytes_count"],
+                [recv, needle],
+                name=self._fresh("bytes.count"),
+            )
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name in ("startswith", "endswith")
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            # bytes/bytearray .startswith/.endswith(prefix-or-tuple-of-prefixes).
+            # py_str_startswith / py_str_endswith read the receiver and each
+            # tuple element via stringlike_bytes() (handles bytes/bytearray) and
+            # already implement the tuple-of-prefixes case; they return i64 0/1.
+            # Box as a bool object (result type is unmodelled -> object).
+            recv = self._emit_expr(attr.obj)
+            needle = self._emit_as_object(expr.args[0])
+            fn = {
+                "startswith": "py_str_startswith",
+                "endswith": "py_str_endswith",
+            }[attr.name]
+            i64v = self.builder.call(
+                self.runtime[fn],
+                [recv, needle],
+                name=self._fresh(f"bytes.{attr.name}"),
+            )
+            bit = self.builder.icmp_signed(
+                "!=",
+                i64v,
+                ir.Constant(_I64, 0),
+                name=self._fresh(f"bytes.{attr.name}.bit"),
+            )
+            bit32 = self.builder.zext(
+                bit,
+                _I32,
+                name=self._fresh(f"bytes.{attr.name}.i32"),
+            )
+            return self.builder.call(
+                self.runtime["py_bool_from_bit"],
+                [bit32],
+                name=self._fresh(f"bytes.{attr.name}.bool"),
+            )
         if isinstance(obj_ty, (BytesType, ByteArrayType)) and attr.name == "decode":
             # decode() defaults to utf-8, and pcc str is utf-8 internally, so an
-            # explicit "utf-8" encoding (+ optional "strict" errors) is identical
-            # to the no-arg form. Other encodings / error modes fall back.
+            # explicit "utf-8" encoding (+ optional supported errors mode) stays
+            # in the native runtime. Other encodings / error modes fall back.
             encoding_arg = None
             errors_arg = None
             ok = True
@@ -1447,31 +1835,31 @@ class MethodCallExpressionLoweringMixin:
                 errors_arg = expr.args[1]
             if len(expr.args) > 2:
                 ok = False
-            for kname, kval in (expr.kwargs or ()):
+            for kname, kval in expr.kwargs or ():
                 if kname == "encoding" and encoding_arg is None:
                     encoding_arg = kval
                 elif kname == "errors" and errors_arg is None:
                     errors_arg = kval
                 else:
                     ok = False
-            if encoding_arg is not None and (
-                not isinstance(encoding_arg, StrLit)
-                or encoding_arg.value.lower().replace("-", "") != "utf8"
-            ):
-                ok = False
-            if errors_arg is not None and (
-                not isinstance(errors_arg, StrLit) or errors_arg.value != "strict"
-            ):
-                ok = False
             if not ok:
                 raise NotImplementedError(
-                    "bytes.decode() with a non-utf-8 encoding or non-strict "
-                    "errors is not supported yet"
+                    "bytes.decode() accepts at most encoding and errors"
                 )
             recv = self._emit_expr(attr.obj)
+            encoding = (
+                self._emit_expr_as_pcc_object(encoding_arg)
+                if encoding_arg is not None
+                else self._emit_str_literal("utf-8")
+            )
+            errors = (
+                self._emit_expr_as_pcc_object(errors_arg)
+                if errors_arg is not None
+                else self._emit_str_literal("strict")
+            )
             return self.builder.call(
-                self.runtime["py_bytes_decode"],
-                [recv],
+                self.runtime["py_bytes_decode_with_encoding"],
+                [recv, encoding, errors],
                 name=self._fresh("bytes.decode"),
             )
         if (
@@ -1487,6 +1875,95 @@ class MethodCallExpressionLoweringMixin:
                 [recv],
                 name=self._fresh("bytes.hex"),
             )
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name in ("upper", "lower")
+            and not expr.args
+            and not expr.kwargs
+        ):
+            recv = self._emit_expr(attr.obj)
+            fn = "py_bytes_upper" if attr.name == "upper" else "py_bytes_lower"
+            return self.builder.call(
+                self.runtime[fn],
+                [recv],
+                name=self._fresh(f"bytes.{attr.name}"),
+            )
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name == "strip"
+            and not expr.args
+            and not expr.kwargs
+        ):
+            # no-arg strip (ASCII whitespace); strip(chars) still falls back.
+            recv = self._emit_expr(attr.obj)
+            return self.builder.call(
+                self.runtime["py_bytes_strip"],
+                [recv],
+                name=self._fresh("bytes.strip"),
+            )
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name == "split"
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            # bytes/bytearray .split(sep): list of same-family pieces. Empty sep
+            # raises ValueError (py_bytes_split), so err-check after. No-arg
+            # whitespace split still falls back.
+            recv = self._emit_expr(attr.obj)
+            sep = self._emit_as_object(expr.args[0])
+            result = self.builder.call(
+                self.runtime["py_bytes_split"],
+                [recv, sep],
+                name=self._fresh("bytes.split"),
+            )
+            self._emit_post_call_err_check(expr.span)
+            return result
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name == "partition"
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            # bytes/bytearray .partition(sep) -> (before, sep, after) tuple.
+            recv = self._emit_expr(attr.obj)
+            sep = self._emit_as_object(expr.args[0])
+            return self.builder.call(
+                self.runtime["py_bytes_partition"],
+                [recv, sep],
+                name=self._fresh("bytes.partition"),
+            )
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name == "translate"
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            recv = self._emit_expr(attr.obj)
+            table_obj = self._emit_as_object(expr.args[0])
+            result = self.builder.call(
+                self.runtime["py_bytes_translate"],
+                [recv, table_obj],
+                name=self._fresh("bytes.translate"),
+            )
+            self._emit_post_call_err_check(expr.span)
+            return result
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name == "replace"
+            and len(expr.args) == 2
+            and not expr.kwargs
+        ):
+            recv = self._emit_expr(attr.obj)
+            old_obj = self._emit_as_object(expr.args[0])
+            new_obj = self._emit_as_object(expr.args[1])
+            result = self.builder.call(
+                self.runtime["py_bytes_replace"],
+                [recv, old_obj, new_obj],
+                name=self._fresh("bytes.replace"),
+            )
+            self._emit_post_call_err_check(expr.span)
+            return result
         if isinstance(obj_ty, StrType):
             # Typed-str receiver with a method not on the pcc-native
             # fast path (``encode`` / ``rsplit`` / ``format`` / …).
@@ -1589,6 +2066,46 @@ class MethodCallExpressionLoweringMixin:
                 [obj],
                 name=self._fresh("int.bit_length"),
             )
+        if (
+            isinstance(obj_ty, (IntType, DynType))
+            and attr.name == "bit_count"
+            and not expr.args
+            and not expr.kwargs
+        ):
+            # Native int.bit_count() — sibling of bit_length; avoid the libpython
+            # fallback so it works under --python-libpython=off. Returns the
+            # population count (set bits of abs(value)) as an int (i64), exact
+            # for bignums (py_int_bit_count popcounts each limb). DynType included
+            # so a boxed int from a dynamic expression works (py_int_bit_count
+            # reads the object's tag: tagged int / bignum).
+            obj = self._emit_as_object(attr.obj)
+            return self.builder.call(
+                self.runtime["py_int_bit_count"],
+                [obj],
+                name=self._fresh("int.bit_count"),
+            )
+        if (
+            isinstance(obj_ty, (IntType, DynType))
+            and attr.name == "to_bytes"
+            and len(expr.args) == 2
+            and not expr.kwargs
+        ):
+            # Native int.to_bytes(length, byteorder) — unsigned form;
+            # exact for bignums (py_int_to_bytes walks the limbs).
+            # Raises OverflowError/ValueError per CPython, so the
+            # post-call err check is required. signed= falls through
+            # to the fallback (rejected honestly under
+            # --python-libpython=off).
+            obj = self._emit_as_object(attr.obj)
+            length_val = self._emit_expr_as_i64(expr.args[0])
+            order_obj = self._emit_as_object(expr.args[1])
+            result = self.builder.call(
+                self.runtime["py_int_to_bytes"],
+                [obj, length_val, order_obj],
+                name=self._fresh("int.to_bytes"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
         if isinstance(obj_ty, (IntType, FloatType, BoolType)):
             # Numeric method call (``int.to_bytes``, ``float.is_integer``,
             # ``bool.conjugate``, etc.) — box to a CPython object and
@@ -1616,6 +2133,19 @@ class MethodCallExpressionLoweringMixin:
                 kwargs=expr.kwargs,
             )
         if isinstance(obj_ty, ClassType):
+            receiver_hint = self._class_hint_for_expr(attr.obj)
+            if receiver_hint is not None:
+                class_info = self.class_lowering.classes.get(receiver_hint)
+                if class_info is not None and self._class_attr_needs_runtime_lookup(
+                    class_info, attr.name
+                ):
+                    return self._emit_callable_attribute_call(
+                        attr.obj,
+                        attr.name,
+                        expr.args,
+                        expr.kwargs,
+                        expr.span,
+                    )
             # A schema-bearing local class should have matched one of
             # the direct method cases above. If it did not, or the type
             # is only an unresolved imported annotation shell, preserve

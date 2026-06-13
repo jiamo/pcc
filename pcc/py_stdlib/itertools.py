@@ -6,7 +6,7 @@ groupby, count.
 from __future__ import annotations
 
 
-def chain(*iterables):
+def _chain_impl(*iterables):
     for it in iterables:
         for item in it:
             yield item
@@ -16,7 +16,16 @@ def _chain_from_iterable(iterables):
         for item in it:
             yield item
 
-chain.from_iterable = _chain_from_iterable
+
+class _Chain:
+    def __call__(self, *iterables):
+        return _chain_impl(*iterables)
+
+    def from_iterable(self, iterables):
+        return _chain_from_iterable(iterables)
+
+
+chain = _Chain()
 
 
 def repeat(value, times=None):

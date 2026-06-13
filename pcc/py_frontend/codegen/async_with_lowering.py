@@ -57,14 +57,14 @@ class AsyncWithLoweringMixin:
         ctx_expr, as_expr = stmt.items[0]
         ctx_val = self._emit_expr(ctx_expr)
         if ctx_val not in getattr(self, "_cpy_values", ()):
-            marshalled, _owned = self._marshal_to_cpython(
-                ctx_val,
-                ctx_expr.ty,
+            enter_val = self.builder.call(
+                self.runtime["py_context_enter"],
+                [ctx_val],
+                name=self._fresh("with.dynamic.enter"),
             )
-            ctx_val = marshalled
-            if not hasattr(self, "_cpy_values"):
-                self._cpy_values = set()
-            self._cpy_values.add(ctx_val)
+            self._emit_post_call_err_check()
+            self._emit_native_context_body(stmt, ctx_val, enter_val)
+            return
 
         enter_ptr = self._ptr_to_cstr(
             self._cstr_global("__enter__", ".cpy.attr.__enter__")
@@ -334,6 +334,24 @@ class AsyncWithLoweringMixin:
             "__enter__",
             (),
         )
+
+        self._emit_native_context_body(stmt, ctx_val, enter_val)
+        return True
+
+    def _emit_native_context_body(
+        self,
+        stmt: With,
+        ctx_val: ir.Value,
+        enter_val: ir.Value,
+    ) -> None:
+        """Emit the body/exit control flow for a pcc-native manager.
+
+        The manager may be statically known (the direct-method path above) or
+        a native object whose precise class is only available at runtime.  In
+        both cases ``py_context_exit`` owns Python's exception-suppression
+        protocol, so the body must use the same unwind graph.
+        """
+        _ctx_expr, as_expr = stmt.items[0]
         if as_expr is not None:
             if not isinstance(as_expr, Name):
                 raise NotImplementedError(
@@ -398,7 +416,6 @@ class AsyncWithLoweringMixin:
         self.builder.branch(outer)
 
         self.builder.position_at_end(after_bb)
-        return True
 
     def _emit_async_with(self, stmt: With) -> None:
         if len(stmt.items) != 1:

@@ -1,4 +1,5 @@
 """List method lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -7,6 +8,7 @@ from pcc.llvm_capi.compat import ir
 
 from ..py_ast import (
     Attr,
+    BinOp,
     BoolLit,
     Call,
     DynType,
@@ -23,11 +25,15 @@ from ..py_ast import (
 )
 from . import marshal
 
-
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _CSTR = ir.IntType(8).as_pointer()
+
+# Sentinel "end" for the 2-arg ``list.index(x, start)`` form: py_list_index_range
+# clamps any ``end > length`` down to ``length``, so a value safely larger than
+# any realizable list length means "to the end of the list".
+_LIST_INDEX_END_SENTINEL = 1 << 62
 
 # No-arg str methods usable as an inline ``key=lambda s: s.<m>()`` over a list
 # of str (case-insensitive sort etc.); each maps to ``py_str_<m>``.
@@ -46,19 +52,13 @@ _DYN_LIST_METHOD_NATIVE = frozenset(
         "count",
         "sort",
         "clear",
+        "copy",
     }
 )
 
 
 def _list_method_box(host, e: Expr) -> ir.Value:
-    v = host._emit_expr(e)
-    return marshal.marshal_to_object(
-        host.builder,
-        host.module,
-        host.runtime,
-        v,
-        e.ty,
-    )
+    return host._emit_expr_as_pcc_object(e)
 
 
 class ListMethodLoweringMixin:
@@ -70,8 +70,361 @@ class ListMethodLoweringMixin:
         assert isinstance(attr, Attr)
         if attr.name not in _DYN_LIST_METHOD_NATIVE:
             return None
-        list_ty = ListType(name="list", elem=DynType(name="dyn"))
-        return self._maybe_emit_list_method(expr, list_ty)
+        return self._emit_dyn_list_method_with_runtime_guard(expr)
+
+    def _emit_generic_dyn_method_call_on_value(
+        self,
+        recv_obj: ir.Value,
+        attr_name: str,
+        expr: Call,
+    ) -> ir.Value:
+        method_obj = self.builder.call(
+            self.runtime["py_obj_getattr"],
+            [recv_obj, self._attr_name_ptr(attr_name)],
+            name=self._fresh(f"dyn.attr.{attr_name}"),
+        )
+        self._emit_attribute_error_if_null(method_obj, attr_name, expr.func.span)
+        kwdict_unpack = self._split_starstar_kwargs_unpack(expr.args)
+        arg_exprs = expr.args
+        kwargs_expr = None
+        if kwdict_unpack is not None:
+            arg_exprs, kwargs_expr = kwdict_unpack
+        args_owned = not self._is_starred_unpack(arg_exprs)
+        args_tuple = self._emit_dynamic_call_args_tuple(arg_exprs)
+        kwargs_obj = self._emit_dynamic_call_kwargs_object(
+            expr.kwargs,
+            kwargs_expr,
+            expr.span,
+        )
+        result = self.builder.call(
+            self.runtime["py_obj_call"],
+            [method_obj, args_tuple, kwargs_obj],
+            name=self._fresh(f"dyn.method.{attr_name}"),
+        )
+        if args_owned:
+            self._gc_release(args_tuple)
+        if expr.kwargs or kwargs_expr is not None:
+            self._gc_release(kwargs_obj)
+        self._emit_post_call_err_check(expr.span)
+        return result
+
+    def _emit_dyn_list_native_method(
+        self,
+        recv: ir.Value,
+        expr: Call,
+    ) -> Optional[ir.Value]:
+        attr = expr.func
+        assert isinstance(attr, Attr)
+        name = attr.name
+
+        sort_key_spec = None
+        sort_reverse_const = False
+        if expr.kwargs:
+            if name != "sort":
+                return None
+            for k, v in expr.kwargs:
+                if k == "reverse" and isinstance(v, BoolLit):
+                    sort_reverse_const = bool(v.value)
+                elif k == "key":
+                    sort_key_spec = self._key_spec_from_callable(
+                        v,
+                        DynType(name="dyn"),
+                    )
+                    if sort_key_spec is None:
+                        sort_key_spec = ("callable", self._emit_as_object(v))
+                else:
+                    return None
+        if any(
+            isinstance(a, Call)
+            and isinstance(a.func, Name)
+            and a.func.ident in ("*", "__starred__")
+            for a in expr.args
+        ):
+            return None
+
+        if name == "sort":
+            if expr.args:
+                return None
+            if sort_key_spec is not None:
+                self._emit_list_insertion_sort_by_key(recv, sort_key_spec)
+                if sort_reverse_const:
+                    self.builder.call(self.runtime["py_list_reverse"], [recv])
+                return self._emit_none_literal()
+            sorted_list = self.builder.call(
+                self.runtime["py_obj_sorted"],
+                [recv],
+                name=self._fresh("dyn.list.sort.sorted"),
+            )
+            if sort_reverse_const:
+                self.builder.call(self.runtime["py_list_reverse"], [sorted_list])
+            none_obj = self._emit_none_literal()
+            self.builder.call(
+                self.runtime["py_list_set_slice"],
+                [recv, none_obj, none_obj, none_obj, sorted_list],
+            )
+            self._gc_release(sorted_list)
+            return none_obj
+
+        if name == "append":
+            if len(expr.args) != 1:
+                return None
+            item = _list_method_box(self, expr.args[0])
+            item_root = ir.Constant(_CSTR, None)
+            item_for_call = item
+            if isinstance(item.type, ir.PointerType) and item not in getattr(
+                self, "_cpy_values", ()
+            ):
+                item_root = self._enter_container_temp_root(item, "dyn.list.item")
+                item_for_call = self.builder.call(
+                    self.runtime["pcc_gc_load_ptr"],
+                    [
+                        ir.Constant(_CSTR, None),
+                        self._as_gc_ptr(
+                            item_root,
+                            name=self._fresh("dyn.list.item.root.ptr"),
+                        ),
+                    ],
+                    name=self._fresh("dyn.list.item.current"),
+                )
+            self.builder.call(self.runtime["py_list_append"], [recv, item_for_call])
+            item_after_append = item_for_call
+            if not isinstance(item_root, ir.Constant):
+                item_after_append = self.builder.call(
+                    self.runtime["pcc_gc_load_ptr"],
+                    [
+                        ir.Constant(_CSTR, None),
+                        self._as_gc_ptr(
+                            item_root,
+                            name=self._fresh("dyn.list.item.release.root.ptr"),
+                        ),
+                    ],
+                    name=self._fresh("dyn.list.item.release.current"),
+                )
+            if self._container_store_temp_needs_release(
+                expr.args[0],
+                expr.args[0].ty,
+                False,
+            ):
+                self._gc_release(item_after_append)
+            self._leave_container_temp_root(item_root)
+            return self._emit_none_literal()
+
+        if name == "extend":
+            if len(expr.args) != 1:
+                return None
+            self.builder.call(
+                self.runtime["py_list_extend"],
+                [recv, _list_method_box(self, expr.args[0])],
+            )
+            return self._emit_none_literal()
+
+        if name == "insert":
+            if len(expr.args) != 2:
+                return None
+            idx_val = self._emit_expr_as_i64(expr.args[0])
+            self.builder.call(
+                self.runtime["py_list_insert"],
+                [recv, idx_val, _list_method_box(self, expr.args[1])],
+            )
+            return self._emit_none_literal()
+
+        if name == "pop":
+            if len(expr.args) == 0:
+                idx_val = ir.Constant(_I64, -1)
+            elif len(expr.args) == 1:
+                idx_val = self._emit_expr_as_i64(expr.args[0])
+            else:
+                return None
+            return self.builder.call(
+                self.runtime["py_list_pop"],
+                [recv, idx_val],
+                name=self._fresh("dyn.list.pop"),
+            )
+
+        if name == "remove":
+            if len(expr.args) != 1:
+                return None
+            self.builder.call(
+                self.runtime["py_list_remove"],
+                [recv, _list_method_box(self, expr.args[0])],
+            )
+            return self._emit_none_literal()
+
+        if name == "clear":
+            if len(expr.args) != 0:
+                return None
+            self.builder.call(self.runtime["py_list_clear"], [recv])
+            return self._emit_none_literal()
+
+        if name == "index":
+            if len(expr.args) < 1 or len(expr.args) > 3:
+                return None
+            if len(expr.args) == 1:
+                idx = self.builder.call(
+                    self.runtime["py_list_index"],
+                    [recv, _list_method_box(self, expr.args[0])],
+                    name=self._fresh("dyn.list.index.i64"),
+                )
+            else:
+                start_val = self._emit_expr_as_i64(expr.args[1])
+                if len(expr.args) == 3:
+                    end_val = self._emit_expr_as_i64(expr.args[2])
+                else:
+                    end_val = ir.Constant(_I64, _LIST_INDEX_END_SENTINEL)
+                idx = self.builder.call(
+                    self.runtime["py_list_index_range"],
+                    [
+                        recv,
+                        _list_method_box(self, expr.args[0]),
+                        start_val,
+                        end_val,
+                    ],
+                    name=self._fresh("dyn.list.index.range.i64"),
+                )
+                self._emit_post_call_err_check(getattr(expr, "span", None))
+            return self.builder.call(
+                self.runtime["py_int_from_i64"],
+                [idx],
+                name=self._fresh("dyn.list.index"),
+            )
+
+        if name == "count":
+            if len(expr.args) != 1:
+                return None
+            count = self.builder.call(
+                self.runtime["py_list_count"],
+                [recv, _list_method_box(self, expr.args[0])],
+                name=self._fresh("dyn.list.count.i64"),
+            )
+            return self.builder.call(
+                self.runtime["py_int_from_i64"],
+                [count],
+                name=self._fresh("dyn.list.count"),
+            )
+
+        if name == "reverse":
+            if len(expr.args) != 0:
+                return None
+            self.builder.call(self.runtime["py_list_reverse"], [recv])
+            return self._emit_none_literal()
+
+        if name == "copy":
+            if len(expr.args) != 0:
+                return None
+            return self.builder.call(
+                self.runtime["py_list_copy"],
+                [recv],
+                name=self._fresh("dyn.list.copy"),
+            )
+
+        return None
+
+    def _dyn_list_method_shape_supported(self, expr: Call) -> bool:
+        attr = expr.func
+        assert isinstance(attr, Attr)
+        name = attr.name
+        if any(
+            isinstance(a, Call)
+            and isinstance(a.func, Name)
+            and a.func.ident in ("*", "__starred__")
+            for a in expr.args
+        ):
+            return False
+        if expr.kwargs:
+            if name != "sort":
+                return False
+            for k, v in expr.kwargs:
+                if k == "reverse" and isinstance(v, BoolLit):
+                    continue
+                if (
+                    k == "key"
+                    and self._key_spec_from_callable(
+                        v,
+                        DynType(name="dyn"),
+                    )
+                    is not None
+                ):
+                    continue
+                return False
+        if name == "sort":
+            return not expr.args
+        if name == "index":
+            # list.index(x[, start[, end]]) — 1..3 positional args.
+            return 1 <= len(expr.args) <= 3 and not expr.kwargs
+        if name in ("append", "extend", "remove", "count"):
+            return len(expr.args) == 1 and not expr.kwargs
+        if name == "insert":
+            return len(expr.args) == 2 and not expr.kwargs
+        if name == "pop":
+            return len(expr.args) <= 1 and not expr.kwargs
+        if name in ("clear", "reverse", "copy"):
+            return not expr.args and not expr.kwargs
+        return False
+
+    def _emit_dyn_list_method_with_runtime_guard(
+        self,
+        expr: Call,
+    ) -> Optional[ir.Value]:
+        attr = expr.func
+        assert isinstance(attr, Attr)
+        if attr.name not in _DYN_LIST_METHOD_NATIVE:
+            return None
+        if not self._dyn_list_method_shape_supported(expr):
+            return None
+        if self.current_function is None:
+            return None
+
+        recv = self._emit_expr(attr.obj)
+        if recv in getattr(self, "_cpy_values", ()):
+            return self._emit_cpy_method_call_src(
+                recv,
+                attr.name,
+                expr.args,
+                kwargs=expr.kwargs,
+            )
+
+        tag = self.builder.call(
+            self.runtime["py_obj_type_tag"],
+            [recv],
+            name=self._fresh("dyn.list.recv.tag"),
+        )
+        is_list = self.builder.icmp_signed(
+            "==",
+            tag,
+            ir.Constant(_I64, 5),
+            name=self._fresh("dyn.list.recv.is_list"),
+        )
+
+        fn = self.current_function
+        list_bb = fn.append_basic_block(name=self._fresh("dyn.list.native"))
+        generic_bb = fn.append_basic_block(name=self._fresh("dyn.list.generic"))
+        done_bb = fn.append_basic_block(name=self._fresh("dyn.list.done"))
+        self.builder.cbranch(is_list, list_bb, generic_bb)
+
+        self.builder.position_at_end(list_bb)
+        list_result = self._emit_dyn_list_native_method(recv, expr)
+        if list_result is None:
+            return None
+        list_exit = self.builder.block
+        self._gc_release_if_owned(recv, attr.obj)
+        self.builder.branch(done_bb)
+
+        self.builder.position_at_end(generic_bb)
+        generic_result = self._emit_generic_dyn_method_call_on_value(
+            recv,
+            attr.name,
+            expr,
+        )
+        generic_exit = self.builder.block
+        self._gc_release_if_owned(recv, attr.obj)
+        self.builder.branch(done_bb)
+
+        self.builder.position_at_end(done_bb)
+        result = self.builder.phi(_CSTR, name=self._fresh("dyn.list.result"))
+        result.add_incoming(list_result, list_exit)
+        result.add_incoming(generic_result, generic_exit)
+        return result
+
     def _maybe_emit_list_method(
         self,
         expr: Call,
@@ -82,15 +435,20 @@ class ListMethodLoweringMixin:
         path so callers can fall through to the generic dispatch."""
         attr = expr.func
         assert isinstance(attr, Attr)
-        if expr.kwargs and not (
-            attr.name == "sort"
-            and all(
-                k == "reverse" and isinstance(v, BoolLit)
-                for k, v in expr.kwargs
-            )
-        ):
-            return None  # generic path handles or errors
-            # (sort(reverse=<bool const>) is allowed through and handled below)
+        sort_key_spec = None
+        sort_reverse_const = False
+        if expr.kwargs:
+            if attr.name != "sort":
+                return None  # generic path handles or errors
+            for k, v in expr.kwargs:
+                if k == "reverse" and isinstance(v, BoolLit):
+                    sort_reverse_const = bool(v.value)
+                elif k == "key":
+                    sort_key_spec = self._key_spec_from_callable(v, list_ty.elem)
+                    if sort_key_spec is None:
+                        sort_key_spec = ("callable", self._emit_as_object(v))
+                else:
+                    return None
         # Starred argument (``lst.method(*args)``) — bail to generic
         # CPython dispatch which handles splats via py_cpy_call_list.
         if any(
@@ -113,29 +471,34 @@ class ListMethodLoweringMixin:
         if name == "sort":
             if expr.args:
                 return None
-            # sort(reverse=<bool const>): sort then reverse in place. key= and a
-            # non-constant reverse were already bounced by the kwargs guard.
-            reverse_const = False
-            for k, v in (expr.kwargs or ()):
-                if k == "reverse" and isinstance(v, BoolLit):
-                    reverse_const = bool(v.value)
+            # sort(key=<supported inline callable>, reverse=<bool const>):
+            # sort in place, then optionally reverse. Unsupported key callables
+            # and non-constant reverse were already bounced by the kwargs guard.
+            if sort_key_spec is not None:
+                self._emit_list_insertion_sort_by_key(recv, sort_key_spec)
+                if sort_reverse_const:
+                    self.builder.call(
+                        self.runtime["py_list_reverse"],
+                        [recv],
+                    )
+                return self._emit_none_literal()
             elem_hint = None
             if isinstance(attr.obj, Name):
                 elem_hint = self.env_list_elem_class_hint.get(attr.obj.ident)
-            if elem_hint is not None and not reverse_const:
+            if elem_hint is not None and not sort_reverse_const:
                 return self._emit_list_sort_with_dunder_lt(
                     recv,
                     elem_hint,
                     list_ty.elem,
                 )
-            if elem_hint is not None and reverse_const:
+            if elem_hint is not None and sort_reverse_const:
                 return None  # custom-class element + reverse: rare, fall back
             sorted_list = self.builder.call(
                 self.runtime["py_obj_sorted"],
                 [recv],
                 name=self._fresh("list.sort.sorted"),
             )
-            if reverse_const:
+            if sort_reverse_const:
                 self.builder.call(
                     self.runtime["py_list_reverse"],
                     [sorted_list],
@@ -152,26 +515,57 @@ class ListMethodLoweringMixin:
             if len(expr.args) != 1:
                 return None
             if isinstance(attr.obj, Name):
-                item_kind = self._threading_constructor_kind_for_expr(expr.args[0])
+                item_kind = self._threading_constructor_kind_for_expr(
+                    expr.args[0]
+                ) or self._threading_kind_for_receiver_expr(expr.args[0])
                 if item_kind is not None:
-                    current_kind = self._threading_list_elem_flags.get(
-                        attr.obj.ident
-                    )
+                    current_kind = self._threading_list_elem_flags.get(attr.obj.ident)
                     if current_kind is None or current_kind == item_kind:
                         self._threading_list_elem_flags[attr.obj.ident] = item_kind
                     else:
                         self._threading_list_elem_flags.pop(attr.obj.ident, None)
             item = _list_method_box(self, expr.args[0])
+            item_root = ir.Constant(_CSTR, None)
+            item_for_call = item
+            if isinstance(item.type, ir.PointerType) and item not in getattr(
+                self, "_cpy_values", ()
+            ):
+                item_root = self._enter_container_temp_root(item, "list.item")
+                item_for_call = self.builder.call(
+                    self.runtime["pcc_gc_load_ptr"],
+                    [
+                        ir.Constant(_CSTR, None),
+                        self._as_gc_ptr(
+                            item_root,
+                            name=self._fresh("list.item.root.ptr"),
+                        ),
+                    ],
+                    name=self._fresh("list.item.current"),
+                )
             self.builder.call(
                 self.runtime["py_list_append"],
-                [recv, item],
+                [recv, item_for_call],
             )
+            item_after_append = item_for_call
+            if not isinstance(item_root, ir.Constant):
+                item_after_append = self.builder.call(
+                    self.runtime["pcc_gc_load_ptr"],
+                    [
+                        ir.Constant(_CSTR, None),
+                        self._as_gc_ptr(
+                            item_root,
+                            name=self._fresh("list.item.release.root.ptr"),
+                        ),
+                    ],
+                    name=self._fresh("list.item.release.current"),
+                )
             if self._container_store_temp_needs_release(
                 expr.args[0],
                 expr.args[0].ty,
                 False,
             ):
-                self._gc_release(item)
+                self._gc_release(item_after_append)
+            self._leave_container_temp_root(item_root)
             self._gc_release_if_owned(recv, attr.obj)
             return ir.Constant(_I1, 0)
         if name == "extend":
@@ -226,13 +620,26 @@ class ListMethodLoweringMixin:
             self.builder.call(self.runtime["py_list_clear"], [recv])
             return ir.Constant(_I1, 0)
         if name == "index":
-            if len(expr.args) != 1:
+            if len(expr.args) < 1 or len(expr.args) > 3:
                 return None
-            return self.builder.call(
-                self.runtime["py_list_index"],
-                [recv, _list_method_box(self, expr.args[0])],
-                name=self._fresh("list.index"),
+            if len(expr.args) == 1:
+                return self.builder.call(
+                    self.runtime["py_list_index"],
+                    [recv, _list_method_box(self, expr.args[0])],
+                    name=self._fresh("list.index"),
+                )
+            start_val = self._emit_expr_as_i64(expr.args[1])
+            if len(expr.args) == 3:
+                end_val = self._emit_expr_as_i64(expr.args[2])
+            else:
+                end_val = ir.Constant(_I64, _LIST_INDEX_END_SENTINEL)
+            res = self.builder.call(
+                self.runtime["py_list_index_range"],
+                [recv, _list_method_box(self, expr.args[0]), start_val, end_val],
+                name=self._fresh("list.index.range"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return res
         if name == "count":
             if len(expr.args) != 1:
                 return None
@@ -246,7 +653,18 @@ class ListMethodLoweringMixin:
                 return None
             self.builder.call(self.runtime["py_list_reverse"], [recv])
             return ir.Constant(_I1, 0)
+        if name == "copy":
+            if len(expr.args) != 0:
+                return None
+            new_list = self.builder.call(
+                self.runtime["py_list_copy"],
+                [recv],
+                name=self._fresh("list.copy"),
+            )
+            self._gc_release_if_owned(recv, attr.obj)
+            return new_list
         return None
+
     def _emit_list_sort_with_dunder_lt(
         self,
         recv: ir.Value,
@@ -378,8 +796,9 @@ class ListMethodLoweringMixin:
 
     def _sorted_key_spec_from_lambda(self, key_lambda, elem_ty=None):
         """Detect a simple single-param ``key=`` lambda we can inline without
-        first-class-function boxing. Returns ('attr', (parts,...)) for
-        ``lambda x: x.a.b``, ('index', N) for ``lambda x: x[N]`` (int literal),
+        first-class-function boxing. Returns ('self', None) for
+        ``lambda x: x``, ('attr', (parts,...)) for ``lambda x: x.a.b``,
+        ('index', N) for ``lambda x: x[N]`` (int literal),
         ('strmethod', name) for ``lambda s: s.lower()`` when ``elem_ty`` is str,
         ('tuple', (subspec,...)) for ``lambda x: (x.a, x.b)`` (multi-key sort),
         or None (caller falls through to the libpython path). ``elem_ty`` is the
@@ -405,20 +824,38 @@ class ListMethodLoweringMixin:
             return ("tuple", tuple(subspecs))
         return self._simple_key_subspec(body, param, elem_ty)
 
+    def _key_spec_from_callable(self, key_expr, elem_ty=None):
+        """Return an inline key spec for key callables supported natively.
+
+        This is deliberately a small whitelist. Lambdas are reduced to simple
+        structural specs; builtin ``len`` maps to a runtime length key. Anything
+        else stays a first-class callable gap and must fall through.
+        """
+        if isinstance(key_expr, Lambda):
+            return self._sorted_key_spec_from_lambda(key_expr, elem_ty)
+        if isinstance(key_expr, Name) and key_expr.ident == "len":
+            return ("len", None)
+        return None
+
     def _simple_key_subspec(self, expr, param, elem_ty=None):
-        """('attr', parts) for ``param.a.b`` / ('index', N) for ``param[N]``
-        (int literal) / ('strmethod', name) for a no-arg str method
+        """('self', None) for ``param`` / ('attr', parts) for ``param.a.b`` /
+        ('index', N) for ``param[N]`` (int literal) / ('sum', subspec) for
+        ``sum(param[N])`` / ('strmethod', name) for a no-arg str method
         ``param.lower()`` when ``elem_ty`` is str / ('neg', subspec) for
-        ``-param.a`` / ``-param[N]`` (descending key), else None. The scalar key
-        shapes that compose a tuple key or stand alone."""
-        # Unary negation of an attr/index key -> descending sort by that key
-        # (e.g. key=lambda kv: -kv[1], or as a tuple component (-kv[1], kv[0])).
-        # Emitted as the generic 0 - key (py_obj_sub), correct for int+float.
+        ``-param`` / ``-param.a`` / ``-param[N]``
+        (descending key), else None. The scalar key shapes that compose a tuple
+        key or stand alone."""
+        # Unary negation of a self/attr/index key -> descending sort by that
+        # key (e.g. key=lambda v: -v, key=lambda kv: -kv[1], or as a tuple
+        # component (-kv[1], kv[0])). Emitted as generic 0 - key (py_obj_sub),
+        # correct for int+float.
         if isinstance(expr, UnaryOp) and expr.op == "-":
             inner = self._simple_key_subspec(expr.operand, param, elem_ty)
-            if inner is not None and inner[0] in ("attr", "index"):
+            if inner is not None and inner[0] in ("self", "attr", "index"):
                 return ("neg", inner)
             return None
+        if isinstance(expr, Name) and expr.ident == param:
+            return ("self", None)
         parts: list[str] = []
         cur = expr
         while isinstance(cur, Attr):
@@ -434,6 +871,17 @@ class ListMethodLoweringMixin:
             and isinstance(expr.idx, IntLit)
         ):
             return ("index", expr.idx.value)
+        if (
+            isinstance(expr, Call)
+            and isinstance(expr.func, Name)
+            and expr.func.ident == "sum"
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            inner = self._simple_key_subspec(expr.args[0], param, elem_ty)
+            if inner is not None and inner[0] in ("self", "attr", "index"):
+                return ("sum", inner)
+            return None
         # No-arg str method on a str element: lambda s: s.lower() etc. Gated on
         # str elements so py_str_<m> is safe; non-str / unknown -> None (the
         # caller falls back to libpython, which handles it correctly).
@@ -454,6 +902,26 @@ class ListMethodLoweringMixin:
         """Inline the simple key extraction described by ``key_spec`` against
         element object ``obj`` (PyObject*), returning the key PyObject*."""
         kind, data = key_spec
+        if kind == "self":
+            return obj
+        if kind == "callable":
+            args = self.builder.call(
+                self.runtime["py_tuple_new"],
+                [ir.Constant(_I64, 1)],
+                name=self._fresh("sortkey.call.args"),
+            )
+            self.builder.call(
+                self.runtime["py_tuple_set_item"],
+                [args, ir.Constant(_I64, 0), obj],
+            )
+            result = self.builder.call(
+                self.runtime["py_obj_call"],
+                [data, args, self._emit_none_literal()],
+                name=self._fresh("sortkey.call"),
+            )
+            self._gc_release(args)
+            self._emit_post_call_err_check()
+            return result
         if kind == "tuple":
             # Build a tuple of the component keys; py_obj_lt orders tuples
             # lexicographically. Mirrors the tuple-literal lowering (no extra
@@ -487,6 +955,20 @@ class ListMethodLoweringMixin:
                 [obj],
                 name=self._fresh("sortkey.strmethod"),
             )
+        if kind == "len":
+            length = self.builder.call(
+                self.runtime["py_obj_len"],
+                [obj],
+                name=self._fresh("sortkey.len.raw"),
+            )
+            return self.builder.call(
+                self.runtime["py_int_from_i64"],
+                [length],
+                name=self._fresh("sortkey.len"),
+            )
+        if kind == "sum":
+            src = self._emit_key_of(obj, data)
+            return self._emit_sum_via_iter(src, None, None)
         if kind == "neg":
             # Descending key: 0 - subkey via the generic py_obj_sub (handles
             # int and float keys). ``data`` is the wrapped attr/index subspec.
@@ -513,21 +995,18 @@ class ListMethodLoweringMixin:
         )
 
     def _emit_sorted_with_key_lambda(self, expr, key_lambda, reverse_const):
-        """``sorted(xs, key=<simple lambda>)`` without first-class-function
-        boxing: build a COPY (sorted() is non-mutating) and insertion-sort it
-        comparing inline-extracted keys via py_obj_lt (correct for int/str/
-        float keys; a custom-__lt__ key object would hit the cmp_threeway
-        limitation, but sort keys are virtually always primitives). Returns the
-        new list, or None when the lambda is not a simple attr/index shape
-        (caller then falls through to the libpython path)."""
+        """Build the fresh list required by ``sorted(xs, key=callable)``.
+
+        Structural lambda/builtin keys retain their inline extraction path.
+        Other native callable values use the same ``py_obj_call`` key path as
+        ``list.sort(key=callable)`` instead of falling through to libpython.
+        """
         elem_ty = (
-            expr.args[0].ty.elem
-            if isinstance(expr.args[0].ty, ListType)
-            else None
+            expr.args[0].ty.elem if isinstance(expr.args[0].ty, ListType) else None
         )
-        key_spec = self._sorted_key_spec_from_lambda(key_lambda, elem_ty)
+        key_spec = self._key_spec_from_callable(key_lambda, elem_ty)
         if key_spec is None:
-            return None
+            key_spec = ("callable", self._emit_as_object(key_lambda))
         src_obj = marshal.marshal_to_object(
             self.builder,
             self.module,
@@ -595,7 +1074,9 @@ class ListMethodLoweringMixin:
             j_val, ir.Constant(_I64, 1), name=self._fresh("sortkey.j_prev")
         )
         prev = self.builder.call(
-            self.runtime["py_list_get"], [recv, j_prev], name=self._fresh("sortkey.prev")
+            self.runtime["py_list_get"],
+            [recv, j_prev],
+            name=self._fresh("sortkey.prev"),
         )
         cur = self.builder.load(cur_slot, name=self._fresh("sortkey.cur2"))
         key_cur = self._emit_key_of(cur, key_spec)

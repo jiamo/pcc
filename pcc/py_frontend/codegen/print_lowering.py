@@ -5,7 +5,7 @@ from typing import Optional
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import BoolType, Call, FloatType, IntType
+from ..py_ast import BoolLit, BoolType, Call, FloatType, IntType
 from . import marshal
 
 
@@ -15,23 +15,78 @@ _CSTR = _I8.as_pointer()
 
 
 class PrintLoweringMixin:
+    def _is_native_print_flush_kw(self, k, vexpr) -> bool:
+        # ``print(..., flush=True/False)``: the native ``py_print`` /
+        # ``py_print_many`` runtime already flushes stdout per line, so a
+        # bool-literal ``flush=`` is a no-op we can accept and drop (it only
+        # controls *when* CPython flushes, never *what* bytes are emitted).
+        # A non-literal ``flush=<expr>`` could have side effects when
+        # evaluated for its truthiness, so leave those on the cpython path.
+        return k == "flush" and isinstance(vexpr, BoolLit)
+
+    def _print_kwargs_are_native(self, kwargs) -> bool:
+        """True when every print kwarg is one we lower natively: ``sep`` /
+        ``end`` (handled by ``py_print_many``) or a bool-literal ``flush=``
+        (a no-op because the native print path already flushes)."""
+        for k, vexpr in kwargs:
+            if k == "sep" or k == "end":
+                continue
+            if self._is_native_print_flush_kw(k, vexpr):
+                continue
+            return False
+        return True
+
+    def _print_kwargs_without_flush(self, kwargs):
+        # Drop the accepted bool-literal ``flush=`` before delegating to the
+        # ``sep``/``end`` emitters so they never emit a dead truthiness value.
+        out = []
+        for k, vexpr in kwargs:
+            if self._is_native_print_flush_kw(k, vexpr):
+                continue
+            out.append((k, vexpr))
+        return out
+
+    def _emit_print_many_arg(self, tup, idx, arg) -> None:
+        if isinstance(arg.ty, IntType):
+            exact_obj = self._maybe_emit_exact_int_object(arg)
+            if exact_obj is not None:
+                self.builder.call(
+                    self.runtime["py_tuple_set_item"], [tup, idx, exact_obj]
+                )
+                return
+        v = self._emit_expr(arg)
+        if v in self._cpy_values:
+            pcc_str = self.builder.call(
+                self.runtime["py_cpy_to_pcc_str"],
+                [v],
+                name=self._fresh("cpy.str"),
+            )
+            self.builder.call(self.runtime["py_cpy_decref"], [v])
+            v_obj = pcc_str
+        else:
+            boxed_valueclass = self._emit_valueclass_payload_to_object(v, arg.ty)
+            if boxed_valueclass is not None:
+                v_obj = boxed_valueclass
+            else:
+                v_obj = marshal.marshal_to_object(
+                    self.builder, self.module, self.runtime, v, arg.ty
+                )
+        self.builder.call(self.runtime["py_tuple_set_item"], [tup, idx, v_obj])
+
     def _emit_print_call(self, call: Call) -> None:
         # print(*items) / print(a, *rest): a positional *splat. The per-arg
         # paths below would emit the *m marker (Call(Name("*"),...)) as a
         # Name("*") lookup -> runtime "NameError: name '*'". Expand the args
-        # into a runtime tuple first. Only sep/end kwargs are handled natively
-        # here; other kwargs (file=, flush=) fall through to the cpython path.
-        if self._has_starred_unpack(call.args) and all(
-            k in ("sep", "end") for k, _ in (call.kwargs or ())
+        # into a runtime tuple first. sep/end kwargs and a bool-literal flush=
+        # are handled natively here; other kwargs (file=, non-literal flush=)
+        # fall through to the cpython path.
+        if self._has_starred_unpack(call.args) and self._print_kwargs_are_native(
+            call.kwargs or ()
         ):
             self._emit_print_many_splat(call)
             return
         if call.kwargs:
-            only_sep_end = True
-            for k, _ in call.kwargs:
-                if k != "sep" and k != "end":
-                    only_sep_end = False
-            if only_sep_end:
+            if self._print_kwargs_are_native(call.kwargs):
                 self._emit_print_many(call)
                 return
             if self._try_emit_native_file_stream_print(call):
@@ -124,40 +179,14 @@ class PrintLoweringMixin:
         )
         tup_root = self._alloca_in_entry(_CSTR, name=self._fresh("pr.args.root"))
         self.builder.store(tup, tup_root)
-        self._emit_entry_gc_frame_enter(self._gc_one_slot_frame_map(), tup_root)
+        self._emit_current_gc_frame_enter_lifo(self._gc_one_slot_frame_map(), tup_root)
         for i, arg in enumerate(call.args):
-            if isinstance(arg.ty, IntType):
-                exact_obj = self._maybe_emit_exact_int_object(arg)
-                if exact_obj is not None:
-                    v_obj = exact_obj
-                    idx = ir.Constant(_I64, i)
-                    self.builder.call(
-                        self.runtime["py_tuple_set_item"], [tup, idx, v_obj]
-                    )
-                    continue
-            v = self._emit_expr(arg)
-            if v in self._cpy_values:
-                pcc_str = self.builder.call(
-                    self.runtime["py_cpy_to_pcc_str"],
-                    [v],
-                    name=self._fresh("cpy.str"),
-                )
-                self.builder.call(self.runtime["py_cpy_decref"], [v])
-                v_obj = pcc_str
-            else:
-                boxed_valueclass = self._emit_valueclass_payload_to_object(v, arg.ty)
-                if boxed_valueclass is not None:
-                    v_obj = boxed_valueclass
-                else:
-                    v_obj = marshal.marshal_to_object(
-                        self.builder, self.module, self.runtime, v, arg.ty
-                    )
             idx = ir.Constant(_I64, i)
-            self.builder.call(self.runtime["py_tuple_set_item"], [tup, idx, v_obj])
+            self._emit_print_many_arg(tup, idx, arg)
 
         sep_obj: Optional[ir.Value] = None
         end_obj: Optional[ir.Value] = None
-        for k, vexpr in call.kwargs:
+        for k, vexpr in self._print_kwargs_without_flush(call.kwargs):
             v = self._emit_expr(vexpr)
             boxed = marshal.marshal_to_object(
                 self.builder, self.module, self.runtime, v, vexpr.ty
@@ -171,7 +200,7 @@ class PrintLoweringMixin:
         if end_obj is None:
             end_obj = self._emit_literal_str("\n")
         self.builder.call(self.runtime["py_print_many"], [tup, sep_obj, end_obj])
-        self._emit_gc_frame_leave_for_slot(tup_root)
+        self._emit_gc_frame_leave_lifo_for_slot(tup_root)
 
     def _emit_print_many_splat(self, call: Call) -> None:
         """``print(*items)`` / ``print(a, *rest, b)``: build the positional
@@ -179,7 +208,8 @@ class PrintLoweringMixin:
         appends the plain args), convert it to a tuple via
         ``py_call_merge_posargs`` (an empty base + the list as *args), then hand
         that tuple to ``py_print_many`` like the fixed-arity path. Only sep/end
-        kwargs reach here (gated by the caller)."""
+        kwargs and a bool-literal flush= reach here (gated by the caller); the
+        flush= no-op is dropped before the sep/end loop."""
         lst = self._emit_pcc_args_list(call.args, "print.splat")
         tup = self.builder.call(
             self.runtime["py_call_merge_posargs"],
@@ -188,10 +218,10 @@ class PrintLoweringMixin:
         )
         tup_root = self._alloca_in_entry(_CSTR, name=self._fresh("pr.splat.root"))
         self.builder.store(tup, tup_root)
-        self._emit_entry_gc_frame_enter(self._gc_one_slot_frame_map(), tup_root)
+        self._emit_current_gc_frame_enter_lifo(self._gc_one_slot_frame_map(), tup_root)
         sep_obj: Optional[ir.Value] = None
         end_obj: Optional[ir.Value] = None
-        for k, vexpr in call.kwargs:
+        for k, vexpr in self._print_kwargs_without_flush(call.kwargs):
             v = self._emit_expr(vexpr)
             boxed = marshal.marshal_to_object(
                 self.builder, self.module, self.runtime, v, vexpr.ty
@@ -205,4 +235,4 @@ class PrintLoweringMixin:
         if end_obj is None:
             end_obj = self._emit_literal_str("\n")
         self.builder.call(self.runtime["py_print_many"], [tup, sep_obj, end_obj])
-        self._emit_gc_frame_leave_for_slot(tup_root)
+        self._emit_gc_frame_leave_lifo_for_slot(tup_root)

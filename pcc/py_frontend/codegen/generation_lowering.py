@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
@@ -13,11 +14,13 @@ from ..py_ast import (
     AugAssign,
     ClassDef,
     Delete,
+    DynType,
     ExprStmt,
     For,
     FuncDef,
     If,
     Module,
+    Name,
     Stmt,
     Try,
     While,
@@ -29,6 +32,7 @@ from .layer1_support import (
     _is_import_from_stmt,
     _is_import_stmt,
 )
+from .hoist_lowering import hoist_nested_funcdefs
 from .runtime_abi import declare_runtime
 
 _UNSAFE_SCAFFOLD_MODULES = frozenset({"pcc.unsafe"})
@@ -41,7 +45,7 @@ def _codegen_log(parent, enabled: bool, label: str) -> None:
     sys.stderr.write("[pcc.codegen] " + mod_name + ":" + label + "\n")
 
 
-def _iter_module_block_decls(stmt: Stmt):
+def _iter_module_block_decls(stmt: Stmt, static_bool_condition=None):
     """Yield ``def``/``class`` statements nested in module-scope blocks.
 
     Python treats ``def`` and ``class`` as executable statements, so packages
@@ -52,26 +56,73 @@ def _iter_module_block_decls(stmt: Stmt):
     if isinstance(stmt, (FuncDef, ClassDef)):
         yield stmt
         return
-    if isinstance(stmt, (If, While, For)):
+    if isinstance(stmt, If):
+        static_cond = (
+            static_bool_condition(stmt.cond)
+            if static_bool_condition is not None
+            else None
+        )
+        if static_cond is True:
+            selected_bodies = (stmt.body,)
+        elif static_cond is False:
+            selected_bodies = (stmt.else_body,)
+        else:
+            selected_bodies = (stmt.body, stmt.else_body)
+        for body in selected_bodies:
+            for child in body:
+                yield from _iter_module_block_decls(child, static_bool_condition)
+        return
+    if isinstance(stmt, (While, For)):
         for child in stmt.body:
-            yield from _iter_module_block_decls(child)
+            yield from _iter_module_block_decls(child, static_bool_condition)
         for child in stmt.else_body:
-            yield from _iter_module_block_decls(child)
+            yield from _iter_module_block_decls(child, static_bool_condition)
         return
     if isinstance(stmt, Try):
         for child in stmt.body:
-            yield from _iter_module_block_decls(child)
+            yield from _iter_module_block_decls(child, static_bool_condition)
         for handler in stmt.handlers:
             for child in handler.body:
-                yield from _iter_module_block_decls(child)
+                yield from _iter_module_block_decls(child, static_bool_condition)
         for child in stmt.else_body:
-            yield from _iter_module_block_decls(child)
+            yield from _iter_module_block_decls(child, static_bool_condition)
         for child in stmt.finally_body:
-            yield from _iter_module_block_decls(child)
+            yield from _iter_module_block_decls(child, static_bool_condition)
         return
     if isinstance(stmt, With):
         for child in stmt.body:
-            yield from _iter_module_block_decls(child)
+            yield from _iter_module_block_decls(child, static_bool_condition)
+
+
+def _iter_module_block_name_assigns(stmt: Stmt):
+    """Yield simple Name assignments nested in a module-scope block."""
+    if isinstance(stmt, (FuncDef, ClassDef)):
+        return
+    if isinstance(stmt, Assign):
+        for target in stmt.targets:
+            if isinstance(target, Name):
+                yield target.ident
+        return
+    if isinstance(stmt, (If, While, For)):
+        for child in stmt.body:
+            yield from _iter_module_block_name_assigns(child)
+        for child in stmt.else_body:
+            yield from _iter_module_block_name_assigns(child)
+        return
+    if isinstance(stmt, Try):
+        for child in stmt.body:
+            yield from _iter_module_block_name_assigns(child)
+        for handler in stmt.handlers:
+            for child in handler.body:
+                yield from _iter_module_block_name_assigns(child)
+        for child in stmt.else_body:
+            yield from _iter_module_block_name_assigns(child)
+        for child in stmt.finally_body:
+            yield from _iter_module_block_name_assigns(child)
+        return
+    if isinstance(stmt, With):
+        for child in stmt.body:
+            yield from _iter_module_block_name_assigns(child)
 
 
 class GenerationLoweringMixin:
@@ -99,6 +150,9 @@ class GenerationLoweringMixin:
             setattr(self, "_module_has_c_abi_export", False)
             setattr(self, "_fn_err_exit_blocks", {})
             setattr(self, "_fn_err_exit_gc_root_names", {})
+            setattr(self, "_fn_gc_root_slot_registry", {})
+            setattr(self, "_fn_err_exit_gc_root_slots", {})
+            setattr(self, "_fn_gc_root_exit_sites", {})
             setattr(self, "_post_call_frame_blocks", {})
             setattr(self, "_fmt_int", None)
             setattr(self, "_fmt_float", None)
@@ -110,15 +164,28 @@ class GenerationLoweringMixin:
             setattr(self, "_cstr_pool", {})
             setattr(self, "_str_counter", 0)
             setattr(self, "_cstr_counter", 0)
+            setattr(self, "_native_lambda_func_counter", 0)
+            setattr(self, "_native_lambda_callback_counter", 0)
+            setattr(self, "_lambda_counter", [])
             setattr(self, "_class_type_export_cache", {})
             setattr(self, "_class_aliases", {})
+            setattr(self, "_extern_bindings", {})
+            setattr(self, "_unsafe_bindings", {})
+            setattr(self, "_extern_decls", {})
             setattr(self, "_native_module_aliases", {})
+            setattr(self, "_native_module_constant_bindings", {})
             setattr(self, "_native_builtin_module_aliases", {})
             setattr(self, "_native_builtin_value_aliases", {})
             setattr(self, "_native_module_attr_globals", {})
+            setattr(self, "_native_re_compile_aliases", {})
+            setattr(self, "_native_re_compile_local_aliases", {})
+            setattr(self, "_native_re_static_flag_aliases", {})
             setattr(self, "_native_file_values", set())
             setattr(self, "_native_file_env_flags", {})
+            setattr(self, "_weakref_env_flags", {})
             setattr(self, "_cross_module_func_defs", {})
+            setattr(self, "_cross_module_identity_decorators", {})
+            setattr(self, "_cross_module_semantic_functions", {})
             setattr(self, "_module_block_func_defs", {})
             setattr(self, "_unboxed_typed_int_abi_cache", {})
             setattr(self, "_typed_int_abi_call_arg_safety", [])
@@ -143,8 +210,12 @@ class GenerationLoweringMixin:
         # so direct calls ``inner_name(arg)`` continue to route
         # through the existing user-function call path.
         _codegen_log(self, debug_codegen, "hoist begin")
-        hoisted = self._hoist_nested_funcdefs()
+        hoisted = hoist_nested_funcdefs(self)
         _codegen_log(self, debug_codegen, "hoist end " + str(len(hoisted)))
+        # Modules importing ``traceback``: synthesize handler bindings so
+        # ``traceback.format_exc()``/``print_exc()`` can read the handled
+        # exception (see NativeModuleAliasMixin._rewrite_traceback_handler_bindings).
+        self._rewrite_traceback_handler_bindings()
         _codegen_log(self, debug_codegen, "module flags raw-int begin")
         setattr(
             self,
@@ -164,10 +235,10 @@ class GenerationLoweringMixin:
         _codegen_log(self, debug_codegen, "module flags typed-int end")
         _codegen_log(self, debug_codegen, "module flags done")
 
-        # Partition module-level statements into (def-shaped,
-        # statement-body). Anything that isn't a FuncDef/ClassDef is
-        # queued into the synthesized module-main body so that
-        # ``main()`` at file scope still runs at program start.
+        # Predeclare function/class bodies, then queue every executable
+        # module-level statement in source order.  A ``def`` is executable:
+        # its callable binding becomes visible at that exact point, including
+        # to modules reached through an import cycle.
         main_body: list[Stmt] = []
         module_block_decls: list[Stmt] = []
         declared_module_funcs: set[str] = set()
@@ -181,6 +252,13 @@ class GenerationLoweringMixin:
                 declared_module_funcs.add(stmt.name)
                 self._prescan_function_module_globals(stmt)
                 self._declare_user_function(stmt)
+                # Closure conversion appends synthetic ``__nested_*``
+                # declarations to the module body so their native bodies can
+                # be emitted.  They were never source-level module statements:
+                # executing them here would evaluate closure/default values in
+                # the wrong (module) scope.
+                if not stmt.name.startswith("__nested_"):
+                    main_body.append(stmt)
             elif isinstance(stmt, ClassDef):
                 declared_module_classes.add(stmt.name)
                 for class_stmt in stmt.body:
@@ -200,7 +278,6 @@ class GenerationLoweringMixin:
                         "string",
                         "platform",
                         "subprocess",
-                        "asyncio",
                         "tempfile",
                         "fileinput",
                         "shutil",
@@ -211,6 +288,7 @@ class GenerationLoweringMixin:
                         "re",
                         "codecs",
                         "copy",
+                        "functools",
                         "pickle",
                         "gc",
                         "weakref",
@@ -220,8 +298,11 @@ class GenerationLoweringMixin:
                         "importlib",
                         "inspect",
                         "contextlib",
+                        "contextvars",
+                        "enum",
                         "warnings",
                         "textwrap",
+                        "traceback",
                     ):
                         self._register_native_builtin_module_alias(
                             as_name or mod_name,
@@ -241,7 +322,6 @@ class GenerationLoweringMixin:
                             "os",
                             "platform",
                             "subprocess",
-                            "asyncio",
                             "tempfile",
                             "fileinput",
                             "shutil",
@@ -252,6 +332,7 @@ class GenerationLoweringMixin:
                             "re",
                             "codecs",
                             "copy",
+                            "functools",
                             "pickle",
                             "gc",
                             "weakref",
@@ -261,6 +342,8 @@ class GenerationLoweringMixin:
                             "importlib",
                             "inspect",
                             "contextlib",
+                            "contextvars",
+                            "enum",
                             "warnings",
                             "textwrap",
                         ):
@@ -312,6 +395,22 @@ class GenerationLoweringMixin:
                     self._resolve_relative_import(stmt),
                 ):
                     pass
+                elif (
+                    self._resolve_pcc_native_extension_path(
+                        self._resolve_relative_import(stmt)
+                    )
+                    is not None
+                ):
+                    resolved_extension = self._resolve_relative_import(stmt)
+                    for attr_name, as_name in _import_names_from_stmt(stmt):
+                        if attr_name == "*":
+                            self._native_extension_star_module_global(
+                                resolved_extension
+                            )
+                            continue
+                        local_name = as_name or attr_name
+                        gv = self._native_extension_module_global(local_name)
+                        self._native_extension_modules()[local_name] = gv
                 else:
                     # Multi-file compile: pre-register native sibling
                     # imports in the first pass so user function bodies
@@ -407,11 +506,23 @@ class GenerationLoweringMixin:
                 # for imports without altering runtime semantics.
                 if isinstance(stmt, (Try, With, If, While, For)):
                     self._prescan_nested_imports(stmt)
-                    for decl in _iter_module_block_decls(stmt):
+                    for target_name in _iter_module_block_name_assigns(stmt):
+                        self._ensure_module_global_name(
+                            target_name,
+                            DynType("dyn"),
+                        )
+                    for decl in _iter_module_block_decls(
+                        stmt,
+                        self._static_bool_condition,
+                    ):
                         if isinstance(decl, FuncDef):
                             if decl.name in declared_module_funcs:
                                 continue
                             declared_module_funcs.add(decl.name)
+                            self._ensure_module_global_name(
+                                decl.name,
+                                DynType("dyn"),
+                            )
                             self._prescan_function_module_globals(decl)
                             self._declare_user_function(decl)
                             self._module_block_func_defs[decl.name] = decl
@@ -441,16 +552,73 @@ class GenerationLoweringMixin:
 
         self._predeclare_native_builtin_module_attr_stores(tuple(self.ast_module.body))
 
+        worker_timing = str(
+            os.environ.get("PCC_PY_FRONTEND_WORKER_TIMING", "") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
         stmt_index = 0
         for stmt in self.ast_module.body:
             if isinstance(stmt, FuncDef):
-                _codegen_log(self, debug_codegen, "emit func begin " + str(stmt_index) + " " + stmt.name)
+                emit_started = time.monotonic() if worker_timing else 0.0
+                if worker_timing:
+                    sys.stderr.write(
+                        "pcc frontend function start module="
+                        + (self.ast_module.name or "<module>")
+                        + " name="
+                        + stmt.name
+                        + "\n"
+                    )
+                _codegen_log(
+                    self,
+                    debug_codegen,
+                    "emit func begin " + str(stmt_index) + " " + stmt.name,
+                )
                 self._emit_user_function(stmt)
-                _codegen_log(self, debug_codegen, "emit func end " + str(stmt_index) + " " + stmt.name)
+                if worker_timing:
+                    sys.stderr.write(
+                        "pcc frontend function done module="
+                        + (self.ast_module.name or "<module>")
+                        + " name="
+                        + stmt.name
+                        + " elapsed_ms="
+                        + str(int((time.monotonic() - emit_started) * 1000))
+                        + "\n"
+                    )
+                _codegen_log(
+                    self,
+                    debug_codegen,
+                    "emit func end " + str(stmt_index) + " " + stmt.name,
+                )
             elif isinstance(stmt, ClassDef):
-                _codegen_log(self, debug_codegen, "emit class begin " + str(stmt_index) + " " + stmt.name)
+                emit_started = time.monotonic() if worker_timing else 0.0
+                if worker_timing:
+                    sys.stderr.write(
+                        "pcc frontend class start module="
+                        + (self.ast_module.name or "<module>")
+                        + " name="
+                        + stmt.name
+                        + "\n"
+                    )
+                _codegen_log(
+                    self,
+                    debug_codegen,
+                    "emit class begin " + str(stmt_index) + " " + stmt.name,
+                )
                 self.class_lowering.emit_methods(stmt)
-                _codegen_log(self, debug_codegen, "emit class end " + str(stmt_index) + " " + stmt.name)
+                if worker_timing:
+                    sys.stderr.write(
+                        "pcc frontend class done module="
+                        + (self.ast_module.name or "<module>")
+                        + " name="
+                        + stmt.name
+                        + " elapsed_ms="
+                        + str(int((time.monotonic() - emit_started) * 1000))
+                        + "\n"
+                    )
+                _codegen_log(
+                    self,
+                    debug_codegen,
+                    "emit class end " + str(stmt_index) + " " + stmt.name,
+                )
             stmt_index += 1
         for decl in module_block_decls:
             if isinstance(decl, FuncDef):

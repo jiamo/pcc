@@ -1,7 +1,7 @@
 """Decorator helper lowering for Layer-1 Python codegen."""
 from __future__ import annotations
 
-from ..py_ast import Attr, Call, Name, StrLit
+from ..py_ast import Assign, Attr, Call, Name, StrLit
 
 
 _NOOP_DECORATOR_QUALIFIED = frozenset(
@@ -20,6 +20,9 @@ _NOOP_DECORATOR_QUALIFIED = frozenset(
         "contextlib.contextmanager",
         "pytest.fixture",
         "pytest.mark.parametrize",
+        "pytest.mark.integration",
+        "pytest.mark.skip",
+        "pytest.mark.skipif",
         "pcc.test_runner.fixture",
         "pcc.test_runner.parametrize",
     }
@@ -132,8 +135,53 @@ class DecoratorLoweringMixin:
             return True
         if "." not in qn and qn in _NOOP_DECORATOR_BARE:
             return True
+        if self._decorator_is_runtime_partial_factory(dec):
+            return False
         if self._decorator_is_external_metadata_factory(dec):
             return True
+        return False
+
+    def _decorator_is_runtime_partial_factory(self, dec) -> bool:
+        """Whether ``dec`` calls a module-global ``functools.partial`` value.
+
+        Package dispatch layers commonly bind a decorator factory with
+        ``factory = functools.partial(...)`` and then use ``@factory(...)``.
+        Unlike imported metadata-only factories, that call has Python-visible
+        semantics: it can replace the decorated function.  Recognize the
+        generic assignment shape so call lowering executes both factory calls.
+        """
+        if not isinstance(dec, Call):
+            return False
+        root = self._decorator_root_name(dec.func)
+        if root is None:
+            return False
+        for stmt in self.ast_module.body:
+            if not isinstance(stmt, Assign) or len(stmt.targets) != 1:
+                continue
+            target = stmt.targets[0]
+            if not isinstance(target, Name) or target.ident != root:
+                continue
+            value = stmt.value
+            if not isinstance(value, Call):
+                return False
+            partial_func = value.func
+            if isinstance(partial_func, Attr):
+                if partial_func.name != "partial":
+                    return False
+                partial_obj = partial_func.obj
+                return bool(
+                    isinstance(partial_obj, Name)
+                    and self._native_builtin_module_for_name(partial_obj.ident)
+                    == "functools"
+                )
+            if isinstance(partial_func, Name):
+                return bool(
+                    getattr(self, "_native_builtin_value_aliases", {}).get(
+                        partial_func.ident
+                    )
+                    == "functools.partial"
+                )
+            return False
         return False
 
     def _decorator_is_external_metadata_factory(self, dec) -> bool:
@@ -143,9 +191,26 @@ class DecoratorLoweringMixin:
         the wrapper only affects CPython dispatch/reflection. pcc cannot execute
         arbitrary import-time decorator factories during native declaration, but
         it can still compile the underlying function body. Keep this limited to
-        call-shaped decorators whose root name came from another module; a
-        same-module decorator remains semantic user code and is not ignored.
+        decorators whose root name came from another module; a same-module
+        decorator remains semantic user code and is not ignored.
+
+        Two shapes qualify: call-shaped ``@imported_factory(...)`` (any
+        imported-name table), and bare ``@imported_name``.  A bare native
+        sibling qualifies only when closed-world export analysis proved the
+        function returns its first argument unchanged; otherwise it remains a
+        semantic decorator.  CPython-imported bare decorators retain the
+        existing metadata treatment.
         """
+        if isinstance(dec, Name):
+            ident = dec.ident
+            if ident in getattr(self, "functions", {}):
+                return bool(
+                    getattr(self, "_cross_module_identity_decorators", {}).get(
+                        ident,
+                        False,
+                    )
+                )
+            return ident in getattr(self, "_cpy_module_env", {})
         if not isinstance(dec, Call):
             return False
         root = self._decorator_root_name(dec.func)

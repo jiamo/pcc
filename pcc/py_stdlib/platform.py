@@ -1,7 +1,7 @@
 """pcc.py_stdlib.platform — narrow ``platform`` skeleton."""
 from __future__ import annotations
 
-from . import sys as _sys
+import sys as _sys
 
 
 def system() -> str:

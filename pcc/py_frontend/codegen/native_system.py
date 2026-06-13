@@ -1,4 +1,5 @@
 """Native system/process module lowering helpers for layer-1 codegen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -8,12 +9,10 @@ from pcc.llvm_capi.compat import ir
 from ..py_ast import Attr, BoolLit, Call, Expr, Name, StrLit, StrType
 from . import marshal
 
-
 _I8 = ir.IntType(8)
 _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _CSTR = _I8.as_pointer()
-
 
 
 class NativeSystemLoweringMixin:
@@ -51,15 +50,15 @@ class NativeSystemLoweringMixin:
             name=self._fresh(f"sys.version_info.{name}"),
         )
 
-    def _subprocess_text_kwargs_are_native(self, expr: Call) -> bool:
-        if not expr.kwargs:
-            return False
+    def _subprocess_check_output_text_mode(self, expr: Call) -> Optional[bool]:
+        text_mode = False
         seen_text = False
         for key, value in expr.kwargs:
             if key in ("text", "universal_newlines"):
                 if not isinstance(value, BoolLit) or not value.value:
-                    return False
+                    return None
                 seen_text = True
+                text_mode = True
                 continue
             if key == "stderr":
                 if not (
@@ -69,11 +68,14 @@ class NativeSystemLoweringMixin:
                     and self._native_builtin_module_for_name(value.obj.ident)
                     == "subprocess"
                 ):
-                    return False
+                    return None
                 continue
-            if key not in ("text", "universal_newlines"):
-                return False
-        return seen_text
+            return None
+        # text=True  -> True  (py_subprocess_check_output result decoded to str)
+        # no text=   -> False (native bytes; downstream .decode()/bytes methods
+        #              stay native via _maybe_emit_bytes_method_via_dyn)
+        # unsupported kwarg above already returned None to bail to CPython.
+        return True if seen_text else False
 
     def _emit_native_subprocess_call(self, expr: Call) -> Optional[ir.Value]:
         attr = expr.func
@@ -83,27 +85,79 @@ class NativeSystemLoweringMixin:
             or self._native_builtin_module_for_name(attr.obj.ident) != "subprocess"
         ):
             return None
-        if attr.name != "check_output":
+        if attr.name not in ("check_output", "check_call"):
             return None
         if len(expr.args) != 1:
             return None
-        if not self._subprocess_text_kwargs_are_native(expr):
+        if attr.name == "check_output":
+            text_mode = self._subprocess_check_output_text_mode(expr)
+            if text_mode is None:
+                return None
+        elif expr.kwargs:
             return None
         argv = self._emit_expr(expr.args[0])
         if argv in getattr(self, "_cpy_values", ()):
             return None
-        res = self.builder.call(
-            self.runtime["py_subprocess_check_output"],
-            [
-                marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    argv,
-                    expr.args[0].ty,
+        argv_obj = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            argv,
+            expr.args[0].ty,
+        )
+        if attr.name == "check_output":
+            res = self.builder.call(
+                self.runtime["py_subprocess_check_output"],
+                [argv_obj],
+                name=self._fresh("subprocess.check_output"),
+            )
+            self._emit_post_call_err_check(expr.span)
+            if text_mode:
+                res = self.builder.call(
+                    self.runtime["py_bytes_decode"],
+                    [res],
+                    name=self._fresh("subprocess.check_output.text"),
                 )
+            return res
+        rc = self.builder.call(
+            self.runtime["py_subprocess_run"],
+            [argv_obj, ir.Constant(_I32, 0)],
+            name=self._fresh("subprocess.check_call"),
+        )
+        failed = self.builder.icmp_signed(
+            "!=",
+            rc,
+            ir.Constant(_I64, 0),
+            name=self._fresh("subprocess.check_call.failed"),
+        )
+        fn = self.current_function
+        fail_bb = fn.append_basic_block(name=self._fresh("subprocess.check_call.fail"))
+        ok_bb = fn.append_basic_block(name=self._fresh("subprocess.check_call.ok"))
+        self.builder.cbranch(failed, fail_bb, ok_bb)
+        self.builder.position_at_end(fail_bb)
+        exc = self.builder.call(
+            self.runtime["py_exc_new"],
+            [
+                ir.Constant(_I64, 14),
+                self._ptr_to_cstr(
+                    self._cstr_global(
+                        "subprocess.check_call failed",
+                        self._fresh(".err.subprocess.check_call"),
+                    )
+                ),
             ],
-            name=self._fresh("subprocess.check_output"),
+            name=self._fresh("subprocess.check_call.exc"),
+        )
+        self.builder.call(self.runtime["py_raise"], [exc])
+        err_target = getattr(self, "_try_err_block", None)
+        if err_target is None:
+            err_target = self._ensure_fn_err_exit()
+        self.builder.branch(err_target)
+        self.builder.position_at_end(ok_bb)
+        res = self.builder.call(
+            self.runtime["py_int_from_i64"],
+            [rc],
+            name=self._fresh("subprocess.check_call.result"),
         )
         self._emit_post_call_err_check(expr.span)
         return res
@@ -121,6 +175,7 @@ class NativeSystemLoweringMixin:
             return False
         check_true = False
         capture_output_val = ir.Constant(_I32, 0)
+        timeout_ms = None
         for key, value in expr.kwargs:
             if key == "check":
                 if not isinstance(value, BoolLit) or not value.value:
@@ -144,11 +199,12 @@ class NativeSystemLoweringMixin:
                 if not isinstance(value, BoolLit):
                     return False
             elif key == "timeout":
-                # The bootstrap driver wraps stage execution with a hard
-                # process timeout. Accept this keyword in native no-libpython
-                # lowering so pass-runner helper calls do not fall back to
-                # CPython just because the host path has a tighter timeout.
-                continue
+                timeout_seconds = self._emit_expr_as_i64(value)
+                timeout_ms = self.builder.mul(
+                    timeout_seconds,
+                    ir.Constant(_I64, 1000),
+                    name=self._fresh("subprocess.timeout.ms"),
+                )
             else:
                 return False
         if not check_true:
@@ -163,11 +219,18 @@ class NativeSystemLoweringMixin:
             argv,
             expr.args[0].ty,
         )
-        rc = self.builder.call(
-            self.runtime["py_subprocess_run"],
-            [argv_obj, capture_output_val],
-            name=self._fresh("subprocess.run"),
-        )
+        if timeout_ms is None:
+            rc = self.builder.call(
+                self.runtime["py_subprocess_run"],
+                [argv_obj, capture_output_val],
+                name=self._fresh("subprocess.run"),
+            )
+        else:
+            rc = self.builder.call(
+                self.runtime["py_subprocess_run_timeout"],
+                [argv_obj, capture_output_val, timeout_ms],
+                name=self._fresh("subprocess.run.timeout"),
+            )
         failed = self.builder.icmp_signed(
             "!=",
             rc,
@@ -177,7 +240,45 @@ class NativeSystemLoweringMixin:
         fn = self.current_function
         fail_bb = fn.append_basic_block(name=self._fresh("subprocess.run.fail"))
         ok_bb = fn.append_basic_block(name=self._fresh("subprocess.run.ok"))
-        self.builder.cbranch(failed, fail_bb, ok_bb)
+        if timeout_ms is None:
+            self.builder.cbranch(failed, fail_bb, ok_bb)
+        else:
+            timeout_bb = fn.append_basic_block(
+                name=self._fresh("subprocess.run.timeout")
+            )
+            status_bb = fn.append_basic_block(
+                name=self._fresh("subprocess.run.status")
+            )
+            timed_out = self.builder.icmp_signed(
+                "==",
+                rc,
+                ir.Constant(_I64, -124),
+                name=self._fresh("subprocess.run.timed_out"),
+            )
+            self.builder.cbranch(timed_out, timeout_bb, status_bb)
+
+            self.builder.position_at_end(timeout_bb)
+            timeout_exc = self.builder.call(
+                self.runtime["py_exc_new"],
+                [
+                    ir.Constant(_I64, 7),
+                    self._ptr_to_cstr(
+                        self._cstr_global(
+                            "subprocess.run timed out",
+                            self._fresh(".err.subprocess.run.timeout"),
+                        )
+                    ),
+                ],
+                name=self._fresh("subprocess.run.timeout.exc"),
+            )
+            self.builder.call(self.runtime["py_raise"], [timeout_exc])
+            timeout_err_target = getattr(self, "_try_err_block", None)
+            if timeout_err_target is None:
+                timeout_err_target = self._ensure_fn_err_exit()
+            self.builder.branch(timeout_err_target)
+
+            self.builder.position_at_end(status_bb)
+            self.builder.cbranch(failed, fail_bb, ok_bb)
         self.builder.position_at_end(fail_bb)
         exc = self.builder.call(
             self.runtime["py_exc_new"],
@@ -259,18 +360,21 @@ class NativeSystemLoweringMixin:
             name=self._fresh("sysconfig.get_config_var"),
         )
 
-    def _native_builtin_stream_kind_for_expr(self,
+    def _native_builtin_stream_kind_for_expr(
+        self,
         expr: Expr,
     ) -> Optional[str]:
         if (
             isinstance(expr, Attr)
-            and expr.name in ("stdout", "stderr")
+            and expr.name in ("stdin", "stdout", "stderr")
             and isinstance(expr.obj, Name)
             and self._native_builtin_module_for_name(expr.obj.ident) == "sys"
         ):
             return expr.name
         if isinstance(expr, Name):
             value_kind = self._native_builtin_value_for_name(expr.ident)
+            if value_kind == "sys.stdin":
+                return "stdin"
             if value_kind == "sys.stdout":
                 return "stdout"
             if value_kind == "sys.stderr":
@@ -284,6 +388,14 @@ class NativeSystemLoweringMixin:
             return None
         stream_kind = self._native_builtin_stream_kind_for_expr(attr.obj)
         if stream_kind is None:
+            return None
+        if stream_kind == "stdin":
+            if attr.name == "readline" and not expr.args:
+                return self.builder.call(
+                    self.runtime["py_sys_stdin_readline"],
+                    [],
+                    name=self._fresh("sys.stdin.readline"),
+                )
             return None
         if attr.name == "flush" and not expr.args:
             return self._emit_none_literal()

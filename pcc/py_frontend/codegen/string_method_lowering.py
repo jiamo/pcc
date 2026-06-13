@@ -1,4 +1,5 @@
 """String method lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -8,6 +9,8 @@ from pcc.llvm_capi.compat import ir
 from ..py_ast import (
     Attr,
     BoolLit,
+    ByteArrayType,
+    BytesType,
     Call,
     DynType,
     Expr,
@@ -18,11 +21,12 @@ from ..py_ast import (
 )
 from . import marshal
 
-
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _CSTR = ir.IntType(8).as_pointer()
+_PY_TYPE_BYTES = 17
+_PY_TYPE_BYTEARRAY = 18
 
 _STR_METHOD_NATIVE = frozenset(
     {
@@ -50,6 +54,7 @@ _STR_METHOD_NATIVE = frozenset(
         "join",
         "replace",
         "find",
+        "rfind",
         "count",
         "encode",
         "startswith",
@@ -61,8 +66,23 @@ _STR_METHOD_NATIVE = frozenset(
         "isalnum",
         "isupper",
         "islower",
+        "isascii",
+        "isidentifier",
+        "isprintable",
+        "isnumeric",
+        "isdecimal",
+        "istitle",
         "index",
         "rindex",
+    }
+)
+_BYTES_METHOD_NATIVE = frozenset(
+    {
+        "decode",
+        "hex",
+        "upper",
+        "translate",
+        "replace",
     }
 )
 
@@ -87,7 +107,48 @@ def _str_i32_to_i1(host, v: ir.Value, nm: str) -> ir.Value:
     )
 
 
+# CPython uses PY_SSIZE_T_MAX as the default ``end`` for
+# str.find/rfind/index/rindex; the runtime *_range helpers clamp any
+# end > cp_len down to cp_len, so this sentinel reproduces "no end given".
+_STR_FIND_END_DEFAULT = 0x7FFFFFFFFFFFFFFF
+
+
+def _str_find_range_bounds(host, expr: Call):
+    """Return the (start, end) i64 codepoint bounds for a 2- or 3-arg
+    ``find``/``rfind``/``index``/``rindex`` call. ``start`` is
+    ``expr.args[1]``; ``end`` is ``expr.args[2]`` if present, else the
+    PY_SSIZE_T_MAX sentinel that the runtime clamps to cp_len."""
+    start = host._emit_expr_as_i64(expr.args[1])
+    if len(expr.args) >= 3:
+        end = host._emit_expr_as_i64(expr.args[2])
+    else:
+        end = ir.Constant(_I64, _STR_FIND_END_DEFAULT)
+    return start, end
+
+
 class StringMethodLoweringMixin:
+    def _emit_native_str_join(self, recv: ir.Value, arg_expr: Expr, prefix: str):
+        """Call ``py_str_join`` while its temporary sequence stays rooted.
+
+        A list literal is unpinned when literal construction finishes.  The
+        join runtime allocates the result before reading the elements again,
+        so a sufficiently large result can run GC in that gap.  Keep the
+        sequence pinned across the call, and keep the result pinned while the
+        owned argument is released.
+        """
+        items = _str_method_arg(self, arg_expr)
+        self.builder.call(self.runtime["pcc_gc_pin"], [items])
+        result = self.builder.call(
+            self.runtime["py_str_join"],
+            [recv, items],
+            name=self._fresh(prefix + ".join"),
+        )
+        self.builder.call(self.runtime["pcc_gc_pin"], [result])
+        self.builder.call(self.runtime["pcc_gc_unpin"], [items])
+        self._gc_release_if_owned(items, arg_expr)
+        self.builder.call(self.runtime["pcc_gc_unpin"], [result])
+        return result
+
     def _extract_splitlines_keepends(self, expr: Call):
         """Return the ``keepends`` constant bool for a
         ``splitlines(True)`` / ``splitlines(keepends=…)`` call, or ``None``
@@ -111,6 +172,7 @@ class StringMethodLoweringMixin:
                 # safe; produced output preserves line endings.
                 return True
         return None
+
     def _maybe_emit_str_method_via_dyn(
         self,
         expr: Call,
@@ -124,6 +186,13 @@ class StringMethodLoweringMixin:
         attr = expr.func
         assert isinstance(attr, Attr)
         if attr.name not in _STR_METHOD_NATIVE:
+            return None
+        if isinstance(attr.obj.ty, (BytesType, ByteArrayType)):
+            # A statically bytes/bytearray receiver must NOT be forced onto the
+            # StrType fast path: py_str_upper on a bytearray reads the raw bytes
+            # as a string (e.g. ``bytearray(b"abz").upper()`` -> garbage). Bail
+            # so the precise bytes branch (py_bytes_*) in
+            # method_call_expression_lowering handles it.
             return None
         # The only kwarg we recognise on a str method today is
         # ``splitlines(keepends=…)``. Everything else is routed via
@@ -203,7 +272,19 @@ class StringMethodLoweringMixin:
                 [recv, _str_method_arg(self, expr.args[0])],
                 name=self._fresh(f"dyn.str.{name}.chars"),
             )
-        if name == "count" and len(expr.args) == 1:
+        if name == "count" and 1 <= len(expr.args) <= 3:
+            if len(expr.args) >= 2:
+                start_obj = self._emit_as_object(expr.args[1])
+                end_obj = (
+                    self._emit_as_object(expr.args[2])
+                    if len(expr.args) == 3
+                    else self._emit_none_literal()
+                )
+                return self.builder.call(
+                    self.runtime["py_str_count_range"],
+                    [recv, _str_method_arg(self, expr.args[0]), start_obj, end_obj],
+                    name=self._fresh("dyn.str.count.range"),
+                )
             return self.builder.call(
                 self.runtime["py_str_count"],
                 [recv, _str_method_arg(self, expr.args[0])],
@@ -218,6 +299,12 @@ class StringMethodLoweringMixin:
                 "isalnum",
                 "isupper",
                 "islower",
+                "isascii",
+                "isidentifier",
+                "isprintable",
+                "isnumeric",
+                "isdecimal",
+                "istitle",
             )
             and not expr.args
         ):
@@ -228,16 +315,22 @@ class StringMethodLoweringMixin:
                 "isalnum": "py_str_isalnum",
                 "isupper": "py_str_isupper",
                 "islower": "py_str_islower",
+                "isascii": "py_str_isascii",
+                "isidentifier": "py_str_isidentifier",
+                "isprintable": "py_str_isprintable",
+                "isnumeric": "py_str_isnumeric",
+                "isdecimal": "py_str_isdecimal",
+                "istitle": "py_str_istitle",
             }[name]
-            i32v = self.builder.call(
+            i64v = self.builder.call(
                 self.runtime[fn],
                 [recv],
                 name=self._fresh(f"dyn.str.{name}"),
             )
             return self.builder.icmp_signed(
                 "!=",
-                i32v,
-                ir.Constant(_I32, 0),
+                i64v,
+                ir.Constant(_I64, 0),
                 name=self._fresh(f"dyn.str.{name}.i1"),
             )
         if (
@@ -297,7 +390,15 @@ class StringMethodLoweringMixin:
                 [recv, sep],
                 name=self._fresh("dyn.str.split"),
             )
-        if name == "rsplit" and 1 <= len(expr.args) <= 2:
+        if name == "rsplit" and len(expr.args) <= 2:
+            if not expr.args:
+                # rsplit() with no args == split() with no args: whitespace
+                # split, no limit -> identical parts in identical order.
+                return self.builder.call(
+                    self.runtime["py_str_split"],
+                    [recv, ir.Constant(_CSTR, None)],
+                    name=self._fresh("dyn.str.rsplit.ws"),
+                )
             sep = _str_method_arg(self, expr.args[0])
             if len(expr.args) == 2:
                 maxsplit = self._emit_expr_as_i64(expr.args[1])
@@ -378,15 +479,15 @@ class StringMethodLoweringMixin:
                 name=self._fresh("dyn.str.expandtabs"),
             )
         if name == "join" and len(expr.args) == 1:
-            return self.builder.call(
-                self.runtime["py_str_join"],
-                [recv, _str_method_arg(self, expr.args[0])],
-                name=self._fresh("dyn.str.join"),
-            )
+            return self._emit_native_str_join(recv, expr.args[0], "dyn.str")
         if name == "replace" and len(expr.args) == 2:
             return self.builder.call(
                 self.runtime["py_str_replace"],
-                [recv, _str_method_arg(self, expr.args[0]), _str_method_arg(self, expr.args[1])],
+                [
+                    recv,
+                    _str_method_arg(self, expr.args[0]),
+                    _str_method_arg(self, expr.args[1]),
+                ],
                 name=self._fresh("dyn.str.replace"),
             )
         if name == "replace" and len(expr.args) == 3:
@@ -407,6 +508,15 @@ class StringMethodLoweringMixin:
                 [recv, _str_method_arg(self, expr.args[0])],
                 name=self._fresh("dyn.str.find"),
             )
+        if name in ("find", "rfind") and 2 <= len(expr.args) <= 3 and not expr.kwargs:
+            fn = "py_str_find_range" if name == "find" else "py_str_rfind_range"
+            needle = _str_method_arg(self, expr.args[0])
+            start, end = _str_find_range_bounds(self, expr)
+            return self.builder.call(
+                self.runtime[fn],
+                [recv, needle, start, end],
+                name=self._fresh(f"dyn.str.{name}.range"),
+            )
         if name in ("index", "rindex") and len(expr.args) == 1:
             idx_fn = "py_str_index_of" if name == "index" else "py_str_rindex_of"
             res = self.builder.call(
@@ -417,6 +527,19 @@ class StringMethodLoweringMixin:
             # index/rindex raise ValueError when the substring is absent;
             # emit the post-call error check so a surrounding try/except can
             # catch it (mirrors subscript_lowering).
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return res
+        if name in ("index", "rindex") and 2 <= len(expr.args) <= 3 and not expr.kwargs:
+            idx_fn = (
+                "py_str_index_of_range" if name == "index" else "py_str_rindex_of_range"
+            )
+            needle = _str_method_arg(self, expr.args[0])
+            start, end = _str_find_range_bounds(self, expr)
+            res = self.builder.call(
+                self.runtime[idx_fn],
+                [recv, needle, start, end],
+                name=self._fresh(f"dyn.str.{name}.range"),
+            )
             self._emit_post_call_err_check(getattr(expr, "span", None))
             return res
         if name == "rfind" and len(expr.args) == 1:
@@ -441,6 +564,196 @@ class StringMethodLoweringMixin:
                 name=self._fresh(f"dyn.str.{name}.i1"),
             )
         return None
+
+    def _maybe_emit_bytes_method_via_dyn(
+        self,
+        expr: Call,
+    ) -> Optional[ir.Value]:
+        """DynType receiver whose method name matches a pcc-native bytes
+        helper. This is the bytes analogue of ``_maybe_emit_str_method_via_dyn``:
+        it keeps common call chains like ``subprocess.check_output(...).decode()``
+        on the no-libpython path after the producer returns a PyObject*."""
+        attr = expr.func
+        assert isinstance(attr, Attr)
+        name = attr.name
+        if name not in _BYTES_METHOD_NATIVE:
+            return None
+        if name in ("replace", "translate", "upper"):
+            # These names overlap with str helpers. With a DynType
+            # receiver, choosing the bytes helper first sends ordinary
+            # dynamic strings such as parser token text into
+            # py_bytes_replace/upper/translate and raises a bogus
+            # bytes-like TypeError. Statically typed bytes/bytearray
+            # calls still use the precise bytes branch in
+            # method_call_expression_lowering.
+            return None
+        recv = self._emit_expr(attr.obj)
+        if recv in getattr(self, "_cpy_values", ()):
+            recv = self.builder.call(
+                self.runtime["py_cpy_to_pcc_obj"],
+                [recv],
+                name=self._fresh(f"cpy.bytes.{name}.recv"),
+            )
+        if not isinstance(recv.type, ir.PointerType):
+            recv = marshal.marshal_to_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                recv,
+                attr.obj.ty,
+            )
+        if name == "decode":
+            encoding_arg = None
+            errors_arg = None
+            ok = True
+            if len(expr.args) >= 1:
+                encoding_arg = expr.args[0]
+            if len(expr.args) >= 2:
+                errors_arg = expr.args[1]
+            if len(expr.args) > 2:
+                ok = False
+            for kname, kval in expr.kwargs or ():
+                if kname == "encoding" and encoding_arg is None:
+                    encoding_arg = kval
+                elif kname == "errors" and errors_arg is None:
+                    errors_arg = kval
+                else:
+                    ok = False
+            if not ok:
+                raise NotImplementedError(
+                    "bytes.decode() accepts at most encoding and errors"
+                )
+            # A DynType receiver is not proof of bytes. Method names overlap
+            # user classes (notably JSONDecoder.decode), so preserve Python
+            # dispatch with a runtime tag guard and a generic getattr/call
+            # slow path. Statically typed bytes still use the direct branch in
+            # MethodCallExpressionLoweringMixin.
+            tag = self.builder.call(
+                self.runtime["py_obj_type_tag"],
+                [recv],
+                name=self._fresh("dyn.bytes.decode.tag"),
+            )
+            is_bytes = self.builder.icmp_signed(
+                "==",
+                tag,
+                ir.Constant(_I64, _PY_TYPE_BYTES),
+                name=self._fresh("dyn.bytes.decode.is_bytes"),
+            )
+            is_bytearray = self.builder.icmp_signed(
+                "==",
+                tag,
+                ir.Constant(_I64, _PY_TYPE_BYTEARRAY),
+                name=self._fresh("dyn.bytes.decode.is_bytearray"),
+            )
+            is_bytes_like = self.builder.or_(
+                is_bytes,
+                is_bytearray,
+                name=self._fresh("dyn.bytes.decode.is_bytes_like"),
+            )
+            parent_fn = self.current_function
+            bytes_bb = parent_fn.append_basic_block(
+                name=self._fresh("dyn.bytes.decode.bytes")
+            )
+            object_bb = parent_fn.append_basic_block(
+                name=self._fresh("dyn.bytes.decode.object")
+            )
+            end_bb = parent_fn.append_basic_block(
+                name=self._fresh("dyn.bytes.decode.end")
+            )
+            self.builder.cbranch(is_bytes_like, bytes_bb, object_bb)
+
+            self.builder.position_at_end(bytes_bb)
+            encoding = (
+                self._emit_expr_as_pcc_object(encoding_arg)
+                if encoding_arg is not None
+                else self._emit_str_literal("utf-8")
+            )
+            errors = (
+                self._emit_expr_as_pcc_object(errors_arg)
+                if errors_arg is not None
+                else self._emit_str_literal("strict")
+            )
+            bytes_result = self.builder.call(
+                self.runtime["py_bytes_decode_with_encoding"],
+                [recv, encoding, errors],
+                name=self._fresh("dyn.bytes.decode"),
+            )
+            self.builder.branch(end_bb)
+            bytes_exit = self.builder.block
+
+            self.builder.position_at_end(object_bb)
+            callable_obj = self.builder.call(
+                self.runtime["py_obj_getattr"],
+                [recv, self._attr_name_ptr("decode")],
+                name=self._fresh("dyn.decode.callable"),
+            )
+            kwdict_unpack = self._split_starstar_kwargs_unpack(expr.args)
+            arg_exprs = expr.args
+            kwargs_expr = None
+            if kwdict_unpack is not None:
+                arg_exprs, kwargs_expr = kwdict_unpack
+            args_owned = not self._is_starred_unpack(arg_exprs)
+            args_tuple = self._emit_dynamic_call_args_tuple(arg_exprs)
+            kwargs_obj = self._emit_dynamic_call_kwargs_object(
+                expr.kwargs,
+                kwargs_expr,
+                expr.span,
+            )
+            object_result = self.builder.call(
+                self.runtime["py_obj_call"],
+                [callable_obj, args_tuple, kwargs_obj],
+                name=self._fresh("dyn.decode.call"),
+            )
+            if args_owned:
+                self._gc_release(args_tuple)
+            if expr.kwargs:
+                self._gc_release(kwargs_obj)
+            self._gc_release(callable_obj)
+            self._emit_post_call_err_check(expr.span)
+            self.builder.branch(end_bb)
+            object_exit = self.builder.block
+
+            self.builder.position_at_end(end_bb)
+            result = self.builder.phi(
+                _CSTR,
+                name=self._fresh("dyn.decode.result"),
+            )
+            result.add_incoming(bytes_result, bytes_exit)
+            result.add_incoming(object_result, object_exit)
+            return result
+        if name == "hex" and not expr.args and not expr.kwargs:
+            return self.builder.call(
+                self.runtime["py_bytes_hex"],
+                [recv],
+                name=self._fresh("dyn.bytes.hex"),
+            )
+        if name == "upper" and not expr.args and not expr.kwargs:
+            return self.builder.call(
+                self.runtime["py_bytes_upper"],
+                [recv],
+                name=self._fresh("dyn.bytes.upper"),
+            )
+        if name == "translate" and len(expr.args) == 1 and not expr.kwargs:
+            table = self._emit_as_object(expr.args[0])
+            result = self.builder.call(
+                self.runtime["py_bytes_translate"],
+                [recv, table],
+                name=self._fresh("dyn.bytes.translate"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
+        if name == "replace" and len(expr.args) == 2 and not expr.kwargs:
+            old_obj = self._emit_as_object(expr.args[0])
+            new_obj = self._emit_as_object(expr.args[1])
+            result = self.builder.call(
+                self.runtime["py_bytes_replace"],
+                [recv, old_obj, new_obj],
+                name=self._fresh("dyn.bytes.replace"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
+        return None
+
     def _maybe_emit_str_method(
         self,
         expr: Call,
@@ -519,7 +832,19 @@ class StringMethodLoweringMixin:
                 [recv, _str_method_arg(self, expr.args[0])],
                 name=self._fresh(f"str.{name}.chars"),
             )
-        if name == "count" and len(expr.args) == 1:
+        if name == "count" and 1 <= len(expr.args) <= 3:
+            if len(expr.args) >= 2:
+                start_obj = self._emit_as_object(expr.args[1])
+                end_obj = (
+                    self._emit_as_object(expr.args[2])
+                    if len(expr.args) == 3
+                    else self._emit_none_literal()
+                )
+                return self.builder.call(
+                    self.runtime["py_str_count_range"],
+                    [recv, _str_method_arg(self, expr.args[0]), start_obj, end_obj],
+                    name=self._fresh("str.count.range"),
+                )
             return self.builder.call(
                 self.runtime["py_str_count"],
                 [recv, _str_method_arg(self, expr.args[0])],
@@ -534,6 +859,12 @@ class StringMethodLoweringMixin:
                 "isalnum",
                 "isupper",
                 "islower",
+                "isascii",
+                "isidentifier",
+                "isprintable",
+                "isnumeric",
+                "isdecimal",
+                "istitle",
             )
             and not expr.args
         ):
@@ -544,16 +875,22 @@ class StringMethodLoweringMixin:
                 "isalnum": "py_str_isalnum",
                 "isupper": "py_str_isupper",
                 "islower": "py_str_islower",
+                "isascii": "py_str_isascii",
+                "isidentifier": "py_str_isidentifier",
+                "isprintable": "py_str_isprintable",
+                "isnumeric": "py_str_isnumeric",
+                "isdecimal": "py_str_isdecimal",
+                "istitle": "py_str_istitle",
             }[name]
-            i32v = self.builder.call(
+            i64v = self.builder.call(
                 self.runtime[fn],
                 [recv],
                 name=self._fresh(f"str.{name}"),
             )
             return self.builder.icmp_signed(
                 "!=",
-                i32v,
-                ir.Constant(_I32, 0),
+                i64v,
+                ir.Constant(_I64, 0),
                 name=self._fresh(f"str.{name}.i1"),
             )
         if (
@@ -612,7 +949,15 @@ class StringMethodLoweringMixin:
                 [recv, sep],
                 name=self._fresh("str.split"),
             )
-        if name == "rsplit" and 1 <= len(expr.args) <= 2:
+        if name == "rsplit" and len(expr.args) <= 2:
+            if not expr.args:
+                # rsplit() with no args == split() with no args: whitespace
+                # split, no limit -> identical parts in identical order.
+                return self.builder.call(
+                    self.runtime["py_str_split"],
+                    [recv, ir.Constant(_CSTR, None)],
+                    name=self._fresh("str.rsplit.ws"),
+                )
             sep = _str_method_arg(self, expr.args[0])
             if len(expr.args) == 2:
                 maxsplit = self._emit_expr_as_i64(expr.args[1])
@@ -696,16 +1041,16 @@ class StringMethodLoweringMixin:
         if name == "join":
             if len(expr.args) != 1:
                 return None
-            return self.builder.call(
-                self.runtime["py_str_join"],
-                [recv, _str_method_arg(self, expr.args[0])],
-                name=self._fresh("str.join"),
-            )
+            return self._emit_native_str_join(recv, expr.args[0], "str")
         if name == "replace":
             if len(expr.args) == 2:
                 return self.builder.call(
                     self.runtime["py_str_replace"],
-                    [recv, _str_method_arg(self, expr.args[0]), _str_method_arg(self, expr.args[1])],
+                    [
+                        recv,
+                        _str_method_arg(self, expr.args[0]),
+                        _str_method_arg(self, expr.args[1]),
+                    ],
                     name=self._fresh("str.replace"),
                 )
             if len(expr.args) == 3:
@@ -721,35 +1066,51 @@ class StringMethodLoweringMixin:
                     name=self._fresh("str.replace.count"),
                 )
             return None
-        if name == "find":
-            if len(expr.args) != 1:
+        if name in ("find", "rfind"):
+            if expr.kwargs or not (1 <= len(expr.args) <= 3):
                 return None
+            if len(expr.args) == 1:
+                fn = "py_str_find" if name == "find" else "py_str_rfind"
+                return self.builder.call(
+                    self.runtime[fn],
+                    [recv, _str_method_arg(self, expr.args[0])],
+                    name=self._fresh(f"str.{name}"),
+                )
+            fn = "py_str_find_range" if name == "find" else "py_str_rfind_range"
+            needle = _str_method_arg(self, expr.args[0])
+            start, end = _str_find_range_bounds(self, expr)
             return self.builder.call(
-                self.runtime["py_str_find"],
-                [recv, _str_method_arg(self, expr.args[0])],
-                name=self._fresh("str.find"),
+                self.runtime[fn],
+                [recv, needle, start, end],
+                name=self._fresh(f"str.{name}.range"),
             )
         if name in ("index", "rindex"):
-            if len(expr.args) != 1:
+            if expr.kwargs or not (1 <= len(expr.args) <= 3):
                 return None
-            idx_fn = "py_str_index_of" if name == "index" else "py_str_rindex_of"
-            res = self.builder.call(
-                self.runtime[idx_fn],
-                [recv, _str_method_arg(self, expr.args[0])],
-                name=self._fresh(f"str.{name}"),
-            )
+            if len(expr.args) == 1:
+                idx_fn = "py_str_index_of" if name == "index" else "py_str_rindex_of"
+                res = self.builder.call(
+                    self.runtime[idx_fn],
+                    [recv, _str_method_arg(self, expr.args[0])],
+                    name=self._fresh(f"str.{name}"),
+                )
+            else:
+                idx_fn = (
+                    "py_str_index_of_range"
+                    if name == "index"
+                    else "py_str_rindex_of_range"
+                )
+                needle = _str_method_arg(self, expr.args[0])
+                start, end = _str_find_range_bounds(self, expr)
+                res = self.builder.call(
+                    self.runtime[idx_fn],
+                    [recv, needle, start, end],
+                    name=self._fresh(f"str.{name}.range"),
+                )
             # ValueError on absent substring -> emit err check so try/except
             # can catch it (mirrors subscript_lowering).
             self._emit_post_call_err_check(getattr(expr, "span", None))
             return res
-        if name == "rfind":
-            if len(expr.args) != 1:
-                return None
-            return self.builder.call(
-                self.runtime["py_str_rfind"],
-                [recv, _str_method_arg(self, expr.args[0])],
-                name=self._fresh("str.rfind"),
-            )
         if name in ("startswith", "endswith"):
             if len(expr.args) != 1:
                 return None

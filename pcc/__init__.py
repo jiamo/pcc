@@ -4,6 +4,7 @@ Keep package import side effects minimal so subpackages such as
 ``pcc.py_frontend`` can be imported without pulling the full C
 evaluator / llvmlite stack into the process.
 """
+
 from __future__ import annotations
 
 __all__ = [
@@ -14,13 +15,14 @@ __all__ = [
     "valueclass",
     "ValueBox",
     "ValuePayload",
+    "array",
 ]
 
 
 def __getattr__(name: str):
     if name in __all__:
         from .api import BuildArtifact, Module, build, module
-        from .value_model import ValueBox, ValuePayload, valueclass
+        from .value_model import ValueBox, ValuePayload, array, valueclass
 
         exports = {
             "module": module,
@@ -30,6 +32,7 @@ def __getattr__(name: str):
             "valueclass": valueclass,
             "ValueBox": ValueBox,
             "ValuePayload": ValuePayload,
+            "array": array,
         }
         return exports[name]
     raise AttributeError(f"module 'pcc' has no attribute {name!r}")
@@ -45,6 +48,7 @@ def __dir__() -> list[str]:
 # PCC_DISABLE_ROADMAP_DEEPWIRE=1 when bisecting bootstrap regressions.
 try:
     from .roadmap_deepwire import install as _pcc_roadmap_deepwire_install
+
     _pcc_roadmap_deepwire_install()
 except Exception:
     pass

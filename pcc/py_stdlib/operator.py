@@ -11,7 +11,11 @@ def mod(a, b): return a % b
 def pow(a, b): return a ** b
 def neg(a): return -a
 def pos(a): return +a
-def abs_(a): return abs(a)
+def abs_(a): return -a if a < 0 else a
+def is_(a, b): return a is b
+def is_not(a, b): return a is not b
+def truth(a): return bool(a)
+def index(a): return int(a)
 
 def lt(a, b): return a < b
 def le(a, b): return a <= b

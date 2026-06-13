@@ -1,4 +1,5 @@
 """For-loop lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -7,6 +8,7 @@ from pcc.llvm_capi.compat import ir
 
 from ..py_ast import (
     Assign,
+    Attr,
     BoolLit,
     BoolType,
     Break,
@@ -19,14 +21,59 @@ from ..py_ast import (
     IntType,
     ListType,
     Name,
+    SetType,
     StrType,
     Try,
     TupleExpr,
     TupleType,
     Type,
+    While,
 )
 from . import marshal
+from .builtin_exceptions import BUILTIN_EXC_TAG as _BUILTIN_EXC_TAG
 from .errors import L1CodegenError
+
+# AST-bearing fields walked by the cpy-for cross-yield read scan
+# (audited against the full py_ast dataclass field inventory).
+_CPY_SCAN_FIELDS = (
+    "args",
+    "bases",
+    "body",
+    "cause",
+    "cond",
+    "decorators",
+    "default",
+    "elems",
+    "else_body",
+    "else_e",
+    "exc",
+    "expr",
+    "fields",
+    "finally_body",
+    "func",
+    "handlers",
+    "hi",
+    "idx",
+    "items",
+    "iter",
+    "key",
+    "keywords",
+    "kwargs",
+    "left",
+    "lhs",
+    "lo",
+    "obj",
+    "operand",
+    "pairs",
+    "params",
+    "right",
+    "rhs",
+    "step",
+    "target",
+    "targets",
+    "then_e",
+    "value",
+)
 
 
 _I1 = ir.IntType(1)
@@ -34,10 +81,6 @@ _I8 = ir.IntType(8)
 _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _CSTR = _I8.as_pointer()
-_BUILTIN_EXC_TAG = {
-    "StopIteration": 8,
-    "StopAsyncIteration": 17,
-}
 
 
 def _for_loop_has_attr(obj, name: str) -> bool:
@@ -81,7 +124,128 @@ def _for_loop_is_call_name(obj, names: tuple[str, ...]) -> bool:
         return False
 
 
+def _for_loop_dict_items_target_names(target) -> Optional[tuple[str, str]]:
+    if not _for_loop_is_tuple_expr(target):
+        return None
+    elems = getattr(target, "elems", ())
+    if len(elems) != 2:
+        return None
+    left = elems[0]
+    right = elems[1]
+    if _for_loop_is_name(left) and _for_loop_is_name(right):
+        return (left.ident, right.ident)
+    return None
+
+
+def _for_loop_dict_items_object(iter_expr):
+    if not _for_loop_is_call(iter_expr):
+        return None
+    if getattr(iter_expr, "args", ()) or getattr(iter_expr, "kwargs", ()):
+        return None
+    func = getattr(iter_expr, "func", None)
+    if not isinstance(func, Attr):
+        return None
+    if func.name != "items":
+        return None
+    return func.obj
+
+
 class ForLoopLoweringMixin:
+    def _clear_cpy_for_target_binding(self, target_ident: str) -> None:
+        """Native for-target rebinding must overwrite CPython local state."""
+        if hasattr(self, "_cpy_env_flags"):
+            self._cpy_env_flags.pop(target_ident, None)
+
+    def _cpy_for_scan_node(self, node, events: list) -> bool:
+        """Append ordered events for the cross-yield read check to
+        ``events`` ("Y" for a yield sentinel, "R:<ident>" for a Name)
+        and return True when the subtree contains a yield. Pre-order
+        with two adjustments: a yield sentinel's argument reads precede
+        its "Y" (``yield line`` reads ``line`` while still running),
+        and a loop subtree that contains a yield emits "Y" FIRST — the
+        back-edge makes every read inside happen after a suspension at
+        runtime. Written in the bootstrap-safe dialect (no generators,
+        no genexprs, no reflection)."""
+        if node is None:
+            return False
+        if isinstance(node, list) or isinstance(node, tuple):
+            has_y = False
+            i = 0
+            while i < len(node):
+                if self._cpy_for_scan_node(node[i], events):
+                    has_y = True
+                i += 1
+            return has_y
+        if isinstance(node, str):
+            return False
+        if isinstance(node, Name):
+            events.append("R:" + node.ident)
+            return False
+        if isinstance(node, For) or isinstance(node, While):
+            sub: list = []
+            has_y = self._cpy_for_scan_fields(node, sub)
+            if has_y:
+                events.append("Y")
+            i = 0
+            while i < len(sub):
+                events.append(sub[i])
+                i += 1
+            return has_y
+        if isinstance(node, Call):
+            sentinel = None
+            try:
+                sentinel = self._yield_sentinel_call(node)
+            except AttributeError:
+                sentinel = None
+            if sentinel is not None:
+                self._cpy_for_scan_node(node.args, events)
+                events.append("Y")
+                return True
+        return self._cpy_for_scan_fields(node, events)
+
+    def _cpy_for_scan_fields(self, node, events: list) -> bool:
+        # Explicit AST-bearing field table (audited against the full
+        # py_ast dataclass field set on 2026-06-10); metadata fields
+        # (span/ty/ident/name/line/...) are deliberately absent. A new
+        # structural field added to py_ast must be added here or the
+        # cross-yield check under-approximates reads.
+        has_y = False
+        i = 0
+        while i < len(_CPY_SCAN_FIELDS):
+            child = getattr(node, _CPY_SCAN_FIELDS[i], None)
+            if child is not None:
+                if self._cpy_for_scan_node(child, events):
+                    has_y = True
+            i += 1
+        return has_y
+
+    def _cpy_for_target_read_crosses_yield(self, stmt: For, target: str) -> bool:
+        """True when the loop target may be read after a yield
+        suspension inside the loop body (the unsupported-by-J1 shape).
+        The target is re-stored at the top of every iteration, so the
+        loop's own back-edge is safe; only reads AFTER a yield (in
+        source order, with yielding nested loops treated as
+        yield-before-everything) are crossings."""
+        events: list = []
+        body_stmts = []
+        i = 0
+        while i < len(stmt.body):
+            body_stmts.append(stmt.body[i])
+            i += 1
+        self._cpy_for_scan_node(body_stmts, events)
+        saw_yield = False
+        marker = "R:" + target
+        i = 0
+        while i < len(events):
+            ev = events[i]
+            i += 1
+            if ev == "Y":
+                saw_yield = True
+                continue
+            if saw_yield and ev == marker:
+                return True
+        return False
+
     def _emit_for_cpython_iter(
         self,
         stmt: For,
@@ -89,13 +253,118 @@ class ForLoopLoweringMixin:
     ) -> None:
         """Lower ``for <name> in <cpython_iterable>:`` via PyObject_GetIter
         + PyIter_Next. Each iteration binds the target name to the
-        returned CPython PyObject* (tagged as cpy)."""
+        returned CPython PyObject* (tagged as cpy).
+
+        Inside a generator (J2', see
+        docs/investigations/generator-cpython-iteration-dominance.md):
+        the iterator AND the single-name loop target are boxed into
+        CpyHandle pcc objects (raw libpython pointers must never enter
+        the frame py_list — store barriers and frame dealloc
+        dereference pcc headers; the handle's dealloc releases the
+        foreign ref, so dropping a suspended generator releases its
+        live iterator/item). The central name-load helper unboxes
+        names registered in ``cpy_boxed_names``, so the target may be
+        read across yield suspensions like CPython. TUPLE-UNPACK
+        targets still use the J1 skip-save + precise cross-yield guard
+        (full unpack support is the tracked second stage)."""
+        gen_ctx = None
+        target_name = stmt.target.ident
+        # ``for (a, b) in cpy:`` was normalised into a synthetic single
+        # target plus a leading unpack assignment; the unpack targets
+        # receive cpy element pointers, so they are cpy locals too.
+        # FLAT single-level all-Name unpacks are handled natively in a
+        # generator (J2' stage 2: the loop emits the element extraction
+        # itself and consumes body[0]); nested tuple targets keep the
+        # J1 skip-save + precise guard.
+        flat_unpack_names: list = []
+        nested_unpack_names: list = []
+        has_unpack = False
+        if stmt.body:
+            first = stmt.body[0]
+            if (
+                isinstance(first, Assign)
+                and isinstance(first.value, Name)
+                and first.value.ident == target_name
+                and len(first.targets) == 1
+                and isinstance(first.targets[0], TupleExpr)
+            ):
+                has_unpack = True
+                flat_ok = True
+                for el in first.targets[0].elems:
+                    if isinstance(el, Name):
+                        flat_unpack_names.append(el.ident)
+                    else:
+                        flat_ok = False
+                if not flat_ok:
+                    flat_unpack_names = []
+                    work = [first.targets[0]]
+                    while work:
+                        cur = work.pop()
+                        if isinstance(cur, TupleExpr):
+                            work.extend(cur.elems)
+                        elif isinstance(cur, Name):
+                            nested_unpack_names.append(cur.ident)
+        if len(getattr(self, "_generator_ctx_stack", ())) > 0:
+            gen_ctx = self._generator_ctx_stack[-1]
+            for nm in nested_unpack_names:
+                if self._cpy_for_target_read_crosses_yield(stmt, nm):
+                    raise NotImplementedError(
+                        "Layer 1 does not support reading the "
+                        f"CPython-backed loop variable {nm!r} after a "
+                        "yield suspension yet"
+                    )
         fn = self.current_function
         iter_obj = self.builder.call(
             self.runtime["py_cpy_iter"],
             [iter_src_val],
             name=self._fresh("cpy.iter"),
         )
+        # Spill the iterator to a slot so the def dominates the
+        # header/after uses. In a generator the slot must live in the
+        # persisted frame (a plain entry alloca is rebuilt per resume
+        # call), and the frame only holds pcc objects — so the handle
+        # is boxed as a pcc int and unboxed at each use.
+        iter_slot = None
+        frame_iter_slot = None
+        if gen_ctx is not None:
+            hidden = self._generator_for_iter_name(stmt)
+            frame_entry = gen_ctx["frame_slots"].get(hidden)
+            if frame_entry is None:
+                raise L1CodegenError("generator for-loop missing iterator frame slot")
+            frame_iter_slot = frame_entry[1]
+            # CpyHandle takes ownership of the py_cpy_iter ref; its
+            # dealloc (frame drop / save overwrite) releases it.
+            boxed = self.builder.call(
+                self.runtime["py_cpy_handle_new"],
+                [iter_obj],
+                name=self._fresh("cpy.iter.box"),
+            )
+            self.builder.store(boxed, frame_iter_slot)
+            if nested_unpack_names:
+                skip = gen_ctx.setdefault("cpy_skip_save_names", set())
+                skip.update(nested_unpack_names)
+            # Pre-clear the target slot (and the flat-unpack slots):
+            # the per-iteration store decrefs the previous box, and the
+            # first iteration must not decref alloca garbage
+            # (py_decref(NULL) is a no-op). Prior same-named local
+            # values are discarded like any for-target rebind.
+            for pre_ident in [stmt.target.ident] + flat_unpack_names:
+                pre_slot = self.env.get(pre_ident)
+                if pre_slot is None:
+                    pre_alloca = self._alloca_in_entry(_CSTR, name=f"{pre_ident}.addr")
+                    self.env[pre_ident] = (
+                        pre_alloca,
+                        _CSTR,
+                        DynType(name="dyn"),
+                    )
+                    pre_slot = self.env[pre_ident]
+                self.builder.store(ir.Constant(_CSTR, None), pre_slot[0])
+        else:
+            iter_slot = self._alloca_in_entry(
+                iter_obj.type,
+                name=self._fresh("cpy.iter.slot"),
+            )
+            self.builder.store(iter_obj, iter_slot)
 
         header_bb = fn.append_basic_block(name=self._fresh("for.cpy.header"))
         body_bb = fn.append_basic_block(name=self._fresh("for.cpy.body"))
@@ -104,9 +373,16 @@ class ForLoopLoweringMixin:
 
         self.builder.branch(header_bb)
         self.builder.position_at_end(header_bb)
+        if frame_iter_slot is not None:
+            iter_cur = self._cpy_iter_unbox_from_frame(frame_iter_slot)
+        else:
+            iter_cur = self.builder.load(
+                iter_slot,
+                name=self._fresh("cpy.iter.cur"),
+            )
         item = self.builder.call(
             self.runtime["py_cpy_iter_next"],
-            [iter_obj],
+            [iter_cur],
             name=self._fresh("cpy.next"),
         )
         is_null = self.builder.icmp_signed(
@@ -125,15 +401,117 @@ class ForLoopLoweringMixin:
             alloca = self._alloca_in_entry(_CSTR, name=f"{target_ident}.addr")
             self.env[target_ident] = (alloca, _CSTR, DynType(name="dyn"))
             slot = self.env[target_ident]
-        self.builder.store(item, slot[0])
+        if gen_ctx is not None:
+            # J2': the target slot holds a CpyHandle box (frame-safe;
+            # the central name-load helper unboxes). The handle takes
+            # ownership of the PyIter_Next ref; the PREVIOUS
+            # iteration's box loses its local reference here (the
+            # frame may still hold one from the last save).
+            old_box = self.builder.load(slot[0], name=self._fresh("cpy.item.old"))
+            item_box = self.builder.call(
+                self.runtime["py_cpy_handle_new"],
+                [item],
+                name=self._fresh("cpy.item.box"),
+            )
+            self.builder.store(item_box, slot[0])
+            self.builder.call(self.runtime["py_decref"], [old_box])
+            boxed_names = gen_ctx.setdefault("cpy_boxed_names", set())
+            boxed_names.add(target_ident)
+        else:
+            self.builder.store(item, slot[0])
         # Mark target as CPython-backed.
         if not hasattr(self, "_cpy_env_flags"):
             self._cpy_env_flags = {}
         self._cpy_env_flags[target_ident] = True
 
+        body_stmts = stmt.body
+        if gen_ctx is not None and has_unpack and flat_unpack_names:
+            # J2' stage 2: emit the flat tuple unpack OURSELVES from the
+            # raw cpy item (cpy-bridge element extraction, each element
+            # boxed like the target) and consume body[0] — the generic
+            # assignment path neither tracks element cpy-ness nor boxes.
+            #
+            # Arity check first (CPython raises ValueError on
+            # mismatch); py_cpy_len returns -1 for unsized items, in
+            # which case the check is skipped (conservative).
+            expected_n = len(flat_unpack_names)
+            item_len = self.builder.call(
+                self.runtime["py_cpy_len"],
+                [item],
+                name=self._fresh("cpy.unpack.len"),
+            )
+            unsized = self.builder.icmp_signed(
+                "<",
+                item_len,
+                ir.Constant(_I64, 0),
+                name=self._fresh("cpy.unpack.unsized"),
+            )
+            len_match = self.builder.icmp_signed(
+                "==",
+                item_len,
+                ir.Constant(_I64, expected_n),
+                name=self._fresh("cpy.unpack.match"),
+            )
+            arity_ok = self.builder.or_(
+                unsized, len_match, name=self._fresh("cpy.unpack.ok")
+            )
+            arity_ok_bb = fn.append_basic_block(name=self._fresh("for.cpy.unpack.ok"))
+            arity_bad_bb = fn.append_basic_block(name=self._fresh("for.cpy.unpack.bad"))
+            self.builder.cbranch(arity_ok, arity_ok_bb, arity_bad_bb)
+            self.builder.position_at_end(arity_bad_bb)
+            arity_msg = self._ptr_to_cstr(
+                self._cstr_global(
+                    "cannot unpack CPython sequence: arity mismatch "
+                    f"(expected {expected_n})",
+                    ".cpy.unpack.arity",
+                )
+            )
+            arity_exc = self.builder.call(
+                self.runtime["py_exc_new"],
+                [ir.Constant(_I64, 2), arity_msg],
+                name=self._fresh("cpy.unpack.exc"),
+            )
+            self.builder.call(self.runtime["py_raise"], [arity_exc])
+            arity_err_target = (
+                getattr(self, "_try_err_block", None) or self._ensure_fn_err_exit()
+            )
+            self.builder.branch(arity_err_target)
+            self.builder.position_at_end(arity_ok_bb)
+            boxed_names = gen_ctx.setdefault("cpy_boxed_names", set())
+            for uj, unm in enumerate(flat_unpack_names):
+                idx_cpy = self.builder.call(
+                    self.runtime["py_cpy_from_i64"],
+                    [ir.Constant(_I64, uj)],
+                    name=self._fresh(f"cpy.unpack.idx.{uj}"),
+                )
+                elem = self.builder.call(
+                    self.runtime["py_cpy_getitem"],
+                    [item, idx_cpy],
+                    name=self._fresh(f"cpy.unpack.{uj}"),
+                )
+                self.builder.call(self.runtime["py_cpy_decref"], [idx_cpy])
+                un_slot = self.env.get(unm)
+                if un_slot is None:
+                    un_alloca = self._alloca_in_entry(_CSTR, name=f"{unm}.addr")
+                    self.env[unm] = (un_alloca, _CSTR, DynType(name="dyn"))
+                    un_slot = self.env[unm]
+                old_elem_box = self.builder.load(
+                    un_slot[0], name=self._fresh(f"cpy.unpack.old.{uj}")
+                )
+                elem_box = self.builder.call(
+                    self.runtime["py_cpy_handle_new"],
+                    [elem],
+                    name=self._fresh(f"cpy.unpack.box.{uj}"),
+                )
+                self.builder.store(elem_box, un_slot[0])
+                self.builder.call(self.runtime["py_decref"], [old_elem_box])
+                self._cpy_env_flags[unm] = True
+                boxed_names.add(unm)
+            body_stmts = stmt.body[1:]
+
         # Loop control stack: continue -> header, break -> after.
-        self.loop_stack.append((latch_bb, after_bb))
-        self._emit_stmts(stmt.body)
+        self.loop_stack.append((latch_bb, after_bb, self._loop_finally_base()))
+        self._emit_stmts(body_stmts)
         self.loop_stack.pop()
         if not self._builder_block_is_terminated():
             # Release item (we took ownership from PyIter_Next).
@@ -146,7 +524,49 @@ class ForLoopLoweringMixin:
         self.builder.branch(header_bb)
 
         self.builder.position_at_end(after_bb)
-        self.builder.call(self.runtime["py_cpy_decref"], [iter_obj])
+        if frame_iter_slot is not None:
+            # J2': the iterator's foreign ref belongs to its CpyHandle
+            # box (released on frame drop / save overwrite) — no manual
+            # py_cpy_decref. The target slot keeps the LAST item's box
+            # so reads after the loop see the final item like CPython
+            # (the generator frame's save/dealloc balances its ref).
+            # Drop the iterator box's local reference now and clear the
+            # frame slot so the iterator is released at loop exit, not
+            # at generator drop.
+            iter_box_done = self.builder.load(
+                frame_iter_slot, name=self._fresh("cpy.iter.box.done")
+            )
+            self.builder.store(ir.Constant(_CSTR, None), frame_iter_slot)
+            self.builder.call(self.runtime["py_decref"], [iter_box_done])
+            if nested_unpack_names:
+                # J1 behavior for NESTED unpack names: clear raw cpy
+                # pointers before frame saves resume, then re-arm
+                # normal saves. (Flat unpack names hold CpyHandle boxes
+                # and stay readable after the loop like the target.)
+                none_obj = self._emit_none_literal()
+                for nm in nested_unpack_names:
+                    nm_slot = self.env.get(nm)
+                    if nm_slot is not None and nm_slot[1] == _CSTR:
+                        self.builder.store(none_obj, nm_slot[0])
+                    gen_ctx["cpy_skip_save_names"].discard(nm)
+        else:
+            iter_done = self.builder.load(
+                iter_slot,
+                name=self._fresh("cpy.iter.done"),
+            )
+            self.builder.call(self.runtime["py_cpy_decref"], [iter_done])
+
+    def _cpy_iter_unbox_from_frame(self, frame_iter_slot) -> ir.Value:
+        boxed = self.builder.load(
+            frame_iter_slot,
+            name=self._fresh("cpy.iter.boxed"),
+        )
+        return self.builder.call(
+            self.runtime["py_cpy_handle_get"],
+            [boxed],
+            name=self._fresh("cpy.iter.ptr"),
+        )
+
     def _emit_for_list_index(
         self,
         stmt: For,
@@ -205,6 +625,19 @@ class ForLoopLoweringMixin:
             )
             self.env[target_ident] = (alloca, target_ir_ty, elem_ty)
             slot = self.env[target_ident]
+        threading_target_kind = self._threading_kind_for_type(elem_ty)
+        if threading_target_kind is None and isinstance(stmt.iter, Name):
+            threading_target_kind = self._threading_list_elem_flags.get(stmt.iter.ident)
+        if threading_target_kind is not None:
+            self._threading_env_flags[target_ident] = threading_target_kind
+        else:
+            self._threading_env_flags.pop(target_ident, None)
+        threading_list_elem_kind = self._threading_list_elem_kind_for_type(elem_ty)
+        if threading_list_elem_kind is not None:
+            self._threading_list_elem_flags[target_ident] = threading_list_elem_kind
+        else:
+            self._threading_list_elem_flags.pop(target_ident, None)
+        self._clear_cpy_for_target_binding(target_ident)
 
         cond_bb = fn.append_basic_block(name=self._fresh("for.lst.cond"))
         body_bb = fn.append_basic_block(name=self._fresh("for.lst.body"))
@@ -251,6 +684,20 @@ class ForLoopLoweringMixin:
             )
             if isinstance(elem_ty, DynType) or isinstance(target_ir_ty, ir.PointerType):
                 self.builder.store(elem_obj, target_alloca)
+            elif self._is_valueclass_payload_type(elem_ty):
+                native_val = self._emit_object_to_valueclass_payload(
+                    elem_obj,
+                    elem_ty,
+                )
+                if native_val is None:
+                    native_val = marshal.marshal_from_object(
+                        self.builder,
+                        self.module,
+                        self.runtime,
+                        elem_obj,
+                        elem_ty,
+                    )
+                self.builder.store(native_val, target_alloca)
             else:
                 native_val = marshal.marshal_from_object(
                     self.builder,
@@ -260,8 +707,14 @@ class ForLoopLoweringMixin:
                     elem_ty,
                 )
                 self.builder.store(native_val, target_alloca)
+        if self._is_valueclass_payload_type(slot[2]):
+            self._ensure_valueclass_payload_gc_roots(
+                target_ident,
+                target_alloca,
+                slot[2],
+            )
 
-        self.loop_stack.append((step_bb, end_bb))
+        self.loop_stack.append((step_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
         if not self._builder_block_is_terminated():
@@ -279,6 +732,108 @@ class ForLoopLoweringMixin:
         self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
+
+    def _ensure_object_for_target(self, target_ident: str):
+        slot = self.env.get(target_ident)
+        if slot is None or not self._ir_type_matches(slot[1], _CSTR):
+            alloca = self._alloca_in_entry(
+                _CSTR,
+                name=f"{target_ident}.addr",
+            )
+            self.env[target_ident] = (alloca, _CSTR, DynType(name="dyn"))
+            slot = self.env[target_ident]
+        else:
+            self.env[target_ident] = (slot[0], _CSTR, DynType(name="dyn"))
+            slot = self.env[target_ident]
+        self._threading_env_flags.pop(target_ident, None)
+        self._threading_list_elem_flags.pop(target_ident, None)
+        self._clear_cpy_for_target_binding(target_ident)
+        return slot
+
+    def _emit_for_dict_items_direct(self, stmt: For, dict_expr: Expr) -> None:
+        target_names = _for_loop_dict_items_target_names(stmt.target)
+        if target_names is None:
+            raise L1CodegenError("dict.items fast path requires two-name target")
+        key_name, value_name = target_names
+        dict_val = self._emit_expr(dict_expr)
+        if not isinstance(dict_val.type, ir.PointerType):
+            dict_val = marshal.marshal_to_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                dict_val,
+                dict_expr.ty,
+            )
+        n_val = self.builder.call(
+            self.runtime["py_dict_entries_used"],
+            [dict_val],
+            name=self._fresh("for.dict.items.used"),
+        )
+        idx_slot = self._alloca_in_entry(_I64, name="for.dict.items.idx.addr")
+        self.builder.store(ir.Constant(_I64, 0), idx_slot)
+
+        key_slot = self._ensure_object_for_target(key_name)
+        value_slot = self._ensure_object_for_target(value_name)
+
+        fn = self.current_function
+        cond_bb = fn.append_basic_block(name=self._fresh("for.dict.items.cond"))
+        load_bb = fn.append_basic_block(name=self._fresh("for.dict.items.load"))
+        body_bb = fn.append_basic_block(name=self._fresh("for.dict.items.body"))
+        step_bb = fn.append_basic_block(name=self._fresh("for.dict.items.step"))
+        end_bb = fn.append_basic_block(name=self._fresh("for.dict.items.end"))
+        self.builder.branch(cond_bb)
+
+        self.builder.position_at_end(cond_bb)
+        cur = self.builder.load(idx_slot, name=self._fresh("for.dict.items.idx"))
+        cond = self.builder.icmp_signed(
+            "<",
+            cur,
+            n_val,
+            name=self._fresh("for.dict.items.cond.i1"),
+        )
+        self.builder.cbranch(cond, load_bb, end_bb)
+
+        self.builder.position_at_end(load_bb)
+        key_obj = self.builder.call(
+            self.runtime["py_dict_entry_key_at"],
+            [dict_val, cur],
+            name=self._fresh("for.dict.items.key"),
+        )
+        key_is_null = self.builder.icmp_unsigned(
+            "==",
+            key_obj,
+            ir.Constant(_CSTR, None),
+            name=self._fresh("for.dict.items.key.null"),
+        )
+        self.builder.cbranch(key_is_null, step_bb, body_bb)
+
+        self.builder.position_at_end(body_bb)
+        value_obj = self.builder.call(
+            self.runtime["py_dict_entry_value_at"],
+            [dict_val, cur],
+            name=self._fresh("for.dict.items.value"),
+        )
+        self.builder.store(key_obj, key_slot[0])
+        self.builder.store(value_obj, value_slot[0])
+        self.loop_stack.append((step_bb, end_bb, self._loop_finally_base()))
+        self._emit_stmts(stmt.body)
+        self.loop_stack.pop()
+        if not self._builder_block_is_terminated():
+            self.builder.branch(step_bb)
+
+        self.builder.position_at_end(step_bb)
+        cur2 = self.builder.load(idx_slot, name=self._fresh("for.dict.items.idx2"))
+        nxt = self.builder.add(
+            cur2,
+            ir.Constant(_I64, 1),
+            name=self._fresh("for.dict.items.next"),
+        )
+        self.builder.store(nxt, idx_slot)
+        self._emit_thread_safepoint()
+        self.builder.branch(cond_bb)
+
+        self.builder.position_at_end(end_bb)
+
     def _emit_for_obj_index(self, stmt: For, iter_val: ir.Value) -> None:
         """DynType for-loop: iterate by index using ``py_obj_len`` +
         ``py_obj_getitem``. Each iteration binds the target to a
@@ -313,6 +868,7 @@ class ForLoopLoweringMixin:
             )
             self.env[target_ident] = (alloca, _CSTR, DynType(name="dyn"))
             slot = self.env[target_ident]
+        self._clear_cpy_for_target_binding(target_ident)
 
         cond_bb = fn.append_basic_block(name=self._fresh("for.obj.cond"))
         body_bb = fn.append_basic_block(name=self._fresh("for.obj.body"))
@@ -344,7 +900,7 @@ class ForLoopLoweringMixin:
         )
         alloca, _, _ = slot
         self.builder.store(elem, alloca)
-        self.loop_stack.append((step_bb, end_bb))
+        self.loop_stack.append((step_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
         if not self._builder_block_is_terminated():
@@ -362,6 +918,7 @@ class ForLoopLoweringMixin:
         self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
+
     def _emit_for_obj_iterator(self, stmt: For, iter_val: ir.Value) -> None:
         """DynType for-loop through the native iterator protocol."""
         fn = self.current_function
@@ -380,6 +937,7 @@ class ForLoopLoweringMixin:
         )
         self._emit_post_call_err_check(stmt.span)
         iter_slot = None
+        owned_iter_name = None
         if len(self._generator_ctx_stack) > 0:
             hidden = self._generator_for_iter_name(stmt)
             frame_entry = self._generator_ctx_stack[-1]["frame_slots"].get(hidden)
@@ -387,6 +945,39 @@ class ForLoopLoweringMixin:
                 raise L1CodegenError("generator for-loop missing iterator frame slot")
             iter_slot = frame_entry[1]
             self.builder.store(iterator, iter_slot)
+        else:
+            # py_obj_iter returns an owned GC object.  A plain function used
+            # to keep it only in an SSA value, so a tracing step during a
+            # long loop could not prove the iterator live and the loop also
+            # leaked the owned reference at exhaustion.  Give it the same
+            # updateable rooted-local contract as an ordinary object binding.
+            owned_iter_name = self._fresh("for.obj.iter.owner")
+            iter_slot = self._alloca_in_entry(
+                _CSTR,
+                name=self._fresh("for.obj.iter.root"),
+            )
+            self._store_entry_initializer(iter_slot, ir.Constant(_CSTR, None))
+            self.env[owned_iter_name] = (
+                iter_slot,
+                _CSTR,
+                DynType(name="dyn"),
+            )
+            self._ensure_owned_local_gc_root(
+                owned_iter_name,
+                iter_slot,
+                _CSTR,
+            )
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [iter_slot, iterator],
+            )
+            self._owned_local_names.add(owned_iter_name)
+            self._owned_local_has_value.add(owned_iter_name)
+            owned_flag = self._ensure_owned_local_flag(
+                owned_iter_name,
+                iter_slot,
+            )
+            self.builder.store(ir.Constant(_I1, 1), owned_flag)
 
         target_ident = stmt.target.ident
         slot = self.env.get(target_ident)
@@ -394,9 +985,28 @@ class ForLoopLoweringMixin:
             alloca = self._alloca_in_entry(
                 _CSTR,
                 name=f"{target_ident}.addr",
+                init_null=True,
             )
             self.env[target_ident] = (alloca, _CSTR, DynType(name="dyn"))
             slot = self.env[target_ident]
+        self._clear_cpy_for_target_binding(target_ident)
+        target_manages_owned = target_ident not in getattr(
+            self, "_current_param_names", set()
+        ) and target_ident not in getattr(self, "_current_global_names", set())
+        target_owned_flag = None
+        if target_manages_owned:
+            # py_obj_next returns an owned reference.  Treat the for-target
+            # as a normal replaceable owned local: it must be an updateable
+            # frame root while the body allocates, each iteration releases
+            # the previous binding, and function cleanup releases the final
+            # item.  The runtime flag keeps zero-iteration loops safe.
+            self._ensure_owned_local_gc_root(target_ident, slot[0], _CSTR)
+            self._owned_local_names.add(target_ident)
+            self._owned_local_has_value.add(target_ident)
+            target_owned_flag = self._ensure_owned_local_flag(
+                target_ident,
+                slot[0],
+            )
 
         header_bb = fn.append_basic_block(name=self._fresh("for.obj.next"))
         body_bb = fn.append_basic_block(name=self._fresh("for.obj.body"))
@@ -410,8 +1020,9 @@ class ForLoopLoweringMixin:
         self.builder.position_at_end(header_bb)
         iterator_cur = iterator
         if iter_slot is not None:
-            iterator_cur = self.builder.load(
-                iter_slot,
+            iterator_cur = self.builder.call(
+                self.runtime["pcc_gc_load_ptr"],
+                [ir.Constant(_CSTR, None), iter_slot],
                 name=self._fresh("for.obj.iter.cur"),
             )
         item = self.builder.call(
@@ -428,8 +1039,22 @@ class ForLoopLoweringMixin:
         self.builder.cbranch(is_null, maybe_end_bb, body_bb)
 
         self.builder.position_at_end(body_bb)
-        self.builder.store(item, slot[0])
-        self.loop_stack.append((latch_bb, end_bb))
+        if target_manages_owned:
+            # Releasing the prior target can run arbitrary finalization.  Pin
+            # the newly returned owned item until it reaches the rooted slot,
+            # then publish it with the root write barrier.
+            self.builder.call(self.runtime["pcc_gc_pin"], [item])
+            self._emit_release_owned_local_if_flagged(target_ident, slot[0])
+            self.builder.call(
+                self.runtime["pcc_gc_note_write_barrier"],
+                [ir.Constant(_CSTR, None), item],
+            )
+            self.builder.store(item, slot[0])
+            self.builder.store(ir.Constant(_I1, 1), target_owned_flag)
+            self.builder.call(self.runtime["pcc_gc_unpin"], [item])
+        else:
+            self.builder.store(item, slot[0])
+        self.loop_stack.append((latch_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
         if not self._builder_block_is_terminated():
@@ -468,12 +1093,31 @@ class ForLoopLoweringMixin:
         self.builder.branch(end_bb)
 
         self.builder.position_at_end(propagate_bb)
+        if owned_iter_name is not None:
+            self._emit_release_owned_local_if_flagged(
+                owned_iter_name,
+                iter_slot,
+            )
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [iter_slot, ir.Constant(_CSTR, None)],
+            )
         err_target = getattr(self, "_try_err_block", None)
         if err_target is None:
             err_target = self._ensure_fn_err_exit()
         self.builder.branch(err_target)
 
         self.builder.position_at_end(end_bb)
+        if owned_iter_name is not None:
+            self._emit_release_owned_local_if_flagged(
+                owned_iter_name,
+                iter_slot,
+            )
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [iter_slot, ir.Constant(_CSTR, None)],
+            )
+
     def _emit_for_str_chars(self, stmt: For, iter_val: ir.Value) -> None:
         """StrType for-loop: iterate codepoints via ``py_str_slice(s, i, i+1, 1)``.
         Target binds to a 1-char StrType slice each iteration."""
@@ -500,6 +1144,7 @@ class ForLoopLoweringMixin:
             )
             self.env[target_ident] = (alloca, _CSTR, StrType(name="str"))
             slot = self.env[target_ident]
+        self._clear_cpy_for_target_binding(target_ident)
 
         cond_bb = fn.append_basic_block(name=self._fresh("for.str.cond"))
         body_bb = fn.append_basic_block(name=self._fresh("for.str.body"))
@@ -540,7 +1185,7 @@ class ForLoopLoweringMixin:
         )
         alloca, _, _ = slot
         self.builder.store(ch, alloca)
-        self.loop_stack.append((step_bb, end_bb))
+        self.loop_stack.append((step_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
         if not self._builder_block_is_terminated():
@@ -558,6 +1203,7 @@ class ForLoopLoweringMixin:
         self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
+
     def _emit_for_native_iterator(
         self,
         stmt: For,
@@ -588,6 +1234,19 @@ class ForLoopLoweringMixin:
         if next_info is None:
             return self._emit_for_obj_index(stmt, iterator)
         next_fn = next_info.methods["__next__"]
+        # Inside a generator the iterator must live in the persisted
+        # frame slot (same idiom as _emit_for_obj_iterator): the raw SSA
+        # value does not dominate the loop header once the generator
+        # transform splits the body at yields, and the suspended frame
+        # must keep the iterator GC-visible across resumes.
+        iter_slot = None
+        if len(self._generator_ctx_stack) > 0:
+            hidden = self._generator_for_iter_name(stmt)
+            frame_entry = self._generator_ctx_stack[-1]["frame_slots"].get(hidden)
+            if frame_entry is None:
+                raise L1CodegenError("generator for-loop missing iterator frame slot")
+            iter_slot = frame_entry[1]
+            self.builder.store(iterator, iter_slot)
         next_fd = self.class_lowering._find_method_def(
             next_info.name,
             "__next__",
@@ -610,6 +1269,7 @@ class ForLoopLoweringMixin:
             )
             self.env[target_ident] = (alloca, target_ir_ty, target_ty)
             slot = self.env[target_ident]
+        self._clear_cpy_for_target_binding(target_ident)
 
         fn = self.current_function
         header_bb = fn.append_basic_block(name=self._fresh("for.iter.header"))
@@ -620,11 +1280,17 @@ class ForLoopLoweringMixin:
 
         self.builder.branch(header_bb)
         self.builder.position_at_end(header_bb)
+        iterator_cur = iterator
+        if iter_slot is not None:
+            iterator_cur = self.builder.load(
+                iter_slot,
+                name=self._fresh("for.iter.cur"),
+            )
         prev_err_block = getattr(self, "_try_err_block", None)
         self._try_err_block = err_bb
         item = self._emit_direct_method_call(
             next_fn,
-            iterator,
+            iterator_cur,
             next_info,
             "__next__",
             (),
@@ -636,7 +1302,7 @@ class ForLoopLoweringMixin:
         self.builder.branch(body_bb)
 
         self.builder.position_at_end(body_bb)
-        self.loop_stack.append((latch_bb, after_bb))
+        self.loop_stack.append((latch_bb, after_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
         if not self._builder_block_is_terminated():
@@ -679,6 +1345,7 @@ class ForLoopLoweringMixin:
         self.builder.branch(outer)
 
         self.builder.position_at_end(after_bb)
+
     def _emit_async_for(self, stmt: For) -> None:
         if isinstance(stmt.target, TupleExpr):
             stmt = self._normalise_for_tuple_target(stmt)
@@ -731,6 +1398,7 @@ class ForLoopLoweringMixin:
             )
             self.env[target_ident] = (alloca, _CSTR, DynType(name="dyn"))
             slot = self.env[target_ident]
+        self._clear_cpy_for_target_binding(target_ident)
 
         fn = self.current_function
         header_bb = fn.append_basic_block(name=self._fresh("async.for.next"))
@@ -763,7 +1431,7 @@ class ForLoopLoweringMixin:
 
         self.builder.position_at_end(body_bb)
         self.builder.store(item, slot[0])
-        self.loop_stack.append((latch_bb, end_bb))
+        self.loop_stack.append((latch_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
         if not self._builder_block_is_terminated():
@@ -806,6 +1474,7 @@ class ForLoopLoweringMixin:
         self.builder.branch(outer)
 
         self.builder.position_at_end(end_bb)
+
     def _emit_for(self, stmt: For) -> None:
         if stmt.else_body:
             # Desugar for-else into a flag-guarded post-loop if:
@@ -941,6 +1610,17 @@ class ForLoopLoweringMixin:
         # enough for stdlib-style usage).
         if self._for_iter_is_zip(stmt):
             stmt = self._normalise_for_zip(stmt)
+        # ``for k, v in d.items():`` can walk pcc-native dict entries
+        # directly. The normal pcc-native ``.items()`` path materialises a
+        # list of 2-tuples via py_dict_items(); this avoids that allocation
+        # while keeping target names typed as DynType PyObject* values.
+        dict_items_obj = _for_loop_dict_items_object(stmt.iter)
+        if (
+            dict_items_obj is not None
+            and _for_loop_dict_items_target_names(stmt.target) is not None
+            and len(self._generator_ctx_stack) == 0
+        ):
+            return self._emit_for_dict_items_direct(stmt, dict_items_obj)
         # ``for (a, b) in items:`` — normalise by introducing a fresh
         # scalar target and prepending an unpack assign to the loop body.
         if _for_loop_is_tuple_expr(stmt.target):
@@ -973,7 +1653,7 @@ class ForLoopLoweringMixin:
                 return self._emit_for_cpython_iter(stmt, iter_val)
             if len(self._generator_ctx_stack) > 0 and isinstance(
                 stmt.iter.ty,
-                (ListType, TupleType, DictType, StrType, DynType),
+                (ListType, TupleType, DictType, SetType, StrType, DynType),
             ):
                 return self._emit_for_obj_iterator(stmt, iter_val)
             # ListType / TupleType iteration via index: length from
@@ -1097,6 +1777,7 @@ class ForLoopLoweringMixin:
                         _I64,
                         IntType(name="int"),
                     )
+        self._clear_cpy_for_target_binding(target_name)
         self.builder.store(start_val, counter_alloca)
 
         fn = self.current_function
@@ -1128,7 +1809,7 @@ class ForLoopLoweringMixin:
         )
         self.builder.cbranch(cond_i1, body_bb, end_bb)
 
-        self.loop_stack.append((step_bb, end_bb))
+        self.loop_stack.append((step_bb, end_bb, self._loop_finally_base()))
         self.builder.position_at_end(body_bb)
         if boxed_range_target:
             cur_body = self.builder.load(
@@ -1155,6 +1836,7 @@ class ForLoopLoweringMixin:
         self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
+
     def _emit_range_loop(
         self,
         target: Name,
@@ -1258,6 +1940,7 @@ class ForLoopLoweringMixin:
         self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
+
     def _emit_cpy_iter_loop(
         self,
         target: Name,

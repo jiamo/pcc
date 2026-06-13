@@ -64,26 +64,114 @@ class NativeOsLoweringMixin:
     def _emit_native_os_environ_subscript(self,
         expr: Subscript,
     ) -> Optional[ir.Value]:
-        """Lower ``os.environ[key]`` to ``py_os_getenv`` with a ``None``
-        fallback.
+        """Lower ``os.environ[key]`` to ``py_os_environ_getitem``.
 
-        ``os.environ`` is treated as an environment dictionary in CPython
-        but, for now, lowering to ``py_os_getenv`` keeps this access path
-        native and avoids ``py_cpy_*`` contagion for bootstrap-style builds.
+        CPython mapping semantics: a missing variable raises KeyError
+        (carrying the key) and a non-str key raises TypeError, so the
+        runtime helper raises instead of returning a ``None`` fallback.
+        ``os.environ.get`` / ``os.getenv`` keep the non-raising
+        ``py_os_getenv`` path.
         """
         if isinstance(expr.idx, Slice):
             return None
         if not self._is_os_environ_attr(expr.obj):
             return None
-        return self.builder.call(
-            self.runtime["py_os_getenv"],
-            [self._emit_as_object(expr.idx), self._emit_none_literal()],
+        item = self.builder.call(
+            self.runtime["py_os_environ_getitem"],
+            [self._emit_as_object(expr.idx)],
             name=self._fresh("os.environ.getitem"),
         )
+        # py_os_environ_getitem raises KeyError/TypeError; branch to the
+        # surrounding try handler (or the fn err exit) when it did.
+        self._emit_post_call_err_check(getattr(expr, "span", None))
+        return item
+
+    def _emit_native_os_environ_setitem_store(
+        self,
+        target: Subscript,
+        value_expr: Expr,
+    ) -> bool:
+        """Store hook for ``os.environ[key] = value`` statements.
+
+        Lowers to ``py_os_environ_setitem`` (str-only key/value with
+        TypeError otherwise, setenv-backed store — CPython's putenv-
+        backed ``__setitem__``). Returns True when handled natively.
+        """
+        if isinstance(target.idx, Slice):
+            return False
+        if not self._is_os_environ_attr(target.obj):
+            return False
+        v_obj = self._emit_expr_as_pcc_object(value_expr)
+        self.builder.call(
+            self.runtime["py_os_environ_setitem"],
+            [self._emit_as_object(target.idx), v_obj],
+            name=self._fresh("os.environ.setitem"),
+        )
+        self._emit_post_call_err_check(getattr(target, "span", None))
+        self._gc_release_if_owned(v_obj, value_expr)
+        return True
+
+    def _emit_native_os_environ_setitem_value(
+        self,
+        target: Subscript,
+        value: ir.Value,
+        value_ty,
+        *,
+        release_value: bool = False,
+    ) -> bool:
+        """Store hook for ``os.environ[key] = <pre-computed value>``
+        (tuple-unpack targets). Mirrors the release discipline of
+        ``_store_value_at_subscript``. Returns True when handled."""
+        if isinstance(target.idx, Slice):
+            return False
+        if not self._is_os_environ_attr(target.obj):
+            return False
+        v_obj = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            value,
+            value_ty,
+        )
+        self.builder.call(
+            self.runtime["py_os_environ_setitem"],
+            [self._emit_as_object(target.idx), v_obj],
+            name=self._fresh("os.environ.setitem"),
+        )
+        self._emit_post_call_err_check(getattr(target, "span", None))
+        if release_value and isinstance(v_obj.type, ir.PointerType):
+            if v_obj not in getattr(self, "_cpy_values", ()):
+                self._gc_release(v_obj)
+        return True
 
     def _emit_native_os_call(self, expr: Call) -> Optional[ir.Value]:
         attr = expr.func
         assert isinstance(attr, Attr)
+        if (
+            isinstance(attr.obj, Name)
+            and self._native_builtin_module_for_name(attr.obj.ident) == "os"
+            and attr.name == "makedirs"
+            and len(expr.args) == 1
+        ):
+            exist_ok = ir.Constant(_I32, 0)
+            if expr.kwargs:
+                if len(expr.kwargs) != 1 or expr.kwargs[0][0] != "exist_ok":
+                    return None
+                value_expr = expr.kwargs[0][1]
+                raw = self._emit_expr(value_expr)
+                truthy = self._truthy(raw, value_expr.ty)
+                exist_ok = self.builder.zext(
+                    truthy,
+                    _I32,
+                    name=self._fresh("os.makedirs.exist_ok"),
+                )
+            result = self.builder.call(
+                self.runtime["py_os_makedirs"],
+                [self._emit_as_object(expr.args[0]), exist_ok],
+                name=self._fresh("os.makedirs"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
         if expr.kwargs:
             return None
         if (
@@ -136,6 +224,14 @@ class NativeOsLoweringMixin:
                 [],
                 name=self._fresh("os.cpu_count"),
             )
+        if name == "uname" and len(expr.args) == 0:
+            result = self.builder.call(
+                self.runtime["py_os_uname"],
+                [],
+                name=self._fresh("os.uname"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
         if name == "listdir" and len(expr.args) == 1:
             return self.builder.call(
                 self.runtime["py_os_listdir"],
@@ -190,6 +286,47 @@ class NativeOsLoweringMixin:
                 name=self._fresh("os.pcc_http_download_to_file"),
             )
         return None
+
+    def _emit_native_os_uname_attr(self, expr: Attr) -> Optional[ir.Value]:
+        """Lower direct ``os.uname().<field>`` access.
+
+        ``py_os_uname`` returns the correct five-field sequence for unpacking;
+        this preserves the named-result access used by platform/bootstrap code
+        without routing the result through libpython.
+        """
+        call = expr.obj
+        if not isinstance(call, Call) or call.args or call.kwargs:
+            return None
+        func = call.func
+        if (
+            not isinstance(func, Attr)
+            or func.name != "uname"
+            or not isinstance(func.obj, Name)
+            or self._native_builtin_module_for_name(func.obj.ident) != "os"
+        ):
+            return None
+        field_index = {
+            "sysname": 0,
+            "nodename": 1,
+            "release": 2,
+            "version": 3,
+            "machine": 4,
+        }.get(expr.name)
+        if field_index is None:
+            return None
+        result = self.builder.call(
+            self.runtime["py_os_uname"],
+            [],
+            name=self._fresh("os.uname.attr.result"),
+        )
+        self._emit_post_call_err_check(getattr(expr, "span", None))
+        field = self.builder.call(
+            self.runtime["py_tuple_get"],
+            [result, ir.Constant(_I64, field_index)],
+            name=self._fresh(f"os.uname.{expr.name}"),
+        )
+        self._gc_release(result)
+        return field
 
     def _emit_native_platform_call(self, expr: Call) -> Optional[ir.Value]:
         attr = expr.func

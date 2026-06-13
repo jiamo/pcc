@@ -66,6 +66,7 @@ from ..py_ast import (
     Arg,
     Assign,
     Attr,
+    AugAssign,
     BinOp,
     BoolExpr,
     BoolLit,
@@ -99,6 +100,7 @@ from ..py_ast import (
     Name,
     NoneLit,
     NoneType,
+    SetType,
     Pass,
     Return,
     SourceSpan,
@@ -113,8 +115,9 @@ from ..py_ast import (
     With,
 )
 from ..py_ast_contract import PY_AST_FIELD_NAME_OVERRIDES
-from .host_contract import L1_CODEGEN_HOST_ATTRS
 from . import marshal
+from .builtin_exceptions import builtin_exc_tag_or_missing
+from .host_contract import L1_CODEGEN_HOST_ATTRS
 from .runtime_abi import declare_runtime_global
 
 _I1 = ir.IntType(1)
@@ -128,6 +131,50 @@ _PTR = _I8.as_pointer()  # also i8* (opaque)
 _METACLASS_CONFLICT = "__pcc_metaclass_conflict__"
 _NO_METACLASS_RETURN = "__pcc_no_metaclass_return__"
 _AMBIGUOUS_METACLASS_RETURN = "__pcc_ambiguous_metaclass_return__"
+_NATIVE_DEFAULT_FUNC_SENTINEL = "__pcc_native_default_func_ref__"
+_NATIVE_DEFAULT_GLOBAL_SENTINEL = "__pcc_native_default_global_ref__"
+
+
+def _classgen_extern_default_expr(arg: dict, span: SourceSpan):
+    ref = arg.get("default_native_func")
+    if isinstance(ref, dict):
+        owning_module = ref.get("owning_module")
+        name = ref.get("name")
+        if owning_module and name:
+            return Call(
+                span=span,
+                ty=DynType(name="dyn"),
+                func=Name(span, DynType(name="dyn"), _NATIVE_DEFAULT_FUNC_SENTINEL),
+                args=(
+                    StrLit(span, StrType(name="str"), str(owning_module)),
+                    StrLit(span, StrType(name="str"), str(name)),
+                ),
+                kwargs=(),
+            )
+    gref = arg.get("default_native_global")
+    if isinstance(gref, dict):
+        owning_module = gref.get("owning_module")
+        name = gref.get("name")
+        if owning_module and name:
+            default_expr = Call(
+                span=span,
+                ty=DynType(name="dyn"),
+                func=Name(span, DynType(name="dyn"), _NATIVE_DEFAULT_GLOBAL_SENTINEL),
+                args=(
+                    StrLit(span, StrType(name="str"), str(owning_module)),
+                    StrLit(span, StrType(name="str"), str(name)),
+                ),
+                kwargs=(),
+            )
+            for attr_name in gref.get("attrs", ()):
+                default_expr = Attr(
+                    span=span,
+                    ty=DynType(name="dyn"),
+                    obj=default_expr,
+                    name=str(attr_name),
+                )
+            return default_expr
+    return arg.get("default")
 
 
 def _classgen_extern_field_names(
@@ -222,7 +269,7 @@ def _extern_class_decl_plan(
                     _Arg(
                         name=arg["name"],
                         annotation=decode_type(arg.get("annotation")),
-                        default=arg.get("default"),
+                        default=_classgen_extern_default_expr(arg, span),
                         kind=arg.get("kind", "pos"),
                         has_default=arg.get(
                             "has_default",
@@ -250,6 +297,7 @@ def _extern_class_decl_plan(
             return_ty=return_ty,
             body=(),
             decorators=(),
+            is_async=bool(mdesc.get("is_async", False)),
         )
         decoded_param_types = []
         for raw_ty in mdesc["param_types"]:
@@ -366,6 +414,39 @@ def _classgen_valueclass_payload_ir_type(ty: Type) -> Optional[ir.Type]:
                 field_ir_types[3],
             )
         )
+    if n_fields == 5:
+        return ir.LiteralStructType(
+            (
+                field_ir_types[0],
+                field_ir_types[1],
+                field_ir_types[2],
+                field_ir_types[3],
+                field_ir_types[4],
+            )
+        )
+    if n_fields == 6:
+        return ir.LiteralStructType(
+            (
+                field_ir_types[0],
+                field_ir_types[1],
+                field_ir_types[2],
+                field_ir_types[3],
+                field_ir_types[4],
+                field_ir_types[5],
+            )
+        )
+    if n_fields == 7:
+        return ir.LiteralStructType(
+            (
+                field_ir_types[0],
+                field_ir_types[1],
+                field_ir_types[2],
+                field_ir_types[3],
+                field_ir_types[4],
+                field_ir_types[5],
+                field_ir_types[6],
+            )
+        )
     return None
 
 
@@ -377,7 +458,7 @@ def _classgen_valueclass_field_payload_ir_type(field_ty: Type) -> Optional[ir.Ty
     if _is_ast_node(field_ty, BoolType):
         return _I1
     if _is_ast_node(field_ty, ClassType) and getattr(field_ty, "valueclass", False):
-        return None
+        return _classgen_valueclass_payload_ir_type(field_ty)
     if _is_ast_node(
         field_ty,
         (
@@ -386,6 +467,7 @@ def _classgen_valueclass_field_payload_ir_type(field_ty: Type) -> Optional[ir.Ty
             ByteArrayType,
             MemoryViewType,
             ListType,
+            SetType,
             DictType,
             TupleType,
             ClassType,
@@ -903,26 +985,33 @@ def _classgen_emit_dynamic_attr_value(
 
 
 def _classgen_attr_name_ptr(parent, name: str) -> ir.Value:
-    existing = parent._attr_pool.get(name)
+    stable_name: str = name
+    attr_pool: dict[str, ir.GlobalVariable] = parent._attr_pool
+    module: ir.Module = parent.module
+    existing = attr_pool.get(stable_name)
     if existing is None:
-        data = _classgen_utf8_byte_values(name) + [0]
+        data = _classgen_utf8_byte_values(stable_name) + [0]
         arr_ty = ir.ArrayType(_I8, len(data))
-        sym = ".pyattr." + str(name)
-        if sym in parent.module.globals:
-            sym = ".pyattr." + str(name) + "." + str(len(parent._attr_pool))
-        gv = ir.GlobalVariable(parent.module, arr_ty, name=sym)
+        sym = ".pyattr." + stable_name
+        if sym in module.globals:
+            sym = ".pyattr." + stable_name + "." + str(len(attr_pool))
+        gv = ir.GlobalVariable(module, arr_ty, name=sym)
         gv.linkage = "internal"
         gv.global_constant = True
         gv.initializer = ir.Constant(arr_ty, data)
-        parent._attr_pool[name] = gv
+        attr_pool[stable_name] = gv
         existing = gv
+        name_text = sym
+    else:
+        typed_existing: ir.GlobalVariable = existing
+        name_text = typed_existing.name
     expr = (
         "getelementptr inbounds ("
         + str(existing.value_type)
         + ", "
         + str(existing.type)
         + " @"
-        + str(existing.name)
+        + name_text
         + ", i32 0, i32 0)"
     )
     return ir.Value(ir.PointerType(_I8), expr)
@@ -1467,11 +1556,13 @@ def _classgen_recover_method_call_arg(
             if recovered is not None:
                 value = recovered
     value_ty = _classgen_value_type_or_none(value)
-    expected_is_object = (
-        expected_ir_ty is not None and _classgen_ir_type_is_pointer(expected_ir_ty)
+    expected_is_object = expected_ir_ty is not None and _classgen_ir_type_is_pointer(
+        expected_ir_ty
     )
-    if expected_is_object and value_ty is not None and not _classgen_ir_type_is_pointer(
-        value_ty
+    if (
+        expected_is_object
+        and value_ty is not None
+        and not _classgen_ir_type_is_pointer(value_ty)
     ):
         value = marshal.marshal_to_object(
             parent.builder,
@@ -1518,9 +1609,7 @@ def _classgen_recover_self_method_call_value(
     if self_val is None:
         return None
     method_ast = classgen._find_method_def(info.name, method_name)
-    declared = [
-        a for a in (method_ast.args[1:] if method_ast else ()) if a.name != ""
-    ]
+    declared = [a for a in (method_ast.args[1:] if method_ast else ()) if a.name != ""]
     call_args = [self_val]
     fn_args = getattr(method_fn, "args", ())
     expr_args = getattr(expr, "args", ())
@@ -1687,81 +1776,15 @@ class ClassLoweringError(Exception):
 def _builtin_exception_tag_for_base_name(name: str) -> Optional[int]:
     """Return the pcc builtin-exception tag for a class base name.
 
-    This lives in class_gen instead of reading L1CodeGen._BUILTIN_EXC_TAG
-    through getattr(parent, ...): the self-hosted runtime does not yet expose
-    Python class attributes through instance getattr, and losing this base
-    breaks ``except Exception`` for user-defined exception subclasses.
+    This calls the shared codegen metadata module instead of reading through
+    getattr(parent, ...): the self-hosted runtime does not yet expose Python
+    class attributes through instance getattr, and losing this base breaks
+    ``except Exception`` for user-defined exception subclasses.
     """
 
-    if name == "BaseException":
-        return 0
-    if name == "Exception":
-        return 1
-    if name == "ValueError":
-        return 2
-    if name == "TypeError":
-        return 3
-    if name == "KeyError":
-        return 4
-    if name == "IndexError":
-        return 5
-    if name == "AttributeError":
-        return 6
-    if name == "SyntaxError":
-        return 1
-    if name == "RuntimeError":
-        return 7
-    if name == "StopIteration":
-        return 8
-    if name == "ZeroDivisionError":
-        return 9
-    if name == "NameError":
-        return 10
-    if name == "NotImplementedError":
-        return 11
-    if name == "ArithmeticError":
-        return 12
-    if name == "LookupError":
-        return 13
-    if name == "OSError" or name == "IOError":
-        return 14
-    if name == "OverflowError":
-        return 15
-    if name == "AssertionError":
-        return 16
-    if name == "StopAsyncIteration":
-        return 17
-    if name == "ReferenceError":
-        return 18
-    if (
-        name == "FileNotFoundError"
-        or name == "FileExistsError"
-        or name == "IsADirectoryError"
-        or name == "NotADirectoryError"
-        or name == "PermissionError"
-        or name == "BrokenPipeError"
-        or name == "ConnectionError"
-        or name == "ConnectionAbortedError"
-        or name == "ConnectionRefusedError"
-        or name == "ConnectionResetError"
-        or name == "BlockingIOError"
-        or name == "ChildProcessError"
-        or name == "InterruptedError"
-        or name == "TimeoutError"
-    ):
-        return 14
-    if (
-        name == "UnicodeError"
-        or name == "UnicodeDecodeError"
-        or name == "UnicodeEncodeError"
-    ):
-        return 2
-    if name == "RecursionError":
-        return 7
-    if name == "ImportError" or name == "ModuleNotFoundError" or name == "EOFError":
-        return 1
-    if name == "SystemExit" or name == "KeyboardInterrupt" or name == "GeneratorExit":
-        return 0
+    tag = builtin_exc_tag_or_missing(name)
+    if tag >= 0:
+        return tag
     return None
 
 
@@ -1843,10 +1866,12 @@ class ClassInfo:
         self.global_var = global_var
         self.bases_ast = bases_ast
         self.field_names: list[str] = []
+        self.field_types: dict[str, Type] = {}
         self.owning_module: Optional[str] = None
         self.export_class_name: Optional[str] = name
         self.class_attrs: dict[str, tuple[ir.GlobalVariable, Type]] = {}
         self.class_attr_values: dict[str, Expr] = {}
+        self.class_attr_initializers: list[tuple[str, Expr]] = []
         self.methods: dict[str, ir.Function] = {}
         self.method_defs: list[tuple[str, FuncDef]] = []
         self.init_fn: Optional[ir.Function] = None
@@ -1881,7 +1906,9 @@ class ClassInfo:
         # attributes are not reliable in the native object layout.
         self.extern_method_defs: dict[str, FuncDef] = {}
         self.enum_members: dict[str, int] = {}
+        self.enum_string_members: dict[str, str] = {}
         self.protocol_members: list[str] = []
+        self.runtime_decorators: tuple[Expr, ...] = ()
         self.metaclass_name: Optional[str] = None
         self.slots_only = False
         self.dataclass_frozen = False
@@ -1930,29 +1957,40 @@ class ClassLowering:
         if cd.name in self.classes:
             raise ClassLoweringError(f"duplicate class definition for {cd.name!r}")
         # ``@dataclass`` is supported by synthesizing ``__init__`` /
-        # ``__repr__`` / ``__eq__`` into the class body. Other class
-        # decorators remain unsupported for now.
+        # ``__repr__`` / ``__eq__`` into the class body. Native unary
+        # decorators are applied to the completed class object at module-init
+        # time; compile-time/no-op decorators remain stripped here.
         valueclass = _class_has_valueclass_decorator(cd)
         dataclass_options = _dataclass_options(cd)
         if valueclass:
             dataclass_options["frozen"] = True
         original_cd = cd
+        runtime_decorators: list[Expr] = []
+        for dec in original_cd.decorators:
+            dname = _simple_decorator_name(dec)
+            if (
+                self._class_decorator_is_noop(dec)
+                or _is_dataclass_decorator_name(dname)
+                or _is_valueclass_decorator_name(dname)
+            ):
+                continue
+            if _is_ast_node(dec, Name):
+                runtime_decorators.append(dec)
+                continue
+            raise NotImplementedError(
+                f"Layer 1 does not handle class decorator expression " f"on {cd.name!r}"
+            )
         cd = self._maybe_expand_dataclass(cd)
         expanded = cd is not original_cd
         if cd.decorators:
-            if all(self._class_decorator_is_noop(dec) for dec in cd.decorators):
-                cd = ClassDef(
-                    span=cd.span,
-                    name=cd.name,
-                    bases=cd.bases,
-                    keywords=cd.keywords,
-                    decorators=(),
-                    body=cd.body,
-                )
-            else:
-                raise NotImplementedError(
-                    f"Layer 1 does not handle class decorators on {cd.name!r}"
-                )
+            cd = ClassDef(
+                span=cd.span,
+                name=cd.name,
+                bases=cd.bases,
+                keywords=cd.keywords,
+                decorators=(),
+                body=cd.body,
+            )
         if cd.keywords and any(
             not self._class_keyword_is_noop(cd, k) for k, _ in cd.keywords
         ):
@@ -2004,6 +2042,7 @@ class ClassLowering:
                 fields_ordered[pf] = True
 
         info = ClassInfo(name=cd.name, global_var=gv, bases_ast=cd.bases)
+        info.runtime_decorators = tuple(runtime_decorators)
         info.metaclass_name = self._resolve_metaclass_name_for_class(cd)
         info.dataclass_frozen = bool(dataclass_options.get("frozen", False))
         info.valueclass = valueclass
@@ -2038,17 +2077,12 @@ class ClassLowering:
                 return self._resolve_metaclass_expr_name(cd, value)
         return self._resolve_metaclass_name_from_bases(cd)
 
-    def _resolve_metaclass_expr_name(
-        self, cd: ClassDef, value: Expr
-    ) -> Optional[str]:
+    def _resolve_metaclass_expr_name(self, cd: ClassDef, value: Expr) -> Optional[str]:
         if _is_ast_node(value, Name):
             if value.ident in self.classes:
                 return value.ident
             return self._resolve_module_class_alias_before(value.ident, cd)
-        if (
-            _is_ast_node(value, Call)
-            and _is_ast_node(value.func, Name)
-        ):
+        if _is_ast_node(value, Call) and _is_ast_node(value.func, Name):
             return self._resolve_function_returning_class_name_before(
                 value.func.ident,
                 cd,
@@ -2081,10 +2115,7 @@ class ClassLowering:
             return True
         if _is_ast_node(value, BoolLit):
             return getattr(value, "value", True) == False
-        if (
-            _is_ast_node(value, Call)
-            and _is_ast_node(value.func, Name)
-        ):
+        if _is_ast_node(value, Call) and _is_ast_node(value.func, Name):
             return self._resolve_function_returning_falsey_before(
                 value.func.ident,
                 cd,
@@ -2093,10 +2124,9 @@ class ClassLowering:
             if value.op == "and":
                 return self._resolve_metaclass_expr_is_falsey(cd, value.left)
             if value.op == "or":
-                return (
-                    self._resolve_metaclass_expr_is_falsey(cd, value.left)
-                    and self._resolve_metaclass_expr_is_falsey(cd, value.right)
-                )
+                return self._resolve_metaclass_expr_is_falsey(
+                    cd, value.left
+                ) and self._resolve_metaclass_expr_is_falsey(cd, value.right)
         return False
 
     def _resolve_function_returning_falsey_before(
@@ -2141,10 +2171,7 @@ class ClassLowering:
                 stmt.body,
                 before_cd,
             )
-            if (
-                name == _NO_METACLASS_RETURN
-                or name == _AMBIGUOUS_METACLASS_RETURN
-            ):
+            if name == _NO_METACLASS_RETURN or name == _AMBIGUOUS_METACLASS_RETURN:
                 return None
             return name
         return None
@@ -2532,7 +2559,8 @@ class ClassLowering:
                 )
             )
         user_has_post_init = any(
-            _is_ast_node(s, FuncDef) and s.name == "__post_init__" for s in remaining_body
+            _is_ast_node(s, FuncDef) and s.name == "__post_init__"
+            for s in remaining_body
         )
         if user_has_post_init:
             init_stmts.append(
@@ -2731,10 +2759,81 @@ class ClassLowering:
             if _is_ast_node(stmt, Pass):
                 continue
             if _is_ast_node(stmt, Assign):
+                alias_source = None
+                property_fget_alias = False
+                alias_targets: list[Name] = []
+                if _is_ast_node(stmt.value, Name) and stmt.value.ident in info.methods:
+                    alias_source = stmt.value.ident
+                    for target in stmt.targets:
+                        if _is_ast_node(target, Name):
+                            alias_targets.append(target)
+                        else:
+                            alias_source = None
+                            break
+                elif (
+                    _is_ast_node(stmt.value, Attr)
+                    and stmt.value.name == "fget"
+                    and _is_ast_node(stmt.value.obj, Name)
+                    and info.method_kinds.get(stmt.value.obj.ident) == "property_getter"
+                ):
+                    alias_source = stmt.value.obj.ident
+                    property_fget_alias = True
+                    for target in stmt.targets:
+                        if _is_ast_node(target, Name):
+                            alias_targets.append(target)
+                        else:
+                            alias_source = None
+                            break
+                elif self._is_walrus_sentinel(stmt.value):
+                    chain_target, final_value = stmt.value.args
+                    if (
+                        _is_ast_node(final_value, Name)
+                        and final_value.ident in info.methods
+                    ):
+                        alias_source = final_value.ident
+                        for target in stmt.targets:
+                            if _is_ast_node(target, Name):
+                                alias_targets.append(target)
+                            else:
+                                alias_source = None
+                                break
+                        if alias_source is not None:
+                            alias_targets.extend(
+                                self._collect_chained_assignment_targets(chain_target)
+                            )
+                if alias_source is not None:
+                    for target in alias_targets:
+                        self._declare_method_alias(info, target.ident, alias_source)
+                        if property_fget_alias:
+                            info.method_kinds[target.ident] = "instance"
+                    continue
                 # Class-level assignments are class attributes. Instance
                 # fields come from dataclass expansion or ``self.x`` writes.
                 for t in stmt.targets:
+                    unpack_pairs = self._class_attr_unpack_pairs(t, stmt.value)
+                    if unpack_pairs is not None:
+                        for attr_name, attr_value in unpack_pairs:
+                            self._declare_class_attr(info, attr_name, attr_value)
+                        continue
                     if _is_ast_node(t, Name):
+                        if (
+                            _is_ast_node(stmt.value, Name)
+                            and stmt.value.ident in info.methods
+                        ):
+                            src_name = stmt.value.ident
+                            info.methods[t.ident] = info.methods[src_name]
+                            src_ref = info.method_refs.get(src_name)
+                            if src_ref is not None:
+                                info.method_refs[t.ident] = src_ref
+                            info.method_kinds[t.ident] = info.method_kinds.get(
+                                src_name,
+                                "instance",
+                            )
+                            for method_name, method_def in reversed(info.method_defs):
+                                if method_name == src_name:
+                                    info.method_defs.append((t.ident, method_def))
+                                    break
+                            continue
                         if t.ident == "__slots__":
                             self._declare_slots(info, stmt.value)
                         if enum_like and not t.ident.startswith("_"):
@@ -2744,7 +2843,14 @@ class ClassLowering:
                             )
                             if enum_value is not None:
                                 info.enum_members[t.ident] = enum_value
-                                next_enum_value = enum_value + 1
+                                next_enum_value = max(
+                                    next_enum_value,
+                                    enum_value + 1,
+                                )
+                            elif _is_ast_node(stmt.value, StrLit):
+                                info.enum_string_members[t.ident] = str(
+                                    stmt.value.value
+                                )
                         if (
                             protocol_like
                             and _classgen_annotation_or_none(stmt) is not None
@@ -2769,28 +2875,13 @@ class ClassLowering:
                     if _is_ast_node(target, Name):
                         info.class_attrs.pop(target.ident, None)
                         info.class_attr_values.pop(target.ident, None)
+                        self._remove_class_attr_initializers(info, target.ident)
                 continue
             if _is_ast_node(stmt, FuncDef):
                 self._declare_method(cd, stmt, info)
                 if self._func_is_abstract(stmt):
                     abstract_methods.append(stmt.name)
-                # Scan direct ``self.field = ...`` assignments in all
-                # methods. Python permits fields to first appear outside
-                # ``__init__`` (for example iterator state in __iter__).
-                for s in stmt.body:
-                    if _is_ast_node(s, Assign):
-                        for target in s.targets:
-                            if (
-                                _is_ast_node(target, Attr)
-                                and _is_ast_node(target.obj, Name)
-                                and target.obj.ident == "self"
-                            ):
-                                field_name = _mangle_private_name(
-                                    cd.name,
-                                    target.name,
-                                )
-                                if field_name not in info.field_names:
-                                    info.field_names.append(field_name)
+                self._collect_method_instance_fields(cd, stmt, info)
                 continue
             # Ignore anything else (nested classes etc.) until a later
             # phase picks them up.
@@ -2811,9 +2902,69 @@ class ClassLowering:
             )
             self._declare_class_attr(info, "__abstractmethods__", abstract_expr)
 
+    def _collect_method_instance_fields(
+        self,
+        cd: ClassDef,
+        fd: FuncDef,
+        info: ClassInfo,
+    ) -> None:
+        """Discover ``self`` writes across control flow and unpack targets."""
+
+        def add_target(target, value_expr) -> None:
+            if _is_ast_node(target, (TupleExpr, ListExpr)):
+                for elem in target.elems:
+                    add_target(elem, value_expr)
+                return
+            if not (
+                _is_ast_node(target, Attr)
+                and _is_ast_node(target.obj, Name)
+                and target.obj.ident == "self"
+            ):
+                return
+            field_name = _mangle_private_name(cd.name, target.name)
+            if field_name not in info.field_names:
+                info.field_names.append(field_name)
+            field_ty = getattr(target, "ty", None)
+            if field_ty is None or _is_ast_node(field_ty, DynType):
+                field_ty = getattr(value_expr, "ty", None)
+            if field_ty is not None:
+                info.field_types[field_name] = field_ty
+
+        pending = list(reversed(fd.body))
+        while pending:
+            stmt = pending.pop()
+            if _is_ast_node(stmt, Assign):
+                for target in stmt.targets:
+                    add_target(target, stmt.value)
+                continue
+            if _is_ast_node(stmt, AugAssign):
+                add_target(stmt.target, stmt.value)
+                continue
+            if _is_ast_node(stmt, (If, While, For)):
+                pending.extend(reversed(stmt.else_body))
+                pending.extend(reversed(stmt.body))
+                continue
+            if _is_ast_node(stmt, With):
+                pending.extend(reversed(stmt.body))
+                continue
+            if _is_ast_node(stmt, Try):
+                pending.extend(reversed(stmt.finally_body))
+                pending.extend(reversed(stmt.else_body))
+                for handler in reversed(stmt.handlers):
+                    pending.extend(reversed(handler.body))
+                pending.extend(reversed(stmt.body))
+
     def _is_enum_like_class(self, cd: ClassDef) -> bool:
         for base in cd.bases:
             if _is_ast_node(base, Name) and base.ident in ("Enum", "IntEnum"):
+                return True
+            if (
+                _is_ast_node(base, Attr)
+                and base.name in ("Enum", "IntEnum")
+                and _is_ast_node(base.obj, Name)
+                and self.parent._native_builtin_module_for_name(base.obj.ident)
+                == "enum"
+            ):
                 return True
         return False
 
@@ -2824,16 +2975,27 @@ class ClassLowering:
         return False
 
     def _enum_member_value(self, value_expr: Expr, next_auto: int) -> Optional[int]:
+        if _is_ast_node(value_expr, BoolLit):
+            return 1 if value_expr.value else 0
         if _is_ast_node(value_expr, IntLit):
             return int(value_expr.value)
         if (
             _is_ast_node(value_expr, Call)
             and not value_expr.args
             and not value_expr.kwargs
-            and _is_ast_node(value_expr.func, Name)
-            and value_expr.func.ident == "auto"
         ):
-            return next_auto
+            if _is_ast_node(value_expr.func, Name) and value_expr.func.ident == "auto":
+                return next_auto
+            if (
+                _is_ast_node(value_expr.func, Attr)
+                and value_expr.func.name == "auto"
+                and _is_ast_node(value_expr.func.obj, Name)
+                and self.parent._native_builtin_module_for_name(
+                    value_expr.func.obj.ident
+                )
+                == "enum"
+            ):
+                return next_auto
         return None
 
     def _func_is_abstract(self, fd: FuncDef) -> bool:
@@ -2921,8 +3083,61 @@ class ClassLowering:
                     self._declare_class_attr(info, attr_name, value_expr)
             return
 
+    def _resolve_preceding_class_literal_defaults(
+        self,
+        fd: FuncDef,
+        info: ClassInfo,
+    ) -> FuncDef:
+        """Snapshot safe class-body constants used by method defaults.
+
+        Python evaluates a method default while executing the surrounding
+        class body, so a bare name may resolve to an earlier class attribute.
+        Class lowering currently creates method signature objects before it
+        initializes class attributes. Preserve the definition-point value for
+        immutable literals without re-evaluating mutable class values or
+        consulting a later class-body rebind.
+        """
+        resolved_args: list[Arg] = []
+        changed = False
+        for arg in fd.args:
+            default = arg.default
+            if _is_ast_node(default, Name):
+                class_attr_name = self.mangle_private_attr_name(
+                    info,
+                    default.ident,
+                )
+                class_value = info.class_attr_values.get(class_attr_name)
+                if _is_ast_node(
+                    class_value,
+                    (IntLit, FloatLit, StrLit, BoolLit, NoneLit),
+                ):
+                    default = class_value
+                    changed = True
+            resolved_args.append(
+                Arg(
+                    name=arg.name,
+                    annotation=arg.annotation,
+                    default=default,
+                    kind=arg.kind,
+                    has_default=arg.has_default,
+                )
+            )
+        if not changed:
+            return fd
+        return FuncDef(
+            span=fd.span,
+            name=fd.name,
+            args=tuple(resolved_args),
+            return_ty=fd.return_ty,
+            body=fd.body,
+            decorators=fd.decorators,
+            is_method=fd.is_method,
+            is_async=fd.is_async,
+        )
+
     def _declare_method(self, cd: ClassDef, fd: FuncDef, info: ClassInfo) -> None:
         """Declare one method function. Body is emitted separately."""
+        fd = self._resolve_preceding_class_literal_defaults(fd, info)
         kind = "instance"
         for dec in fd.decorators:
             dname = _simple_decorator_name(dec)
@@ -3103,10 +3318,54 @@ class ClassLowering:
             if kind == "property_getter":
                 info.properties[fd.name] = fn
 
+    def _declare_method_alias(
+        self,
+        info: ClassInfo,
+        alias_name: str,
+        src_name: str,
+    ) -> None:
+        info.methods[alias_name] = info.methods[src_name]
+        src_ref = info.method_refs.get(src_name)
+        if src_ref is not None:
+            info.method_refs[alias_name] = src_ref
+        info.method_kinds[alias_name] = info.method_kinds.get(src_name, "instance")
+        for method_name, method_def in reversed(info.method_defs):
+            if method_name == src_name:
+                info.method_defs.append((alias_name, method_def))
+                break
+
     def _class_attr_global_name(self, class_name: str, attr_name: str) -> str:
         mod = self.parent.ast_module.name or "mod"
         sanitised_mod = mod.replace(".", "_").replace("-", "_")
         return f".classattr.{sanitised_mod}.{class_name}.{attr_name}"
+
+    def mangle_private_attr_name(self, info: ClassInfo, attr_name: str) -> str:
+        """Return the lexical Python spelling for a class-private attribute."""
+        return _mangle_private_name(info.name, attr_name)
+
+    def _class_attr_unpack_pairs(
+        self,
+        target: Expr,
+        value_expr: Expr,
+    ) -> Optional[list[tuple[str, Expr]]]:
+        if not (
+            _is_ast_node(target, TupleExpr) and _is_ast_node(value_expr, TupleExpr)
+        ):
+            return None
+        target_elems = target.elems
+        value_elems = value_expr.elems
+        if len(target_elems) != len(value_elems):
+            return None
+        pairs: list[tuple[str, Expr]] = []
+        for target_elem, value_elem in zip(target_elems, value_elems):
+            if _is_ast_node(target_elem, Name):
+                pairs.append((target_elem.ident, value_elem))
+                continue
+            nested = self._class_attr_unpack_pairs(target_elem, value_elem)
+            if nested is None:
+                return None
+            pairs.extend(nested)
+        return pairs
 
     def _declare_class_attr(
         self,
@@ -3114,6 +3373,8 @@ class ClassLowering:
         attr_name: str,
         value_expr: Expr,
     ) -> None:
+        attr_name = self.mangle_private_attr_name(info, attr_name)
+        info.class_attr_initializers.append((attr_name, value_expr))
         if attr_name in info.class_attrs:
             info.class_attr_values[attr_name] = value_expr
             return
@@ -3127,6 +3388,18 @@ class ClassLowering:
             gv.initializer = ir.Constant(_PTR, None)
         info.class_attrs[attr_name] = (gv, value_expr.ty)
         info.class_attr_values[attr_name] = value_expr
+
+    def _remove_class_attr_initializers(
+        self,
+        info: ClassInfo,
+        attr_name: str,
+    ) -> None:
+        attr_name = self.mangle_private_attr_name(info, attr_name)
+        kept: list[tuple[str, Expr]] = []
+        for name, expr in info.class_attr_initializers:
+            if name != attr_name:
+                kept.append((name, expr))
+        info.class_attr_initializers = kept
 
     def _is_walrus_sentinel(self, expr: Expr) -> bool:
         return (
@@ -3171,6 +3444,7 @@ class ClassLowering:
         field_names: tuple,
         methods: tuple,
         local_name: str = None,
+        field_types: tuple = (),
     ) -> ClassInfo:
         """Declare a class imported from a sibling multi-file module.
 
@@ -3228,6 +3502,20 @@ class ClassLowering:
         info.owning_module = owning_module
         info.export_class_name = class_name
         info.field_names = list(effective_field_names)
+        if not isinstance(field_types, tuple):
+            field_types = ()
+        for field_entry in field_types:
+            try:
+                field_name, raw_field_ty = field_entry
+            except Exception:
+                continue
+            field_ty = (
+                raw_field_ty
+                if _is_ast_node(raw_field_ty, Type)
+                else decode_type(raw_field_ty)
+            )
+            if field_ty is not None:
+                info.field_types[str(field_name)] = field_ty
         self.classes[primary_key] = info
 
         # Register qualified name as a secondary key if not already primary.
@@ -3347,6 +3635,7 @@ class ClassLowering:
         saved_builder = parent.builder
         saved_fn = parent.current_function
         saved_fd = parent.current_func_def
+        saved_entry_block = getattr(parent, "_current_entry_block", None)
         saved_env = parent.env
         saved_env_class_hint = parent.env_class_hint
         saved_env_class_object_hint = parent.env_class_object_hint
@@ -3362,7 +3651,20 @@ class ClassLowering:
         saved_owned_local_names = parent._owned_local_names
         saved_owned_local_has_value = parent._owned_local_has_value
         saved_owned_local_flag_slots = parent._owned_local_flag_slots
+        saved_owned_local_flag_allocas = getattr(
+            parent,
+            "_owned_local_flag_allocas",
+            {},
+        )
         saved_gc_rooted_local_names = parent._gc_rooted_local_names
+        saved_gc_rooted_local_order = getattr(parent, "_gc_rooted_local_order", [])
+        saved_borrowed_gc_rooted_local_names = getattr(
+            parent,
+            "_borrowed_gc_rooted_local_names",
+            set(),
+        )
+        saved_pinned_gc_rooted_local_names = parent._pinned_gc_rooted_local_names
+        saved_active_handler_excs = parent._active_handler_excs
         # Snapshot the user-function name table — a method body may
         # encounter ``from .sibling import name`` (handled by
         # ``_emit_import_from`` → ``_bind_native_cross_module_imports``)
@@ -3379,6 +3681,11 @@ class ClassLowering:
             [],
         )
         saved_current_param_names = getattr(parent, "_current_param_names", set())
+        saved_lambda_lexical_shadow_names = getattr(
+            parent,
+            "_lambda_lexical_shadow_names",
+            set(),
+        )
         if bool(getattr(parent, "_codegen_trace_enabled", False)):
             saved_trace_stmt_index = parent._codegen_current_stmt_index
             saved_trace_stmt_kind = parent._codegen_current_stmt_kind
@@ -3394,7 +3701,7 @@ class ClassLowering:
                     -1,
                     "",
                     "",
-                    getattr(parent, "_codegen_trace_span", lambda node: "")(fd),
+                    parent._codegen_trace_span(fd),
                 )
         else:
             saved_trace_stmt_index = -1
@@ -3425,7 +3732,14 @@ class ClassLowering:
             parent.builder = ir.IRBuilder(entry)
             parent.current_function = fn
             parent.current_func_def = fd
-            parent._current_global_names = parent._collect_explicit_global_names(fd.body)
+            # Target-language handlers are scoped to this method.  Reset the
+            # compiler's active-handler IR stack at the method boundary so a
+            # value from another generated function cannot cross into ``fn``.
+            parent._active_handler_excs = []
+            parent._current_entry_block = entry
+            parent._current_global_names = parent._collect_explicit_global_names(
+                fd.body
+            )
             parent.env = {}
             parent.env_class_hint = {}
             parent.env_class_object_hint = {}
@@ -3437,14 +3751,67 @@ class ClassLowering:
             parent._owned_local_names = set()
             parent._owned_local_has_value = set()
             parent._owned_local_flag_slots = {}
+            parent._owned_local_flag_allocas = {}
             parent._gc_rooted_local_names = set()
+            parent._gc_rooted_local_order = []
+            parent._borrowed_gc_rooted_local_names = set()
+            parent._pinned_gc_rooted_local_names = set()
             parent._container_temp_root_slot_names = []
             parent._exact_int_env_flags = {}
-            parent._async_body_depth = saved_async_body_depth + (1 if fd.is_async else 0)
+            parent._async_body_depth = saved_async_body_depth + (
+                1 if fd.is_async else 0
+            )
             parent.current_class = info  # type: ignore[attr-defined]
             parent.current_method_kind = kind  # type: ignore[attr-defined]
             # Filter the bare ``*`` kw-only separator — it has no IR slot.
             runtime_args = [a for a in fd.args if a.name != ""]
+            boxed_param_names = set(
+                getattr(parent, "_closure_boxed_params", {}).get(
+                    f"{cd.name}.{fd.name}",
+                    getattr(parent, "_closure_boxed_params", {}).get(fd.name, ()),
+                )
+            )
+            auto_root_borrowed_params = not getattr(
+                parent,
+                "_suppress_implicit_gc_roots",
+                False,
+            )
+
+            def bind_method_arg(
+                ir_arg: ir.Value,
+                ast_arg: Arg,
+                ir_ty: ir.Type,
+                bind_ty: Type,
+            ) -> bool:
+                if ast_arg.name not in boxed_param_names:
+                    return False
+                cell = parent.builder.call(
+                    parent.runtime["py_list_new"],
+                    [ir.Constant(_I64, 0)],
+                    name=parent._fresh(f"{ast_arg.name}.cell"),
+                )
+                initial = marshal.marshal_to_object(
+                    parent.builder,
+                    parent.module,
+                    parent.runtime,
+                    ir_arg,
+                    bind_ty or DynType(name="dyn"),
+                )
+                parent.builder.call(
+                    parent.runtime["py_list_append"],
+                    [cell, initial],
+                )
+                slot = parent.builder.alloca(_CSTR, name=f"{ast_arg.name}.addr")
+                parent.builder.store(cell, slot)
+                parent.env[ast_arg.name] = (
+                    slot,
+                    _CSTR,
+                    ListType(name="list", elem=DynType(name="dyn")),
+                )
+                if auto_root_borrowed_params:
+                    parent._ensure_borrowed_local_gc_root(ast_arg.name, slot, _CSTR)
+                return True
+
             if kind == "static":
                 # No implicit receiver. Walk declared args directly.
                 parent._current_param_names = {a.name for a in runtime_args}
@@ -3463,6 +3830,8 @@ class ClassLowering:
                         owner_name=f"{cd.name}.{fd.name}",
                         box_int_params=box_int_abi,
                     )
+                    if bind_method_arg(ir_arg, ast_arg, ir_ty, bind_ty):
+                        continue
                     parent.env[ast_arg.name] = (slot, ir_ty, bind_ty)
             else:
                 # First argument is the receiver (``self`` or ``cls``).
@@ -3489,7 +3858,15 @@ class ClassLowering:
                 recv_bind_ty: Type = DynType(name="dyn")
                 if runtime_args and _is_ast_node(runtime_args[0].annotation, ClassType):
                     recv_bind_ty = runtime_args[0].annotation
-                parent.env[recv_name] = (self_slot, recv_ir_ty, recv_bind_ty)
+                if runtime_args and bind_method_arg(
+                    recv_arg,
+                    runtime_args[0],
+                    recv_ir_ty,
+                    recv_bind_ty,
+                ):
+                    pass
+                else:
+                    parent.env[recv_name] = (self_slot, recv_ir_ty, recv_bind_ty)
 
                 for offset, (ir_arg, ast_arg) in enumerate(
                     zip(fn.args[1:], runtime_args[1:])
@@ -3507,8 +3884,11 @@ class ClassLowering:
                         owner_name=f"{cd.name}.{fd.name}",
                         box_int_params=box_int_abi,
                     )
+                    if bind_method_arg(ir_arg, ast_arg, ir_ty, bind_ty):
+                        continue
                     parent.env[ast_arg.name] = (slot, ir_ty, bind_ty)
 
+            parent._lambda_lexical_shadow_names = set(parent._current_param_names)
             parent._emit_thread_safepoint()
 
             # Emit statements via the parent's normal emitter. In debug mode,
@@ -3614,9 +3994,11 @@ class ClassLowering:
             parent._codegen_trace_dump(exc)
             raise
         finally:
+            parent._strict_stub_user_function_with_cpy_fallback(fn, fd)
             parent.builder = saved_builder
             parent.current_function = saved_fn
             parent.current_func_def = saved_fd
+            parent._current_entry_block = saved_entry_block
             parent._current_global_names = saved_global_names
             parent.env = saved_env
             parent.env_class_hint = saved_env_class_hint
@@ -3629,10 +4011,18 @@ class ClassLowering:
             parent._ir_builder_env_flags = saved_ir_builder_flags
             parent.current_class = saved_class  # type: ignore[attr-defined]
             parent.current_method_kind = saved_kind  # type: ignore[attr-defined]
+            parent._lambda_lexical_shadow_names = saved_lambda_lexical_shadow_names
             parent._owned_local_names = saved_owned_local_names
             parent._owned_local_has_value = saved_owned_local_has_value
             parent._owned_local_flag_slots = saved_owned_local_flag_slots
+            parent._owned_local_flag_allocas = saved_owned_local_flag_allocas
             parent._gc_rooted_local_names = saved_gc_rooted_local_names
+            parent._gc_rooted_local_order = saved_gc_rooted_local_order
+            parent._borrowed_gc_rooted_local_names = (
+                saved_borrowed_gc_rooted_local_names
+            )
+            parent._pinned_gc_rooted_local_names = saved_pinned_gc_rooted_local_names
+            parent._active_handler_excs = saved_active_handler_excs
             # Restore the saved function table; see saved_functions above.
             # Only undo OVERWRITES of pre-existing keys (the leak case).
             # New keys added during method emission (e.g. nested ``def``
@@ -3643,7 +4033,9 @@ class ClassLowering:
             # missing entries.
             for _key, _val in saved_functions.items():
                 parent.functions[_key] = _val
-            parent._container_temp_root_slot_names = saved_container_temp_root_slot_names
+            parent._container_temp_root_slot_names = (
+                saved_container_temp_root_slot_names
+            )
             parent._current_param_names = saved_current_param_names
             if bool(getattr(parent, "_codegen_trace_enabled", False)):
                 parent._codegen_current_stmt_index = saved_trace_stmt_index
@@ -3680,18 +4072,23 @@ class ClassLowering:
         # Save parent state so we can re-use its builder abstraction.
         saved_builder = self.parent.builder
         saved_fn = self.parent.current_function
+        saved_entry_block = getattr(self.parent, "_current_entry_block", None)
         entry = init_fn.append_basic_block(name="entry")
         self.parent.builder = ir.IRBuilder(entry)
         self.parent.current_function = init_fn
+        self.parent._current_entry_block = entry
 
-        # Emit per-class init in declaration order.
-        for cd in self._iter_class_defs():
-            info = self.classes[cd.name]
-            self._emit_class_init(cd, info)
+        try:
+            # Emit per-class init in declaration order.
+            for cd in self._iter_class_defs():
+                info = self.classes[cd.name]
+                self._emit_class_init(cd, info)
 
-        self.parent.builder.ret_void()
-        self.parent.builder = saved_builder
-        self.parent.current_function = saved_fn
+            self.parent.builder.ret_void()
+        finally:
+            self.parent.builder = saved_builder
+            self.parent.current_function = saved_fn
+            self.parent._current_entry_block = saved_entry_block
 
     def emit_class_statement_init(self, cd: ClassDef) -> None:
         info = self.classes.get(cd.name)
@@ -3846,17 +4243,56 @@ class ClassLowering:
         self._maybe_emit_class_metaclass_slot(info, cls_ptr)
         if info.slots_only:
             builder.call(runtime["py_class_mark_slots_only"], [cls_ptr])
+        if self._class_subclasses_dict(info):
+            builder.call(runtime["py_class_mark_dict_subclass"], [cls_ptr])
+
+        method_defs_by_name = {mname: fd for mname, fd in info.method_defs}
 
         # 5. py_class_add_method(cls, "method", func_as_PyObject_ptr) for each.
         for mname, mfunc in info.methods.items():
             mname_ptr = self._cname_ptr(mname)
+            method_kind = info.method_kinds.get(mname, "instance")
+            method_def = method_defs_by_name.get(mname)
             mref = info.method_refs.get(mname)
             if mref is None:
                 mref = mfunc
-            func_as_obj = builder.bitcast(mref, _PTR, name=self._fresh(f"m.{mname}"))
+            if method_kind == "instance" and method_def is not None:
+                func_as_obj = self._emit_method_pyfunc_object(
+                    cd,
+                    mname,
+                    mfunc,
+                    method_def,
+                    mname_ptr,
+                    "method",
+                )
+            else:
+                func_as_obj = builder.bitcast(
+                    mref, _PTR, name=self._fresh(f"m.{mname}")
+                )
             builder.call(
                 runtime["py_class_add_method"], [cls_ptr, mname_ptr, func_as_obj]
             )
+            if method_kind == "classmethod":
+                if method_def is not None:
+                    func_obj = self._emit_method_pyfunc_object(
+                        cd,
+                        mname,
+                        mfunc,
+                        method_def,
+                        mname_ptr,
+                        "classmethod",
+                    )
+                    classmethod_obj = builder.call(
+                        runtime["py_classmethod_new"],
+                        [func_obj],
+                        name=self._fresh(f"classmethod.{mname}"),
+                    )
+                    builder.call(
+                        runtime["py_class_setattr_raw"],
+                        [cls_ptr, mname_ptr, classmethod_obj],
+                    )
+                    builder.call(runtime["py_decref"], [classmethod_obj])
+                    builder.call(runtime["py_decref"], [func_obj])
         self._emit_property_descriptor_class_attrs(cd, info, cls_ptr)
         hash_attr = info.class_attr_values.get("__hash__")
         hash_is_none = _is_ast_node(hash_attr, NoneLit)
@@ -3873,38 +4309,86 @@ class ClassLowering:
                 [cls_ptr, self._cname_ptr("__hash__"), none_obj],
             )
 
-        # 6. Initialize class-attribute storage.
-        for attr_name, value_expr in info.class_attr_values.items():
-            gv, _attr_ty = info.class_attrs[attr_name]
-            if attr_name in info.enum_members:
-                obj = self.parent._emit_none_literal()
-            elif attr_name in prepared_attr_objects:
-                obj = prepared_attr_objects[attr_name]
-            else:
-                re_pattern = self.parent._native_re_class_compile_attr_string_value(
-                    info.name,
-                    attr_name,
-                    value_expr,
-                )
-                if re_pattern is not None:
-                    obj = self.parent._emit_str_literal(re_pattern)
-                else:
-                    raw = self.parent._emit_expr(value_expr)
-                    obj = marshal.marshal_to_object(
-                        builder,
-                        self.parent.module,
-                        runtime,
-                        raw,
-                        value_expr.ty,
-                    )
-            builder.store(obj, gv)
-            builder.call(
-                runtime["py_class_setattr_raw"],
-                [cls_ptr, self._cname_ptr(attr_name), obj],
+        # 6. Initialize class-attribute storage. Class bodies execute
+        # sequentially, so later attribute initializers can refer to
+        # earlier attributes by bare name.
+        missing_env = object()
+        saved_class_attr_env = {}
+        for attr_name in info.class_attr_values:
+            saved_class_attr_env[attr_name] = self.parent.env.get(
+                attr_name,
+                missing_env,
             )
-            self._maybe_emit_set_name(info, attr_name, obj, cls_ptr)
+        try:
+            for attr_name, value_expr in info.class_attr_initializers:
+                gv, _attr_ty = info.class_attrs[attr_name]
+                if attr_name in info.enum_members:
+                    # Enum members load as their int value so identity /
+                    # equality (``x == E.A``) behaves; a None placeholder
+                    # made every member compare equal. ``E.A.name`` /
+                    # ``E.A.value`` stay statically lowered in
+                    # _maybe_emit_enum_member_attr.
+                    obj = builder.call(
+                        runtime["py_int_from_i64"],
+                        [ir.Constant(_I64, int(info.enum_members[attr_name]))],
+                        name=self._fresh("enum." + attr_name),
+                    )
+                elif attr_name in info.enum_string_members:
+                    obj = self.parent._emit_str_literal(
+                        info.enum_string_members[attr_name]
+                    )
+                elif attr_name in prepared_attr_objects:
+                    obj = prepared_attr_objects[attr_name]
+                else:
+                    re_pattern = self.parent._native_re_class_compile_attr_string_value(
+                        info.name,
+                        attr_name,
+                        value_expr,
+                    )
+                    if re_pattern is not None:
+                        obj = self.parent._emit_str_literal(re_pattern)
+                    else:
+                        raw = self.parent._emit_expr(value_expr)
+                        obj = marshal.marshal_to_object(
+                            builder,
+                            self.parent.module,
+                            runtime,
+                            raw,
+                            value_expr.ty,
+                        )
+                builder.store(obj, gv)
+                builder.call(
+                    runtime["py_class_setattr_raw"],
+                    [cls_ptr, self._cname_ptr(attr_name), obj],
+                )
+                self.parent.env[attr_name] = (gv, _PTR, value_expr.ty)
+                self._maybe_emit_set_name(info, attr_name, obj, cls_ptr)
+        finally:
+            for attr_name, old_env in saved_class_attr_env.items():
+                if old_env is missing_env:
+                    if attr_name in self.parent.env:
+                        del self.parent.env[attr_name]
+                else:
+                    self.parent.env[attr_name] = old_env
 
-        # 7. Store into the class global.
+        # 7. Apply native unary class decorators in reverse source order,
+        # matching Python's ``C = dec_n(...dec_1(C))`` rebinding rule.
+        for decorator in reversed(info.runtime_decorators):
+            decorator_fn = self.parent.functions.get(decorator.ident)
+            if decorator_fn is None:
+                raise NotImplementedError(
+                    f"Layer 1 cannot resolve class decorator "
+                    f"{decorator.ident!r} on {cd.name!r}"
+                )
+            cls_ptr = self.parent._call_user(
+                decorator_fn,
+                [cls_ptr],
+                self._fresh(f"class.decorator.{cd.name}.{decorator.ident}"),
+                cd.span,
+                root_result=True,
+            )
+
+        # 8. Store the decorated/rebound object into the class global.
         builder.store(cls_ptr, info.global_var)
 
     def _maybe_emit_class_metaclass_slot(
@@ -4003,6 +4487,60 @@ class ClassLowering:
                 return stmt
         return None
 
+    def _emit_method_pyfunc_object(
+        self,
+        cd: ClassDef,
+        method_name: str,
+        method_fn: ir.Function,
+        method_def: FuncDef,
+        method_name_ptr: ir.Value,
+        suffix: str,
+    ) -> ir.Value:
+        runtime_args = tuple(a for a in method_def.args if a.name != "")
+        body_adapter = self.parent._emit_native_func_adapter(
+            f"{cd.name}_{method_name}_{suffix}",
+            method_fn,
+            runtime_args,
+            (),
+            method_def.return_ty,
+        )
+        adapter = (
+            self.parent._emit_async_native_func_value_adapter(
+                f"{cd.name}_{method_name}_{suffix}",
+                body_adapter,
+            )
+            if method_def.is_async
+            else body_adapter
+        )
+        captures = self.parent.builder.call(
+            self.parent.runtime["py_tuple_new"],
+            [ir.Constant(_I64, 0)],
+            name=self._fresh(f"{suffix}.{method_name}.captures"),
+        )
+        signature = self.parent._emit_native_func_signature(runtime_args)
+        wrapped_captures = self.parent.builder.call(
+            self.parent.runtime["py_tuple_new"],
+            [ir.Constant(_I64, 2)],
+            name=self._fresh(f"{suffix}.{method_name}.signature.wrapper"),
+        )
+        self.parent.builder.call(
+            self.parent.runtime["py_tuple_set_item"],
+            [wrapped_captures, ir.Constant(_I64, 0), captures],
+        )
+        self.parent.builder.call(
+            self.parent.runtime["py_tuple_set_item"],
+            [wrapped_captures, ir.Constant(_I64, 1), signature],
+        )
+        func_obj = self.parent.builder.call(
+            self.parent.runtime["py_func_new_named"],
+            [adapter, wrapped_captures, method_name_ptr],
+            name=self._fresh(f"{suffix}.{method_name}.func"),
+        )
+        self.parent._gc_release(captures)
+        self.parent._gc_release(signature)
+        self.parent._gc_release(wrapped_captures)
+        return func_obj
+
     def _emit_property_accessor_func_obj(
         self,
         cd: ClassDef,
@@ -4040,9 +4578,7 @@ class ClassLowering:
         func_obj = self.parent.builder.call(
             self.parent.runtime["py_func_new_named"],
             [adapter, captures, self.parent._attr_name_ptr(prop_name)],
-            name=self._fresh(
-                f"property.{info.name}.{prop_name}.{accessor_kind}"
-            ),
+            name=self._fresh(f"property.{info.name}.{prop_name}.{accessor_kind}"),
         )
         self.parent._gc_release(captures)
         return func_obj
@@ -4126,10 +4662,7 @@ class ClassLowering:
         value: Optional[Expr],
         before_cd: ClassDef,
     ) -> Optional[str]:
-        if not (
-            _is_ast_node(value, Call)
-            and _is_ast_node(value.func, Name)
-        ):
+        if not (_is_ast_node(value, Call) and _is_ast_node(value.func, Name)):
             return None
         ns_name = value.func.ident
         ns_info = self.classes.get(ns_name)
@@ -4465,24 +4998,48 @@ class ClassLowering:
         if method_fn is None:
             return None
         runtime_args = tuple(a for a in fd.args if a.name != "")
-        adapter = self.parent._emit_native_func_adapter(
+        body_adapter = self.parent._emit_native_func_adapter(
             cd.name + "_" + fd.name + "_namespace",
             method_fn,
             runtime_args,
             (),
             fd.return_ty,
         )
+        adapter = (
+            self.parent._emit_async_native_func_value_adapter(
+                cd.name + "_" + fd.name + "_namespace",
+                body_adapter,
+            )
+            if fd.is_async
+            else body_adapter
+        )
         captures = self.parent.builder.call(
             self.parent.runtime["py_tuple_new"],
             [ir.Constant(_I64, 0)],
             name=self._fresh("namespace.method.captures"),
         )
+        signature = self.parent._emit_native_func_signature(runtime_args)
+        wrapped_captures = self.parent.builder.call(
+            self.parent.runtime["py_tuple_new"],
+            [ir.Constant(_I64, 2)],
+            name=self._fresh(f"namespace.method.{fd.name}.signature.wrapper"),
+        )
+        self.parent.builder.call(
+            self.parent.runtime["py_tuple_set_item"],
+            [wrapped_captures, ir.Constant(_I64, 0), captures],
+        )
+        self.parent.builder.call(
+            self.parent.runtime["py_tuple_set_item"],
+            [wrapped_captures, ir.Constant(_I64, 1), signature],
+        )
         fn_obj = self.parent.builder.call(
             self.parent.runtime["py_func_new_named"],
-            [adapter, captures, self.parent._attr_name_ptr(fd.name)],
+            [adapter, wrapped_captures, self.parent._attr_name_ptr(fd.name)],
             name=self._fresh(f"namespace.method.{fd.name}"),
         )
         self.parent._gc_release(captures)
+        self.parent._gc_release(signature)
+        self.parent._gc_release(wrapped_captures)
         return fn_obj
 
     def _emit_prepared_namespace_body_writes(
@@ -4574,13 +5131,6 @@ class ClassLowering:
             "__static_attributes__",
             self.parent._emit_empty_tuple("namespace.static.attrs"),
         )
-        if any(_is_ast_node(stmt, FuncDef) for stmt in cd.body):
-            self._emit_namespace_setitem(
-                ns_obj,
-                ns_info,
-                "__classdictcell__",
-                self.parent._emit_none_literal(),
-            )
         return precomputed
 
     def _maybe_emit_metaclass_prepared_namespace_constructor(
@@ -5042,11 +5592,60 @@ class ClassLowering:
                             return f_names.index(name)
         return None
 
+    def _derives_from(self, info: ClassInfo, base_name: str) -> bool:
+        """True if ``base_name`` is a transitive base of ``info``.
+
+        Mirrors :meth:`lookup_class_attr`'s base walk. Python forbids
+        inheritance cycles, so no visited-set is needed.
+        """
+        for b in info.bases_ast:
+            if _is_ast_node(b, Name):
+                if b.ident == base_name:
+                    return True
+                base_info = self.classes.get(b.ident)
+                if base_info is not None and self._derives_from(base_info, base_name):
+                    return True
+        return False
+
+    def class_attr_overridden_by_subclass(
+        self, info: ClassInfo, attr_name: str
+    ) -> bool:
+        """True if any subclass of ``info`` declares its own ``attr_name``.
+
+        When a subclass overrides the class attribute, a *static* load from
+        ``info``'s per-class global is unsound for an instance receiver: the
+        instance may actually be that subclass, whose override must win
+        (CPython resolves ``self.<attr>`` / ``inst.<attr>`` for a class
+        attribute via ``type(inst).__mro__``). The caller must then fall
+        through to the runtime ``py_obj_getattr`` MRO lookup rather than the
+        static fast path. The common no-override case keeps the fast path,
+        so emitted IR is unchanged there.
+        """
+        attr_name = self.mangle_private_attr_name(info, attr_name)
+        for other in self.classes.values():
+            if other is info:
+                continue
+            if attr_name not in other.class_attrs:
+                continue
+            if self._derives_from(other, info.name):
+                return True
+        return False
+
+    # Dict-inherited methods the runtime serves for classes that subclass the
+    # builtin ``dict`` (PY_CLASS_FLAG_DICT_SUBCLASS): py_dict_subclass_getattr
+    # in py_protocol.c binds each of these against the instance's backing dict
+    # when the user class does not define an override. Keep this set in sync
+    # with py_dict_subclass_getattr.
+    _DICT_SUBCLASS_RUNTIME_METHODS = frozenset(
+        ("get", "keys", "values", "items", "pop", "setdefault", "clear")
+    )
+
     def lookup_class_attr(
         self,
         info: ClassInfo,
         name: str,
     ) -> Optional[tuple[ir.GlobalVariable, Type]]:
+        name = self.mangle_private_attr_name(info, name)
         if name in info.class_attrs:
             return info.class_attrs[name]
         for b in info.bases_ast:
@@ -5056,6 +5655,21 @@ class ClassLowering:
                     found = self.lookup_class_attr(base_info, name)
                     if found is not None:
                         return found
+        # Dict-subclass inherited methods (collections.Counter.get, ...) are
+        # not statically declared anywhere — the ``dict`` base is dropped from
+        # the native MRO — but the runtime resolves them per-instance via
+        # py_dict_subclass_getattr. Report them as known-with-no-static-global
+        # (``(None, DynType)``) so ``_class_attr_needs_runtime_lookup`` routes
+        # ``obj.get(...)`` through py_obj_getattr + py_obj_call instead of
+        # (a) statically mis-dispatching to an unrelated same-named method via
+        # the closed-world any-class scan, or (b) falling into the CPython
+        # py_cpy_* dispatch, which is a compile error under
+        # ``--python-libpython=off``. emit_class_attr_load below checks the
+        # None global and refuses to emit a static load for this sentinel.
+        if name in self._DICT_SUBCLASS_RUNTIME_METHODS and self._class_subclasses_dict(
+            info
+        ):
+            return (None, DynType(name="dyn"))
         return None
 
     def emit_class_attr_load(
@@ -5067,6 +5681,11 @@ class ClassLowering:
         if found is None:
             return None
         gv, _ty = found
+        if gv is None:
+            # dict-subclass runtime-served method sentinel — there is no
+            # static class-attr global to load; let the caller fall through
+            # to its runtime-lookup path.
+            return None
         return self.parent.builder.load(
             gv,
             name=self._fresh(f"classattr.{info.name}.{attr_name}"),
@@ -5079,6 +5698,7 @@ class ClassLowering:
         value: ir.Value,
         value_ty: Type,
     ) -> bool:
+        attr_name = self.mangle_private_attr_name(info, attr_name)
         found = info.class_attrs.get(attr_name)
         if found is None:
             g_name = self._class_attr_global_name(info.name, attr_name)
@@ -5137,10 +5757,16 @@ class ClassLowering:
                 [self_val, ir.Constant(_I32, idx)],
                 name=self._fresh(f"self.{attr_name}"),
             )
-        class_attr = self.emit_class_attr_load(info, attr_name)
-        if class_attr is not None:
-            return class_attr
-        name_ptr = self._cname_ptr(attr_name)
+        # A subclass override must win: ``self`` may be a subclass instance
+        # even inside a base-class method. Only take the static class-attr
+        # load when no subclass redeclares the attribute; otherwise fall
+        # through to the runtime MRO lookup.
+        if not self.class_attr_overridden_by_subclass(info, attr_name):
+            class_attr = self.emit_class_attr_load(info, attr_name)
+            if class_attr is not None:
+                return class_attr
+        runtime_attr_name = self.mangle_private_attr_name(info, attr_name)
+        name_ptr = self._cname_ptr(runtime_attr_name)
         return builder.call(
             runtime["py_obj_getattr"],
             [self_val, name_ptr],
@@ -5164,7 +5790,8 @@ class ClassLowering:
                 [self_val, ir.Constant(_I32, idx), value],
             )
             return None
-        name_ptr = self._cname_ptr(attr_name)
+        runtime_attr_name = self.mangle_private_attr_name(info, attr_name)
+        name_ptr = self._cname_ptr(runtime_attr_name)
         return builder.call(
             runtime["py_obj_setattr"],
             [self_val, name_ptr, value],
@@ -5265,13 +5892,77 @@ class ClassLowering:
         """True if any direct base of ``info`` is a builtin exception class
         (Exception, ValueError, ...). Used to give a no-``__init__`` exception
         subclass BaseException's constructor-args storage semantics."""
+        # Cross-module classes declared from the native export table can have
+        # an empty ``bases_ast``.  Use the shared base-name lookup so imported
+        # ``class Error(Exception): pass`` definitions retain BaseException's
+        # constructor-args semantics too.
+        for name in self._class_declared_base_names(info):
+            if _builtin_exception_tag_for_base_name(name) is not None:
+                return True
+        return False
+
+    def _class_declared_base_names(self, info) -> tuple:
+        """Base-class names of ``info``: AST bases when present, else the
+        cross-module native-exports entry for an extern class.
+
+        Extern classes declared through ``declare_extern_class`` may carry an
+        empty ``bases_ast`` (only the ``_ensure_class_type_registered`` path
+        materializes Name stubs from the export's ``base_names``), so fall
+        back to the exports registry keyed by ``owning_module`` — mirrors the
+        cross-module lookup in :meth:`lookup_field_index`."""
+        names: list[str] = []
         for base_expr in getattr(info, "bases_ast", ()) or ():
             name = getattr(base_expr, "ident", None)
-            if (
-                name is not None
-                and _builtin_exception_tag_for_base_name(name) is not None
-            ):
+            if name is not None:
+                names.append(name)
+        if names:
+            return tuple(names)
+        owning_mod = getattr(info, "owning_module", None)
+        if owning_mod is None:
+            return ()
+        native_table = getattr(self.parent, "_native_module_exports", None) or {}
+        export_name = getattr(info, "export_class_name", None) or info.name
+        rem_info = native_table.get(owning_mod, {}).get(export_name)
+        if isinstance(rem_info, dict) and rem_info.get("kind") == "class":
+            return tuple(rem_info.get("base_names", ()))
+        return ()
+
+    def _class_subclasses_dict(self, info) -> bool:
+        """True if ``info`` (transitively) subclasses the builtin ``dict``.
+
+        The frontend drops the ``dict`` base from the native MRO (dict is not a
+        user PyClassObject), so a class such as collections.Counter/OrderedDict/
+        defaultdict is created as a plain instance with no dict item storage or
+        methods. We mark such classes with ``py_class_mark_dict_subclass`` so
+        the runtime routes dict-inherited operations (__setitem__/__getitem__/
+        get/__missing__/__len__/__contains__) to a backing dict. Detection is
+        transitive over user bases: a user class whose base is another
+        dict-subclass user class is also a dict-subclass. Works for both local
+        classes (AST bases) and extern/cross-module classes (exports registry
+        ``base_names``) via :meth:`_class_declared_base_names`."""
+        visited: set[str] = set()
+        queue: list[str] = list(self._class_declared_base_names(info))
+        native_table = getattr(self.parent, "_native_module_exports", None) or {}
+        while queue:
+            name = queue.pop(0)
+            if name in visited:
+                continue
+            visited.add(name)
+            if name == "dict":
                 return True
+            base_info = self.classes.get(name)
+            if base_info is not None:
+                for pname in self._class_declared_base_names(base_info):
+                    queue.append(pname)
+                continue
+            # Base class not registered locally: consult the cross-module
+            # exports registry directly (first module exporting that name).
+            for mod_exports in native_table.values():
+                rem_info = mod_exports.get(name)
+                if isinstance(rem_info, dict) and rem_info.get("kind") == "class":
+                    for pname in rem_info.get("base_names", ()):
+                        queue.append(pname)
+                    break
         return False
 
     def emit_instantiate(self, class_name: str, arg_exprs, parent) -> ir.Value:
@@ -5293,6 +5984,13 @@ class ClassLowering:
             [cls_ptr],
             name=self._fresh("inst." + class_name),
         )
+        # ``py_instance_new`` returns an owned object, but an SSA pointer is
+        # not a GC root.  Argument lowering and ``__init__`` may allocate, so
+        # keep the new instance pinned until construction finishes.  Without
+        # this, a relocating collection can leave ``self`` stale and later
+        # class fields (notably IR symbol strings during pcc1 -> pcc2) read as
+        # NULL even though every store succeeded inside ``__init__``.
+        builder.call(runtime["pcc_gc_pin"], [inst])
         init_info = info
         init_fn = info.init_fn
         if init_fn is None:
@@ -5329,10 +6027,14 @@ class ClassLowering:
                     init_fn = candidate
                     break
                 for parent_expr in base_info.bases_ast:
-                    if _is_ast_node(parent_expr, Name) and parent_expr.ident != "object":
+                    if (
+                        _is_ast_node(parent_expr, Name)
+                        and parent_expr.ident != "object"
+                    ):
                         queue.append(parent_expr.ident)
         init_ast_fd = self._find_method_def(init_info.name, "__init__")
         should_call_init = init_fn is not None
+        init_called = False
         if not should_call_init and init_ast_fd is not None:
             should_call_init = True
         if not should_call_init and len(arg_exprs) > 0:
@@ -5397,7 +6099,7 @@ class ClassLowering:
                             arg_expr,
                             expected_ir_ty,
                             declared_annotation,
-                    )
+                        )
                     if recovered_v is not None:
                         v = recovered_v
                 expected_is_object = (
@@ -5594,9 +6296,7 @@ class ClassLowering:
                     except AttributeError:
                         arg_ref_text = "false"
                     else:
-                        arg_ref_text = (
-                            "true" if bool(default_bool_value) else "false"
-                        )
+                        arg_ref_text = "true" if bool(default_bool_value) else "false"
                 if _classgen_ref_text_is_null(arg_ref_text):
                     recent_ref_text = _classgen_recent_value_ref_text(
                         builder,
@@ -5660,6 +6360,18 @@ class ClassLowering:
                     init_arg_ref_texts,
                     init_info.init_returns_void,
                 )
+                init_called = True
+        builder.call(runtime["pcc_gc_unpin"], [inst])
+        if init_called:
+            # A user ``__init__`` reports Python exceptions through TLS even
+            # when its native return value is discarded.  Check only after
+            # removing the construction pin, and release the owned, failed
+            # instance on the error edge before entering the surrounding
+            # try/except or function error epilogue.
+            parent._emit_post_call_err_check(
+                None,
+                release_on_error=(inst,),
+            )
         return inst
 
     def _find_method_def(self, class_name: str, method_name: str):

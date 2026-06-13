@@ -14,25 +14,29 @@ class OrderedDict(dict):
 
     def move_to_end(self, key, last: bool = True) -> None:
         v = self[key]
-        del self[key]
         if last:
+            del self[key]
             self[key] = v
         else:
-            # Python OrderedDict move_to_end(last=False) puts at the
-            # front. Recreate by popping everything and reinserting.
-            saved = list(self.items())
-            self.clear()
+            keys = list(self)
+            saved = []
+            for k in keys:
+                if k != key:
+                    saved.append((k, self[k]))
+            for k in keys:
+                del self[k]
             self[key] = v
-            for k, v2 in saved:
-                self[k] = v2
+            for pair in saved:
+                self[pair[0]] = pair[1]
 
     def popitem(self, last: bool = True):
         if not self:
             raise KeyError("dictionary is empty")
+        keys = list(self)
         if last:
-            k = next(reversed(self))
+            k = keys[len(keys) - 1]
         else:
-            k = next(iter(self))
+            k = keys[0]
         v = self[k]
         del self[k]
         return k, v
@@ -65,35 +69,51 @@ class Counter(dict):
 
     def update(self, iterable=None, **kwargs) -> None:
         if iterable is not None:
-            if hasattr(iterable, "items"):
-                for key, value in iterable.items():
-                    self[key] = self.get(key, 0) + value
+            if isinstance(iterable, dict):
+                for key in iterable:
+                    self[key] = self.get(key, 0) + iterable[key]
             else:
                 for item in iterable:
                     self[item] = self.get(item, 0) + 1
-        for key, value in kwargs.items():
-            self[key] = self.get(key, 0) + value
+        for key in kwargs:
+            self[key] = self.get(key, 0) + kwargs[key]
 
     def subtract(self, iterable=None, **kwargs) -> None:
         if iterable is not None:
-            if hasattr(iterable, "items"):
-                for key, value in iterable.items():
-                    self[key] = self.get(key, 0) - value
+            if isinstance(iterable, dict):
+                for key in iterable:
+                    self[key] = self.get(key, 0) - iterable[key]
             else:
                 for item in iterable:
                     self[item] = self.get(item, 0) - 1
-        for key, value in kwargs.items():
-            self[key] = self.get(key, 0) - value
+        for key in kwargs:
+            self[key] = self.get(key, 0) - kwargs[key]
 
     def elements(self):
-        for key, value in self.items():
+        for key in self:
+            value = self[key]
             i = 0
             while i < value:
                 yield key
                 i += 1
 
     def most_common(self, n=None):
-        items = sorted(self.items(), key=lambda kv: -kv[1])
+        items = []
+        for key in self:
+            items.append((key, self[key]))
+        i = 0
+        while i < len(items):
+            best = i
+            j = i + 1
+            while j < len(items):
+                if items[j][1] > items[best][1]:
+                    best = j
+                j += 1
+            if best != i:
+                tmp = items[i]
+                items[i] = items[best]
+                items[best] = tmp
+            i += 1
         if n is None:
             return items
         return items[:n]
@@ -126,6 +146,9 @@ class deque:
     def __len__(self) -> int:
         return len(self._data)
 
+    def __contains__(self, value) -> bool:
+        return value in self._data
+
     def rotate(self, n: int = 1) -> None:
         length = len(self._data)
         if length == 0:
@@ -156,6 +179,67 @@ class ChainMap:
         return ChainMap(child, *self.maps)
 
 
+class _NamedTupleType:
+    def __init__(self, name: str, fields) -> None:
+        self.__name__ = name
+        self._name = name
+        self._fields = fields
+
+    def __call__(self, *args, **kwargs):
+        return _NamedTupleInstance(self, args, kwargs)
+
+
+class _NamedTupleInstance:
+    def __init__(self, owner, args, kwargs) -> None:
+        self._owner = owner
+        vals = list(args)
+        fields = owner._fields
+        i = 0
+        for f in fields:
+            if i < len(vals):
+                i += 1
+                continue
+            if f in kwargs:
+                vals.append(kwargs[f])
+            else:
+                raise TypeError(f"missing field {f!r}")
+            i += 1
+        if len(vals) > len(fields):
+            raise TypeError("too many positional arguments")
+        self._values = tuple(vals)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __getitem__(self, index: int):
+        return self._values[index]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __getattr__(self, attr):
+        if attr == "_fields":
+            return self._owner._fields
+        fields = self._owner._fields
+        i = 0
+        while i < len(fields):
+            if fields[i] == attr:
+                return self._values[i]
+            i += 1
+        raise AttributeError(attr)
+
+    def __repr__(self):
+        fields = self._owner._fields
+        parts = ", ".join(
+            f"{f}={v!r}" for f, v in zip(fields, self._values)
+        )
+        return f"{self._owner._name}({parts})"
+
+    def _asdict(self):
+        fields = self._owner._fields
+        return {f: v for f, v in zip(fields, self._values)}
+
+
 def namedtuple(name, field_spec):
     """Minimal ``namedtuple`` — supports space-or-comma separated
     field specs; returns a class whose instances are tuples with
@@ -167,30 +251,4 @@ def namedtuple(name, field_spec):
     else:
         fields = tuple(field_spec)
 
-    class _NT(tuple):
-        _fields = fields
-
-        def __new__(cls, *args, **kwargs):
-            vals = list(args)
-            for i, f in enumerate(fields):
-                if i < len(vals):
-                    continue
-                if f in kwargs:
-                    vals.append(kwargs[f])
-                else:
-                    raise TypeError(f"missing field {f!r}")
-            return tuple.__new__(cls, vals)
-
-        def __repr__(self):
-            parts = ", ".join(
-                f"{f}={v!r}" for f, v in zip(fields, self)
-            )
-            return f"{name}({parts})"
-
-        def _asdict(self):
-            return {f: v for f, v in zip(fields, self)}
-
-    _NT.__name__ = name
-    for i, f in enumerate(fields):
-        setattr(_NT, f, property(lambda self, i=i: self[i]))
-    return _NT
+    return _NamedTupleType(name, fields)

@@ -12,6 +12,12 @@ from .self_backend_parse import (
 
 
 def is_local_value_ref(value: str) -> bool:
+    # llvmlite names unnamed SSA results ``%.6``, decoded here as ``.6``.
+    # That spelling also matches our permissive float-literal regex, but LLVM
+    # canonical floating constants include a leading digit.  Classify the
+    # dot-plus-digits spelling as SSA before consulting the literal helpers.
+    if len(value) > 1 and value.startswith(".") and value[1:].isdigit():
+        return True
     return not (
         value == "null"
         or value == "poison"
@@ -91,7 +97,15 @@ def instruction_used_values(instr: ParsedInstr) -> list[str]:
         _dest, _aggregate_type, value, _indices, _result_type, _offset = data
         values = [value]
     elif kind == "insertvalue":
-        _dest, _aggregate_type, aggregate_value, _elem_type, elem_value, _indices, _offset = data
+        (
+            _dest,
+            _aggregate_type,
+            aggregate_value,
+            _elem_type,
+            elem_value,
+            _indices,
+            _offset,
+        ) = data
         values = [aggregate_value, elem_value]
     elif kind == "gep":
         _dest, _base_type, _ptr_type, ptr_value, indices = data
@@ -139,7 +153,9 @@ def collect_block_local_last_uses(func: ParsedFunction) -> dict[str, dict[str, i
                     continue
                 use_blocks.setdefault(incoming.value, set()).add(incoming.label)
                 key = (incoming.label, incoming.value)
-                last_uses[key] = max(last_uses.get(key, -1), block_lengths[incoming.label])
+                last_uses[key] = max(
+                    last_uses.get(key, -1), block_lengths[incoming.label]
+                )
         for index, instr in enumerate(block.instructions):
             for value in instruction_used_values(instr):
                 use_blocks.setdefault(value, set()).add(block.name)
@@ -153,20 +169,25 @@ def collect_block_local_last_uses(func: ParsedFunction) -> dict[str, dict[str, i
     block_local_last_uses: dict[str, dict[str, int]] = {}
     for value, block_name in def_blocks.items():
         if use_blocks.get(value) == {block_name}:
-            block_local_last_uses.setdefault(block_name, {})[value] = last_uses[(block_name, value)]
+            block_local_last_uses.setdefault(block_name, {})[value] = last_uses[
+                (block_name, value)
+            ]
     return block_local_last_uses
 
 
-def collect_used_values(func: ParsedFunction) -> set[str]:
-    used: set[str] = set()
+def collect_used_values(func: ParsedFunction) -> list[str]:
+    # Keep the authoritative use collection hash-free. Native bootstrap can
+    # produce equal SSA-name strings whose hashes disagree; set.add/update can
+    # then lose the equality relationship that stack-slot assignment needs.
+    used: list[str] = []
     for block in func.blocks:
         for phi in block.phis:
             for incoming in phi.incoming:
                 if is_local_value_ref(incoming.value):
-                    used.add(incoming.value)
+                    used.append(incoming.value)
         for instr in block.instructions:
-            used.update(instruction_used_values(instr))
-        used.update(terminator_used_values(block.terminator))
+            used.extend(instruction_used_values(instr))
+        used.extend(terminator_used_values(block.terminator))
     return used
 
 

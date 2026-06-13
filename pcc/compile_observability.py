@@ -22,6 +22,7 @@ from .diagnostics import (
     Diagnostic,
     DiagnosticBag,
     DiagnosticSeverity,
+    DiagnosticSpan,
     diagnostic_from_exception,
     emit_diagnostics,
 )
@@ -136,10 +137,14 @@ def observed_compile(
     except ObservedCompileError:
         raise
     except Exception as exc:
+        span = getattr(exc, "diagnostic_span", None)
+        if not isinstance(span, DiagnosticSpan):
+            span = _diagnostic_span_from_compile_args(args)
         diagnostic = _diagnostic_for_compile_exception(
             exc,
             options=options,
             metadata=metadata or {},
+            span=span,
         )
         bag = DiagnosticBag([diagnostic])
         formatted = emit_diagnostics(bag, fmt=options.diagnostic_format)
@@ -169,19 +174,33 @@ def _compile_metadata(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str
     return meta
 
 
+def _diagnostic_span_from_compile_args(args: tuple[Any, ...]) -> Optional[DiagnosticSpan]:
+    if not args:
+        return None
+    first = args[0]
+    if isinstance(first, (str, os.PathLike)):
+        return DiagnosticSpan(file=os.fspath(first))
+    return None
+
+
 def _diagnostic_for_compile_exception(
     exc: Exception,
     *,
     options: ObservabilityOptions,
     metadata: dict[str, Any],
+    span: Optional[DiagnosticSpan] = None,
 ) -> Diagnostic:
     diag = diagnostic_from_exception(
         exc,
         code="PCC-PY-COMPILE-001",
         phase=options.phase,
+        span=span,
         docs="pcc_multi_year_roadmap.md#92-compiler-diagnostics",
     )
     notes = list(diag.notes)
+    original_exception_type = getattr(exc, "original_exception_type", "")
+    if original_exception_type:
+        notes[0] = "exception_type=" + str(original_exception_type)
     if metadata:
         notes.append("metadata=" + repr(metadata))
     if options.explain_fallback:

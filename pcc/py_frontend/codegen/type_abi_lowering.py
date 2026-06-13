@@ -30,6 +30,7 @@ from ..py_ast import (
     StrType,
     TupleType,
     Type,
+    ValueArrayType,
 )
 from .errors import L1CodegenError
 from .layer1_support import _import_from_module_or_empty, _stmt_kind_name
@@ -181,6 +182,10 @@ class TypeAbiLoweringMixin:
             return _DOUBLE
         if isinstance(ty, BoolType):
             return _I1
+        if isinstance(ty, ValueArrayType):
+            payload_ty = self._value_array_payload_ir_type(ty)
+            if payload_ty is not None:
+                return payload_ty
         if isinstance(ty, ClassType) and bool(getattr(ty, "valueclass", False)):
             payload_ty = self._valueclass_payload_ir_type(ty)
             if payload_ty is not None:
@@ -231,6 +236,51 @@ class TypeAbiLoweringMixin:
             f"(name={getattr(ty, 'name', '?')!r})"
         )
 
+    def _value_array_payload_ir_type(self, ty: Type) -> Optional[ir.Type]:
+        if not isinstance(ty, ValueArrayType):
+            return None
+        elem_ir_ty = self._valueclass_payload_ir_type(ty.elem)
+        if elem_ir_ty is None:
+            return None
+        if ty.length == 1:
+            return ir.LiteralStructType((elem_ir_ty,))
+        if ty.length == 2:
+            return ir.LiteralStructType((elem_ir_ty, elem_ir_ty))
+        if ty.length == 3:
+            return ir.LiteralStructType((elem_ir_ty, elem_ir_ty, elem_ir_ty))
+        if ty.length == 4:
+            return ir.LiteralStructType(
+                (elem_ir_ty, elem_ir_ty, elem_ir_ty, elem_ir_ty)
+            )
+        if ty.length == 5:
+            return ir.LiteralStructType(
+                (elem_ir_ty, elem_ir_ty, elem_ir_ty, elem_ir_ty, elem_ir_ty)
+            )
+        if ty.length == 6:
+            return ir.LiteralStructType(
+                (
+                    elem_ir_ty,
+                    elem_ir_ty,
+                    elem_ir_ty,
+                    elem_ir_ty,
+                    elem_ir_ty,
+                    elem_ir_ty,
+                )
+            )
+        if ty.length == 7:
+            return ir.LiteralStructType(
+                (
+                    elem_ir_ty,
+                    elem_ir_ty,
+                    elem_ir_ty,
+                    elem_ir_ty,
+                    elem_ir_ty,
+                    elem_ir_ty,
+                    elem_ir_ty,
+                )
+            )
+        return None
+
     def _valueclass_payload_ir_type(self, ty: Type) -> Optional[ir.Type]:
         if not isinstance(ty, ClassType):
             return None
@@ -266,6 +316,39 @@ class TypeAbiLoweringMixin:
                     field_ir_types[3],
                 )
             )
+        if n_fields == 5:
+            return ir.LiteralStructType(
+                (
+                    field_ir_types[0],
+                    field_ir_types[1],
+                    field_ir_types[2],
+                    field_ir_types[3],
+                    field_ir_types[4],
+                )
+            )
+        if n_fields == 6:
+            return ir.LiteralStructType(
+                (
+                    field_ir_types[0],
+                    field_ir_types[1],
+                    field_ir_types[2],
+                    field_ir_types[3],
+                    field_ir_types[4],
+                    field_ir_types[5],
+                )
+            )
+        if n_fields == 7:
+            return ir.LiteralStructType(
+                (
+                    field_ir_types[0],
+                    field_ir_types[1],
+                    field_ir_types[2],
+                    field_ir_types[3],
+                    field_ir_types[4],
+                    field_ir_types[5],
+                    field_ir_types[6],
+                )
+            )
         return None
 
     def _valueclass_field_payload_ir_type(
@@ -281,7 +364,7 @@ class TypeAbiLoweringMixin:
         if isinstance(field_ty, ClassType) and bool(
             getattr(field_ty, "valueclass", False)
         ):
-            return None
+            return self._valueclass_payload_ir_type(field_ty)
         if isinstance(
             field_ty,
             (
@@ -311,6 +394,128 @@ class TypeAbiLoweringMixin:
     def _is_valueclass_payload_type(self, ty: Type) -> bool:
         return self._valueclass_payload_ir_type(ty) is not None
 
+    def _valueclass_payload_pointer_field_paths(
+        self,
+        ty: Type,
+        prefix: tuple[int, ...] = (),
+    ) -> tuple[tuple[int, ...], ...]:
+        if not isinstance(ty, ClassType):
+            return ()
+        if not bool(getattr(ty, "valueclass", False)):
+            return ()
+        paths: list[tuple[int, ...]] = []
+        for idx, (_field_name, field_ty) in enumerate(ty.fields):
+            field_path = prefix + (idx,)
+            if self._is_valueclass_payload_type(field_ty):
+                paths.extend(
+                    self._valueclass_payload_pointer_field_paths(
+                        field_ty,
+                        field_path,
+                    )
+                )
+                continue
+            field_ir_ty = self._valueclass_field_payload_ir_type(field_ty)
+            if field_ir_ty is not None and self._ir_type_matches(field_ir_ty, _CSTR):
+                paths.append(field_path)
+        return tuple(paths)
+
+    def _emit_entry_valueclass_payload_field_slot(
+        self,
+        payload_alloca: ir.Value,
+        field_path: tuple[int, ...],
+        name: str,
+    ) -> ir.Value:
+        fn = self.current_function
+        entry = getattr(self, "_current_entry_block", None)
+        if entry is None:
+            entry = fn.blocks[0]
+        saved_block = getattr(self.builder, "_block", None)
+        alloca_index = -1
+        alloca_prefix = str(payload_alloca) + " = alloca "
+        instr_index = 0
+        for instr in entry._instrs:
+            if str(instr.text).startswith(alloca_prefix):
+                alloca_index = instr_index
+                break
+            instr_index += 1
+        if alloca_index >= 0:
+            # Field roots are pointers into the payload alloca. They must be
+            # entry-local so every exit can leave them, but they also must
+            # follow the alloca they GEP from. Do not update the alloca
+            # insertion cache here: future allocas should still be free to
+            # insert before this non-alloca root setup.
+            if alloca_index + 1 < len(entry._instrs):
+                self.builder.position_before(entry._instrs[alloca_index + 1])
+            else:
+                self.builder.position_at_end(entry)
+        else:
+            insert_before = None
+            for instr in entry._instrs:
+                if self._instruction_opname_text(instr) != "alloca":
+                    insert_before = instr
+                    break
+            if insert_before is not None:
+                self.builder.position_before(insert_before)
+            else:
+                self.builder.position_at_end(entry)
+        indices = [ir.Constant(_I32, 0)]
+        for idx in field_path:
+            indices.append(ir.Constant(_I32, idx))
+        field_slot = self.builder.gep(
+            payload_alloca,
+            indices,
+            inbounds=True,
+            name=name,
+        )
+        self.builder.store(ir.Constant(_CSTR, None), field_slot)
+        if saved_block is not None:
+            self.builder.position_at_end(saved_block)
+        return field_slot
+
+    def _ensure_valueclass_payload_gc_roots(
+        self,
+        name: str,
+        payload_alloca: ir.Value,
+        ty: Type,
+        *,
+        borrowed: bool = True,
+    ) -> None:
+        if self.current_func_def is None:
+            return
+        if name in getattr(self, "_current_global_names", set()):
+            return
+        paths = self._valueclass_payload_pointer_field_paths(ty)
+        if not paths:
+            return
+        fn = self.current_function
+        if fn is None:
+            return
+        if not hasattr(self, "_fn_valueclass_payload_root_slots"):
+            self._fn_valueclass_payload_root_slots = {}
+        registry = self._fn_valueclass_payload_root_slots.setdefault(fn.name, [])
+        frame_map = (
+            self._gc_one_slot_borrowed_frame_map()
+            if borrowed
+            else self._gc_one_slot_frame_map()
+        )
+        for path in paths:
+            already_registered = False
+            for registered_alloca, registered_path in registry:
+                if registered_alloca is payload_alloca and registered_path == path:
+                    already_registered = True
+                    break
+            if already_registered:
+                continue
+            path_suffix = "_".join(str(i) for i in path)
+            field_slot = self._emit_entry_valueclass_payload_field_slot(
+                payload_alloca,
+                path,
+                self._fresh(f"{name}.value.root.{path_suffix}"),
+            )
+            registry.append((payload_alloca, path))
+            root_name = f"{name}.$valuefield.{path_suffix}"
+            self._ensure_local_gc_frame_root(root_name, field_slot, _CSTR, frame_map)
+
     def _valueclass_field_info(
         self,
         ty: Type,
@@ -329,6 +534,8 @@ class TypeAbiLoweringMixin:
         self,
         value: ir.Value,
         ty: Type,
+        *,
+        consume_fields: bool = False,
     ) -> Optional[ir.Value]:
         if not isinstance(ty, ClassType):
             return None
@@ -362,17 +569,29 @@ class TypeAbiLoweringMixin:
                 [idx],
                 name=self._fresh(f"value.{ty.name}.box.field{idx}"),
             )
-            field_obj = marshal.marshal_to_object(
-                self.builder,
-                self.module,
-                self.runtime,
+            field_obj = self._emit_valueclass_payload_to_object(
                 field_value,
                 field_ty,
+                consume_fields=consume_fields,
             )
+            if field_obj is None:
+                field_obj = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    field_value,
+                    field_ty,
+                )
             self.builder.call(
                 self.runtime["py_valuebox_set_field"],
                 [inst, ir.Constant(_I32, idx), field_obj],
             )
+            if consume_fields and isinstance(field_obj.type, ir.PointerType):
+                if field_obj not in getattr(self, "_cpy_values", ()):
+                    self._gc_release(
+                        field_obj,
+                        self._release_context_label("valuebox_field_transfer"),
+                    )
         return inst
 
     def _emit_object_to_valueclass_payload(
@@ -457,13 +676,15 @@ class TypeAbiLoweringMixin:
                 [value, ir.Constant(_I32, idx)],
                 name=self._fresh(f"value.{ty.name}.unbox.field{idx}.obj"),
             )
-            field_value = marshal.marshal_from_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                field_obj,
-                field_ty,
-            )
+            field_value = self._emit_object_to_valueclass_payload(field_obj, field_ty)
+            if field_value is None:
+                field_value = marshal.marshal_from_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    field_obj,
+                    field_ty,
+                )
             field_ptr = self.builder.gep(
                 payload_slot,
                 [zero, ir.Constant(_I32, idx)],
@@ -480,6 +701,9 @@ class TypeAbiLoweringMixin:
         return isinstance(ty, (IntType, FloatType, BoolType))
 
     def _is_object(self, ty: Type) -> bool:
+        if isinstance(ty, ValueArrayType):
+            if self._value_array_payload_ir_type(ty) is not None:
+                return False
         if isinstance(ty, ClassType) and bool(getattr(ty, "valueclass", False)):
             if self._is_valueclass_payload_type(ty):
                 return False

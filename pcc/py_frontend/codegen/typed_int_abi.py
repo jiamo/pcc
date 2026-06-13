@@ -65,17 +65,31 @@ from ..py_ast import (
 _ClassDef = ClassDef
 
 
-def _typed_int_unboxed_abi_enabled() -> bool:
+def _typed_int_unboxed_abi_mode() -> str:
     mode = os.environ.get("PCC_PYTHON_TYPED_INT_ABI", "auto").strip().lower()
     if mode == "0":
-        return False
+        return "off"
     if mode == "off":
-        return False
+        return "off"
     if mode == "false":
-        return False
+        return "off"
     if mode == "boxed":
-        return False
-    return True
+        return "off"
+    if mode == "unsafe-i64":
+        return "unsafe-i64"
+    if mode == "unsafe_i64":
+        return "unsafe-i64"
+    if mode == "raw-i64":
+        return "unsafe-i64"
+    if mode == "raw_i64":
+        return "unsafe-i64"
+    if mode == "i64":
+        return "unsafe-i64"
+    return "auto"
+
+
+def _typed_int_unboxed_abi_enabled() -> bool:
+    return _typed_int_unboxed_abi_mode() != "off"
 
 
 def _typed_int_abi_debug(func_name: str, reason: str) -> None:
@@ -270,8 +284,9 @@ class TypedIntAbiMixin:
         # Keep this as direct field checks. A previous dict cache used
         # Optional[bool] sentinel logic and pcc1 miscompiled the None test,
         # silently forcing typed-int functions back to the boxed ABI.
+        mode = _typed_int_unboxed_abi_mode()
         result = False
-        if _typed_int_unboxed_abi_enabled():
+        if mode != "off":
             result = True
             if fd.is_async:
                 result = False
@@ -279,8 +294,12 @@ class TypedIntAbiMixin:
                 result = False
             if len(fd.decorators) != 0:
                 result = False
-            if not isinstance(fd.return_ty, (IntType, FloatType)):
-                result = False
+            if mode == "unsafe-i64":
+                if not isinstance(fd.return_ty, (IntType, FloatType)):
+                    result = False
+            else:
+                if not isinstance(fd.return_ty, FloatType):
+                    result = False
             if result:
                 for arg in fd.args:
                     if arg.name == "":
@@ -292,9 +311,14 @@ class TypedIntAbiMixin:
                     ):
                         result = False
                         break
-                    if not _type_is_typed_int_abi_param(arg.annotation):
-                        result = False
-                        break
+                    if mode == "unsafe-i64":
+                        if not _type_is_typed_int_abi_param(arg.annotation):
+                            result = False
+                            break
+                    else:
+                        if not isinstance(arg.annotation, FloatType):
+                            result = False
+                            break
                     if arg.default is not None:
                         if not _type_is_typed_int_abi_scalar(arg.annotation):
                             result = False
@@ -302,7 +326,11 @@ class TypedIntAbiMixin:
                         if not _expr_is_native_typed_int_shape(arg.default):
                             result = False
                             break
-            if result and self._typed_int_abi_call_arg_safety:
+            if (
+                mode == "unsafe-i64"
+                and result
+                and self._typed_int_abi_call_arg_safety
+            ):
                 arg_safety = self._typed_int_call_safety_for_name(
                     self._typed_int_abi_call_arg_safety,
                     fd.name,

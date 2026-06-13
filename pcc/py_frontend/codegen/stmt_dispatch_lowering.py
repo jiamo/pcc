@@ -1,4 +1,5 @@
 """Statement dispatch lowering for L1CodeGen."""
+
 from __future__ import annotations
 
 import os
@@ -11,6 +12,7 @@ from ..py_ast import (
     ClassDef,
     Continue,
     Delete,
+    DynType,
     ExprStmt,
     For,
     FuncDef,
@@ -18,6 +20,7 @@ from ..py_ast import (
     If,
     Import,
     ImportFrom,
+    Name,
     Nonlocal,
     Pass,
     Raise,
@@ -88,6 +91,30 @@ def _stmt_is_return(stmt) -> bool:
 
 
 class StmtDispatchLoweringMixin:
+    def _loop_finally_base(self) -> int:
+        """Depth of the finally stack at loop entry. ``break``/``continue`` run
+        the finally blocks pushed *above* this base (those entered inside the
+        loop) before jumping, without disturbing finallys enclosing the loop."""
+        stack = getattr(self, "_finally_stack", None)
+        return len(stack) if stack else 0
+
+    def _run_loop_exit_finallys(self, base: int) -> None:
+        """Emit the finally blocks entered inside the current loop (top-down to
+        ``base``) on a ``break``/``continue`` exit. Mirrors the return path's
+        ``_emit_pending_finally_blocks`` but bounded to the loop scope."""
+        stack = getattr(self, "_finally_stack", None)
+        if not stack or getattr(self, "_emitting_finally", False):
+            return
+        prev = self._emitting_finally
+        self._emitting_finally = True
+        idx = len(stack) - 1
+        while idx >= base:
+            if self._builder_block_is_terminated():
+                break
+            self._emit_stmts(stack[idx])
+            idx -= 1
+        self._emitting_finally = prev
+
     def _emit_stmts_impl(self, stmts: tuple[Stmt, ...]) -> None:
         debug_codegen = bool(os.environ.get("PCC_DEBUG_CODEGEN_PHASES"))
         stmt_index = 0
@@ -212,23 +239,119 @@ class StmtDispatchLoweringMixin:
         if isinstance(stmt, Break):
             if not self.loop_stack:
                 raise L1CodegenError("break outside loop")
-            _, break_bb = self.loop_stack[-1]
-            self.builder.branch(break_bb)
+            frame = self.loop_stack[-1]
+            break_bb = frame[1]
+            # finally blocks entered inside the loop must run before the jump.
+            self._run_loop_exit_finallys(frame[2] if len(frame) > 2 else 0)
+            if not self._builder_block_is_terminated():
+                self.builder.branch(break_bb)
             return
         if isinstance(stmt, Continue):
             if not self.loop_stack:
                 raise L1CodegenError("continue outside loop")
-            cont_bb, _ = self.loop_stack[-1]
-            self.builder.branch(cont_bb)
+            frame = self.loop_stack[-1]
+            cont_bb = frame[0]
+            self._run_loop_exit_finallys(frame[2] if len(frame) > 2 else 0)
+            if not self._builder_block_is_terminated():
+                self.builder.branch(cont_bb)
             return
         if isinstance(stmt, Delete):
             self._emit_delete(stmt)
             return
         if isinstance(stmt, FuncDef):
-            # Module-scope block declarations are predeclared and emitted by
-            # the module-generation pass. Nested FuncDefs are closure-hoisted
-            # before codegen; the declaration statement itself has no native
-            # side effect in pcc's static model.
+            # A def nested in a module-scope control-flow block is an
+            # executable binding.  Its body was predeclared/emitted by the
+            # generation pass; create the callable only when this branch runs
+            # and store it in the module namespace.  Function-local nested
+            # defs remain closure-hoisted and therefore have no statement-side
+            # effect here.
+            if self.current_func_def is None and stmt.name in getattr(
+                self, "_module_block_func_defs", {}
+            ):
+                fn_obj = self._emit_native_func_value(
+                    stmt.name,
+                    stmt.name,
+                    self.functions[stmt.name],
+                    (),
+                )
+                self._store_value_at_name(
+                    Name(
+                        span=stmt.span,
+                        ty=DynType(name="dyn"),
+                        ident=stmt.name,
+                    ),
+                    fn_obj,
+                    DynType(name="dyn"),
+                    value_is_owned=True,
+                )
+                return
+
+            # An ordinary module-level ``def`` is executable too.  Publish
+            # the callable as soon as the statement runs so an import cycle
+            # can observe functions defined before the cycle began.  The
+            # end-of-module globals synchronization is too late for that
+            # partial-initialization boundary.
+            #
+            # Decorators may replace the callable.  Keep statement-time
+            # publication to the same undecorated surface that the former
+            # end-of-module synchronization exposed; eagerly wrapping every
+            # metadata-decorated package function causes severe IR growth.
+            if self.current_func_def is None and stmt.name in self.functions:
+                decorators = self._func_decorators(stmt)
+                needs_object = bool(
+                    getattr(self, "_native_function_object_exports", {}).get(
+                        stmt.name,
+                        False,
+                    )
+                )
+                # Avoid ``all(generator)`` in this self-hosted codegen path.
+                # pcc1 can lose the yielded bool projection and classify a
+                # metadata-only decorator as semantic, which suppresses a
+                # required runtime function-object publication.
+                metadata_only = bool(decorators)
+                if metadata_only:
+                    for decorator in decorators:
+                        if not self._decorator_is_noop_whitelist(decorator):
+                            metadata_only = False
+                            break
+                semantic_decorators = bool(
+                    decorators
+                ) and self._decorators_are_native_functions(stmt)
+                if (
+                    not decorators
+                    or semantic_decorators
+                    or (needs_object and metadata_only)
+                ):
+                    if semantic_decorators:
+                        fn_obj = self._emit_decorated_user_function_value(
+                            name=stmt.name,
+                            fn=self.functions[stmt.name],
+                            ast_func_def=stmt,
+                        )
+                    else:
+                        fn_obj = self._emit_native_func_value(
+                            stmt.name,
+                            stmt.name,
+                            self.functions[stmt.name],
+                            (),
+                        )
+                    module_name = self.ast_module.name or "__main__"
+                    module_name_ptr = self._ptr_to_cstr(
+                        self._cstr_global(
+                            module_name,
+                            f".pcc.def.binding.module.{module_name}",
+                        )
+                    )
+                    self.builder.call(
+                        self.runtime["py_module_attr_set"],
+                        [
+                            module_name_ptr,
+                            self._attr_name_ptr(stmt.name),
+                            fn_obj,
+                        ],
+                        name=self._fresh(f"pcc.def.binding.publish.{stmt.name}"),
+                    )
+                    self._gc_release(fn_obj)
             return
         if isinstance(stmt, ClassDef) and self.current_func_def is None:
             self.class_lowering.emit_class_statement_init(stmt)

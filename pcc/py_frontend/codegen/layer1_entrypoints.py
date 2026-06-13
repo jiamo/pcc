@@ -1,14 +1,17 @@
 """Public entrypoint wrappers for ``L1CodeGen``."""
+
 from __future__ import annotations
 
 import os
 import sys
 from typing import Optional
 
+from pcc.diagnostics import DiagnosticSpan
 from pcc.llvm_capi.compat import ir
 
 from ..py_ast import Expr, Module, Stmt
 from .expr_dispatch_lowering import ExprDispatchLoweringMixin
+from .errors import CodegenDiagnosticError
 from .generation_lowering import GenerationLoweringMixin
 from .layer1_init import Layer1InitMixin
 from .stmt_dispatch_lowering import StmtDispatchLoweringMixin
@@ -42,29 +45,41 @@ class L1CodeGenEntrypointMixin:
             return GenerationLoweringMixin._generate_impl(self, module)
         except BaseException as exc:
             self._codegen_trace_dump(exc)
+            if self._codegen_trace_is_enabled():
+                if isinstance(exc, CodegenDiagnosticError):
+                    raise
+                diagnostic_span = None
+                ring = self._codegen_trace_ring
+                if len(ring) > 0:
+                    ring_index = len(ring) - 1
+                    capacity = self._codegen_trace_capacity
+                    if capacity > 0 and len(ring) >= capacity:
+                        ring_index = (self._codegen_trace_next - 1) % len(ring)
+                    diagnostic_span = ring[ring_index][6]
+                raise CodegenDiagnosticError(
+                    str(exc) or type(exc).__name__,
+                    diagnostic_span,
+                    type(exc).__name__,
+                ) from exc
             raise
 
-    def _codegen_trace_span(self, node: object) -> str:
+    def _codegen_trace_span(self, node: object):
         try:
             span = node.span  # type: ignore[attr-defined]
         except Exception:
-            return ""
+            return None
         if span is None:
-            return ""
+            return None
         try:
-            return (
-                str(span.file)
-                + ":"
-                + str(span.line)
-                + ":"
-                + str(span.col)
-                + "-"
-                + str(span.end_line)
-                + ":"
-                + str(span.end_col)
+            return DiagnosticSpan(
+                file=str(span.file),
+                line=int(span.line),
+                col=int(span.col),
+                end_line=int(span.end_line),
+                end_col=int(span.end_col),
             )
         except Exception:
-            return ""
+            return None
 
     def _codegen_trace_module(self) -> str:
         mod_name = ""
@@ -102,7 +117,7 @@ class L1CodeGenEntrypointMixin:
         stmt_index: int,
         stmt_kind: str,
         expr_kind: str,
-        span: str,
+        span,
     ) -> None:
         if not self._codegen_trace_is_enabled():
             return
@@ -115,8 +130,6 @@ class L1CodeGenEntrypointMixin:
         trace_next = int(getattr(self, "_codegen_trace_next", 0))
         if trace_next < 0:
             trace_next = 0
-        if span is None:
-            span = ""
         entry = (
             boundary,
             self._codegen_trace_module(),
@@ -165,6 +178,16 @@ class L1CodeGenEntrypointMixin:
             + function_name
             + "\n"
         )
+        try:
+            _write_line(
+                "PCC_CODEGEN_EXCEPTION_DETAIL message="
+                + str(exc)
+                + " args="
+                + repr(getattr(exc, "args", ()))
+                + "\n"
+            )
+        except Exception:
+            pass
         try:
             current_stmt = self._codegen_current_stmt_index
         except Exception:
@@ -216,6 +239,9 @@ class L1CodeGenEntrypointMixin:
                 b_expr_kind,
                 b_span,
             ) = ordered[idx]
+            span_text = ""
+            if b_span is not None:
+                span_text = b_span.format_compact()
             line = (
                 "PCC_CODEGEN_BREADCRUMB "
                 + str(idx)
@@ -232,7 +258,7 @@ class L1CodeGenEntrypointMixin:
                 + " expr_kind="
                 + b_expr_kind
                 + " span="
-                + b_span
+                + span_text
                 + "\n"
             )
             _write_line(line)

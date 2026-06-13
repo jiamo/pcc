@@ -16,6 +16,7 @@ from ..py_ast import (
     ListType,
     MemoryViewType,
     NoneType,
+    SetType,
     StrType,
     TupleType,
     Type,
@@ -55,12 +56,30 @@ class CpyBridgeLoweringMixin:
         import os
         import sys
 
-        if os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE"):
+        module_name = ""
+        try:
+            module_name = self.ast_module.name
+        except AttributeError:
             module_name = ""
-            try:
-                module_name = self.ast_module.name
-            except AttributeError:
-                module_name = ""
+        function_name = "<module>"
+        current_func_def = getattr(self, "current_func_def", None)
+        if current_func_def is not None:
+            function_name = current_func_def.name
+        strict_stub_filter = os.environ.get(
+            "PCC_DEBUG_STRICT_NOLIB_STUB", ""
+        ).strip()
+        qualified_name = str(module_name) + "." + str(function_name)
+        if strict_stub_filter and (
+            strict_stub_filter == "1" or strict_stub_filter in qualified_name
+        ):
+            sys.stderr.write(
+                "[pcc.strict-nolib-fallback] "
+                + qualified_name
+                + ": builtin="
+                + str(name)
+                + "\n"
+            )
+        if os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE"):
             sys.stderr.write(
                 "debug: load_cpython_builtin module="
                 + str(module_name)
@@ -93,6 +112,8 @@ class CpyBridgeLoweringMixin:
         value: ir.Value,
         value_ty: Type,
         name_hint: str,
+        *,
+        consume_valueclass_payload_fields: bool = False,
     ) -> ir.Value:
         if value in self._cpy_values:
             bridged = self.builder.call(
@@ -102,7 +123,11 @@ class CpyBridgeLoweringMixin:
             )
             self.builder.call(self.runtime["py_cpy_decref"], [value])
             return bridged
-        boxed_valueclass = self._emit_valueclass_payload_to_object(value, value_ty)
+        boxed_valueclass = self._emit_valueclass_payload_to_object(
+            value,
+            value_ty,
+            consume_fields=consume_valueclass_payload_fields,
+        )
         if boxed_valueclass is not None:
             return boxed_valueclass
         return marshal.marshal_to_object(
@@ -210,7 +235,15 @@ class CpyBridgeLoweringMixin:
             )
         if isinstance(
             ty,
-            (ListType, DictType, TupleType, BytesType, ByteArrayType, MemoryViewType),
+            (
+                ListType,
+                DictType,
+                TupleType,
+                SetType,
+                BytesType,
+                ByteArrayType,
+                MemoryViewType,
+            ),
         ):
             # pcc-native object containers / byte buffers — rebuild as a
             # CPython object.

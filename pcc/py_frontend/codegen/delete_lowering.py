@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Attr, ClassType, Delete, DictType, DynType, IntType, ListType, Name, Slice, Subscript
+from ..py_ast import Attr, ByteArrayType, ClassType, Delete, DictType, DynType, IntType, ListType, Name, Slice, Subscript
 from . import marshal
 from .runtime_abi import declare_runtime_global
 
@@ -43,6 +43,7 @@ class DeleteLoweringMixin:
                     self.env_class_hint.pop(target.ident, None)
                 self._clear_native_module_object_alias(target.ident)
                 self._weak_dict_env_flags.pop(target.ident, None)
+                self._weakref_env_flags.pop(target.ident, None)
                 continue
             if isinstance(target, Subscript):
                 if isinstance(target.idx, Slice):
@@ -55,6 +56,12 @@ class DeleteLoweringMixin:
                         if isinstance(obj_ty, ListType):
                             self.builder.call(
                                 self.runtime["py_list_del_slice"],
+                                [obj, lo_obj, hi_obj, step_obj],
+                            )
+                            return
+                        if isinstance(obj_ty, ByteArrayType):
+                            self.builder.call(
+                                self.runtime["py_bytearray_del_slice"],
                                 [obj, lo_obj, hi_obj, step_obj],
                             )
                             return

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Call, Expr
+from ..py_ast import Call, Expr, Lambda
 
 
 _I8 = ir.IntType(8)
@@ -13,6 +13,27 @@ _CSTR = _I8.as_pointer()
 
 
 class CpyCallLoweringMixin:
+    def _emit_cpython_call_arg(self, expr: Expr) -> tuple[ir.Value, bool]:
+        """Emit one argument for a CPython call boundary.
+
+        Lambda values need a real CPython callable wrapper here. The generic
+        expression path may prefer pcc-native callable objects, which are not
+        valid PyObject callables for libpython APIs such as sorted(key=...).
+        """
+
+        if isinstance(expr, Lambda):
+            simple = self._maybe_emit_simple_lambda(expr)
+            if simple is not None:
+                return simple, True
+            wrapped = self._maybe_emit_lambda_wrap(expr)
+            if wrapped is not None:
+                return wrapped, True
+            raise NotImplementedError(
+                "CPython fallback call cannot pass unsupported lambda"
+            )
+        v = self._emit_expr(expr)
+        return self._marshal_to_cpython(v, expr.ty)
+
     def _emit_cpy_call_kwdict(
         self,
         fn_val: ir.Value,
@@ -32,8 +53,7 @@ class CpyCallLoweringMixin:
         n_pos = len(pos_exprs)
         pos_vals: list[ir.Value] = []
         for arg in pos_exprs:
-            v = self._emit_expr(arg)
-            ca, _ = self._marshal_to_cpython(v, arg.ty)
+            ca, _ = self._emit_cpython_call_arg(arg)
             pos_vals.append(ca)
         if n_pos == 0:
             pos_argv_ptr = ir.Constant(_CSTR, None)
@@ -56,8 +76,7 @@ class CpyCallLoweringMixin:
                 _CSTR,
                 name=self._fresh("pos.p"),
             )
-        kw_v = self._emit_expr(kwargs_expr)
-        kw_cpy, kw_owned = self._marshal_to_cpython(kw_v, kwargs_expr.ty)
+        kw_cpy, kw_owned = self._emit_cpython_call_arg(kwargs_expr)
         result = self.builder.call(
             self.runtime["py_cpy_call_kwdict"],
             [fn_val, ir.Constant(_I64, n_pos), pos_argv_ptr, kw_cpy],
@@ -100,8 +119,7 @@ class CpyCallLoweringMixin:
         """Dispatch ``callable(pos..., *iters..., **mapping)`` via the
         list+kwdict helper."""
         args_list = self._emit_pcc_args_list(arg_exprs, name_hint)
-        kw_v = self._emit_expr(kwargs_expr)
-        kw_cpy, kw_owned = self._marshal_to_cpython(kw_v, kwargs_expr.ty)
+        kw_cpy, kw_owned = self._emit_cpython_call_arg(kwargs_expr)
         result = self.builder.call(
             self.runtime["py_cpy_call_list_kwdict"],
             [fn_val, args_list, kw_cpy],
@@ -126,8 +144,7 @@ class CpyCallLoweringMixin:
         helper that converts the pcc container to a CPython tuple."""
         inner = starred_call.args[0]
         iter_val = self._emit_expr(inner)
-        kw_v = self._emit_expr(kwargs_expr)
-        kw_cpy, kw_owned = self._marshal_to_cpython(kw_v, kwargs_expr.ty)
+        kw_cpy, kw_owned = self._emit_cpython_call_arg(kwargs_expr)
         result = self.builder.call(
             self.runtime["py_cpy_call_list_kwdict"],
             [fn_val, iter_val, kw_cpy],
@@ -153,8 +170,7 @@ class CpyCallLoweringMixin:
         that merges explicit kwargs into the mapping before the call."""
         pos_vals: list[ir.Value] = []
         for arg in pos_exprs:
-            v = self._emit_expr(arg)
-            ca, _ = self._marshal_to_cpython(v, arg.ty)
+            ca, _ = self._emit_cpython_call_arg(arg)
             pos_vals.append(ca)
         if pos_vals:
             pos_arr_ty = ir.ArrayType(_CSTR, len(pos_vals))
@@ -178,8 +194,7 @@ class CpyCallLoweringMixin:
         else:
             pos_argv_ptr = ir.Constant(_CSTR, None)
 
-        kw_v = self._emit_expr(kwargs_expr)
-        kw_cpy, kw_owned = self._marshal_to_cpython(kw_v, kwargs_expr.ty)
+        kw_cpy, kw_owned = self._emit_cpython_call_arg(kwargs_expr)
 
         if kwargs:
             names_arr_ty = ir.ArrayType(_CSTR, len(kwargs))
@@ -206,8 +221,7 @@ class CpyCallLoweringMixin:
                     name=self._fresh(f"mixn.{i}"),
                 )
                 self.builder.store(self._ptr_to_cstr(name_gv), ngep)
-                raw_v = self._emit_expr(kw_expr)
-                ca, is_owned = self._marshal_to_cpython(raw_v, kw_expr.ty)
+                ca, is_owned = self._emit_cpython_call_arg(kw_expr)
                 kw_vals.append(ca)
                 kw_owned_flags.append(is_owned)
                 vgep = self.builder.gep(
@@ -329,8 +343,7 @@ class CpyCallLoweringMixin:
             )
         cpy_args: list[ir.Value] = []
         for arg in arg_exprs:
-            v = self._emit_expr(arg)
-            cpy_arg, _owned = self._marshal_to_cpython(v, arg.ty)
+            cpy_arg, _owned = self._emit_cpython_call_arg(arg)
             cpy_args.append(cpy_arg)
         n = len(cpy_args)
         if n == 0:
@@ -457,8 +470,7 @@ class CpyCallLoweringMixin:
         cpy_args: list[ir.Value] = []
         owned: list[bool] = []
         for arg in arg_exprs:
-            v = self._emit_expr(arg)
-            cpy_arg, is_owned = self._marshal_to_cpython(v, arg.ty)
+            cpy_arg, is_owned = self._emit_cpython_call_arg(arg)
             cpy_args.append(cpy_arg)
             owned.append(is_owned)
 
@@ -565,14 +577,12 @@ class CpyCallLoweringMixin:
         n_kw = len(kwargs)
         pos_vals: list[ir.Value] = []
         for arg in pos_exprs:
-            v = self._emit_expr(arg)
-            ca, _ = self._marshal_to_cpython(v, arg.ty)
+            ca, _ = self._emit_cpython_call_arg(arg)
             pos_vals.append(ca)
         kw_vals: list[ir.Value] = []
         kw_owned: list[bool] = []
         for _name, kv in kwargs:
-            v = self._emit_expr(kv)
-            ca, is_owned = self._marshal_to_cpython(v, kv.ty)
+            ca, is_owned = self._emit_cpython_call_arg(kv)
             kw_vals.append(ca)
             kw_owned.append(is_owned)
 
@@ -665,5 +675,4 @@ class CpyCallLoweringMixin:
             self._cpy_values = set()
         self._cpy_values.add(result)
         return result
-
 

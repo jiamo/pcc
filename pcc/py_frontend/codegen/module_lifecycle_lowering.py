@@ -1,10 +1,10 @@
 """Module lifecycle lowering for L1CodeGen."""
+
 from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
 
 from ..py_ast import Stmt
-
 
 _I8 = ir.IntType(8)
 _I32 = ir.IntType(32)
@@ -13,6 +13,16 @@ _CSTR = _I8.as_pointer()
 
 
 class ModuleLifecycleLoweringMixin:
+    def _emit_module_docstring_binding(self) -> None:
+        """Publish the module's implicit ``__doc__`` attribute."""
+        docstring = self.ast_module.docstring
+        if docstring is None:
+            value = self._emit_none_literal()
+        else:
+            value = self._emit_str_literal(docstring)
+        self._publish_module_scope_import_binding("__doc__", value)
+        self._gc_release(value)
+
     def _emit_module_teardown(self) -> None:
         """Emit a per-module function that clears object globals."""
         fn_name = self._module_teardown_name()
@@ -53,10 +63,26 @@ class ModuleLifecycleLoweringMixin:
 
         self.builder.position_at_end(body_bb)
         self.builder.store(ir.Constant(_I32, 1), guard)
+        module_name_ptr = self._pooled_cstr_ptr(
+            self.ast_module.name or "__main__",
+            ".pcc.module.fini.name",
+        )
         for _name, item in reversed(list(self._module_globals.items())):
             gv, declared_ty = item
+            if self._is_valueclass_payload_type(declared_ty):
+                self._clear_module_global_valueclass_payload_roots(gv, declared_ty)
+                continue
             if not self._module_global_needs_teardown(gv, declared_ty):
                 continue
+            # Executed module assignments are also retained by the module
+            # attribute dictionary.  Drop that duplicate owner before the
+            # LLVM global root so a last-reference __del__ runs while imports
+            # and the rest of the module namespace are still available.
+            self.builder.call(
+                self.runtime["py_module_attr_del"],
+                [module_name_ptr, self._attr_name_ptr(_name)],
+                name=self._fresh("mod.fini.attr.del"),
+            )
             if self._cpy_module_flags.get(_name, False):
                 value = self.builder.load(
                     gv,
@@ -152,10 +178,17 @@ class ModuleLifecycleLoweringMixin:
         self.builder.position_at_end(body_bb)
         self.builder.store(ir.Constant(_I32, 1), guard)
         self._emit_module_root_enters()
+        self._emit_module_docstring_binding()
 
         self._emit_stmts(tuple(body))
 
         if not self._builder_block_is_terminated():
+            # Make initialized sibling-module globals and classes visible to
+            # the public C-API import bridge. This is the native equivalent of
+            # publishing a module namespace after executing its top level;
+            # extensions using PyImport_ImportModule must see the same compiled
+            # modules that direct pcc imports already resolved.
+            self._emit_globals_builtin()
             self.builder.branch(done_bb)
 
         self.builder.position_at_end(done_bb)
@@ -208,9 +241,7 @@ class ModuleLifecycleLoweringMixin:
             [fn.args[0], fn.args[1]],
         )
 
-        # Call other-module top-inits first (multi-file compile).
-        # Each declared-external void function executes the sibling
-        # module's class init + top-level statements.
+        sibling_init_functions = []
         for sibling_mod in self._sibling_module_inits:
             sanitised_sib = sibling_mod.replace(".", "_").replace("-", "_")
             sib_top = f"_pcc_py_module_top_{sanitised_sib}"
@@ -224,10 +255,35 @@ class ModuleLifecycleLoweringMixin:
                 sib_fn.linkage = "external"
             else:
                 sib_fn = existing
-            self.builder.call(sib_fn, [])
-            self._emit_post_call_err_check()
+            sibling_init_functions.append((sibling_mod, sib_fn))
 
+        # Register every compiled sibling before executing any of them. A C
+        # extension may import a sibling that is later in the eager order; the
+        # runtime can now execute that guarded top-init on demand.
+        for sibling_mod, sib_fn in sibling_init_functions:
+            mod_name_ptr = self._ptr_to_cstr(
+                self._cstr_global(
+                    sibling_mod,
+                    f".pcc.compiled.init.name.{sibling_mod}",
+                )
+            )
+            init_ptr = sib_fn
+            if init_ptr.type != _CSTR:
+                init_ptr = self.builder.bitcast(
+                    init_ptr,
+                    _CSTR,
+                    name=self._fresh("compiled.init.fn"),
+                )
+            self.builder.call(
+                self.runtime["py_compiled_module_register_init"],
+                [mod_name_ptr, init_ptr],
+            )
+
+        # Sibling top-level code runs when an import statement reaches it.
+        # Eager dependency-first execution cannot preserve a package's partial
+        # state across cycles (parent setup; import child; child reads parent).
         self._emit_module_root_enters()
+        self._emit_module_docstring_binding()
         self._emit_stmts(tuple(body))
 
         if not self._builder_block_is_terminated():

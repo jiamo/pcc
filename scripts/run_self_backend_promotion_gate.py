@@ -27,13 +27,17 @@ GATES: dict[str, Gate] = {
     ),
     "c-testsuite": Gate(
         name="c-testsuite",
-        pytest_args=("tests/c/test_c_testsuite_self.py", "-q", "-n0"),
+        pytest_args=(
+            "-m", "integration", "tests/c/test_c_testsuite_self.py", "-q", "-n0"
+        ),
         timeout_seconds=1200,
         description="full c-testsuite self/native and self/LLVM broad gate",
     ),
     "gcc-torture": Gate(
         name="gcc-torture",
-        pytest_args=("tests/c/test_gcc_torture_self.py", "-q", "-n0"),
+        pytest_args=(
+            "-m", "integration", "tests/c/test_gcc_torture_self.py", "-q", "-n0"
+        ),
         timeout_seconds=3600,
         description="full gcc-torture self/native and self/LLVM formal gate",
     ),

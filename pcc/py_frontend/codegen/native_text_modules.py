@@ -1,11 +1,12 @@
 """Native ``json`` and ``re`` module lowering helpers."""
+
 from __future__ import annotations
 
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Attr, BinOp, BoolLit, Call, Expr, IntLit, Name, StrLit
+from ..py_ast import Assign, Attr, BinOp, BoolLit, Call, Expr, IntLit, Name, StrLit
 from .import_lowering import (
     _dataclass_field_names,
     _dataclass_field_value,
@@ -20,11 +21,72 @@ _RE_CONSTS = {
     "MULTILINE": 8,
     "S": 16,
     "DOTALL": 16,
+    "X": 64,
+    "VERBOSE": 64,
 }
 _RE_ALIAS_METHODS = frozenset(("match", "search", "findall"))
 
 
 class NativeTextModulesLoweringMixin:
+    @staticmethod
+    def _native_re_hex_digit(ch: str) -> int:
+        if "0" <= ch <= "9":
+            return ord(ch) - ord("0")
+        if "a" <= ch <= "f":
+            return ord(ch) - ord("a") + 10
+        if "A" <= ch <= "F":
+            return ord(ch) - ord("A") + 10
+        return -1
+
+    @staticmethod
+    def _native_re_literal_escape_value(ch: str) -> int:
+        if ch == "n":
+            return 10
+        if ch == "t":
+            return 9
+        if ch == "r":
+            return 13
+        if ch == "f":
+            return 12
+        if ch == "v":
+            return 11
+        return ord(ch)
+
+    def _native_re_strip_verbose_pattern(self, pattern: str) -> str:
+        """Apply the lexical part of ``re.X`` to a literal pattern."""
+        out = []
+        in_class = False
+        escaped = False
+        in_comment = False
+        for ch in pattern:
+            if in_comment:
+                if ch == "\n":
+                    in_comment = False
+                continue
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == "[":
+                in_class = True
+                out.append(ch)
+                continue
+            if ch == "]" and in_class:
+                in_class = False
+                out.append(ch)
+                continue
+            if not in_class and ch == "#":
+                in_comment = True
+                continue
+            if not in_class and ch in " \t\n\r\f\v":
+                continue
+            out.append(ch)
+        return "".join(out)
+
     def _native_re_findall_supported_pattern_text(self, pattern: str) -> bool:
         return pattern in (
             r"\b[a-z][\w$]*\b",
@@ -112,17 +174,35 @@ class NativeTextModulesLoweringMixin:
         if kwargs or len(args) != 1:
             return None
         arg = args[0]
-        if not isinstance(arg, StrLit):
-            return None
-        return self._emit_str_literal(
-            self._textwrap_dedent_literal_value(arg.value)
+        if isinstance(arg, StrLit):
+            return self._emit_str_literal(self._textwrap_dedent_literal_value(arg.value))
+        result = self.builder.call(
+            self.runtime["py_textwrap_dedent"],
+            [self._emit_as_object(arg)],
+            name=self._fresh("textwrap.dedent"),
         )
+        self._emit_post_call_err_check(self._expr_span_or_none(arg))
+        return result
 
     def _native_re_static_flags_value(self, expr: Expr | None) -> Optional[int]:
         if expr is None:
             return 0
         if isinstance(expr, IntLit):
             return int(expr.value)
+        if isinstance(expr, Name):
+            known = getattr(self, "_native_re_static_flag_aliases", {}).get(expr.ident)
+            if known is not None:
+                return known
+            for stmt in getattr(self.ast_module, "body", ()):
+                if not isinstance(stmt, Assign) or len(stmt.targets) != 1:
+                    continue
+                target = stmt.targets[0]
+                if not isinstance(target, Name) or target.ident != expr.ident:
+                    continue
+                if isinstance(stmt.value, Name) and stmt.value.ident == expr.ident:
+                    return None
+                return self._native_re_static_flags_value(stmt.value)
+            return None
         if (
             isinstance(expr, Attr)
             and isinstance(expr.obj, Name)
@@ -162,7 +242,12 @@ class NativeTextModulesLoweringMixin:
         )
         if flags is None:
             return None
-        return pattern.value, flags
+        if flags & 64:
+            pattern_value = self._native_re_strip_verbose_pattern(pattern.value)
+            flags &= ~64
+        else:
+            pattern_value = pattern.value
+        return pattern_value, flags
 
     def _native_re_compile_alias_for_name(
         self,
@@ -318,14 +403,18 @@ class NativeTextModulesLoweringMixin:
             or len(expr.args) != 1
         ):
             return None
-        # `json.dumps` supports `sort_keys` but we currently ignore it at
-        # codegen time to stay on the native path (`py_json_dumps`).
+        # `json.dumps` supports `sort_keys=<literal bool>` natively: it lowers
+        # to `py_json_dumps_ex(obj, sort_flag)`, which sorts dict keys (at all
+        # nesting levels) by code point to match CPython. Any other kwarg — or
+        # a non-literal `sort_keys` value — falls back off the native path.
+        sort_keys = False
         if expr.kwargs:
             if attr.name != "dumps" or len(expr.kwargs) != 1:
                 return None
             key, value = expr.kwargs[0]
             if key != "sort_keys" or not isinstance(value, BoolLit):
                 return None
+            sort_keys = value.value
         if attr.name == "loads":
             return self.builder.call(
                 self.runtime["py_json_loads"],
@@ -333,12 +422,323 @@ class NativeTextModulesLoweringMixin:
                 name=self._fresh("json.loads"),
             )
         if attr.name == "dumps":
+            if sort_keys:
+                return self.builder.call(
+                    self.runtime["py_json_dumps_ex"],
+                    [self._emit_as_object(expr.args[0]), ir.Constant(_I64, 1)],
+                    name=self._fresh("json.dumps"),
+                )
             return self.builder.call(
                 self.runtime["py_json_dumps"],
                 [self._emit_as_object(expr.args[0])],
                 name=self._fresh("json.dumps"),
             )
         return None
+
+    @staticmethod
+    def _re_subset_parse_counts(pattern: str, j: int) -> tuple[int, int]:
+        """Mirror of py_re_engine.c re_parse_counts for the checker.
+
+        Returns (status, end): status 0 = malformed ('{' is a literal),
+        1 = valid counted repeat, 2 = valid syntax but over the engine cap
+        (engine rejects). Written in the bootstrap-safe dialect because this
+        module is inside the self-host closure (fallback baseline pins 0).
+        """
+        n = len(pattern)
+        k = j + 1
+        m_val = -1
+        n_val = -1
+        inf = 0
+        while k < n and "0" <= pattern[k] <= "9":
+            if m_val < 0:
+                m_val = 0
+            m_val = m_val * 10 + (ord(pattern[k]) - 48)
+            if m_val > 9999:
+                return (0, j)
+            k += 1
+        if k < n and pattern[k] == ",":
+            k += 1
+            saw = 0
+            while k < n and "0" <= pattern[k] <= "9":
+                if n_val < 0:
+                    n_val = 0
+                n_val = n_val * 10 + (ord(pattern[k]) - 48)
+                if n_val > 9999:
+                    return (0, j)
+                saw = 1
+                k += 1
+            if saw == 0:
+                inf = 1
+        else:
+            n_val = m_val
+        if k >= n or pattern[k] != "}":
+            return (0, j)
+        if m_val < 0 and n_val < 0 and inf == 0:
+            return (0, j)
+        m_eff = m_val
+        if m_eff < 0:
+            m_eff = 0
+        if inf == 0 and n_val >= 0 and n_val < m_eff:
+            return (0, j)
+        if m_eff > 64 or (inf == 0 and n_val >= 0 and n_val > 64):
+            return (2, k + 1)
+        return (1, k + 1)
+
+    @staticmethod
+    def _re_engine_subset_supported(pattern: str) -> bool:
+        """Conservative mirror of py_re_engine.c's strict subset parser.
+
+        MUST stay a SUBSET of the C engine's accepted language: approving a
+        pattern the engine rejects would turn the compile-time gate into a
+        construction-time NotImplementedError. The inclusion is pinned by
+        tests/python/test_re_engine_differential.py::test_frontend_checker_subset_of_engine.
+        When unsure, return False. Written in the bootstrap-safe dialect
+        (no set unions / typing generics / closures) because this module is
+        inside the self-host closure.
+        """
+        literal_escapes = "ntrfv\\.*+?()[]{}|^$-/'\" ,:;=<>#!&~@%"
+        class_extra = "dwsDWSb"
+        n = len(pattern)
+        i = 0
+        while i < n:
+            if ord(pattern[i]) >= 128:
+                return False
+            i += 1
+        # atom-kind stack per group depth: 0 none, 1 single-byte atom,
+        # 2 other (group/anchor/quantified)
+        stack = [0]
+        depth = 0
+        seen_names = []
+        i = 0
+        while i < n:
+            c = pattern[i]
+            if c == "*" or c == "+" or c == "?":
+                if stack[depth] == 0:
+                    return False
+                i += 1
+                if i < n and pattern[i] == "?":
+                    i += 1
+                if i < n and (
+                    pattern[i] == "*"
+                    or pattern[i] == "+"
+                    or pattern[i] == "?"
+                    or pattern[i] == "{"
+                ):
+                    return False
+                stack[depth] = 2
+                continue
+            if c == "{":
+                status_end = NativeTextModulesLoweringMixin._re_subset_parse_counts(
+                    pattern, i
+                )
+                status = status_end[0]
+                end = status_end[1]
+                if status == 0:
+                    stack[depth] = 1
+                    i += 1
+                    continue
+                if status == 2:
+                    return False
+                if stack[depth] != 1:
+                    return False
+                i = end
+                if i < n and pattern[i] == "?":
+                    i += 1
+                if i < n and (
+                    pattern[i] == "*"
+                    or pattern[i] == "+"
+                    or pattern[i] == "?"
+                    or pattern[i] == "{"
+                ):
+                    return False
+                stack[depth] = 2
+                continue
+            if c == "|":
+                stack[depth] = 0
+                i += 1
+                continue
+            if c == "(":
+                if i + 1 < n and pattern[i + 1] == "?":
+                    if pattern[i : i + 3] == "(?:":
+                        i += 3
+                    elif pattern[i : i + 4] == "(?P<":
+                        j = i + 4
+                        name = ""
+                        while j < n and pattern[j] != ">":
+                            ch = pattern[j]
+                            is_alpha = (
+                                ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ch == "_"
+                            )
+                            is_digit = "0" <= ch <= "9"
+                            if name == "":
+                                if not is_alpha:
+                                    return False
+                            elif not (is_alpha or is_digit):
+                                return False
+                            name = name + ch
+                            if len(name) >= 31:
+                                return False
+                            j += 1
+                        if j >= n or name == "":
+                            return False
+                        if name in seen_names:
+                            return False
+                        seen_names.append(name)
+                        i = j + 1
+                    else:
+                        return False
+                else:
+                    i += 1
+                depth += 1
+                if depth > 30:
+                    return False
+                stack.append(0)
+                continue
+            if c == ")":
+                if depth == 0:
+                    return False
+                depth -= 1
+                stack.pop()
+                stack[depth] = 2
+                i += 1
+                continue
+            if c == "[":
+                j = i + 1
+                if j < n and pattern[j] == "^":
+                    j += 1
+                first = 1
+                ok = 0
+                prev_lit = -1
+                while j < n:
+                    if pattern[j] == "]" and first == 0:
+                        ok = 1
+                        break
+                    first = 0
+                    if pattern[j] == "\\":
+                        if j + 1 >= n:
+                            return False
+                        e = pattern[j + 1]
+                        if e == "x":
+                            if j + 3 >= n:
+                                return False
+                            hi_digit = (
+                                NativeTextModulesLoweringMixin._native_re_hex_digit(
+                                    pattern[j + 2]
+                                )
+                            )
+                            lo_digit = (
+                                NativeTextModulesLoweringMixin._native_re_hex_digit(
+                                    pattern[j + 3]
+                                )
+                            )
+                            if hi_digit < 0 or lo_digit < 0:
+                                return False
+                            lo_value = hi_digit * 16 + lo_digit
+                            token_end = j + 4
+                            if (
+                                token_end + 1 < n
+                                and pattern[token_end] == "-"
+                                and pattern[token_end + 1] != "]"
+                            ):
+                                high_start = token_end + 1
+                                if (
+                                    high_start + 3 >= n
+                                    or pattern[high_start] != "\\"
+                                    or pattern[high_start + 1] != "x"
+                                ):
+                                    return False
+                                high_hi = (
+                                    NativeTextModulesLoweringMixin._native_re_hex_digit(
+                                        pattern[high_start + 2]
+                                    )
+                                )
+                                high_lo = (
+                                    NativeTextModulesLoweringMixin._native_re_hex_digit(
+                                        pattern[high_start + 3]
+                                    )
+                                )
+                                if high_hi < 0 or high_lo < 0:
+                                    return False
+                                if high_hi * 16 + high_lo < lo_value:
+                                    return False
+                                j = high_start + 4
+                            else:
+                                j = token_end
+                            prev_lit = lo_value
+                            continue
+                        if e not in class_extra and e not in literal_escapes:
+                            return False
+                        if e in "dwsDWS":
+                            prev_lit = -1
+                        elif e == "b":
+                            prev_lit = 8
+                        else:
+                            prev_lit = NativeTextModulesLoweringMixin._native_re_literal_escape_value(
+                                e
+                            )
+                        j += 2
+                        continue
+                    if ord(pattern[j]) >= 128:
+                        return False
+                    if (
+                        pattern[j] == "-"
+                        and prev_lit >= 0
+                        and j + 1 < n
+                        and pattern[j + 1] != "]"
+                    ):
+                        hi = pattern[j + 1]
+                        if hi == "\\" or ord(hi) >= 128 or ord(hi) < prev_lit:
+                            return False
+                        prev_lit = -1
+                        j += 2
+                        continue
+                    prev_lit = ord(pattern[j])
+                    j += 1
+                if ok == 0:
+                    return False
+                i = j + 1
+                stack[depth] = 1
+                continue
+            if c == "\\":
+                if i + 1 >= n:
+                    return False
+                e = pattern[i + 1]
+                if e == "d" or e == "D" or e == "w" or e == "W" or e == "s" or e == "S":
+                    stack[depth] = 1
+                elif e == "b" or e == "B" or e == "A" or e == "Z":
+                    stack[depth] = 2
+                elif e == "x":
+                    if i + 3 >= n:
+                        return False
+                    if (
+                        NativeTextModulesLoweringMixin._native_re_hex_digit(
+                            pattern[i + 2]
+                        )
+                        < 0
+                        or NativeTextModulesLoweringMixin._native_re_hex_digit(
+                            pattern[i + 3]
+                        )
+                        < 0
+                    ):
+                        return False
+                    stack[depth] = 1
+                    i += 4
+                    continue
+                elif e in literal_escapes:
+                    stack[depth] = 1
+                else:
+                    return False
+                i += 2
+                continue
+            if c == "^" or c == "$":
+                stack[depth] = 2
+                i += 1
+                continue
+            stack[depth] = 1
+            i += 1
+        if depth != 0:
+            return False
+        return True
 
     def _emit_native_re_call(self, expr: Call) -> Optional[ir.Value]:
         attr = expr.func
@@ -364,11 +764,68 @@ class NativeTextModulesLoweringMixin:
                 [arg],
                 name=self._fresh("re.escape"),
             )
+        if attr.name == "compile" and not expr.kwargs and 1 <= len(expr.args) <= 2:
+            pattern_expr = expr.args[0]
+            flags_value = self._native_re_static_flags_value(
+                expr.args[1] if len(expr.args) == 2 else None
+            )
+            pattern_value = (
+                pattern_expr.value if isinstance(pattern_expr, StrLit) else None
+            )
+            if (
+                pattern_value is not None
+                and flags_value is not None
+                and flags_value & 64
+            ):
+                pattern_value = self._native_re_strip_verbose_pattern(pattern_value)
+                flags_value &= ~64
+            if (
+                pattern_value is not None
+                and flags_value is not None
+                and (flags_value & ~26) == 0  # re.I|re.M|re.S engine mask
+                and self._re_engine_subset_supported(pattern_value)
+            ):
+                result = self.builder.call(
+                    self.runtime["py_re_compile_obj"],
+                    [
+                        self._emit_str_literal(pattern_value),
+                        ir.Constant(_I64, flags_value),
+                    ],
+                    name=self._fresh("re.compile.obj"),
+                )
+                self._emit_post_call_err_check(getattr(expr, "span", None))
+                return result
+            if (
+                pattern_value is None
+                and flags_value is not None
+                and (flags_value & ~26) == 0
+            ):
+                # Runtime-composed pattern strings cannot use the static
+                # subset checker, but they still belong to the same native
+                # Pattern contract.  Compile them in the runtime engine and
+                # let that engine raise the existing unsupported-pattern
+                # diagnostic when necessary.  This keeps pcc-authored tools
+                # such as the self-backend IR parser off libpython when they
+                # assemble regexes from constant fragments.
+                pattern_obj = self._emit_as_object(pattern_expr)
+                result = self.builder.call(
+                    self.runtime["py_re_compile_obj"],
+                    [pattern_obj, ir.Constant(_I64, flags_value)],
+                    name=self._fresh("re.compile.dynamic.obj"),
+                )
+                self._emit_post_call_err_check(getattr(expr, "span", None))
+                return result
+            return None
         if attr.name == "findall":
             return self._emit_native_re_findall_call(expr.args, expr.kwargs)
         if attr.name == "split":
-            return self._emit_native_re_split_call(expr.args, expr.kwargs)
-        if attr.name not in ("match", "search"):
+            legacy_split = self._emit_native_re_split_call(expr.args, expr.kwargs)
+            if legacy_split is not None:
+                return legacy_split
+            return self._emit_native_re_engine_split_call(expr.args, expr.kwargs)
+        if attr.name == "sub":
+            return self._emit_native_re_sub_call(expr.args, expr.kwargs)
+        if attr.name not in ("match", "search", "fullmatch"):
             return None
         return self._emit_native_re_value_call(
             "re." + attr.name,
@@ -382,17 +839,17 @@ class NativeTextModulesLoweringMixin:
         args: tuple[Expr, ...],
         kwargs: tuple[tuple[str, Expr], ...],
     ) -> Optional[ir.Value]:
-        if kind not in ("re.match", "re.search"):
+        if kind not in ("re.match", "re.search", "re.fullmatch"):
             return None
         if kwargs or len(args) < 2 or len(args) > 3:
             return None
         if len(args) == 3:
-            helper = (
-                "py_re_match_flags"
-                if kind == "re.match"
-                else "py_re_search_flags"
-            )
-            return self.builder.call(
+            helper = {
+                "re.match": "py_re_match_flags",
+                "re.search": "py_re_search_flags",
+                "re.fullmatch": "py_re_fullmatch_flags",
+            }[kind]
+            result = self.builder.call(
                 self.runtime[helper],
                 [
                     self._emit_as_object(args[0]),
@@ -401,12 +858,22 @@ class NativeTextModulesLoweringMixin:
                 ],
                 name=self._fresh(kind),
             )
-        helper = "py_re_match" if kind == "re.match" else "py_re_search"
-        return self.builder.call(
+            # flags==0 routes through the faithful engine, which raises for
+            # patterns outside the native subset instead of mismatching.
+            self._emit_post_call_err_check(getattr(args[0], "span", None))
+            return result
+        helper = {
+            "re.match": "py_re_match",
+            "re.search": "py_re_search",
+            "re.fullmatch": "py_re_fullmatch",
+        }[kind]
+        result = self.builder.call(
             self.runtime[helper],
             [self._emit_as_object(args[0]), self._emit_as_object(args[1])],
             name=self._fresh(kind),
         )
+        self._emit_post_call_err_check(getattr(args[0], "span", None))
+        return result
 
     def _emit_native_re_findall_call(
         self,
@@ -415,14 +882,10 @@ class NativeTextModulesLoweringMixin:
     ) -> Optional[ir.Value]:
         if kwargs or len(args) < 2 or len(args) > 3:
             return None
-        if not self._native_re_findall_supported_pattern(args[0]):
-            return None
         flags = (
-            ir.Constant(_I64, 0)
-            if len(args) == 2
-            else self._emit_expr_as_i64(args[2])
+            ir.Constant(_I64, 0) if len(args) == 2 else self._emit_expr_as_i64(args[2])
         )
-        return self.builder.call(
+        result = self.builder.call(
             self.runtime["py_re_findall_flags"],
             [
                 self._emit_as_object(args[0]),
@@ -431,6 +894,10 @@ class NativeTextModulesLoweringMixin:
             ],
             name=self._fresh("re.findall"),
         )
+        # flags==0 routes through the faithful engine, which raises for
+        # patterns outside the native subset instead of mismatching.
+        self._emit_post_call_err_check(getattr(args[0], "span", None))
+        return result
 
     def _emit_native_re_split_call(
         self,
@@ -489,6 +956,62 @@ class NativeTextModulesLoweringMixin:
             name=self._fresh("re.split.literal.maxsplit"),
         )
 
+    def _emit_native_re_engine_split_call(
+        self,
+        args: tuple[Expr, ...],
+        kwargs: tuple[tuple[str, Expr], ...],
+    ) -> Optional[ir.Value]:
+        if kwargs or len(args) < 2 or len(args) > 3:
+            return None
+        # py_re_engine_split requires a STRING pattern. A non-literal first arg
+        # (e.g. a compiled ``re.compile(...)`` object passed as
+        # ``re.split(self.sep, text)``) is not a string at runtime and would
+        # raise "split expects string pattern"; fall back to CPython instead.
+        if not isinstance(args[0], StrLit):
+            return None
+        maxsplit = (
+            ir.Constant(_I64, 0) if len(args) == 2 else self._emit_expr_as_i64(args[2])
+        )
+        result = self.builder.call(
+            self.runtime["py_re_engine_split"],
+            [
+                self._emit_as_object(args[0]),
+                self._emit_as_object(args[1]),
+                maxsplit,
+                ir.Constant(_I64, 0),
+            ],
+            name=self._fresh("re.split.engine"),
+        )
+        # the engine raises for patterns outside the native subset
+        self._emit_post_call_err_check(getattr(args[0], "span", None))
+        return result
+
+    def _emit_native_re_sub_call(
+        self,
+        args: tuple[Expr, ...],
+        kwargs: tuple[tuple[str, Expr], ...],
+    ) -> Optional[ir.Value]:
+        if kwargs or len(args) < 3 or len(args) > 4:
+            return None
+        count = (
+            ir.Constant(_I64, 0) if len(args) == 3 else self._emit_expr_as_i64(args[3])
+        )
+        result = self.builder.call(
+            self.runtime["py_re_engine_sub"],
+            [
+                self._emit_as_object(args[0]),
+                self._emit_as_object(args[1]),
+                self._emit_as_object(args[2]),
+                count,
+                ir.Constant(_I64, 0),
+            ],
+            name=self._fresh("re.sub.engine"),
+        )
+        # the engine raises for patterns outside the native subset or
+        # backslash replacement templates
+        self._emit_post_call_err_check(getattr(args[0], "span", None))
+        return result
+
     def _emit_native_re_compile_alias_method_call(
         self,
         alias_info: tuple[str, int],
@@ -499,16 +1022,12 @@ class NativeTextModulesLoweringMixin:
         if kwargs or method_name not in _RE_ALIAS_METHODS or len(args) != 1:
             return None
         pattern, flags = alias_info
-        if method_name == "findall" and not self._native_re_findall_supported_pattern_text(
-            pattern
-        ):
-            return None
         helper = {
             "match": "py_re_match_flags",
             "search": "py_re_search_flags",
             "findall": "py_re_findall_flags",
         }[method_name]
-        return self.builder.call(
+        result = self.builder.call(
             self.runtime[helper],
             [
                 self._emit_str_literal(pattern),
@@ -517,6 +1036,10 @@ class NativeTextModulesLoweringMixin:
             ],
             name=self._fresh(f"re.compile.alias.{method_name}"),
         )
+        # flags==0 match/search route through the faithful engine, which can
+        # raise for patterns outside the native subset.
+        self._emit_post_call_err_check(getattr(args[0], "span", None))
+        return result
 
     def _emit_native_re_compile_method_attr(
         self,
@@ -528,11 +1051,6 @@ class NativeTextModulesLoweringMixin:
             alias_info = self._native_re_compile_alias_for_name(expr.obj.ident)
             if alias_info is not None:
                 pattern, flags = alias_info
-                if (
-                    expr.name == "findall"
-                    and not self._native_re_findall_supported_pattern_text(pattern)
-                ):
-                    return None
                 method_kind = {"match": 0, "search": 1, "findall": 2}[expr.name]
                 return self.builder.call(
                     self.runtime["py_re_compile_method"],
@@ -555,10 +1073,6 @@ class NativeTextModulesLoweringMixin:
         ):
             return None
         if len(call.args) < 1 or len(call.args) > 2:
-            return None
-        if expr.name == "findall" and not self._native_re_findall_supported_pattern(
-            call.args[0]
-        ):
             return None
         flags = (
             ir.Constant(_I64, 0)

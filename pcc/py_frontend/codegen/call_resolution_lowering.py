@@ -1,4 +1,5 @@
 """Call argument resolution and direct-call unpack lowering."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -84,18 +85,19 @@ class CallResolutionLoweringMixin:
         formal_args: tuple,
         skip_self: bool,
     ) -> tuple[tuple, tuple]:
-        if not positional:
+        has_kw_unpack = any(name == "**" for name, _expr in kwargs_pairs)
+        if not positional and not has_kw_unpack:
             return positional, kwargs_pairs
-        has_unpack = False
+        has_pos_unpack = False
         for e in positional:
             if self._is_starred_unpack_expr(e) or (
                 isinstance(e, Call)
                 and isinstance(e.func, Name)
                 and e.func.ident == "**"
             ):
-                has_unpack = True
+                has_pos_unpack = True
                 break
-        if not has_unpack:
+        if not has_pos_unpack and not has_kw_unpack:
             return positional, kwargs_pairs
 
         formals: list = []
@@ -109,7 +111,15 @@ class CallResolutionLoweringMixin:
                 formals.append(formal)
             src_i += 1
 
-        explicit_kw = {name for name, _expr in kwargs_pairs}
+        plain_kwargs: list = []
+        kwdict_srcs: list[Expr] = []
+        for kw_name, kw_expr in kwargs_pairs:
+            if kw_name == "**":
+                kwdict_srcs.append(kw_expr)
+            else:
+                plain_kwargs.append((kw_name, kw_expr))
+
+        explicit_kw = {name for name, _expr in plain_kwargs}
         positional_formals: list = []
         saw_var_pos = False
         for formal in formals:
@@ -127,12 +137,17 @@ class CallResolutionLoweringMixin:
 
         plain_pos: list = []
         star_src: Optional[Expr] = None
-        kwdict_src: Optional[Expr] = None
+        # Number of plain positional args that appear *before* the starred
+        # splat in source order. The splat expansion must be inserted at this
+        # index so ``f(1, *x, 3)`` keeps the argument order ``1, *x, 3`` rather
+        # than moving the splat to the end (which produced ``1, 3, *x``).
+        star_prefix_count = 0
         for e in positional:
             if self._is_starred_unpack_expr(e):
                 if star_src is not None:
                     return positional, kwargs_pairs
                 star_src = e.args[0]
+                star_prefix_count = len(plain_pos)
                 continue
             if (
                 isinstance(e, Call)
@@ -141,11 +156,31 @@ class CallResolutionLoweringMixin:
                 and len(e.args) == 1
                 and not e.kwargs
             ):
-                if kwdict_src is not None:
-                    return positional, kwargs_pairs
-                kwdict_src = e.args[0]
+                kwdict_srcs.append(e.args[0])
                 continue
             plain_pos.append(e)
+        kwdict_src: Optional[Expr] = None
+        if len(kwdict_srcs) == 1:
+            kwdict_src = kwdict_srcs[0]
+        elif len(kwdict_srcs) > 1:
+            span = self._call_resolution_span_or_none(kwdict_srcs[0])
+            pairs = []
+            for src in kwdict_srcs:
+                pairs.append(
+                    (
+                        Name(span, DynType(name="dyn"), "**"),
+                        src,
+                    )
+                )
+            kwdict_src = DictExpr(
+                span=span,
+                ty=DictType(
+                    name="dict",
+                    key=StrType(name="str"),
+                    value=DynType(name="dyn"),
+                ),
+                pairs=tuple(pairs),
+            )
 
         expanded_pos = list(plain_pos)
         if star_src is not None:
@@ -245,6 +280,7 @@ class CallResolutionLoweringMixin:
                 has_var_pos
                 and star_count is None
                 and kwdict_src is None
+                and star_prefix_count == len(plain_pos)
                 and len(expanded_pos) == len(positional_formals)
             ):
                 marker = Call(
@@ -260,12 +296,21 @@ class CallResolutionLoweringMixin:
                 )
                 expanded_pos.append(marker)
                 return tuple(expanded_pos), tuple(kwargs_pairs)
+            # Insert the splat expansion at the splat's source position so
+            # positional args after the splat keep their order, e.g.
+            # ``f(1, *x, 3)`` -> ``[1, x[0], x[1], ..., 3]``.
+            star_exprs: list = []
             i = 0
             while i < needed:
-                expanded_pos.append(self._index_expr_for_unpack(star_src, i))
+                star_exprs.append(self._index_expr_for_unpack(star_src, i))
                 i += 1
+            expanded_pos = (
+                expanded_pos[:star_prefix_count]
+                + star_exprs
+                + expanded_pos[star_prefix_count:]
+            )
 
-        expanded_kwargs = list(kwargs_pairs)
+        expanded_kwargs = list(plain_kwargs)
         if kwdict_src is not None:
             filled = set()
             i = 0
@@ -335,6 +380,19 @@ class CallResolutionLoweringMixin:
 
         raw_positional = positional
         raw_positional_len = len(raw_positional)
+        raw_kwdict_srcs: list[Expr] = []
+        for raw_arg in raw_positional:
+            if (
+                isinstance(raw_arg, Call)
+                and isinstance(raw_arg.func, Name)
+                and raw_arg.func.ident == "**"
+                and len(raw_arg.args) == 1
+                and not raw_arg.kwargs
+            ):
+                raw_kwdict_srcs.append(raw_arg.args[0])
+        for raw_kw_name, raw_kw_expr in kwargs_pairs:
+            if raw_kw_name == "**":
+                raw_kwdict_srcs.append(raw_kw_expr)
         raw_first_kind = ""
         if raw_positional_len > 0:
             try:
@@ -502,6 +560,20 @@ class CallResolutionLoweringMixin:
 
         if var_kw_idx >= 0:
             kw_pairs: list = []
+            raw_i = 0
+            while raw_i < len(raw_kwdict_srcs):
+                raw_src = raw_kwdict_srcs[raw_i]
+                kw_pairs.append(
+                    (
+                        Name(
+                            self._call_resolution_span_or_none(raw_src),
+                            DynType(name="dyn"),
+                            "**",
+                        ),
+                        raw_src,
+                    )
+                )
+                raw_i += 1
             kw_i = 0
             while kw_i < len(extra_kwargs):
                 kw_pair = extra_kwargs[kw_i]

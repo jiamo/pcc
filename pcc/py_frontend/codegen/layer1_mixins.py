@@ -43,7 +43,6 @@ from .for_normalization_lowering import ForNormalizationLoweringMixin
 from .format_lowering import FormatLoweringMixin
 from .generation_lowering import GenerationLoweringMixin
 from .generator_lowering import GeneratorLoweringMixin
-from .hoist_lowering import HoistLoweringMixin
 from .import_lowering import ImportLoweringMixin
 from .ir_decl_helpers import IrDeclHelperMixin
 from .ir_scaffold_lowering import IrScaffoldLoweringMixin
@@ -154,7 +153,6 @@ class L1CodeGenMixinStack(
     StmtDispatchLoweringMixin,
     GeneratorLoweringMixin,
     UserFunctionLoweringMixin,
-    HoistLoweringMixin,
     FormatLoweringMixin,
     StringGlobalsLoweringMixin,
     TypeAbiLoweringMixin,

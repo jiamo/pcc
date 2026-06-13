@@ -23,6 +23,7 @@ been set up by :func:`declare_runtime` beforehand.
 Mirrors the ABI documented in Section 3 of
 ``docs/plans/python-frontend-interfaces.md``.
 """
+
 from __future__ import annotations
 
 from typing import Mapping
@@ -42,12 +43,12 @@ from ..py_ast import (
     ListType,
     MemoryViewType,
     NoneType,
+    SetType,
     StrType,
     TupleType,
     Type,
 )
 from .runtime_abi import declare_runtime_global
-
 
 # -- Canonical IR types ------------------------------------------------------
 
@@ -56,7 +57,7 @@ _I8 = ir.IntType(8)
 _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _DOUBLE = ir.DoubleType()
-_PTR = _I8.as_pointer()   # PyObject*
+_PTR = _I8.as_pointer()  # PyObject*
 
 
 def _type_name(ty: Type) -> str:
@@ -140,16 +141,28 @@ def is_object_type(ty: Type) -> bool:
             "list",
             "dict",
             "tuple",
+            "set",
+            "frozenset",
             "None",
             "complex",
         ),
     ):
         return True
     return isinstance(
-        ty, (StrType, BytesType, ByteArrayType, MemoryViewType,
-             ListType, DictType, TupleType, NoneType, ComplexType)
-)
-
+        ty,
+        (
+            StrType,
+            BytesType,
+            ByteArrayType,
+            MemoryViewType,
+            ListType,
+            DictType,
+            TupleType,
+            SetType,
+            NoneType,
+            ComplexType,
+        ),
+    )
 
 
 def is_native_type(ty: Type) -> bool:
@@ -212,8 +225,7 @@ def marshal_to_object(
                     + _ir_type_text(value_ty)
                     + " for int"
                 )
-        return builder.call(runtime["py_int_from_i64"], [v64],
-                              name="m.int_box")
+        return builder.call(runtime["py_int_from_i64"], [v64], name="m.int_box")
     if isinstance(ty, FloatType) or ty_name == "float":
         # If inference said float but the caller already has a
         # PyObject* (e.g. a CPython ``float(...)`` fallback returned
@@ -221,8 +233,7 @@ def marshal_to_object(
         # the object form.
         if _ir_is_pointer_type(value_ty):
             return value
-        return builder.call(runtime["py_float_from_f64"], [value],
-                              name="m.flt_box")
+        return builder.call(runtime["py_float_from_f64"], [value], name="m.flt_box")
     if isinstance(ty, BoolType) or ty_name == "bool":
         # py_bool_from_bit takes i32.
         value_width = _ir_int_width(value_ty)
@@ -244,8 +255,7 @@ def marshal_to_object(
                 + _ir_type_text(value_ty)
                 + " for bool"
             )
-        return builder.call(runtime["py_bool_from_bit"], [bit],
-                              name="m.bool_box")
+        return builder.call(runtime["py_bool_from_bit"], (bit,), name="m.bool_box")
     if isinstance(ty, NoneType) or ty_name == "None":
         # If caller already has a pointer (e.g. loaded py_None earlier),
         # return it; otherwise materialise a load of the global.
@@ -263,12 +273,23 @@ def marshal_to_object(
             "list",
             "dict",
             "tuple",
+            "set",
+            "frozenset",
             "complex",
         ),
     ) or isinstance(
         ty,
-        (StrType, BytesType, ByteArrayType, MemoryViewType,
-         ListType, DictType, TupleType, ComplexType),
+        (
+            StrType,
+            BytesType,
+            ByteArrayType,
+            MemoryViewType,
+            ListType,
+            DictType,
+            TupleType,
+            SetType,
+            ComplexType,
+        ),
     ):
         # Already a PyObject* in the common case. But an ``or`` /
         # ``and`` phi whose arms are str-typed can land as i1 in IR
@@ -283,15 +304,18 @@ def marshal_to_object(
         value_width = _ir_int_width(value_ty)
         if value_width == 1:
             bit = builder.zext(value, _I32, name="m.str.b2i32")
-            return builder.call(runtime["py_bool_from_bit"], [bit],
-                                  name="m.str.bool_box")
+            return builder.call(
+                runtime["py_bool_from_bit"], (bit,), name="m.str.bool_box"
+            )
         if value_width > 0:
             widened = (
-                value if value_width == 64
+                value
+                if value_width == 64
                 else builder.sext(value, _I64, name="m.str.sext64")
             )
-            return builder.call(runtime["py_int_from_i64"], [widened],
-                                  name="m.str.int_box")
+            return builder.call(
+                runtime["py_int_from_i64"], (widened,), name="m.str.int_box"
+            )
         return value
     # DynType values are usually ``PyObject*`` at the IR level (class
     # instances, attribute loads, results of ``MyClass(args)``). But if
@@ -300,6 +324,7 @@ def marshal_to_object(
     # ``py_int_to_i64``), marshal back to ``PyObject*`` based on the
     # LLVM type we actually hold.
     from ..py_ast import DynType, FuncType  # local import to avoid cycle
+
     if isinstance(ty, FuncType):
         # FuncType values at runtime are PyObject* (either a CPython
         # callable wrapping a hoisted pcc FuncDef, or an
@@ -330,22 +355,27 @@ def marshal_to_object(
             return value
         value_width = _ir_int_width(value_ty)
         if value_width == 64:
-            return builder.call(runtime["py_int_from_i64"], [value],
-                                  name="m.dyn.int_box")
+            return builder.call(
+                runtime["py_int_from_i64"], [value], name="m.dyn.int_box"
+            )
         if value_width > 0:
             if value_width == 1:
                 bit = builder.zext(value, _I32, name="m.dyn.b2i32")
-                return builder.call(runtime["py_bool_from_bit"], [bit],
-                                      name="m.dyn.bool_box")
+                return builder.call(
+                    runtime["py_bool_from_bit"], (bit,), name="m.dyn.bool_box"
+                )
             widened = (
-                value if value_width == 64
+                value
+                if value_width == 64
                 else builder.sext(value, _I64, name="m.dyn.sext64")
             )
-            return builder.call(runtime["py_int_from_i64"], [widened],
-                                  name="m.dyn.int_box")
+            return builder.call(
+                runtime["py_int_from_i64"], (widened,), name="m.dyn.int_box"
+            )
         if _ir_is_double_type(value_ty):
-            return builder.call(runtime["py_float_from_f64"], [value],
-                                  name="m.dyn.flt_box")
+            return builder.call(
+                runtime["py_float_from_f64"], [value], name="m.dyn.flt_box"
+            )
         raise NotImplementedError(
             "marshal_to_object: DynType with IR "
             + _ir_type_text(value_ty)
@@ -369,9 +399,7 @@ def marshal_to_object(
         # during bootstrap when type-description objects cross compiled
         # module boundaries. Scalars still fail below.
         return value
-    raise NotImplementedError(
-        "marshal_to_object: unsupported type descriptor"
-    )
+    raise NotImplementedError("marshal_to_object: unsupported type descriptor")
 
 
 def marshal_from_object(
@@ -408,20 +436,14 @@ def marshal_from_object(
             return pyobj
         if isinstance(pyobj.type, ir.FloatType):
             return builder.fpext(pyobj, _DOUBLE, name="m.flt_widen")
-        return builder.call(
-            runtime["py_float_to_f64"], [pyobj], name="m.flt_unbox"
-        )
+        return builder.call(runtime["py_float_to_f64"], [pyobj], name="m.flt_unbox")
     if isinstance(target_ty, BoolType) or target_name == "bool":
         if isinstance(pyobj.type, ir.IntType) and pyobj.type.width == 1:
             return pyobj
         if isinstance(pyobj.type, ir.IntType):
             zero = ir.Constant(pyobj.type, 0)
-            return builder.icmp_unsigned(
-                "!=", pyobj, zero, name="m.bool_native"
-            )
-        i32 = builder.call(
-            runtime["py_obj_truthy"], [pyobj], name="m.bool_unbox_i32"
-        )
+            return builder.icmp_unsigned("!=", pyobj, zero, name="m.bool_native")
+        i32 = builder.call(runtime["py_obj_truthy"], [pyobj], name="m.bool_unbox_i32")
         return builder.trunc(i32, _I1, name="m.bool_unbox")
     if _type_name_in(
         target_ty,
@@ -433,16 +455,30 @@ def marshal_from_object(
             "list",
             "dict",
             "tuple",
+            "set",
+            "frozenset",
             "None",
             "complex",
         ),
     ) or isinstance(
         target_ty,
-        (StrType, BytesType, ByteArrayType, MemoryViewType,
-         ListType, DictType, TupleType, ClassType, NoneType, ComplexType),
+        (
+            StrType,
+            BytesType,
+            ByteArrayType,
+            MemoryViewType,
+            ListType,
+            DictType,
+            TupleType,
+            SetType,
+            ClassType,
+            NoneType,
+            ComplexType,
+        ),
     ):
         return pyobj
     from ..py_ast import DynType as _DynType, FuncType as _FuncType
+
     if isinstance(target_ty, (_DynType, _FuncType)) or target_name in (
         "dyn",
         "FuncType",
@@ -459,9 +495,7 @@ def marshal_from_object(
         # Same duplicate-type-object fallback as marshal_to_object: an
         # already boxed value can be carried through unchanged.
         return pyobj
-    raise NotImplementedError(
-        "marshal_from_object: unsupported target type descriptor"
-    )
+    raise NotImplementedError("marshal_from_object: unsupported target type descriptor")
 
 
 def _stash_overflow_slot(builder: ir.IRBuilder) -> ir.Value:

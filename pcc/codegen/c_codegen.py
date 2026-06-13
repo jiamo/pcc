@@ -9,6 +9,12 @@ from itertools import count
 # β5: route C frontend codegen through compat.ir_c; default = llvmlite
 # (PCC_USE_LLVMCAPI_C=1 opts into pcc.llvm_capi).
 from pcc.llvm_capi.compat import ir_c as ir
+from pcc.llvm_capi.compat import add_raw_function_attribute
+from pcc.c_abi_layout import (
+    floating_scalar_layout,
+    integer_scalar_layout,
+    pointer_scalar_layout,
+)
 IRBuilder = ir.IRBuilder
 from .c_varargs import (
     build_report as _build_varargs_report,
@@ -33,6 +39,7 @@ false_byte = int8_t(0)
 cstring = voidptr_t
 struct_types = {}
 _aggregate_namespace_counter = count(1)
+_LARGE_AGGREGATE_COPY_BYTES = 128
 
 
 class SemanticError(ValueError):
@@ -90,6 +97,42 @@ class BitFieldRef:
     is_unsigned: bool
 
 
+@dataclass(frozen=True)
+class IntegerConversionDecision:
+    """Shared winner for an already-promoted integer operand pair.
+
+    ``target_order`` is a semantic integer rank for AST type keys and a bit
+    width for lowered/constant values. ``source`` preserves the concrete type
+    object or key selected by the decision.
+    """
+
+    target_order: int
+    is_unsigned: bool
+    source: str
+
+
+def _decide_usual_integer_conversion(
+    lhs_order: int,
+    lhs_unsigned: bool,
+    rhs_order: int,
+    rhs_unsigned: bool,
+) -> IntegerConversionDecision:
+    """Choose the common integer rank/width and signedness after promotion."""
+    if lhs_unsigned == rhs_unsigned:
+        source = "lhs" if lhs_order >= rhs_order else "rhs"
+        target_order = lhs_order if source == "lhs" else rhs_order
+        return IntegerConversionDecision(target_order, lhs_unsigned, source)
+
+    if lhs_unsigned:
+        if lhs_order >= rhs_order:
+            return IntegerConversionDecision(lhs_order, True, "lhs")
+        return IntegerConversionDecision(rhs_order, False, "rhs")
+
+    if rhs_order >= lhs_order:
+        return IntegerConversionDecision(rhs_order, True, "rhs")
+    return IntegerConversionDecision(lhs_order, False, "lhs")
+
+
 class ConstIntValue(int):
     def __new__(cls, value, width, is_unsigned):
         obj = int.__new__(cls, value)
@@ -110,10 +153,8 @@ _FILE_ptr = voidptr_t  # FILE* modeled as opaque void*
 _size_t = int64_t
 _time_t = int64_t
 
-LIBC_FUNCTIONS = {
+_LEGACY_LIBC_FUNCTIONS = {
     # === stdio.h ===
-    "printf": (int32_t, [cstring], True),
-    "fprintf": (int32_t, [_FILE_ptr, cstring], True),
     "sprintf": (int32_t, [cstring, cstring], True),
     "snprintf": (int32_t, [cstring, _size_t, cstring], True),
     "vprintf": (int32_t, [cstring, voidptr_t], False),
@@ -152,16 +193,16 @@ LIBC_FUNCTIONS = {
     "fseeko": (int32_t, [_FILE_ptr, int64_t, int32_t], False),
     "ftello": (int64_t, [_FILE_ptr], False),
     # === stdlib.h ===
-    "malloc": (voidptr_t, [_size_t], False),
     "calloc": (voidptr_t, [_size_t, _size_t], False),
     "realloc": (voidptr_t, [voidptr_t, _size_t], False),
-    "free": (_VOID, [voidptr_t], False),
     "exit": (_VOID, [int32_t], False),
     "_Exit": (_VOID, [int32_t], False),
     "abort": (_VOID, [], False),
     "atexit": (int32_t, [voidptr_t], False),
     "abs": (int32_t, [int32_t], False),
     "labs": (int64_t, [int64_t], False),
+    "llabs": (int64_t, [int64_t], False),
+    "imaxabs": (int64_t, [int64_t], False),
     "atoi": (int32_t, [cstring], False),
     "atol": (int64_t, [cstring], False),
     "atof": (_double, [cstring], False),
@@ -185,7 +226,6 @@ LIBC_FUNCTIONS = {
     "unsetenv": (int32_t, [cstring], False),
     "system": (int32_t, [cstring], False),
     # === string.h ===
-    "strlen": (_size_t, [cstring], False),
     "strcmp": (int32_t, [cstring, cstring], False),
     "strncmp": (int32_t, [cstring, cstring, _size_t], False),
     "strcpy": (cstring, [cstring, cstring], False),
@@ -201,8 +241,6 @@ LIBC_FUNCTIONS = {
     "strspn": (_size_t, [cstring, cstring], False),
     "strcspn": (_size_t, [cstring, cstring], False),
     "strtok": (cstring, [cstring, cstring], False),
-    "memset": (voidptr_t, [voidptr_t, int32_t, _size_t], False),
-    "memcpy": (voidptr_t, [voidptr_t, voidptr_t, _size_t], False),
     "memmove": (voidptr_t, [voidptr_t, voidptr_t, _size_t], False),
     "memcmp": (int32_t, [voidptr_t, voidptr_t, _size_t], False),
     "memchr": (voidptr_t, [voidptr_t, int32_t, _size_t], False),
@@ -289,12 +327,8 @@ LIBC_FUNCTIONS = {
     "sleep": (int32_t, [int32_t], False),
     "alarm": (int32_t, [int32_t], False),
     "usleep": (int32_t, [int32_t], False),
-    "read": (int64_t, [int32_t, voidptr_t, _size_t], False),
-    "write": (int64_t, [int32_t, voidptr_t, _size_t], False),
     "getuid": (int32_t, [], False),
     "geteuid": (int32_t, [], False),
-    "open": (int32_t, [cstring, int32_t], True),
-    "close": (int32_t, [int32_t], False),
     "access": (int32_t, [cstring, int32_t], False),
     "fcntl": (int32_t, [int32_t, int32_t], True),
     "fsync": (int32_t, [int32_t], False),
@@ -333,7 +367,6 @@ LIBC_FUNCTIONS = {
     "kill": (int32_t, [int32_t, int32_t], False),
     "raise": (int32_t, [int32_t], False),
     # === errno ===
-    "__errno_location": (ir.IntType(32).as_pointer(), [], False),
     # === locale.h ===
     "setlocale": (cstring, [int32_t, cstring], False),
     "localeconv": (voidptr_t, [], False),
@@ -341,7 +374,6 @@ LIBC_FUNCTIONS = {
     # === misc ===
     "tmpnam": (cstring, [cstring], False),
     "tmpfile": (voidptr_t, [], False),
-    "__errno_location": (int32_t.as_pointer(), [], False),
     "stat": (int32_t, [cstring, voidptr_t], False),
     "fstat": (int32_t, [int32_t, voidptr_t], False),
     "lstat": (int32_t, [cstring, voidptr_t], False),
@@ -372,6 +404,10 @@ LIBC_FUNCTIONS = {
     "__builtin_add_overflow": (int32_t, [int64_t, int64_t, voidptr_t], False),
     "__builtin_sub_overflow": (int32_t, [int64_t, int64_t, voidptr_t], False),
     "__builtin_mul_overflow": (int32_t, [int64_t, int64_t, voidptr_t], False),
+    "__builtin_abs": (int32_t, [int32_t], False),
+    "__builtin_labs": (int64_t, [int64_t], False),
+    "__builtin_llabs": (int64_t, [int64_t], False),
+    "__builtin_imaxabs": (int64_t, [int64_t], False),
     "__builtin_bswap16": (int32_t, [int32_t], False),
     "__builtin_bswap32": (int32_t, [int32_t], False),
     "__builtin_bswap64": (int64_t, [int64_t], False),
@@ -392,6 +428,12 @@ LIBC_FUNCTIONS = {
     "__atomic_sub_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
     "__atomic_or_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
     "__atomic_and_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_xor_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_fetch_add": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_fetch_sub": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_fetch_or": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_fetch_and": (int64_t, [voidptr_t, int64_t, int32_t], False),
+    "__atomic_fetch_xor": (int64_t, [voidptr_t, int64_t, int32_t], False),
     "__atomic_compare_exchange_n": (
         int32_t,
         [voidptr_t, voidptr_t, int64_t, int32_t, int32_t, int32_t],
@@ -399,6 +441,7 @@ LIBC_FUNCTIONS = {
     ),
     "__atomic_test_and_set": (int32_t, [voidptr_t, int32_t], False),
     "__atomic_clear": (_VOID, [voidptr_t, int32_t], False),
+    "__atomic_thread_fence": (_VOID, [int32_t], False),
     "modf": (_double, [_double, ir.DoubleType().as_pointer()], False),
     "ldexp": (_double, [_double, int32_t], False),
     "__builtin_va_arg": (voidptr_t, [voidptr_t, int64_t], False),
@@ -415,6 +458,10 @@ LIBC_FUNCTIONS = {
     "freopen": (voidptr_t, [cstring, cstring, voidptr_t], False),
     "getc": (int32_t, [voidptr_t], False),
 }
+
+# Public lowered map. Declarative signatures are merged below only after a
+# source guard proves they do not retain a shadow entry in this legacy table.
+LIBC_FUNCTIONS = dict(_LEGACY_LIBC_FUNCTIONS)
 
 
 def _libc_registry_ir_type(type_name: str):
@@ -488,11 +535,31 @@ def refresh_libc_registry_from_declarative() -> int:
     code.  It replaces duplicate built-in entries with the declarative source
     of truth and adds new signatures without touching call sites.
     """
+    signatures = iter_signatures()
+    overlaps = sorted(
+        sig.name for sig in signatures if sig.name in _LEGACY_LIBC_FUNCTIONS
+    )
+    if overlaps:
+        raise AssertionError(
+            "declarative libc signatures still shadow legacy codegen entries: "
+            + ", ".join(overlaps)
+        )
     count = 0
-    for sig in iter_signatures():
+    for sig in signatures:
         LIBC_FUNCTIONS[sig.name] = _libc_registry_signature_to_codegen(sig)
         count += 1
     return count
+
+
+def libc_registry_shadow_names() -> tuple[str, ...]:
+    """Return declarative names that still have a legacy codegen definition."""
+    return tuple(
+        sorted(
+            sig.name
+            for sig in iter_signatures()
+            if sig.name in _LEGACY_LIBC_FUNCTIONS
+        )
+    )
 
 
 refresh_libc_registry_from_declarative()
@@ -653,6 +720,13 @@ def postprocess_ir_text_with_report(text):
 def postprocess_ir_text(text):
     """Apply the minimal textual lowering that llvmlite cannot express directly."""
     return _postprocess_varargs_ir(text)
+
+
+_AARCH64_BRANCH_PROTECTION_ATTRS = (
+    '"branch-target-enforcement"',
+    '"sign-return-address"="non-leaf"',
+    '"sign-return-address-key"="a_key"',
+)
 
 
 def get_ir_type_from_names(names):
@@ -872,13 +946,13 @@ def _ir_type_align_static(ir_type):
     if isinstance(ir_type, ir.VoidType):
         return 1
     if isinstance(ir_type, ir.IntType):
-        return min(ir_type.width // 8, 8)
+        return integer_scalar_layout(ir_type.width).alignment
     if isinstance(ir_type, ir.FloatType):
-        return 4
+        return floating_scalar_layout(32).alignment
     if isinstance(ir_type, ir.DoubleType):
-        return 8
+        return floating_scalar_layout(64).alignment
     if isinstance(ir_type, ir.PointerType):
-        return 8
+        return pointer_scalar_layout().alignment
     if isinstance(ir_type, ir.ArrayType):
         return _ir_type_align_static(ir_type.element)
     if _is_struct_ir_type(ir_type):
@@ -893,13 +967,13 @@ def _ir_type_size_static(ir_type):
     if custom_size is not None:
         return custom_size
     if isinstance(ir_type, ir.IntType):
-        return ir_type.width // 8
+        return integer_scalar_layout(ir_type.width).size
     if isinstance(ir_type, ir.FloatType):
-        return 4
+        return floating_scalar_layout(32).size
     if isinstance(ir_type, ir.DoubleType):
-        return 8
+        return floating_scalar_layout(64).size
     if isinstance(ir_type, ir.PointerType):
-        return 8
+        return pointer_scalar_layout().size
     if isinstance(ir_type, ir.ArrayType):
         return int(ir_type.count) * _ir_type_size_static(ir_type.element)
     if _is_struct_ir_type(ir_type):
@@ -980,10 +1054,167 @@ class LLVMCodeGenerator(object):
         # Pass framework context (HighTier analysis results)
         self._pass_ctx = pass_ctx
 
+        # SEC-P1-UBSAN: opt-in `-fsanitize=undefined`-style UB trapping.
+        # OFF by default -> `_maybe_ubsan_guard_*` helpers return immediately
+        # and lowering is byte-for-byte identical to the un-instrumented path
+        # (the property pinned by tests/security/test_c_ubsan_characterization.py).
+        # `_ubsan_checks` is the enabled subset of the Clang-style check names;
+        # `_ubsan_mode` selects trap vs handler (only "trap" is implemented, it
+        # needs no runtime and is the only self-backend-safe mode — §4.2 of
+        # docs/design/pcc-ubsan.md).
+        self._ubsan_checks: set = set()
+        self._ubsan_mode = "trap"
+
+    # --- SEC-P1-UBSAN: opt-in UB-trap instrumentation --------------------
+    #
+    # The check set follows Clang's `-fsanitize=<group>` naming. `undefined`
+    # expands to the individual arithmetic groups in scope for this slice; a
+    # caller can also request a single group. See docs/design/pcc-ubsan.md §5.
+    _UBSAN_GROUP_EXPANSION = {
+        "undefined": (
+            "signed-integer-overflow",
+            "integer-divide-by-zero",
+            "shift",
+            "shift-base",
+            "shift-exponent",
+        ),
+        "shift": ("shift", "shift-base", "shift-exponent"),
+    }
+
+    def configure_ubsan(self, checks, *, mode="trap"):
+        """Enable opt-in UB trapping for the named Clang-style ``checks``.
+
+        ``checks`` is an iterable of Clang ``-fsanitize`` names (or the
+        ``undefined`` umbrella). ``mode`` selects ``trap`` (self-contained,
+        self-backend-safe) — the only implemented fail-block mode. Passing an
+        empty ``checks`` leaves the instrumentation OFF (the default), so the
+        un-instrumented lowering is unchanged.
+        """
+        resolved: set = set()
+        for name in checks or ():
+            name = str(name).strip()
+            if not name:
+                continue
+            resolved.update(self._UBSAN_GROUP_EXPANSION.get(name, (name,)))
+        self._ubsan_checks = resolved
+        if mode not in ("trap",):
+            raise ValueError(
+                f"unsupported UBSan mode {mode!r}; only 'trap' is implemented "
+                f"(handler mode pulls in libubsan and is not self-backend-safe "
+                f"— see docs/design/pcc-ubsan.md §4.2)"
+            )
+        self._ubsan_mode = mode
+
+    def _ubsan_enabled(self, check):
+        return bool(self._ubsan_checks) and check in self._ubsan_checks
+
+    def _emit_ubsan_trap_branch(self, cond, *, kind):
+        """Split the current block: on ``cond`` true, trap; else continue.
+
+        Mirrors Clang's ``-fsanitize-trap=undefined`` fail block. The trap leg
+        reuses the exact ``llvm.trap`` + ``unreachable`` idiom of
+        ``_codegen_builtin_trap`` so it is self-contained (no ``libubsan``) and
+        the self backend can lower it (``brk #1`` / ``ud2``). ``cond`` is the
+        "UB detected" predicate (i1); lowering of the real op continues in the
+        fall-through ``cont`` block.
+        """
+        fail_bb = self.function.append_basic_block(name=f"ubsan_{kind}_fail")
+        cont_bb = self.function.append_basic_block(name=f"ubsan_{kind}_cont")
+        self.builder.cbranch(cond, fail_bb, cont_bb)
+        self.builder.position_at_end(fail_bb)
+        trap = self._get_or_declare_intrinsic("llvm.trap", ir.VoidType(), [])
+        self.builder.call(trap, [])
+        self.builder.unreachable()
+        self.builder.position_at_end(cont_bb)
+
+    def _maybe_ubsan_guard_div(self, lhs, rhs, *, signed):
+        """Guard a ``/`` or ``%`` against divide-by-zero and ``INT_MIN / -1``.
+
+        No-op unless the flag is on. ``signed`` controls whether the
+        overflow leg (``lhs == INT_MIN && rhs == -1``) is added — unsigned
+        division cannot overflow, only its zero-divisor case is UB.
+        """
+        want_zero = self._ubsan_enabled("integer-divide-by-zero")
+        want_ovf = signed and self._ubsan_enabled("signed-integer-overflow")
+        if not (want_zero or want_ovf):
+            return
+        ty = rhs.type
+        if not isinstance(ty, ir.IntType):
+            return
+        b = self.builder
+        cond = None
+        if want_zero:
+            cond = b.icmp_signed("==", rhs, ir.Constant(ty, 0), "ubsan.divz")
+        if want_ovf:
+            int_min = -(1 << (ty.width - 1))
+            is_min = b.icmp_signed("==", lhs, ir.Constant(ty, int_min), "ubsan.dmin")
+            is_neg1 = b.icmp_signed("==", rhs, ir.Constant(ty, -1), "ubsan.dm1")
+            ovf = b.and_(is_min, is_neg1, "ubsan.dovf")
+            cond = ovf if cond is None else b.or_(cond, ovf, "ubsan.divchk")
+        if cond is None:
+            return
+        self._emit_ubsan_trap_branch(cond, kind="divrem")
+
+    def _maybe_ubsan_guard_shift(self, lhs, rhs):
+        """Guard a ``<<`` / ``>>`` against out-of-range / negative amounts.
+
+        UB when the shift amount is negative or ``>=`` the bit width of the
+        promoted left operand. This is keyed on width, not signedness (an
+        unsigned shift by ``>= width`` is still UB). No-op unless enabled.
+        """
+        if not self._ubsan_enabled("shift-exponent"):
+            return
+        ty = rhs.type
+        if not isinstance(ty, ir.IntType):
+            return
+        width = lhs.type.width if isinstance(lhs.type, ir.IntType) else ty.width
+        b = self.builder
+        # Unsigned compare of the amount against the width catches both the
+        # negative case (wraps to a huge unsigned value) and the too-large
+        # case in one predicate — this is exactly Clang's check.
+        cond = b.icmp_unsigned(
+            ">=", rhs, ir.Constant(ty, width), "ubsan.shamt"
+        )
+        self._emit_ubsan_trap_branch(cond, kind="shift")
+
+    def _maybe_ubsan_guard_arith(self, lhs, rhs, op, *, signed):
+        """Guard signed ``+ - *`` against overflow via the checked intrinsic.
+
+        Reuses ``llvm.sadd/ssub/smul.with.overflow`` — the same detection the
+        ``__builtin_*_overflow`` path already declares — and branches on the
+        overflow flag. Unsigned arithmetic is well-defined modular wrap and is
+        never guarded by the ``undefined`` set. No-op unless enabled.
+        """
+        if not signed or not self._ubsan_enabled("signed-integer-overflow"):
+            return
+        ty = lhs.type
+        if not isinstance(ty, ir.IntType) or not isinstance(rhs.type, ir.IntType):
+            return
+        prefix = {"+": "sadd", "-": "ssub", "*": "smul"}.get(op)
+        if prefix is None:
+            return
+        struct_ty = ir.LiteralStructType([ty, ir.IntType(1)])
+        intrinsic = self._get_or_declare_intrinsic(
+            f"llvm.{prefix}.with.overflow.i{ty.width}", struct_ty, [ty, ty]
+        )
+        agg = self.builder.call(intrinsic, [lhs, rhs], "ubsan.ovf")
+        flag = self.builder.extract_value(agg, 1, "ubsan.ovfflag")
+        self._emit_ubsan_trap_branch(flag, kind="arith")
+
     def set_target_machine(self, triple, target_machine):
         self.module.triple = triple
         self.module.data_layout = str(target_machine.target_data)
         self._target_data = target_machine.target_data
+
+    def _apply_aarch64_branch_protection_attributes(self) -> None:
+        triple = str(self.module.triple or "")
+        if not (triple.startswith("arm64-") or triple.startswith("aarch64-")):
+            return
+        for function in self.module.functions:
+            if not getattr(function, "blocks", None):
+                continue
+            for attribute in _AARCH64_BRANCH_PROTECTION_ATTRS:
+                add_raw_function_attribute(function, attribute)
 
     def _get_var_alloc_strategy(self, var_name):
         """Query PassContext for the allocation strategy of a variable."""
@@ -1751,6 +1982,13 @@ class LLVMCodeGenerator(object):
                 self._ssa_is_unsigned_type(left_type_name)
                 or self._ssa_is_unsigned_type(right_type_name)
             )
+        # SEC-P1-UBSAN guards (no-op unless the flag is enabled). Signedness of
+        # `+ - *` uses the common (result) type, matching the sdiv/srem choice.
+        _ubsan_signed = not self._ssa_is_unsigned_type(result_type_name)
+        if op in ("+", "-", "*"):
+            self._maybe_ubsan_guard_arith(left, right, op, signed=_ubsan_signed)
+        elif op in ("/", "%"):
+            self._maybe_ubsan_guard_div(left, right, signed=not is_unsigned)
         if op == "+":
             return b.add(left, right, name=name)
         if op == "-":
@@ -1775,8 +2013,10 @@ class LLVMCodeGenerator(object):
         if op == "^":
             return b.xor(left, right, name=name)
         if op == "<<":
+            self._maybe_ubsan_guard_shift(left, right)  # SEC-P1-UBSAN (no-op if off)
             return b.shl(left, right, name=name)
         if op == ">>":
+            self._maybe_ubsan_guard_shift(left, right)  # SEC-P1-UBSAN (no-op if off)
             return b.lshr(left, right, name=name) if self._ssa_is_unsigned_type(left_type_name) else b.ashr(left, right, name=name)
         # Fallback
         return b.add(left, right, name=name)
@@ -1809,9 +2049,8 @@ class LLVMCodeGenerator(object):
                 target_type,
                 source_type_name=operand_type_name,
             )
-        # Float → integer: pick signed vs unsigned based on the declared
-        # target type. `_implicit_convert` hard-codes fptosi, which is
-        # wrong for `(unsigned long long) f` (gcc_torture conversion.c).
+        # Float -> integer: explicit SSA casts keep their own declared-type
+        # path, matching the generic implicit conversion's signedness choice.
         _FLOAT_TYPES = (ir.HalfType, ir.FloatType, ir.DoubleType)
         if isinstance(operand.type, _FLOAT_TYPES) and isinstance(target_type, ir.IntType):
             if self._ssa_is_unsigned_type(result_type_name):
@@ -2609,6 +2848,15 @@ class LLVMCodeGenerator(object):
             return self.builder.uitofp(val, target_type)
         return self.builder.sitofp(val, target_type)
 
+    def _apply_integer_target_signedness(self, val, target_unsigned):
+        if not isinstance(getattr(val, "type", None), ir.IntType):
+            return val
+        if target_unsigned is True:
+            return self._tag_unsigned(val)
+        if target_unsigned is False:
+            return self._clear_unsigned(val)
+        return val
+
     def _convert_int_value(self, val, target_type, result_unsigned=None):
         if not (
             isinstance(getattr(val, "type", None), ir.IntType)
@@ -2629,6 +2877,15 @@ class LLVMCodeGenerator(object):
 
         if result_unsigned is None:
             result_unsigned = source_unsigned
+        elif result_unsigned != source_unsigned and result is val:
+            # Signedness is semantic metadata on an otherwise identical LLVM
+            # integer type. Do not retag the original SSA value: it may be
+            # reused by a later expression under its declared signedness.
+            result = self.builder.or_(
+                val,
+                ir.Constant(target_type, 0),
+                name="int.signcast",
+            )
         if result_unsigned:
             return self._tag_unsigned(result)
         return self._clear_unsigned(result)
@@ -2661,7 +2918,13 @@ class LLVMCodeGenerator(object):
             return lhs_type if self._is_floating_ir_type(lhs_type) else rhs_type
 
         if isinstance(lhs_type, ir.IntType) and isinstance(rhs_type, ir.IntType):
-            return lhs_type if lhs_type.width >= rhs_type.width else rhs_type
+            decision = _decide_usual_integer_conversion(
+                lhs_type.width,
+                False,
+                rhs_type.width,
+                False,
+            )
+            return lhs_type if decision.source == "lhs" else rhs_type
 
         return lhs_type
 
@@ -2679,23 +2942,14 @@ class LLVMCodeGenerator(object):
         lhs_width = lhs.type.width
         rhs_width = rhs.type.width
 
-        if lhs_unsigned == rhs_unsigned:
-            target_type = lhs.type if lhs_width >= rhs_width else rhs.type
-            result_unsigned = lhs_unsigned
-        elif lhs_unsigned:
-            if lhs_width >= rhs_width:
-                target_type = lhs.type
-                result_unsigned = True
-            else:
-                target_type = rhs.type
-                result_unsigned = False
-        else:
-            if rhs_width >= lhs_width:
-                target_type = rhs.type
-                result_unsigned = True
-            else:
-                target_type = lhs.type
-                result_unsigned = False
+        decision = _decide_usual_integer_conversion(
+            lhs_width,
+            lhs_unsigned,
+            rhs_width,
+            rhs_unsigned,
+        )
+        target_type = lhs.type if decision.source == "lhs" else rhs.type
+        result_unsigned = decision.is_unsigned
 
         lhs = self._convert_int_value(lhs, target_type, result_unsigned)
         rhs = self._convert_int_value(rhs, target_type, result_unsigned)
@@ -3108,6 +3362,8 @@ class LLVMCodeGenerator(object):
             if not self.builder.block.is_terminated:
                 self.builder.ret(ir.Constant(ir.IntType(64), int(0)))
 
+        self._apply_aarch64_branch_protection_attributes()
+
         pass  # empty block fixes done in IR post-processing
 
         return normal
@@ -3439,6 +3695,10 @@ class LLVMCodeGenerator(object):
 
     def codegen_Assignment(self, node):
 
+        aggregate_copy = self._try_codegen_large_aggregate_assignment(node)
+        if aggregate_copy is not None:
+            return aggregate_copy
+
         lv, lv_addr = self.codegen(node.lvalue)
         rv, _ = self.codegen(node.rvalue)
         if lv is None or rv is None:
@@ -3507,7 +3767,16 @@ class LLVMCodeGenerator(object):
             else:
                 target_type = lv.type
             if rv.type != target_type:
-                rv = self._implicit_convert(rv, target_type)
+                target_unsigned = None
+                if is_bitfield:
+                    target_unsigned = bool(getattr(lv_addr, "is_unsigned", False))
+                elif self._is_unsigned_binding(lv_addr):
+                    target_unsigned = True
+                rv = self._implicit_convert(
+                    rv,
+                    target_type,
+                    target_unsigned=target_unsigned,
+                )
             if is_bitfield:
                 self._store_bitfield(rv, lv_addr)
                 rv = self._load_bitfield(lv_addr)
@@ -3527,6 +3796,17 @@ class LLVMCodeGenerator(object):
                 else:
                     addresult = handle(lv, rv, "addtmp")
             else:
+                # SEC-P1-UBSAN guards for compound assignment (no-op if off).
+                # Only the integer-typed forms carry arithmetic UB in scope.
+                if dispatch_type == dispatch_type_int:
+                    if node.op in ("/=", "%="):
+                        self._maybe_ubsan_guard_div(lv, rv, signed=not is_unsigned)
+                    elif node.op in ("<<=", ">>="):
+                        self._maybe_ubsan_guard_shift(lv, rv)
+                    elif node.op in ("+=", "-=", "*="):
+                        self._maybe_ubsan_guard_arith(
+                            lv, rv, node.op[0], signed=not is_unsigned
+                        )
                 addresult = handle(lv, rv, "addtmp")
             if dispatch_type == dispatch_type_int and is_unsigned:
                 self._tag_unsigned(addresult)
@@ -3535,6 +3815,105 @@ class LLVMCodeGenerator(object):
                 return self._load_bitfield(lv_addr), lv_addr
             self._safe_store(addresult, lv_addr)
             return addresult, lv_addr
+
+    @staticmethod
+    def _is_direct_addressable_aggregate_expr(node):
+        """Whether *node* can yield an aggregate address without side effects.
+
+        Keep this deliberately narrow.  Falling back after evaluating a more
+        general pointer expression could evaluate calls/increments twice.
+        Direct aggregate objects and ``*pointer_name`` cover the common C
+        struct-copy forms while preserving the existing path for everything
+        else.
+        """
+        return isinstance(node, c_ast.ID) or (
+            isinstance(node, c_ast.UnaryOp)
+            and node.op == "*"
+            and isinstance(node.expr, c_ast.ID)
+        )
+
+    def _direct_aggregate_address(self, node):
+        if isinstance(node, c_ast.ID):
+            aggregate_type, binding = self.lookup(node.name)
+            if (
+                self._is_aggregate_ir_type(aggregate_type)
+                and isinstance(getattr(binding, "type", None), ir.PointerType)
+                and self._same_ir_type_semantics(
+                    binding.type.pointee, aggregate_type
+                )
+            ):
+                return binding, aggregate_type
+            return None
+
+        pointer_value, _ = self.codegen(node.expr)
+        pointer_type = getattr(pointer_value, "type", None)
+        if (
+            isinstance(pointer_type, ir.PointerType)
+            and self._is_aggregate_ir_type(pointer_type.pointee)
+        ):
+            return pointer_value, pointer_type.pointee
+        return None
+
+    def _try_codegen_large_aggregate_assignment(self, node):
+        """Lower large addressable struct/union assignment as one memmove.
+
+        Materializing a value such as ``struct { int x[4096]; }`` turns a
+        source-level assignment into thousands of aggregate SSA operations.
+        LLVM's SelectionDAG then spends minutes combining MERGE_VALUES nodes.
+        A memory copy is the natural C representation and also preserves the
+        exact object representation (including padding).  ``memmove`` keeps
+        exact-source/destination aliasing and overlapping subobjects safe.
+        """
+        if node.op != "=":
+            return None
+        if not self._is_direct_addressable_aggregate_expr(
+            node.lvalue
+        ) or not self._is_direct_addressable_aggregate_expr(node.rvalue):
+            return None
+
+        dest = self._direct_aggregate_address(node.lvalue)
+        source = self._direct_aggregate_address(node.rvalue)
+        if dest is None or source is None:
+            return None
+        dest_addr, dest_type = dest
+        source_addr, source_type = source
+        if not self._same_ir_type_semantics(dest_type, source_type):
+            return None
+
+        copy_size = self._ir_type_size(dest_type)
+        if copy_size < _LARGE_AGGREGATE_COPY_BYTES:
+            return None
+
+        dest_ptr = (
+            dest_addr
+            if dest_addr.type == voidptr_t
+            else self.builder.bitcast(dest_addr, voidptr_t, name="aggcopy.dst")
+        )
+        source_ptr = (
+            source_addr
+            if source_addr.type == voidptr_t
+            else self.builder.bitcast(source_addr, voidptr_t, name="aggcopy.src")
+        )
+        memmove = self._get_or_declare_intrinsic(
+            "llvm.memmove.p0.p0.i64",
+            ir.VoidType(),
+            [voidptr_t, voidptr_t, int64_t, bool_t],
+        )
+        self.builder.call(
+            memmove,
+            [
+                dest_ptr,
+                source_ptr,
+                ir.Constant(int64_t, copy_size),
+                false_bit,
+            ],
+            name="aggcopy",
+        )
+
+        # C assignment expressions yield the assigned value.  In the common
+        # statement form this load is dead and LLVM removes it; chained/used
+        # assignments still receive the required value semantics.
+        return self._safe_load(dest_addr, name="aggcopy.value"), dest_addr
 
     def codegen_UnaryOp(self, node):
 
@@ -5134,6 +5513,24 @@ class LLVMCodeGenerator(object):
             init_val, _ = self.codegen(init_node)
             if init_val is not None:
                 if init_val.type != target_type:
+                    if getattr(target_type, "is_union", False):
+                        # A non-list scalar initializer for a union targets
+                        # its FIRST member (C99 6.7.9p17), not the whole
+                        # aggregate. Storing the scalar as the union type
+                        # emits invalid IR (`store <union> <int>`). Route the
+                        # already-evaluated value into the first member via a
+                        # bitcast, mirroring the InitList path's
+                        # _select_union_initializer behavior.
+                        first_type = target_type.elements[0]
+                        member_ptr = self.builder.bitcast(
+                            dest_ptr,
+                            ir.PointerType(first_type),
+                            name="unioninit",
+                        )
+                        if init_val.type != first_type:
+                            init_val = self._implicit_convert(init_val, first_type)
+                        self._safe_store(init_val, member_ptr)
+                        return
                     init_val = self._implicit_convert(init_val, target_type)
                 self._safe_store(init_val, dest_ptr)
             return
@@ -5561,13 +5958,19 @@ class LLVMCodeGenerator(object):
         if not isinstance(ptr.type, ir.PointerType):
             return
         if hasattr(ptr.type, "pointee") and value.type != ptr.type.pointee:
-            value = self._implicit_convert(value, ptr.type.pointee)
+            value = self._implicit_convert(
+                value,
+                ptr.type.pointee,
+                target_unsigned=(
+                    True if self._is_unsigned_binding(ptr) else None
+                ),
+            )
         try:
             self.builder.store(value, ptr)
         except (TypeError, Exception):
             pass
 
-    def _implicit_convert(self, val, target_type):
+    def _implicit_convert(self, val, target_type, *, target_unsigned=None):
         """Convert val to target_type if needed (implicit C promotion/truncation)."""
         if val is None or isinstance(val.type, ir.VoidType):
             # Can't convert void — return a zero of target type
@@ -5575,11 +5978,15 @@ class LLVMCodeGenerator(object):
                 return val
             return self._zero_initializer(target_type)
         if self._same_ir_type_semantics(val.type, target_type):
-            return val
+            return self._apply_integer_target_signedness(val, target_unsigned)
         if isinstance(val.type, ir.IntType) and self._is_floating_ir_type(target_type):
             return self._int_to_float(val, target_type)
         if self._is_floating_ir_type(val.type) and isinstance(target_type, ir.IntType):
-            return self.builder.fptosi(val, target_type)
+            if target_unsigned is True:
+                return self._tag_unsigned(self.builder.fptoui(val, target_type))
+            return self._apply_integer_target_signedness(
+                self.builder.fptosi(val, target_type), target_unsigned
+            )
         if self._is_floating_ir_type(val.type) and self._is_floating_ir_type(
             target_type
         ):
@@ -5597,13 +6004,19 @@ class LLVMCodeGenerator(object):
             if val.type.width < target_type.width:
                 if self._is_unsigned_val(val):
                     result = self.builder.zext(val, target_type)
-                    return self._tag_unsigned(result)
-                return self.builder.sext(val, target_type)
+                    return self._apply_integer_target_signedness(
+                        result,
+                        True if target_unsigned is None else target_unsigned,
+                    )
+                return self._apply_integer_target_signedness(
+                    self.builder.sext(val, target_type), target_unsigned
+                )
             elif val.type.width > target_type.width:
                 result = self.builder.trunc(val, target_type)
-                if self._is_unsigned_val(val):
-                    return self._tag_unsigned(result)
-                return result
+                if target_unsigned is None:
+                    target_unsigned = self._is_unsigned_val(val)
+                return self._apply_integer_target_signedness(result, target_unsigned)
+            return self._apply_integer_target_signedness(val, target_unsigned)
         # int -> pointer (e.g., NULL assignment, p = 0)
         if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.PointerType):
             # inttoptr only works for simple pointer types, not function pointers
@@ -5724,13 +6137,13 @@ class LLVMCodeGenerator(object):
         if isinstance(ir_type, ir.VoidType):
             return 1
         if isinstance(ir_type, ir.IntType):
-            return min(ir_type.width // 8, 8)
+            return integer_scalar_layout(ir_type.width).alignment
         elif isinstance(ir_type, ir.FloatType):
-            return 4
+            return floating_scalar_layout(32).alignment
         elif isinstance(ir_type, ir.DoubleType):
-            return 8
+            return floating_scalar_layout(64).alignment
         elif isinstance(ir_type, ir.PointerType):
-            return 8
+            return pointer_scalar_layout().alignment
         elif isinstance(ir_type, ir.ArrayType):
             return self._ir_type_align(ir_type.element)
         elif _is_struct_ir_type(ir_type):
@@ -5745,13 +6158,13 @@ class LLVMCodeGenerator(object):
         if custom_size is not None:
             return custom_size
         if isinstance(ir_type, ir.IntType):
-            return ir_type.width // 8
+            return integer_scalar_layout(ir_type.width).size
         elif isinstance(ir_type, ir.FloatType):
-            return 4
+            return floating_scalar_layout(32).size
         elif isinstance(ir_type, ir.DoubleType):
-            return 8
+            return floating_scalar_layout(64).size
         elif isinstance(ir_type, ir.PointerType):
-            return 8
+            return pointer_scalar_layout().size
         elif isinstance(ir_type, ir.ArrayType):
             return int(ir_type.count) * self._ir_type_size(ir_type.element)
         elif _is_struct_ir_type(ir_type):
@@ -6217,6 +6630,9 @@ class LLVMCodeGenerator(object):
             decl_type = member_decl_types[member_key]
 
         if decl_type is None:
+            return semantic_field_type
+
+        if self._is_aggregate_ir_type(field_type):
             return semantic_field_type
 
         try:
@@ -6738,15 +7154,14 @@ class LLVMCodeGenerator(object):
 
         lhs_rank = self._generic_base_rank(lhs_names)
         rhs_rank = self._generic_base_rank(rhs_names)
-        if lhs_rank > rhs_rank:
-            return ("base", (), lhs_names)
-        if rhs_rank > lhs_rank:
-            return ("base", (), rhs_names)
-        if "unsigned" in lhs_names:
-            return ("base", (), lhs_names)
-        if "unsigned" in rhs_names:
-            return ("base", (), rhs_names)
-        return ("base", (), lhs_names)
+        decision = _decide_usual_integer_conversion(
+            lhs_rank,
+            "unsigned" in lhs_names,
+            rhs_rank,
+            "unsigned" in rhs_names,
+        )
+        result_names = lhs_names if decision.source == "lhs" else rhs_names
+        return ("base", (), result_names)
 
     def _generic_expr_type_key(self, node):
         if node is None:
@@ -6999,6 +7414,13 @@ class LLVMCodeGenerator(object):
                 }
                 return ops[node.op](lhs, rhs, "tmp"), None
             else:
+                # SEC-P1-UBSAN guards (no-op unless the flag is enabled).
+                if node.op in ("/", "%"):
+                    self._maybe_ubsan_guard_div(lhs, rhs, signed=not is_unsigned)
+                elif node.op in ("+", "-", "*"):
+                    self._maybe_ubsan_guard_arith(
+                        lhs, rhs, node.op, signed=not is_unsigned
+                    )
                 if node.op in ("/", "%") and is_unsigned:
                     op = self.builder.udiv if node.op == "/" else self.builder.urem
                 else:
@@ -7051,11 +7473,13 @@ class LLVMCodeGenerator(object):
                 self._tag_unsigned(result)
             return result, None
         elif node.op == "<<":
+            self._maybe_ubsan_guard_shift(lhs, rhs)  # SEC-P1-UBSAN (no-op if off)
             result = self.builder.shl(lhs, rhs, "shltmp")
             if is_unsigned:
                 self._tag_unsigned(result)
             return result, None
         elif node.op == ">>":
+            self._maybe_ubsan_guard_shift(lhs, rhs)  # SEC-P1-UBSAN (no-op if off)
             if is_unsigned:
                 result = self.builder.lshr(lhs, rhs, "shrtmp")
                 self._tag_unsigned(result)
@@ -7722,6 +8146,17 @@ class LLVMCodeGenerator(object):
                 return self._codegen_builtin_overflow(node, "sub")
             if callee == "__builtin_mul_overflow":
                 return self._codegen_builtin_overflow(node, "mul")
+            if callee in {"abs", "__builtin_abs"}:
+                return self._codegen_builtin_abs(node, int32_t)
+            if callee in {
+                "labs",
+                "llabs",
+                "imaxabs",
+                "__builtin_labs",
+                "__builtin_llabs",
+                "__builtin_imaxabs",
+            }:
+                return self._codegen_builtin_abs(node, int64_t)
             if callee == "__builtin_bswap16":
                 return self._codegen_builtin_bswap(node, 16)
             if callee == "__builtin_bswap32":
@@ -7822,12 +8257,26 @@ class LLVMCodeGenerator(object):
                 return self._codegen_builtin_atomic_fetch_op(node, "or")
             if callee == "__atomic_and_fetch":
                 return self._codegen_builtin_atomic_fetch_op(node, "and")
+            if callee == "__atomic_xor_fetch":
+                return self._codegen_builtin_atomic_fetch_op(node, "xor")
+            if callee == "__atomic_fetch_add":
+                return self._codegen_builtin_atomic_fetch_op(node, "add", return_new=False)
+            if callee == "__atomic_fetch_sub":
+                return self._codegen_builtin_atomic_fetch_op(node, "sub", return_new=False)
+            if callee == "__atomic_fetch_or":
+                return self._codegen_builtin_atomic_fetch_op(node, "or", return_new=False)
+            if callee == "__atomic_fetch_and":
+                return self._codegen_builtin_atomic_fetch_op(node, "and", return_new=False)
+            if callee == "__atomic_fetch_xor":
+                return self._codegen_builtin_atomic_fetch_op(node, "xor", return_new=False)
             if callee == "__atomic_compare_exchange_n":
                 return self._codegen_builtin_atomic_compare_exchange(node)
             if callee == "__atomic_test_and_set":
                 return self._codegen_builtin_atomic_test_and_set(node)
             if callee == "__atomic_clear":
                 return self._codegen_builtin_atomic_clear(node)
+            if callee == "__atomic_thread_fence":
+                return self._codegen_builtin_atomic_thread_fence(node)
         else:
             # Calling function pointer in struct: s.fn(args)
             call_args = []
@@ -7930,6 +8379,11 @@ class LLVMCodeGenerator(object):
         converted = self._convert_call_args(
             call_args, callee_func, arg_nodes=arg_nodes
         )
+        secure_memset_result = self._maybe_codegen_secure_clear(
+            callee, converted
+        )
+        if secure_memset_result is not None:
+            return secure_memset_result
 
         # Call and handle return type
         call_target = self._direct_call_callee(callee_func, converted)
@@ -7954,6 +8408,105 @@ class LLVMCodeGenerator(object):
             ),
             None,
         )
+
+    def _is_integer_zero_constant(self, value):
+        if not isinstance(getattr(value, "type", None), ir.IntType):
+            return False
+        raw = getattr(value, "value", None)
+        if raw is None:
+            raw = getattr(value, "constant", None)
+        try:
+            return int(raw) == 0
+        except (TypeError, ValueError):
+            return False
+
+    def _maybe_codegen_secure_clear(self, callee, converted):
+        """Lower secret-clearing calls so dead-store elimination cannot erase
+        the zero-fill of a buffer that dies (CWE-14 / CWE-226).
+
+        Three call shapes are recognized:
+
+          * ``memset(dst, 0, n)``          -> volatile ``llvm.memset``
+          * ``explicit_bzero(dst, n)``     -> volatile ``llvm.memset`` (0)
+          * ``memset_s(dst, smax, ch, n)`` -> bounded volatile ``llvm.memset`` (ch)
+
+        The clear is a *volatile* ``llvm.memset`` (``isvolatile == true``). A
+        volatile store is an observable side effect the optimizer is not allowed
+        to remove, so the zero-fill survives ``-O2`` DSE without any extra
+        optimization barrier. (An earlier revision also emitted glibc's inline
+        ``asm sideeffect "" ... ~{memory}`` barrier for defense in depth, but it
+        was redundant given the volatile store and, more importantly, the
+        LLVM-free ``self`` backend cannot parse an inline-asm call — it broke
+        real programs such as lz4 that memset internally. The volatile lowering
+        is the mechanism the task explicitly lists as sufficient and it is
+        backend-agnostic.) ``explicit_bzero`` returns ``void`` (modeled as 0);
+        ``memset_s`` caps the write at ``smax`` and returns non-zero when
+        ``n > smax`` rather than turning a bounded clear into an out-of-bounds
+        volatile write."""
+        if len(converted) < 2:
+            return None
+
+        if callee == "memset":
+            if len(converted) < 3:
+                return None
+            dst, fill, size = converted[:3]
+            if not self._is_integer_zero_constant(fill):
+                return None
+            fill_byte = ir.Constant(int8_t, 0)
+            result = None  # memset returns dst
+        elif callee == "explicit_bzero":
+            if len(converted) < 2:
+                return None
+            dst, size = converted[0], converted[1]
+            fill_byte = ir.Constant(int8_t, 0)
+            result = ir.Constant(int64_t, 0)  # void return, modeled as 0
+        elif callee == "memset_s":
+            # memset_s(void *dst, rsize_t smax, int ch, rsize_t n)
+            if len(converted) < 4:
+                return None
+            dst, smax, ch, size = converted[:4]
+            if isinstance(getattr(ch, "type", None), ir.IntType):
+                fill_byte = self._convert_int_value(ch, int8_t)
+            else:
+                fill_byte = ir.Constant(int8_t, 0)
+            result = None  # Filled after width-normalizing smax/size.
+        else:
+            return None
+
+        if not isinstance(getattr(dst, "type", None), ir.PointerType):
+            return None
+        if dst.type == voidptr_t:
+            dst_ptr = dst
+        else:
+            dst_ptr = self.builder.bitcast(dst, voidptr_t, name="secure.memset.dst")
+        if getattr(size, "type", None) != int64_t:
+            size = self._implicit_convert(size, int64_t)
+        if callee == "memset_s":
+            if getattr(smax, "type", None) != int64_t:
+                smax = self._implicit_convert(smax, int64_t)
+            in_bounds = self.builder.icmp_unsigned(
+                "<=", size, smax, name="memset_s.in_bounds"
+            )
+            size = self.builder.select(
+                in_bounds, size, smax, name="memset_s.size"
+            )
+            result = self.builder.select(
+                in_bounds,
+                ir.Constant(int64_t, 0),
+                ir.Constant(int64_t, 22),
+                name="memset_s.errno",
+            )
+        memset_intrinsic = self._get_or_declare_intrinsic(
+            "llvm.memset.p0.i64",
+            ir.VoidType(),
+            [voidptr_t, int8_t, int64_t, bool_t],
+        )
+        self.builder.call(
+            memset_intrinsic,
+            [dst_ptr, fill_byte, size, true_bit],
+            name="secure.memset",
+        )
+        return dst_ptr if result is None else result, None
 
     def _get_or_declare_intrinsic(self, name, ret_type, arg_types):
         existing = self.module.globals.get(name)
@@ -8263,6 +8816,21 @@ class LLVMCodeGenerator(object):
             cttz = self.builder.trunc(cttz, int32_t, name="ffsi32")
         plus_one = self.builder.add(cttz, ir.Constant(int32_t, 1), name="ffsplusone")
         result = self.builder.select(is_zero, ir.Constant(int32_t, 0), plus_one)
+        self._clear_unsigned(result)
+        return result, None
+
+    def _codegen_builtin_abs(self, node, target_type):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(target_type, 0), None
+        value, _ = self.codegen(node.args.exprs[0])
+        if not isinstance(getattr(value, "type", None), ir.IntType):
+            value = self._implicit_convert(value, target_type)
+        if value.type != target_type:
+            value = self._implicit_convert(value, target_type)
+        zero = ir.Constant(target_type, 0)
+        is_negative = self.builder.icmp_signed("<", value, zero, name="absneg")
+        negated = self.builder.neg(value, name="abstmp")
+        result = self.builder.select(is_negative, negated, value, name="abs")
         self._clear_unsigned(result)
         return result, None
 
@@ -8629,6 +9197,25 @@ class LLVMCodeGenerator(object):
             5: "seq_cst",    # __ATOMIC_SEQ_CST
         }.get(value, "monotonic")
 
+    def _codegen_builtin_atomic_thread_fence(self, node):
+        if not node.args or not node.args.exprs:
+            return ir.Constant(int64_t, 0), None
+        try:
+            order_value = self._eval_const_expr(node.args.exprs[0])
+        except Exception:
+            order_value = 5
+        ordering = {
+            0: None,       # __ATOMIC_RELAXED: no inter-thread ordering edge
+            1: "acquire",  # __ATOMIC_CONSUME is implemented as acquire
+            2: "acquire",
+            3: "release",
+            4: "acq_rel",
+            5: "seq_cst",
+        }.get(order_value, "seq_cst")
+        if ordering is not None:
+            self.builder.fence(ordering)
+        return ir.Constant(int64_t, 0), None
+
     def _codegen_builtin_atomic_load(self, node):
         if not node.args or len(node.args.exprs) < 2:
             return ir.Constant(int64_t, 0), None
@@ -8658,7 +9245,12 @@ class LLVMCodeGenerator(object):
         self.builder.store_atomic(value, ptr, ordering, align)
         return ir.Constant(int64_t, 0), None
 
-    def _codegen_builtin_atomic_fetch_op(self, node, op):
+    def _codegen_builtin_atomic_fetch_op(self, node, op, *, return_new=True):
+        # return_new=True  -> __atomic_<op>_fetch (returns the NEW value)
+        # return_new=False -> __atomic_fetch_<op> (returns the OLD value,
+        #                     which is exactly what atomicrmw yields). Without
+        #                     this the fetch_* family fell through to an
+        #                     undefined `__atomic_fetch_<op>` libcall.
         if not node.args or len(node.args.exprs) < 3:
             return ir.Constant(int64_t, 0), None
         ptr, _ = self.codegen(node.args.exprs[0])
@@ -8674,7 +9266,9 @@ class LLVMCodeGenerator(object):
         old = self.builder.atomic_rmw(
             op, ptr, value, ordering, name=f"atomic.{op}.old"
         )
-        if op == "add":
+        if not return_new:
+            result = old
+        elif op == "add":
             result = self.builder.add(old, value, name="atomic.add.new")
         elif op == "sub":
             result = self.builder.sub(old, value, name="atomic.sub.new")
@@ -8682,6 +9276,8 @@ class LLVMCodeGenerator(object):
             result = self.builder.or_(old, value, name="atomic.or.new")
         elif op == "and":
             result = self.builder.and_(old, value, name="atomic.and.new")
+        elif op == "xor":
+            result = self.builder.xor(old, value, name="atomic.xor.new")
         else:
             result = old
         if self._is_unsigned_pointee(ptr):
@@ -8975,8 +9571,10 @@ class LLVMCodeGenerator(object):
                         if existing:
                             self.define(funcname, (resolved.return_type, existing))
                     return None, None
-                if isinstance(resolved, (ir.PointerType, ir.ArrayType)) or _is_struct_ir_type(
-                    resolved
+                if (
+                    isinstance(resolved, (ir.PointerType, ir.ArrayType))
+                    or _is_struct_ir_type(resolved)
+                    or getattr(resolved, "is_union", False)
                 ):
                     name = node.type.declname
                     ir_type = resolved
@@ -8999,9 +9597,11 @@ class LLVMCodeGenerator(object):
                                     node.init, ir_type
                                 )
                         else:
-                            if isinstance(node.init, c_ast.InitList) and (
-                                getattr(ir_type, "is_union", False)
-                                or _is_struct_ir_type(ir_type)
+                            if getattr(ir_type, "is_union", False):
+                                self._safe_store(self._zero_initializer(ir_type), ret)
+                                self._init_runtime_value(ret, ir_type, node.init)
+                            elif isinstance(node.init, c_ast.InitList) and _is_struct_ir_type(
+                                ir_type
                             ):
                                 self._safe_store(self._zero_initializer(ir_type), ret)
                                 self._init_runtime_aggregate(ret, node.init, ir_type)
@@ -9052,7 +9652,12 @@ class LLVMCodeGenerator(object):
                                     node.init, struct_type
                                 )
                         else:
-                            if isinstance(node.init, c_ast.InitList):
+                            if getattr(struct_type, "is_union", False):
+                                self._safe_store(
+                                    self._zero_initializer(struct_type), ret
+                                )
+                                self._init_runtime_value(ret, struct_type, node.init)
+                            elif isinstance(node.init, c_ast.InitList):
                                 self._safe_store(
                                     self._zero_initializer(struct_type), ret
                                 )
@@ -9093,7 +9698,12 @@ class LLVMCodeGenerator(object):
                                     node.init, struct_type
                                 )
                         else:
-                            if isinstance(node.init, c_ast.InitList):
+                            if getattr(struct_type, "is_union", False):
+                                self._safe_store(
+                                    self._zero_initializer(struct_type), ret
+                                )
+                                self._init_runtime_value(ret, struct_type, node.init)
+                            elif isinstance(node.init, c_ast.InitList):
                                 self._safe_store(
                                     self._zero_initializer(struct_type), ret
                                 )
@@ -9162,7 +9772,11 @@ class LLVMCodeGenerator(object):
                 else:
                     if _ssa_promote:
                         # Direct SSA: define as value, no alloca/store
-                        init_val = self._implicit_convert(init_val, ir_type)
+                        init_val = self._implicit_convert(
+                            init_val,
+                            ir_type,
+                            target_unsigned=is_unsigned,
+                        )
                         init_val = self._tag_value_from_decl_type(init_val, node.type)
                         self.define(node.name, (ir_type, init_val))
                         if is_unsigned:
@@ -9175,7 +9789,11 @@ class LLVMCodeGenerator(object):
                             )
                             if is_unsigned:
                                 self._mark_unsigned(var_addr)
-                        init_val = self._implicit_convert(init_val, ir_type)
+                        init_val = self._implicit_convert(
+                            init_val,
+                            ir_type,
+                            target_unsigned=is_unsigned,
+                        )
                         init_val = self._tag_value_from_decl_type(init_val, node.type)
                         self._safe_store(init_val, var_addr)
                 if self.in_global and is_unsigned:
@@ -9683,7 +10301,13 @@ class LLVMCodeGenerator(object):
                 self.builder.ret_void()
                 return None, None
             if retval.type != func_ret_type:
-                retval = self._implicit_convert(retval, func_ret_type)
+                retval = self._implicit_convert(
+                    retval,
+                    func_ret_type,
+                    target_unsigned=(
+                        True if self._is_unsigned_return_binding(self.function) else None
+                    ),
+                )
             self.builder.ret(retval)
         return None, None
 
@@ -10696,23 +11320,14 @@ class LLVMCodeGenerator(object):
             lhs_width = lhs.width
             rhs_width = rhs.width
 
-            if lhs_unsigned == rhs_unsigned:
-                target_width = lhs_width if lhs_width >= rhs_width else rhs_width
-                result_unsigned = lhs_unsigned
-            elif lhs_unsigned:
-                if lhs_width >= rhs_width:
-                    target_width = lhs_width
-                    result_unsigned = True
-                else:
-                    target_width = rhs_width
-                    result_unsigned = False
-            else:
-                if rhs_width >= lhs_width:
-                    target_width = rhs_width
-                    result_unsigned = True
-                else:
-                    target_width = lhs_width
-                    result_unsigned = False
+            decision = _decide_usual_integer_conversion(
+                lhs_width,
+                lhs_unsigned,
+                rhs_width,
+                rhs_unsigned,
+            )
+            target_width = decision.target_order
+            result_unsigned = decision.is_unsigned
 
             lhs = convert_int_value(lhs, target_width, result_unsigned)
             rhs = convert_int_value(rhs, target_width, result_unsigned)

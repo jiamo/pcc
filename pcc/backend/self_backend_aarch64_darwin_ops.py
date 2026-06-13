@@ -72,7 +72,6 @@ def emit_aggregate_bitwise_binop(
         abi_value_reg_names(value_type, lhs_start),
         abi_value_reg_names(value_type, rhs_start),
         abi_value_reg_names(value_type, dest_start),
-        strict=False,
     ):
         lines.append(f"  {mnemonic} {dest_reg}, {lhs_reg}, {rhs_reg}")
     return lines

@@ -11,6 +11,7 @@ from ..py_ast import (
     BoolType,
     Call,
     ClassType,
+    ComplexType,
     DictType,
     DynType,
     FloatType,
@@ -19,6 +20,7 @@ from ..py_ast import (
     ListExpr,
     ListType,
     Name,
+    SetType,
     StrType,
     TupleExpr,
     TupleType,
@@ -29,6 +31,7 @@ from . import marshal
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
+_CSTR = ir.IntType(8).as_pointer()
 _DOUBLE = ir.DoubleType()
 
 
@@ -93,8 +96,13 @@ class NumericBuiltinLoweringMixin:
             )
             # py_int_from_cstr_or_raise raises ValueError on invalid input
             # (py_int_from_cstr returned NULL, which would otherwise unbox to 0
-            # -> int('xyz') silently became 0). Emit the err check so try/except
-            # can catch it and the bad value never propagates.
+            # -> int('xyz') silently became 0). It raises the CPython-accurate
+            # message from the (string, base) it receives: either
+            # "int() base must be >= 2 and <= 36, or 0" for a bad base, or
+            # "invalid literal for int() with base <base>: <repr(s)>" for a bad
+            # literal — so ``base_val`` must be the original base argument.
+            # Emit the err check so try/except can catch it and the bad value
+            # never propagates.
             self._emit_post_call_err_check(getattr(expr, "span", None))
             # Unbox to native i64 via the existing marshal helper.
             return marshal.marshal_from_object(
@@ -176,7 +184,9 @@ class NumericBuiltinLoweringMixin:
                 [cstr, base_val],
                 name=self._fresh("int.dyn.parse"),
             )
-            # ValueError on invalid input (was silent 0); err check so
+            # ValueError on invalid input (was silent 0); the helper builds the
+            # CPython-accurate message from the original (string, base) — bad
+            # base vs bad literal, with base/repr embedded. Err check so
             # try/except can catch it. The check's continuation block becomes
             # the current block, so the marshal + branch below stay correct.
             self._emit_post_call_err_check(getattr(expr, "span", None))
@@ -248,19 +258,39 @@ class NumericBuiltinLoweringMixin:
             phi.add_incoming(int_val, int_exit)
             return phi
         return None
+    def _emit_sum_start_object(self, start):
+        if start is None:
+            return self.builder.call(
+                self.runtime["py_int_from_i64"],
+                [ir.Constant(_I64, 0)],
+                name=self._fresh("sum.start.zero"),
+            )
+        raw = self._emit_expr(start)
+        return marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            raw,
+            start.ty,
+        )
+
+    def _emit_sum_add_objects(self, acc_obj, elem_obj):
+        return self.builder.call(
+            self.runtime["py_int_add"],
+            [acc_obj, elem_obj],
+            name=self._fresh("sum.obj.next"),
+        )
+
     def _emit_sum_via_iter(self, src_obj, start, span):
         """``sum(<iterable>)`` over a DynType source via the iterator protocol
-        (py_obj_iter/py_obj_next), accumulating int elements into an i64. Used
+        (py_obj_iter/py_obj_next), accumulating with Python int semantics. Used
         for iterator-only objects such as generators (no length / __getitem__).
         Mirrors the for-loop / list-builtin iterator path; clears a terminal
         StopIteration (tag 8) and propagates any other exception."""
         cstr = ir.IntType(8).as_pointer()
         fn = self.current_function
-        acc_slot = self._alloca_in_entry(_I64, name="sum.iter.acc.addr")
-        if start is not None:
-            self.builder.store(self._emit_expr_as_i64(start), acc_slot)
-        else:
-            self.builder.store(ir.Constant(_I64, 0), acc_slot)
+        acc_slot = self._alloca_in_entry(_CSTR, name="sum.iter.acc.addr")
+        self.builder.store(self._emit_sum_start_object(start), acc_slot)
         iterator = self.builder.call(
             self.runtime["py_obj_iter"],
             [src_obj],
@@ -285,18 +315,8 @@ class NumericBuiltinLoweringMixin:
         )
         self.builder.cbranch(is_null, maybe_end_bb, body_bb)
         self.builder.position_at_end(body_bb)
-        elem_i64 = marshal.marshal_from_object(
-            self.builder,
-            self.module,
-            self.runtime,
-            item,
-            IntType(name="int"),
-        )
         acc_cur = self.builder.load(acc_slot, name=self._fresh("sum.iter.acc"))
-        self.builder.store(
-            self.builder.add(acc_cur, elem_i64, name=self._fresh("sum.iter.acc.next")),
-            acc_slot,
-        )
+        self.builder.store(self._emit_sum_add_objects(acc_cur, item), acc_slot)
         self.builder.branch(header_bb)
         self.builder.position_at_end(maybe_end_bb)
         current_exc = self.builder.call(
@@ -372,13 +392,9 @@ class NumericBuiltinLoweringMixin:
             )
             fn_ = self.current_function
             idx_slot = self._alloca_in_entry(_I64, name="sum.idx.addr")
-            acc_slot = self._alloca_in_entry(_I64, name="sum.acc.addr")
+            acc_slot = self._alloca_in_entry(_CSTR, name="sum.acc.addr")
             self.builder.store(ir.Constant(_I64, 0), idx_slot)
-            if start is not None:
-                start_i64 = self._emit_expr_as_i64(start)
-                self.builder.store(start_i64, acc_slot)
-            else:
-                self.builder.store(ir.Constant(_I64, 0), acc_slot)
+            self.builder.store(self._emit_sum_start_object(start), acc_slot)
             cond_bb = fn_.append_basic_block(name=self._fresh("sum.cond"))
             body_bb = fn_.append_basic_block(name=self._fresh("sum.body"))
             step_bb = fn_.append_basic_block(name=self._fresh("sum.step"))
@@ -404,22 +420,11 @@ class NumericBuiltinLoweringMixin:
                 [src_obj, idx_box],
                 name=self._fresh("sum.elem"),
             )
-            elem_i64 = marshal.marshal_from_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                elem_obj,
-                IntType(name="int"),
-            )
             acc_cur = self.builder.load(
                 acc_slot,
                 name=self._fresh("sum.acc"),
             )
-            new_acc = self.builder.add(
-                acc_cur,
-                elem_i64,
-                name=self._fresh("sum.acc.next"),
-            )
+            new_acc = self._emit_sum_add_objects(acc_cur, elem_obj)
             self.builder.store(new_acc, acc_slot)
             self.builder.branch(step_bb)
             self.builder.position_at_end(step_bb)
@@ -451,21 +456,13 @@ class NumericBuiltinLoweringMixin:
             if start is not None:
                 acc = self._emit_expr(start)
                 if not isinstance(start.ty, FloatType):
-                    acc = self.builder.sitofp(
-                        acc,
-                        _DOUBLE,
-                        name=self._fresh("promote"),
-                    )
+                    acc = self._to_double(acc, start.ty)
             else:
                 acc = ir.Constant(_DOUBLE, 0.0)
             for e in elems:
                 v = self._emit_expr(e)
                 if not isinstance(e.ty, FloatType):
-                    v = self.builder.sitofp(
-                        v,
-                        _DOUBLE,
-                        name=self._fresh("promote"),
-                    )
+                    v = self._to_double(v, e.ty)
                 acc = self.builder.fadd(
                     acc,
                     v,
@@ -473,13 +470,17 @@ class NumericBuiltinLoweringMixin:
                 )
             return acc
         # All-int path.
-        if start is not None:
-            acc = self._emit_expr_as_i64(start)
-        else:
-            acc = ir.Constant(_I64, 0)
+        acc = self._emit_sum_start_object(start)
         for e in elems:
-            v = self._emit_expr_as_i64(e)
-            acc = self.builder.add(acc, v, name=self._fresh("sum"))
+            v = self._emit_expr(e)
+            v_obj = marshal.marshal_to_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                v,
+                e.ty,
+            )
+            acc = self._emit_sum_add_objects(acc, v_obj)
         return acc
     def _maybe_emit_any_all_literal(
         self,
@@ -492,11 +493,14 @@ class NumericBuiltinLoweringMixin:
         (ListType / TupleType / DictType / DynType) iterate via
         ``py_obj_len`` / ``py_obj_getitem`` with early exit."""
         arg = expr.args[0]
+        mapped = self._maybe_emit_any_all_map_lambda(arg, name)
+        if mapped is not None:
+            return mapped
         if not isinstance(arg, (TupleExpr, ListExpr)):
             arg_ty = arg.ty
             if not isinstance(
                 arg_ty,
-                (ListType, TupleType, DictType, DynType),
+                (ListType, TupleType, DictType, SetType, DynType),
             ):
                 return None
             src_val = self._emit_expr(arg)
@@ -654,6 +658,150 @@ class NumericBuiltinLoweringMixin:
         for val, pred_bb in incoming:
             phi.add_incoming(val, pred_bb)
         return phi
+
+    def _maybe_emit_any_all_map_lambda(
+        self,
+        arg: object,
+        name: str,
+    ) -> Optional[ir.Value]:
+        if (
+            not isinstance(arg, Call)
+            or not isinstance(arg.func, Name)
+            or arg.func.ident != "map"
+            or arg.kwargs
+            or len(arg.args) != 2
+            or not isinstance(arg.args[0], Lambda)
+            or len(arg.args[0].params) != 1
+        ):
+            return None
+        lam = arg.args[0]
+        param = lam.params[0]
+        if param.kind != "pos":
+            return None
+
+        src_expr = arg.args[1]
+        src_val = self._emit_expr(src_expr)
+        src_obj = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            src_val,
+            src_expr.ty,
+        )
+        fn_ = self.current_function
+        n_val = self.builder.call(
+            self.runtime["py_obj_len"],
+            [src_obj],
+            name=self._fresh(f"{name}.map.src.len"),
+        )
+        idx_slot = self._alloca_in_entry(_I64, name=f"{name}.map.idx.addr")
+        item_slot = self._alloca_in_entry(_CSTR, name=f"{name}.map.item.addr")
+        result_slot = self._alloca_in_entry(
+            _I1,
+            name=f"{name}.map.result.addr",
+        )
+        init = 0 if name == "any" else 1
+        self.builder.store(ir.Constant(_I1, init), result_slot)
+        self.builder.store(ir.Constant(_I64, 0), idx_slot)
+
+        cond_bb = fn_.append_basic_block(name=self._fresh(f"{name}.map.cond"))
+        body_bb = fn_.append_basic_block(name=self._fresh(f"{name}.map.body"))
+        step_bb = fn_.append_basic_block(name=self._fresh(f"{name}.map.step"))
+        end_bb = fn_.append_basic_block(name=self._fresh(f"{name}.map.end"))
+        self.builder.branch(cond_bb)
+
+        self.builder.position_at_end(cond_bb)
+        cur = self.builder.load(idx_slot, name=self._fresh(f"{name}.map.idx"))
+        cond = self.builder.icmp_signed(
+            "<",
+            cur,
+            n_val,
+            name=self._fresh(f"{name}.map.cond.i1"),
+        )
+        self.builder.cbranch(cond, body_bb, end_bb)
+
+        self.builder.position_at_end(body_bb)
+        idx_box = self.builder.call(
+            self.runtime["py_int_from_i64"],
+            [cur],
+            name=self._fresh(f"{name}.map.idx.box"),
+        )
+        elem = self.builder.call(
+            self.runtime["py_obj_getitem"],
+            [src_obj, idx_box],
+            name=self._fresh(f"{name}.map.elem"),
+        )
+        self.builder.store(elem, item_slot)
+
+        param_name = param.name
+        old_env = self.env.get(param_name)
+        old_cpy_flag = getattr(self, "_cpy_env_flags", {}).get(param_name)
+        old_class_hint = self.env_class_hint.get(param_name)
+        old_class_obj_hint = self.env_class_object_hint.get(param_name)
+        old_elem_hint = self.env_list_elem_class_hint.get(param_name)
+        old_exact_int_flag = getattr(self, "_exact_int_env_flags", {}).get(
+            param_name
+        )
+        self.env[param_name] = (item_slot, _CSTR, DynType(name="dyn"))
+        self._cpy_env_flags.pop(param_name, None)
+        self.env_class_hint.pop(param_name, None)
+        self.env_class_object_hint.pop(param_name, None)
+        self.env_list_elem_class_hint.pop(param_name, None)
+        self._exact_int_env_flags.pop(param_name, None)
+        try:
+            mapped = self._emit_expr(lam.body)
+        finally:
+            if old_env is None:
+                self.env.pop(param_name, None)
+            else:
+                self.env[param_name] = old_env
+            if old_cpy_flag is None:
+                self._cpy_env_flags.pop(param_name, None)
+            else:
+                self._cpy_env_flags[param_name] = old_cpy_flag
+            if old_class_hint is None:
+                self.env_class_hint.pop(param_name, None)
+            else:
+                self.env_class_hint[param_name] = old_class_hint
+            if old_class_obj_hint is None:
+                self.env_class_object_hint.pop(param_name, None)
+            else:
+                self.env_class_object_hint[param_name] = old_class_obj_hint
+            if old_elem_hint is None:
+                self.env_list_elem_class_hint.pop(param_name, None)
+            else:
+                self.env_list_elem_class_hint[param_name] = old_elem_hint
+            if old_exact_int_flag is None:
+                self._exact_int_env_flags.pop(param_name, None)
+            else:
+                self._exact_int_env_flags[param_name] = old_exact_int_flag
+        truthy = self._truthy(mapped, lam.body.ty)
+        if name == "any":
+            hit_bb = fn_.append_basic_block(name=self._fresh("any.map.hit"))
+            self.builder.cbranch(truthy, hit_bb, step_bb)
+            self.builder.position_at_end(hit_bb)
+            self.builder.store(ir.Constant(_I1, 1), result_slot)
+            self.builder.branch(end_bb)
+        else:
+            miss_bb = fn_.append_basic_block(name=self._fresh("all.map.miss"))
+            self.builder.cbranch(truthy, step_bb, miss_bb)
+            self.builder.position_at_end(miss_bb)
+            self.builder.store(ir.Constant(_I1, 0), result_slot)
+            self.builder.branch(end_bb)
+
+        self.builder.position_at_end(step_bb)
+        nxt = self.builder.add(
+            cur,
+            ir.Constant(_I64, 1),
+            name=self._fresh(f"{name}.map.idx.next"),
+        )
+        self.builder.store(nxt, idx_slot)
+        self.builder.branch(cond_bb)
+        self.builder.position_at_end(end_bb)
+        return self.builder.load(
+            result_slot,
+            name=self._fresh(f"{name}.map.result"),
+        )
     def _min_max_needs_object_compare(self, ty) -> bool:
         """True if min()/max() over ``ty`` must compare elements as objects
         (py_obj_cmp_threeway) rather than the int-accumulator fast path: a str
@@ -934,27 +1082,27 @@ class NumericBuiltinLoweringMixin:
         the resolver and seeds the accumulator on empty."""
         arg = expr.args[0]
         arg_ty = arg.ty
-        # key=<simple attr/index lambda>: inline the key extraction (no
+        # key=<supported inline callable>: inline the key extraction (no
         # first-class-fn boxing), reusing the sorted() #56 key machinery, in an
         # object fold returning the extreme ELEMENT. Takes precedence over the
         # element-__lt__ route below (Python uses key=, ignoring __lt__). A
-        # non-simple key lambda / non-lambda key / unknown kwarg returns None
-        # here -> libpython fallback (we must NOT run the key-blind folds below).
+        # non-simple lambda / unsupported key / unknown kwarg returns None here
+        # -> libpython fallback (we must NOT run the key-blind folds below).
         if any(k == "key" for k, _ in (expr.kwargs or ())):
-            key_lambda = None
+            key_expr = None
             handled = True
             for k, v in expr.kwargs:
-                if k == "key" and isinstance(v, Lambda):
-                    key_lambda = v
+                if k == "key":
+                    key_expr = v
                 elif k == "default":
                     pass
                 else:
                     handled = False
-            if handled and key_lambda is not None:
+            if handled and key_expr is not None:
                 elem_ty = (
                     arg_ty.elem if isinstance(arg_ty, ListType) else None
                 )
-                key_spec = self._sorted_key_spec_from_lambda(key_lambda, elem_ty)
+                key_spec = self._key_spec_from_callable(key_expr, elem_ty)
                 if key_spec is not None:
                     return self._emit_min_max_by_key_fold(expr, name, key_spec)
             return None
@@ -1197,18 +1345,8 @@ class NumericBuiltinLoweringMixin:
         if isinstance(a_ty, FloatType) or isinstance(b_ty, FloatType):
             av = self._emit_expr(a_expr)
             bv = self._emit_expr(b_expr)
-            if not isinstance(a_ty, FloatType):
-                av = self.builder.sitofp(
-                    av,
-                    _DOUBLE,
-                    name=self._fresh("promote"),
-                )
-            if not isinstance(b_ty, FloatType):
-                bv = self.builder.sitofp(
-                    bv,
-                    _DOUBLE,
-                    name=self._fresh("promote"),
-                )
+            av = self._to_double(av, a_ty)
+            bv = self._to_double(bv, b_ty)
             cmp = self.builder.fcmp_ordered(
                 "<" if name == "min" else ">",
                 av,
@@ -1276,13 +1414,36 @@ class NumericBuiltinLoweringMixin:
 
     def _emit_abs_builtin(self, expr: Call) -> ir.Value:
         """``abs(x)`` for native int / float / bool, with DynType
-        routed through CPython."""
+        routed through the pcc object runtime."""
         a_expr = expr.args[0]
         a_ty = a_expr.ty
         if isinstance(a_ty, DynType):
-            fn_val = self._load_cpython_builtin("abs")
-            return self._emit_cpy_func_call(fn_val, "abs", expr.args)
-        if isinstance(a_ty, (IntType, BoolType)):
+            arg_obj = self._emit_as_object(a_expr)
+            result = self.builder.call(
+                self.runtime["py_obj_abs"],
+                [arg_obj],
+                name=self._fresh("obj.abs"),
+            )
+            self._emit_post_call_err_check(self._expr_span_or_none(expr))
+            return result
+        if isinstance(a_ty, IntType):
+            # ``int`` is arbitrary precision: the i64 fast path truncated a
+            # bignum (abs(10**40) collapsed to 0). Route through the object
+            # runtime py_obj_abs (the bignum-correct path DynType uses), which
+            # preserves/promotes bignums instead of truncating to i64.
+            arg_obj = self._emit_as_object(a_expr)
+            result = self.builder.call(
+                self.runtime["py_obj_abs"],
+                [arg_obj],
+                name=self._fresh("int.abs"),
+            )
+            self._emit_post_call_err_check(self._expr_span_or_none(expr))
+            return result
+        if isinstance(a_ty, BoolType):
+            # bool is always 0/1, so the i64 path is exact. (NOTE: ``abs(bool)``
+            # is an ``int`` in CPython and ``print(abs(True))`` hits a separate
+            # pre-existing bool-print typing bug — tracked separately, not
+            # widened here to keep this fix scoped to the bignum truncation.)
             v = self._emit_expr_as_i64(a_expr)
             zero = ir.Constant(_I64, 0)
             neg = self.builder.icmp_signed(
@@ -1322,6 +1483,21 @@ class NumericBuiltinLoweringMixin:
                 v,
                 name=self._fresh("abs"),
             )
+        if isinstance(a_ty, ComplexType):
+            # abs(complex) is the magnitude sqrt(re**2 + im**2) -> float.
+            arg_obj = self._emit_as_object(a_expr)
+            return self.builder.call(
+                self.runtime["py_complex_abs"],
+                [arg_obj],
+                name=self._fresh("complex.abs"),
+            )
+        if isinstance(a_ty, ClassType):
+            # abs(obj) dispatches to the user __abs__ method, mirroring unary
+            # -obj -> __neg__ (unary_call_lowering). The helper emits the
+            # receiver itself.
+            dunder = self._try_dispatch_dunder_unary(a_expr, "__abs__", ())
+            if dunder is not None:
+                return dunder
         raise NotImplementedError(
             f"Layer 1 abs() with arg type {a_ty!r} needs runtime support"
         )

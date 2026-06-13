@@ -1,5 +1,11 @@
 from .backend import backend_env_name
+from .cli_contract import (
+    BACKEND_CHOICES,
+    DEFAULT_EMIT_LL,
+    PYTHON_LIBPYTHON_CHOICES,
+)
 from .cli_core import cli_main, execute_cli
+from .gpu_backend import gpu_backend_env_name
 
 
 _MAIN_DOC = """Pcc - a C compiler built on Python and LLVM.
@@ -53,6 +59,7 @@ def _click_entry(
     emit_llvm,
     output_path,
     backend,
+    gpu_backend,
     python_libpython,
     python_library,
     verbose,
@@ -89,6 +96,7 @@ def _click_entry(
             emit_llvm=emit_llvm,
             output_path=output_path,
             backend=backend,
+            gpu_backend=gpu_backend,
             python_libpython=python_libpython,
             python_library=python_library,
             verbose=verbose,
@@ -118,7 +126,7 @@ def _build_click_main():
     )(cmd)
     cmd = click_mod.option(
         "--python-libpython",
-        type=click_mod.Choice(["auto", "on", "off"], case_sensitive=False),
+        type=click_mod.Choice(PYTHON_LIBPYTHON_CHOICES, case_sensitive=False),
         default=None,
         envvar="PCC_PYTHON_LIBPYTHON",
         metavar="MODE",
@@ -132,11 +140,19 @@ def _build_click_main():
     )(cmd)
     cmd = click_mod.option(
         "--backend",
-        type=click_mod.Choice(["llvm", "llvm_capi", "self"], case_sensitive=False),
+        type=click_mod.Choice(BACKEND_CHOICES, case_sensitive=False),
         default=None,
         envvar=backend_env_name(),
         metavar="BACKEND",
         help="Backend implementation to use: llvm (default), llvm_capi, or self.",
+    )(cmd)
+    cmd = click_mod.option(
+        "--gpu-backend",
+        type=click_mod.Choice(["none", "metal"], case_sensitive=False),
+        default=None,
+        envvar=gpu_backend_env_name(),
+        metavar="BACKEND",
+        help="Device backend for annotated GPU kernels: none (default) or metal.",
     )(cmd)
     cmd = click_mod.option(
         "-o",
@@ -152,7 +168,7 @@ def _build_click_main():
         help="Emit LLVM IR to PATH instead of running. For .py inputs may "
         "be given without a value to emit to <stem>.ll.",
         is_flag=False,
-        flag_value="__PCC_DEFAULT_LL__",
+        flag_value=DEFAULT_EMIT_LL,
     )(cmd)
     cmd = click_mod.option(
         "--emit-asm",

@@ -270,6 +270,81 @@ _PY_BUILTINS_NS = ('ArithmeticError',
  'zip')
 
 
+_FIELD_NAMES_BY_KIND = {
+    "SourceSpan": ("file", "line", "col", "end_line", "end_col"),
+    "IntType": ("name", "width"),
+    "FloatType": ("name", "width"),
+    "BoolType": ("name",),
+    "NoneType": ("name",),
+    "StrType": ("name",),
+    "ListType": ("name", "elem"),
+    "DictType": ("name", "key", "value"),
+    "TupleType": ("name", "elems"),
+    "FuncType": ("name", "params", "ret"),
+    "ClassType": ("name", "module", "fields", "bases"),
+    "DynType": ("name",),
+    "Type": ("name",),
+    "NoneLit": ("span", "ty"),
+    "IntLit": ("span", "ty", "value"),
+    "FloatLit": ("span", "ty", "value"),
+    "BoolLit": ("span", "ty", "value"),
+    "StrLit": ("span", "ty", "value"),
+    "Name": ("span", "ty", "ident"),
+    "BinOp": ("span", "ty", "op", "lhs", "rhs"),
+    "UnaryOp": ("span", "ty", "op", "operand"),
+    "Compare": ("span", "ty", "op", "lhs", "rhs"),
+    "BoolExpr": ("span", "ty", "op", "left", "right"),
+    "Call": ("span", "ty", "func", "args", "kwargs"),
+    "Attr": ("span", "ty", "obj", "name"),
+    "Subscript": ("span", "ty", "obj", "idx"),
+    "Slice": ("span", "ty", "lo", "hi", "step"),
+    "ListExpr": ("span", "ty", "elems"),
+    "DictExpr": ("span", "ty", "pairs"),
+    "TupleExpr": ("span", "ty", "elems"),
+    "IfExpr": ("span", "ty", "cond", "then_e", "else_e"),
+    "Lambda": ("span", "ty", "params", "body"),
+    "Assign": ("span", "targets", "value", "annotation"),
+    "AugAssign": ("span", "target", "op", "value"),
+    "ExprStmt": ("span", "expr"),
+    "If": ("span", "cond", "body", "else_body"),
+    "While": ("span", "cond", "body", "else_body"),
+    "For": ("span", "target", "iter", "body", "else_body"),
+    "Return": ("span", "value"),
+    "Pass": ("span",),
+    "Break": ("span",),
+    "Continue": ("span",),
+    "Raise": ("span", "exc", "cause"),
+    "Try": ("span", "body", "handlers", "else_body", "finally_body"),
+    "With": ("span", "items", "body"),
+    "Import": ("span", "names"),
+    "ImportFrom": ("span", "module", "names", "level"),
+    "Global": ("span", "names"),
+    "Nonlocal": ("span", "names"),
+    "Delete": ("span", "targets"),
+    "FuncDef": (
+        "span",
+        "name",
+        "args",
+        "return_ty",
+        "body",
+        "decorators",
+        "is_method",
+        "is_async",
+    ),
+    "ClassDef": (
+        "span",
+        "name",
+        "bases",
+        "keywords",
+        "body",
+        "decorators",
+    ),
+    "Arg": ("name", "annotation", "default", "kind", "has_default"),
+    "ExceptHandler": ("exc_type", "name", "body", "span"),
+    "Module": ("name", "body", "docstring"),
+}
+
+
 
 
 def _dataclass_field_value(obj, field_name: str, default=None):
@@ -290,6 +365,9 @@ def _dataclass_field_names(obj):
     kind = type(obj).__name__
     if kind.startswith("_"):
         kind = kind[1:]
+    cached = _FIELD_NAMES_BY_KIND.get(kind)
+    if cached is not None:
+        return cached
     if kind == "SourceSpan":
         return ("file", "line", "col", "end_line", "end_col")
     if kind == "IntType" or kind == "FloatType":
@@ -922,11 +1000,11 @@ def body_uses_name_walk(
             return True
         for h in x.handlers:
             if body_uses_name_walk(
-                h.exc_type,
+                _dataclass_field_value(h, "exc_type", None),
                 target,
                 in_lambda=in_lambda,
             ) or body_uses_name_walk(
-                h.body,
+                _dataclass_field_value(h, "body", ()),
                 target,
                 in_lambda=in_lambda,
             ):
@@ -991,7 +1069,10 @@ def body_returns_name_walk_block(block, target):
             if body_returns_name_walk_block(s.body, target):
                 return True
             for h in s.handlers:
-                if body_returns_name_walk_block(h.body, target):
+                if body_returns_name_walk_block(
+                    _dataclass_field_value(h, "body", ()),
+                    target,
+                ):
                     return True
             if body_returns_name_walk_block(
                 s.else_body,
@@ -1111,9 +1192,13 @@ def _hoist_fast_stmt_may_need(stmt) -> bool:
             continue
         if slot == "handlers":
             for handler in value:
-                if _hoist_fast_expr_may_need(handler.exc_type):
+                if _hoist_fast_expr_may_need(
+                    _dataclass_field_value(handler, "exc_type", None)
+                ):
                     return True
-                if _hoist_fast_block_may_need(handler.body):
+                if _hoist_fast_block_may_need(
+                    _dataclass_field_value(handler, "body", ())
+                ):
                     return True
             continue
         if isinstance(value, tuple):

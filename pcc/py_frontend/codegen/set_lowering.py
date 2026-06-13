@@ -15,6 +15,7 @@ from ..py_ast import (
     ListExpr,
     ListType,
     Name,
+    SetType,
     StrType,
     TupleExpr,
     TupleType,
@@ -38,7 +39,11 @@ _DYN_SET_METHOD_NATIVE = frozenset(
         "intersection",
         "difference",
         "symmetric_difference",
+        "intersection_update",
+        "difference_update",
+        "symmetric_difference_update",
         "copy",
+        "pop",
     }
 )
 
@@ -56,9 +61,7 @@ class SetLoweringMixin:
     def _maybe_emit_set_method(self, expr: Call) -> Optional[ir.Value]:
         """Dispatch selected pcc-native set methods.
 
-        Sets are represented as ``DynType(name="set")`` until the frozen
-        AST grows a first-class SetType, so this is keyed off the type
-        hint rather than ``isinstance``.
+        Set/frozenset values carry a first-class ``SetType`` projection.
         """
         attr = expr.func
         assert isinstance(attr, Attr)
@@ -68,10 +71,11 @@ class SetLoweringMixin:
         if name not in (
             "add", "remove", "discard", "update", "issubset", "issuperset",
             "isdisjoint", "union", "intersection", "difference",
-            "symmetric_difference", "copy",
+            "symmetric_difference", "intersection_update", "difference_update",
+            "symmetric_difference_update", "copy", "pop",
         ):
             return None
-        if name == "copy":
+        if name in ("copy", "pop"):
             if expr.args:
                 return None
         elif len(expr.args) != 1:
@@ -88,6 +92,26 @@ class SetLoweringMixin:
             )
         if name == "update":
             self._spread_into_set(recv, expr.args[0])
+            return self._emit_none_literal()
+        if name in (
+            "intersection_update",
+            "difference_update",
+            "symmetric_difference_update",
+        ):
+            # In-place mutators: the runtime helper rewrites the receiver's
+            # contents in place (preserving receiver identity so aliases see
+            # the change) using the corresponding
+            # py_set_intersection/difference/symmetric_difference result.
+            # They return None, matching CPython.
+            fn_name = {
+                "intersection_update": "py_set_intersection_update",
+                "difference_update": "py_set_difference_update",
+                "symmetric_difference_update": "py_set_symmetric_difference_update",
+            }[name]
+            self.builder.call(
+                self.runtime[fn_name],
+                [recv, self._emit_as_object(expr.args[0])],
+            )
             return self._emit_none_literal()
         if name in ("issubset", "issuperset"):
             fn_name = (
@@ -129,6 +153,14 @@ class SetLoweringMixin:
                     [new_set, self._emit_as_object(expr.args[0])],
                 )
             return new_set
+        if name == "pop":
+            result = self.builder.call(
+                self.runtime["py_set_pop"],
+                [recv],
+                name=self._fresh("set.pop"),
+            )
+            self._emit_post_call_err_check(expr.span)
+            return result
         if name == "isdisjoint":
             inter = self.builder.call(
                 self.runtime["py_set_intersection"],
@@ -146,7 +178,7 @@ class SetLoweringMixin:
                 ir.Constant(_I64, 0),
                 name=self._fresh("set.isdisjoint.i1"),
             )
-        item = self._emit_as_object(expr.args[0])
+        item = self._emit_expr_as_pcc_object(expr.args[0])
         if name == "add":
             self.builder.call(self.runtime["py_set_add"], [recv, item])
             return self._emit_none_literal()
@@ -225,21 +257,14 @@ class SetLoweringMixin:
                     # splat ergonomics.
                     self._spread_into_set(new_set, el.args[0])
                     continue
-                v = self._emit_expr(el)
-                v_obj = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    v,
-                    el.ty,
-                )
+                v_obj = self._emit_expr_as_pcc_object(el)
                 self.builder.call(
                     self.runtime["py_set_add"],
                     [new_set, v_obj],
                 )
             return new_set
         arg_ty = arg.ty
-        if isinstance(arg_ty, DynType) and arg_ty.name == "set":
+        if isinstance(arg_ty, SetType):
             src_val = self._emit_expr(arg)
             self.builder.call(
                 self.runtime["py_set_update"],
@@ -298,7 +323,10 @@ class SetLoweringMixin:
             self.builder.branch(cond_bb)
             self.builder.position_at_end(end_bb)
             return new_set
-        if isinstance(arg_ty, (ListType, TupleType, DictType, DynType, StrType)):
+        if isinstance(
+            arg_ty,
+            (ListType, TupleType, DictType, SetType, DynType, StrType),
+        ):
             src_val = self._emit_expr(arg)
             src_obj = marshal.marshal_to_object(
                 self.builder,
@@ -374,7 +402,7 @@ class SetLoweringMixin:
         ``dst_set``. Used to lower the set-literal splat element
         ``{x, *iterable}`` (see ``_maybe_emit_set_builtin``)."""
         src_val = self._emit_expr(src_expr)
-        if isinstance(src_expr.ty, DynType) and src_expr.ty.name == "set":
+        if isinstance(src_expr.ty, SetType):
             self.builder.call(self.runtime["py_set_update"], [dst_set, src_val])
             return
         src_obj = marshal.marshal_to_object(

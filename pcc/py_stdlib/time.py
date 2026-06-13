@@ -3,36 +3,35 @@
 Scope: what pcc's own source (and the self-host benchmark harness)
 actually calls.
 """
+
 from __future__ import annotations
 
-from pcc.extern import extern, c_int64, c_double
+import time as _native_time
 
-
-_clock_gettime_realtime: "extern" = extern(
-    "clock_gettime", (c_int64, c_int64), c_int64,
-)
+from pcc.extern import c_int64, extern
 
 
 def time() -> float:
     """Seconds since the epoch, as a float."""
-    raise NotImplementedError(
-        "time.time() awaits the struct timespec marshalling path in P6C.1"
-    )
+    return float(_native_time.time())
 
 
 def monotonic() -> float:
-    """Monotonic clock seconds. Same marshalling requirement as time.time."""
-    raise NotImplementedError(
-        "time.monotonic() awaits struct-timespec marshalling"
-    )
+    return float(_native_time.monotonic())
 
 
 def perf_counter() -> float:
-    return monotonic()
+    return float(_native_time.perf_counter())
+
+
+def strftime(fmt: str) -> str:
+    return str(_native_time.strftime(fmt))
 
 
 _nanosleep: "extern" = extern(
-    "usleep", (c_int64,), c_int64,
+    "usleep",
+    (c_int64,),
+    c_int64,
 )
 
 

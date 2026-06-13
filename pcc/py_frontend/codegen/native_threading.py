@@ -112,6 +112,21 @@ class NativeThreadingLoweringMixin:
         kind = self._threading_list_elem_kind_for_type(expr.ty)
         if kind is not None:
             return kind
+        if (
+            isinstance(expr, Call)
+            and isinstance(expr.func, Name)
+            and expr.func.ident in (
+                "_list_comp",
+                "__listcomp__",
+                "_gen_comp",
+                "__genexpr__",
+            )
+            and expr.args
+        ):
+            return (
+                self._threading_constructor_kind_for_expr(expr.args[0])
+                or self._threading_kind_for_receiver_expr(expr.args[0])
+            )
         if not isinstance(expr, ListExpr) or not expr.elems:
             return None
         inferred: Optional[str] = None

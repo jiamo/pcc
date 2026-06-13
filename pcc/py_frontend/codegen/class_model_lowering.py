@@ -1,4 +1,5 @@
 """Class hint, MRO, and external class helper lowering for L1CodeGen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -16,9 +17,10 @@ from ..py_ast import (
     Name,
     Return,
     StrLit,
+    TupleExpr,
+    TupleType,
 )
 from . import marshal
-
 
 _I8 = ir.IntType(8)
 _CSTR = _I8.as_pointer()
@@ -113,6 +115,8 @@ class ClassModelLoweringMixin:
 
     def _class_hint_for_expr(self, expr: Expr) -> Optional[str]:
         if isinstance(expr, Name):
+            if expr.ident == "self" and self.current_class is not None:
+                return self.current_class.name
             expr_ty = _class_type_like(expr.ty)
             if expr_ty is not None:
                 alias_name = self._resolve_class_alias(expr_ty.name)
@@ -178,6 +182,12 @@ class ClassModelLoweringMixin:
             name = expr.func.ident
             if name in self.class_lowering.classes:
                 return name
+            # A rebind such as ``cls = Decoder; cls()`` stores a class object
+            # in a normal Python local.  Its call result is an instance of the
+            # hinted class even when stage inference widens the Call to DynType.
+            class_object_hint = getattr(self, "env_class_object_hint", {}).get(name)
+            if class_object_hint is not None:
+                return class_object_hint
             return None
         if isinstance(expr.func, Attr):
             # Check if this is a cross-module class instantiation.
@@ -240,7 +250,7 @@ class ClassModelLoweringMixin:
             owning = getattr(local_info, "owning_module", None)
             if owning is None or ty.module is None or owning == ty.module:
                 return ty.name
-        
+
         # Check by qualified name to handle shadowed classes.
         if ty.module:
             qualified = f"{ty.module}.{ty.name}"
@@ -269,9 +279,13 @@ class ClassModelLoweringMixin:
                 "",
             ):
                 base_owner = base_info.get("owning_module", base_module)
-                base_ty = ClassType(name=base_name, module=base_module, fields=(), bases=())
+                base_ty = ClassType(
+                    name=base_name, module=base_module, fields=(), bases=()
+                )
                 if base_owner != base_module:
-                    base_ty = ClassType(name=base_name, module=base_owner, fields=(), bases=())
+                    base_ty = ClassType(
+                        name=base_name, module=base_owner, fields=(), bases=()
+                    )
                 self._ensure_class_type_registered(base_ty)
                 break
         class_info = self.class_lowering.declare_extern_class(
@@ -280,11 +294,13 @@ class ClassModelLoweringMixin:
             field_names=info["field_names"],
             methods=info["methods"],
             local_name=ty.name,
+            field_types=info.get("field_types", ()),
         )
         local_info = class_info
         if local_info is not None:
             from ..py_ast import Name as _BaseName
             from ..py_ast import SourceSpan as _Span
+
             _stub_span = _Span(file="<extern>", line=0, col=0, end_line=0, end_col=0)
             local_info.bases_ast = tuple(
                 _BaseName(span=_stub_span, ty=DynType(name="dyn"), ident=bn)
@@ -360,6 +376,7 @@ class ClassModelLoweringMixin:
             "field_names",
             "methods",
             "local_name",
+            "field_types",
         )
         out: list[Expr] = []
         i = 0
@@ -375,7 +392,14 @@ class ClassModelLoweringMixin:
                     found = value
                     break
             if found is None:
-                return None
+                if names[i] == "field_types":
+                    found = TupleExpr(
+                        span=expr.span,
+                        ty=TupleType(name="tuple", elems=()),
+                        elems=(),
+                    )
+                else:
+                    return None
             out.append(found)
             i += 1
         return out
@@ -599,14 +623,16 @@ class ClassModelLoweringMixin:
                         i -= 1
                     if idx >= 0:
                         prefix = cname[:idx]
-                        short = cname[idx + 1:]
+                        short = cname[idx + 1 :]
                         if prefix == mod_name:
                             c_info = mod_exports.get(short)
 
                 if isinstance(c_info, dict) and c_info.get("kind") == "class":
                     # We found the metadata. Does it define the method/field?
                     m_names = [m["name"] for m in c_info.get("methods", ())]
-                    if method_name in m_names or method_name in c_info.get("field_names", ()):
+                    if method_name in m_names or method_name in c_info.get(
+                        "field_names", ()
+                    ):
                         # Synthetic ClassInfo for the remote class.
                         owning_module = c_info.get("owning_module", mod_name)
                         return remember(
@@ -619,6 +645,7 @@ class ClassModelLoweringMixin:
                                 field_names=c_info.get("field_names", ()),
                                 methods=c_info.get("methods", ()),
                                 local_name=cname,
+                                field_types=c_info.get("field_types", ()),
                             )
                         )
                     # Not defined here, queue its bases for further MRO search.
@@ -627,9 +654,6 @@ class ClassModelLoweringMixin:
                             queue.append(base_name)
                     break
         return remember_missing()
-
-
-
 
     _STR_METHOD_NATIVE = frozenset(
         {

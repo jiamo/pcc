@@ -539,20 +539,26 @@ class _Lifter:
             )
         span = self._span(node)
         values = [self.lift_expr(v) for v in node.values]
-        # Right-fold so each BoolExpr node holds two children.
-        result = values[-1]
-        i = len(values) - 2
-        while i >= 0:
-            left = values[i]
-            result = pa.BoolExpr(
-                span=span,
-                ty=_DYN,
-                op=op,
-                left=left,
-                right=result,
-            )
-            i -= 1
-        return result
+        return self._build_balanced_bool_expr(values, span, op)
+
+    def _build_balanced_bool_expr(
+        self,
+        values: list[pa.Expr],
+        span: pa.SourceSpan,
+        op: str,
+    ) -> pa.Expr:
+        if len(values) == 1:
+            return values[0]
+        mid = len(values) // 2
+        left = self._build_balanced_bool_expr(values[:mid], span, op)
+        right = self._build_balanced_bool_expr(values[mid:], span, op)
+        return pa.BoolExpr(
+            span=span,
+            ty=_DYN,
+            op=op,
+            left=left,
+            right=right,
+        )
 
     def _expr_Compare(self, node: _py_ast.Compare) -> pa.Expr:
         """``a < b < c`` → ``(a < b) and (b < c)`` as an ast-level fold.
@@ -1009,6 +1015,12 @@ class _Lifter:
         # ``int``, ``float``, ``bool``, ``None``, ``str``.
         if isinstance(node, _py_ast.Name):
             ident = node.id
+            # Preserve the typing marker long enough for codegen to elide the
+            # annotated value.  Treating it as an anonymous ``dyn`` loses the
+            # only reliable signal for aliases composed entirely from local
+            # protocol/classes (a common shape in NumPy's typing modules).
+            if ident == "TypeAlias":
+                return pa.DynType(name="TypeAlias")
             return _PRIMITIVE_TYPES.get(ident, pa.DynType(name="dyn"))
         if isinstance(node, _py_ast.Constant) and node.value is None:
             return pa.NoneType(name="None")

@@ -36,7 +36,14 @@ class TailCallPass(IRPass):
     )
     _PTR_DERIVE_RE = re.compile(
         r'^\s*(%(?:"[^"]+"|[-A-Za-z$._0-9]+))\s+=\s+'
-        r'(?:bitcast|getelementptr|phi|select)\b'
+        # `load ptr` is included so a pointer loaded out of an unsafe
+        # (alloca-derived) slot is itself treated as unsafe. Without it, a
+        # pointer into a local buffer that reaches a returned call via a
+        # pointer-typed local (pre-mem2reg: `%p = load ptr, ptr %p.addr`)
+        # would not be flagged, and the call would be marked `tail` — which
+        # frees the caller frame (and the local buffer) before the callee
+        # reads through the pointer. C99 return-of-call passing &local.
+        r'(?:bitcast|getelementptr|phi|select|load\s+ptr)\b'
     )
     _CALL_ASSIGN_RE = re.compile(
         r'''

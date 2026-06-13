@@ -11,6 +11,7 @@ with arguments, walrus, starred assignments) is staged in
 successive iterations. CPython's own parser (``Parser/Python.asdl``
 and ``Parser/parser.c``) is the reference.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,9 +19,9 @@ import os
 import sys
 
 from .py_lex import (
-    Lexer, Token,
+    Lexer,
+    Token,
 )
-
 
 # Keep these token-kind strings local to avoid pulling sibling-module
 # constant imports through the multi-file CPython fallback path.
@@ -95,6 +96,18 @@ def _pow10f(exp: int) -> float:
     return out
 
 
+def _pow10i(exp: int) -> int:
+    # 10**exp as an EXACT integer (bignum). Used to scale the decimal mantissa
+    # without accumulating float error.
+    out = 1
+    ten = 10
+    i = 0
+    while i < exp:
+        out = out * ten
+        i += 1
+    return out
+
+
 def _parse_float_literal(text: str) -> float:
     exp = 0
     mantissa = text
@@ -102,22 +115,37 @@ def _parse_float_literal(text: str) -> float:
     e_idx = lower.find("e")
     if e_idx >= 0:
         mantissa = text[:e_idx]
-        exp = int(text[e_idx + 1:], 10)
+        exp = int(text[e_idx + 1 :], 10)
     dot_idx = mantissa.find(".")
     frac_len = 0
     digits = mantissa
     if dot_idx >= 0:
         frac_len = len(mantissa) - dot_idx - 1
-        digits = mantissa[:dot_idx] + mantissa[dot_idx + 1:]
+        digits = mantissa[:dot_idx] + mantissa[dot_idx + 1 :]
     if not digits:
         digits = "0"
-    value = float(int(digits, 10))
-    if frac_len > 0:
-        value = value / _pow10f(frac_len)
-    if exp > 0:
-        value = value * _pow10f(exp)
-    elif exp < 0:
-        value = value / _pow10f(-exp)
+    # value = int(digits) * 10**(exp - frac_len). Scale in EXACT integer space
+    # for the common magnitude range — the old repeated float-mult lost
+    # precision (1e100 -> 1.0000000000000006e+100). The exact path stays within
+    # the double range (<= 10**308) so float() never raises OverflowError; the
+    # extreme tails (overflow->inf / subnormal underflow) fall back to the
+    # original graceful float-mult, which is imprecise but doesn't crash.
+    m = int(digits, 10)
+    net = exp - frac_len
+    ndig = len(digits)
+    if net >= 0 and ndig + net <= 308:
+        # exact integer < 10**308 < DBL_MAX; float() correctly rounds it.
+        return float(m * _pow10i(net))
+    if net < 0 and ndig <= 308 and -net <= 308:
+        # m / 10**|net|: exact denominator + one division. Correctly rounded for
+        # the common range, far better than repeated-mult for big |net|.
+        return float(m) / float(_pow10i(-net))
+    # Extreme exponent (beyond the double range): graceful imprecise fallback.
+    value = float(m)
+    if net > 0:
+        value = value * _pow10f(net)
+    elif net < 0:
+        value = value / _pow10f(-net)
     return value
 
 
@@ -225,7 +253,7 @@ class _Assign:
 @dataclass
 class _AugAssign:
     target: object
-    op: str           # ``+=`` / ``-=`` / ...
+    op: str  # ``+=`` / ``-=`` / ...
     value: object
     line: int
 
@@ -345,6 +373,14 @@ class _BoolOp:
     line: int
 
 
+def _extend_boolop(lhs, op: str, rhs, line: int) -> _BoolOp:
+    if isinstance(lhs, _BoolOp) and lhs.op == op:
+        values = list(lhs.values)
+        values.append(rhs)
+        return _BoolOp(op=op, values=values, line=line)
+    return _BoolOp(op=op, values=[lhs, rhs], line=line)
+
+
 @dataclass
 class _Compare:
     op: str
@@ -386,7 +422,7 @@ class _Set:
 
 @dataclass
 class _Lambda:
-    params: list   # same shape as _FuncDef.params
+    params: list  # same shape as _FuncDef.params
     body: object
     line: int
 
@@ -407,9 +443,9 @@ class _Ternary:
 
 @dataclass
 class _Comp:
-    kind: str           # "list" / "set" / "dict" / "gen"
-    elt: object         # _DictCompElt for dict comprehensions
-    generators: list    # list of (target, iter, [ifs])
+    kind: str  # "list" / "set" / "dict" / "gen"
+    elt: object  # _DictCompElt for dict comprehensions
+    generators: list  # list of (target, iter, [ifs])
     line: int
 
 
@@ -423,7 +459,7 @@ class _Yield:
 @dataclass
 class _Starred:
     value: object
-    is_kw: bool    # ``*x`` vs ``**x``
+    is_kw: bool  # ``*x`` vs ``**x``
     line: int
 
 
@@ -441,7 +477,7 @@ class _Nonlocal:
 
 @dataclass
 class _With:
-    items: list   # list of (ctx_expr, as_name)
+    items: list  # list of (ctx_expr, as_name)
     body: list
     line: int
     is_async: bool = False
@@ -470,7 +506,7 @@ class _FStringText:
 
 @dataclass
 class _FString:
-    parts: list   # mix of _FStringText and embedded expr nodes
+    parts: list  # mix of _FStringText and embedded expr nodes
     line: int
 
 
@@ -549,10 +585,7 @@ class Parser:
             if p.kind == TK_EOF:
                 return p
             # ``a; b`` — semicolon is a soft statement terminator.
-            if (
-                p.kind == TK_OP
-                and p.text == ";"
-            ):
+            if p.kind == TK_OP and p.text == ";":
                 if self._in_single_line_block:
                     return p
                 return self._advance()
@@ -561,8 +594,13 @@ class Parser:
             got = self._peek()
             exp = text or kind
             raise ParseError(
-                self.filename + ": expected " + exp
-                + ", got " + got.kind + " " + got.text
+                self.filename
+                + ": expected "
+                + exp
+                + ", got "
+                + got.kind
+                + " "
+                + got.text
             )
         return t
 
@@ -659,11 +697,7 @@ class Parser:
                 return self._parse_with()
             if t.text == "assert":
                 return self._parse_assert()
-        if (
-            t.kind == TK_NAME
-            and t.text == "match"
-            and self._looks_like_match_stmt()
-        ):
+        if t.kind == TK_NAME and t.text == "match" and self._looks_like_match_stmt():
             return self._parse_match()
         if t.kind == TK_OP and t.text == "@":
             # Decorator chain — followed by either ``def`` or ``class``.
@@ -681,8 +715,20 @@ class Parser:
         i = 1
         saw_subject_token = False
         assignment_ops = (
-            "=", "+=", "-=", "*=", "/=", "//=", "%=", "**=",
-            "&=", "|=", "^=", "<<=", ">>=", ":=",
+            "=",
+            "+=",
+            "-=",
+            "*=",
+            "/=",
+            "//=",
+            "%=",
+            "**=",
+            "&=",
+            "|=",
+            "^=",
+            "<<=",
+            ">>=",
+            ":=",
         )
         while True:
             tok = self._peek(i)
@@ -722,12 +768,18 @@ class Parser:
             return _Global(names=names, line=kw.line)
         return _Nonlocal(names=names, line=kw.line)
 
-    def _parse_with(self, *, is_async: bool = False, line_override: int | None = None) -> _With:
+    def _parse_with(
+        self, *, is_async: bool = False, line_override: int | None = None
+    ) -> _With:
         kw = self._expect(TK_KEYWORD, "with")
         parenthesized = self._accept(TK_OP, "(") is not None
         items = [self._parse_with_item()]
         while self._accept(TK_OP, ","):
-            if parenthesized and self._peek().kind == TK_OP and self._peek().text == ")":
+            if (
+                parenthesized
+                and self._peek().kind == TK_OP
+                and self._peek().text == ")"
+            ):
                 break
             items.append(self._parse_with_item())
         if parenthesized:
@@ -741,7 +793,8 @@ class Parser:
         if line_override is not None:
             line = line_override
         return _With(
-            items=items, body=body,
+            items=items,
+            body=body,
             line=line,
             is_async=is_async,
         )
@@ -783,7 +836,9 @@ class Parser:
             pattern = self._parse_expr()
             if self._accept(TK_KEYWORD, "as"):
                 as_tok = self._expect(TK_NAME)
-                pattern = _MatchAs(pattern=pattern, name=as_tok.text, line=case_tok.line)
+                pattern = _MatchAs(
+                    pattern=pattern, name=as_tok.text, line=case_tok.line
+                )
             self._expect(TK_OP, ":")
             body = self._parse_block()
             cases.append((pattern, body, case_tok.line))
@@ -794,7 +849,9 @@ class Parser:
         while i >= 0:
             pattern, body, line = cases[i]
             cond, bindings = self._match_pattern_condition_bindings(
-                subject_name, pattern, line,
+                subject_name,
+                pattern,
+                line,
             )
             case_body = bindings + body
             if cond is None:
@@ -804,20 +861,27 @@ class Parser:
             i -= 1
         return [
             _Assign(
-                target=subject_name, value=subject,
-                annotation=None, line=kw.line,
+                target=subject_name,
+                value=subject,
+                annotation=None,
+                line=kw.line,
             )
         ] + chain
 
     def _match_pattern_condition_bindings(
-        self, subject: _Name, pattern: object, line: int,
+        self,
+        subject: _Name,
+        pattern: object,
+        line: int,
     ) -> tuple[object | None, list]:
         if isinstance(pattern, _MatchAs):
             cond = None
             bindings: list = []
             if pattern.pattern is not None:
                 cond, bindings = self._match_pattern_condition_bindings(
-                    subject, pattern.pattern, line,
+                    subject,
+                    pattern.pattern,
+                    line,
                 )
             if pattern.name != "_":
                 bindings.append(
@@ -852,7 +916,9 @@ class Parser:
             if len(pattern.args) == 1:
                 arg = pattern.args[0]
                 elem_cond, elem_bindings = self._match_pattern_condition_bindings(
-                    subject, arg, line,
+                    subject,
+                    arg,
+                    line,
                 )
                 if elem_cond is not None:
                     conds.append(elem_cond)
@@ -860,7 +926,9 @@ class Parser:
             elif len(pattern.args) > 1:
                 tuple_pattern = _Tuple(elems=pattern.args, line=line)
                 elem_cond, elem_bindings = self._match_pattern_condition_bindings(
-                    subject, tuple_pattern, line,
+                    subject,
+                    tuple_pattern,
+                    line,
                 )
                 if elem_cond is not None:
                     conds.append(elem_cond)
@@ -880,10 +948,14 @@ class Parser:
             bindings: list = []
             for idx, elem in enumerate(pattern.elems):
                 item = _Subscript(
-                    obj=subject, idx=_Num(str(idx), line, True), line=line,
+                    obj=subject,
+                    idx=_Num(str(idx), line, True),
+                    line=line,
                 )
                 elem_cond, elem_bindings = self._match_pattern_condition_bindings(
-                    item, elem, line,
+                    item,
+                    elem,
+                    line,
                 )
                 if elem_cond is not None:
                     conds.append(elem_cond)
@@ -928,47 +1000,62 @@ class Parser:
             self._advance()
             ann_node = self._parse_type_expr()
             if self._accept(TK_OP, "="):
-                value = self._parse_expr()
+                value = self._parse_list_item()
             else:
                 value = _None(line=t.line)
             self._expect(TK_NEWLINE)
             return _Assign(
-                target=lhs, value=value, annotation=ann_node, line=t.line,
+                target=lhs,
+                value=value,
+                annotation=ann_node,
+                line=t.line,
             )
         if t.kind == TK_OP and t.text == "=":
             self._advance()
-            value = self._parse_expr()
+            value = self._parse_list_item()
             # Support ``a, b = 1, 2``: tuple RHS without parens.
             if self._peek().kind == TK_OP and self._peek().text == ",":
                 elems = [value]
                 while self._accept(TK_OP, ","):
                     if self._peek().kind == TK_NEWLINE:
                         break
-                    elems.append(self._parse_expr())
+                    elems.append(self._parse_list_item())
                 value = _Tuple(elems=elems, line=t.line)
             # Chained assignment ``a = b = c`` is parsed as repeated
             # ``= rhs`` — fold extras into nested assigns.
             while self._peek().kind == TK_OP and self._peek().text == "=":
                 self._advance()
-                nxt = self._parse_expr()
+                nxt = self._parse_list_item()
                 if self._peek().kind == TK_OP and self._peek().text == ",":
                     elems = [nxt]
                     while self._accept(TK_OP, ","):
                         if self._peek().kind == TK_NEWLINE:
                             break
-                        elems.append(self._parse_expr())
+                        elems.append(self._parse_list_item())
                     nxt = _Tuple(elems=elems, line=t.line)
                 # Rewrite ``a = b = c`` as ``a = (b := c)`` — model
                 # with a nested _Assign on the RHS.
                 value = _Assign(
-                    target=value, value=nxt, annotation=None, line=t.line,
+                    target=value,
+                    value=nxt,
+                    annotation=None,
+                    line=t.line,
                 )
             self._expect(TK_NEWLINE)
-            return _Assign(target=lhs, value=value, annotation=None,
-                            line=t.line)
+            return _Assign(target=lhs, value=value, annotation=None, line=t.line)
         if t.kind == TK_OP and t.text in (
-            "+=", "-=", "*=", "/=", "//=", "%=", "**=",
-            "&=", "|=", "^=", "<<=", ">>=",
+            "+=",
+            "-=",
+            "*=",
+            "/=",
+            "//=",
+            "%=",
+            "**=",
+            "&=",
+            "|=",
+            "^=",
+            "<<=",
+            ">>=",
         ):
             op_tok = self._advance()
             op = op_tok.text
@@ -989,10 +1076,11 @@ class Parser:
             self._advance()
             self._expect(TK_OP, ":")
             else_body = self._parse_block()
-        return _While(cond=cond, body=body, else_body=else_body,
-                       line=kw.line)
+        return _While(cond=cond, body=body, else_body=else_body, line=kw.line)
 
-    def _parse_for(self, *, is_async: bool = False, line_override: int | None = None) -> _For:
+    def _parse_for(
+        self, *, is_async: bool = False, line_override: int | None = None
+    ) -> _For:
         kw = self._expect(TK_KEYWORD, "for")
         target = self._parse_for_target()
         self._expect(TK_KEYWORD, "in")
@@ -1016,7 +1104,10 @@ class Parser:
         if line_override is not None:
             line = line_override
         return _For(
-            target=target, iter=it, body=body, else_body=else_body,
+            target=target,
+            iter=it,
+            body=body,
+            else_body=else_body,
             line=line,
             is_async=is_async,
         )
@@ -1027,13 +1118,11 @@ class Parser:
         if self._peek().kind == TK_OP and self._peek().text == ",":
             elems = [first]
             while self._accept(TK_OP, ","):
-                if (
-                    self._peek().kind == TK_KEYWORD
-                    and self._peek().text == "in"
-                ):
+                if self._peek().kind == TK_KEYWORD and self._peek().text == "in":
                     break
                 if self._peek().kind == TK_OP and self._peek().text in (
-                    ")", "]",
+                    ")",
+                    "]",
                 ):
                     break
                 elems.append(self._parse_for_target_atom())
@@ -1059,7 +1148,9 @@ class Parser:
             self._advance()
             name = self._expect(TK_NAME)
             return _Starred(
-                value=_Name(name.text, name.line), is_kw=False, line=t.line,
+                value=_Name(name.text, name.line),
+                is_kw=False,
+                line=t.line,
             )
         name = self._expect(TK_NAME)
         node = _Name(name.text, name.line)
@@ -1113,8 +1204,7 @@ class Parser:
             while self._accept(TK_OP, ","):
                 names.append(self._parse_import_name_item())
         self._expect(TK_NEWLINE)
-        return _ImportFrom(module=module, names=names, level=level,
-                             line=kw.line)
+        return _ImportFrom(module=module, names=names, level=level, line=kw.line)
 
     def _parse_dotted_name_as_pair(self) -> tuple:
         mod = self._parse_dotted_name()
@@ -1182,8 +1272,13 @@ class Parser:
             self._advance()
             self._expect(TK_OP, ":")
             finally_body = self._parse_block()
-        return _Try(body=body, handlers=handlers, else_body=else_body,
-                     finally_body=finally_body, line=kw.line)
+        return _Try(
+            body=body,
+            handlers=handlers,
+            else_body=else_body,
+            finally_body=finally_body,
+            line=kw.line,
+        )
 
     def _parse_decorated(self):
         decorators: list = []
@@ -1198,15 +1293,13 @@ class Parser:
             fn = self._parse_async_stmt(decorators=list(decorators))
             if not isinstance(fn, _FuncDef):
                 raise ParseError(
-                    f"{self.filename}:{t.line}: expected async def after "
-                    "decorators"
+                    f"{self.filename}:{t.line}: expected async def after " "decorators"
                 )
             return fn
         if t.kind == TK_KEYWORD and t.text == "class":
             return self._parse_classdef(tuple(decorators))
         raise ParseError(
-            f"{self.filename}:{t.line}: expected def or class after "
-            "decorators"
+            f"{self.filename}:{t.line}: expected def or class after " "decorators"
         )
 
     def _parse_classdef(self, decorators: tuple) -> _ClassDef:
@@ -1224,22 +1317,23 @@ class Parser:
             self._expect(TK_OP, ")")
         self._expect(TK_OP, ":")
         body = self._parse_block()
-        return _ClassDef(name=name, bases=bases, body=body,
-                          decorators=list(decorators), line=kw.line)
+        return _ClassDef(
+            name=name, bases=bases, body=body, decorators=list(decorators), line=kw.line
+        )
 
     def _parse_async_stmt(self, decorators: list | None = None):
         kw = self._expect(TK_KEYWORD, "async")
         if self._peek().kind == TK_KEYWORD and self._peek().text == "def":
             return self._parse_funcdef(
-                is_async=True, line_override=kw.line, decorators=decorators,
+                is_async=True,
+                line_override=kw.line,
+                decorators=decorators,
             )
         if self._peek().kind == TK_KEYWORD and self._peek().text == "for":
             return self._parse_for(is_async=True, line_override=kw.line)
         if self._peek().kind == TK_KEYWORD and self._peek().text == "with":
             return self._parse_with(is_async=True, line_override=kw.line)
-        raise ParseError(
-            f"{self.filename}:{kw.line}: expected async def/for/with"
-        )
+        raise ParseError(f"{self.filename}:{kw.line}: expected async def/for/with")
 
     def _parse_funcdef(
         self,
@@ -1271,6 +1365,41 @@ class Parser:
                     if self._peek().text == ")":
                         break
                     params.append(self._parse_funcdef_param())
+            # Parameter tokens are parsed independently, so names following
+            # ``*`` / ``*args`` initially carry the ordinary ``pos`` marker,
+            # and names preceding ``/`` do too.  Normalize the surrounding
+            # separator semantics before py_lift constructs Arg nodes.  Keep
+            # the empty separator entries themselves for the existing
+            # closed-world representation; downstream runtime-argument lists
+            # already exclude their empty names.
+            kw_only_mode = False
+            for param_index in range(len(params)):
+                param = params[param_index]
+                param_kind = param[0]
+                if param_kind == "pos-only-sep":
+                    for previous_index in range(param_index):
+                        previous = params[previous_index]
+                        if previous[0] == "pos":
+                            params[previous_index] = (
+                                "pos_only",
+                                previous[1],
+                                previous[2],
+                                previous[3],
+                            )
+                    continue
+                if param_kind == "kwonly-sep":
+                    kw_only_mode = True
+                    continue
+                if param_kind == "*args":
+                    kw_only_mode = True
+                    continue
+                if param_kind == "pos" and kw_only_mode:
+                    params[param_index] = (
+                        "kw_only",
+                        param[1],
+                        param[2],
+                        param[3],
+                    )
             phase = "close_paren"
             self._expect(TK_OP, ")")
             # Optional ``-> type`` return annotation.
@@ -1290,10 +1419,13 @@ class Parser:
             if decorators is not None:
                 decorators_list = decorators
             return _FuncDef(
-                name=name, params=params, body=body,
+                name=name,
+                params=params,
+                body=body,
                 line=line,
                 decorators=decorators_list,
-                returns=returns, is_async=is_async,
+                returns=returns,
+                is_async=is_async,
             )
         except Exception as ex:
             raise ParseError(
@@ -1397,6 +1529,17 @@ class Parser:
             self._advance()
             piece = self._string_piece(t.text)
             node = _Str(parts=(piece,), line=t.line)
+        elif t.kind == TK_NUMBER:
+            self._advance()
+            clean = t.text.replace("_", "")
+            low = clean.lower()
+            is_int = (
+                low.startswith("0x")
+                or low.startswith("0o")
+                or low.startswith("0b")
+                or ("." not in clean and "e" not in low and not low.endswith("j"))
+            )
+            node = _Num(text=clean, line=t.line, is_int=is_int)
         elif t.kind == TK_OP and t.text == "*":
             self._advance()
             inner = self._parse_type_atom()
@@ -1437,14 +1580,14 @@ class Parser:
         if self._peek().kind == TK_NEWLINE:
             self._advance()
             return _Return(value=None, line=kw.line)
-        value = self._parse_expr()
+        value = self._parse_list_item()
         # Implicit tuple: ``return a, b``.
         if self._peek().kind == TK_OP and self._peek().text == ",":
             elems = [value]
             while self._accept(TK_OP, ","):
                 if self._peek().kind == TK_NEWLINE:
                     break
-                elems.append(self._parse_expr())
+                elems.append(self._parse_list_item())
             value = _Tuple(elems=elems, line=kw.line)
         self._expect(TK_NEWLINE)
         return _Return(value=value, line=kw.line)
@@ -1640,7 +1783,9 @@ class Parser:
             # as both an expression and a binding.
             return _Assign(
                 target=_Name(target_tok.text, target_tok.line),
-                value=val, annotation="walrus", line=target_tok.line,
+                value=val,
+                annotation="walrus",
+                line=target_tok.line,
             )
         lhs = self._parse_or()
         if self._peek().kind == TK_KEYWORD and self._peek().text == "if":
@@ -1650,7 +1795,9 @@ class Parser:
             else_expr = self._parse_expr()
             line = self._peek().line
             return _Ternary(
-                then_expr=lhs, cond=cond, else_expr=else_expr,
+                then_expr=lhs,
+                cond=cond,
+                else_expr=else_expr,
                 line=line,
             )
         return lhs
@@ -1673,9 +1820,11 @@ class Parser:
             return _Yield(value=val, is_from=True, line=kw.line)
         # Empty ``yield`` allowed as a standalone expression.
         t = self._peek()
-        if t.kind == TK_NEWLINE or (t.kind == TK_OP and t.text in (")", "]", "}", ",", ":")):
+        if t.kind == TK_NEWLINE or (
+            t.kind == TK_OP and t.text in (")", "]", "}", ",", ":")
+        ):
             return _Yield(value=None, is_from=False, line=kw.line)
-        val = self._parse_expr()
+        val = self._parse_list_item()
         # Implicit tuple: ``yield a, b`` yields the tuple ``(a, b)`` (matches
         # CPython and ``return a, b``).  Without this the trailing ``, b`` is
         # consumed by the enclosing testlist as ``(yield a), b``, which leaks
@@ -1688,7 +1837,7 @@ class Parser:
                     nt.kind == TK_OP and nt.text in (")", "]", "}", ":", "=")
                 ):
                     break
-                elems.append(self._parse_expr())
+                elems.append(self._parse_list_item())
             val = _Tuple(elems=elems, line=kw.line)
         return _Yield(value=val, is_from=False, line=kw.line)
 
@@ -1698,7 +1847,7 @@ class Parser:
             self._advance()
             rhs = self._parse_and()
             line = self._peek().line
-            lhs = _BoolOp(op="or", values=[lhs, rhs], line=line)
+            lhs = _extend_boolop(lhs, "or", rhs, line)
         return lhs
 
     def _parse_and(self):
@@ -1707,7 +1856,7 @@ class Parser:
             self._advance()
             rhs = self._parse_not()
             line = self._peek().line
-            lhs = _BoolOp(op="and", values=[lhs, rhs], line=line)
+            lhs = _extend_boolop(lhs, "and", rhs, line)
         return lhs
 
     def _parse_not(self):
@@ -1726,7 +1875,12 @@ class Parser:
             t = self._peek()
             line = t.line
             if t.kind == TK_OP and t.text in (
-                "<", ">", "<=", ">=", "==", "!=",
+                "<",
+                ">",
+                "<=",
+                ">=",
+                "==",
+                "!=",
             ):
                 op_tok = self._advance()
                 op = op_tok.text
@@ -1740,7 +1894,8 @@ class Parser:
                 self._advance()
                 op = "in"
             elif (
-                t.kind == TK_KEYWORD and t.text == "not"
+                t.kind == TK_KEYWORD
+                and t.text == "not"
                 and self._peek(1).kind == TK_KEYWORD
                 and self._peek(1).text == "in"
             ):
@@ -1809,7 +1964,11 @@ class Parser:
     def _parse_mul(self):
         lhs = self._parse_unary()
         while self._peek().kind == TK_OP and self._peek().text in (
-            "*", "/", "//", "%", "@",
+            "*",
+            "/",
+            "//",
+            "%",
+            "@",
         ):
             op_tok = self._advance()
             op = op_tok.text
@@ -1853,7 +2012,7 @@ class Parser:
         Returns the string body *with escapes unprocessed* — the
         lowering stage owns escape handling because it needs to know
         whether the prefix said ``r`` (raw, no processing) or not."""
-        rest = raw[len(cls._string_prefix(raw)):]
+        rest = raw[len(cls._string_prefix(raw)) :]
         if rest[:3] in ('"""', "'''"):
             return rest[3:-3]
         return rest[1:-1]
@@ -1904,11 +2063,7 @@ class Parser:
                 continue
             if ch in ("'", '"'):
                 quote = ch
-                triple = (
-                    i + 2 < len(text)
-                    and text[i + 1] == ch
-                    and text[i + 2] == ch
-                )
+                triple = i + 2 < len(text) and text[i + 1] == ch and text[i + 2] == ch
                 i += 3 if triple else 1
                 continue
             if ch in "([{":
@@ -1926,12 +2081,10 @@ class Parser:
                     # The format spec is taken literally (CPython does NOT strip
                     # it): a leading space is the space-sign option, e.g.
                     # f"{x: d}". Only the expr part is stripped.
-                    spec = text[i + 3:]
+                    spec = text[i + 3 :]
                 return _FStringExprParts(expr, conversion, spec)
             elif depth == 0 and ch == ":":
-                return _FStringExprParts(
-                    text[:i].strip(), None, text[i + 1:]
-                )
+                return _FStringExprParts(text[:i].strip(), None, text[i + 1 :])
             i += 1
         return _FStringExprParts(text.strip(), None, None)
 
@@ -1973,11 +2126,7 @@ class Parser:
                 continue
             if ch in ("'", '"'):
                 quote = ch
-                triple = (
-                    i + 2 < len(text)
-                    and text[i + 1] == ch
-                    and text[i + 2] == ch
-                )
+                triple = i + 2 < len(text) and text[i + 1] == ch and text[i + 2] == ch
                 i += 3 if triple else 1
                 continue
             if ch in "([{":
@@ -1994,12 +2143,12 @@ class Parser:
                     if i + 2 < len(text) and text[i + 2] == ":":
                         # Format spec is literal (CPython does not strip it): a
                         # leading space is the space-sign option, f"{x: d}".
-                        format_spec = text[i + 3:]
+                        format_spec = text[i + 3 :]
                 found_split = True
                 break
             elif depth == 0 and ch == ":":
                 expr_text = text[:i].strip()
-                format_spec = text[i + 1:]
+                format_spec = text[i + 1 :]
                 found_split = True
                 break
             i += 1
@@ -2023,18 +2172,27 @@ class Parser:
         if Parser._peek(parser).kind != TK_EOF:
             t = Parser._peek(parser)
             raise ParseError(
-                self.filename + ":" + str(line)
+                self.filename
+                + ":"
+                + str(line)
                 + ": trailing f-string expression input near "
                 + repr(t.text)
             )
         if conversion is not None and conversion != "":
             if conversion != "r" and conversion != "s" and conversion != "a":
                 raise ParseError(
-                    self.filename + ":" + str(line)
-                    + ": unsupported f-string conversion !" + conversion
+                    self.filename
+                    + ":"
+                    + str(line)
+                    + ": unsupported f-string conversion !"
+                    + conversion
                 )
         if debug_prefix is None and conversion is None and format_spec is None:
             return expr
+        if debug_prefix is not None and conversion is None and format_spec is None:
+            # CPython: ``f"{x=}"`` defaults to repr (``f"x={x!r}"``), but
+            # ``f"{x=:spec}"`` / ``f"{x=!s}"`` keep their explicit spec/conversion.
+            conversion = "r"
         formatted = _FStringFormat(
             expr=expr,
             conversion=conversion,
@@ -2102,9 +2260,7 @@ class Parser:
                     if c in ("'", '"'):
                         quote = c
                         triple = (
-                            i + 2 < len(body)
-                            and body[i + 1] == c
-                            and body[i + 2] == c
+                            i + 2 < len(body) and body[i + 1] == c and body[i + 2] == c
                         )
                         i += 3 if triple else 1
                         continue
@@ -2112,9 +2268,7 @@ class Parser:
                         depth += 1
                     elif c in ")]}":
                         if c == "}" and depth == 0:
-                            out.append(
-                                self._parse_fstring_expr(body[start:i], line)
-                            )
+                            out.append(self._parse_fstring_expr(body[start:i], line))
                             i += 1
                             break
                         if depth > 0:
@@ -2122,14 +2276,15 @@ class Parser:
                     i += 1
                 else:
                     raise ParseError(
-                        self.filename + ":" + str(line)
+                        self.filename
+                        + ":"
+                        + str(line)
                         + ": unterminated f-string expression"
                     )
                 continue
             if ch == "}":
                 raise ParseError(
-                    self.filename + ":" + str(line)
-                    + ": single '}' in f-string"
+                    self.filename + ":" + str(line) + ": single '}' in f-string"
                 )
             literal.append(ch)
             i += 1
@@ -2160,10 +2315,7 @@ class Parser:
         if not (self._peek().kind == TK_OP and self._peek().text == ":"):
             return lo
         self._advance()  # ':'
-        if (
-            self._peek().kind == TK_OP
-            and self._peek().text in (":", "]", ",")
-        ):
+        if self._peek().kind == TK_OP and self._peek().text in (":", "]", ","):
             hi = None
         else:
             hi = self._parse_expr()
@@ -2215,15 +2367,16 @@ class Parser:
                     # ``f(x for y in z)`` — generator comprehension as
                     # the sole argument. The grammar allows a bare
                     # ``for`` right after the first expression.
-                    if (
-                        self._peek().kind == TK_KEYWORD
-                        and self._peek().text == "for"
-                    ):
+                    if self._peek().kind == TK_KEYWORD and self._peek().text == "for":
                         gens = self._parse_comp_for()
-                        args.append(_Comp(
-                            kind="gen", elt=first_arg, generators=gens,
-                            line=t.line,
-                        ))
+                        args.append(
+                            _Comp(
+                                kind="gen",
+                                elt=first_arg,
+                                generators=gens,
+                                line=t.line,
+                            )
+                        )
                     else:
                         args.append(first_arg)
                         while self._accept(TK_OP, ","):
@@ -2330,8 +2483,7 @@ class Parser:
             ):
                 gens = self._parse_comp_for()
                 self._expect(TK_OP, ")")
-                return _Comp(kind="gen", elt=first, generators=gens,
-                              line=t.line)
+                return _Comp(kind="gen", elt=first, generators=gens, line=t.line)
             if self._accept(TK_OP, ","):
                 elems = [first]
                 if self._peek().text != ")":
@@ -2357,8 +2509,7 @@ class Parser:
             ):
                 gens = self._parse_comp_for()
                 self._expect(TK_OP, "]")
-                return _Comp(kind="list", elt=first, generators=gens,
-                              line=t.line)
+                return _Comp(kind="list", elt=first, generators=gens, line=t.line)
             elems: list = [first]
             while self._accept(TK_OP, ","):
                 if self._peek().text == "]":
@@ -2374,7 +2525,11 @@ class Parser:
             # ``{*x, ...}`` → set with unpacking. Detect before the
             # generic expression parse because ``*`` isn't valid at
             # _parse_expr's top.
-            if self._peek().kind == TK_OP and self._peek().text == "*" and self._peek(1).text != "*":
+            if (
+                self._peek().kind == TK_OP
+                and self._peek().text == "*"
+                and self._peek(1).text != "*"
+            ):
                 first = self._parse_list_item()
                 elems = [first]
                 while self._accept(TK_OP, ","):
@@ -2407,15 +2562,11 @@ class Parser:
             if self._accept(TK_OP, ":"):
                 # Dict literal or dict comprehension.
                 v = self._parse_expr()
-                if (
-                    self._peek().kind == TK_KEYWORD
-                    and self._peek().text == "for"
-                ):
+                if self._peek().kind == TK_KEYWORD and self._peek().text == "for":
                     gens = self._parse_comp_for()
                     self._expect(TK_OP, "}")
                     elt = (first, v)
-                    return _Comp(kind="dict", elt=elt,
-                                  generators=gens, line=t.line)
+                    return _Comp(kind="dict", elt=elt, generators=gens, line=t.line)
                 keys = [first]
                 values = [v]
                 while self._accept(TK_OP, ","):
@@ -2431,14 +2582,10 @@ class Parser:
                     values.append(self._parse_expr())
                 self._expect(TK_OP, "}")
                 return _Dict(keys=keys, values=values, line=t.line)
-            if (
-                self._peek().kind == TK_KEYWORD
-                and self._peek().text == "for"
-            ):
+            if self._peek().kind == TK_KEYWORD and self._peek().text == "for":
                 gens = self._parse_comp_for()
                 self._expect(TK_OP, "}")
-                return _Comp(kind="set", elt=first, generators=gens,
-                              line=t.line)
+                return _Comp(kind="set", elt=first, generators=gens, line=t.line)
             # Plain set literal.
             elems = [first]
             while self._accept(TK_OP, ","):
@@ -2447,9 +2594,7 @@ class Parser:
                 elems.append(self._parse_list_item())
             self._expect(TK_OP, "}")
             return _Set(elems=elems, line=t.line)
-        raise ParseError(
-            f"{self.filename}:{t.line}:{t.col}: unexpected token {t!r}"
-        )
+        raise ParseError(f"{self.filename}:{t.line}:{t.col}: unexpected token {t!r}")
 
     def _parse_list_item(self):
         """Element inside ``[...]`` / ``{...}`` / tuple — accepts a
@@ -2464,9 +2609,7 @@ class Parser:
     def _parse_comp_for(self) -> list:
         """Parse one or more ``for <target> in <iter> [if <cond>]`` clauses."""
         gens: list = []
-        while (
-            self._peek().kind == TK_KEYWORD and self._peek().text == "for"
-        ):
+        while self._peek().kind == TK_KEYWORD and self._peek().text == "for":
             self._advance()
             target = self._parse_for_target()
             self._expect(TK_KEYWORD, "in")
@@ -2474,10 +2617,7 @@ class Parser:
             # the trailing ``if``/``for``.
             it = self._parse_or()
             ifs: list = []
-            while (
-                self._peek().kind == TK_KEYWORD
-                and self._peek().text == "if"
-            ):
+            while self._peek().kind == TK_KEYWORD and self._peek().text == "if":
                 self._advance()
                 ifs.append(self._parse_or())
             gens.append((target, it, ifs))

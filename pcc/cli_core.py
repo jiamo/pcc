@@ -1,11 +1,19 @@
 import os
 import sys
 
+from .cli_contract import (
+    BACKEND_CHOICES,
+    DEFAULT_EMIT_LL,
+    DIAGNOSTIC_FORMAT_CHOICES,
+    IR_SCAFFOLD_CHOICES,
+    PYTHON_LIBPYTHON_CHOICES,
+)
+
 _PASS_DISABLE_ENV = "PCC_DISABLE_PASSES"
 _LLVM_TEXT_PIPELINE_ENV = "PCC_LLVM_PIPELINE"
 _LLVM_OPT_BIN_ENV = "PCC_LLVM_OPT_BIN"
 _SELF_BACKEND_VECTORIZE_ENV = "PCC_SELF_BACKEND_VECTORIZE"
-_DEFAULT_EMIT_LL = "__PCC_DEFAULT_LL__"
+_DEFAULT_EMIT_LL = DEFAULT_EMIT_LL
 
 _HELP_TEXT = """Usage: pcc [OPTIONS] PATH [PROG_ARGS...]
 
@@ -43,6 +51,7 @@ Options:
   --emit-llvm[=PATH]        Emit LLVM IR instead of running.
   -o PATH                   Output path for Python inputs.
   --backend BACKEND         llvm, llvm_capi, or self.
+  --gpu-backend BACKEND     none (default) or metal for annotated GPU kernels.
   --diagnostic-format FMT   text (default), json, or sarif for hard errors.
   --profile-json PATH       Write compiler phase/profile JSON.
   --explain-fallback        Include native/fallback routing diagnostics.
@@ -76,6 +85,209 @@ def _normalize_pass_names(values):
         if value and value not in names:
             names.append(value)
     return names
+
+
+_PY_RUN_CACHE_VERSION = "pcc-py-run-cache-v46"
+
+
+def _path_list_sep() -> str:
+    return ";" if sys.platform.startswith("win") else ":"
+
+
+def _split_path_list(raw):
+    out = []
+    for item in str(raw or "").split(_path_list_sep()):
+        item = item.strip()
+        if item:
+            out.append(os.path.abspath(item))
+    return out
+
+
+def _append_unique_path(paths, path):
+    path = os.path.abspath(str(path or ""))
+    if not path or path in paths:
+        return
+    paths.append(path)
+
+
+def _inferred_package_site_roots(src_path: str):
+    """Infer project import roots for script-style Python entrypoints.
+
+    CPython executes ``tests/foo.py`` with import behavior often adjusted by
+    the script itself (for example inserting the project root into sys.path).
+    pcc resolves imports at compile time, so the no-``-o`` runner gives common
+    project layouts the same root without requiring the caller to export
+    PCC_PACKAGE_SITE manually.
+    """
+
+    roots = []
+    src_dir = os.path.dirname(os.path.abspath(src_path))
+    _append_unique_path(roots, src_dir)
+    if os.path.basename(src_dir) in ("test", "tests"):
+        _append_unique_path(roots, os.path.dirname(src_dir))
+    for root in _split_path_list(os.environ.get("PCC_PACKAGE_SITE", "")):
+        _append_unique_path(roots, root)
+    return roots
+
+
+def _seed_package_site_for_python_entry(src_path: str) -> None:
+    roots = _inferred_package_site_roots(src_path)
+    if roots:
+        os.environ["PCC_PACKAGE_SITE"] = _path_list_sep().join(roots)
+
+
+def _fnv1a_update_u64(value: int, text: str) -> int:
+    h = value & 0xFFFFFFFFFFFFFFFF
+    data = str(text or "")
+    i = 0
+    while i < len(data):
+        h ^= ord(data[i]) & 0xFF
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        i += 1
+    return h
+
+
+def _fnv1a_update_bytes_u64(value: int, data) -> int:
+    h = value & 0xFFFFFFFFFFFFFFFF
+    i = 0
+    while i < len(data):
+        h ^= data[i] & 0xFF
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        i += 1
+    return h
+
+
+def _iter_py_sources_under(root: str):
+    root = os.path.abspath(root)
+    out = []
+    if os.path.isfile(root):
+        if root.endswith(".py"):
+            out.append(root)
+        return out
+    if not os.path.isdir(root):
+        return out
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            names = sorted(os.listdir(cur))
+        except OSError:
+            names = []
+        for name in names:
+            if name in (
+                ".git",
+                ".hg",
+                ".mypy_cache",
+                ".pytest_cache",
+                ".ruff_cache",
+                "__pycache__",
+                "build",
+                "dist",
+                ".venv",
+                "venv",
+            ):
+                continue
+            full = os.path.join(cur, name)
+            if os.path.isdir(full):
+                stack.append(full)
+            elif name.endswith(".py"):
+                out.append(os.path.abspath(full))
+    out.sort()
+    return out
+
+
+def _python_run_cache_key(
+    src_path: str,
+    *,
+    python_libpython: str,
+    python_library: bool,
+    ir_scaffold: str,
+    backend: str,
+    gpu_backend,
+):
+    roots = _inferred_package_site_roots(src_path)
+    _append_unique_path(roots, src_path)
+    h = 1469598103934665603
+    for part in (
+        _PY_RUN_CACHE_VERSION,
+        os.path.abspath(src_path),
+        str(python_libpython or ""),
+        str(bool(python_library)),
+        str(ir_scaffold or ""),
+        str(backend or ""),
+        str(gpu_backend or ""),
+        sys.platform,
+    ):
+        h = _fnv1a_update_u64(h, part)
+        h = _fnv1a_update_u64(h, "\0")
+    seen = []
+    for root in roots:
+        for path in _iter_py_sources_under(root):
+            if path in seen:
+                continue
+            seen.append(path)
+            try:
+                with open(path, "rb") as f:
+                    content = f.read()
+            except OSError:
+                h = _fnv1a_update_u64(h, "missing:" + path)
+                continue
+            rel = path
+            for root2 in roots:
+                prefix = os.path.abspath(root2)
+                if not prefix.endswith(os.sep):
+                    prefix += os.sep
+                if path.startswith(prefix):
+                    rel = path[len(prefix) :]
+                    break
+            h = _fnv1a_update_u64(h, rel)
+            h = _fnv1a_update_u64(h, str(len(content)))
+            h = _fnv1a_update_bytes_u64(h, content)
+            h = _fnv1a_update_u64(h, "\0")
+    return format(h, "016x")
+
+
+def _python_run_cache_path(
+    src_path: str,
+    *,
+    python_libpython: str,
+    python_library: bool,
+    ir_scaffold: str,
+    backend: str,
+    gpu_backend,
+):
+    if str(os.environ.get("PCC_DISABLE_PY_RUN_CACHE", "")).strip() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None
+    root = os.environ.get("PCC_PY_RUN_CACHE_DIR", "")
+    if not root:
+        home = os.environ.get("HOME", "")
+        root = os.path.join(home, ".cache", "pcc", "py-run-cache") if home else ""
+    if not root:
+        return None
+    key = _python_run_cache_key(
+        src_path,
+        python_libpython=python_libpython,
+        python_library=python_library,
+        ir_scaffold=ir_scaffold,
+        backend=backend,
+        gpu_backend=gpu_backend,
+    )
+    tag = os.path.basename(src_path)
+    if tag.endswith(".py"):
+        tag = tag[:-3]
+    safe = []
+    for ch in tag or "pcc_run":
+        if ch.isalnum() or ch in ("_", "-"):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    cache_dir = os.path.join(root, key)
+    return os.path.join(cache_dir, "".join(safe) or "pcc_run")
 
 
 def _copy_seq(values):
@@ -209,11 +421,24 @@ def _parse_backend(value):
         lowered = ""
     else:
         lowered = value.strip().lower()
-    if lowered not in ("llvm", "llvm_capi", "self"):
+    if lowered not in BACKEND_CHOICES:
         raise ValueError(
             "invalid backend " f"{value!r}; expected one of llvm, llvm_capi, self"
         )
     return lowered
+
+
+def _parse_gpu_backend(value):
+    from pcc.gpu_backend import all_gpu_backend_names, resolve_gpu_backend
+
+    try:
+        return resolve_gpu_backend(value).kind
+    except ValueError:
+        expected = ", ".join(all_gpu_backend_names())
+        raise ValueError(
+            "invalid gpu backend "
+            f"{value!r}; expected one of {expected}"
+        )
 
 
 def _self_backend_vectorize_requested() -> bool:
@@ -235,9 +460,40 @@ def _effective_self_backend_opt_level(backend, opt_level: int) -> int:
     return int(opt_level)
 
 
+def _self_backend_opt_level_clamp_message(backend, requested_opt_level, effective_opt_level):
+    backend_name = (backend or os.environ.get("PCC_BACKEND", "") or "").strip().lower()
+    requested = int(requested_opt_level)
+    effective = int(effective_opt_level)
+    if (
+        backend_name == "self"
+        and requested > 0
+        and effective == 0
+        and not _self_backend_vectorize_requested()
+    ):
+        return (
+            "Warning: --backend=self requested -O"
+            + str(requested)
+            + " but is using -O0 because the self backend does not yet lower "
+            "LLVM vectorizer output safely; set "
+            + _SELF_BACKEND_VECTORIZE_ENV
+            + "=1 to opt into LLVM-vectorized self-backend experiments."
+        )
+    return None
+
+
+def _warn_if_self_backend_opt_level_clamped(backend, requested_opt_level, effective_opt_level):
+    message = _self_backend_opt_level_clamp_message(
+        backend,
+        requested_opt_level,
+        effective_opt_level,
+    )
+    if message:
+        _write_text(message, err=True)
+
+
 def _parse_python_libpython(value):
     lowered = (value or "").strip().lower()
-    if lowered not in ("auto", "on", "off"):
+    if lowered not in PYTHON_LIBPYTHON_CHOICES:
         raise ValueError(
             "invalid --python-libpython " f"{value!r}; expected auto, on, or off"
         )
@@ -246,7 +502,7 @@ def _parse_python_libpython(value):
 
 def _parse_ir_scaffold(value):
     lowered = (value or "").strip().lower()
-    if lowered not in ("auto", "on", "off"):
+    if lowered not in IR_SCAFFOLD_CHOICES:
         raise ValueError(
             "invalid --ir-scaffold " f"{value!r}; expected off, on, or auto"
         )
@@ -350,6 +606,7 @@ def parse_cli_args(argv=None):
     emit_llvm = None
     output_path = None
     backend = None
+    gpu_backend = None
     python_libpython = None
     python_library = False
     ir_scaffold = None
@@ -394,7 +651,7 @@ def parse_cli_args(argv=None):
             continue
         if arg.startswith("--diagnostic-format="):
             value = _option_value(arg, "--diagnostic-format=").strip().lower()
-            if value not in ("text", "json", "sarif"):
+            if value not in DIAGNOSTIC_FORMAT_CHOICES:
                 return None, 2, "--diagnostic-format must be text, json, or sarif"
             os.environ["PCC_DIAGNOSTIC_FORMAT"] = value
             i += 1
@@ -403,7 +660,7 @@ def parse_cli_args(argv=None):
             if i + 1 >= len(argv):
                 return None, 2, "--diagnostic-format requires a value"
             value = argv[i + 1].strip().lower()
-            if value not in ("text", "json", "sarif"):
+            if value not in DIAGNOSTIC_FORMAT_CHOICES:
                 return None, 2, "--diagnostic-format must be text, json, or sarif"
             os.environ["PCC_DIAGNOSTIC_FORMAT"] = value
             i += 2
@@ -593,6 +850,24 @@ def parse_cli_args(argv=None):
                 return None, 2, str(exc)
             i += 2
             continue
+        if arg.startswith("--gpu-backend="):
+            try:
+                gpu_backend = _parse_gpu_backend(
+                    _option_value(arg, "--gpu-backend=")
+                )
+            except ValueError as exc:
+                return None, 2, str(exc)
+            i += 1
+            continue
+        if arg == "--gpu-backend":
+            if i + 1 >= len(argv):
+                return None, 2, "--gpu-backend requires a value"
+            try:
+                gpu_backend = _parse_gpu_backend(argv[i + 1])
+            except ValueError as exc:
+                return None, 2, str(exc)
+            i += 2
+            continue
         if arg.startswith("--python-libpython="):
             try:
                 python_libpython = _parse_python_libpython(
@@ -690,6 +965,7 @@ def parse_cli_args(argv=None):
             emit_llvm,
             output_path,
             backend,
+            gpu_backend,
             python_libpython,
             python_library,
             ir_scaffold,
@@ -746,6 +1022,7 @@ def _execute_python_path(
     python_libpython,
     python_library,
     ir_scaffold,
+    gpu_backend,
     verbose,
     prog_args,
 ):
@@ -764,6 +1041,7 @@ def _execute_python_path(
         compile_libpython_mode,
         compile_python_library,
         compile_ir_scaffold_mode,
+        compile_gpu_backend,
     ):
         opts = ObservabilityOptions(
             diagnostic_format=os.getenv("PCC_DIAGNOSTIC_FORMAT", "text"),
@@ -784,11 +1062,13 @@ def _execute_python_path(
                 libpython_mode=compile_libpython_mode,
                 python_library=compile_python_library,
                 ir_scaffold_mode=compile_ir_scaffold_mode,
+                gpu_backend=compile_gpu_backend,
             )
         except ObservedCompileError as exc:
             raise PyPipelineError(exc.formatted) from exc
 
     src_path = path
+    _seed_package_site_for_python_entry(src_path)
     emit_ll_only = emit_llvm is not None
     if emit_ll_only:
         if emit_llvm == _DEFAULT_EMIT_LL:
@@ -805,6 +1085,7 @@ def _execute_python_path(
                 python_libpython,
                 python_library,
                 ir_scaffold,
+                gpu_backend,
             )
         except PyPipelineError as exc:
             _write_text("Error: " + str(exc), err=True)
@@ -821,6 +1102,7 @@ def _execute_python_path(
                 python_libpython,
                 python_library,
                 ir_scaffold,
+                gpu_backend,
             )
         except PyPipelineError as exc:
             _write_text("Error: " + str(exc), err=True)
@@ -829,6 +1111,56 @@ def _execute_python_path(
 
     import subprocess as _subp
     import tempfile as _tmp
+
+    cache_path = _python_run_cache_path(
+        src_path,
+        python_libpython=python_libpython,
+        python_library=python_library,
+        ir_scaffold=ir_scaffold,
+        backend=backend,
+        gpu_backend=gpu_backend,
+    )
+    if cache_path and os.path.isfile(cache_path):
+        try:
+            run = _subp.run([cache_path] + _copy_seq(prog_args))
+        except OSError as exc:
+            _write_text(f"Error running cached exe: {exc}", err=True)
+            return 1
+        return run.returncode
+
+    if cache_path:
+        cache_dir = os.path.dirname(cache_path)
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except OSError:
+            cache_path = None
+
+    if cache_path:
+        exe_path = cache_path + ".tmp." + str(os.getpid())
+        try:
+            _observed_compile(
+                src_path,
+                exe_path,
+                verbose,
+                False,
+                python_libpython,
+                python_library,
+                ir_scaffold,
+                gpu_backend,
+            )
+        except PyPipelineError as exc:
+            _write_text("Error: " + str(exc), err=True)
+            return 1
+        try:
+            os.replace(exe_path, cache_path)
+        except OSError:
+            cache_path = exe_path
+        try:
+            run = _subp.run([cache_path] + _copy_seq(prog_args))
+        except OSError as exc:
+            _write_text(f"Error running exe: {exc}", err=True)
+            return 1
+        return run.returncode
 
     with _tmp.TemporaryDirectory(prefix="pcc_py_run_") as td:
         exe_path = os.path.join(td, os.path.basename(src_path)[:-3] or "pcc_run")
@@ -841,6 +1173,7 @@ def _execute_python_path(
                 python_libpython,
                 python_library,
                 ir_scaffold,
+                gpu_backend,
             )
         except PyPipelineError as exc:
             _write_text("Error: " + str(exc), err=True)
@@ -879,6 +1212,7 @@ def execute_cli(
     emit_llvm=None,
     output_path=None,
     backend=None,
+    gpu_backend=None,
     python_libpython=None,
     python_library=False,
     ir_scaffold=None,
@@ -891,6 +1225,7 @@ def execute_cli(
         backend_request_allows_unimplemented,
         resolve_backend,
     )
+    from pcc.gpu_backend import resolve_gpu_backend
     from pcc.evaluater.c_evaluator import CEvaluator
     from pcc.project import (
         TranslationUnit,
@@ -902,6 +1237,12 @@ def execute_cli(
         translation_unit_include_dirs,
     )
 
+    try:
+        resolve_gpu_backend(gpu_backend)
+    except ValueError as exc:
+        _write_text("Error: " + str(exc), err=True)
+        return 1
+
     if isinstance(path, str) and path.endswith(".py"):
         return _execute_python_path(
             path=path,
@@ -910,6 +1251,7 @@ def execute_cli(
             python_libpython=python_libpython,
             python_library=python_library,
             ir_scaffold=ir_scaffold,
+            gpu_backend=gpu_backend,
             verbose=verbose,
             prog_args=prog_args,
         )
@@ -933,7 +1275,13 @@ def execute_cli(
     try:
         run_prepare_commands(prepare_cmds)
         ensure_make_goals(ensure_make_goal_specs, jobs=jobs)
-        opt_level = _effective_self_backend_opt_level(backend, opt_level)
+        requested_opt_level = int(opt_level)
+        opt_level = _effective_self_backend_opt_level(backend, requested_opt_level)
+        _warn_if_self_backend_opt_level_clamped(
+            backend,
+            requested_opt_level,
+            opt_level,
+        )
         pass_env = _pass_env_overrides(
             opt_level,
             enabled_passes=enabled_passes,
@@ -1148,6 +1496,7 @@ def cli_main(argv=None) -> int:
         emit_llvm_raw,
         output_path_raw,
         backend_raw,
+        gpu_backend_raw,
         python_libpython_raw,
         python_library_raw,
         ir_scaffold_raw,
@@ -1167,6 +1516,7 @@ def cli_main(argv=None) -> int:
         if not os.path.isfile(path):
             _write_text("Error: input file not found: " + path, err=True)
             return 1
+        _seed_package_site_for_python_entry(path)
         from pcc.py_frontend.pipeline import PyPipelineError, compile_python
         from pcc.compile_observability import (
             ObservabilityOptions,
@@ -1183,6 +1533,7 @@ def cli_main(argv=None) -> int:
             compile_python_library,
             compile_ir_scaffold_mode,
             compile_backend,
+            compile_gpu_backend,
         ):
             opts = ObservabilityOptions(
                 diagnostic_format=os.getenv("PCC_DIAGNOSTIC_FORMAT", "text"),
@@ -1204,6 +1555,7 @@ def cli_main(argv=None) -> int:
                     python_library=compile_python_library,
                     ir_scaffold_mode=compile_ir_scaffold_mode,
                     backend=compile_backend,
+                    gpu_backend=compile_gpu_backend,
                 )
             except ObservedCompileError as exc:
                 raise PyPipelineError(exc.formatted) from exc
@@ -1225,6 +1577,7 @@ def cli_main(argv=None) -> int:
                     bool(python_library_raw),
                     ir_scaffold_raw,
                     backend_raw,
+                    gpu_backend_raw,
                 )
             except PyPipelineError as exc:
                 _write_text("Error: " + str(exc), err=True)
@@ -1242,6 +1595,7 @@ def cli_main(argv=None) -> int:
                     bool(python_library_raw),
                     ir_scaffold_raw,
                     backend_raw,
+                    gpu_backend_raw,
                 )
             except PyPipelineError as exc:
                 _write_text("Error: " + str(exc), err=True)
@@ -1250,6 +1604,57 @@ def cli_main(argv=None) -> int:
 
         import subprocess as _subp
         import tempfile as _tmp
+
+        cache_path = _python_run_cache_path(
+            path,
+            python_libpython=python_libpython_raw,
+            python_library=bool(python_library_raw),
+            ir_scaffold=ir_scaffold_raw,
+            backend=backend_raw,
+            gpu_backend=gpu_backend_raw,
+        )
+        if cache_path and os.path.isfile(cache_path):
+            try:
+                run = _subp.run([cache_path] + _copy_seq(prog_args))
+            except OSError as exc:
+                _write_text(f"Error running cached exe: {exc}", err=True)
+                return 1
+            return run.returncode
+
+        if cache_path:
+            cache_dir = os.path.dirname(cache_path)
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+            except OSError:
+                cache_path = None
+
+        if cache_path:
+            exe_path = cache_path + ".tmp." + str(os.getpid())
+            try:
+                _observed_compile(
+                    path,
+                    exe_path,
+                    verbose,
+                    False,
+                    python_libpython_raw,
+                    bool(python_library_raw),
+                    ir_scaffold_raw,
+                    backend_raw,
+                    gpu_backend_raw,
+                )
+            except PyPipelineError as exc:
+                _write_text("Error: " + str(exc), err=True)
+                return 1
+            try:
+                os.replace(exe_path, cache_path)
+            except OSError:
+                cache_path = exe_path
+            try:
+                run = _subp.run([cache_path] + _copy_seq(prog_args))
+            except OSError as exc:
+                _write_text(f"Error running exe: {exc}", err=True)
+                return 1
+            return run.returncode
 
         with _tmp.TemporaryDirectory(prefix="pcc_py_run_") as td:
             exe_path = os.path.join(td, os.path.basename(path)[:-3] or "pcc_run")
@@ -1263,6 +1668,7 @@ def cli_main(argv=None) -> int:
                     bool(python_library_raw),
                     ir_scaffold_raw,
                     backend_raw,
+                    gpu_backend_raw,
                 )
             except PyPipelineError as exc:
                 _write_text("Error: " + str(exc), err=True)
@@ -1295,6 +1701,7 @@ def cli_main(argv=None) -> int:
     emit_obj = _normalize_cli_optional_text(emit_obj_raw)
     emit_asm = _normalize_cli_optional_text(emit_asm_raw)
     backend = _normalize_cli_optional_text(backend_raw)
+    gpu_backend = _normalize_cli_optional_text(gpu_backend_raw)
     python_libpython = _normalize_cli_optional_text(python_libpython_raw)
     python_library = _normalize_cli_flag(python_library_raw)
     ir_scaffold = _normalize_cli_optional_text(ir_scaffold_raw)
@@ -1323,6 +1730,7 @@ def cli_main(argv=None) -> int:
         emit_llvm=emit_llvm,
         output_path=output_path,
         backend=backend,
+        gpu_backend=gpu_backend,
         python_libpython=python_libpython,
         python_library=python_library,
         ir_scaffold=ir_scaffold,

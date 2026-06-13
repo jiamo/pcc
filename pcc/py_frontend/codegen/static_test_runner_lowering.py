@@ -10,6 +10,7 @@ from ..py_ast import (
     Attr,
     AugAssign,
     Call,
+    ClassDef,
     DynType,
     ExceptHandler,
     Expr,
@@ -160,6 +161,25 @@ class StaticTestRunnerLoweringMixin:
     ) -> None:
         if not funcs:
             return
+        fixtures = self._fixture_funcdefs()
+        calls: list[Call] = []
+        for fd in funcs:
+            calls.extend(self._static_test_call_exprs(fd, fixtures, span))
+        self._emit_static_test_runner_calls(
+            tuple(calls),
+            span,
+            exit_on_failure=exit_on_failure,
+        )
+
+    def _emit_static_test_runner_calls(
+        self,
+        calls: tuple[Call, ...],
+        span: SourceSpan,
+        *,
+        exit_on_failure: bool,
+    ) -> None:
+        if not calls:
+            return
         int_ty = IntType(name="int")
         suffix = self._fresh("pytest_runner").replace(".", "_")
         passed_name = f"__pcc_{suffix}_passed"
@@ -182,44 +202,42 @@ class StaticTestRunnerLoweringMixin:
                 annotation=int_ty,
             ),
         ]
-        fixtures = self._fixture_funcdefs()
-        for fd in funcs:
-            for call in self._static_test_call_exprs(fd, fixtures, span):
-                stmts.append(
-                    Try(
-                        span=span,
-                        body=(
-                            ExprStmt(span=span, expr=call),
-                            AugAssign(
-                                span=span,
-                                target=passed_ref,
-                                op="+=",
-                                value=one,
-                            ),
+        for call in calls:
+            stmts.append(
+                Try(
+                    span=span,
+                    body=(
+                        ExprStmt(span=span, expr=call),
+                        AugAssign(
+                            span=span,
+                            target=passed_ref,
+                            op="+=",
+                            value=one,
                         ),
-                        handlers=(
-                            ExceptHandler(
+                    ),
+                    handlers=(
+                        ExceptHandler(
+                            span=span,
+                            exc_type=Name(
                                 span=span,
-                                exc_type=Name(
+                                ty=DynType(name="dyn"),
+                                ident="AssertionError",
+                            ),
+                            name=None,
+                            body=(
+                                AugAssign(
                                     span=span,
-                                    ty=DynType(name="dyn"),
-                                    ident="AssertionError",
-                                ),
-                                name=None,
-                                body=(
-                                    AugAssign(
-                                        span=span,
-                                        target=failed_ref,
-                                        op="+=",
-                                        value=one,
-                                    ),
+                                    target=failed_ref,
+                                    op="+=",
+                                    value=one,
                                 ),
                             ),
                         ),
-                        else_body=(),
-                        finally_body=(),
-                    )
+                    ),
+                    else_body=(),
+                    finally_body=(),
                 )
+            )
 
         self._emit_stmts(tuple(stmts))
         passed = self._emit_expr_as_i64(passed_ref)
@@ -277,6 +295,62 @@ class StaticTestRunnerLoweringMixin:
             funcs.append(fd)
         return tuple(funcs)
 
+    def _is_unittest_main_call(self, expr: Call) -> bool:
+        if expr.args or expr.kwargs:
+            return False
+        func = expr.func
+        return (
+            isinstance(func, Attr)
+            and func.name == "main"
+            and isinstance(func.obj, Name)
+            and func.obj.ident == "unittest"
+        )
+
+    def _is_unittest_testcase_base(self, base: Expr) -> bool:
+        if isinstance(base, Name):
+            return base.ident == "TestCase"
+        return (
+            isinstance(base, Attr)
+            and base.name == "TestCase"
+            and isinstance(base.obj, Name)
+            and base.obj.ident == "unittest"
+        )
+
+    def _unittest_discovered_case_calls(self, span: SourceSpan) -> tuple[Call, ...]:
+        """``ClassName().test_x()`` call exprs for every ``test*`` method on a
+        top-level ``unittest.TestCase`` subclass, in source order.
+
+        ``unittest.main()`` discovers tests by reflecting over the running
+        ``__main__`` module, which cannot see pcc-native classes; this static
+        mirror plays the same role as the ``pytest.main()`` lowering."""
+        dyn = DynType(name="dyn")
+        calls: list[Call] = []
+        for stmt in self.ast_module.body:
+            if not isinstance(stmt, ClassDef):
+                continue
+            if not any(self._is_unittest_testcase_base(b) for b in stmt.bases):
+                continue
+            for item in stmt.body:
+                if not isinstance(item, FuncDef) or not item.name.startswith("test"):
+                    continue
+                inst = Call(
+                    span=span,
+                    ty=dyn,
+                    func=Name(span=span, ty=dyn, ident=stmt.name),
+                    args=(),
+                    kwargs=(),
+                )
+                calls.append(
+                    Call(
+                        span=span,
+                        ty=dyn,
+                        func=Attr(span=span, ty=dyn, obj=inst, name=item.name),
+                        args=(),
+                        kwargs=(),
+                    )
+                )
+        return tuple(calls)
+
     def _is_pytest_main_call(self, expr: Call) -> bool:
         if expr.kwargs:
             return False
@@ -311,6 +385,15 @@ class StaticTestRunnerLoweringMixin:
                 exit_on_failure=True,
             )
             return True
+        if self._is_unittest_main_call(expr):
+            case_calls = self._unittest_discovered_case_calls(expr.span)
+            if case_calls:
+                self._emit_static_test_runner_calls(
+                    case_calls,
+                    expr.span,
+                    exit_on_failure=True,
+                )
+                return True
         return False
 
     # -- Expression statement -----------------------------------------

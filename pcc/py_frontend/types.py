@@ -27,6 +27,7 @@ from .py_ast import (
     Expr,
     FloatType,
     FuncType,
+    IntLit,
     IntType,
     ListType,
     ListExpr,
@@ -34,6 +35,7 @@ from .py_ast import (
     Name,
     NoneLit,
     NoneType,
+    SetType,
     SourceSpan,
     StrLit,
     StrType,
@@ -41,6 +43,7 @@ from .py_ast import (
     TupleExpr,
     TupleType,
     Type,
+    ValueArrayType,
 )
 
 # ---------------------------------------------------------------------------
@@ -62,6 +65,8 @@ TYPE_BYTES: BytesType = BytesType(name="bytes")
 TYPE_BYTEARRAY: ByteArrayType = ByteArrayType(name="bytearray")
 TYPE_MEMORYVIEW: MemoryViewType = MemoryViewType(name="memoryview")
 TYPE_DYN: DynType = DynType(name="dyn")
+TYPE_SET: SetType = SetType(name="set", elem=TYPE_DYN)
+TYPE_FROZENSET: SetType = SetType(name="frozenset", elem=TYPE_DYN)
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +125,8 @@ _BUILTIN_NAMED_TYPES: dict[str, Type] = {
     "NoneType": TYPE_NONE,
     "object": TYPE_DYN,
     "Any": TYPE_DYN,
-    "set": DynType(name="set"),
-    "frozenset": DynType(name="set"),
+    "set": TYPE_SET,
+    "frozenset": TYPE_FROZENSET,
 }
 
 
@@ -152,7 +157,7 @@ def _class_type_from_dotted(name: str) -> ClassType:
                 last_dot = i
             i += 1
         module = name[:last_dot]
-        leaf = name[last_dot + 1:]
+        leaf = name[last_dot + 1 :]
         return ClassType(name=leaf, module=module, fields=(), bases=())
     return ClassType(name=name, module="", fields=(), bases=())
 
@@ -160,7 +165,7 @@ def _class_type_from_dotted(name: str) -> ClassType:
 def _parse_string_annotation(text: str) -> Optional[Type]:
     text = text.strip()
     if text.startswith("Optional[") and text.endswith("]"):
-        return _class_type_from_dotted(text[len("Optional["):-1].strip())
+        return _class_type_from_dotted(text[len("Optional[") : -1].strip())
     return None
 
 
@@ -216,6 +221,33 @@ def parse_annotation(expr: Expr) -> Type:
                 return ListType(name="list", elem=parse_annotation(idx_exprs[0]))
             return ListType(name="list", elem=TYPE_DYN)
 
+        if head in ("pcc.array", "array"):
+            if len(idx_exprs) != 2:
+                raise PyFrontendError(
+                    expr.span,
+                    "pcc.array needs an element type and literal length",
+                    "use pcc.array[ValueClass, N] with N between 1 and 7",
+                )
+            length_expr = idx_exprs[1]
+            if not isinstance(length_expr, IntLit):
+                raise PyFrontendError(
+                    length_expr.span,
+                    "pcc.array length must be an integer literal",
+                    "write a literal length between 1 and 7",
+                )
+            length = int(length_expr.value)
+            if length < 1 or length > 7:
+                raise PyFrontendError(
+                    length_expr.span,
+                    "pcc.array length must be between 1 and 7",
+                    "the selected self-backend aggregate ABI supports lengths 1..7",
+                )
+            return ValueArrayType(
+                name="pcc.array",
+                elem=parse_annotation(idx_exprs[0]),
+                length=length,
+            )
+
         if head == "dict" or head == "Dict":
             if len(idx_exprs) == 2:
                 return DictType(
@@ -226,7 +258,9 @@ def parse_annotation(expr: Expr) -> Type:
             return DictType(name="dict", key=TYPE_DYN, value=TYPE_DYN)
 
         if head in ("set", "Set", "frozenset", "FrozenSet"):
-            return DynType(name="set")
+            elem = parse_annotation(idx_exprs[0]) if len(idx_exprs) == 1 else TYPE_DYN
+            name = "frozenset" if head in ("frozenset", "FrozenSet") else "set"
+            return SetType(name=name, elem=elem)
 
         if head == "tuple" or head == "Tuple":
             return TupleType(
@@ -256,9 +290,7 @@ def parse_annotation(expr: Expr) -> Type:
             if len(idx_exprs) == 2:
                 params_expr, ret_expr = idx_exprs
                 if isinstance(params_expr, ListExpr):
-                    params = tuple(
-                        parse_annotation(p) for p in params_expr.elems
-                    )
+                    params = tuple(parse_annotation(p) for p in params_expr.elems)
                 else:
                     params = ()
                 return FuncType(
@@ -351,28 +383,14 @@ def type_eq(a: Type, b: Type) -> bool:
             and a.name == b.name
         )
     if isinstance(a, BoolType) or isinstance(b, BoolType):
-        return (
-            isinstance(a, BoolType)
-            and isinstance(b, BoolType)
-            and a.name == b.name
-        )
+        return isinstance(a, BoolType) and isinstance(b, BoolType) and a.name == b.name
     if isinstance(a, NoneType) or isinstance(b, NoneType):
-        return (
-            isinstance(a, NoneType)
-            and isinstance(b, NoneType)
-            and a.name == b.name
-        )
+        return isinstance(a, NoneType) and isinstance(b, NoneType) and a.name == b.name
     if isinstance(a, StrType) or isinstance(b, StrType):
-        return (
-            isinstance(a, StrType)
-            and isinstance(b, StrType)
-            and a.name == b.name
-        )
+        return isinstance(a, StrType) and isinstance(b, StrType) and a.name == b.name
     if isinstance(a, BytesType) or isinstance(b, BytesType):
         return (
-            isinstance(a, BytesType)
-            and isinstance(b, BytesType)
-            and a.name == b.name
+            isinstance(a, BytesType) and isinstance(b, BytesType) and a.name == b.name
         )
     if isinstance(a, ByteArrayType) or isinstance(b, ByteArrayType):
         return (
@@ -387,23 +405,23 @@ def type_eq(a: Type, b: Type) -> bool:
             and a.name == b.name
         )
     if isinstance(a, DynType) or isinstance(b, DynType):
-        return (
-            isinstance(a, DynType)
-            and isinstance(b, DynType)
-            and a.name == b.name
-        )
+        return isinstance(a, DynType) and isinstance(b, DynType) and a.name == b.name
     if isinstance(a, ListType) or isinstance(b, ListType):
         if not (isinstance(a, ListType) and isinstance(b, ListType)):
             return False
         return a.name == b.name and type_eq(a.elem, b.elem)
+    if isinstance(a, SetType) or isinstance(b, SetType):
+        if not (isinstance(a, SetType) and isinstance(b, SetType)):
+            return False
+        return a.name == b.name and type_eq(a.elem, b.elem)
+    if isinstance(a, ValueArrayType) or isinstance(b, ValueArrayType):
+        if not (isinstance(a, ValueArrayType) and isinstance(b, ValueArrayType)):
+            return False
+        return a.name == b.name and a.length == b.length and type_eq(a.elem, b.elem)
     if isinstance(a, DictType) or isinstance(b, DictType):
         if not (isinstance(a, DictType) and isinstance(b, DictType)):
             return False
-        return (
-            a.name == b.name
-            and type_eq(a.key, b.key)
-            and type_eq(a.value, b.value)
-        )
+        return a.name == b.name and type_eq(a.key, b.key) and type_eq(a.value, b.value)
     if isinstance(a, TupleType) or isinstance(b, TupleType):
         if not (isinstance(a, TupleType) and isinstance(b, TupleType)):
             return False
@@ -528,6 +546,8 @@ __all__ = [
     "TYPE_BYTES",
     "TYPE_BYTEARRAY",
     "TYPE_MEMORYVIEW",
+    "TYPE_SET",
+    "TYPE_FROZENSET",
     "TYPE_DYN",
     "PyFrontendError",
     "parse_annotation",

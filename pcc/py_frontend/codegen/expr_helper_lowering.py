@@ -24,6 +24,32 @@ _I64 = ir.IntType(64)
 _DOUBLE = ir.DoubleType()
 
 
+def emit_python_floordiv_i64_unchecked(
+    builder,
+    a: ir.Value,
+    b: ir.Value,
+    name_prefix: str,
+) -> ir.Value:
+    """Emit Python signed floor division after the caller rejects ``b == 0``.
+
+    Both the regular unboxed-int lowering and the pure low-IR lowering use
+    this arithmetic core.  Zero-division handling remains with the caller
+    because only the regular path has an exception exit; low IR admits this
+    helper only for a divisor already proven to be a non-zero literal.
+    """
+    zero = ir.Constant(a.type, 0)
+    one = ir.Constant(a.type, 1)
+    q = builder.sdiv(a, b, name=name_prefix + ".q")
+    r = builder.srem(a, b, name=name_prefix + ".r")
+    r_nz = builder.icmp_signed("!=", r, zero, name=name_prefix + ".r_nz")
+    r_neg = builder.icmp_signed("<", r, zero, name=name_prefix + ".r_neg")
+    b_neg = builder.icmp_signed("<", b, zero, name=name_prefix + ".b_neg")
+    sign_diff = builder.xor(r_neg, b_neg, name=name_prefix + ".sign_diff")
+    need_fix = builder.and_(r_nz, sign_diff, name=name_prefix + ".need_fix")
+    q_minus_1 = builder.sub(q, one, name=name_prefix + ".q_fix")
+    return builder.select(need_fix, q_minus_1, q, name=name_prefix)
+
+
 class ExprHelperLoweringMixin:
     def _join_reversed_strs(self, parts: list[str]) -> str:
         rev: list[str] = []
@@ -71,35 +97,14 @@ class ExprHelperLoweringMixin:
         val_expr,
     ) -> None:
         if kind == "dict":
-            k = self._emit_expr(key_expr)
-            v = self._emit_expr(val_expr)
-            k_obj = marshal.marshal_to_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                k,
-                key_expr.ty,
-            )
-            v_obj = marshal.marshal_to_object(
-                self.builder,
-                self.module,
-                self.runtime,
-                v,
-                val_expr.ty,
-            )
+            k_obj = self._emit_expr_as_pcc_object(key_expr)
+            v_obj = self._emit_expr_as_pcc_object(val_expr)
             self.builder.call(
                 self.runtime["py_dict_set"],
                 [container, k_obj, v_obj],
             )
             return
-        v = self._emit_expr(elt_expr)
-        v_obj = marshal.marshal_to_object(
-            self.builder,
-            self.module,
-            self.runtime,
-            v,
-            elt_expr.ty,
-        )
+        v_obj = self._emit_expr_as_pcc_object(elt_expr)
         fn_name = "py_list_append" if kind == "list" else "py_set_add"
         self.builder.call(self.runtime[fn_name], [container, v_obj])
 
@@ -169,28 +174,19 @@ class ExprHelperLoweringMixin:
 
 
     def _python_floordiv_i64(self, a: ir.Value, b: ir.Value) -> ir.Value:
-        """Python-correct signed floor division on i64.
-
-        ``q = a sdiv b; r = a srem b; if (r != 0) && ((r < 0) != (b < 0))
-        then q = q - 1``.
-        """
+        """Python-correct signed floor division on i64."""
         b_is_zero = self.builder.icmp_signed(
             "==", b, ir.Constant(_I64, 0), name=self._fresh("fdiv_bz")
         )
         self._emit_zero_division_check(
             b_is_zero, "division by zero"
         )
-        q = self.builder.sdiv(a, b, name=self._fresh("q"))
-        r = self.builder.srem(a, b, name=self._fresh("r"))
-        zero = ir.Constant(_I64, 0)
-        one = ir.Constant(_I64, 1)
-        r_nz = self.builder.icmp_signed("!=", r, zero, name=self._fresh("r_nz"))
-        r_neg = self.builder.icmp_signed("<", r, zero, name=self._fresh("r_neg"))
-        b_neg = self.builder.icmp_signed("<", b, zero, name=self._fresh("b_neg"))
-        sign_diff = self.builder.xor(r_neg, b_neg, name=self._fresh("sign_diff"))
-        need_fix = self.builder.and_(r_nz, sign_diff, name=self._fresh("need_fix"))
-        q_minus_1 = self.builder.sub(q, one, name=self._fresh("q_fix"))
-        return self.builder.select(need_fix, q_minus_1, q, name=self._fresh("floordiv"))
+        return emit_python_floordiv_i64_unchecked(
+            self.builder,
+            a,
+            b,
+            self._fresh("floordiv"),
+        )
 
     def _python_mod_i64(self, a: ir.Value, b: ir.Value) -> ir.Value:
         """Python-correct signed mod on i64; sign follows divisor.
@@ -215,6 +211,16 @@ class ExprHelperLoweringMixin:
 
     def _get_floor_intrinsic(self) -> ir.Function:
         name = "llvm.floor.f64"
+        existing = self.module.globals.get(name)
+        if isinstance(existing, ir.Function):
+            return existing
+        fnty = ir.FunctionType(_DOUBLE, [_DOUBLE])
+        fn = ir.Function(self.module, fnty, name=name)
+        fn.linkage = "external"
+        return fn
+
+    def _get_ceil_intrinsic(self) -> ir.Function:
+        name = "llvm.ceil.f64"
         existing = self.module.globals.get(name)
         if isinstance(existing, ir.Function):
             return existing
@@ -270,6 +276,12 @@ class ExprHelperLoweringMixin:
         if isinstance(expr, BoolLit):
             return ir.Constant(_I64, 1 if bool(expr.value) else 0)
         value = self._emit_expr(expr)
+        if value in getattr(self, "_cpy_values", ()):
+            return self.builder.call(
+                self.runtime["py_cpy_to_i64"],
+                [value],
+                name=self._fresh("cpy.to_i64"),
+            )
         if isinstance(expr.ty, IntType):
             if self._ir_type_matches(value.type, _I64):
                 return value

@@ -1,4 +1,5 @@
 """Subscript and slice lowering helpers for L1CodeGen."""
+
 from __future__ import annotations
 
 import os
@@ -17,6 +18,7 @@ from ..py_ast import (
     DictType,
     DynType,
     Expr,
+    IntLit,
     IntType,
     ListExpr,
     ListType,
@@ -29,10 +31,10 @@ from ..py_ast import (
     TupleExpr,
     TupleType,
     Type,
+    ValueArrayType,
 )
 from . import marshal
 from .runtime_abi import declare_runtime_global
-
 
 _I8 = ir.IntType(8)
 _I64 = ir.IntType(64)
@@ -44,10 +46,218 @@ def _same_type_kind(a: Type, b: Type) -> bool:
 
 
 class SubscriptLoweringMixin:
+    def _emit_value_array_subscript_load(self, expr: Subscript) -> ir.Value:
+        array_ty = expr.obj.ty
+        payload = self._emit_expr(expr.obj)
+        index_value = self._emit_expr(expr.idx)
+
+        if isinstance(index_value.type, ir.PointerType):
+            if index_value in getattr(self, "_cpy_values", ()):
+                index_i64 = self.builder.call(
+                    self.runtime["py_cpy_to_i64"],
+                    [index_value],
+                    name=self._fresh("value.array.cpy.index"),
+                )
+                self._emit_post_call_err_check(expr.span)
+                self._gc_release_if_owned(index_value, expr.idx)
+            else:
+                overflow_slot = self._alloca_in_entry(
+                    ir.IntType(32),
+                    name=self._fresh("value.array.index.overflow"),
+                )
+                self.builder.store(ir.Constant(ir.IntType(32), 0), overflow_slot)
+                index_i64 = self.builder.call(
+                    self.runtime["py_int_to_i64"],
+                    [index_value, overflow_slot],
+                    name=self._fresh("value.array.index"),
+                )
+                overflow = self.builder.load(
+                    overflow_slot,
+                    name=self._fresh("value.array.index.overflow.flag"),
+                )
+                overflowed = self.builder.icmp_signed(
+                    "!=",
+                    overflow,
+                    ir.Constant(ir.IntType(32), 0),
+                    name=self._fresh("value.array.index.overflowed"),
+                )
+                self._gc_release_if_owned(index_value, expr.idx)
+                overflow_bb = self.current_function.append_basic_block(
+                    name=self._fresh("value.array.index.overflow"),
+                )
+                converted_bb = self.current_function.append_basic_block(
+                    name=self._fresh("value.array.index.converted"),
+                )
+                self.builder.cbranch(overflowed, overflow_bb, converted_bb)
+
+                self.builder.position_at_end(overflow_bb)
+                overflow_exc = self.builder.call(
+                    self.runtime["py_exc_new"],
+                    [
+                        ir.Constant(_I64, 15),
+                        self._pooled_cstr_ptr(
+                            "pcc.array index does not fit in a signed 64-bit integer",
+                            ".value.array.index.overflow.msg",
+                        ),
+                    ],
+                    name=self._fresh("value.array.index.overflow.exc"),
+                )
+                self.builder.call(self.runtime["py_raise"], [overflow_exc])
+                self._gc_release(overflow_exc)
+                frame_exc = self.builder.call(
+                    self.runtime["py_current_exception"],
+                    [],
+                    name=self._fresh("value.array.index.overflow.frame"),
+                )
+                self._emit_exception_frame(frame_exc, expr.span)
+                err_target = self._current_try_err_block()
+                if err_target is None:
+                    err_target = self._ensure_fn_err_exit()
+                self.builder.branch(err_target)
+                self.builder.position_at_end(converted_bb)
+        else:
+            index_i64 = self._to_int64(index_value, expr.idx.ty)
+            self._gc_release_if_owned(index_value, expr.idx)
+        is_negative = self.builder.icmp_signed(
+            "<",
+            index_i64,
+            ir.Constant(_I64, 0),
+            name=self._fresh("value.array.index.negative"),
+        )
+        from_end = self.builder.add(
+            index_i64,
+            ir.Constant(_I64, array_ty.length),
+            name=self._fresh("value.array.index.from_end"),
+        )
+        normalized = self.builder.select(
+            is_negative,
+            from_end,
+            index_i64,
+            name=self._fresh("value.array.index.normalized"),
+        )
+        at_least_zero = self.builder.icmp_signed(
+            ">=",
+            normalized,
+            ir.Constant(_I64, 0),
+            name=self._fresh("value.array.index.nonnegative"),
+        )
+        below_length = self.builder.icmp_signed(
+            "<",
+            normalized,
+            ir.Constant(_I64, array_ty.length),
+            name=self._fresh("value.array.index.below_length"),
+        )
+        in_bounds = self.builder.and_(
+            at_least_zero,
+            below_length,
+            name=self._fresh("value.array.index.in_bounds"),
+        )
+        bounds_ok_bb = self.current_function.append_basic_block(
+            name=self._fresh("value.array.index.bounds_ok"),
+        )
+        bounds_error_bb = self.current_function.append_basic_block(
+            name=self._fresh("value.array.index.bounds_error"),
+        )
+        self.builder.cbranch(in_bounds, bounds_ok_bb, bounds_error_bb)
+
+        self.builder.position_at_end(bounds_error_bb)
+        bounds_exc = self.builder.call(
+            self.runtime["py_exc_new"],
+            [
+                ir.Constant(_I64, 5),
+                self._pooled_cstr_ptr(
+                    "pcc.array index out of range",
+                    ".value.array.index.bounds.msg",
+                ),
+            ],
+            name=self._fresh("value.array.index.bounds.exc"),
+        )
+        self.builder.call(self.runtime["py_raise"], [bounds_exc])
+        self._gc_release(bounds_exc)
+        frame_exc = self.builder.call(
+            self.runtime["py_current_exception"],
+            [],
+            name=self._fresh("value.array.index.bounds.frame"),
+        )
+        self._emit_exception_frame(frame_exc, expr.span)
+        err_target = self._current_try_err_block()
+        if err_target is None:
+            err_target = self._ensure_fn_err_exit()
+        self.builder.branch(err_target)
+
+        self.builder.position_at_end(bounds_ok_bb)
+        elem_ir_ty = self._valueclass_payload_ir_type(array_ty.elem)
+        result_slot = self._alloca_in_entry(
+            elem_ir_ty,
+            name=self._fresh("value.array.index.result"),
+        )
+        done_bb = self.current_function.append_basic_block(
+            name=self._fresh("value.array.index.done"),
+        )
+        candidate = 0
+        while candidate < array_ty.length:
+            match_bb = self.current_function.append_basic_block(
+                name=self._fresh(f"value.array.index.match{candidate}"),
+            )
+            next_bb = self.current_function.append_basic_block(
+                name=self._fresh(f"value.array.index.next{candidate}"),
+            )
+            matches = self.builder.icmp_signed(
+                "==",
+                normalized,
+                ir.Constant(_I64, candidate),
+                name=self._fresh(f"value.array.index.is{candidate}"),
+            )
+            self.builder.cbranch(matches, match_bb, next_bb)
+
+            self.builder.position_at_end(match_bb)
+            if candidate == 0:
+                selected = self.builder.extract_value(payload, [0])
+            elif candidate == 1:
+                selected = self.builder.extract_value(payload, [1])
+            elif candidate == 2:
+                selected = self.builder.extract_value(payload, [2])
+            elif candidate == 3:
+                selected = self.builder.extract_value(payload, [3])
+            elif candidate == 4:
+                selected = self.builder.extract_value(payload, [4])
+            elif candidate == 5:
+                selected = self.builder.extract_value(payload, [5])
+            else:
+                selected = self.builder.extract_value(payload, [6])
+            self.builder.store(selected, result_slot)
+            self.builder.branch(done_bb)
+
+            self.builder.position_at_end(next_bb)
+            candidate += 1
+
+        fallback = self.builder.extract_value(payload, [0])
+        self.builder.store(fallback, result_slot)
+        self.builder.branch(done_bb)
+
+        self.builder.position_at_end(done_bb)
+        return self.builder.load(
+            result_slot,
+            name=self._fresh("value.array.index.value"),
+        )
+
     def _emit_index_expr_as_i64(self, expr: Expr) -> ir.Value:
+        value = self._emit_expr(expr)
+        if value in getattr(self, "_cpy_values", ()):
+            return self.builder.call(
+                self.runtime["py_cpy_to_i64"],
+                [value],
+                name=self._fresh("cpy.index.to_i64"),
+            )
         if isinstance(expr.ty, (IntType, BoolType)):
-            return self._emit_expr_as_i64(expr)
-        obj = self._emit_as_object(expr)
+            return self._to_int64(value, expr.ty)
+        obj = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            value,
+            expr.ty,
+        )
         idx = self.builder.call(
             self.runtime["py_obj_index_i64"],
             [obj],
@@ -56,12 +266,67 @@ class SubscriptLoweringMixin:
         self._emit_post_call_err_check(expr.span)
         return idx
 
+    def _emit_exact_container_subscript_load_object(
+        self,
+        expr: Subscript,
+        obj: ir.Value,
+    ) -> Optional[tuple]:
+        """Emit the raw object result for exact list/tuple/dict getitem.
+
+        Both ordinary expression lowering and the exact-int object boundary
+        need this behavior.  Keep runtime-symbol selection, raising helpers,
+        the post-call exception edge, and receiver ownership in one place;
+        callers only decide whether to coerce the returned object.
+
+        Returns ``(raw_object, semantic_element_type_or_none)`` or ``None``
+        when the receiver is outside this finite exact-container family.
+        """
+        obj_ty = expr.obj.ty
+        span = getattr(expr, "span", None)
+        elem_ty: Optional[Type] = None
+        if isinstance(obj_ty, ListType):
+            idx = self._emit_index_expr_as_i64(expr.idx)
+            got = self.builder.call(
+                self.runtime["py_list_getitem"],
+                [obj, idx],
+                name=self._fresh("subscript.list.getitem"),
+            )
+            elem_ty = obj_ty.elem
+        elif isinstance(obj_ty, TupleType):
+            idx = self._emit_index_expr_as_i64(expr.idx)
+            got = self.builder.call(
+                self.runtime["py_tuple_getitem"],
+                [obj, idx],
+                name=self._fresh("subscript.tuple.getitem"),
+            )
+            if obj_ty.elems:
+                first = obj_ty.elems[0]
+                if all(_same_type_kind(item, first) for item in obj_ty.elems):
+                    elem_ty = first
+        elif isinstance(obj_ty, DictType):
+            key_obj = self._emit_subscript_key_object(expr.idx)
+            got = self.builder.call(
+                self.runtime["py_dict_getitem"],
+                [obj, key_obj],
+                name=self._fresh("subscript.dict.getitem"),
+            )
+            elem_ty = obj_ty.value
+        else:
+            return None
+
+        # These public getitem variants raise IndexError/KeyError.  Keep the
+        # exception edge paired with symbol selection so no caller can regress
+        # to a silent NULL result.
+        self._emit_post_call_err_check(span)
+        self._gc_release_if_owned(obj, expr.obj)
+        return got, elem_ty
+
     def _emit_subscript_store(self, target: Subscript, value_expr: Expr) -> None:
-        rhs = self._emit_expr(value_expr)
+        rhs = self._emit_expr_as_pcc_object(value_expr)
         self._emit_subscript_store_value(
             target,
             rhs,
-            value_expr.ty,
+            DynType(name="dyn"),
             release_expr=value_expr,
         )
 
@@ -189,6 +454,10 @@ class SubscriptLoweringMixin:
                 [obj, key_obj, rhs_obj],
                 name=self._fresh("weak.value.dict.set"),
             )
+            # the internal py_weakref_new can raise (TypeError on
+            # valueclass payloads); without this check the pending
+            # exception skips enclosing try/except blocks
+            self._emit_post_call_err_check(target.span)
             release_rhs()
             return
         if weak_dict_kind == "key":
@@ -198,15 +467,22 @@ class SubscriptLoweringMixin:
                 [obj, key_obj, rhs_obj],
                 name=self._fresh("weak.key.dict.set"),
             )
+            # see weak-value note above
+            self._emit_post_call_err_check(target.span)
             release_rhs()
             return
         if isinstance(obj_ty, ListType):
             idx_i64 = self._emit_index_expr_as_i64(idx_expr)
-            self.builder.call(self.runtime["py_list_set"], [obj, idx_i64, rhs_obj])
+            # User-visible store contract: out-of-range raises catchable
+            # IndexError (py_list_set stays the internal non-raising setter).
+            self.builder.call(
+                self.runtime["py_list_setitem"], [obj, idx_i64, rhs_obj]
+            )
+            self._emit_post_call_err_check(target.span)
             release_rhs()
             return
         if isinstance(obj_ty, DictType):
-            key_obj = self._emit_as_object(idx_expr)
+            key_obj = self._emit_subscript_key_object(idx_expr)
             self.builder.call(self.runtime["py_dict_set"], [obj, key_obj, rhs_obj])
             release_rhs()
             return
@@ -214,8 +490,19 @@ class SubscriptLoweringMixin:
             raise NotImplementedError(
                 "tuples are immutable - subscript-assignment not allowed"
             )
-        key_obj = self._emit_as_object(idx_expr)
+        if isinstance(idx_expr.ty, (IntType, BoolType)):
+            idx_i64 = self._emit_index_expr_as_i64(idx_expr)
+            self.builder.call(
+                self.runtime["py_obj_setitem_i64"],
+                [obj, idx_i64, rhs_obj],
+                name=self._fresh("obj.setitem.i64"),
+            )
+            self._emit_post_call_err_check(target.span)
+            release_rhs()
+            return
+        key_obj = self._emit_subscript_key_object(idx_expr)
         self.builder.call(self.runtime["py_obj_setitem"], [obj, key_obj, rhs_obj])
+        self._emit_post_call_err_check(target.span)
         release_rhs()
 
     def _emit_slice_bound_object(self, expr: Optional[Expr]) -> ir.Value:
@@ -229,33 +516,22 @@ class SubscriptLoweringMixin:
         """Emit a Python ``slice`` object for expression contexts.
 
         Runtime slicing helpers consume loose ``lo`` / ``hi`` / ``step``
-        bounds, but CPython-backed tuple-index paths such as ``obj[:, None]``
-        need a real slice object as an element of the index tuple.
+        bounds, but tuple-index paths such as ``obj[:, None]`` need a real
+        slice object as an element of the index tuple.  Build that object with
+        the native runtime: C-extension ``mp_subscript`` sees the same object
+        through the C-API slice bridge, without importing CPython's builtins.
         """
-
-        def _bound_cpy(e: Optional[Expr]) -> ir.Value:
-            if e is None:
-                gv = declare_runtime_global(self.module, "py_None")
-                none = self.builder.load(gv, name=self._fresh("none"))
-                return self.builder.call(
-                    self.runtime["py_cpy_from_pcc_obj"],
-                    [none],
-                    name=self._fresh("cpy.slice.none"),
-                )
-            v = self._emit_expr(e)
-            cpy, _owned = self._marshal_to_cpython(v, e.ty)
-            return cpy
-
-        slice_fn = self._load_cpython_builtin("slice")
-        lo_cpy = _bound_cpy(sl.lo)
-        hi_cpy = _bound_cpy(sl.hi)
-        step_cpy = _bound_cpy(sl.step)
         result = self.builder.call(
-            self.runtime["py_cpy_call3"],
-            [slice_fn, lo_cpy, hi_cpy, step_cpy],
-            name=self._fresh("cpy.slice.expr"),
+            self.runtime["py_slice_new"],
+            [
+                self._emit_slice_bound_object(sl.lo),
+                self._emit_slice_bound_object(sl.hi),
+                self._emit_slice_bound_object(sl.step),
+            ],
+            name=self._fresh("slice.expr"),
         )
-        return self._mark_cpy_value(result)
+        self._emit_post_call_err_check(getattr(sl, "span", None))
+        return result
 
     def _emit_slice_load(self, expr: Subscript) -> ir.Value:
         debug_codegen = bool(os.environ.get("PCC_DEBUG_CODEGEN_PHASES"))
@@ -270,13 +546,7 @@ class SubscriptLoweringMixin:
                 else "<top>"
             )
             sys.stderr.write(
-                "[pcc.codegen] "
-                + mod_name
-                + ":"
-                + func_name
-                + ":slice "
-                + label
-                + "\n"
+                "[pcc.codegen] " + mod_name + ":" + func_name + ":slice " + label + "\n"
             )
 
         slice_log("begin")
@@ -364,7 +634,9 @@ class SubscriptLoweringMixin:
             helper = "py_str_slice"
         elif isinstance(obj_ty, (BytesType, ByteArrayType, MemoryViewType)):
             helper = "py_bytes_slice"
-        elif isinstance(obj_ty, DynType):
+        elif isinstance(obj_ty, (DynType, ClassType)):
+            # py_obj_slice dispatches __getitem__(slice(...)) for user
+            # instances (ClassType / dyn instance).
             helper = "py_obj_slice"
         else:
             raise NotImplementedError(
@@ -399,6 +671,23 @@ class SubscriptLoweringMixin:
         self,
         expr: Expr,
     ) -> Optional[ir.Value]:
+        if isinstance(expr, Name) and expr.ident in (
+            "bool",
+            "int",
+            "float",
+            "str",
+            "list",
+            "dict",
+            "tuple",
+            "bytes",
+            "bytearray",
+        ):
+            # A CPython-owned typing key must contain CPython type objects.
+            # Emitting the normal pcc builtin type here creates a foreign
+            # pointer inside a real CPython list/tuple (for example
+            # ``Callable[[str], str]``), which crashes when CPython later
+            # decrefs that container.
+            return self._load_cpython_builtin(expr.ident)
         if isinstance(expr, ListExpr):
             ops: list[tuple[str, ir.Value, Type]] = []
             for el in expr.elems:
@@ -432,6 +721,11 @@ class SubscriptLoweringMixin:
     def _emit_subscript_load(self, expr: Subscript) -> ir.Value:
         if isinstance(expr.idx, Slice):
             return self._emit_slice_load(expr)
+        if isinstance(expr.obj.ty, ValueArrayType):
+            return self._emit_value_array_subscript_load(expr)
+        native_module_name = self._native_module_name_for_object_expr(expr)
+        if native_module_name is not None:
+            return self._emit_native_module_placeholder(native_module_name)
         dunder = self._try_dispatch_dunder_unary(expr, "__getitem__", (expr.idx,))
         if dunder is not None:
             return dunder
@@ -460,52 +754,12 @@ class SubscriptLoweringMixin:
             self._gc_release_if_owned(obj, expr.obj)
             return result
         obj_ty = expr.obj.ty
-        if isinstance(obj_ty, ListType):
-            idx = self._emit_index_expr_as_i64(expr.idx)
-            got = self.builder.call(
-                self.runtime["py_list_getitem"],
-                [obj, idx],
-                name=self._fresh("list.getitem"),
-            )
-            # py_list_getitem raises IndexError on out-of-range; emit the
-            # post-call err check so a surrounding try/except can catch it
-            # (was py_list_get, which returned NULL silently -> "<null>").
-            self._emit_post_call_err_check(getattr(expr, "span", None))
-            self._gc_release_if_owned(obj, expr.obj)
-            return self._coerce_from_object(got, obj_ty.elem)
-        if isinstance(obj_ty, TupleType):
-            idx = self._emit_index_expr_as_i64(expr.idx)
-            got = self.builder.call(
-                self.runtime["py_tuple_get"],
-                [obj, idx],
-                name=self._fresh("tup.get"),
-            )
-            elem_ty: Type
-            if obj_ty.elems:
-                first = obj_ty.elems[0]
-                if all(_same_type_kind(e, first) for e in obj_ty.elems):
-                    elem_ty = first
-                else:
-                    self._gc_release_if_owned(obj, expr.obj)
-                    return got
-            else:
-                self._gc_release_if_owned(obj, expr.obj)
+        exact_container = self._emit_exact_container_subscript_load_object(expr, obj)
+        if exact_container is not None:
+            got, elem_ty = exact_container
+            if elem_ty is None:
                 return got
-            self._gc_release_if_owned(obj, expr.obj)
             return self._coerce_from_object(got, elem_ty)
-        if isinstance(obj_ty, DictType):
-            key_obj = self._emit_as_object(expr.idx)
-            got = self.builder.call(
-                self.runtime["py_dict_getitem"],
-                [obj, key_obj],
-                name=self._fresh("dict.getitem"),
-            )
-            # py_dict_getitem raises KeyError (carrying the key) when missing;
-            # emit the post-call err check so a surrounding try/except can catch
-            # it (was py_dict_get, which returned NULL silently -> "<null>").
-            self._emit_post_call_err_check(getattr(expr, "span", None))
-            self._gc_release_if_owned(obj, expr.obj)
-            return self._coerce_from_object(got, obj_ty.value)
         if isinstance(obj_ty, StrType):
             idx_obj = self._emit_as_object(expr.idx)
             result = self.builder.call(
@@ -513,6 +767,7 @@ class SubscriptLoweringMixin:
                 [obj, idx_obj],
                 name=self._fresh("str.idx"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
             self._gc_release_if_owned(obj, expr.obj)
             return result
         if isinstance(obj_ty, (BytesType, ByteArrayType, MemoryViewType)):
@@ -522,6 +777,7 @@ class SubscriptLoweringMixin:
                 [obj, idx_obj],
                 name=self._fresh("bytes.idx"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
             result = marshal.marshal_from_object(
                 self.builder,
                 self.module,
@@ -531,7 +787,16 @@ class SubscriptLoweringMixin:
             )
             self._gc_release_if_owned(obj, expr.obj)
             return result
-        key_obj = self._emit_as_object(expr.idx)
+        if isinstance(expr.idx.ty, (IntType, BoolType)):
+            idx_i64 = self._emit_index_expr_as_i64(expr.idx)
+            result = self.builder.call(
+                self.runtime["py_obj_getitem_i64"],
+                [obj, idx_i64],
+                name=self._fresh("obj.getitem.i64"),
+            )
+            self._gc_release_if_owned(obj, expr.obj)
+            return result
+        key_obj = self._emit_subscript_key_object(expr.idx)
         result = self.builder.call(
             self.runtime["py_obj_getitem"],
             [obj, key_obj],
@@ -539,3 +804,17 @@ class SubscriptLoweringMixin:
         )
         self._gc_release_if_owned(obj, expr.obj)
         return result
+
+    def _emit_subscript_key_object(self, expr: Expr) -> ir.Value:
+        valueclass_payload = self._maybe_emit_valueclass_constructor_payload(
+            expr.ty,
+            expr,
+        )
+        if valueclass_payload is not None:
+            boxed_valueclass = self._emit_valueclass_payload_to_object(
+                valueclass_payload,
+                expr.ty,
+            )
+            if boxed_valueclass is not None:
+                return boxed_valueclass
+        return self._emit_as_object(expr)

@@ -5,6 +5,7 @@ authoritative contract. These dataclasses are ``frozen=True`` — no
 mutation after construction. Type inference runs as a separate pass
 that constructs fresh nodes.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Union
@@ -13,6 +14,7 @@ from typing import Optional, Union
 @dataclass(frozen=True)
 class SourceSpan:
     """Line/column range for diagnostics."""
+
     file: str
     line: int
     col: int
@@ -22,15 +24,17 @@ class SourceSpan:
 
 # -- Types -------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Type:
     """Base; every type has a name."""
+
     name: str
 
 
 @dataclass(frozen=True)
-class IntType(Type):    # name = "int"
-    width: int = 64     # tagged default; 32 for explicit i32, etc.
+class IntType(Type):  # name = "int"
+    width: int = 64  # tagged default; 32 for explicit i32, etc.
     signed: bool = True
 
 
@@ -45,32 +49,53 @@ class ComplexType(Type):  # name = "complex"
 
 
 @dataclass(frozen=True)
-class BoolType(Type):   pass   # name = "bool"
+class BoolType(Type):
+    pass  # name = "bool"
 
 
 @dataclass(frozen=True)
-class NoneType(Type):   pass   # name = "None"
+class NoneType(Type):
+    pass  # name = "None"
 
 
 @dataclass(frozen=True)
-class StrType(Type):    pass   # name = "str"
+class StrType(Type):
+    pass  # name = "str"
 
 
 @dataclass(frozen=True)
-class BytesType(Type):  pass   # name = "bytes"
+class BytesType(Type):
+    pass  # name = "bytes"
 
 
 @dataclass(frozen=True)
-class ByteArrayType(Type):  pass   # name = "bytearray"
+class ByteArrayType(Type):
+    pass  # name = "bytearray"
 
 
 @dataclass(frozen=True)
-class MemoryViewType(Type): pass   # name = "memoryview"
+class MemoryViewType(Type):
+    pass  # name = "memoryview"
 
 
 @dataclass(frozen=True)
 class ListType(Type):
     elem: Type
+
+
+@dataclass(frozen=True)
+class SetType(Type):
+    """First-class set/frozenset projection for native lowering."""
+
+    elem: Type
+
+
+@dataclass(frozen=True)
+class ValueArrayType(Type):
+    """Fixed-length pcc-owned array of one valueclass payload type."""
+
+    elem: Type
+    length: int
 
 
 @dataclass(frozen=True)
@@ -113,10 +138,12 @@ class ValueClassType(ClassType):
 
 
 @dataclass(frozen=True)
-class DynType(Type):    pass   # name = "dyn"; fallback when untyped
+class DynType(Type):
+    pass  # name = "dyn"; fallback when untyped
 
 
 # -- Expressions -------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class Expr:
@@ -125,11 +152,13 @@ class Expr:
 
 
 @dataclass(frozen=True)
-class IntLit(Expr):      value: int
+class IntLit(Expr):
+    value: int
 
 
 @dataclass(frozen=True)
-class FloatLit(Expr):    value: float
+class FloatLit(Expr):
+    value: float
 
 
 @dataclass(frozen=True)
@@ -139,49 +168,54 @@ class ComplexLit(Expr):
 
 
 @dataclass(frozen=True)
-class BoolLit(Expr):     value: bool
+class BoolLit(Expr):
+    value: bool
 
 
 @dataclass(frozen=True)
-class NoneLit(Expr):     pass
+class NoneLit(Expr):
+    pass
 
 
 @dataclass(frozen=True)
-class StrLit(Expr):      value: str
+class StrLit(Expr):
+    value: str
 
 
 @dataclass(frozen=True)
-class BytesLit(Expr):    value: bytes
+class BytesLit(Expr):
+    value: bytes
 
 
 @dataclass(frozen=True)
-class Name(Expr):        ident: str
+class Name(Expr):
+    ident: str
 
 
 @dataclass(frozen=True)
 class BinOp(Expr):
-    op: str              # "+", "-", "*", "/", "//", "%", "**",
-                         # "&", "|", "^", "<<", ">>"
+    op: str  # "+", "-", "*", "/", "//", "%", "**",
+    # "&", "|", "^", "<<", ">>"
     lhs: Expr
     rhs: Expr
 
 
 @dataclass(frozen=True)
 class UnaryOp(Expr):
-    op: str              # "-", "+", "~", "not"
+    op: str  # "-", "+", "~", "not"
     operand: Expr
 
 
 @dataclass(frozen=True)
 class Compare(Expr):
-    op: str              # "==", "!=", "<", "<=", ">", ">=", "is", "is not", "in", "not in"
+    op: str  # "==", "!=", "<", "<=", ">", ">=", "is", "is not", "in", "not in"
     lhs: Expr
     rhs: Expr
 
 
 @dataclass(frozen=True)
 class BoolExpr(Expr):
-    op: str              # "and", "or"
+    op: str  # "and", "or"
     left: Expr
     right: Expr
 
@@ -213,15 +247,18 @@ class Slice(Expr):
 
 
 @dataclass(frozen=True)
-class ListExpr(Expr):    elems: tuple[Expr, ...]
+class ListExpr(Expr):
+    elems: tuple[Expr, ...]
 
 
 @dataclass(frozen=True)
-class DictExpr(Expr):    pairs: tuple[tuple[Expr, Expr], ...]
+class DictExpr(Expr):
+    pairs: tuple[tuple[Expr, Expr], ...]
 
 
 @dataclass(frozen=True)
-class TupleExpr(Expr):   elems: tuple[Expr, ...]
+class TupleExpr(Expr):
+    elems: tuple[Expr, ...]
 
 
 @dataclass(frozen=True)
@@ -239,6 +276,7 @@ class Lambda(Expr):
 
 # -- Statements --------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Stmt:
     span: SourceSpan
@@ -246,7 +284,7 @@ class Stmt:
 
 @dataclass(frozen=True)
 class Assign(Stmt):
-    targets: tuple[Expr, ...]   # Name/Attr/Subscript
+    targets: tuple[Expr, ...]  # Name/Attr/Subscript
     value: Expr
     annotation: Optional[Type] = None
 
@@ -254,7 +292,7 @@ class Assign(Stmt):
 @dataclass(frozen=True)
 class AugAssign(Stmt):
     target: Expr
-    op: str                      # "+=", etc.
+    op: str  # "+=", etc.
     value: Expr
 
 
@@ -292,15 +330,18 @@ class Return(Stmt):
 
 
 @dataclass(frozen=True)
-class Pass(Stmt):    pass
+class Pass(Stmt):
+    pass
 
 
 @dataclass(frozen=True)
-class Break(Stmt):   pass
+class Break(Stmt):
+    pass
 
 
 @dataclass(frozen=True)
-class Continue(Stmt): pass
+class Continue(Stmt):
+    pass
 
 
 @dataclass(frozen=True)
@@ -361,6 +402,7 @@ class Delete(Stmt):
 
 # -- Top-level & declarations -----------------------------------------------
 
+
 @dataclass(frozen=True)
 class Arg:
     name: str
@@ -385,7 +427,7 @@ class FuncDef(Stmt):
 class ClassDef(Stmt):
     name: str
     bases: tuple[Expr, ...]
-    keywords: tuple[tuple[str, Expr], ...]   # for metaclass=
+    keywords: tuple[tuple[str, Expr], ...]  # for metaclass=
     body: tuple[Stmt, ...]
     decorators: tuple[Expr, ...] = ()
 

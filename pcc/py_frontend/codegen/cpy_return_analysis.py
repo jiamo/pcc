@@ -1,4 +1,5 @@
 """CPython result-space analysis helpers for Layer-1 calls."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -21,7 +22,6 @@ from ..py_ast import (
 )
 from .errors import L1CodegenError
 
-
 _CPY_BUILTIN_FALLBACK = frozenset(
     {
         "getattr",
@@ -30,7 +30,6 @@ _CPY_BUILTIN_FALLBACK = frozenset(
         "hasattr",
         "dir",
         "vars",
-        "globals",
         "locals",
         "eval",
         "exec",
@@ -51,13 +50,15 @@ class CpyReturnAnalysisMixin:
             if expr.ident in getattr(self, "_cpy_star_module_env", {}):
                 return True
             if expr.ident in self._native_module_aliases:
-                return True
+                return False
             if getattr(self, "_cpy_module_flags", {}).get(expr.ident, False):
                 return True
             if getattr(self, "_cpy_env_flags", {}).get(expr.ident, False):
                 return True
             return False
         if isinstance(expr, Attr):
+            if self._native_module_expr_export_info(expr.obj, expr.name) is not None:
+                return False
             return self._expr_looks_cpython(expr.obj)
         if isinstance(expr, BinOp):
             # A binary op with a CPython operand produces a CPython object
@@ -73,6 +74,13 @@ class CpyReturnAnalysisMixin:
         if isinstance(expr, Call):
             if isinstance(expr.func, Name):
                 if expr.func.ident == "getattr" and expr.args:
+                    return self._expr_looks_cpython(expr.args[0])
+                if expr.func.ident == "type" and len(expr.args) == 1:
+                    # ``type(cpy)`` resolves to the real CPython type object
+                    # (lowered as ``py_cpy_getattr(x, "__class__")``), so its
+                    # attribute loads — ``type(a).__name__`` etc. — must route
+                    # through libpython as well. Inert in no-libpython, where
+                    # the argument never looks cpy.
                     return self._expr_looks_cpython(expr.args[0])
                 if expr.func.ident in _CPY_BUILTIN_FALLBACK:
                     return True

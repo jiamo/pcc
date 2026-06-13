@@ -3,12 +3,12 @@ from __future__ import annotations
 """AArch64 Darwin global/data emission helpers for the self backend."""
 
 import re
-import struct
 
 from . import BackendUnavailable
 from .self_backend_aarch64_darwin_regs import align_pow2
 from .self_backend_aarch64_darwin_symbols import asm_symbol
 from .self_backend_ir import GlobalDef, TypeDesc, _align_to
+from .self_backend_float_bits import bits_to_float64, float32_to_bits
 from .self_backend_module_symbols import PreparedModuleSymbols
 from .self_backend_parse import (
     decode_global_name,
@@ -27,7 +27,11 @@ def emit_globals(
 ) -> list[str]:
     lines: list[str] = []
     for global_ in globals_:
-        section = ".section __DATA,__const" if global_.is_constant else ".section __DATA,__data"
+        section = (
+            ".section __DATA,__const"
+            if global_.is_constant
+            else ".section __DATA,__data"
+        )
         lines.append(section)
         lines.append(f".p2align {align_pow2(global_.type.align)}")
         if not global_.is_internal:
@@ -100,11 +104,8 @@ def emit_scalar_initializer(
         if is_hex_literal(init):
             bits = int(init, 16)
             if ty.width <= 32:
-                value = struct.unpack(">d", bits.to_bytes(8, byteorder="big", signed=False))[0]
-                fp32_bits = struct.unpack(
-                    "<I",
-                    struct.pack("<f", value),
-                )[0]
+                value = bits_to_float64(bits)
+                fp32_bits = float32_to_bits(value)
                 return [f"  .long {fp32_bits}"]
             if ty.width <= 64:
                 return [f"  .quad {bits}"]
@@ -148,7 +149,11 @@ def emit_typed_initializer(
         lines: list[str] = []
         stride = _align_to(ty.elem.slot_size, ty.elem.align)
         for item in items:
-            lines.extend(emit_typed_initializer(ty.elem, strip_typed_initializer(item), global_name, module_symbols))
+            lines.extend(
+                emit_typed_initializer(
+                    ty.elem, strip_typed_initializer(item), global_name, module_symbols
+                )
+            )
             lines.extend(emit_zero_fill(stride - ty.elem.slot_size))
         return lines
     if ty.is_struct:
@@ -167,14 +172,22 @@ def emit_typed_initializer(
         for index, (field_ty, item) in enumerate(zip(ty.fields, items)):
             field_offset = ty.field_offset(index)
             lines.extend(emit_zero_fill(field_offset - offset))
-            lines.extend(emit_typed_initializer(field_ty, strip_typed_initializer(item), global_name, module_symbols))
+            lines.extend(
+                emit_typed_initializer(
+                    field_ty, strip_typed_initializer(item), global_name, module_symbols
+                )
+            )
             offset = field_offset + field_ty.slot_size
         lines.extend(emit_zero_fill(ty.slot_size - offset))
         return lines
     return emit_scalar_initializer(ty, init, global_name, module_symbols)
 
 
-def emit_global_initializer(global_: GlobalDef, module_symbols: PreparedModuleSymbols) -> str:
+def emit_global_initializer(
+    global_: GlobalDef, module_symbols: PreparedModuleSymbols
+) -> str:
     return "\n".join(
-        emit_typed_initializer(global_.type, global_.initializer, global_.name, module_symbols)
+        emit_typed_initializer(
+            global_.type, global_.initializer, global_.name, module_symbols
+        )
     )

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from . import BackendUnavailable
 from .self_backend_aarch64_darwin_addr import materialize_global_address
-from .self_backend_aarch64_darwin_regs import emit_add_offset, emit_const_to_reg, emit_fp_constant
+from .self_backend_aarch64_darwin_regs import (
+    emit_add_offset,
+    emit_const_to_reg,
+    emit_fp_constant,
+)
 from .self_backend_aarch64_darwin_slots import (
     copy_slot_to_slot,
     emit_slot_base_address,
@@ -11,8 +15,19 @@ from .self_backend_aarch64_darwin_slots import (
     zero_address,
     zero_slot,
 )
-from .self_backend_aarch64_darwin_abi import abi_value_reg_names, aggregate_reg_chunks, reg_name
-from .self_backend_ir import ParsedFunction, SlotInfo, TypeDesc, _align_to
+from .self_backend_aarch64_darwin_abi import (
+    abi_value_reg_names,
+    aggregate_reg_chunks,
+    reg_name,
+)
+from .self_backend_ir import (
+    ParsedFunction,
+    SlotInfo,
+    TypeDesc,
+    _align_to,
+    parsed_function_value_slot,
+    text_key_mapping_get,
+)
 from .self_backend_module_symbols import PreparedModuleSymbols
 from .self_backend_parse import (
     aggregate_literal_to_bytes,
@@ -29,7 +44,6 @@ from .self_backend_parse import (
     strip_typed_initializer,
 )
 
-
 _CONSTANT_EXPR_PREFIX = "cexpr:"
 _CONSTANT_EXPR_BINOPS = {"add", "sub", "mul", "and", "or", "xor", "shl", "lshr", "ashr"}
 _CONSTANT_EXPR_CASTS = {"ptrtoint", "inttoptr", "trunc"}
@@ -41,7 +55,9 @@ def _strip_constant_expr_attrs(rest: str) -> str:
     while text and not text.startswith("("):
         pieces = text.split(None, 1)
         if len(pieces) != 2:
-            raise BackendUnavailable(f"self backend cannot parse constant expression attributes in {rest!r}")
+            raise BackendUnavailable(
+                f"self backend cannot parse constant expression attributes in {rest!r}"
+            )
         text = pieces[1].strip()
     return text
 
@@ -84,7 +100,9 @@ def _parse_constant_expr_binop(text: str):
     return op, value_type, lhs_value_text, rhs_value_text
 
 
-def _emit_constant_expr_binop(op: str, value_type: TypeDesc, dest_reg_index: int, rhs_reg_index: int) -> list[str]:
+def _emit_constant_expr_binop(
+    op: str, value_type: TypeDesc, dest_reg_index: int, rhs_reg_index: int
+) -> list[str]:
     if not value_type.is_int:
         raise BackendUnavailable(
             f"self backend constant expression binop expected integer type, got {value_type.describe()}"
@@ -103,7 +121,9 @@ def _emit_constant_expr_binop(op: str, value_type: TypeDesc, dest_reg_index: int
         "ashr": f"  asrv {dest}, {dest}, {rhs}",
     }
     if op not in mapping:
-        raise BackendUnavailable(f"self backend does not support constant expression binop {op!r}")
+        raise BackendUnavailable(
+            f"self backend does not support constant expression binop {op!r}"
+        )
     return [mapping[op]]
 
 
@@ -163,7 +183,9 @@ def _materialize_constant_expr_to_reg(
             )
         scratch_regs = tuple(index for index in available_regs if index != reg_index)
         if not scratch_regs:
-            raise BackendUnavailable(f"self backend ran out of registers for constant expression in {func.name!r}")
+            raise BackendUnavailable(
+                f"self backend ran out of registers for constant expression in {func.name!r}"
+            )
         rhs_reg_index = scratch_regs[0]
         lines = _materialize_constant_expr_operand(
             func,
@@ -183,9 +205,13 @@ def _materialize_constant_expr_to_reg(
                 scratch_regs,
             )
         )
-        lines.extend(_emit_constant_expr_binop(op, value_type, reg_index, rhs_reg_index))
+        lines.extend(
+            _emit_constant_expr_binop(op, value_type, reg_index, rhs_reg_index)
+        )
         return lines
-    raise BackendUnavailable(f"self backend cannot materialize constant expression in {func.name!r}: {text!r}")
+    raise BackendUnavailable(
+        f"self backend cannot materialize constant expression in {func.name!r}: {text!r}"
+    )
 
 
 def materialize_indirect_aggregate_arg_pointer(
@@ -215,7 +241,10 @@ def materialize_aggregate_storage_address(
 ) -> list[str]:
     if value in func.value_slots:
         return emit_slot_base_address(func.value_slots[value], reg)
-    if value in func.alloca_slots and func.alloca_slots[value].allocated_type.describe() == value_type.describe():
+    if (
+        value in func.alloca_slots
+        and func.alloca_slots[value].allocated_type.describe() == value_type.describe()
+    ):
         return emit_add_offset(reg, "x29", -func.alloca_slots[value].offset)
     raise BackendUnavailable(
         f"self backend can only materialize aggregate storage from local slots right now in {func.name!r}: {value}"
@@ -274,16 +303,18 @@ def _store_literal_bytes_to_address(
     offset = 0
     while offset < len(literal_bytes):
         remaining = len(literal_bytes) - offset
-        chunk_size = 8 if remaining >= 8 else 4 if remaining >= 4 else 2 if remaining >= 2 else 1
+        chunk_size = (
+            8 if remaining >= 8 else 4 if remaining >= 4 else 2 if remaining >= 2 else 1
+        )
         chunk_value = int.from_bytes(
-            literal_bytes[offset : offset + chunk_size],
-            byteorder="little",
-            signed=False,
+            literal_bytes[offset : offset + chunk_size], "little"
         )
         addr_reg = base_addr_reg
         absolute_offset = base_offset + offset
         if absolute_offset:
-            lines.extend(emit_add_offset(addr_scratch_reg, base_addr_reg, absolute_offset))
+            lines.extend(
+                emit_add_offset(addr_scratch_reg, base_addr_reg, absolute_offset)
+            )
             addr_reg = addr_scratch_reg
         width = max(8, chunk_size * 8)
         data_reg = data_reg_64 if chunk_size > 4 else data_reg_32
@@ -347,7 +378,7 @@ def _store_symbolic_aggregate_literal_fields(
             )
         items = split_top_level(text[1:-1].strip())
         lines: list[str] = []
-        for index, (field_type, item) in enumerate(zip(value_type.fields, items, strict=False)):
+        for index, (field_type, item) in enumerate(zip(value_type.fields, items)):
             lines.extend(
                 _store_symbolic_aggregate_literal_fields(
                     field_type,
@@ -381,7 +412,9 @@ def _store_symbolic_aggregate_literal_fields(
 
 
 def _is_symbolic_pointer_literal(value: str) -> bool:
-    return value.startswith("@") or value.startswith(("gep0:", "gepconst:", "getelementptr"))
+    return value.startswith("@") or value.startswith(
+        ("gep0:", "gepconst:", "getelementptr")
+    )
 
 
 def _store_symbolic_pointer_literal_to_address(
@@ -396,7 +429,11 @@ def _store_symbolic_pointer_literal_to_address(
     lines: list[str] = []
     decoded = decode_value_token(value)
     if decoded.startswith("gep0:"):
-        lines.extend(materialize_global_address(decoded.split(":", 1)[1], data_reg_64, module_symbols))
+        lines.extend(
+            materialize_global_address(
+                decoded.split(":", 1)[1], data_reg_64, module_symbols
+            )
+        )
     elif decoded.startswith("gepconst:"):
         _tag, base, offset_text = decoded.split(":", 2)
         lines.extend(materialize_global_address(base, data_reg_64, module_symbols))
@@ -409,7 +446,11 @@ def _store_symbolic_pointer_literal_to_address(
         if offset:
             lines.extend(emit_add_offset(data_reg_64, data_reg_64, offset))
     elif decoded.startswith("@"):
-        lines.extend(materialize_global_address(decode_global_name(decoded), data_reg_64, module_symbols))
+        lines.extend(
+            materialize_global_address(
+                decode_global_name(decoded), data_reg_64, module_symbols
+            )
+        )
     else:
         raise BackendUnavailable(
             f"self backend cannot store symbolic pointer aggregate literal: {value!r}"
@@ -418,7 +459,11 @@ def _store_symbolic_pointer_literal_to_address(
     if base_offset:
         lines.extend(emit_add_offset(addr_scratch_reg, base_addr_reg, base_offset))
         addr_reg = addr_scratch_reg
-    lines.extend(store_to_address(addr_reg, data_reg_64, TypeDesc("ptr", pointee=TypeDesc("void"))))
+    lines.extend(
+        store_to_address(
+            addr_reg, data_reg_64, TypeDesc("ptr", pointee=TypeDesc("void"))
+        )
+    )
     return lines
 
 
@@ -454,11 +499,17 @@ def _materialize_symbolic_ptr_array_literal_to_regs(
             f"self backend ptr-array literal lane count mismatch for {value_type.describe()}: {value!r}"
         )
     lines: list[str] = []
-    for item, reg in zip(items, regs, strict=False):
+    for item, reg in zip(items, regs):
         if not reg.startswith("x"):
-            raise BackendUnavailable(f"self backend expected GPR for ptr lane, got {reg}")
+            raise BackendUnavailable(
+                f"self backend expected GPR for ptr lane, got {reg}"
+            )
         lane_value = decode_value_token(strip_typed_initializer(item))
-        lines.extend(materialize_value(func, lane_value, value_type.elem, int(reg[1:]), module_symbols))
+        lines.extend(
+            materialize_value(
+                func, lane_value, value_type.elem, int(reg[1:]), module_symbols
+            )
+        )
     return lines
 
 
@@ -485,7 +536,10 @@ def copy_large_aggregate_value_to_slot(
         return lines
     if value in func.value_slots:
         return copy_slot_to_slot(func.value_slots[value], dest_slot)
-    if value in func.alloca_slots and func.alloca_slots[value].allocated_type.describe() == value_type.describe():
+    if (
+        value in func.alloca_slots
+        and func.alloca_slots[value].allocated_type.describe() == value_type.describe()
+    ):
         src_slot = SlotInfo(func.alloca_slots[value].offset, value_type)
         return copy_slot_to_slot(src_slot, dest_slot)
     raise BackendUnavailable(
@@ -522,7 +576,11 @@ def materialize_pointer(
         )
     if value.startswith("@"):
         return materialize_global_address(value[1:], f"x{reg_index}", module_symbols)
-    ptr_type = func.value_types.get(value)
+    ptr_type = text_key_mapping_get(func.value_types, value)
+    if ptr_type is None:
+        value_slot = parsed_function_value_slot(func, value)
+        if value_slot is not None:
+            ptr_type = value_slot.type
     if value in func.alloca_slots:
         ptr_type = func.alloca_slots[value].allocated_type.ptr()
     if ptr_type is None or not ptr_type.is_ptr:
@@ -592,7 +650,9 @@ def materialize_value(
         const_value = const_int_from_value(inner_value)
         if const_value is not None:
             return emit_const_to_reg(expected_type, reg, -const_value)
-        lines = materialize_value(func, inner_value, expected_type, reg_index, module_symbols)
+        lines = materialize_value(
+            func, inner_value, expected_type, reg_index, module_symbols
+        )
         zero_reg = "wzr" if reg.startswith("w") else "xzr"
         lines.append(f"  sub {reg}, {zero_reg}, {reg}")
         return lines
@@ -607,7 +667,9 @@ def materialize_value(
             raise BackendUnavailable(
                 f"self backend expected integer offset inside add constant expression in {func.name!r}: {value}"
             )
-        lines = materialize_value(func, inner_value, expected_type, reg_index, module_symbols)
+        lines = materialize_value(
+            func, inner_value, expected_type, reg_index, module_symbols
+        )
         if offset:
             x_reg = f"x{reg[1:]}" if reg.startswith("w") else reg
             lines.extend(emit_add_offset(x_reg, x_reg, offset))
@@ -622,6 +684,9 @@ def materialize_value(
                 f"self backend cannot use alloca address {value!r} as non-pointer in {func.name!r}"
             )
         return emit_add_offset(reg, "x29", -func.alloca_slots[value].offset)
+    # Most values use consistent native string hashes.  Take that O(1) path
+    # before classifying literals, while reserving the linear false-hash
+    # recovery below for values that are not known constants or globals.
     slot = func.value_slots.get(value)
     if slot is not None:
         return load_slot_to_value_regs(slot, reg_index)
@@ -649,11 +714,9 @@ def materialize_value(
             )
         lines: list[str] = []
         offset = 0
-        for chunk_reg, chunk_size in zip(regs, aggregate_reg_chunks(expected_type), strict=False):
+        for chunk_reg, chunk_size in zip(regs, aggregate_reg_chunks(expected_type)):
             chunk_value = int.from_bytes(
-                literal_bytes[offset : offset + chunk_size],
-                byteorder="little",
-                signed=False,
+                literal_bytes[offset : offset + chunk_size], "little"
             )
             lines.extend(
                 emit_const_to_reg(
@@ -687,6 +750,16 @@ def materialize_value(
                 f"self backend cannot use global symbol {value!r} as non-pointer in {func.name!r}"
             )
         return materialize_global_address(value[1:], reg, module_symbols)
+    slot = parsed_function_value_slot(func, value)
+    if slot is not None:
+        return load_slot_to_value_regs(slot, reg_index)
+    value_is_used = False
+    for used_value in func.used_values:
+        if used_value == value:
+            value_is_used = True
+            break
+    value_has_type = text_key_mapping_get(func.value_types, value) is not None
     raise BackendUnavailable(
-        f"self backend does not know how to materialize value {value!r} in {func.name!r}"
+        f"self backend does not know how to materialize value {value!r} in {func.name!r} "
+        f"(used={value_is_used}, typed={value_has_type}, slots={len(func.value_slots)})"
     )

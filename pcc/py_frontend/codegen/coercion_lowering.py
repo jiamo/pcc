@@ -4,8 +4,18 @@ from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import BoolType, DynType, FloatType, IntType, NoneType, Type
+from ..py_ast import (
+    BoolType,
+    ClassType,
+    DynType,
+    FloatType,
+    IntType,
+    NoneType,
+    Type,
+    ValueArrayType,
+)
 from . import marshal
+from .errors import L1CodegenError
 
 _I1 = ir.IntType(1)
 _I64 = ir.IntType(64)
@@ -137,17 +147,17 @@ class CoercionLoweringMixin:
             return v
         if isinstance(ty, IntType):
             if isinstance(v.type, ir.PointerType):
-                i64 = marshal.marshal_from_object(
+                # A boxed int may be an arbitrary-precision bignum; marshalling
+                # to i64 first truncates it (float(2**70) -> 0.0). py_float_to_f64
+                # (reached via marshal_from_object FloatType) handles tagged ints
+                # AND bignums (py_bigint_to_double), so go object -> double
+                # directly, matching the DynType-pointer branch below.
+                return marshal.marshal_from_object(
                     self.builder,
                     self.module,
                     self.runtime,
                     v,
-                    IntType(name="int"),
-                )
-                return self.builder.sitofp(
-                    i64,
-                    _DOUBLE,
-                    name=self._fresh("iobj2f"),
+                    FloatType(name="float"),
                 )
             return self.builder.sitofp(v, _DOUBLE, name=self._fresh("i2f"))
         if isinstance(ty, BoolType):
@@ -253,6 +263,20 @@ class CoercionLoweringMixin:
                 name=self._fresh("truthy_obj"),
             )
             return self.builder.trunc(i32, _I1, name=self._fresh("truthy_obj_i1"))
+        if isinstance(ty, ClassType):
+            # valueclass payloads box (always-truthy valuebox unless a user
+            # __bool__/__len__ runs via py_obj_truthy); instance pointers
+            # dispatch the same way
+            obj = self._emit_valueclass_payload_to_object(v, ty)
+            if obj is None and isinstance(v.type, ir.PointerType):
+                obj = v
+            if obj is not None:
+                i32 = self.builder.call(
+                    self.runtime["py_obj_truthy"],
+                    [obj],
+                    name=self._fresh("truthy_obj"),
+                )
+                return self.builder.trunc(i32, _I1, name=self._fresh("truthy_obj_i1"))
         raise NotImplementedError(
             f"Layer 1 cannot compute truthiness of {type(ty).__name__}"
         )
@@ -265,6 +289,13 @@ class CoercionLoweringMixin:
         """
         if from_ty is None or to_ty is None:
             return v
+        if isinstance(from_ty, ValueArrayType) and (
+            isinstance(to_ty, DynType) or self._is_object(to_ty)
+        ):
+            raise L1CodegenError(
+                "pcc.array cannot cross an object or Any boundary; "
+                "select an element first"
+            )
         if isinstance(to_ty, IntType) and self._int_exprs_are_boxed():
             if isinstance(v.type, ir.PointerType):
                 return v
