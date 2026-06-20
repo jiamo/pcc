@@ -1,0 +1,284 @@
+{
+  "schema_version": 1,
+  "pcc_support_claimed": false,
+  "stage": "inventory-oracle-only",
+  "task_row": "DS4-P0-INVENTORY-ORACLE",
+  "reference": {
+    "name": "antirez ds4 / DwarfStar",
+    "local_path": "~/pcc_refs/antirez-ds4-depth1",
+    "pinned_commit": "80ebbc396aee40eedc1d829222f3362d10fa4c6c",
+    "note": "External reference / oracle ONLY. This manifest is inventory metadata plus external oracle-vector definitions. NO pcc ds4 support is claimed: pcc does not compile, run, or GPU-execute any ds4 source here. Any later compile / runtime / GPU-execution claim is a SEPARATE slice and must not read this manifest as evidence of support."
+  },
+  "surfaces": {
+    "c_runtime_core": {
+      "role": "DeepSeek-v4 inference engine core, session API, on-disk KV store, SSD/streaming planning, and CLI/server/agent/bench/eval frontends.",
+      "files": [
+        {"path": "ds4.c", "lines": 27791, "role": "Engine core: model load, tokenizer, tensor graph, session eval, sampling, DSV4 payload save/load."},
+        {"path": "ds4.h", "lines": 335, "role": "Public engine/session API: ds4_engine, ds4_session, ds4_tokens, ds4_engine_options, ds4_think_mode."},
+        {"path": "ds4_kvstore.c", "lines": 1359, "role": "On-disk prompt KV cache store implementation: entry headers, eviction scoring, store/load live prefix."},
+        {"path": "ds4_kvstore.h", "lines": 218, "role": "KV store API: ds4_kvstore, ds4_kvstore_entry, SHA prefix keys, trailer hooks, load result."},
+        {"path": "ds4_ssd.c", "lines": 181, "role": "SSD/streaming memory planning implementation: GiB parse, expert-cache plan, mlock acquire/release."},
+        {"path": "ds4_ssd.h", "lines": 36, "role": "SSD API: ds4_ssd_memory_lock, ds4_ssd_cache_plan, expert cache budget helpers."},
+        {"path": "ds4_server.c", "lines": 15875, "role": "HTTP / OpenAI-compatible inference server frontend."},
+        {"path": "ds4_cli.c", "lines": 1707, "role": "Interactive CLI frontend (uses linenoise)."},
+        {"path": "ds4_agent.c", "lines": 10244, "role": "Agent / tool-use runtime frontend (uses ds4_web + ds4_kvstore + linenoise)."},
+        {"path": "ds4_bench.c", "lines": 683, "role": "Throughput / latency benchmark harness frontend."},
+        {"path": "ds4_eval.c", "lines": 4289, "role": "Model evaluation harness frontend."},
+        {"path": "ds4_web.c", "lines": 1385, "role": "Minimal web/HTTP helper used by the agent."},
+        {"path": "ds4_web.h", "lines": 33, "role": "Web helper API header."},
+        {"path": "ds4_help.c", "lines": 559, "role": "CLI help text."},
+        {"path": "ds4_help.h", "lines": 16, "role": "CLI help API header."},
+        {"path": "rax.c", "lines": 2747, "role": "antirez radix-tree dependency (rax)."},
+        {"path": "rax.h", "lines": 301, "role": "rax radix-tree API header."},
+        {"path": "rax_malloc.h", "lines": 43, "role": "rax allocator shim header."},
+        {"path": "linenoise.c", "lines": 2690, "role": "Line-editing dependency used by the CLI/agent."},
+        {"path": "linenoise.h", "lines": 149, "role": "linenoise API header."}
+      ]
+    },
+    "gpu_api": {
+      "role": "Backend-neutral GPU API surface declared once; Metal/CUDA/ROCm each implement it.",
+      "files": [
+        {"path": "ds4_gpu.h", "lines": 1024, "role": "GPU backend API: ds4_gpu_tensor opaque handle, alloc/view/read/write/copy, command begin/flush/fence/event, model-map streaming, and 86 per-primitive GPU op entrypoints."}
+      ]
+    },
+    "metal_host": {
+      "role": "Apple Metal host runtime implementing ds4_gpu.h on macOS.",
+      "files": [
+        {"path": "ds4_metal.m", "lines": 26819, "role": "Metal host: device/queue/pipeline setup, buffer alloc, command encoding, fences/events, and dispatch of all metal/*.metal kernels."}
+      ]
+    },
+    "metal_kernels": {
+      "role": "Metal Shading Language kernels dispatched by ds4_metal.m.",
+      "files": [
+        {"path": "metal/cpy.metal", "lines": 57, "role": "copy row"},
+        {"path": "metal/bin.metal", "lines": 192, "role": "binary elementwise row"},
+        {"path": "metal/dense.metal", "lines": 1600, "role": "dense / q8 matmul row"},
+        {"path": "metal/dsv4_kv.metal", "lines": 314, "role": "KV cache store/update row"},
+        {"path": "metal/dsv4_rope.metal", "lines": 165, "role": "RoPE row"},
+        {"path": "metal/flash_attn.metal", "lines": 1429, "role": "attention (flash) row"},
+        {"path": "metal/moe.metal", "lines": 4606, "role": "MoE expert row"},
+        {"path": "metal/norm.metal", "lines": 160, "role": "norm (rms) row"},
+        {"path": "metal/softmax.metal", "lines": 241, "role": "softmax row"},
+        {"path": "metal/repeat.metal", "lines": 52, "role": "repeat row"},
+        {"path": "metal/sum_rows.metal", "lines": 102, "role": "sum-rows row"},
+        {"path": "metal/argsort.metal", "lines": 266, "role": "argsort / topk support"},
+        {"path": "metal/concat.metal", "lines": 62, "role": "concat"},
+        {"path": "metal/dsv4_hc.metal", "lines": 885, "role": "compressed-attention (hc) indexer"},
+        {"path": "metal/dsv4_misc.metal", "lines": 1327, "role": "misc dsv4 primitives"},
+        {"path": "metal/get_rows.metal", "lines": 54, "role": "gather rows / embedding"},
+        {"path": "metal/glu.metal", "lines": 40, "role": "GLU/SwiGLU"},
+        {"path": "metal/set_rows.metal", "lines": 55, "role": "scatter rows"},
+        {"path": "metal/unary.metal", "lines": 312, "role": "unary elementwise"}
+      ]
+    },
+    "cuda_rocm": {
+      "role": "NVIDIA CUDA and AMD ROCm/HIP backends implementing ds4_gpu.h, plus quant tables.",
+      "files": [
+        {"path": "ds4_cuda.cu", "lines": 13256, "role": "CUDA backend: kernels + host launch implementing ds4_gpu.h."},
+        {"path": "ds4_rocm.cu", "lines": 131, "role": "ROCm/HIP backend entry that includes rocm/*.cuh (also builds as generic CUDA)."},
+        {"path": "ds4_rocm.h", "lines": 142, "role": "ROCm backend header / config."},
+        {"path": "ds4_iq2_tables_cuda.inc", "lines": 77, "role": "IQ2 quant lookup table (CUDA include)."},
+        {"path": "ds4_streaming_hotlist.inc", "lines": 13334, "role": "Precomputed streaming expert hotlist table (include)."}
+      ],
+      "rocm_cuh_count": 22,
+      "rocm_cuh_dir": "rocm/",
+      "rocm_cuh_examples": [
+        "ds4_rocm_common.cuh",
+        "ds4_rocm_runtime.cuh",
+        "ds4_rocm_matmul.cuh",
+        "ds4_rocm_q8.cuh",
+        "ds4_rocm_attention.cuh",
+        "ds4_rocm_moe.cuh",
+        "ds4_rocm_norm_rope.cuh",
+        "ds4_rocm_indexer.cuh"
+      ]
+    },
+    "gguf_tools": {
+      "role": "GGUF / DeepSeek-v4 quantization tooling.",
+      "files": [
+        {"path": "gguf-tools/deepseek4-quantize.c", "lines": 1908, "role": "DeepSeek-v4 GGUF quantizer entry."},
+        {"path": "gguf-tools/quants.c", "lines": 1109, "role": "Quantization format library."},
+        {"path": "gguf-tools/quants.h", "lines": 75, "role": "Quantization format API header."}
+      ],
+      "subdirs": ["gguf-tools/imatrix", "gguf-tools/mixed", "gguf-tools/quality-testing"]
+    },
+    "distributed": {
+      "role": "Distributed inference backend: coordinator/worker sessions over the DS4D wire protocol.",
+      "files": [
+        {"path": "ds4_distributed.c", "lines": 8414, "role": "Coordinator/worker sessions, DS4D wire protocol, layer-range routing, activation send/recv, topology-neutral snapshot save/load."},
+        {"path": "ds4_distributed.h", "lines": 125, "role": "Distributed API: options parse, session create/free, route_ready, sync, eval, save/load payload, run."}
+      ]
+    }
+  },
+  "gpu_api_detail": {
+    "opaque_type": "ds4_gpu_tensor",
+    "entrypoint_count": 86,
+    "lifecycle_entrypoints": [
+      "ds4_gpu_init",
+      "ds4_gpu_cleanup",
+      "ds4_gpu_tensor_alloc",
+      "ds4_gpu_tensor_alloc_managed",
+      "ds4_gpu_tensor_view",
+      "ds4_gpu_tensor_free",
+      "ds4_gpu_tensor_write",
+      "ds4_gpu_tensor_read",
+      "ds4_gpu_tensor_copy",
+      "ds4_gpu_begin_commands",
+      "ds4_gpu_flush_commands",
+      "ds4_gpu_end_commands",
+      "ds4_gpu_synchronize",
+      "ds4_gpu_signal_selected_readback_ready",
+      "ds4_gpu_commit_and_wait_selected_readback",
+      "ds4_gpu_wait_selected_readback_ready",
+      "ds4_gpu_tensor_read_after_selected_event"
+    ],
+    "primitive_entrypoint_examples": [
+      "ds4_gpu_argmax_tensor",
+      "ds4_gpu_repeat_hc_tensor",
+      "ds4_gpu_rms_norm_weight_tensor",
+      "ds4_gpu_rope_tail_tensor",
+      "ds4_gpu_store_raw_kv_tensor",
+      "ds4_gpu_compressor_prefill_tensor",
+      "ds4_gpu_attention_decode_heads_tensor",
+      "ds4_gpu_attention_prefill_masked_mixed_heads_tensor",
+      "ds4_gpu_swiglu_tensor",
+      "ds4_gpu_router_select_tensor",
+      "ds4_gpu_routed_moe_one_tensor",
+      "ds4_gpu_routed_moe_batch_tensor"
+    ],
+    "streaming_entrypoint_examples": [
+      "ds4_gpu_set_model_map",
+      "ds4_gpu_set_model_fd",
+      "ds4_gpu_set_model_map_spans",
+      "ds4_gpu_cache_model_range",
+      "ds4_gpu_should_use_managed_kv_cache",
+      "ds4_gpu_set_ssd_streaming",
+      "ds4_gpu_stream_expert_cache_begin_selected_load",
+      "ds4_gpu_stream_expert_cache_prepare_selected_batch"
+    ]
+  },
+  "distributed_protocol": {
+    "magic": "0x44533444 (\"DS4D\")",
+    "message_ops": [
+      "DS4_DIST_MSG_HELLO",
+      "DS4_DIST_MSG_ERROR",
+      "DS4_DIST_MSG_WORK",
+      "DS4_DIST_MSG_RESULT",
+      "DS4_DIST_MSG_SNAPSHOT_SAVE_REQ",
+      "DS4_DIST_MSG_SNAPSHOT_BEGIN",
+      "DS4_DIST_MSG_SNAPSHOT_CHUNK",
+      "DS4_DIST_MSG_SNAPSHOT_DONE",
+      "DS4_DIST_MSG_SNAPSHOT_LOAD_BEGIN"
+    ],
+    "result_kinds": [
+      "DS4_DIST_RESULT_ACK",
+      "DS4_DIST_RESULT_HIDDEN_STATE",
+      "DS4_DIST_RESULT_LOGITS"
+    ],
+    "work_flags": [
+      "DS4_DIST_WORK_F_INPUT_HC",
+      "DS4_DIST_WORK_F_OUTPUT_LOGITS",
+      "DS4_DIST_WORK_F_RESET_SESSION",
+      "DS4_DIST_WORK_F_ACK_ONLY"
+    ],
+    "public_functions": [
+      "ds4_dist_enabled",
+      "ds4_dist_options_create",
+      "ds4_dist_options_free",
+      "ds4_dist_usage",
+      "ds4_dist_parse_cli_arg",
+      "ds4_dist_prepare_engine_options",
+      "ds4_dist_session_create",
+      "ds4_dist_session_free",
+      "ds4_dist_session_route_ready",
+      "ds4_dist_session_sync",
+      "ds4_dist_session_eval",
+      "ds4_dist_session_save_payload",
+      "ds4_dist_session_load_payload",
+      "ds4_dist_run"
+    ]
+  },
+  "kv_ssd_detail": {
+    "kvstore_functions": [
+      "ds4_kvstore_open",
+      "ds4_kvstore_close",
+      "ds4_kvstore_clear",
+      "ds4_kvstore_evict",
+      "ds4_kvstore_entry_eviction_score",
+      "ds4_kvstore_find_text_prefix",
+      "ds4_kvstore_store_live_prefix",
+      "ds4_kvstore_store_live_prefix_text",
+      "ds4_kvstore_maybe_store_continued",
+      "ds4_kvstore_try_load_text",
+      "ds4_kvstore_read_header",
+      "ds4_kvstore_fill_header",
+      "ds4_kvstore_sha1_bytes_hex"
+    ],
+    "kvstore_structs": [
+      "ds4_kvstore",
+      "ds4_kvstore_entry",
+      "ds4_kvstore_options",
+      "ds4_kvstore_eviction_context",
+      "ds4_kvstore_trailer_hooks",
+      "ds4_kvstore_load_result"
+    ],
+    "ssd_functions": [
+      "ds4_parse_gib_arg",
+      "ds4_parse_streaming_cache_experts_arg",
+      "ds4_ssd_cache_experts_for_byte_budget",
+      "ds4_ssd_auto_cache_plan",
+      "ds4_ssd_memory_lock_acquire",
+      "ds4_ssd_memory_lock_release"
+    ],
+    "ssd_structs": [
+      "ds4_ssd_memory_lock",
+      "ds4_ssd_cache_plan"
+    ]
+  },
+  "make_targets": {
+    "note": "ds4's own Makefile targets (for later CPU-only / GPU compile-subset classification, NOT built by pcc here).",
+    "default": ["ds4", "ds4-server", "ds4-bench", "ds4-eval", "ds4-agent"],
+    "gpu_backends": ["cpu", "cuda", "cuda-spark", "cuda-generic", "cuda-regression", "strix-halo", "rocm"]
+  },
+  "oracle_vectors": [
+    {
+      "path": "tests/ds4_test.c",
+      "lines": 2308,
+      "kind": "native-c-test",
+      "role": "ds4's own C unit/integration test (includes ds4_server.c). EXTERNAL oracle only; pcc does not compile or run it in this slice."
+    },
+    {
+      "path": "tests/test_q4k_dot.c",
+      "lines": 249,
+      "kind": "native-c-test",
+      "role": "Q4_K dot-product numeric oracle vector for the q8/quant matmul path."
+    },
+    {
+      "path": "tests/cuda_long_context_smoke.c",
+      "lines": 166,
+      "kind": "native-c-test",
+      "role": "CUDA long-context smoke oracle (built via `make cuda-regression`)."
+    },
+    {
+      "path": "tests/ds4_agent_test.c",
+      "lines": 14,
+      "kind": "native-c-test",
+      "role": "Agent test entry (includes ds4_agent.c)."
+    },
+    {
+      "path": "tests/test-vectors/manifest.json",
+      "lines": null,
+      "kind": "vector-manifest",
+      "role": "Manifest for golden numeric test vectors (local-golden.vec / official.vec / prompts)."
+    }
+  ],
+  "oracle_golden_capture": {
+    "manifest": "tests/ds4_oracle/golden/manifest.json",
+    "pinned_commit": "80ebbc396aee40eedc1d829222f3362d10fa4c6c",
+    "files": [
+      "tests/ds4_oracle/golden/official.vec",
+      "tests/ds4_oracle/golden/local-golden.vec"
+    ],
+    "claim": "Captured external reference values only; no pcc ds4 compile, runtime, model-quality, or GPU support claim."
+  }
+}

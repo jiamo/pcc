@@ -1,0 +1,49 @@
+{
+  "schema": "pcc-ds4-cpu-compile-subset-v1",
+  "task_row": "DS4-P1-CPU-COMPILE-SUBSET",
+  "pinned_commit": "80ebbc396aee40eedc1d829222f3362d10fa4c6c",
+  "mode": "host-pcc-c-frontend",
+  "full_ds4_support_claimed": false,
+  "units": [
+    {
+      "id": "ssd-posix",
+      "category": "c-posix",
+      "source": "ds4_ssd.c",
+      "source_sha256": "2b2ba6e2278c24196bde916f7149f9c2a9cbc87460d5ce6c421651899f4a4c78",
+      "header": "ds4_ssd.h",
+      "header_sha256": "6d96ed420fe55c725578662f35f3724f7ce3a6c46676d528d652c0119f92665d",
+      "classification": "PCC_OBJECT_NATIVE_LINK_RUNTIME_ORACLE_EQUAL",
+      "oracle_stdout": "gib=17179869184 experts=37 plan=800/600/4/400\n"
+    },
+    {
+      "id": "q4k-quant",
+      "category": "gguf-quant-numeric",
+      "source": "tests/test_q4k_dot.c",
+      "source_sha256": "7604a44b395c355e7bcb57e7c071f092f2e1bc3da312cffcca0318ec4c5753c9",
+      "classification": "PCC_OBJECT_NATIVE_LINK_RUNTIME_ORACLE_EQUAL",
+      "oracle_summary": "4/4 tests passed"
+    },
+    {
+      "id": "kvstore-tu",
+      "category": "kv-posix",
+      "source": "ds4_kvstore.c",
+      "source_sha256": "929df5271da4075cf5977f7ff601c300a6f7620f557dd985ff76ae5390d2d44a",
+      "header": "ds4_kvstore.h",
+      "header_sha256": "4f3979fdb2db35add43960bc5ba973bdc93c70c0fe18e063092ce1f5e969b0e1",
+      "classification": "PCC_OBJECT_COMPILE_SUPPORTED_RUNTIME_UNPROVEN",
+      "runtime_boundary": "Full KV runtime links against ds4 engine/session/token payload APIs outside this bounded subset."
+    }
+  ],
+  "generic_gaps_closed": [
+    "fake sys/mman.h platform-correct MAP_ANON/MAP_ANONYMOUS plus mlock/munlock",
+    "fake dirent.h DIR/struct dirent ABI and directory functions",
+    "fake time.h CLOCK_MONOTONIC plus clock_gettime/clock_getres"
+  ],
+  "excluded": [
+    "full ds4 engine link or model execution",
+    "Metal, CUDA, ROCm, or GPU API compilation",
+    "GGUF quantizer program and model-file conversion",
+    "KV session payload runtime behavior",
+    "performance or model-quality parity"
+  ]
+}

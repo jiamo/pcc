@@ -1,0 +1,24 @@
+{
+  "schema": "pcc-ds4-oracle-golden-v1",
+  "task_row": "DS4-P0-INVENTORY-ORACLE",
+  "pinned_commit": "80ebbc396aee40eedc1d829222f3362d10fa4c6c",
+  "pcc_support_claimed": false,
+  "capture_kind": "external-reference-values-only",
+  "source_manifest_sha256": "4eac228274116bc84f3b6e41f543cbf678008052530e82531f19c0bb00ec7723",
+  "files": [
+    {
+      "path": "tests/ds4_oracle/golden/official.vec",
+      "source_path": "tests/test-vectors/official.vec",
+      "sha256": "0223bbe1eaa3b626be87849df389af91c3f3f6e6b0d4436baf2dbb6ed624b1ac",
+      "case_count": 5,
+      "step_count": 17
+    },
+    {
+      "path": "tests/ds4_oracle/golden/local-golden.vec",
+      "source_path": "tests/test-vectors/local-golden.vec",
+      "sha256": "e9003e7d1adfda3a12e0358580fbdbd84bfd62a10fb3746a43cd0e692f42bdfa",
+      "case_count": 1,
+      "top_count": 64
+    }
+  ]
+}

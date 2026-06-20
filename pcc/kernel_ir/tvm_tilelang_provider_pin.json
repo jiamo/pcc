@@ -1,0 +1,23 @@
+{
+  "schema": "pcc-tvm-tilelang-provider-pin-v1",
+  "provider_identity": "pcc-tvm-tilelang-metal-owner-v1",
+  "tilelang_revision": "ed00dfcd7f9c200e1150896b1be59c41ff3e8d9d",
+  "tilelang_version": "0.1.11+gited00dfcd",
+  "tvm_revision": "1ecfcc2e1e1fb9f75db9ed760a97aa9687372905",
+  "tvm_version": "0.25.dev0",
+  "default_root": "/Users/jiamo/tilelang",
+  "default_python": "/Users/jiamo/.venv/bin/python",
+  "default_site_packages": "/Users/jiamo/.venv/lib/python3.13/site-packages",
+  "source_hashes": {
+    "VERSION": "66d60356172ccafdd334fca9bf33243c8409216a733dcde0d66a24fd70ee8132",
+    "tilelang/engine/lower.py": "045d3ca3680dfda6e0b16269878ecc98b91b71655e82a1222e27f07ebb98eab4",
+    "tilelang/metal/codegen.py": "2e152c8221269f9d5521a55940b8ce824a120697b821f3b6bd27a5a81d1d93d5",
+    "tilelang/metal/pipeline.py": "ed2733631779cf830259274ee308b7219c872831e773d79bd76b4e3d62c78754"
+  },
+  "library_hashes": {
+    "libtilelang.dylib": "8c48dcc04a5090fc1709e3089c0f58b41f4a37cf59d6d23399a1bf90a47d9753",
+    "libtvm_compiler.dylib": "23dd42d24139687483d28711f844e30a07708d0f73109134a4d2aebd575ac126",
+    "libtvm_ffi.dylib": "4d9ea218d53f8e7d841c0134782d06a44e477db94d466c52f73fc6afe7c0fcf7",
+    "libtvm_runtime.dylib": "412a91e0eac04e7709d568a0061568412e292a68d5cda2767da0e98ce2b498fd"
+  }
+}
