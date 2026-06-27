@@ -15,7 +15,7 @@ def test_list_unpack_assignment_target_self_backend(tmp_path):
         print(left)
         print(right)
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "list_unpack_assign.out"
     compile_python(
         str(src),

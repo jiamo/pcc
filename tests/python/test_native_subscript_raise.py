@@ -19,9 +19,25 @@ runtime mode (pcc-Python ports — the goal mode).
 """
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 from pathlib import Path
+
+
+def _compile_to_ll(tmp_path: Path, source: str, name: str) -> str:
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / f"{name}.py"
+    out = tmp_path / f"{name}.ll"
+    src.write_text(source, encoding="utf-8")
+    compile_python(
+        str(src),
+        str(out),
+        emit_llvm_only=True,
+        libpython_mode="off",
+    )
+    return out.read_text(encoding="utf-8")
 
 
 def _run_pcc_program(tmp_path: Path, source: str) -> str:
@@ -72,3 +88,85 @@ def test_dict_keyerror_list_indexerror_catch_no_libpython(tmp_path):
         "99 1",
         "2 3",
     ], out
+
+
+def test_exact_container_getitem_has_one_behavior_owner():
+    from pcc.py_frontend.codegen.exact_int_lowering import ExactIntLoweringMixin
+    from pcc.py_frontend.codegen.host_contract import L1_CODEGEN_HOST_METHODS
+    from pcc.py_frontend.codegen.subscript_lowering import SubscriptLoweringMixin
+
+    owner = inspect.getsource(
+        SubscriptLoweringMixin._emit_exact_container_subscript_load_object
+    )
+    ordinary = inspect.getsource(SubscriptLoweringMixin._emit_subscript_load)
+    object_boundary = inspect.getsource(ExactIntLoweringMixin._emit_subscript_load_object)
+
+    for runtime_symbol in (
+        "py_list_getitem",
+        "py_tuple_getitem",
+        "py_dict_getitem",
+    ):
+        assert runtime_symbol in owner
+        assert runtime_symbol not in ordinary
+        assert runtime_symbol not in object_boundary
+    assert "_emit_post_call_err_check" in owner
+    assert "_emit_exact_container_subscript_load_object" in ordinary
+    assert "_emit_exact_container_subscript_load_object" in object_boundary
+    assert "_emit_exact_container_subscript_load_object" in L1_CODEGEN_HOST_METHODS
+
+
+def test_exact_container_getitem_former_entrypoints_emit_same_raising_shape(tmp_path):
+    source = (
+        "def list_value(xs: list[int], i: int) -> int:\n"
+        "    return xs[i] + 1\n"
+        "def list_object(xs: list[int], i: int):\n"
+        "    return [xs[i]]\n"
+        "def dict_value(values: dict[str, int], key: str) -> int:\n"
+        "    return values[key] + 1\n"
+        "def dict_object(values: dict[str, int], key: str):\n"
+        "    return [values[key]]\n"
+    )
+    ir_text = _compile_to_ll(tmp_path, source, "exact_container_owner")
+
+    def function_body(name: str) -> str:
+        marker = "@user_exact_container_owner_" + name + "("
+        marker_pos = ir_text.index(marker)
+        start = ir_text.rfind("define ", 0, marker_pos)
+        end = ir_text.index("\n}", marker_pos)
+        return ir_text[start:end]
+
+    for name in ("list_value", "list_object"):
+        body = function_body(name)
+        assert "@py_list_getitem" in body
+        assert "@py_err_occurred" in body
+        assert "subscript.list.getitem" in body
+    for name in ("dict_value", "dict_object"):
+        body = function_body(name)
+        assert "@py_dict_getitem" in body
+        assert "@py_err_occurred" in body
+        assert "subscript.dict.getitem" in body
+
+
+def test_dynamic_int_subscript_uses_i64_helper_without_losing_dict_keys(tmp_path):
+    source = (
+        "def get_item(o, i: int):\n"
+        "    return o[i]\n"
+        "def set_item(o, i: int, v):\n"
+        "    o[i] = v\n"
+        "def main():\n"
+        "    xs = [4, 5]\n"
+        "    tup = (7, 8)\n"
+        "    d = {1: 'one'}\n"
+        "    print(get_item(xs, 1))\n"
+        "    print(get_item(tup, 0))\n"
+        "    print(get_item(d, 1))\n"
+        "    set_item(xs, 0, 9)\n"
+        "    set_item(d, 2, 'two')\n"
+        "    print(xs[0], d[2])\n"
+        "main()\n"
+    )
+    ir_text = _compile_to_ll(tmp_path, source, "dyn_int_subscript_i64")
+    assert "@py_obj_getitem_i64" in ir_text, ir_text
+    assert "@py_obj_setitem_i64" in ir_text, ir_text
+    out = _run_pcc_program(tmp_path, source)
+    assert out.splitlines() == ["5", "7", "one", "9 two"], out

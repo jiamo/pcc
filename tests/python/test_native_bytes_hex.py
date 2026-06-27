@@ -54,3 +54,23 @@ def test_bytes_hex_native_no_libpython(tmp_path):
         "0102ff",
         "68656c6c6f",
     ], out
+
+
+def test_bytes_upper_native_no_libpython(tmp_path):
+    out = _run_pcc_program(
+        tmp_path,
+        "def main():\n"
+        "    print(b'hello'.upper())\n"
+        "    print(b'a1z'.upper())\n"
+        "    print(bytearray(b'abz').upper())\n"
+        "    print(b''.upper())\n"
+        "    print(b'abc'.upper().decode('utf-8'))\n"
+        "main()\n",
+    )
+    assert out.splitlines() == [
+        "b'HELLO'",
+        "b'A1Z'",
+        "bytearray(b'ABZ')",
+        "b''",
+        "ABC",
+    ], out

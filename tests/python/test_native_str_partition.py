@@ -28,7 +28,8 @@ def _compile(monkeypatch, src: Path, exe: Path) -> None:
 
 def _run(exe: Path, timeout: float = 30.0) -> str:
     result = subprocess.run(
-        [str(exe)], capture_output=True, text=True, timeout=timeout,
+        [str(exe)], capture_output=True, text=True, encoding="utf-8",
+        timeout=timeout,
     )
     assert result.returncode == 0, (
         f"{exe.name} exited {result.returncode}\n"
@@ -54,10 +55,11 @@ def test_str_partition_matches_cpython(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     cpython = subprocess.run(
-        [sys.executable, str(src)], capture_output=True, text=True, timeout=30,
+        [sys.executable, str(src)], capture_output=True, text=True,
+        encoding="utf-8", timeout=30,
     ).stdout
     # The strict ``libpython_mode="off"`` compile above already proves no
     # libpython fallback (strict mode hard-errors on any py_cpy_* emission);
@@ -84,10 +86,11 @@ def test_str_rjust_ljust_matches_cpython(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     cpython = subprocess.run(
-        [sys.executable, str(src)], capture_output=True, text=True, timeout=30,
+        [sys.executable, str(src)], capture_output=True, text=True,
+        encoding="utf-8", timeout=30,
     ).stdout
     assert _run(exe) == cpython
 
@@ -110,10 +113,11 @@ def test_str_removeprefix_removesuffix_matches_cpython(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     cpython = subprocess.run(
-        [sys.executable, str(src)], capture_output=True, text=True, timeout=30,
+        [sys.executable, str(src)], capture_output=True, text=True,
+        encoding="utf-8", timeout=30,
     ).stdout
     assert _run(exe) == cpython
 
@@ -139,10 +143,11 @@ def test_str_rsplit_matches_cpython(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     cpython = subprocess.run(
-        [sys.executable, str(src)], capture_output=True, text=True, timeout=30,
+        [sys.executable, str(src)], capture_output=True, text=True,
+        encoding="utf-8", timeout=30,
     ).stdout
     assert _run(exe) == cpython
 
@@ -168,9 +173,10 @@ def test_str_center_zfill_matches_cpython(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     cpython = subprocess.run(
-        [sys.executable, str(src)], capture_output=True, text=True, timeout=30,
+        [sys.executable, str(src)], capture_output=True, text=True,
+        encoding="utf-8", timeout=30,
     ).stdout
     assert _run(exe) == cpython

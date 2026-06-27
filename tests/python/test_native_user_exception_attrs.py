@@ -58,3 +58,47 @@ def test_user_exception_attrs_and_str(tmp_path):
         "1 direct ('direct',)",
         "plain msg ('plain msg',)",
     ], out
+
+
+def test_unhandled_user_exception_prints_exception_heading(tmp_path):
+    src = tmp_path / "p.py"
+    src.write_text(
+        "class MyError(Exception):\n"
+        "    pass\n"
+        "def main():\n"
+        "    raise MyError('visible boom')\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    exe = tmp_path / "p_bin"
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    build = subprocess.run(
+        [
+            "uv",
+            "run",
+            "pcc",
+            "--backend",
+            "self",
+            "--python-libpython=off",
+            "--ir-scaffold=on",
+            str(src),
+            "-o",
+            str(exe),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=420,
+        env=env,
+    )
+    assert build.returncode == 0, build.stderr
+    run = subprocess.run(
+        [str(exe)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    assert run.returncode == 1
+    assert "Unhandled non-exception object" not in run.stderr
+    assert "MyError: visible boom" in run.stderr

@@ -4,10 +4,10 @@ from pathlib import Path
 
 
 def test_b1_b6_runtime_symbols_stay_wired():
-    header = Path("pcc/py_runtime/include/py_runtime.h").read_text()
-    abi = Path("pcc/py_frontend/codegen/runtime_abi.py").read_text()
-    obj_dispatch = Path("pcc/py_runtime/src/py_obj_ops_dispatch.c").read_text()
-    py_dispatch = Path("pcc/py_runtime/py/py_obj_ops_dispatch.py").read_text()
+    header = Path("pcc/py_runtime/include/py_runtime.h").read_text(encoding="utf-8")
+    abi = Path("pcc/py_frontend/codegen/runtime_abi.py").read_text(encoding="utf-8")
+    obj_dispatch = Path("pcc/py_runtime/src/py_obj_ops_dispatch.c").read_text(encoding="utf-8")
+    py_dispatch = Path("pcc/py_runtime/py/py_obj_ops_dispatch.py").read_text(encoding="utf-8")
 
     # B1 bytes
     assert "py_bytes_new" in header
@@ -46,10 +46,10 @@ def test_b1_b6_runtime_symbols_stay_wired():
 
 
 def test_b5_exception_accessors_stay_wired():
-    header = Path("pcc/py_runtime/include/py_runtime.h").read_text()
-    abi = Path("pcc/py_frontend/codegen/runtime_abi.py").read_text()
-    exc_c = Path("pcc/py_runtime/src/py_exc_objects.c").read_text()
-    exc_py = Path("pcc/py_runtime/py/py_exc_objects.py").read_text()
+    header = Path("pcc/py_runtime/include/py_runtime.h").read_text(encoding="utf-8")
+    abi = Path("pcc/py_frontend/codegen/runtime_abi.py").read_text(encoding="utf-8")
+    exc_c = Path("pcc/py_runtime/src/py_exc_objects.c").read_text(encoding="utf-8")
+    exc_py = Path("pcc/py_runtime/py/py_exc_objects.py").read_text(encoding="utf-8")
 
     for sym in ["py_exc_get_cause", "py_exc_get_context", "py_exc_traceback_len"]:
         assert sym in header

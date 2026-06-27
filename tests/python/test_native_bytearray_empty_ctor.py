@@ -34,3 +34,66 @@ def test_bytearray_empty_constructor(tmp_path):
     assert out.split("\n")[:4] == [
         "bytearray(b'')", "0", "True", "bytearray(b'xy')",
     ], out
+
+
+def test_bytearray_slice_delete_no_libpython(tmp_path):
+    out = _run(tmp_path,
+        "def main():\n"
+        "    ba = bytearray(b'abcdef')\n"
+        "    del ba[:2]\n"
+        "    print(ba)\n"
+        "    del ba[1::2]\n"
+        "    print(ba)\n"
+        "    del ba[::-2]\n"
+        "    print(ba)\n"
+        "main()\n")
+    assert out.split("\n")[:3] == [
+        "bytearray(b'cdef')", "bytearray(b'ce')", "bytearray(b'c')",
+    ], out
+
+
+def test_bytearray_extend_statement_updates_local_no_libpython(tmp_path):
+    out = _run(tmp_path,
+        "def main():\n"
+        "    ba = bytearray()\n"
+        "    ba.extend(b'ab')\n"
+        "    ba.extend(bytearray(b'c'))\n"
+        "    ba.extend([100, 101])\n"
+        "    print(ba)\n"
+        "    print(bytes(ba))\n"
+        "    print(ba.decode('utf-8'))\n"
+        "main()\n")
+    assert out.split("\n")[:3] == [
+        "bytearray(b'abcde')", "b'abcde'", "abcde",
+    ], out
+
+
+def test_bytearray_extend_statement_updates_attr_no_libpython(tmp_path):
+    out = _run(tmp_path,
+        "class Box:\n"
+        "    def __init__(self):\n"
+        "        self.buf = bytearray()\n"
+        "    def add(self, data):\n"
+        "        self.buf.extend(data)\n"
+        "\n"
+        "def main():\n"
+        "    b = Box()\n"
+        "    b.add(b'xy')\n"
+        "    b.add(bytearray(b'z'))\n"
+        "    print(b.buf)\n"
+        "main()\n")
+    assert out.strip() == "bytearray(b'xyz')", out
+
+
+def test_bytes_and_bytearray_find_no_libpython(tmp_path):
+    out = _run(tmp_path,
+        "def main():\n"
+        "    data = b'GET /abc\\r\\n\\r\\n'\n"
+        "    print(data.find(b'GET'))\n"
+        "    print(data.find(b'\\r\\n\\r\\n'))\n"
+        "    print(data.find(b'missing'))\n"
+        "    print(data.find(47))\n"
+        "    ba = bytearray(data)\n"
+        "    print(ba.find(b'abc'))\n"
+        "main()\n")
+    assert out.splitlines() == ["0", "8", "-1", "4", "5"], out

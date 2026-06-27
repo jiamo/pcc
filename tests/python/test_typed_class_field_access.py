@@ -11,6 +11,7 @@ attribute access calls on AST nodes, all currently DynType-routed.
 from __future__ import annotations
 
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -33,7 +34,7 @@ def _multi_compile(srcs_mods, out_path: str) -> str:
         entry_module=mods[0],
         module_names=mods,
     )
-    return Path(out_path).read_text()
+    return Path(out_path).read_text(encoding="utf-8")
 
 
 def test_typed_field_access_resolves_natively(tmp_path):
@@ -50,7 +51,7 @@ def test_typed_field_access_resolves_natively(tmp_path):
             name: str
             body: tuple
         """
-    ))
+    ), encoding="utf-8")
     user = tmp_path / "user.py"
     user.write_text(textwrap.dedent(
         """
@@ -60,7 +61,7 @@ def test_typed_field_access_resolves_natively(tmp_path):
             for stmt in fd.body:
                 pass
         """
-    ))
+    ), encoding="utf-8")
     out = tmp_path / "combined.ll"
     text = _multi_compile(
         [(str(user), "user"), (str(sibling), "ast_pkg")],
@@ -94,7 +95,7 @@ def test_local_typed_class_field_access_uses_slot_load(tmp_path):
         def push(box: Box, item) -> None:
             box.items.append(item)
         """
-    ))
+    ), encoding="utf-8")
     out = tmp_path / "typed_local_field.ll"
     compile_python(
         str(src),
@@ -103,7 +104,7 @@ def test_local_typed_class_field_access_uses_slot_load(tmp_path):
         ir_scaffold_mode="on",
         libpython_mode="off",
     )
-    text = out.read_text()
+    text = out.read_text(encoding="utf-8")
     m_fn = re.search(
         r"define[^\n]+@user_typed_local_field[^\n]*push[^{]+\{(.+?)\n\}",
         text, re.DOTALL,
@@ -112,6 +113,52 @@ def test_local_typed_class_field_access_uses_slot_load(tmp_path):
     body = m_fn.group(1)
     assert "py_instance_get_field" in body, body
     assert "py_obj_getattr" not in body, body
+
+
+def test_instance_field_precedes_same_named_annotated_class_slot(tmp_path):
+    """Typed receivers read the initialized instance slot before class data.
+
+    This is the minimized shape of the former ``_InferCtx.globals`` self-host
+    corruption: annotation-only class metadata and an ``__init__`` instance
+    write share a name.
+    """
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "annotated_instance_precedence.py"
+    exe = tmp_path / "annotated_instance_precedence"
+    src.write_text(
+        textwrap.dedent(
+            """
+            class Context:
+                value: object
+
+                def __init__(self, value: object) -> None:
+                    self.value = value
+
+            def read(ctx: Context) -> object:
+                return ctx.value
+
+            print(read(Context("instance")))
+            """
+        ),
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        backend="self",
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+    )
+    run = subprocess.run(
+        [str(exe)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "instance\n"
 
 
 def test_field_type_propagates_into_for_loop(tmp_path):
@@ -126,7 +173,7 @@ def test_field_type_propagates_into_for_loop(tmp_path):
         class Module2:
             stmts: tuple
         """
-    ))
+    ), encoding="utf-8")
     user = tmp_path / "user2.py"
     user.write_text(textwrap.dedent(
         """
@@ -138,7 +185,7 @@ def test_field_type_propagates_into_for_loop(tmp_path):
                 n = n + 1
             return n
         """
-    ))
+    ), encoding="utf-8")
     out = tmp_path / "combined2.ll"
     text = _multi_compile(
         [(str(user), "user2"), (str(sibling), "ast_pkg2")],

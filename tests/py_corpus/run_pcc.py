@@ -52,7 +52,7 @@ def load_expected(test_dir: Path) -> tuple[bytes, int] | None:
     ):
         return None
     stdout_bytes = stdout_path.read_bytes()
-    status_text = status_path.read_text().strip()
+    status_text = status_path.read_text(encoding="utf-8").strip()
     try:
         status = int(status_text)
     except ValueError:

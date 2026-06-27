@@ -21,7 +21,7 @@ def test_for_loop_falls_back_to_object_iterator_for_pointer_typed_iterable(tmp_p
             print(values(True))
             """
         )
-    )
+    , encoding="utf-8")
     exe = tmp_path / "for_pointer_iterable.out"
     compile_python(str(src), str(exe), libpython_mode="off", ir_scaffold_mode="on")
     out = subprocess.check_output([str(exe)], text=True).strip()

@@ -10,6 +10,7 @@ dispatch lives in ``_emit_native_os_call`` (for the methods) and
 from __future__ import annotations
 
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -26,13 +27,13 @@ def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _function_body(ir_text: str, fn_name_suffix: str) -> str | None:
@@ -80,6 +81,51 @@ def test_access_dispatches_to_native(mode):
     assert "@py_os_access" in body, body
     assert "cpy.get.access" not in body, body
     assert "cpy.get.X_OK" not in body, body
+
+
+@pytest.mark.parametrize("mode", ["off", "on"])
+def test_urandom_dispatches_to_native(mode):
+    program = textwrap.dedent(
+        """
+        import os
+
+        def f() -> bytes:
+            return os.urandom(4)
+        """
+    )
+    ir = _compile_to_ll(program, f"urandom_{mode}", mode=mode)
+    body = _function_body(ir, "f")
+    assert body is not None
+    assert "@py_os_urandom" in body, body
+    assert "cpy.get.urandom" not in body, body
+    assert "cpy.import.os" not in body, body
+
+
+def test_urandom_runtime_no_libpython(
+    tmp_path, monkeypatch, pcc_py_runtime_archive
+):
+    from pcc.py_frontend.pipeline import compile_python
+
+    monkeypatch.setenv("PCC_RUNTIME_ARCHIVE", str(pcc_py_runtime_archive))
+
+    src = tmp_path / "urandom_runtime.py"
+    exe = tmp_path / "urandom_runtime.out"
+    src.write_text(
+        textwrap.dedent(
+            """
+            import os
+
+            data = os.urandom(8)
+            print(len(data))
+            print(type(data).__name__)
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    compile_python(str(src), str(exe), ir_scaffold_mode="on", libpython_mode="off")
+    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "8\nbytes\n"
 
 
 @pytest.mark.parametrize("mode", ["off", "on"])

@@ -30,8 +30,6 @@ runtime-archive setup. This file adds the surrounding contract.
 """
 from __future__ import annotations
 
-import os
-import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -39,44 +37,30 @@ from pathlib import Path
 import pytest
 
 
-def _wipe_repo_runtime_archive() -> None:
-    repo = Path(__file__).absolute().parents[2]
-    runtime = repo / "pcc" / "py_runtime"
-    archive = runtime / "libpy_runtime.a"
-    stamp = Path(str(archive) + ".target")
-    if archive.exists():
-        archive.unlink()
-    if stamp.exists():
-        stamp.unlink()
-    shutil.rmtree(runtime / "build", ignore_errors=True)
-
-
-def _compile_threaded(monkeypatch, src_path: Path, exe_path: Path) -> None:
-    """Compile ``src_path`` to ``exe_path`` against a runtime built with
-    ``PCC_WITH_THREADS=1``. Wipes the cached archive on entry so the
-    rebuild picks up the threads flag, and again at the end so other
-    tests get their default (non-threaded) build.
-    """
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        pytest.skip("threaded runtime archive tests mutate libpy_runtime.a; run with -n0")
+def _compile_threaded(
+    monkeypatch,
+    runtime_archive: Path,
+    src_path: Path,
+    exe_path: Path,
+) -> None:
+    """Compile against an isolated ``PCC_WITH_THREADS=1`` archive."""
     monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
     monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
     monkeypatch.setenv("PCC_WITH_THREADS", "1")
-    _wipe_repo_runtime_archive()
-    try:
-        from pcc.py_frontend.pipeline import compile_python
+    monkeypatch.setenv("PCC_RUNTIME_ARCHIVE", str(runtime_archive))
+    from pcc.py_frontend.pipeline import compile_python
 
-        compile_python(
-            str(src_path),
-            str(exe_path),
-            ir_scaffold_mode="on",
-            libpython_mode="off",
-        )
-    finally:
-        _wipe_repo_runtime_archive()
+    compile_python(
+        str(src_path),
+        str(exe_path),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+    )
 
 
-def test_pthread_lock_disjoint_slot_writes_succeed(tmp_path, monkeypatch):
+def test_pthread_lock_disjoint_slot_writes_succeed(
+    tmp_path, monkeypatch, threaded_c_runtime_archive
+):
     """Control: 4 threads each write to their own slot under one Lock.
 
     Each thread mutates ``my_count[idx]`` (idx differs per thread), so
@@ -112,9 +96,9 @@ def test_pthread_lock_disjoint_slot_writes_succeed(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    _compile_threaded(monkeypatch, src, exe)
+    _compile_threaded(monkeypatch, threaded_c_runtime_archive, src, exe)
 
     for _ in range(3):
         result = subprocess.run(
@@ -128,7 +112,9 @@ def test_pthread_lock_disjoint_slot_writes_succeed(tmp_path, monkeypatch):
         )
 
 
-def test_pthread_lock_low_iter_count_succeeds(tmp_path, monkeypatch):
+def test_pthread_lock_low_iter_count_succeeds(
+    tmp_path, monkeypatch, threaded_c_runtime_archive
+):
     """Control: 8 threads × 1 iter each. Contention window is too
     small to trigger the lost-update bug; the canonical case at
     1000 iters/thread does trigger it. Asserts the happy path still
@@ -168,9 +154,9 @@ def test_pthread_lock_low_iter_count_succeeds(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    _compile_threaded(monkeypatch, src, exe)
+    _compile_threaded(monkeypatch, threaded_c_runtime_archive, src, exe)
 
     for _ in range(3):
         result = subprocess.run(
@@ -185,7 +171,9 @@ def test_pthread_lock_low_iter_count_succeeds(tmp_path, monkeypatch):
         )
 
 
-def test_pthread_lock_list_append_under_contention(tmp_path, monkeypatch):
+def test_pthread_lock_list_append_under_contention(
+    tmp_path, monkeypatch, threaded_c_runtime_archive
+):
     """4 threads × 1000 iters of ``shared.append(1)`` under one Lock.
 
     Expected: final length 4000, no crash, deterministic.
@@ -224,9 +212,9 @@ def test_pthread_lock_list_append_under_contention(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    _compile_threaded(monkeypatch, src, exe)
+    _compile_threaded(monkeypatch, threaded_c_runtime_archive, src, exe)
 
     for _ in range(3):
         result = subprocess.run(

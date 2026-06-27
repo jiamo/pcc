@@ -12,10 +12,28 @@ _AUTO_CLEAN_TARGET_DIRS = {
     "zlib": ("projects/zlib-1.3.1/",),
     "nginx": ("projects/nginx-1.28.3/",),
 }
+_AUTO_CLEAN_ENV = "PCC_PYTEST_AUTO_CLEAN"
 
 
 def _repo_root():
     return os.path.dirname(__file__)
+
+
+def _auto_clean_enabled():
+    return os.environ.get(_AUTO_CLEAN_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _xdist_controller_enabled(config):
+    if hasattr(config, "workerinput"):
+        return False
+    option = getattr(config, "option", None)
+    workers = getattr(option, "numprocesses", None)
+    return workers not in (None, 0, "0")
 
 
 def _auto_clean_lock_path():
@@ -55,6 +73,7 @@ def _status_paths(repo_root):
         cwd=repo_root,
         capture_output=True,
         text=True,
+        timeout=10,
     )
     if result.returncode != 0:
         return set()
@@ -96,11 +115,15 @@ def _auto_clean_targets(initial_status_paths, current_status_paths):
 
 def pytest_configure(config):
     """Warm caches before xdist workers start."""
-    # Only run on the xdist controller (or when not using xdist).
-    # Workers have 'workerinput' set; the controller does not.
-    if not hasattr(config, 'workerinput'):
+    if not hasattr(config, "workerinput"):
+        config._pcc_auto_clean_enabled = _auto_clean_enabled()
+    if getattr(config, "_pcc_auto_clean_enabled", False):
         _acquire_session_shared_lock(config)
         config._pcc_initial_status_paths = _status_paths(_repo_root())
+
+    # Cache warming exists only to make xdist worker collection consistent.
+    # Nested/focused ``-n0`` pytest processes must not repeat this startup work.
+    if _xdist_controller_enabled(config):
         from pcc.parse.c_parser import CParser
 
         CParser()
@@ -117,6 +140,12 @@ def pytest_configure(config):
 
 def pytest_sessionfinish(session, exitstatus):
     if hasattr(session.config, "workerinput"):
+        return
+    if not getattr(
+        session.config,
+        "_pcc_auto_clean_enabled",
+        _auto_clean_enabled(),
+    ):
         return
 
     lockfile = _upgrade_to_session_clean_lock(session.config)

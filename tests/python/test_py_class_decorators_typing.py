@@ -19,7 +19,7 @@ def test_typing_final_class_decorator_is_noop_self_backend(tmp_path):
 
         print("ok")
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "typing_final_class.out"
     compile_python(
         str(src),

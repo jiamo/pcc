@@ -12,7 +12,15 @@ from pcc.package_compat import (
 
 
 def test_extension_targets_are_abi_targets_before_acceleration_claims():
-    for name in ("numpy", "cffi", "pybind11"):
+    for name in (
+        "numpy",
+        "mlx",
+        "vllm",
+        "tilelang",
+        "vllm-metal",
+        "cffi",
+        "pybind11",
+    ):
         target = get_package_target(name)
         assert target is not None
         assert target.level == LEVEL_C_EXTENSION_ABI

@@ -40,7 +40,7 @@ def test_shlex_compile_succeeds_despite_collections_codegen_failure():
         def f(s: str) -> None:
             pass
         """
-    ))
+    ), encoding="utf-8")
     out = _BUILD / "fb_shlex.ll"
     # Must NOT raise NotImplementedError or similar codegen errors
     # from the transitively-pulled collections module.
@@ -49,7 +49,7 @@ def test_shlex_compile_succeeds_despite_collections_codegen_failure():
         emit_llvm_only=True,
         recursive_stdlib=True,
     )
-    text = out.read_text()
+    text = out.read_text(encoding="utf-8")
     assert len(text) > 0
 
 
@@ -67,14 +67,14 @@ def test_simple_module_still_native():
         def f(s: str) -> None:
             pass
         """
-    ))
+    ), encoding="utf-8")
     out = _BUILD / "fb_keyword.ll"
     compile_python(
         str(src), str(out),
         emit_llvm_only=True,
         recursive_stdlib=True,
     )
-    text = out.read_text()
+    text = out.read_text(encoding="utf-8")
     # keyword is fully compilable, should NOT pull libpython for it
     pattern = re.compile(
         r"%\.\w+\s*=\s*getelementptr[^\n]+@\.cpy\.mod\.keyword"

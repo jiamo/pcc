@@ -20,7 +20,7 @@ def test_tuple_concat_after_singleton_tuple_rebind_self_backend(tmp_path):
         result = pack(Item())
         print(len(result))
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "tuple_concat_rebind.out"
     compile_python(
         str(src),

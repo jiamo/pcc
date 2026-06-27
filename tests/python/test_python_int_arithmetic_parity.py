@@ -57,7 +57,7 @@ def test_int_basic_addition_subtraction(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["3", "7", "-5", "2", "600"]
 
@@ -76,7 +76,7 @@ def test_int_multiplication_division(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     # CPython floor-div: -10 // 3 == -4; -10 % 3 == 2.
     assert _run(exe).strip().splitlines() == ["12", "-10", "3", "-4", "1", "2"]
@@ -94,7 +94,7 @@ def test_int_power(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1024", "1", "1", "1073741824"]
 
@@ -112,7 +112,7 @@ def test_int_bitwise_ops(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["0", "255", "240", "-1", "0"]
 
@@ -129,7 +129,7 @@ def test_int_shift_ops(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     # CPython arithmetic shift: -1 >> 1 == -1.
     assert _run(exe).strip().splitlines() == ["32", "64", "1073741824", "-1"]
@@ -147,7 +147,7 @@ def test_int_to_str_conversion(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["0", "42", "-7", "1000000"]
 
@@ -164,7 +164,7 @@ def test_int_from_str_conversion(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["0", "42", "-7", "100"]
 
@@ -184,7 +184,7 @@ def test_int_comparisons(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True"] * 7
 
@@ -198,7 +198,7 @@ def test_int_large_bignum_print(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "10000000000000000000000000000000000000000",

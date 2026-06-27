@@ -17,7 +17,7 @@ def test_no_init_class_call_accepts_keyword_attrs_without_libpython(tmp_path):
             print(b.count)
             """
         )
-    )
+    , encoding="utf-8")
     exe = tmp_path / "class_kwargs_no_init.out"
     compile_python(
         str(src),
@@ -42,7 +42,7 @@ def test_no_init_field_class_accepts_extra_keyword_attrs_without_libpython(tmp_p
             print(b.label)
             """
         )
-    )
+    , encoding="utf-8")
     exe = tmp_path / "field_class_extra_kwargs_no_init.out"
     compile_python(
         str(src),
@@ -80,7 +80,7 @@ def test_self_dunder_class_constructor_starstar_kwargs_without_libpython(tmp_pat
             print(d.noarch)
             """
         )
-    )
+    , encoding="utf-8")
     exe = tmp_path / "self_dunder_class_ctor_starstar.out"
     compile_python(
         str(src),

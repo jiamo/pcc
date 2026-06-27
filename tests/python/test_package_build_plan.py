@@ -269,7 +269,7 @@ def test_pcc1_build_plan_excludes_non_build_tree_surfaces(tmp_path):
     )
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -302,7 +302,7 @@ def test_pcc1_build_plan_does_not_need_host_python(tmp_path):
     project = _write_build_project(tmp_path / "demo_pkg-0.1")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),

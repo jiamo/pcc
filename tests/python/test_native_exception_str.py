@@ -13,12 +13,13 @@ exception's message via py_exc_get_message (borrowed ref; an arg-less exception
 renders as the empty string). ``str(exc)`` already routed through py_obj_str's
 existing EXC case; this aligns ``print(exc)`` with it.
 
-Scope note: KeyError's CPython str repr-quotes the key (``str(KeyError('m'))``
-== ``"'m'"``); pcc stores a single message and renders it plainly. That
-repr-quoting is a separate, pre-existing gap shared with the unhandled-exception
-traceback printer (``KeyError: m`` vs ``KeyError: 'm'``), so this test
-deliberately covers the string-message exceptions (ValueError / RuntimeError /
-TypeError), not KeyError.
+KeyError is special: CPython's ``KeyError.__str__`` repr-quotes the key
+(``str(KeyError('m'))`` == ``"'m'"``), unlike other exceptions which render the
+message plainly. Both the ``str(exc)`` path (py_obj_str / py_obj_stubs) and the
+``print(exc)`` path (py_print_fmt) now special-case KeyError via
+``py_exc_matches(o, py_exc_builtin_class(PY_EXC_KEYERROR))`` -> ``repr(key)``.
+(The unhandled-exception traceback printer ``KeyError: m`` and ``repr(exc)``
+itself remain separate follow-ups.)
 
 Runs under ``--backend self --python-libpython=off`` in DEFAULT runtime mode
 (pcc-Python ports — the goal mode; py_print_fmt is a PY_MODULES port).
@@ -82,4 +83,77 @@ def test_print_and_str_of_builtin_exception_no_libpython(tmp_path):
         "boom 42",
         "E: need int",
         "[]",
+    ], out
+
+
+def test_keyerror_str_and_print_repr_quotes_key_no_libpython(tmp_path):
+    """``KeyError.__str__`` is ``repr(key)`` (CPython): both ``str(e)`` and
+    ``print(e)`` quote a string key, while a non-string key uses its repr too,
+    and other exceptions stay plain."""
+    out = _run_pcc_program(
+        tmp_path,
+        "def main():\n"
+        "    try:\n"
+        "        d = {}\n"
+        "        _ = d['missing']\n"
+        "    except KeyError as e:\n"
+        "        print(e)\n"                       # 'missing'
+        "        print('caught:', e)\n"            # caught: 'missing'
+        "        print(str(e))\n"                  # 'missing'
+        "    try:\n"
+        "        d2 = {'a': 1}\n"
+        "        d2.pop('x')\n"
+        "    except KeyError as e:\n"
+        "        print(e)\n"                       # 'x'
+        "    try:\n"
+        "        d3 = {}\n"
+        "        _ = d3[7]\n"                       # int key
+        "    except KeyError as e:\n"
+        "        print(e)\n"                       # 7
+        "    try:\n"
+        "        raise ValueError('plain')\n"      # non-KeyError stays plain
+        "    except ValueError as e:\n"
+        "        print(e)\n"                       # plain
+        "main()\n",
+    )
+    assert out.split("\n")[:6] == [
+        "'missing'",
+        "caught: 'missing'",
+        "'missing'",
+        "'x'",
+        "7",
+        "plain",
+    ], out
+
+
+def test_exception_repr_no_libpython(tmp_path):
+    """``repr(exc)`` is ``ClassName(repr(arg))`` (``ClassName()`` arg-less) —
+    previously returned ``<null>`` for every exception. Covered for the common
+    string-message and arg-less cases across ``repr()``, container repr, and
+    ``print([exc])``. (pcc stores a single stringified message, so a non-string
+    arg like ``KeyError(5)`` renders ``KeyError('5')`` — a documented limit that
+    needs the original args tuple to fix.)"""
+    out = _run_pcc_program(
+        tmp_path,
+        "def main():\n"
+        "    print(repr(KeyError('missing')))\n"        # KeyError('missing')
+        "    print(repr(ValueError('bad value')))\n"    # ValueError('bad value')
+        "    print(repr(ValueError()))\n"               # ValueError()
+        "    print(repr(RuntimeError('boom')))\n"       # RuntimeError('boom')
+        "    print([KeyError('a'), ValueError('b')])\n"  # [KeyError('a'), ValueError('b')]
+        "    try:\n"
+        "        raise TypeError('need int')\n"
+        "    except TypeError as e:\n"
+        "        print(repr(e))\n"                       # TypeError('need int')
+        "        print([e])\n"                           # [TypeError('need int')]
+        "main()\n",
+    )
+    assert out.split("\n")[:7] == [
+        "KeyError('missing')",
+        "ValueError('bad value')",
+        "ValueError()",
+        "RuntimeError('boom')",
+        "[KeyError('a'), ValueError('b')]",
+        "TypeError('need int')",
+        "[TypeError('need int')]",
     ], out

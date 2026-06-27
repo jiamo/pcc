@@ -19,7 +19,7 @@ def test_class_method_symbol_avoids_top_level_wrapper_collision(tmp_path):
                 return b.call4_i32()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
 
     compile_python(
         str(src),
@@ -28,7 +28,7 @@ def test_class_method_symbol_avoids_top_level_wrapper_collision(tmp_path):
         ir_scaffold_mode="on",
         libpython_mode="off",
     )
-    ir_text = out.read_text()
+    ir_text = out.read_text(encoding="utf-8")
 
     assert (
         "@user_symbol_collision_Builder__method_call4_i32("
@@ -54,7 +54,7 @@ def test_extern_class_method_symbol_preserves_wrapper_collision(tmp_path):
                 return b.call4_i32()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     main_src.write_text(
         textwrap.dedent(
             """
@@ -65,7 +65,7 @@ def test_extern_class_method_symbol_preserves_wrapper_collision(tmp_path):
                 print(Builder_call4_i32(b))
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
 
     compile_python_multi(
         [str(lib_src), str(main_src)],
@@ -76,7 +76,7 @@ def test_extern_class_method_symbol_preserves_wrapper_collision(tmp_path):
         ir_scaffold_mode="on",
         libpython_mode="off",
     )
-    ir_text = out.read_text()
+    ir_text = out.read_text(encoding="utf-8")
 
     assert "@user_lib_Builder__method_call4_i32(" in ir_text
     assert "@user_lib_Builder_call4_i32(" in ir_text
@@ -114,7 +114,7 @@ def test_extern_subclass_preserves_untyped_inherited_slot_order(tmp_path):
                     self.function_type = function_type
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     main_src.write_text(
         textwrap.dedent(
             """
@@ -124,7 +124,7 @@ def test_extern_subclass_preserves_untyped_inherited_slot_order(tmp_path):
                 return fn.function_type.return_type
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
 
     compile_python_multi(
         [str(lib_src), str(main_src)],
@@ -135,7 +135,7 @@ def test_extern_subclass_preserves_untyped_inherited_slot_order(tmp_path):
         ir_scaffold_mode="on",
         libpython_mode="off",
     )
-    ir_text = out.read_text()
+    ir_text = out.read_text(encoding="utf-8")
 
     assert re.search(r"py_instance_get_field\(ptr %fn[^,]*, i32 9\)", ir_text)
     assert not re.search(r"py_instance_get_field\(ptr %fn[^,]*, i32 5\)", ir_text)

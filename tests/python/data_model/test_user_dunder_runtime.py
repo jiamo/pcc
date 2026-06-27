@@ -6,13 +6,7 @@ import textwrap
 from pathlib import Path
 
 
-def test_user_dunder_str_hash_iter_next_native(tmp_path):
-    subprocess.run(
-        ["make", "-C", "pcc/py_runtime", "libpy_runtime.a"],
-        check=True,
-        env={**os.environ, "PATH": os.environ.get("PATH", "")},
-    )
-
+def test_user_dunder_str_hash_iter_next_native(tmp_path, c_runtime_archive):
     src = tmp_path / "dunder_probe.c"
     exe = tmp_path / "dunder_probe"
     src.write_text(
@@ -78,11 +72,11 @@ def test_user_dunder_str_hash_iter_next_native(tmp_path):
         [
             os.environ.get("CC", "cc"),
             "-I",
-            "pcc/py_runtime/include",
+            str(c_runtime_archive.parent / "include"),
             "-I",
-            "pcc/py_runtime/src",
+            str(c_runtime_archive.parent / "src"),
             str(src),
-            "pcc/py_runtime/libpy_runtime.a",
+            str(c_runtime_archive),
             "-lm",
             "-o",
             str(exe),
@@ -94,11 +88,11 @@ def test_user_dunder_str_hash_iter_next_native(tmp_path):
 
 
 def test_user_dunder_sources_are_wired():
-    dunder_c = Path("pcc/py_runtime/src/py_dunder.c").read_text()
-    compare_c = Path("pcc/py_runtime/src/py_obj_ops_compare.c").read_text()
-    iter_c = Path("pcc/py_runtime/src/py_iter.c").read_text()
-    dunder_py = Path("pcc/py_runtime/py/py_dunder.py").read_text()
-    iter_py = Path("pcc/py_runtime/py/py_iter.py").read_text()
+    dunder_c = Path("pcc/py_runtime/src/py_dunder.c").read_text(encoding="utf-8")
+    compare_c = Path("pcc/py_runtime/src/py_obj_ops_compare.c").read_text(encoding="utf-8")
+    iter_c = Path("pcc/py_runtime/src/py_iter.c").read_text(encoding="utf-8")
+    dunder_py = Path("pcc/py_runtime/py/py_dunder.py").read_text(encoding="utf-8")
+    iter_py = Path("pcc/py_runtime/py/py_iter.py").read_text(encoding="utf-8")
 
     assert "py_user_hash_dispatch" in dunder_c
     assert "py_user_iter_dispatch" in dunder_c

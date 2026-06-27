@@ -40,7 +40,7 @@ def load_expected(test_dir: Path) -> tuple[bytes, int] | None:
     if not (stdout_path.is_file() and status_path.is_file() and source_path.is_file()):
         return None
     stdout_bytes = stdout_path.read_bytes()
-    status_text = status_path.read_text().strip()
+    status_text = status_path.read_text(encoding="utf-8").strip()
     try:
         status = int(status_text)
     except ValueError:

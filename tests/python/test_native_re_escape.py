@@ -52,7 +52,7 @@ def test_re_escape_matches_cpython(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     cpython = subprocess.run(
         [sys.executable, str(src)], capture_output=True, text=True, timeout=30,

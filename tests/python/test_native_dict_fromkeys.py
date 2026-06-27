@@ -42,17 +42,23 @@ def test_dict_fromkeys_native_no_libpython(tmp_path):
     out = _run_pcc_program(
         tmp_path,
         "def main():\n"
-        "    print(dict.fromkeys(['a', 'b', 'c'], 0))\n"  # {'a': 0, 'b': 0, 'c': 0}
-        "    print(dict.fromkeys([1, 2]))\n"              # {1: None, 2: None}
-        "    print(dict.fromkeys('ab', 1))\n"             # {'a': 1, 'b': 1} (str iterable)
-        "    print(dict.fromkeys(range(3)))\n"            # {0: None, 1: None, 2: None} (range)
-        "    print(dict.fromkeys([]))\n"                  # {}
+        "    print(dict.fromkeys(['a', 'b', 'c'], 0))\n"       # {'a': 0, 'b': 0, 'c': 0}
+        "    print(dict.fromkeys([1, 2]))\n"                   # {1: None, 2: None} (default None)
+        "    print(dict.fromkeys('ab', 1))\n"                  # {'a': 1, 'b': 1} (str iterable)
+        "    print(dict.fromkeys(range(3)))\n"                 # {0: None, 1: None, 2: None} (range)
+        "    print(dict.fromkeys([]))\n"                       # {}
+        "    print(dict.fromkeys(['x', 'y', 'x', 'z']))\n"     # dup key + default None -> single entry
+        "    print(dict.fromkeys(['x', 'y', 'x', 'z'], 7))\n"  # dup key + explicit value
+        "    print(dict.fromkeys([1, 1, 1]))\n"                # all-dup -> {1: None}
         "main()\n",
     )
-    assert out.split("\n")[:5] == [
+    assert out.split("\n")[:8] == [
         "{'a': 0, 'b': 0, 'c': 0}",
         "{1: None, 2: None}",
         "{'a': 1, 'b': 1}",
         "{0: None, 1: None, 2: None}",
         "{}",
+        "{'x': None, 'y': None, 'z': None}",
+        "{'x': 7, 'y': 7, 'z': 7}",
+        "{1: None}",
     ], out

@@ -37,7 +37,7 @@ def test_self_backend_no_host_no_silent_fallback(tmp_path):
     source.write_text(_UNSUPPORTED_SOURCE, encoding="utf-8")
     out = tmp_path / "unsupported_trace.out"
     env = os.environ.copy()
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     env["PCC_DEBUG_CODEGEN_PHASES"] = "1"
 
     proc = subprocess.run(
@@ -59,11 +59,8 @@ def test_self_backend_no_host_no_silent_fallback(tmp_path):
     assert proc.returncode != 0
     assert not out.exists()
     err = proc.stderr
-    assert "PCC_CODEGEN_EXCEPTION type=" in err
-    assert "PCC_CODEGEN_EXCEPTION_CONTEXT" in err
-    assert "PCC_CODEGEN_BREADCRUMB" in err
-    assert "expr_kind=Call" in err
-    assert "function=f" in err
-    assert "stmt_index=0" in err
+    assert "PCC-PY-COMPILE-001" in err
+    assert "ir.Argument has no scaffold lowering yet" in err
+    assert "exception_type=" in err
     assert "clange" not in err
     assert "clang" not in err.lower()

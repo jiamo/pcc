@@ -17,10 +17,12 @@ elsewhere.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +32,16 @@ import pytest
 REPO_ROOT = Path(__file__).absolute().parents[2]
 ORACLE_DIR = REPO_ROOT / "tests" / "runtime_oracle"
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
+
+# Each corpus case compiles a small program through pcc with a 120s per-compile
+# timeout (kept tight on purpose: an un-stamped archive rebuild must not happen
+# once per corpus program). Under the default `-n auto` that timeout
+# is also contention-sensitive — running this file concurrently with the other
+# heavy subprocess-spawning suites (GC backend matrix, runtime emit) starved a
+# normally-fast per-program compile past 120s. Pin the file to its own
+# xdist_group so `--dist=loadgroup` runs its cases on a single worker, isolated
+# from that cross-suite contention, without relaxing the rebuild guard.
+pytestmark = pytest.mark.xdist_group(name="pcc_runtime_oracle")
 
 
 _KNOWN_PCC_C_DIVERGENCES: dict[str, str] = {}
@@ -54,6 +66,11 @@ _PCC_ARCHIVE_COVERED = {
     "path_basics",
 }
 
+_BASELINE_RESULT_CACHE: dict[
+    tuple[str, tuple[str, ...], str], tuple[int, str, str, str]
+] = {}
+_EXE_PLACEHOLDER = "__PCC_RUNTIME_ORACLE_EXE__"
+
 
 def _corpus_programs() -> list[Path]:
     return sorted(ORACLE_DIR.glob("*_basics.py"))
@@ -72,16 +89,27 @@ def _compile_and_run(
     out_path: Path,
     runtime_cc: str,
     args: list[str],
+    runtime_dir: Path,
 ) -> tuple[int, str, str, str]:
     """Compile `source` with the given runtime-cc mode and run it.
 
     Returns (returncode, stdout, stderr, runtime_archive_basename).
     """
+    cache_key = (str(source), tuple(args), str(runtime_dir))
+    if runtime_cc == "cc" and cache_key in _BASELINE_RESULT_CACHE:
+        returncode, stdout, stderr, archive = _BASELINE_RESULT_CACHE[cache_key]
+        return (
+            returncode,
+            stdout.replace(_EXE_PLACEHOLDER, out_path.name),
+            stderr.replace(_EXE_PLACEHOLDER, out_path.name),
+            archive,
+        )
     pcc_bin = _pcc_binary()
     if pcc_bin is None:
         pytest.skip("pcc CLI not on PATH")
     env = dict(os.environ)
     env.pop("LC_ALL", None)
+    env["PCC_RUNTIME_DIR"] = str(runtime_dir)
     if runtime_cc == "cc":
         env["PCC_RUNTIME_CC"] = "cc"
         env["PCC_RUNTIME_HIGH"] = "c"
@@ -125,17 +153,175 @@ def _compile_and_run(
         timeout=30,
         cwd=str(out_path.parent),
     )
-    return (
+    result = (
         run_result.returncode,
         run_result.stdout,
         run_result.stderr,
         archive_basename,
     )
+    if runtime_cc == "cc":
+        _BASELINE_RESULT_CACHE[cache_key] = (
+            result[0],
+            result[1].replace(out_path.name, _EXE_PLACEHOLDER),
+            result[2].replace(out_path.name, _EXE_PLACEHOLDER),
+            result[3],
+        )
+    return result
+
+
+def _run_runtime_archive_make(
+    make: str,
+    runtime_dir: Path,
+    target: str,
+    pcc_bin: str | None = None,
+    *make_args: str,
+):
+    """Build one isolated archive with bounded whole-process-group ownership."""
+    from tests.python.process_timeout import run_process_group_timeout
+
+    cmd = [make, "-C", str(runtime_dir)]
+    if pcc_bin is not None:
+        cmd.append(f"PCC={pcc_bin}")
+        cmd.append(f"PYTHON={sys.executable}")
+        cmd.append(f"PCC_REPO_ROOT={REPO_ROOT}")
+    cmd.extend(make_args)
+    cmd.append(target)
+    env = dict(os.environ)
+    env.pop("LC_ALL", None)
+    result = run_process_group_timeout(
+        cmd,
+        env=env,
+        timeout=300,
+        cwd=REPO_ROOT,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            cmd,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
+
+
+def _runtime_oracle_build_key(pcc_bin: str) -> str:
+    """Hash every source that can affect the four runtime archives."""
+
+    digest = hashlib.sha256()
+    digest.update(sys.version.encode("utf-8"))
+    digest.update(os.path.realpath(pcc_bin).encode("utf-8"))
+    roots = (
+        RUNTIME_DIR,
+        REPO_ROOT / "pcc" / "backend",
+        REPO_ROOT / "pcc" / "codegen",
+        REPO_ROOT / "pcc" / "evaluater",
+        REPO_ROOT / "pcc" / "llvm_capi",
+        REPO_ROOT / "pcc" / "parse",
+        REPO_ROOT / "pcc" / "py_frontend",
+        REPO_ROOT / "pcc" / "tools",
+    )
+    files = []
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(part.startswith(".") or part == "__pycache__" for part in path.parts):
+                continue
+            if path.suffix not in {".c", ".h", ".py"} and path.name != "Makefile":
+                continue
+            files.append(path)
+    for path in (
+        REPO_ROOT / "pcc" / "__main__.py",
+        REPO_ROOT / "pcc" / "api.py",
+        REPO_ROOT / "pcc" / "cli_core.py",
+        REPO_ROOT / "pcc" / "pcc.py",
+        REPO_ROOT / "pcc" / "project.py",
+    ):
+        if path.is_file():
+            files.append(path)
+    for path in sorted(set(files)):
+        digest.update(path.relative_to(REPO_ROOT).as_posix().encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:24]
+
+
+def _cached_runtime_dir(make: str, pcc_bin: str) -> Path:
+    """Return an immutable content-keyed runtime build outside the repo."""
+
+    key = _runtime_oracle_build_key(pcc_bin)
+    cache_root = (
+        Path.home() / ".cache" / "pcc" / "test-artifacts" / "runtime-oracle"
+    )
+    cache_root.mkdir(parents=True, exist_ok=True)
+    runtime_dir = cache_root / key
+    marker = runtime_dir / ".pcc-runtime-oracle-complete"
+    archives = (
+        "libpy_runtime.a",
+        "libpy_runtime_libpython.a",
+        "libpy_runtime_pcc.a",
+        "libpy_runtime_pcc_py.a",
+    )
+
+    lock_path = cache_root / (key + ".lock")
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - POSIX test environment
+            fcntl = None
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            if marker.is_file() and marker.read_text(encoding="utf-8") == key:
+                if all((runtime_dir / name).is_file() for name in archives):
+                    return runtime_dir
+            if runtime_dir.exists():
+                shutil.rmtree(runtime_dir)
+
+            staging_root = Path(
+                tempfile.mkdtemp(prefix=key + ".", dir=str(cache_root))
+            )
+            work_runtime = staging_root / "py_runtime"
+            shutil.copytree(
+                RUNTIME_DIR,
+                work_runtime,
+                ignore=shutil.ignore_patterns(
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
+                ),
+            )
+            _run_runtime_archive_make(make, work_runtime, "libpy_runtime.a")
+            _run_runtime_archive_make(
+                make,
+                work_runtime,
+                "libpy_runtime_libpython.a",
+                None,
+                "PCC_WITH_LIBPYTHON=1",
+                "LIB=libpy_runtime_libpython.a",
+                "OBJDIR=build_libpython",
+            )
+            _run_runtime_archive_make(
+                make, work_runtime, "libpy_runtime_pcc.a", pcc_bin
+            )
+            _run_runtime_archive_make(
+                make, work_runtime, "libpy_runtime_pcc_py.a", pcc_bin
+            )
+
+            from pcc.py_frontend import pipeline as _pcc_pipeline
+
+            for archive_name in archives:
+                _pcc_pipeline._write_runtime_archive_target_stamp(
+                    str(work_runtime / archive_name)
+                )
+            (work_runtime / marker.name).write_text(key, encoding="utf-8")
+            os.replace(work_runtime, runtime_dir)
+            shutil.rmtree(staging_root, ignore_errors=True)
+            return runtime_dir
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 @pytest.fixture(scope="session")
 def _ensure_runtime_archives(tmp_path_factory):
-    """Build both cc and pcc runtime archives once per session."""
+    """Build all oracle runtime archives once in an isolated directory."""
     make = shutil.which("make")
     if make is None:
         pytest.skip("make not available")
@@ -144,36 +330,8 @@ def _ensure_runtime_archives(tmp_path_factory):
     if pcc_bin is None:
         pytest.skip("pcc CLI not available")
 
-    # cc baseline
-    subprocess.run(
-        [make, "-C", str(RUNTIME_DIR), "libpy_runtime.a"],
-        check=True,
-        capture_output=True,
-    )
-    # pcc track (all C, compiled by pcc)
-    subprocess.run(
-        [
-            make,
-            "-C",
-            str(RUNTIME_DIR),
-            f"PCC={pcc_bin}",
-            "libpy_runtime_pcc.a",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    # pcc-py track (Phase 4c: runtime-high from pcc-Python where available)
-    subprocess.run(
-        [
-            make,
-            "-C",
-            str(RUNTIME_DIR),
-            f"PCC={pcc_bin}",
-            "libpy_runtime_pcc_py.a",
-        ],
-        check=True,
-        capture_output=True,
-    )
+    del tmp_path_factory
+    return _cached_runtime_dir(make, pcc_bin)
 
 
 @pytest.mark.parametrize(
@@ -193,10 +351,10 @@ def test_corpus_cc_vs_pcc_equivalence(
     pcc_exe = tmp_path / f"{program.stem}.pcc.out"
 
     cc_rc, cc_stdout, cc_stderr, cc_arc = _compile_and_run(
-        program, cc_exe, "cc", args
+        program, cc_exe, "cc", args, _ensure_runtime_archives
     )
     pcc_rc, pcc_stdout, pcc_stderr, pcc_arc = _compile_and_run(
-        program, pcc_exe, "pcc", args
+        program, pcc_exe, "pcc", args, _ensure_runtime_archives
     )
 
     # Programs on the "pcc-C genuinely covered" list must actually link
@@ -239,21 +397,22 @@ def test_corpus_cc_vs_pcc_equivalence(
 _PCC_PY_ARCHIVE_COVERED = {
     # Programs that do NOT hit py_cpy_* fallback, so PCC_RUNTIME_HIGH=py
     # actually picks libpy_runtime_pcc_py.a and the pcc-Python runtime
-    # port is genuinely exercised.
+    # port is genuinely exercised. Keep this as a ratchet: every current
+    # runtime-oracle basics program is covered, and newly added corpus
+    # programs must prove archive selection before joining the set.
+    "exc_basics",
     "int_basics",
     "str_basics",
+    "list_basics",
     "tuple_basics",
     "class_basics",
     "dict_basics",
     "exc_inherit_basics",
-    # set_basics hits py_cpy_* fallback (sorted / set-union ops), so
-    # pcc-Python port of py_set still runs but the archive selector
-    # picks libpy_runtime_libpython.a instead. pcc-py archive coverage
-    # is enforced by the cc-vs-pcc-C oracle path above.
-    # path_basics: dual-implemented py_os_path_{dirname,isfile,isdir,
-    # getmtime,abspath} ports must produce identical output to the C
-    # baseline.
+    "obj_ops_basics",
+    "os_basics",
     "path_basics",
+    "print_basics",
+    "set_basics",
 }
 
 
@@ -291,10 +450,10 @@ def test_corpus_cc_vs_pcc_py_equivalence(
     pcc_py_exe = tmp_path / f"{program.stem}.pcc_py.out"
 
     cc_rc, cc_stdout, cc_stderr, _ = _compile_and_run(
-        program, cc_exe, "cc", args
+        program, cc_exe, "cc", args, _ensure_runtime_archives
     )
     pcc_py_rc, pcc_py_stdout, pcc_py_stderr, pcc_py_arc = _compile_and_run(
-        program, pcc_py_exe, "pcc-py", args
+        program, pcc_py_exe, "pcc-py", args, _ensure_runtime_archives
     )
 
     if program.stem in _PCC_PY_ARCHIVE_COVERED:
@@ -325,4 +484,16 @@ def test_oracle_inventory_matches_manifest():
     missing = set(_KNOWN_PCC_C_DIVERGENCES) - corpus
     assert not missing, (
         f"xfail list references non-existent programs: {missing}"
+    )
+
+
+def test_pcc_py_archive_coverage_manifest_matches_current_corpus():
+    """The pcc-Python runtime oracle should not silently skip current corpus."""
+    corpus = {p.stem for p in _corpus_programs()}
+    extra = _PCC_PY_ARCHIVE_COVERED - corpus
+    missing = corpus - _PCC_PY_ARCHIVE_COVERED
+    assert not extra, f"pcc-py coverage references non-existent programs: {extra}"
+    assert not missing, (
+        "runtime oracle programs missing from pcc-py archive coverage: "
+        f"{missing}"
     )

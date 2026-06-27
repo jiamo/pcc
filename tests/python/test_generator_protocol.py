@@ -27,7 +27,7 @@ def _compile_and_run(tmp_path, source: str) -> subprocess.CompletedProcess[str]:
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
     return subprocess.run(
         [str(exe)], capture_output=True, text=True, timeout=20,
@@ -199,6 +199,28 @@ def test_generator_close_raises_generator_exit(tmp_path):
         """)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().split("\n") == ["1", "handled", "closed_ok"]
+
+
+def test_dyn_close_dispatches_user_method_not_generator_intrinsic(tmp_path):
+    result = _compile_and_run(tmp_path, """
+        class C:
+            def close(self):
+                print("user_close")
+
+        def make(flag):
+            if flag:
+                return C()
+            return C()
+
+        def main() -> None:
+            obj = make(True)
+            obj.close()
+
+        if __name__ == "__main__":
+            main()
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "user_close"
 
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import stat
 from pathlib import Path
+
+
+def test_bootstrap_subprocess_wrapper_enforces_configured_timeout(monkeypatch):
+    import pcc.cli_bootstrap as cli
+
+    calls = []
+    def fake_run(args, *, check, timeout):
+        calls.append((args, check, timeout))
+        return object()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setenv("PCC_BOOTSTRAP_SUBPROCESS_TIMEOUT_SECONDS", "7")
+
+    assert cli._bootstrap_subprocess_run(["tool", "arg"], check=True) is None
+    assert calls == [(["tool", "arg"], True, 7)]
 
 
 def test_bootstrap_cli_parses_observability_flags():
@@ -51,6 +68,87 @@ def test_bootstrap_cli_writes_profile_json_on_success(monkeypatch, tmp_path):
     assert "phase_totals_s" in data
 
 
+def test_bootstrap_cli_without_output_compiles_to_temp_and_runs(monkeypatch, tmp_path):
+    import pcc.cli_bootstrap as cli
+
+    src = tmp_path / "prog.py"
+    src.write_text("print('ok')\n", encoding="utf-8")
+    calls = []
+
+    def fake_compile(_src, out, **_kwargs):
+        calls.append((_src, out))
+        out_path = Path(out)
+        out_path.write_text("#!/bin/sh\nprintf 'ran-temp\\n'\n", encoding="utf-8")
+        out_path.chmod(out_path.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(cli, "_compile_python", fake_compile)
+    monkeypatch.setenv("PCC_PY_RUN_CACHE_DIR", str(tmp_path / "cache"))
+    status = cli.bootstrap_cli_main([str(src)])
+
+    assert status == 0
+    assert calls
+
+
+def test_bootstrap_cli_without_output_reuses_run_cache(monkeypatch, tmp_path):
+    import pcc.cli_bootstrap as cli
+
+    src = tmp_path / "prog.py"
+    src.write_text("print('ok')\n", encoding="utf-8")
+    calls = []
+
+    def fake_compile(_src, out, **_kwargs):
+        calls.append((_src, out))
+        out_path = Path(out)
+        out_path.write_text("#!/bin/sh\nprintf 'cached\\n'\n", encoding="utf-8")
+        out_path.chmod(out_path.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(cli, "_compile_python", fake_compile)
+    monkeypatch.setenv("PCC_PY_RUN_CACHE_DIR", str(tmp_path / "cache"))
+
+    assert cli.bootstrap_cli_main([str(src)]) == 0
+    assert cli.bootstrap_cli_main([str(src)]) == 0
+    assert len(calls) == 1
+
+
+def test_cli_core_without_output_reuses_run_cache(monkeypatch, tmp_path):
+    import pcc.cli_core as cli
+    import pcc.py_frontend.pipeline as pipeline
+
+    src = tmp_path / "prog.py"
+    src.write_text("print('ok')\n", encoding="utf-8")
+    calls = []
+
+    def fake_compile(_src, out, **_kwargs):
+        calls.append((_src, out))
+        out_path = Path(out)
+        out_path.write_text("#!/bin/sh\nprintf 'cached\\n'\n", encoding="utf-8")
+        out_path.chmod(out_path.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(pipeline, "compile_python", fake_compile)
+    monkeypatch.setenv("PCC_PY_RUN_CACHE_DIR", str(tmp_path / "cache"))
+
+    assert cli.cli_main([str(src)]) == 0
+    assert cli.cli_main([str(src)]) == 0
+    assert len(calls) == 1
+
+
+def test_python_entry_infers_project_root_for_tests_dir(monkeypatch, tmp_path):
+    import pcc.cli_core as cli
+
+    project = tmp_path / "project"
+    tests = project / "tests"
+    tests.mkdir(parents=True)
+    src = tests / "submission_tests.py"
+    src.write_text("import perf_takehome\n", encoding="utf-8")
+    (project / "perf_takehome.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    monkeypatch.delenv("PCC_PACKAGE_SITE", raising=False)
+    roots = cli._inferred_package_site_roots(str(src))
+
+    assert str(tests.resolve()) in roots
+    assert str(project.resolve()) in roots
+
+
 def test_bootstrap_cli_formats_hard_error_as_json(monkeypatch, tmp_path, capsys):
     import pcc.cli_bootstrap as cli
 
@@ -82,68 +180,160 @@ def test_bootstrap_cli_formats_hard_error_as_json(monkeypatch, tmp_path, capsys)
     assert profile.exists()
 
 
-def test_bootstrap_cli_pytest_mode_launches_tests(monkeypatch):
+def test_bootstrap_cli_pytest_mode_uses_pcc1_native_runner(monkeypatch, tmp_path):
     import pcc.cli_bootstrap as cli
+
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_sample.py").write_text(
+        "from pcc.test_runner import fixture\n\n"
+        "@fixture\n"
+        "def value() -> int:\n"
+        "    return 7\n\n"
+        "def test_sample(value: int) -> None:\n"
+        "    assert value == 7\n",
+        encoding="utf-8",
+    )
 
     calls = []
 
-    def fake_run(cmd, *, check):
+    def fake_run(cmd, *, check, timeout=None):
         calls.append((cmd, check))
+        if cmd[:2] == ["mkdir", "-p"]:
+            Path(cmd[2]).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     monkeypatch.setattr(cli.sys, "executable", "/tmp/pcc1")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
 
-    status = cli.bootstrap_cli_main(["--pytest", "tests", "-q", "-n0"])
+    status = cli.bootstrap_cli_main(["--pytest", str(test_dir), "-q", "-n0"])
 
     assert status == 0
-    assert calls == [(
-        [
-            "env",
-            "-u",
-            "LC_ALL",
-            "PCC1_BINARY=/tmp/pcc1",
-            "uv",
-            "run",
-            "pytest",
-            "tests",
-            "-q",
-            "-n0",
-        ],
+    assert calls[0] == (
+        ["mkdir", "-p", str(tmp_path / ("pcc1-pytest-" + str(os.getpid())))],
         True,
-    )]
+    )
+    assert calls[1][0][0] == "/tmp/pcc1"
+    assert calls[1][0][-2:] == ["--python-libpython=off", "--ir-scaffold=on"]
+    assert calls[2][0][0].endswith(".out")
+    assert not any("uv" in arg for cmd, _ in calls for arg in cmd)
 
 
-def test_bootstrap_cli_pytest_mode_defaults_to_tests(monkeypatch):
+def test_bootstrap_cli_pytest_mode_defaults_to_tests(monkeypatch, tmp_path):
     import pcc.cli_bootstrap as cli
 
     calls = []
 
-    def fake_run(cmd, *, check):
+    def fake_run(cmd, *, check, timeout=None):
         calls.append((cmd, check))
+        if cmd[:2] == ["mkdir", "-p"]:
+            Path(cmd[2]).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     monkeypatch.setattr(cli.sys, "executable", "/tmp/pcc1")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_sample.py").write_text(
+        "def test_sample() -> None:\n"
+        "    assert 1 + 1 == 2\n",
+        encoding="utf-8",
+    )
 
     status = cli.bootstrap_cli_main(["--pytest"])
 
     assert status == 0
-    assert calls[0][0][-1] == "tests"
+    assert calls[1][0][0] == "/tmp/pcc1"
 
 
 def test_bootstrap_cli_pytest_mode_reports_failure(monkeypatch, capsys):
     import pcc.cli_bootstrap as cli
 
-    def fake_run(cmd, *, check):
+    def fake_run(cmd, *, check, timeout=None):
         raise subprocess.CalledProcessError(1, cmd)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    status = cli.bootstrap_cli_main(["--pytest", "tests"])
+    status = cli.bootstrap_cli_main(["--pytest", "-m", "slow"])
 
-    assert status == 1
-    assert "pcc1 pytest run failed" in capsys.readouterr().err
+    assert status == 2
+    assert "supports only -m integration" in capsys.readouterr().err
+
+
+def test_bootstrap_cli_pytest_mode_honors_integration_marker(monkeypatch, tmp_path):
+    import pcc.cli_bootstrap as cli
+
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_sample.py").write_text(
+        "import pytest\n"
+        "pytestmark = pytest.mark.integration\n\n"
+        "def test_unit() -> None:\n"
+        "    assert True\n\n"
+        "def test_integration() -> None:\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run(cmd, *, check, timeout=None):
+        calls.append((cmd, check))
+        if cmd[:2] == ["mkdir", "-p"]:
+            Path(cmd[2]).mkdir(parents=True, exist_ok=True)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.sys, "executable", "/tmp/pcc1")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+    status = cli.bootstrap_cli_main(["--pytest", "-m", "integration", str(test_dir)])
+
+    assert status == 0
+    runner = tmp_path / ("pcc1-pytest-" + str(os.getpid()))
+    generated = next(runner.glob("runner_*.py"))
+    text = generated.read_text(encoding="utf-8")
+    assert "pytestmark = None" in text
+    assert "run_tests([test_unit, test_integration])" in text
+
+
+def test_bootstrap_cli_pytest_mode_honors_literal_skipif(monkeypatch, tmp_path):
+    import pcc.cli_bootstrap as cli
+
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_sample.py").write_text(
+        "import pytest\n\n"
+        "@pytest.mark.skipif(True, reason='skip')\n"
+        "def test_skipped() -> None:\n"
+        "    assert False\n\n"
+        "@pytest.mark.skipif(False, reason='run')\n"
+        "def test_kept() -> None:\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run(cmd, *, check, timeout=None):
+        calls.append((cmd, check))
+        if cmd[:2] == ["mkdir", "-p"]:
+            Path(cmd[2]).mkdir(parents=True, exist_ok=True)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.sys, "executable", "/tmp/pcc1")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+    status = cli.bootstrap_cli_main(["--pytest", str(test_dir), "-q", "-n0"])
+
+    assert status == 0
+    runner = tmp_path / ("pcc1-pytest-" + str(os.getpid()))
+    generated = next(runner.glob("runner_*.py"))
+    text = generated.read_text(encoding="utf-8")
+    assert "run_tests([test_kept])" in text
+    assert "test_skipped])" not in text
 
 
 def test_bootstrap_cli_c_delegation_uses_host_python_full_cli(monkeypatch):
@@ -151,7 +341,7 @@ def test_bootstrap_cli_c_delegation_uses_host_python_full_cli(monkeypatch):
 
     calls = []
 
-    def fake_run(cmd, *, check):
+    def fake_run(cmd, *, check, timeout=None):
         calls.append((cmd, check))
         return subprocess.CompletedProcess(cmd, 0)
 
@@ -172,3 +362,69 @@ def test_bootstrap_cli_c_delegation_uses_host_python_full_cli(monkeypatch):
         ],
         True,
     )]
+
+
+def test_bootstrap_cli_capi_symbol_tables_match_representative_symbols():
+    import pcc.cli_bootstrap as cli
+
+    assert cli._native_known_capi_header("PyLong_FromLong") == "longobject.h"
+    assert cli._native_known_capi_header("PyObject_CallNoArgs") == "abstract.h"
+    assert cli._native_known_capi_header("PyArray_API") == "numpy/arrayobject.h"
+    assert cli._native_known_capi_header("PyArray_CustomThing") == (
+        "numpy/arrayobject.h"
+    )
+    assert cli._native_known_capi_header("PyUFunc_CustomThing") == (
+        "numpy/ufuncobject.h"
+    )
+    assert cli._native_known_capi_header("TotallyMissingSymbol") is None
+
+    assert cli._native_capi_implemented("PyLong_FromLong") is True
+    assert cli._native_capi_implemented("PyObject_CallNoArgs") is True
+    assert cli._native_capi_implemented("PyArray_API") is True
+    assert cli._native_capi_implemented("TotallyMissingSymbol") is False
+
+
+def test_bootstrap_array_core_split_module_keeps_native_report_shape(capsys):
+    from pcc.cli_bootstrap_array_core import _run_native_package_array_core_from_pcc1
+
+    status = _run_native_package_array_core_from_pcc1([
+        "--literal",
+        "[[1,2,3],[4,5,6]]",
+        "--json",
+    ])
+
+    assert status == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["schema"] == "pcc.array-core.v1"
+    assert report["ok"] is True
+    assert report["shape"] == [2, 3]
+    assert report["strides"] == [24, 8]
+    assert report["dtype"] == "int64"
+
+
+def test_bootstrap_cli_routes_array_core_to_split_native_module(monkeypatch):
+    import pcc.cli_bootstrap as cli
+
+    calls = []
+
+    def fake_array_core(args):
+        calls.append(args)
+        return 17
+
+    monkeypatch.setattr(cli, "_run_native_package_array_core_from_pcc1", fake_array_core)
+
+    assert cli._run_python_module_from_pcc1([
+        "-m",
+        "pcc.package.array_core",
+        "--literal",
+        "[1]",
+    ]) == 17
+    assert cli._run_python_module_from_pcc1([
+        "-m",
+        "pcc.package",
+        "array-core",
+        "--shape",
+        "2,3",
+    ]) == 17
+
+    assert calls == [["--literal", "[1]"], ["--shape", "2,3"]]

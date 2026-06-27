@@ -149,10 +149,10 @@ class PyLambdaCpythonCallTests(unittest.TestCase):
         src = self._write(
             "cpy_tuple_slice_key.py",
             """
-            import os
+            import ctypes
 
             def main() -> None:
-                os.environ[:, None]
+                ctypes.pythonapi[:, None]
 
             main()
             """,
@@ -161,8 +161,16 @@ class PyLambdaCpythonCallTests(unittest.TestCase):
         compile_python(src, ll, emit_llvm_only=True, libpython_mode="auto")
         with open(ll, "r", encoding="utf-8") as fh:
             ir_text = fh.read()
-        self.assertIn("@py_cpy_call3", ir_text)
-        self.assertIn("cpy.slice.expr", ir_text)
+        self.assertRegex(
+            ir_text,
+            r"slice\.expr[^=\n]* = call ptr @py_slice_new",
+        )
+        self.assertRegex(
+            ir_text,
+            r"cpy\.from_pcc\.dynobj[^=\n]* = call ptr @py_cpy_from_pcc_obj"
+            r"\(ptr %slice\.expr",
+        )
+        self.assertRegex(ir_text, r"cpy\.getitem[^=\n]* = call ptr @py_cpy_getitem")
         self.assertNotIn("does not handle expression Slice", ir_text)
 
     def test_top_level_cpython_system_exit_zero_is_clean(self):

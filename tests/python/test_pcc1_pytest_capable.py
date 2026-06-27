@@ -61,7 +61,15 @@ def _capable_pcc_py_runtime(pcc_py_runtime_archive):
     tests (shared ``pcc_py_runtime_archive`` fixture in conftest). Without it a
     tree missing ``libpy_runtime_pcc_py.a`` fails every pcc1 link with
     undefined ``py_*`` symbols."""
-    return pcc_py_runtime_archive
+    previous = os.environ.get("PCC_RUNTIME_ARCHIVE")
+    os.environ["PCC_RUNTIME_ARCHIVE"] = str(pcc_py_runtime_archive)
+    try:
+        yield pcc_py_runtime_archive
+    finally:
+        if previous is None:
+            os.environ.pop("PCC_RUNTIME_ARCHIVE", None)
+        else:
+            os.environ["PCC_RUNTIME_ARCHIVE"] = previous
 
 
 # --------------------------------------------------------------------------
@@ -74,7 +82,7 @@ def _compile(tmp_path: Path, src_text: str) -> Path:
     """
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(src_text).lstrip())
+    src.write_text(textwrap.dedent(src_text).lstrip(), encoding="utf-8")
     cmd = [
         str(PCC1), str(src), "-o", str(exe),
         "--python-libpython=off",
@@ -359,7 +367,7 @@ def test_pcc1_strict_mode_rejects_unsupported_idiom(tmp_path):
             print(x)
         if __name__ == "__main__":
             main()
-    """).lstrip())
+    """).lstrip(), encoding="utf-8")
     proc = subprocess.run(
         [str(PCC1), str(src), "-o", str(exe),
          "--python-libpython=off", "--ir-scaffold=on"],

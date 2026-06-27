@@ -56,7 +56,7 @@ def test_exception_try_except_basic(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["caught boom", "after"]
 
@@ -74,7 +74,7 @@ def test_unbound_name_raises_name_error_at_runtime(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["caught", "after"]
 
@@ -92,7 +92,7 @@ def test_unbound_function_call_raises_name_error_at_runtime(tmp_path, monkeypatc
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["caught", "after"]
 
@@ -112,7 +112,7 @@ def test_exception_try_finally(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["ran finally", "caught inner"]
 
@@ -132,7 +132,7 @@ def test_exception_try_except_finally_no_raise(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["try", "finally", "after"]
 
@@ -162,7 +162,7 @@ def test_exception_multiple_except(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["value", "runtime"]
 
@@ -179,7 +179,7 @@ def test_exception_subclass_match(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "caught LookupError: oob"
 
@@ -198,7 +198,7 @@ def test_exception_else_runs_when_no_raise(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "else"
 
@@ -219,7 +219,7 @@ def test_exception_bare_raise_reraises(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "first catch", "outer caught inner",
@@ -238,7 +238,7 @@ def test_exception_message_via_str(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "a message"
 
@@ -260,7 +260,7 @@ def test_exception_raise_from(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["wrapped", "orig"]
 
@@ -284,7 +284,7 @@ def test_exception_user_subclass(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "caught as ValueError: custom",

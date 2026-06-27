@@ -6,6 +6,7 @@ import sys
 from click.testing import CliRunner
 
 from pcc.cli_core import cli_main
+from pcc.gpu_backend import resolve_gpu_backend
 from pcc.passes import find_opt_binary
 from pcc.pcc import main
 
@@ -82,7 +83,7 @@ def test_plain_cli_supports_python_path_before_output_flag(tmp_path):
         "    print(123)\n\n"
         "if __name__ == '__main__':\n"
         "    main()\n"
-    )
+    , encoding="utf-8")
 
     result = cli_main([str(script_path), "-o", str(exe_path)])
 
@@ -107,7 +108,7 @@ def test_plain_cli_python_libpython_off_supports_native_subset(tmp_path):
         "    print(123)\n\n"
         "if __name__ == '__main__':\n"
         "    main()\n"
-    )
+    , encoding="utf-8")
 
     result = cli_main(
         ["--python-libpython=off", str(script_path), "-o", str(exe_path)]
@@ -133,7 +134,7 @@ def test_plain_cli_python_libpython_default_is_off(tmp_path):
     script_path.write_text(
         "import tempfile\n"
         "print(tempfile.gettempdir())\n"
-    )
+    , encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -181,7 +182,7 @@ def test_python_libpython_off_reports_friendly_error_for_fallback_script(tmp_pat
     script_path.write_text(
         "import tempfile\n"
         "print(tempfile.gettempdir())\n"
-    )
+    , encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -206,7 +207,7 @@ def test_python_libpython_off_reports_friendly_error_for_fallback_script(tmp_pat
 
 
 def test_jobs_requires_separate_tus(tmp_path):
-    (tmp_path / "main.c").write_text("int main(void) { return 0; }\n")
+    (tmp_path / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(main, ["--jobs", "2", str(tmp_path)])
 
@@ -220,8 +221,8 @@ def test_jobs_requires_separate_tus(tmp_path):
 def test_depends_on_supports_file_with_dependency_make_goal(tmp_path):
     dep_dir = tmp_path / "lib"
     dep_dir.mkdir()
-    (dep_dir / "helper.c").write_text("int helper(void) { return 41; }\n")
-    (dep_dir / "ignored.c").write_text("int ignored(void) { return 99; }\n")
+    (dep_dir / "helper.c").write_text("int helper(void) { return 41; }\n", encoding="utf-8")
+    (dep_dir / "ignored.c").write_text("int ignored(void) { return 99; }\n", encoding="utf-8")
     (dep_dir / "Makefile").write_text(
         "lib: helper.o\n"
         "\tcc -o lib helper.o\n\n"
@@ -229,12 +230,12 @@ def test_depends_on_supports_file_with_dependency_make_goal(tmp_path):
         "\tcc -c -o helper.o helper.c\n\n"
         "ignored.o: ignored.c\n"
         "\tcc -c -o ignored.o ignored.c\n"
-    )
+    , encoding="utf-8")
     main_path = tmp_path / "main.c"
     main_path.write_text(
         "int helper(void);\n"
         "int main(void) { return helper() == 41 ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -247,18 +248,18 @@ def test_depends_on_supports_file_with_dependency_make_goal(tmp_path):
 def test_jobs_allowed_with_depends_on(tmp_path):
     dep_dir = tmp_path / "lib"
     dep_dir.mkdir()
-    (dep_dir / "helper.c").write_text("int helper(void) { return 41; }\n")
+    (dep_dir / "helper.c").write_text("int helper(void) { return 41; }\n", encoding="utf-8")
     (dep_dir / "Makefile").write_text(
         "lib: helper.o\n"
         "\tcc -o lib helper.o\n\n"
         "helper.o: helper.c\n"
         "\tcc -c -o helper.o helper.c\n"
-    )
+    , encoding="utf-8")
     main_path = tmp_path / "main.c"
     main_path.write_text(
         "int helper(void);\n"
         "int main(void) { return helper() == 41 ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -270,12 +271,12 @@ def test_jobs_allowed_with_depends_on(tmp_path):
 
 def test_system_link_supports_depends_on_multi_input(tmp_path):
     helper_path = tmp_path / "helper.c"
-    helper_path.write_text("int helper(void) { return 41; }\n")
+    helper_path.write_text("int helper(void) { return 41; }\n", encoding="utf-8")
     main_path = tmp_path / "main.c"
     main_path.write_text(
         "int helper(void);\n"
         "int main(void) { return helper() == 41 ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -296,11 +297,11 @@ def test_system_link_supports_link_arg_archive(tmp_path):
     helper_a = tmp_path / "libhelper.a"
     main_path = tmp_path / "main.c"
 
-    helper_c.write_text("int helper(void) { return 41; }\n")
+    helper_c.write_text("int helper(void) { return 41; }\n", encoding="utf-8")
     main_path.write_text(
         "int helper(void);\n"
         "int main(void) { return helper() == 41 ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
 
     subprocess.run(
         [cc, "-c", "-o", str(helper_o), str(helper_c)],
@@ -343,16 +344,16 @@ def test_prepare_cmd_and_ensure_make_goal_support_fresh_dependency_project(tmp_p
         "helper.o: helper.c config.h\n"
         "\tcc $(CPPFLAGS) -c -o helper.o helper.c\n"
         "EOF\n"
-    )
+    , encoding="utf-8")
     configure_sh.chmod(0o755)
     helper_c.write_text(
         "#include \"config.h\"\n"
         "int helper(void) { return VALUE; }\n"
-    )
+    , encoding="utf-8")
     main_path.write_text(
         "int helper(void);\n"
         "int main(void) { return helper() == 41 ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -378,7 +379,7 @@ def test_cpp_arg_supports_single_file_define(tmp_path):
         "#error missing VALUE\n"
         "#endif\n"
         "int main(void) { return VALUE == 42 ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -395,7 +396,7 @@ def test_cpp_arg_supports_depends_on_multi_input(tmp_path):
         "#error missing VALUE\n"
         "#endif\n"
         "int helper(void) { return VALUE; }\n"
-    )
+    , encoding="utf-8")
     main_path = tmp_path / "main.c"
     main_path.write_text(
         "int helper(void);\n"
@@ -403,7 +404,7 @@ def test_cpp_arg_supports_depends_on_multi_input(tmp_path):
         "#error missing VALUE\n"
         "#endif\n"
         "int main(void) { return helper() == VALUE ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -415,7 +416,7 @@ def test_cpp_arg_supports_depends_on_multi_input(tmp_path):
 
 def test_backend_llvm_flag_is_accepted(tmp_path):
     main_path = tmp_path / "main.c"
-    main_path.write_text("int main(void) { return 0; }\n")
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -427,7 +428,7 @@ def test_backend_llvm_flag_is_accepted(tmp_path):
 
 def test_backend_self_can_run_simple_program(tmp_path):
     main_path = tmp_path / "main.c"
-    main_path.write_text("int main(void) { return 0; }\n")
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -439,7 +440,7 @@ def test_backend_self_can_run_simple_program(tmp_path):
 
 def test_backend_self_env_can_run_simple_program(tmp_path, monkeypatch):
     main_path = tmp_path / "main.c"
-    main_path.write_text("int main(void) { return 0; }\n")
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
     monkeypatch.setenv("PCC_BACKEND", "self")
 
     result = cli_main([str(main_path)])
@@ -447,10 +448,30 @@ def test_backend_self_env_can_run_simple_program(tmp_path, monkeypatch):
     assert result == 0
 
 
+def test_gpu_backend_metal_flag_is_accepted_as_device_config(tmp_path):
+    main_path = tmp_path / "main.c"
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        main,
+        ["--gpu-backend", "metal", str(main_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_gpu_backend_metal_is_annotated_kernel_only():
+    config = resolve_gpu_backend("metal")
+
+    assert config.kind == "metal"
+    assert "host-device-split" in config.capabilities
+    assert "annotated-kernel-only" in config.capabilities
+
+
 def test_backend_self_emit_asm_starts_aarch64_mvp(tmp_path):
     main_path = tmp_path / "main.c"
     asm_path = tmp_path / "main.s"
-    main_path.write_text("int main(void) { return 7; }\n")
+    main_path.write_text("int main(void) { return 7; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -459,7 +480,7 @@ def test_backend_self_emit_asm_starts_aarch64_mvp(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert asm_path.is_file()
-    asm_text = asm_path.read_text()
+    asm_text = asm_path.read_text(encoding="utf-8")
     assert "_main:" in asm_text
     assert "movz w0, #7" in asm_text
 
@@ -467,7 +488,7 @@ def test_backend_self_emit_asm_starts_aarch64_mvp(tmp_path):
 def test_backend_self_emit_asm_honors_x86_64_linux_target(tmp_path):
     main_path = tmp_path / "main.c"
     asm_path = tmp_path / "main.s"
-    main_path.write_text("int main(void) { return 7; }\n")
+    main_path.write_text("int main(void) { return 7; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -483,7 +504,7 @@ def test_backend_self_emit_asm_honors_x86_64_linux_target(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    asm_text = asm_path.read_text()
+    asm_text = asm_path.read_text(encoding="utf-8")
     assert ".intel_syntax noprefix" in asm_text
     assert "\nmain:\n" in asm_text
     assert "mov eax, 7" in asm_text
@@ -491,7 +512,7 @@ def test_backend_self_emit_asm_honors_x86_64_linux_target(tmp_path):
 
 def test_pass_option_can_select_single_repo_pass_at_o0(tmp_path):
     main_path = tmp_path / "main.c"
-    main_path.write_text("int main(void) { return 0; }\n")
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -503,7 +524,7 @@ def test_pass_option_can_select_single_repo_pass_at_o0(tmp_path):
 
 def test_pass_option_can_select_registered_llvm_alias_at_o0(tmp_path):
     main_path = tmp_path / "main.c"
-    main_path.write_text("int main(void) { return 0; }\n")
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -515,7 +536,7 @@ def test_pass_option_can_select_registered_llvm_alias_at_o0(tmp_path):
 
 def test_disable_pass_rejects_unknown_name(tmp_path):
     main_path = tmp_path / "main.c"
-    main_path.write_text("int main(void) { return 0; }\n")
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -531,7 +552,7 @@ def test_pass_option_can_select_single_llvm_pass_when_opt_available(tmp_path):
         return
 
     main_path = tmp_path / "main.c"
-    main_path.write_text("int main(void) { return 0; }\n")
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -547,15 +568,15 @@ def test_cpp_arg_supports_sources_from_make_directory(tmp_path):
         "#error missing VALUE\n"
         "#endif\n"
         "int helper(void) { return VALUE; }\n"
-    )
+    , encoding="utf-8")
     (tmp_path / "main.c").write_text(
         "int helper(void);\n"
         "#ifndef VALUE\n"
         "#error missing VALUE\n"
         "#endif\n"
         "int main(void) { return helper() == VALUE ? 0 : 1; }\n"
-    )
-    (tmp_path / "ignored.c").write_text("int ignored(void) { return 99; }\n")
+    , encoding="utf-8")
+    (tmp_path / "ignored.c").write_text("int ignored(void) { return 99; }\n", encoding="utf-8")
     (tmp_path / "Makefile").write_text(
         "app: helper.o main.o\n"
         "\tcc -o app helper.o main.o\n\n"
@@ -565,7 +586,7 @@ def test_cpp_arg_supports_sources_from_make_directory(tmp_path):
         "\tcc -c -o main.o main.c\n\n"
         "ignored.o: ignored.c\n"
         "\tcc -c -o ignored.o ignored.c\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -581,15 +602,15 @@ def test_cpp_arg_supports_sources_from_make_directory_with_separate_tus(tmp_path
         "#error missing VALUE\n"
         "#endif\n"
         "int helper(void) { return VALUE; }\n"
-    )
+    , encoding="utf-8")
     (tmp_path / "main.c").write_text(
         "int helper(void);\n"
         "#ifndef VALUE\n"
         "#error missing VALUE\n"
         "#endif\n"
         "int main(void) { return helper() == VALUE ? 0 : 1; }\n"
-    )
-    (tmp_path / "ignored.c").write_text("int ignored(void) { return 99; }\n")
+    , encoding="utf-8")
+    (tmp_path / "ignored.c").write_text("int ignored(void) { return 99; }\n", encoding="utf-8")
     (tmp_path / "Makefile").write_text(
         "app: helper.o main.o\n"
         "\tcc -o app helper.o main.o\n\n"
@@ -599,7 +620,7 @@ def test_cpp_arg_supports_sources_from_make_directory_with_separate_tus(tmp_path
         "\tcc -c -o main.o main.c\n\n"
         "ignored.o: ignored.c\n"
         "\tcc -c -o ignored.o ignored.c\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -623,14 +644,14 @@ def test_sources_from_make_infers_cpp_args_from_compile_commands(tmp_path):
         "#error missing VALUE\n"
         "#endif\n"
         "int helper(void) { return VALUE; }\n"
-    )
+    , encoding="utf-8")
     (tmp_path / "main.c").write_text(
         "int helper(void);\n"
         "#ifndef VALUE\n"
         "#error missing VALUE\n"
         "#endif\n"
         "int main(void) { return helper() == VALUE ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
     (tmp_path / "Makefile").write_text(
         "CPPFLAGS = -DVALUE=41\n"
         "app: helper.o main.o\n"
@@ -639,7 +660,7 @@ def test_sources_from_make_infers_cpp_args_from_compile_commands(tmp_path):
         "\tcc $(CPPFLAGS) -c -o helper.o helper.c\n\n"
         "main.o: main.c\n"
         "\tcc $(CPPFLAGS) -c -o main.o main.c\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -657,14 +678,14 @@ def test_depends_on_make_goal_infers_cpp_args_from_compile_commands(tmp_path):
         "#error missing VALUE\n"
         "#endif\n"
         "int helper(void) { return VALUE; }\n"
-    )
+    , encoding="utf-8")
     (dep_dir / "Makefile").write_text(
         "CPPFLAGS = -DVALUE=41\n"
         "lib: helper.o\n"
         "\tcc -o lib helper.o\n\n"
         "helper.o: helper.c\n"
         "\tcc $(CPPFLAGS) -c -o helper.o helper.c\n"
-    )
+    , encoding="utf-8")
     main_path = tmp_path / "main.c"
     main_path.write_text(
         "int helper(void);\n"
@@ -672,7 +693,7 @@ def test_depends_on_make_goal_infers_cpp_args_from_compile_commands(tmp_path):
         "#error missing VALUE\n"
         "#endif\n"
         "int main(void) { return helper() == VALUE ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -688,14 +709,14 @@ def test_explicit_cpp_arg_overrides_make_inferred_cpp_arg(tmp_path):
         "#error missing VALUE\n"
         "#endif\n"
         "int helper(void) { return VALUE; }\n"
-    )
+    , encoding="utf-8")
     (tmp_path / "main.c").write_text(
         "int helper(void);\n"
         "#ifndef VALUE\n"
         "#error missing VALUE\n"
         "#endif\n"
         "int main(void) { return helper() == 41 ? 0 : 1; }\n"
-    )
+    , encoding="utf-8")
     (tmp_path / "Makefile").write_text(
         "CPPFLAGS = -DVALUE=40\n"
         "app: helper.o main.o\n"
@@ -704,7 +725,7 @@ def test_explicit_cpp_arg_overrides_make_inferred_cpp_arg(tmp_path):
         "\tcc $(CPPFLAGS) -c -o helper.o helper.c\n\n"
         "main.o: main.c\n"
         "\tcc $(CPPFLAGS) -c -o main.o main.c\n"
-    )
+    , encoding="utf-8")
 
     result = CliRunner().invoke(
         main,

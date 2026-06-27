@@ -7,12 +7,6 @@ round(0.5)==0, round(-1.5)==-2. pcc's round() lowering used floor(x + 0.5)
 
 Compiles + runs under --backend self --python-libpython=off and asserts exact
 output.
-
-KNOWN LIMITATION (not asserted here): round(x, ndigits) for ties that are not
-exactly representable (e.g. round(2.675, 2) -> CPython 2.67, pcc 2.68) differs,
-because the x*10**n scaling introduces float error (2.675*100 == 267.5000...006).
-CPython avoids this with a correctly-rounded decimal algorithm. This was already
-the behaviour before the banker's fix and is a separate follow-on.
 """
 from __future__ import annotations
 
@@ -21,13 +15,23 @@ import subprocess
 from pathlib import Path
 
 
-def _run_pcc_program(tmp_path: Path, source: str) -> str:
+def _run_pcc_program(
+    tmp_path: Path,
+    source: str,
+    *,
+    runtime_cc: str = "cc",
+    runtime_high: str = "c",
+    runtime_archive: Path | None = None,
+) -> str:
     src = tmp_path / "prog.py"
     src.write_text(source, encoding="utf-8")
     exe = tmp_path / "prog_bin"
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_RUNTIME_CC"] = "cc"
+    env["PCC_RUNTIME_CC"] = runtime_cc
+    env["PCC_RUNTIME_HIGH"] = runtime_high
+    if runtime_archive is not None:
+        env["PCC_RUNTIME_ARCHIVE"] = str(runtime_archive)
     build = subprocess.run(
         [
             "uv", "run", "pcc", "--backend", "self", "--python-libpython=off",
@@ -61,9 +65,23 @@ def test_round_two_arg_bankers_native_no_libpython(tmp_path):
     out = _run_pcc_program(
         tmp_path,
         "print(round(3.14159, 2), round(123.456, 1))\n"
-        "print(round(2.5, 0), round(0.125, 2))\n",
+        "print(round(2.5, 0), round(0.125, 2))\n"
+        "print(round(2.675, 2))\n",
     )
     assert out.split("\n")[:2] == [
         "3.14 123.5",
         "2.0 0.12",
     ], out
+    assert out.split("\n")[2] == "2.67", out
+
+
+def test_round_two_arg_bankers_pcc_python_runtime(tmp_path, pcc_py_runtime_archive):
+    out = _run_pcc_program(
+        tmp_path,
+        "print(round(2.675, 2))\n"
+        "print(round(0.125, 2))\n",
+        runtime_cc="pcc",
+        runtime_high="py",
+        runtime_archive=pcc_py_runtime_archive,
+    )
+    assert out.split("\n")[:2] == ["2.67", "0.12"], out

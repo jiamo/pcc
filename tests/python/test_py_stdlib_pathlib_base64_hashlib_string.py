@@ -17,8 +17,8 @@ def test_pathlib_purepath_operations(tmp_path):
     assert p.match("*.txt")
 
     f = pathlib.Path(str(tmp_path / "x.txt"))
-    assert f.write_text("hello") == 5
-    assert f.read_text() == "hello"
+    assert f.write_text("hello", encoding="utf-8") == 5
+    assert f.read_text(encoding="utf-8") == "hello"
     assert f.exists()
 
 

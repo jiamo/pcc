@@ -3,19 +3,18 @@ from pathlib import Path
 
 import pytest
 
-from tests.gcc_torture_cases import run_native, run_pcc, run_native_and_pcc
+from tests.gcc_torture_cases import run_native_and_pcc
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 GCC_TORTURE_DIR = REPO_ROOT / "projects" / "gcc-torture-execute"
 GCC_TORTURE_MANIFEST_PATH = REPO_ROOT / "tests" / "gcc_torture_manifest.json"
-GCC_TORTURE_MANIFEST = json.loads(GCC_TORTURE_MANIFEST_PATH.read_text())
+GCC_TORTURE_MANIFEST = json.loads(GCC_TORTURE_MANIFEST_PATH.read_text(encoding="utf-8"))
 
 GCC_TORTURE_RUNTIME_EXACT_MATCH_CASES = GCC_TORTURE_MANIFEST.get(
     "runtime_exact_match", []
 )
-GCC_TORTURE_RUNTIME_SUCCESS_CASES = (
-    GCC_TORTURE_RUNTIME_EXACT_MATCH_CASES
-    + GCC_TORTURE_MANIFEST.get("runtime_returncode_match_only", [])
+GCC_TORTURE_RUNTIME_RETURNCODE_CASES = GCC_TORTURE_MANIFEST.get(
+    "runtime_returncode_match_only", []
 )
 GCC_TORTURE_RUNTIME_BOTH_FAIL_CASES = GCC_TORTURE_MANIFEST.get("runtime_both_fail", [])
 GCC_TORTURE_RUNTIME_NATIVE_FAIL_PCC_PASS_CASES = GCC_TORTURE_MANIFEST.get(
@@ -25,6 +24,8 @@ GCC_TORTURE_RUNTIME_NATIVE_PASS_PCC_FAIL_CASES = GCC_TORTURE_MANIFEST.get(
     "runtime_native_pass_pcc_fail", []
 )
 GCC_TORTURE_RUNTIME_TIMEOUT_CASES = GCC_TORTURE_MANIFEST.get("runtime_timeout", [])
+
+pytestmark = pytest.mark.integration
 
 
 def _case_params(cases):
@@ -41,12 +42,12 @@ def _case_path(relative_path: str) -> Path:
     return GCC_TORTURE_DIR / relative_path
 
 
-if GCC_TORTURE_RUNTIME_SUCCESS_CASES:
+if GCC_TORTURE_RUNTIME_RETURNCODE_CASES:
 
     @pytest.mark.parametrize(
-        "relative_path", _case_params(GCC_TORTURE_RUNTIME_SUCCESS_CASES)
+        "relative_path", _case_params(GCC_TORTURE_RUNTIME_RETURNCODE_CASES)
     )
-    def test_gcc_torture_runtime_succeeds_under_native_and_pcc(relative_path):
+    def test_gcc_torture_runtime_returncode_matches_native(relative_path):
         case_path = _case_path(relative_path)
         assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 

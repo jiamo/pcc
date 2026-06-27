@@ -350,6 +350,44 @@ define i32 @"f"(i32 %".1", i32* %".2")
         out = TailCallPass().run(ir_text, PassContext())
         assert 'tail call' not in out
 
+    def test_tail_call_skips_pointer_loaded_from_local_slot(self):
+        # Regression: a pointer into a local buffer that reaches the returned
+        # call via a pointer-typed local (pre-mem2reg: load from an alloca
+        # slot) must NOT be marked tail. Marking it tail frees the caller frame
+        # (and the buffer) before the callee dereferences it. This is the
+        # py_int_to_str_obj `return py_str_new(p, ...)` shape that produced
+        # str(int) == "\\0\\0" in the pcc-built runtime.
+        ir_text = """
+define ptr @"f"(i64 %".1")
+{
+.4:
+  %"buf" = alloca [32 x i8]
+  %"paddr" = alloca ptr
+  %"end" = getelementptr i8, ptr %"buf", i64 32
+  store ptr %"end", ptr %"paddr"
+  %"p" = load ptr, ptr %"paddr"
+  %"calltmp" = call ptr @"py_str_new"(ptr %"p", i64 2)
+  ret ptr %"calltmp"
+}
+"""
+        out = TailCallPass().run(ir_text, PassContext())
+        assert 'tail call' not in out
+
+    def test_tail_call_marks_returned_call_with_heap_pointer(self):
+        # Control: a pointer that does NOT derive from a local (here from a
+        # call result) is safe to tail-call, so the optimization still applies.
+        ir_text = """
+define ptr @"g"()
+{
+.3:
+  %"heap" = call ptr @"make_heap"()
+  %"calltmp" = call ptr @"py_str_new"(ptr %"heap", i64 2)
+  ret ptr %"calltmp"
+}
+"""
+        out = TailCallPass().run(ir_text, PassContext())
+        assert 'tail call ptr @"py_str_new"' in out
+
     def test_tail_call_marks_simple_returned_call(self):
         ir_text = """
 define i32 @"id"(i32 %".1")

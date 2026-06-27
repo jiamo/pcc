@@ -88,7 +88,7 @@ def test_class_type_from_dotted_has_no_libpython_fallback(tmp_path):
         ir_scaffold_mode="on",
         libpython_mode="off",
     )
-    ir_text = out.read_text()
+    ir_text = out.read_text(encoding="utf-8")
     match = re.search(
         r"define\s+[^\n]*@user_pcc_py_frontend_types__class_type_from_dotted"
         r"\([^)]*\)[^{]*\{(?P<body>.+?)\n\}",

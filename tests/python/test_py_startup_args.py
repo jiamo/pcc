@@ -315,6 +315,7 @@ class PyStartupArgsTests(unittest.TestCase):
             [exe],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=20,
         )
         self.assertEqual(run.returncode, 0, msg=run.stderr)

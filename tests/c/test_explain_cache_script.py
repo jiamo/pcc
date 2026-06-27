@@ -7,7 +7,7 @@ import sys
 
 def test_explain_cache_script_json(tmp_path):
     src = tmp_path / "x.c"
-    src.write_text("int x;\n")
+    src.write_text("int x;\n", encoding="utf-8")
     result = subprocess.run(
         [sys.executable, "scripts/pcc_explain_cache.py", "--format=json", str(src)],
         text=True,

@@ -9,8 +9,9 @@ import pytest
 
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 
-
 REPO = Path(__file__).resolve().parents[2]
+
+
 def _find_current_pcc1() -> Path | None:
     return find_current_pcc1(REPO)
 
@@ -18,9 +19,9 @@ def _find_current_pcc1() -> Path | None:
 def test_package_inspect_counts_generic_source_tree(tmp_path):
     pkg = tmp_path / "demo_pkg"
     pkg.mkdir()
-    (pkg / "__init__.py").write_text("x = 1\n")
-    (pkg / "mod.c").write_text("int demo(void) { return 1; }\n")
-    (pkg / "mod.hpp").write_text("#pragma once\n")
+    (pkg / "__init__.py").write_text("x = 1\n", encoding="utf-8")
+    (pkg / "mod.c").write_text("int demo(void) { return 1; }\n", encoding="utf-8")
+    (pkg / "mod.hpp").write_text("#pragma once\n", encoding="utf-8")
 
     env = os.environ.copy()
     env.pop("LC_ALL", None)
@@ -55,7 +56,7 @@ def test_package_inspect_counts_generic_source_tree(tmp_path):
 def test_package_inspect_accepts_positional_local_source_path(tmp_path):
     pkg = tmp_path / "demo_pkg-0.1"
     pkg.mkdir()
-    (pkg / "__init__.py").write_text("x = 1\n")
+    (pkg / "__init__.py").write_text("x = 1\n", encoding="utf-8")
     (pkg / "pyproject.toml").write_text(
         "[build-system]\nrequires = ['demo-backend']\nbuild-backend = 'demo.backend'\n",
         encoding="utf-8",
@@ -108,6 +109,114 @@ def test_pcc_module_pip_dry_run_shim_is_generic():
     assert "numpy_level" not in inspection
 
 
+def test_package_inspect_reports_mlx_as_extension_abi_target():
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    proc = subprocess.run(
+        [
+            "uv",
+            "run",
+            "pcc",
+            "-m",
+            "pcc.package",
+            "inspect",
+            "mlx",
+            "--json",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    report = json.loads(proc.stdout)
+    assert report["name"] == "mlx"
+    assert report["package_level"] == "c_extension_abi"
+    assert "MLX" in report["package_summary"]
+    assert "numpy_level" not in report
+
+
+def test_package_inspect_reports_vllm_as_extension_abi_target():
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    proc = subprocess.run(
+        [
+            "uv",
+            "run",
+            "pcc",
+            "-m",
+            "pcc.package",
+            "inspect",
+            "vllm",
+            "--json",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    report = json.loads(proc.stdout)
+    assert report["name"] == "vllm"
+    assert report["package_level"] == "c_extension_abi"
+    assert "vLLM" in report["package_summary"]
+    assert "numpy_level" not in report
+
+
+def test_package_inspect_reports_tilelang_as_extension_abi_target():
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    proc = subprocess.run(
+        [
+            "uv",
+            "run",
+            "pcc",
+            "-m",
+            "pcc.package",
+            "inspect",
+            "tilelang",
+            "--json",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    report = json.loads(proc.stdout)
+    assert report["name"] == "tilelang"
+    assert report["package_level"] == "c_extension_abi"
+    assert "TileLang" in report["package_summary"]
+    assert "numpy_level" not in report
+
+
+def test_package_inspect_reports_vllm_metal_as_extension_abi_target():
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    proc = subprocess.run(
+        [
+            "uv",
+            "run",
+            "pcc",
+            "-m",
+            "pcc.package",
+            "inspect",
+            "vllm-metal",
+            "--json",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    report = json.loads(proc.stdout)
+    assert report["name"] == "vllm-metal"
+    assert report["package_level"] == "c_extension_abi"
+    assert "Metal" in report["package_summary"]
+    assert "numpy_level" not in report
+
+
 def test_scientific_package_support_has_no_runtime_or_codegen_special_case():
     forbidden = (
         "PY_TYPE_" + "NUMPY_ARRAY",
@@ -140,15 +249,17 @@ def test_scientific_package_support_has_no_runtime_or_codegen_special_case():
 def test_pcc1_package_inspect_does_not_need_host_python(tmp_path):
     pcc1 = _find_current_pcc1()
     if pcc1 is None:
-        skip_or_fail_no_current_pcc1("no current pcc1 binary with native package module shim")
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 binary with native package module shim"
+        )
     pkg = tmp_path / "demo_pkg"
     pkg.mkdir()
-    (pkg / "__init__.py").write_text("x = 1\n")
-    (pkg / "mod.c").write_text("int demo(void) { return 1; }\n")
-    (pkg / "mod.hpp").write_text("#pragma once\n")
+    (pkg / "__init__.py").write_text("x = 1\n", encoding="utf-8")
+    (pkg / "mod.c").write_text("int demo(void) { return 1; }\n", encoding="utf-8")
+    (pkg / "mod.hpp").write_text("#pragma once\n", encoding="utf-8")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -176,17 +287,19 @@ def test_pcc1_package_inspect_does_not_need_host_python(tmp_path):
 def test_pcc1_package_inspect_accepts_positional_local_source_path(tmp_path):
     pcc1 = _find_current_pcc1()
     if pcc1 is None:
-        skip_or_fail_no_current_pcc1("no current pcc1 binary with native package module shim")
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 binary with native package module shim"
+        )
     pkg = tmp_path / "demo_pkg-0.1"
     pkg.mkdir()
-    (pkg / "__init__.py").write_text("x = 1\n")
+    (pkg / "__init__.py").write_text("x = 1\n", encoding="utf-8")
     (pkg / "pyproject.toml").write_text(
         "[build-system]\nrequires = ['demo-backend']\nbuild-backend = 'demo.backend'\n",
         encoding="utf-8",
     )
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -212,10 +325,12 @@ def test_pcc1_package_inspect_accepts_positional_local_source_path(tmp_path):
 def test_pcc1_pip_dry_run_does_not_need_host_python():
     pcc1 = _find_current_pcc1()
     if pcc1 is None:
-        skip_or_fail_no_current_pcc1("no current pcc1 binary with native package module shim")
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 binary with native package module shim"
+        )
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [str(pcc1), "-m", "pip", "install", "requests", "--dry-run"],
         check=True,
@@ -228,3 +343,119 @@ def test_pcc1_pip_dry_run_does_not_need_host_python():
     assert plan["ok"] is True
     assert plan["packages"] == ["requests"]
     assert plan["inspections"][0]["package_level"] == "nolibpython_python"
+
+
+def test_pcc1_package_inspect_reports_mlx_without_host_python():
+    pcc1 = _find_current_pcc1()
+    if pcc1 is None:
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 binary with native package module shim"
+        )
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    proc = subprocess.run(
+        [
+            str(pcc1),
+            "-m",
+            "pcc.package.inspect",
+            "mlx",
+            "--json",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    report = json.loads(proc.stdout)
+    assert report["name"] == "mlx"
+    assert report["package_level"] == "c_extension_abi"
+    assert "MLX" in report["package_summary"]
+
+
+def test_pcc1_package_inspect_reports_vllm_without_host_python():
+    pcc1 = _find_current_pcc1()
+    if pcc1 is None:
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 binary with native package module shim"
+        )
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    proc = subprocess.run(
+        [
+            str(pcc1),
+            "-m",
+            "pcc.package.inspect",
+            "vllm",
+            "--json",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    report = json.loads(proc.stdout)
+    assert report["name"] == "vllm"
+    assert report["package_level"] == "c_extension_abi"
+    assert "vLLM" in report["package_summary"]
+
+
+def test_pcc1_package_inspect_reports_tilelang_without_host_python():
+    pcc1 = _find_current_pcc1()
+    if pcc1 is None:
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 binary with native package module shim"
+        )
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    proc = subprocess.run(
+        [
+            str(pcc1),
+            "-m",
+            "pcc.package.inspect",
+            "tilelang",
+            "--json",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    report = json.loads(proc.stdout)
+    assert report["name"] == "tilelang"
+    assert report["package_level"] == "c_extension_abi"
+    assert "TileLang" in report["package_summary"]
+
+
+def test_pcc1_package_inspect_reports_vllm_metal_without_host_python():
+    pcc1 = _find_current_pcc1()
+    if pcc1 is None:
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 binary with native package module shim"
+        )
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    proc = subprocess.run(
+        [
+            str(pcc1),
+            "-m",
+            "pcc.package.inspect",
+            "vllm-metal",
+            "--json",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    report = json.loads(proc.stdout)
+    assert report["name"] == "vllm-metal"
+    assert report["package_level"] == "c_extension_abi"
+    assert "Metal" in report["package_summary"]

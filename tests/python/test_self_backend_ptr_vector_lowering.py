@@ -88,13 +88,9 @@ _POISON_POINTER_IR = textwrap.dedent(
 
     define i32 @main() {
     entry:
-      ret i32 0
+      br label %do_store
 
-    dead:
-      %v = load i1, ptr poison, align 1
-      br i1 %v, label %dead_store, label %dead_store
-
-    dead_store:
+    do_store:
       store i1 false, ptr poison, align 1
       ret i32 0
     }

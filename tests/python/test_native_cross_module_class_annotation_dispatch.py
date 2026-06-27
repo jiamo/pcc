@@ -17,7 +17,7 @@ def test_unique_external_class_annotation_dispatches_method_natively(tmp_path):
                     return 7
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     user = tmp_path / "user.py"
     user.write_text(
         textwrap.dedent(
@@ -28,7 +28,7 @@ def test_unique_external_class_annotation_dispatches_method_natively(tmp_path):
                 return parent.ping()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     out = tmp_path / "combined.ll"
     compile_python_multi(
         [str(user), str(owner)],
@@ -37,7 +37,7 @@ def test_unique_external_class_annotation_dispatches_method_natively(tmp_path):
         entry_module="user",
         module_names=["user", "owner"],
     )
-    ir_text = out.read_text()
+    ir_text = out.read_text(encoding="utf-8")
     m = re.search(
         r"define[^\n]+@user_user_run[^{]+\{(.+?)\n\}",
         ir_text,

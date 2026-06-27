@@ -161,7 +161,7 @@ def test_pcc1_toolchain_cli_does_not_need_host_python(tmp_path):
     bin_dir, lib_dir = _write_fake_toolchain(tmp_path)
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -200,7 +200,7 @@ def test_pcc1_toolchain_rejects_broken_executable_shims(tmp_path):
     _write_failing_exe(bin_dir / "cython")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -233,7 +233,7 @@ def test_pcc1_toolchain_checks_cython_minimum_version(tmp_path):
     _write_version_exe(bin_dir / "cython", "Cython version 0.29.36")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),

@@ -102,7 +102,7 @@ def test_compile_translation_units_recompiles_only_dirty_units(tmp_path, monkeyp
 def test_cli_uses_disk_compile_cache_by_default(tmp_path, monkeypatch):
     cache_dir = tmp_path / "compile-cache"
     main_path = tmp_path / "main.c"
-    main_path.write_text("int main(void) { return 0; }\n")
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
 
     result = CliRunner().invoke(
         main,
@@ -129,7 +129,7 @@ def test_cli_uses_disk_compile_cache_by_default(tmp_path, monkeypatch):
 def test_cli_no_cache_bypasses_disk_compile_cache(tmp_path, monkeypatch):
     cache_dir = tmp_path / "compile-cache"
     main_path = tmp_path / "main.c"
-    main_path.write_text("int main(void) { return 0; }\n")
+    main_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
 
     compiled_names = []
     original_compile = c_evaluator._compile_preprocessed_translation_unit_artifact
@@ -152,7 +152,7 @@ def test_cli_no_cache_bypasses_disk_compile_cache(tmp_path, monkeypatch):
     assert compiled_names == ["__pcc_eval__.c"]
 
 
-def test_compiler_cache_fingerprint_tracks_ssa_package_files():
+def test_compiler_cache_fingerprint_tracks_c_codegen_and_ir_analysis_package_files():
     tracked_files = {
         Path(path)
         .relative_to(Path(c_evaluator.__file__).resolve().parents[1])
@@ -160,6 +160,12 @@ def test_compiler_cache_fingerprint_tracks_ssa_package_files():
         for path in c_evaluator._compiler_cache_tracked_files()
     }
 
+    assert "codegen/__init__.py" in tracked_files
+    assert "codegen/c_codegen.py" in tracked_files
+    assert "codegen/c_varargs.py" in tracked_files
+    assert "ir_passes/__init__.py" in tracked_files
+    assert "ir_passes/instcombine.py" in tracked_files
+    assert "ir_passes/parity.py" in tracked_files
     assert "ssa/__init__.py" in tracked_files
     assert "ssa/builder.py" in tracked_files
     assert "ssa/sccp.py" in tracked_files

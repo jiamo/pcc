@@ -31,7 +31,7 @@ def test_dynamic_receiver_truediv_compiles_dunder_self_backend(tmp_path):
         result = join(base, "leaf")
         print(result)
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "dynamic_truediv.out"
     compile_python(
         str(src),
@@ -65,7 +65,7 @@ def test_pcc1_dynamic_truediv_unknown_receiver_compile_only(tmp_path):
             join(PathLike())
         main()
         """
-    ))
+    ), encoding="utf-8")
     out = tmp_path / "dynamic_truediv_unknown.ll"
     env = os.environ.copy()
     env.pop("LC_ALL", None)
@@ -110,7 +110,7 @@ def test_int_builtin_on_class_instance_compiles_dunder_self_backend(tmp_path):
         result = coerce(identity(Kind()))
         print(result)
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "class_int_dunder.out"
     compile_python(
         str(src),
@@ -143,7 +143,7 @@ def test_pcc1_int_builtin_on_class_instance_compile_only(tmp_path):
             print(coerce(Kind()))
         main()
         """
-    ))
+    ), encoding="utf-8")
     out = tmp_path / "class_int_dunder_pcc1.ll"
     env = os.environ.copy()
     env.pop("LC_ALL", None)
@@ -185,7 +185,7 @@ def test_class_instance_numeric_rhs_uses_dynamic_mul_dunder_self_backend(tmp_pat
         result = scale(Factor())
         print(result)
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "class_numeric_rhs_mul.out"
     compile_python(
         str(src),
@@ -218,7 +218,7 @@ def test_pcc1_class_instance_numeric_rhs_compile_only(tmp_path):
             print(scale(Factor()))
         main()
         """
-    ))
+    ), encoding="utf-8")
     out = tmp_path / "class_numeric_rhs_mul_pcc1.ll"
     env = os.environ.copy()
     env.pop("LC_ALL", None)

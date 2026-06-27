@@ -6,19 +6,38 @@ import subprocess
 import textwrap
 from pathlib import Path
 
-import pytest
+from tests.runtime_build_cache import cache_runtime_build
 
 
-def _wipe_repo_runtime_archive() -> None:
-    repo = Path(__file__).absolute().parents[2]
-    runtime = repo / "pcc" / "py_runtime"
-    archive = runtime / "libpy_runtime.a"
-    stamp = Path(str(archive) + ".target")
-    if archive.exists():
-        archive.unlink()
-    if stamp.exists():
-        stamp.unlink()
-    shutil.rmtree(runtime / "build", ignore_errors=True)
+REPO_ROOT = Path(__file__).absolute().parents[2]
+RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
+
+
+@cache_runtime_build
+def _build_threaded_runtime(tmp_path: Path) -> Path:
+    work_runtime = tmp_path / "py_runtime_threads"
+    shutil.copytree(
+        RUNTIME_DIR,
+        work_runtime,
+        ignore=shutil.ignore_patterns(
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
+        ),
+    )
+    result = subprocess.run(
+        [
+            "make",
+            "-B",
+            "-C",
+            str(work_runtime),
+            "PCC_WITH_THREADS=1",
+            "libpy_runtime.a",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return work_runtime
 
 
 def test_threading_stdlib_native_lock_event_smoke(tmp_path):
@@ -41,7 +60,7 @@ def test_threading_stdlib_native_lock_event_smoke(tmp_path):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on", libpython_mode="off")
     result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -68,11 +87,75 @@ def test_thread_start_runs_target_via_native_dispatch_under_default_runtime(tmp_
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on", libpython_mode="off")
     result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().splitlines() == ["False", "worker", "False"]
+
+
+def test_thread_start_on_for_loop_target_from_thread_list(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "thread_for_target.py"
+    exe = tmp_path / "thread_for_target.out"
+    src.write_text(textwrap.dedent("""
+        import threading
+
+        results = []
+
+        def work(n) -> None:
+            results.append(n * n)
+
+        def main() -> None:
+            ts = [threading.Thread(target=work, args=(i,)) for i in range(3)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            print(sorted(results))
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    compile_python(str(src), str(exe), ir_scaffold_mode="on", libpython_mode="off")
+    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[0, 1, 4]"
+
+
+def test_thread_start_on_for_loop_target_from_appended_thread_name(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "thread_for_append_name.py"
+    exe = tmp_path / "thread_for_append_name.out"
+    src.write_text(textwrap.dedent("""
+        from threading import Thread
+
+        def work(n) -> None:
+            print("worker", n)
+
+        def main() -> None:
+            threads = []
+            i = 0
+            while i < 2:
+                th = Thread(target=work, args=(i,))
+                threads.append(th)
+                i += 1
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            print("done")
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    compile_python(str(src), str(exe), ir_scaffold_mode="on", libpython_mode="off")
+    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    lines = sorted(result.stdout.strip().splitlines())
+    assert lines == ["done", "worker 0", "worker 1"]
 
 
 def test_threading_import_from_and_sync_primitives_native(tmp_path):
@@ -100,7 +183,7 @@ def test_threading_import_from_and_sync_primitives_native(tmp_path):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on", libpython_mode="off")
     result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -116,33 +199,7 @@ def test_pthread_thread_object_survives_dropped_user_reference(tmp_path):
     handoff reference, `py_decref(thread)` can free the wrapper before the
     pthread trampoline enters `py_threading_thread_main()`.
     """
-    repo = Path(__file__).absolute().parents[2]
-    runtime = repo / "pcc" / "py_runtime"
-    work_runtime = tmp_path / "py_runtime"
-
-    import shutil
-    shutil.copytree(
-        runtime,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-
-    make = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            "PCC_WITH_THREADS=1",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert make.returncode == 0, make.stdout + make.stderr
+    work_runtime = _build_threaded_runtime(tmp_path)
 
     src = tmp_path / "thread_handoff.c"
     exe = tmp_path / "thread_handoff.out"
@@ -185,7 +242,7 @@ def test_pthread_thread_object_survives_dropped_user_reference(tmp_path):
             }
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     cc = os.environ.get("CC", "cc")
     build = subprocess.run(
         [
@@ -205,14 +262,12 @@ def test_pthread_thread_object_survives_dropped_user_reference(tmp_path):
 
 
 def test_pthread_lock_serializes_shared_list_updates(tmp_path, monkeypatch):
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        pytest.skip("threaded runtime archive tests mutate libpy_runtime.a; run with -n0")
     from pcc.py_frontend.pipeline import compile_python
 
     monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
     monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
     monkeypatch.setenv("PCC_WITH_THREADS", "1")
-    _wipe_repo_runtime_archive()
+    work_runtime = _build_threaded_runtime(tmp_path)
 
     src = tmp_path / "lock_lost_update.py"
     exe = tmp_path / "lock_lost_update.out"
@@ -247,25 +302,23 @@ def test_pthread_lock_serializes_shared_list_updates(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    try:
-        compile_python(
-            str(src),
-            str(exe),
-            ir_scaffold_mode="on",
-            libpython_mode="off",
+    compile_python(
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        runtime_archive=str(work_runtime / "libpy_runtime.a"),
+    )
+    outputs: list[str] = []
+    for _ in range(3):
+        result = subprocess.run(
+            [str(exe)],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        outputs: list[str] = []
-        for _ in range(3):
-            result = subprocess.run(
-                [str(exe)],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            assert result.returncode == 0, result.stderr
-            outputs.append(result.stdout.strip())
-        assert outputs == ["4000", "4000", "4000"]
-    finally:
-        _wipe_repo_runtime_archive()
+        assert result.returncode == 0, result.stderr
+        outputs.append(result.stdout.strip())
+    assert outputs == ["4000", "4000", "4000"]

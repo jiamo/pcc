@@ -59,3 +59,29 @@ def test_range_value_supports_negative_step(tmp_path):
     run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
     assert run.returncode == 0, run.stderr
     assert run.stdout.splitlines() == ["3", "5", "1"]
+
+
+def test_range_builtin_alias_stays_native_no_libpython(tmp_path):
+    src = tmp_path / "range_value_alias.py"
+    src.write_text(
+        textwrap.dedent(
+            """
+            saved_range = range
+            values = saved_range(1, 6, 2)
+            print(values[0] + values[1] + values[2])
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    exe = tmp_path / "range_value_alias.out"
+
+    compile_python(
+        str(src),
+        str(exe),
+        backend="self",
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "9\n"

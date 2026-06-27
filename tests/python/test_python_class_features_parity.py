@@ -65,7 +65,7 @@ def test_class_basic_construction(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["3 4", "25"]
 
@@ -98,7 +98,7 @@ def test_class_inheritance_super(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "I am Rex, a labrador", "Rex", "labrador",
@@ -126,7 +126,7 @@ def test_class_isinstance(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True", "True", "False"]
 
@@ -162,7 +162,7 @@ def test_class_property_getter_setter(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["12", "3", "5", "20"]
 
@@ -188,7 +188,7 @@ def test_class_staticmethod(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["7", "3", "2"]
 
@@ -213,7 +213,7 @@ def test_class_dunder_eq(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True", "False", "False"]
 
@@ -236,7 +236,7 @@ def test_class_dunder_call(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["8", "15"]
 
@@ -255,7 +255,7 @@ def test_class_type_builtin(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["Foo", "int", "str"]
 
@@ -279,7 +279,7 @@ def test_class_class_var_read_write(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["0", "5", "6"]
 
@@ -309,7 +309,7 @@ def test_class_user_iter(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["0", "1", "2"]
 
@@ -329,6 +329,6 @@ def test_class_subclass_type_name_resolution(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["Sub"]

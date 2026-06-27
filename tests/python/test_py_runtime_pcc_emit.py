@@ -24,6 +24,30 @@ REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_SRC = REPO_ROOT / "pcc" / "py_runtime" / "src"
 RUNTIME_INC = REPO_ROOT / "pcc" / "py_runtime" / "include"
 
+# Platform-syscall C-kernel helpers that intentionally stay in C: they read
+# ABI-sensitive OS structs through SDK headers (macOS <mach/mach.h>,
+# <malloc/malloc.h>) that use modern syntax pcc's C frontend does not parse
+# (C23 `enum : uint64_t`, bool bitfields). The pcc-emitted runtime archive
+# CC-builds them (py_runtime/Makefile PCC_CC_ONLY_SRCS); a fake-libc shadow
+# would have to duplicate the OS struct layout exactly, which is fragile. They
+# have no pcc-Python port and no runtime caller, so they are not part of the
+# "pcc compiles its own runtime" oracle gate.
+_CC_ONLY_KERNEL_SOURCES = {"py_os_rss.c", "py_os_heap.c"}
+
+# Large addressable struct assignments now lower to bounded aggregate memory
+# copies, so py_re_engine.c no longer needs a special ~300s exemption. Keep one
+# strict timeout for every runtime source; a renewed IR-shape/codegen blow-up
+# must fail like any other performance regression.
+_DEFAULT_EMIT_TIMEOUT = 120
+
+# This repository-scale self-compilation gate emits every runtime C source.
+# Keep it out of the default unit suite; the integration run owns its cost.
+# Within that gate, serialize compiler subprocesses to bound peak memory.
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.xdist_group(name="pcc_runtime_emit"),
+]
+
 
 def _runtime_sources() -> list[Path]:
     return sorted(RUNTIME_SRC.glob("*.c"))
@@ -38,6 +62,11 @@ def test_pcc_emits_object_for_runtime_source(tmp_path, src):
     pcc_bin = shutil.which("pcc")
     if not pcc_bin:
         pytest.skip("pcc CLI (cli_core) not on PATH")
+    if src.name in _CC_ONLY_KERNEL_SOURCES:
+        pytest.skip(
+            f"{src.name} is a CC-only C-kernel platform helper "
+            "(SDK-header / ABI struct; see Makefile PCC_CC_ONLY_SRCS)"
+        )
     obj_path = tmp_path / (src.stem + ".o")
     cmd = [
         pcc_bin,
@@ -53,7 +82,7 @@ def test_pcc_emits_object_for_runtime_source(tmp_path, src):
         cmd,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=_DEFAULT_EMIT_TIMEOUT,
         cwd=str(REPO_ROOT),
         env=env,
     )

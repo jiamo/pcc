@@ -22,7 +22,7 @@ from tests.self_backend_c_testsuite_common import (
 
 GCC_TORTURE_DIR = REPO_ROOT / "projects" / "gcc-torture-execute"
 GCC_TORTURE_MANIFEST_PATH = REPO_ROOT / "tests" / "gcc_torture_manifest.json"
-GCC_TORTURE_MANIFEST = json.loads(GCC_TORTURE_MANIFEST_PATH.read_text())
+GCC_TORTURE_MANIFEST = json.loads(GCC_TORTURE_MANIFEST_PATH.read_text(encoding="utf-8"))
 
 # Keep this as the full runtime-exact-match bucket so self-backend promotion
 # evidence stays broad. Use short range scouts before running this formal gate;
@@ -30,10 +30,11 @@ GCC_TORTURE_MANIFEST = json.loads(GCC_TORTURE_MANIFEST_PATH.read_text())
 GCC_TORTURE_SELF_BACKEND_EXACT_MATCH_CASES = tuple(
     GCC_TORTURE_MANIFEST.get("runtime_exact_match", [])
 )
-GCC_TORTURE_SELF_BACKEND_DIFFERENTIAL_CASES = GCC_TORTURE_SELF_BACKEND_EXACT_MATCH_CASES
 GCC_TORTURE_SELF_BACKEND_RETURNCODE_CASES = tuple(
     GCC_TORTURE_MANIFEST.get("runtime_returncode_match_only", [])
 )
+
+pytestmark = pytest.mark.integration
 
 
 def _case_params(cases):
@@ -90,28 +91,17 @@ def _run_llvm_backend(case_path: Path, timeout: int = DEFAULT_TIMEOUT):
 @pytest.mark.parametrize(
     "relative_path", _case_params(GCC_TORTURE_SELF_BACKEND_EXACT_MATCH_CASES)
 )
-def test_gcc_torture_self_backend_runtime_matches_native_exactly(relative_path):
+def test_gcc_torture_self_backend_matches_native_and_llvm_exactly(relative_path):
     case_path = _case_path(relative_path)
     assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
     native_result = run_native(case_path, REPO_ROOT)
+    llvm_result = _run_llvm_backend(case_path)
     self_result = _run_self_backend(case_path)
 
     assert_result_triplet_matches(
         relative_path, "self", self_result, "native", native_result
     )
-
-
-@pytest.mark.parametrize(
-    "relative_path", _case_params(GCC_TORTURE_SELF_BACKEND_DIFFERENTIAL_CASES)
-)
-def test_gcc_torture_self_backend_matches_llvm_on_exact_match_bucket(relative_path):
-    case_path = _case_path(relative_path)
-    assert case_path.is_file(), f"missing gcc torture case: {case_path}"
-
-    llvm_result = _run_llvm_backend(case_path)
-    self_result = _run_self_backend(case_path)
-
     assert_result_triplet_matches(
         relative_path, "self", self_result, "llvm", llvm_result
     )
@@ -120,11 +110,12 @@ def test_gcc_torture_self_backend_matches_llvm_on_exact_match_bucket(relative_pa
 @pytest.mark.parametrize(
     "relative_path", _case_params(GCC_TORTURE_SELF_BACKEND_RETURNCODE_CASES)
 )
-def test_gcc_torture_self_backend_returncode_matches_native(relative_path):
+def test_gcc_torture_self_backend_returncode_matches_native_and_llvm(relative_path):
     case_path = _case_path(relative_path)
     assert case_path.is_file(), f"missing gcc torture case: {case_path}"
 
     native_result = run_native(case_path, REPO_ROOT)
+    llvm_result = _run_llvm_backend(case_path)
     self_result = _run_self_backend(case_path)
 
     assert self_result.returncode == native_result.returncode, (
@@ -133,18 +124,6 @@ def test_gcc_torture_self_backend_returncode_matches_native(relative_path):
         f"self={self_result.returncode}\n"
         f"self stderr:\n{self_result.stderr}"
     )
-
-
-@pytest.mark.parametrize(
-    "relative_path", _case_params(GCC_TORTURE_SELF_BACKEND_RETURNCODE_CASES)
-)
-def test_gcc_torture_self_backend_returncode_matches_llvm(relative_path):
-    case_path = _case_path(relative_path)
-    assert case_path.is_file(), f"missing gcc torture case: {case_path}"
-
-    llvm_result = _run_llvm_backend(case_path)
-    self_result = _run_self_backend(case_path)
-
     assert self_result.returncode == llvm_result.returncode, (
         f"{relative_path} return code mismatch:\n"
         f"llvm={llvm_result.returncode}\n"

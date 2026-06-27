@@ -18,7 +18,7 @@ def simple_c(tmp_path):
     src.write_text("""
     int add(int a, int b) { return a + b; }
     int mul(int a, int b) { return a * b; }
-    """)
+    """, encoding="utf-8")
     return str(src)
 
 
@@ -29,7 +29,7 @@ def main_c(tmp_path):
     src.write_text("""
     int square(int x) { return x * x; }
     int main(void) { return square(5) - 25; }
-    """)
+    """, encoding="utf-8")
     return str(src)
 
 
@@ -37,16 +37,16 @@ def main_c(tmp_path):
 def multi_tu(tmp_path):
     """Two-file translation unit setup."""
     header = tmp_path / "utils.h"
-    header.write_text("int triple(int x);\n")
+    header.write_text("int triple(int x);\n", encoding="utf-8")
     impl = tmp_path / "utils.c"
     impl.write_text("""
     int triple(int x) { return x + x + x; }
-    """)
+    """, encoding="utf-8")
     main = tmp_path / "main.c"
     main.write_text("""
     #include "utils.h"
     int main(void) { return triple(3) - 9; }
-    """)
+    """, encoding="utf-8")
     return str(impl), str(main), str(tmp_path)
 
 
@@ -107,7 +107,7 @@ class TestBuild:
         #include <math.h>
         double my_sqrt(double x) { return sqrt(x); }
         int main(void) { return (int)my_sqrt(4.0) - 2; }
-        """)
+        """, encoding="utf-8")
         artifact = build(str(src), libs=["m"], kind="exe")
         assert artifact.libs == ["m"]
         import subprocess
@@ -120,7 +120,7 @@ class TestBuild:
         src.write_text("""
         int get_val(void) { return MY_VAL; }
         int main(void) { return get_val() - 42; }
-        """)
+        """, encoding="utf-8")
         artifact = build(str(src), cpp_args=["-DMY_VAL=42"], kind="exe")
         import subprocess
         r = subprocess.run([artifact.output_path], capture_output=True)
@@ -191,7 +191,7 @@ class TestModule:
         src.write_text("""
         #include <math.h>
         double my_sqrt(double x) { return sqrt(x); }
-        """)
+        """, encoding="utf-8")
         m = module(str(src), libs=["m"])
         m.my_sqrt.restype = ctypes.c_double
         m.my_sqrt.argtypes = [ctypes.c_double]

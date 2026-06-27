@@ -6,13 +6,9 @@ import textwrap
 from pathlib import Path
 
 
-def test_generator_next_send_finish_and_stop_value_native(tmp_path):
-    subprocess.run(
-        ["make", "-C", "pcc/py_runtime", "libpy_runtime.a"],
-        check=True,
-        env={**os.environ, "PATH": os.environ.get("PATH", "")},
-    )
-
+def test_generator_next_send_finish_and_stop_value_native(
+    tmp_path, c_runtime_archive
+):
     src = tmp_path / "gen_probe.c"
     exe = tmp_path / "gen_probe"
     src.write_text(
@@ -76,9 +72,9 @@ def test_generator_next_send_finish_and_stop_value_native(tmp_path):
         [
             os.environ.get("CC", "cc"),
             "-I",
-            "pcc/py_runtime/include",
+            str(c_runtime_archive.parent / "include"),
             str(src),
-            "pcc/py_runtime/libpy_runtime.a",
+            str(c_runtime_archive),
             "-lm",
             "-o",
             str(exe),
@@ -90,10 +86,10 @@ def test_generator_next_send_finish_and_stop_value_native(tmp_path):
 
 
 def test_generator_finish_symbols_are_wired():
-    c_src = Path("pcc/py_runtime/src/py_gen.c").read_text()
-    py_src = Path("pcc/py_runtime/py/py_gen.py").read_text()
-    header = Path("pcc/py_runtime/include/py_runtime.h").read_text()
-    abi = Path("pcc/py_frontend/codegen/runtime_abi.py").read_text()
+    c_src = Path("pcc/py_runtime/src/py_gen.c").read_text(encoding="utf-8")
+    py_src = Path("pcc/py_runtime/py/py_gen.py").read_text(encoding="utf-8")
+    header = Path("pcc/py_runtime/include/py_runtime.h").read_text(encoding="utf-8")
+    abi = Path("pcc/py_frontend/codegen/runtime_abi.py").read_text(encoding="utf-8")
 
     assert "PyObject *py_gen_finish(PyObject *gen, PyObject *value)" in c_src
     assert "int64_t py_gen_is_done(PyObject *gen)" in c_src

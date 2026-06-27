@@ -140,6 +140,52 @@ class PyExceptionTests(unittest.TestCase):
         compile_python(src, ll_path, emit_llvm_only=True)
         self.assertTrue(os.path.isfile(ll_path))
 
+    def test_import_exception_matching_is_narrow_and_hierarchical(self):
+        from pcc.py_frontend.pipeline import compile_python
+
+        src = self._write(
+            "import_exception_matching.py",
+            """
+            try:
+                raise AttributeError("attr")
+            except ImportError:
+                print("wrong-import")
+            except AttributeError:
+                print("attribute")
+
+            try:
+                raise ImportError("import")
+            except ModuleNotFoundError:
+                print("wrong-module")
+            except ImportError:
+                print("import")
+
+            try:
+                raise ModuleNotFoundError("module")
+            except ImportError:
+                print("module-is-import")
+            """,
+        )
+        exe = os.path.join(self.td, "import_exception_matching.out")
+        compile_python(
+            src,
+            exe,
+            libpython_mode="off",
+            ir_scaffold_mode="on",
+            backend="self",
+        )
+        run = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(run.returncode, 0, msg=run.stderr)
+        self.assertEqual(
+            run.stdout.splitlines(),
+            ["attribute", "import", "module-is-import"],
+        )
+
     def test_class_without_explicit_init_does_not_emit_phantom_call(self):
         # Regression: a class that subclasses a builtin (Exception) and does
         # NOT define __init__, when instantiated with args (e.g. raised with a

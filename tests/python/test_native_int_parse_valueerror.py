@@ -71,3 +71,66 @@ def test_int_parse_invalid_raises_uncaught_no_libpython(tmp_path):
     run = subprocess.run([str(exe)], text=True, capture_output=True, timeout=30, env=env)
     assert run.returncode != 0, "expected ValueError exit, got 0 (silent parse?)"
     assert "ValueError" in run.stderr, run.stderr
+
+
+# Each case is (python-literal-for-the-string-arg, base-or-None). When base is
+# None, ``int(<str>)`` is emitted (default base 10 in the message); otherwise
+# ``int(<str>, <base>)``. Every case must raise ValueError under CPython so the
+# expected message is derived from CPython itself (no hard-coded strings).
+_MESSAGE_CASES = [
+    ("'xyz'", None),        # invalid literal for int() with base 10: 'xyz'
+    ("''", None),           # empty -> ...base 10: ''
+    ("'12x'", None),        # trailing junk -> ...base 10: '12x'
+    ("'  xyz  '", 10),      # whitespace kept in repr
+    ("'g'", 16),            # bad digit for base 16
+    ("'0x'", 0),            # base 0 renders as "base 0"
+    ("'123abc'", 0),        # base 0, mixed
+    ("'10'", 1),            # bad base (too small) -> base-must-be message
+    ("'10'", 37),           # bad base (too large)
+    ("'10'", 100),          # bad base (way too large)
+]
+
+
+def _cpython_valueerror_message(str_literal: str, base):
+    s = eval(str_literal)  # trusted: our own test literals
+    try:
+        if base is None:
+            int(s)
+        else:
+            int(s, base)
+    except ValueError as e:
+        return str(e)
+    raise AssertionError(f"expected ValueError for int({str_literal!r}, {base})")
+
+
+def test_int_parse_valueerror_messages_match_cpython_no_libpython(tmp_path):
+    """The two distinct CPython ValueError messages (bad base vs bad literal,
+    with base and repr(string) embedded) are reproduced under no-libpython,
+    byte-for-byte against ``str(e)`` from CPython."""
+    lines = ["def main():"]
+    for i, (str_lit, base) in enumerate(_MESSAGE_CASES):
+        call = f"int({str_lit})" if base is None else f"int({str_lit}, {base})"
+        # Sentinel index prefix so we can align each caught message to its case
+        # regardless of any trailing runtime chatter.
+        lines.append("    try:")
+        lines.append(f"        {call}")
+        lines.append("    except ValueError as e:")
+        lines.append(f"        print('MSG{i}:' + str(e))")
+    lines.append("main()")
+    exe, env = _build(tmp_path, "\n".join(lines) + "\n")
+    run = subprocess.run(
+        [str(exe)], text=True, capture_output=True, timeout=30, env=env
+    )
+    assert run.returncode == 0, run.stderr
+    got = {}
+    for line in run.stdout.split("\n"):
+        if line.startswith("MSG"):
+            idx, _, msg = line.partition(":")
+            got[int(idx[3:])] = msg
+    for i, (str_lit, base) in enumerate(_MESSAGE_CASES):
+        expected = _cpython_valueerror_message(str_lit, base)
+        assert i in got, f"no MSG{i} in output:\n{run.stdout}"
+        assert got[i] == expected, (
+            f"case {i} int({str_lit}, {base}): "
+            f"got {got[i]!r} != cpython {expected!r}"
+        )

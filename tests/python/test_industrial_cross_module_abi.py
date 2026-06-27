@@ -7,7 +7,7 @@ def _run_multi(tmp_path, modules):
     from pcc.py_frontend.pipeline import compile_python_multi
     srcs = []; mods = []
     for name, content in modules.items():
-        p = tmp_path / f"{name}.py"; p.write_text(textwrap.dedent(content).strip())
+        p = tmp_path / f"{name}.py"; p.write_text(textwrap.dedent(content).strip(), encoding="utf-8")
         srcs.append(str(p)); mods.append(name)
     exe = tmp_path / "app.out"
     compile_python_multi(srcs, str(exe), module_names=mods, entry_module="main", ir_scaffold_mode="on", libpython_mode="off")

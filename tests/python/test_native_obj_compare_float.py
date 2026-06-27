@@ -18,8 +18,11 @@ Runs under ``--backend self --python-libpython=off`` in DEFAULT runtime mode.
 """
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import subprocess
+import textwrap
 from pathlib import Path
 
 
@@ -58,13 +61,49 @@ def test_obj_compare_boxed_float_no_libpython(tmp_path):
         "    print(x < 30, x > 30, x >= 25, x <= 25)\n"                    # T F T T
         "    i = A(100)\n"
         "    print(i.bal < 50, i.bal > 50, i.bal <= 100, i.bal >= 200)\n"  # F T T F (int regression)
+        "    print(a.bal > i.bal, a.bal == i.bal, i.bal <= a.bal)\n"       # F T T (object/object path)
         "    print(5 < 3, 2.5 > 1.0, 'abc' < 'abd')\n"                     # F T T (typed/str regression)
         "main()\n",
     )
-    assert out.split("\n")[:5] == [
+    assert out.split("\n")[:6] == [
         "False True True False",
         "False",
         "True False True True",
         "False True True False",
         "False True True",
+        "False True True",
     ], out
+
+
+def test_runtime_object_comparison_has_one_behavior_owner():
+    from pcc.py_frontend.codegen.compare_membership_lowering import (
+        CompareMembershipLoweringMixin,
+    )
+    from pcc.py_frontend.codegen.host_contract import L1_CODEGEN_HOST_METHODS
+
+    owner_source = textwrap.dedent(
+        inspect.getsource(CompareMembershipLoweringMixin._emit_runtime_object_compare)
+    )
+    caller_source = textwrap.dedent(
+        inspect.getsource(CompareMembershipLoweringMixin._emit_compare)
+    )
+    owner_strings = {
+        node.value
+        for node in ast.walk(ast.parse(owner_source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    caller_strings = {
+        node.value
+        for node in ast.walk(ast.parse(caller_source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+    assert {"py_obj_lt", "py_obj_le", "py_obj_gt", "py_obj_ge"}.issubset(
+        owner_strings
+    )
+    assert not {"py_obj_lt", "py_obj_le", "py_obj_gt", "py_obj_ge"}.intersection(
+        caller_strings
+    )
+    assert caller_source.count("_emit_runtime_object_compare(") == 2
+    assert "_emit_post_call_err_check" in owner_source
+    assert "_emit_runtime_object_compare" in L1_CODEGEN_HOST_METHODS

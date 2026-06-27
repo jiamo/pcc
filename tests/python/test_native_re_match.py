@@ -1,4 +1,5 @@
 """Native ``re.match`` / ``re.search`` lowering for the no-libpython subset."""
+
 from __future__ import annotations
 
 import re
@@ -7,7 +8,6 @@ import textwrap
 import os
 from pathlib import Path
 from unittest import mock
-
 
 _REPO_ROOT = Path(__file__).absolute().parents[2]
 _BUILD = _REPO_ROOT / "build"
@@ -42,8 +42,7 @@ def _function_body(ir_text: str, fn_name_suffix: str) -> str | None:
 
 
 def test_re_match_dispatches_to_native_helper():
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import re
         from re import match, search
 
@@ -52,8 +51,7 @@ def test_re_match_dispatches_to_native_helper():
             print(match("\\\\d+", "123") is not None)
             print(re.match("abc", "ABC", re.I) is not None)
             print(search("b+", "aaBBBcc", re.I) is not None)
-        """
-    )
+        """)
 
     ir_text = _compile_to_ll(program, "native_re_match_ir", mode="on")
     body = _function_body(ir_text, "f")
@@ -66,8 +64,7 @@ def test_re_match_dispatches_to_native_helper():
 
 
 def test_re_compile_bound_match_search_stay_native():
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import re
 
         has_word = re.compile("b+", re.I).search
@@ -78,8 +75,7 @@ def test_re_compile_bound_match_search_stay_native():
             print(has_word("xxBBB") is not None)
             print(at_start("AAAxxx") is not None)
             print("beta_2" in words("a + beta_2 + 3"))
-        """
-    )
+        """)
 
     ir_text = _compile_to_ll(program, "native_re_compile_bound_ir", mode="on")
     assert "@py_re_compile_method" in ir_text, ir_text
@@ -88,8 +84,7 @@ def test_re_compile_bound_match_search_stay_native():
 
 
 def test_re_compile_literal_alias_methods_stay_native():
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import re
 
         word = re.compile(r"b+", re.I)
@@ -99,8 +94,7 @@ def test_re_compile_literal_alias_methods_stay_native():
             print(word.match("BBB") is not None)
             print(word.search("xxBBB") is not None)
             print("beta_2" in pieces.findall("a + beta_2 + 3"))
-        """
-    )
+        """)
 
     ir_text = _compile_to_ll(program, "native_re_compile_alias_ir", mode="on")
     assert "@py_re_match_flags" in ir_text, ir_text
@@ -111,24 +105,26 @@ def test_re_compile_literal_alias_methods_stay_native():
 
 
 def test_re_compile_alias_value_use_keeps_fallback_boundary():
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import re
 
         word = re.compile(r"b+", re.I)
 
         def f():
             return word
-        """
-    )
+        """)
 
     ir_text = _compile_to_ll(program, "native_re_compile_alias_value_ir", mode="on")
-    assert "@.cpy.attr.compile" in ir_text, ir_text
+    # re.compile now produces a native pattern object (py_re_compile_obj); the
+    # value-escape (returning ``word``) carries that native object, which is
+    # safe because unsupported uses (e.g. re.split(obj, ...)) fall back to
+    # CPython at the call site, not at compile.
+    assert "@py_re_compile_obj" in ir_text, ir_text
+    assert "@.cpy.attr.compile" not in ir_text, ir_text
 
 
 def test_re_compile_local_alias_methods_stay_native_and_scoped():
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import re
 
         def f(text: str) -> bool:
@@ -138,22 +134,28 @@ def test_re_compile_local_alias_methods_stay_native_and_scoped():
         def g():
             prune_file_pat = re.compile(r"b+")
             return prune_file_pat
-        """
-    )
+        """)
 
     ir_text = _compile_to_ll(program, "native_re_compile_local_alias_ir", mode="on")
     body_f = _function_body(ir_text, "f")
     body_g = _function_body(ir_text, "g")
     assert body_f is not None
     assert body_g is not None
-    assert "@py_re_search_flags" in body_f, body_f
+    # f's local ``re.compile(...).search`` stays native via the pattern object
+    # (py_re_compile_obj + object .search dispatch); no CPython fallback call.
+    # Runtime output verified equal to CPython.
+    assert "@py_re_compile_obj" in body_f, body_f
+    assert re.search(r"\bcall\b[^\n]*@py_cpy_", body_f) is None, body_f
     assert "cpy.fn.compile" not in body_f, body_f
-    assert "cpy.fn.compile" in body_g, body_g
+    # g's ``re.compile(...)`` now produces a native pattern object too (the
+    # returned value is a native re object; previously this escaped to a CPython
+    # compile fallback).
+    assert "@py_re_compile_obj" in body_g, body_g
+    assert "cpy.fn.compile" not in body_g, body_g
 
 
 def test_re_compile_class_attr_re_split_stores_pattern_string():
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import re
 
         class Parser:
@@ -161,8 +163,7 @@ def test_re_compile_class_attr_re_split_stores_pattern_string():
 
             def f(self, text: str):
                 return re.split(self.sep, text)
-        """
-    )
+        """)
 
     ir_text = _compile_to_ll(program, "native_re_compile_class_split_ir", mode="on")
     assert "@.cpy.attr.compile" not in ir_text, ir_text
@@ -170,8 +171,7 @@ def test_re_compile_class_attr_re_split_stores_pattern_string():
 
 
 def test_re_compile_class_attr_method_use_keeps_compile_fallback():
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import re
 
         class Parser:
@@ -179,23 +179,24 @@ def test_re_compile_class_attr_method_use_keeps_compile_fallback():
 
             def f(self, text: str) -> bool:
                 return self.pat.match(text) is not None
-        """
-    )
+        """)
 
     ir_text = _compile_to_ll(program, "native_re_compile_class_method_ir", mode="on")
-    assert "@.cpy.attr.compile" in ir_text, ir_text
+    # ``pat = re.compile(...)`` class attr + ``self.pat.match(...)`` now stays
+    # native: re.compile yields a native pattern object and .match dispatches to
+    # the native engine (runtime output verified equal to CPython).
+    assert "@py_re_compile_obj" in ir_text, ir_text
+    assert "@.cpy.attr.compile" not in ir_text, ir_text
 
 
 def test_re_split_literal_separator_stays_native():
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import re
 
         def f() -> None:
             parts = re.split("/", "alpha/beta/gamma", maxsplit=1)
             print(parts[1])
-        """
-    )
+        """)
 
     ir_text = _compile_to_ll(program, "native_re_split_literal_ir", mode="on")
     body = _function_body(ir_text, "f")
@@ -210,8 +211,7 @@ def test_native_re_match_runtime_matches_basic_prefixes(tmp_path):
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             import re
 
             def main() -> None:
@@ -233,11 +233,14 @@ def test_native_re_match_runtime_matches_basic_prefixes(tmp_path):
                 print(limited[1])
                 unlimited = re.split("/", "alpha/beta/gamma", maxsplit=0)
                 print(unlimited[2])
+                whitespace_match = re.compile(r"[ \\t\\n\\r]*").match
+                offset_search = re.compile("b").search
+                print(whitespace_match("x", 1).end())
+                print(offset_search("ab", 1).start())
 
             if __name__ == "__main__":
                 main()
-            """
-        ).lstrip(),
+            """).lstrip(),
         encoding="utf-8",
     )
     with mock.patch.dict(
@@ -259,5 +262,5 @@ def test_native_re_match_runtime_matches_basic_prefixes(tmp_path):
     assert run.returncode == 0, run.stderr
     assert run.stdout == (
         "True\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\n"
-        "alpha\nbeta/gamma\ngamma\n"
+        "alpha\nbeta/gamma\ngamma\n1\n1\n"
     )

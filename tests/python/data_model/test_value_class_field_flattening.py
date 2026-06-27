@@ -57,6 +57,7 @@ def test_valueclass_generic_signature_and_status_reporting_surface_v1():
     status = value_model_status()
     assert (
         status["implemented_through"]
-        == "V1-direct-scalar-payload-checked-marshal-eq-v2-pointer-boundary-partial"
+        == "V1-direct-scalar-and-nested-payload-eq-checked-marshal-"
+        "v2-pointer-and-nested-dyn-boundary-partial"
     )
     assert "ValueClassType frontend model" in status["implemented"]

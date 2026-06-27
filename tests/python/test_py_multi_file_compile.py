@@ -1,9 +1,11 @@
 """Regression tests for ``compile_python_multi`` — the multi-file
 compile infrastructure (#138.5) that feeds the three-stage bootstrap.
 """
+
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -35,7 +37,8 @@ class MultiFileCompileTests(unittest.TestCase):
             src_paths.append(dst)
         exe = os.path.join(td, "a.out")
         compile_python_multi(
-            src_paths, exe,
+            src_paths,
+            exe,
             entry_module=entry_module,
             module_names=module_names,
         )
@@ -44,6 +47,7 @@ class MultiFileCompileTests(unittest.TestCase):
 
     def _rmtree(self, path):
         import shutil
+
         shutil.rmtree(path, ignore_errors=True)
 
     def test_entry_only_no_siblings(self):
@@ -53,6 +57,58 @@ class MultiFileCompileTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(out, "1\n2\n")
+
+    def test_native_extension_literal_module_dependency_enters_closure(self):
+        from pcc.py_frontend import pipeline
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_extension_literal_import_")
+        self.addCleanup(self._rmtree, td)
+        pkg_dir = os.path.join(td, "pkg")
+        os.makedirs(pkg_dir, exist_ok=True)
+        entry = os.path.join(td, "entry.py")
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write("import pkg.native\n")
+        with open(os.path.join(pkg_dir, "__init__.py"), "w", encoding="utf-8") as fh:
+            fh.write("")
+        hidden = os.path.join(pkg_dir, "hidden.py")
+        with open(hidden, "w", encoding="utf-8") as fh:
+            fh.write("VALUE = 42\n")
+        extension = os.path.join(pkg_dir, "native.pcc_native-test.so")
+        with open(extension, "wb") as fh:
+            fh.write(b"\x00pkg.hidden\x00not.a.real.module\x00")
+
+        with mock.patch.dict(os.environ, {"PCC_PACKAGE_SITE": td}):
+            _srcs, modules = pipeline._collect_multi_source_relative_closure(
+                [entry],
+                ["entry"],
+            )
+
+        self.assertIn("pkg.hidden", modules)
+        self.assertNotIn("not.a.real.module", modules)
+
+    def test_module_scope_same_package_absolute_import_enters_closure(self):
+        from pcc.py_frontend import pipeline
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_absolute_import_")
+        self.addCleanup(self._rmtree, td)
+        pkg_dir = os.path.join(td, "pkg")
+        os.makedirs(pkg_dir, exist_ok=True)
+        entry = os.path.join(pkg_dir, "entry.py")
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write("from pkg.provider import Thing\n")
+            fh.write("def later():\n    from pkg.lazy import Lazy\n")
+        with open(os.path.join(pkg_dir, "provider.py"), "w", encoding="utf-8") as fh:
+            fh.write("class Thing:\n    pass\n")
+        with open(os.path.join(pkg_dir, "lazy.py"), "w", encoding="utf-8") as fh:
+            fh.write("class Lazy:\n    pass\n")
+
+        _srcs, modules = pipeline._collect_multi_source_relative_closure(
+            [entry],
+            ["pkg.entry"],
+        )
+
+        self.assertIn("pkg.provider", modules)
+        self.assertNotIn("pkg.lazy", modules)
 
     def test_multi_compile_backend_self_uses_self_link(self):
         from pcc.py_frontend.pipeline import compile_python_multi
@@ -67,9 +123,7 @@ class MultiFileCompileTests(unittest.TestCase):
             "pcc.py_frontend.pipeline._ensure_runtime",
             return_value="/tmp/libpy_runtime.a",
         ):
-            with mock.patch(
-                "pcc.py_frontend.pipeline._link_with_clang"
-            ) as clang_link:
+            with mock.patch("pcc.py_frontend.pipeline._link_with_clang") as clang_link:
                 with mock.patch(
                     "pcc.py_frontend.pipeline._link_with_self_backend_ir_texts"
                 ) as self_link:
@@ -83,16 +137,20 @@ class MultiFileCompileTests(unittest.TestCase):
         self_link.assert_called_once()
         clang_link.assert_not_called()
 
-    def test_sibling_top_init_runs_before_entry(self):
+    def test_unimported_sibling_top_init_does_not_run(self):
         _, out, code = self._run_multi(
             {
                 "entry.py": 'print("entry")\n',
-                "lib.py":   'print("lib")\n',
+                "lib.py": 'print("lib")\n',
             },
             entry_module="entry",
         )
         self.assertEqual(code, 0)
-        self.assertEqual(out, "lib\nentry\n")
+        # Compiled siblings are registered before entry execution, but Python
+        # module code runs only when imported.  Eagerly executing every source
+        # breaks package-cycle partial-state semantics and makes an unimported
+        # module observable.
+        self.assertEqual(out, "entry\n")
 
     def test_sibling_top_init_has_once_guard(self):
         from pcc.py_frontend.pipeline import compile_python_multi
@@ -128,10 +186,7 @@ class MultiFileCompileTests(unittest.TestCase):
                 "banner()\n"
                 'print("done")\n'
             ),
-            "lib.py": (
-                "def banner() -> None:\n"
-                '    print("banner called")\n'
-            ),
+            "lib.py": ("def banner() -> None:\n" '    print("banner called")\n'),
         }
         _, out, code = self._run_multi(
             files,
@@ -141,6 +196,142 @@ class MultiFileCompileTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, "start\nbanner called\ndone\n")
 
+    def test_cross_module_none_return_extern_uses_void_abi(self):
+        from pcc.py_frontend import pipeline
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_none_return_")
+        self.addCleanup(self._rmtree, td)
+        entry = os.path.join(td, "entry.py")
+        lib = os.path.join(td, "lib.py")
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write("from .lib import touch\n\ntouch()\n")
+        with open(lib, "w", encoding="utf-8") as fh:
+            fh.write("def touch() -> None:\n" "    return\n")
+
+        out_ll = os.path.join(td, "none_return.ll")
+        pipeline.compile_python_multi(
+            [entry, lib],
+            out_ll,
+            entry_module="pkg.entry",
+            module_names=["pkg.entry", "pkg.lib"],
+            emit_llvm_only=True,
+            libpython_mode="off",
+        )
+        with open(out_ll, "r", encoding="utf-8") as fh:
+            ir_text = fh.read()
+
+        sym = "user_pkg_lib_touch"
+        self.assertRegex(ir_text, rf"declare (?:external )?void @{sym}\(\)")
+        self.assertRegex(ir_text, rf"define (?:external )?void @{sym}\(\)")
+        self.assertNotRegex(ir_text, rf"declare (?:external )?ptr @{sym}\(\)")
+        self.assertNotRegex(ir_text, rf"call ptr (?:\(\) )?@{sym}\(\)")
+        self.assertRegex(ir_text, rf"call void (?:\(\) )?@{sym}\(\)")
+
+    def test_tuple_unpack_rebind_to_borrowed_value_does_not_overrelease(self):
+        from pcc.py_frontend import pipeline
+
+        td = tempfile.mkdtemp(prefix="pcc_tuple_unpack_owned_flag_")
+        self.addCleanup(self._rmtree, td)
+        src = os.path.join(td, "entry.py")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import os\n"
+                "\n"
+                "def main() -> None:\n"
+                "    pairs: list[tuple[str, str]] = [\n"
+                "        ('a', 'pkg.a'),\n"
+                "        ('b', 'pkg.b'),\n"
+                "        ('c', 'pkg.c'),\n"
+                "    ]\n"
+                "    for target_src, target_mod in pairs:\n"
+                "        target_src = str(os.path.abspath(target_src))\n"
+                "        print(target_mod)\n"
+                "    print('ok')\n"
+                "\n"
+                "main()\n"
+            )
+
+        exe = os.path.join(td, "entry_bin")
+        pipeline.compile_python(
+            src,
+            exe,
+            backend="self",
+            libpython_mode="off",
+            ir_scaffold_mode="on",
+        )
+        env = os.environ.copy()
+        env.pop("LC_ALL", None)
+        env["PCC_GC_BACKEND"] = "3"
+        env["PCC_DEBUG_RELEASES"] = "1"
+        run = subprocess.run(
+            [exe],
+            text=True,
+            capture_output=True,
+            timeout=20,
+            env=env,
+        )
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("[BAD_INCREF]", run.stderr)
+        self.assertEqual(run.stdout.splitlines(), ["pkg.a", "pkg.b", "pkg.c", "ok"])
+
+    def test_borrowed_object_local_rebind_keeps_gc_root(self):
+        from pcc.py_frontend import pipeline
+
+        td = tempfile.mkdtemp(prefix="pcc_borrowed_local_root_")
+        self.addCleanup(self._rmtree, td)
+        src = os.path.join(td, "entry.py")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(
+                "def scan(source: str) -> str:\n"
+                "    pending = ''\n"
+                "    for raw_line in source.splitlines():\n"
+                "        stripped = raw_line.strip()\n"
+                "        pending = stripped\n"
+                "        pending = pending + 'x'\n"
+                "    return pending\n"
+                "\n"
+                "print(scan('a\\nb'))\n"
+            )
+
+        out_ll = os.path.join(td, "borrowed_local_root.ll")
+        pipeline.compile_python(
+            src,
+            out_ll,
+            emit_llvm_only=True,
+            backend="self",
+            libpython_mode="off",
+            ir_scaffold_mode="on",
+        )
+        with open(out_ll, "r", encoding="utf-8") as fh:
+            ir_text = fh.read()
+
+        pending_root = re.search(
+            r"(?P<slot>%gc\.frame\.slots\.ptr\.[^ ]+) = " r"bitcast ptr %pending\.addr",
+            ir_text,
+        )
+        self.assertIsNotNone(pending_root)
+        self.assertRegex(
+            ir_text,
+            r"call void \(ptr, ptr\) @pcc_gc_frame_enter"
+            r"\(ptr %gc\.frame\.map\.ptr\.[^,]+, ptr "
+            + re.escape(pending_root.group("slot"))
+            + r"\)",
+        )
+        borrowed_rebind = re.search(
+            r"%pending\.local\.copy\.retain[^\n]+ = call ptr \(ptr\) "
+            r"@pcc_gc_retain\(ptr %stripped\.[^\n]+\)"
+            r"(?P<body>(?:(?!%str\.concat).)*?)"
+            r"%str\.concat",
+            ir_text,
+            flags=re.S,
+        )
+        self.assertIsNotNone(borrowed_rebind)
+        self.assertRegex(
+            borrowed_rebind.group("body"),
+            r"store ptr %pending\.owned\.resolve[^\n]+, ptr %pending\.addr",
+        )
+        self.assertNotIn("@pcc_gc_frame_leave", borrowed_rebind.group("body"))
+
     def test_cross_module_function_with_args(self):
         files = {
             "entry.py": (
@@ -148,10 +339,7 @@ class MultiFileCompileTests(unittest.TestCase):
                 "print(adder(3, 4))\n"
                 "print(adder(10, 20))\n"
             ),
-            "lib.py": (
-                "def adder(a: int, b: int) -> int:\n"
-                "    return a + b\n"
-            ),
+            "lib.py": ("def adder(a: int, b: int) -> int:\n" "    return a + b\n"),
         }
         _, out, code = self._run_multi(
             files,
@@ -160,6 +348,26 @@ class MultiFileCompileTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(out, "7\n30\n")
+
+    def test_cross_module_exception_subclass_keeps_constructor_args(self):
+        files = {
+            "entry.py": (
+                "from .errors import ProbeError\n"
+                "try:\n"
+                "    raise ProbeError('hello')\n"
+                "except ProbeError as exc:\n"
+                "    print(str(exc))\n"
+                "    print(exc.args)\n"
+            ),
+            "errors.py": "class ProbeError(Exception):\n    pass\n",
+        }
+        _, out, code = self._run_multi(
+            files,
+            entry_module="pkg.entry",
+            module_names=["pkg.entry", "pkg.errors"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "hello\n('hello',)\n")
 
     def test_package_reexport_chain_stays_native(self):
         """Package ``__init__`` re-exports should not force CPython import calls.
@@ -173,16 +381,10 @@ class MultiFileCompileTests(unittest.TestCase):
         td = tempfile.mkdtemp(prefix="pcc_multi_reexport_chain_")
         self.addCleanup(self._rmtree, td)
         files = {
-            "entry.py": (
-                "from pkg import exported\n"
-                "print(exported(4))\n"
-            ),
+            "entry.py": ("from pkg import exported\n" "print(exported(4))\n"),
             "pkg/__init__.py": "from .mid import *\n",
             "pkg/mid.py": "from .leaf import exported\n",
-            "pkg/leaf.py": (
-                "def exported(x: int) -> int:\n"
-                "    return x + 2\n"
-            ),
+            "pkg/leaf.py": ("def exported(x: int) -> int:\n" "    return x + 2\n"),
         }
         src_paths = []
         for rel, source in files.items():
@@ -238,9 +440,7 @@ class MultiFileCompileTests(unittest.TestCase):
         td = tempfile.mkdtemp(prefix="pcc_multi_if_import_predeclare_")
         self.addCleanup(self._rmtree, td)
         files = {
-            "entry.py": (
-                "import pkg\n"
-            ),
+            "entry.py": ("import pkg\n"),
             "pkg/__init__.py": (
                 "import os\n"
                 "\n"
@@ -254,10 +454,7 @@ class MultiFileCompileTests(unittest.TestCase):
                 "    _sanity_check()\n"
             ),
             "pkg/_core/__init__.py": "from pkg._core.numeric import ones\n",
-            "pkg/_core/numeric.py": (
-                "def ones() -> int:\n"
-                "    return 1\n"
-            ),
+            "pkg/_core/numeric.py": ("def ones() -> int:\n" "    return 1\n"),
         }
         src_paths = []
         module_names = []
@@ -318,10 +515,7 @@ class MultiFileCompileTests(unittest.TestCase):
         td = tempfile.mkdtemp(prefix="pcc_multi_class_reexport_")
         self.addCleanup(self._rmtree, td)
         files = {
-            "entry.py": (
-                "from pkg.user import make\n"
-                "print(make().value)\n"
-            ),
+            "entry.py": ("from pkg.user import make\n" "print(make().value)\n"),
             "pkg/__init__.py": "",
             "pkg/base.py": (
                 "class Base:\n"
@@ -384,10 +578,7 @@ class MultiFileCompileTests(unittest.TestCase):
         td = tempfile.mkdtemp(prefix="pcc_multi_unbound_class_method_")
         self.addCleanup(self._rmtree, td)
         files = {
-            "entry.py": (
-                "from pkg.user import run\n"
-                "run()\n"
-            ),
+            "entry.py": ("from pkg.user import run\n" "run()\n"),
             "pkg/__init__.py": "",
             "pkg/base.py": (
                 "class Base:\n"
@@ -458,13 +649,13 @@ class MultiFileCompileTests(unittest.TestCase):
                 "        return 0\n"
                 "    return VALUES[name]\n\n"
                 "print(direct())\n"
-                "print(lookup(\"b\"))\n"
+                'print(lookup("b"))\n'
             )
         with open(tables, "w", encoding="utf-8") as fh:
             fh.write(
-                "VALUES = {\"a\": 3, \"b\": 4}\n\n"
+                'VALUES = {"a": 3, "b": 4}\n\n'
                 "def direct() -> int:\n"
-                "    return VALUES[\"a\"]\n"
+                '    return VALUES["a"]\n'
             )
 
         out_ll = os.path.join(td, "static_table.ll")
@@ -495,20 +686,94 @@ class MultiFileCompileTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, msg=r.stderr)
         self.assertEqual(r.stdout, "3\n4\n")
 
+    def test_module_tuple_unpack_leaves_are_exported(self):
+        """Module-level destructuring publishes every bound leaf.
+
+        Real packages commonly initialize several exported constants from one
+        helper call.  A compiled sibling must see those bindings through the
+        native module proxy rather than finding only an initializer-local
+        alloca.
+        """
+        from pcc.py_frontend import pipeline
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_module_unpack_")
+        self.addCleanup(self._rmtree, td)
+        entry = os.path.join(td, "entry.py")
+        values = os.path.join(td, "values.py")
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write("from . import values\nprint(values.C)\n")
+        with open(values, "w", encoding="utf-8") as fh:
+            fh.write(
+                "def constants():\n"
+                "    return (10, 32)\n\n"
+                "A, B = constants()\n"
+                "C = B\n"
+            )
+
+        exe = os.path.join(td, "module_unpack.out")
+        pipeline.compile_python_multi(
+            [entry, values],
+            exe,
+            entry_module="pkg.entry",
+            module_names=["pkg.entry", "pkg.values"],
+            libpython_mode="off",
+            ir_scaffold_mode="on",
+            backend="self",
+        )
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertEqual(r.stdout, "32\n")
+
+    def test_conditional_self_unpack_overrides_class_attributes(self):
+        _, out, code = self._run_multi(
+            {
+                "entry.py": """
+                    class Pair:
+                        left = "class-left"
+                        right = "class-right"
+
+                        def __init__(self, values):
+                            if values is not None:
+                                self.left, self.right = values
+
+                        def show(self):
+                            print(self.left)
+                            print(self.right)
+
+                    Pair(("instance-left", "instance-right")).show()
+                """,
+            },
+            entry_module="entry",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "instance-left\ninstance-right\n")
+
+    def test_module_block_function_definition_binds_name(self):
+        """A conditional module-scope ``def`` executes a name binding."""
+        _, out, code = self._run_multi(
+            {
+                "entry.py": (
+                    "if False:\n"
+                    "    selected = int\n"
+                    "else:\n"
+                    "    def selected(value):\n"
+                    "        return int(value) + 1\n"
+                    "print(selected('41'))\n"
+                )
+            },
+            entry_module="entry",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "42\n")
+
     def test_no_libpython_dep(self):
         """Produced binaries must link only libSystem / libc++,
         confirming the multi-file path doesn't pull libpython
         through py_cpy_import for native sibling imports."""
         exe, _, code = self._run_multi(
             {
-                "entry.py": (
-                    "from .lib import greet\n"
-                    "greet()\n"
-                ),
-                "lib.py": (
-                    "def greet() -> None:\n"
-                    '    print("hi")\n'
-                ),
+                "entry.py": ("from .lib import greet\n" "greet()\n"),
+                "lib.py": ("def greet() -> None:\n" '    print("hi")\n'),
             },
             entry_module="pkg.entry",
             module_names=["pkg.entry", "pkg.lib"],
@@ -519,7 +784,9 @@ class MultiFileCompileTests(unittest.TestCase):
         if os.uname().sysname != "Darwin":
             self.skipTest("link-lib check is macOS-specific")
         r = subprocess.run(
-            ["otool", "-L", exe], capture_output=True, text=True,
+            ["otool", "-L", exe],
+            capture_output=True,
+            text=True,
         )
         self.assertEqual(r.returncode, 0)
         self.assertNotIn("Python", r.stdout)
@@ -536,11 +803,7 @@ class MultiFileCompileTests(unittest.TestCase):
         self.addCleanup(self._rmtree, td)
         entry = os.path.join(td, "entry.py")
         with open(entry, "w", encoding="utf-8") as fh:
-            fh.write(
-                "def run() -> None:\n"
-                "    from . import helper\n\n"
-                "run()\n"
-            )
+            fh.write("def run() -> None:\n" "    from . import helper\n\n" "run()\n")
         out_ll = os.path.join(td, "entry.ll")
         compile_python_multi(
             [entry],
@@ -552,9 +815,53 @@ class MultiFileCompileTests(unittest.TestCase):
         )
         with open(out_ll, "r", encoding="utf-8") as fh:
             ir_text = fh.read()
-        self.assertIn("@.cpy.mod.pkg =", ir_text)
+        self.assertRegex(
+            ir_text,
+            r'@[\w.$]*\.cpy\.mod\.pkg = (?:internal )?constant \[4 x i8\] c"pkg\\00"',
+        )
         self.assertIn("%cpy.fromimport.pkg", ir_text)
-        self.assertNotIn("@.cpy.mod. =", ir_text)
+        self.assertNotRegex(
+            ir_text,
+            r"@[\w.$]*\.cpy\.mod\. = (?:internal )?constant",
+        )
+
+    def test_relative_package_attribute_pulls_init_into_native_closure(self):
+        """``from . import Name`` may import an ``__init__.py`` attribute.
+
+        The automatic multi-file closure must include the package module as
+        well as trying ``pkg.Name`` as a possible sibling module.  Otherwise
+        an exported exception class silently lowers through ``py_cpy_call1``.
+        """
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_package_attr_")
+        self.addCleanup(self._rmtree, td)
+        pkg_dir = os.path.join(td, "pkg")
+        os.makedirs(pkg_dir, exist_ok=True)
+        pkg_init = os.path.join(pkg_dir, "__init__.py")
+        entry = os.path.join(pkg_dir, "entry.py")
+        with open(pkg_init, "w", encoding="utf-8") as fh:
+            fh.write("class PackageError(Exception):\n    pass\n")
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write(
+                "from . import PackageError\n\n"
+                "def fail() -> None:\n"
+                "    raise PackageError('boom')\n"
+            )
+        out_ll = os.path.join(td, "entry.ll")
+        compile_python_multi(
+            [entry],
+            out_ll,
+            entry_module="pkg.entry",
+            module_names=["pkg.entry"],
+            emit_llvm_only=True,
+            backend="self",
+            libpython_mode="off",
+        )
+        with open(out_ll, "r", encoding="utf-8") as fh:
+            ir_text = fh.read()
+        self.assertIn("; ---- module: pkg ----", ir_text)
+        self.assertNotRegex(ir_text, r"\bcall [^\n]*@py_cpy_")
 
     def test_missing_native_relative_import_raises_importerror_without_libpython(self):
         """A missing same-package optional import should raise native
@@ -652,6 +959,83 @@ class MultiFileCompileTests(unittest.TestCase):
         self.assertNotIn("call ptr (ptr) @py_cpy_import", ir_text)
         self.assertNotIn("call ptr (ptr, ptr) @py_cpy_getattr", ir_text)
 
+    def test_self_submodule_import_from_parent_uses_native_module_attrs(self):
+        """A compiled ``pkg.sub`` can use ``from pkg import sub`` to publish
+        into its live module namespace without materialising a host package."""
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_self_submodule_import_")
+        self.addCleanup(self._rmtree, td)
+        entry = os.path.join(td, "sub.py")
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write(
+                "def roundtrip(value):\n"
+                "    from pkg import sub\n"
+                "    setattr(sub, 'published', value)\n"
+                "    return value\n"
+                "print(roundtrip(7))\n"
+            )
+
+        exe = os.path.join(td, "self_submodule_import")
+        compile_python_multi(
+            [entry],
+            exe,
+            entry_module="pkg.sub",
+            module_names=["pkg.sub"],
+            backend="self",
+            libpython_mode="off",
+        )
+        result = subprocess.run([exe], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stdout, "7\n")
+
+        out_ll = os.path.join(td, "self_submodule_import.ll")
+        compile_python_multi(
+            [entry],
+            out_ll,
+            entry_module="pkg.sub",
+            module_names=["pkg.sub"],
+            emit_llvm_only=True,
+            backend="self",
+            libpython_mode="off",
+        )
+        with open(out_ll, "r", encoding="utf-8") as fh:
+            ir_text = fh.read()
+        self.assertNotIn("call ptr (ptr) @py_cpy_import", ir_text)
+        self.assertIn("@py_module_attr_set", ir_text)
+
+    def test_dynamic_native_module_attrs_calls_and_sys_modules_stay_native(self):
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_dynamic_module_attrs_")
+        self.addCleanup(self._rmtree, td)
+        entry = os.path.join(td, "entry.py")
+        helper = os.path.join(td, "helper.py")
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import sys\n"
+                "from . import helper\n"
+                "print(hasattr(helper, 'late'))\n"
+                "print(helper.make() != helper.make())\n"
+                "if not hasattr(helper, 'late'):\n"
+                "    print(sys.modules['pkg.helper'].__path__)\n"
+            )
+        with open(helper, "w", encoding="utf-8") as fh:
+            fh.write("globals()['late'] = 1\n" "globals()['make'] = lambda: {'x': 1}\n")
+
+        exe = os.path.join(td, "dynamic_module_attrs")
+        compile_python_multi(
+            [entry, helper],
+            exe,
+            entry_module="pkg.entry",
+            module_names=["pkg.entry", "pkg.helper"],
+            backend="self",
+            libpython_mode="off",
+        )
+        result = subprocess.run([exe], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stdout, "True\nFalse\n")
+
     def test_self_dunder_class_constructor_starstar_kwargs_without_libpython(self):
         """A `self.__class__(..., **kwargs)` clone shape should avoid
         libpython call fallback in no-libpython mode."""
@@ -665,7 +1049,7 @@ class MultiFileCompileTests(unittest.TestCase):
                 "class EnvironmentConfig:\n"
                 "    def __init__(self, distutils_section=None, noopt=None, noarch=None):\n"
                 "        self._distutils_section = distutils_section\n"
-                "        self._conf_keys = {\"noopt\": noopt, \"noarch\": noarch}\n"
+                '        self._conf_keys = {"noopt": noopt, "noarch": noarch}\n'
                 "\n"
                 "    def clone(self):\n"
                 "        return self.__class__(\n"
@@ -673,11 +1057,11 @@ class MultiFileCompileTests(unittest.TestCase):
                 "            **self._conf_keys,\n"
                 "        )\n"
                 "\n"
-                "obj = EnvironmentConfig(\"build\", \"0\", \"1\")\n"
+                'obj = EnvironmentConfig("build", "0", "1")\n'
                 "copy = obj.clone()\n"
                 "print(copy._distutils_section)\n"
-                "print(copy._conf_keys[\"noopt\"])\n"
-                "print(copy._conf_keys[\"noarch\"])\n"
+                'print(copy._conf_keys["noopt"])\n'
+                'print(copy._conf_keys["noarch"])\n'
             )
 
         exe = os.path.join(td, "dunder_class_ctor")
@@ -723,10 +1107,7 @@ class MultiFileCompileTests(unittest.TestCase):
             fh.write("abcdef")
         entry = os.path.join(td, "entry.py")
         with open(entry, "w", encoding="utf-8") as fh:
-            fh.write(
-                "import os\n"
-                f"print(os.path.getsize({data!r}))\n"
-            )
+            fh.write("import os\n" f"print(os.path.getsize({data!r}))\n")
 
         exe = os.path.join(td, "getsize")
         with mock.patch.dict(
@@ -955,9 +1336,7 @@ class MultiFileCompileTests(unittest.TestCase):
             fh.write("VALUE = 1\n")
         with open(types_py, "w", encoding="utf-8") as fh:
             fh.write(
-                "class Marker:\n"
-                "    def value(self) -> int:\n"
-                "        return 7\n"
+                "class Marker:\n" "    def value(self) -> int:\n" "        return 7\n"
             )
         with open(entry, "w", encoding="utf-8") as fh:
             fh.write(
@@ -1035,12 +1414,15 @@ class MultiFileCompileTests(unittest.TestCase):
         entry = os.path.join(td, "entry.py")
         with open(entry, "w", encoding="utf-8") as fh:
             fh.write(
-                "from typing import Any, Literal, Sequence, Union\n"
+                "from typing import Any, Literal, Sequence, TypeAlias, "
+                "TypeAliasType, Union\n"
                 "import typing\n\n"
                 "_BoolCodes = Literal['bool', '?', 'b1']\n"
                 "_MoreCodes = Literal[_BoolCodes, 'i4']\n"
                 "_MaybeCodes = Union[_MoreCodes, Sequence[Any]]\n"
                 "_OtherCodes = typing.Literal['x', 'y']\n"
+                "_ScalarAlias: TypeAlias = tuple[Any, ...] | int\n"
+                "_PublicAlias = TypeAliasType('PublicAlias', _ScalarAlias)\n"
                 "print('runtime')\n"
             )
 
@@ -1077,6 +1459,79 @@ class MultiFileCompileTests(unittest.TestCase):
                     line,
                 )
 
+    def test_typing_metadata_aliases_survive_native_reexports(self):
+        """Compiled siblings must not materialize typing-only exports."""
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_typing_reexport_")
+        self.addCleanup(self._rmtree, td)
+        provider = os.path.join(td, "provider.py")
+        facade = os.path.join(td, "facade.py")
+        entry = os.path.join(td, "entry.py")
+        with open(provider, "w", encoding="utf-8") as fh:
+            fh.write(
+                "from typing import Literal, TypeAlias\n\n"
+                "AnyShape: TypeAlias = tuple[object, ...]\n"
+                "Codes = Literal['x', 'y']\n"
+            )
+        with open(facade, "w", encoding="utf-8") as fh:
+            fh.write(
+                "from .provider import AnyShape as AnyShape, Codes as Codes\n"
+            )
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write(
+                "from .facade import AnyShape, Codes\n\n"
+                "print('typing reexport')\n"
+            )
+
+        exe = os.path.join(td, "typing_reexport")
+        compile_python_multi(
+            [provider, facade, entry],
+            exe,
+            entry_module="pkg.entry",
+            module_names=["pkg.provider", "pkg.facade", "pkg.entry"],
+            backend="self",
+            libpython_mode="off",
+        )
+        run = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "typing reexport\n")
+
+    def test_compiled_sibling_module_docstring_is_importable(self):
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_module_docstring_")
+        self.addCleanup(self._rmtree, td)
+        provider = os.path.join(td, "provider.py")
+        entry = os.path.join(td, "entry.py")
+        with open(provider, "w", encoding="utf-8") as fh:
+            fh.write('"""provider docs"""\n')
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write("from .provider import __doc__\nprint(__doc__)\n")
+
+        exe = os.path.join(td, "module_docstring")
+        compile_python_multi(
+            [provider, entry],
+            exe,
+            entry_module="pkg.entry",
+            module_names=["pkg.provider", "pkg.entry"],
+            backend="self",
+            libpython_mode="off",
+        )
+        run = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "provider docs\n")
+
     def test_multi_compile_auto_closes_relative_sibling_sources(self):
         """Explicit multi-file compiles should recursively add missing
         relative-import siblings, so callers can seed just the entry
@@ -1090,15 +1545,9 @@ class MultiFileCompileTests(unittest.TestCase):
         entry = os.path.join(pkg_dir, "main.py")
         helper = os.path.join(pkg_dir, "helper.py")
         with open(entry, "w", encoding="utf-8") as fh:
-            fh.write(
-                "from .helper import answer\n\n"
-                "print(answer())\n"
-            )
+            fh.write("from .helper import answer\n\n" "print(answer())\n")
         with open(helper, "w", encoding="utf-8") as fh:
-            fh.write(
-                "def answer() -> int:\n"
-                "    return 42\n"
-            )
+            fh.write("def answer() -> int:\n" "    return 42\n")
 
         exe = os.path.join(td, "auto_closure.out")
         compile_python_multi(
@@ -1113,7 +1562,9 @@ class MultiFileCompileTests(unittest.TestCase):
 
         if os.uname().sysname == "Darwin":
             lk = subprocess.run(
-                ["otool", "-L", exe], capture_output=True, text=True,
+                ["otool", "-L", exe],
+                capture_output=True,
+                text=True,
             )
             self.assertEqual(lk.returncode, 0)
             self.assertNotIn("Python", lk.stdout)
@@ -1134,17 +1585,11 @@ class MultiFileCompileTests(unittest.TestCase):
         sub_init = os.path.join(sub_dir, "__init__.py")
         helper = os.path.join(sub_dir, "helper.py")
         with open(entry, "w", encoding="utf-8") as fh:
-            fh.write(
-                "from .sub import helper\n\n"
-                "print(helper.answer())\n"
-            )
+            fh.write("from .sub import helper\n\n" "print(helper.answer())\n")
         with open(sub_init, "w", encoding="utf-8") as fh:
             fh.write("")
         with open(helper, "w", encoding="utf-8") as fh:
-            fh.write(
-                "def answer() -> int:\n"
-                "    return 7\n"
-            )
+            fh.write("def answer() -> int:\n" "    return 7\n")
 
         exe = os.path.join(td, "submodule_alias.out")
         compile_python_multi(

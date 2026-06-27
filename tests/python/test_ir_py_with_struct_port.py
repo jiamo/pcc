@@ -49,8 +49,8 @@ def test_ir_py_functions_stay_no_cpy_with_recursive_stdlib():
         assert out_baseline.exists()
         assert out_with_port.exists()
 
-        baseline_text = out_baseline.read_text()
-        with_port_text = out_with_port.read_text()
+        baseline_text = out_baseline.read_text(encoding="utf-8")
+        with_port_text = out_with_port.read_text(encoding="utf-8")
 
         n_baseline = _count_py_cpy_in_module_funcs(
             baseline_text, "user_pcc_llvm_capi_ir_",
@@ -74,7 +74,7 @@ def test_ir_py_inline_float_bits_helpers_are_compiled():
             emit_llvm_only=True, ir_scaffold_mode="on",
             recursive_stdlib=True,
         )
-        text = out.read_text()
+        text = out.read_text(encoding="utf-8")
         assert re.search(
             r"@user_pcc_llvm_capi_ir__float64_to_bits_ir\b", text,
         ), "ir._float64_to_bits_ir should be defined"
@@ -97,6 +97,6 @@ def test_ir_py_recursive_stdlib_does_not_pull_struct_port():
             recursive_stdlib=True,
         )
 
-        text = out_combined.read_text()
+        text = out_combined.read_text(encoding="utf-8")
         assert "@user_pcc_stdlib_struct_" not in text
         assert "@user_pcc_stdlib__float_bits_" not in text

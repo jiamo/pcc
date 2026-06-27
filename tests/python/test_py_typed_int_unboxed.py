@@ -1,4 +1,4 @@
-"""Typed-int user functions should use native scalar lowering when safe."""
+"""Typed-int projection gates for default tagged ints and explicit raw-i64 mode."""
 
 from __future__ import annotations
 
@@ -71,6 +71,14 @@ _TYPED_FLOAT_LOOP = textwrap.dedent("""
     """)
 
 
+_TYPED_PURE_FLOAT = textwrap.dedent("""
+    def scale(x: float, y: float) -> float:
+        return (x + y) * 2.0
+
+    print(scale(1.25, 2.5))
+    """)
+
+
 _TYPED_FUNCTION_CALL_LOOP = textwrap.dedent("""
     def bump(x: int) -> int:
         return x + 2
@@ -90,7 +98,72 @@ _TYPED_FUNCTION_CALL_LOOP = textwrap.dedent("""
     """)
 
 
-def test_typed_int_loop_uses_unboxed_function_abi(tmp_path):
+_TYPED_RANGE_LOOP = textwrap.dedent("""
+    def sum_range(n: int) -> int:
+        total: int = 0
+        for i in range(n):
+            total = total + i
+        return total
+
+    print(sum_range(10))
+    """)
+
+
+_TYPED_RANGE_ESCAPE = textwrap.dedent("""
+    from typing import Any
+
+    def keep(value: Any) -> Any:
+        return value
+
+    def bump(value: int) -> int:
+        return value + 1
+
+    def last(n: int) -> int:
+        result: int = 0
+        for i in range(n):
+            result = bump(keep(i))
+        return result
+
+    print(last(5))
+    """)
+
+
+def _enable_unsafe_i64(monkeypatch):
+    monkeypatch.setenv("PCC_PYTHON_TYPED_INT_ABI", "unsafe-i64")
+
+
+def _assert_no_class_or_valuebox_allocation(body: str) -> None:
+    assert "@py_instance_new" not in body, body
+    assert "@py_valuebox_new" not in body, body
+
+
+def test_typed_int_loop_defaults_to_boxed_tagged_shape(tmp_path):
+    ir_text = _compile_to_ll(tmp_path, _TYPED_LOOP, "typed_loop_tagged")
+    assert re.search(
+        r"define\s+ptr\s+@user_[A-Za-z0-9_]*_bench\s*\(ptr\s+%n\)",
+        ir_text,
+    ), ir_text
+    assert not re.search(
+        r"define\s+i64\s+@user_[A-Za-z0-9_]*_bench\s*\(",
+        ir_text,
+    ), ir_text
+    body = _fn_body(ir_text, "bench")
+    assert body is not None, ir_text
+    assert "int.tag.fast" in body, body
+    assert "tag.add" in body, body
+    assert "@py_int_add" in body, body
+    assert "@py_int_mod" in body, body
+    assert "@py_int_floordiv" in body, body
+    assert "@py_obj_call" not in body, body
+    assert "@py_cpy_" not in body, body
+    _assert_no_class_or_valuebox_allocation(body)
+
+
+def test_unsafe_i64_typed_int_loop_uses_unboxed_function_abi(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_unsafe_i64(monkeypatch)
     ir_text = _compile_to_ll(tmp_path, _TYPED_LOOP, "typed_loop_unboxed")
     assert re.search(
         r"define\s+i64\s+@user_[A-Za-z0-9_]*_bench\s*\(i64\s+%n\)",
@@ -109,7 +182,34 @@ def test_typed_int_loop_uses_unboxed_function_abi(tmp_path):
     assert "low.while.cond" in body, body
 
 
-def test_typed_list_int_loop_keeps_accumulator_unboxed(tmp_path):
+def test_typed_list_int_loop_defaults_to_boxed_tagged_shape(tmp_path):
+    ir_text = _compile_to_ll(tmp_path, _TYPED_LIST_LOOP, "typed_list_int_tagged")
+    assert re.search(
+        r"define\s+ptr\s+@user_[A-Za-z0-9_]*_sum_ints\s*\(ptr\s+%xs\)",
+        ir_text,
+    ), ir_text
+    assert not re.search(
+        r"define\s+i64\s+@user_[A-Za-z0-9_]*_sum_ints\s*\(",
+        ir_text,
+    ), ir_text
+    body = _fn_body(ir_text, "sum_ints")
+    assert body is not None, ir_text
+    assert "int.tag.fast" in body, body
+    assert "tag.add" in body, body
+    assert "@py_int_add" in body, body
+    assert "@py_list_get(" in body, body
+    assert "@py_list_get_i64_nonnegative" not in body, body
+    assert "@py_list_get_i64(" not in body, body
+    assert "@py_obj_call" not in body, body
+    assert "@py_cpy_" not in body, body
+    _assert_no_class_or_valuebox_allocation(body)
+
+
+def test_unsafe_i64_typed_list_int_loop_keeps_accumulator_unboxed(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_unsafe_i64(monkeypatch)
     ir_text = _compile_to_ll(tmp_path, _TYPED_LIST_LOOP, "typed_list_int_loop")
     assert re.search(
         r"define\s+i64\s+@user_[A-Za-z0-9_]*_sum_ints\s*\(ptr\s+%xs\)",
@@ -128,7 +228,56 @@ def test_typed_list_int_loop_keeps_accumulator_unboxed(tmp_path):
     assert "@py_cpy_" not in body, body
 
 
-def test_typed_function_call_loop_uses_unboxed_direct_calls(tmp_path):
+def test_typed_function_call_loop_defaults_to_boxed_tagged_direct_calls(tmp_path):
+    ir_text = _compile_to_ll(
+        tmp_path,
+        _TYPED_FUNCTION_CALL_LOOP,
+        "typed_function_call_loop_tagged",
+    )
+    for fn_name, arg_name in (
+        ("bump", "x"),
+        ("step", "i"),
+        ("bench", "n"),
+    ):
+        assert re.search(
+            rf"define\s+ptr\s+@user_[A-Za-z0-9_]*_{fn_name}\s*\(ptr\s+%{arg_name}\)",
+            ir_text,
+        ), ir_text
+        assert not re.search(
+            rf"define\s+i64\s+@user_[A-Za-z0-9_]*_{fn_name}\s*\(",
+            ir_text,
+        ), ir_text
+    bump_body = _fn_body(ir_text, "bump")
+    step_body = _fn_body(ir_text, "step")
+    bench_body = _fn_body(ir_text, "bench")
+    assert bump_body is not None, ir_text
+    assert step_body is not None, ir_text
+    assert bench_body is not None, ir_text
+    assert "int.tag.fast" in bump_body, bump_body
+    assert "tag.add" in bump_body, bump_body
+    assert "@py_int_add" in bump_body, bump_body
+    assert "@py_int_mod" in step_body, step_body
+    assert re.search(
+        r"call\s+ptr\s+@user_[A-Za-z0-9_]*_bump\s*\(ptr\s+%",
+        step_body,
+    ), step_body
+    assert re.search(
+        r"call\s+ptr\s+@user_[A-Za-z0-9_]*_step\s*\(ptr\s+%",
+        bench_body,
+    ), bench_body
+    assert "int.tag.fast" in bench_body, bench_body
+    assert "tag.add" in bench_body, bench_body
+    for body in (bump_body, step_body, bench_body):
+        assert "@py_obj_call" not in body, body
+        assert "@py_cpy_" not in body, body
+        _assert_no_class_or_valuebox_allocation(body)
+
+
+def test_unsafe_i64_typed_function_call_loop_uses_unboxed_direct_calls(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_unsafe_i64(monkeypatch)
     ir_text = _compile_to_ll(
         tmp_path,
         _TYPED_FUNCTION_CALL_LOOP,
@@ -175,7 +324,7 @@ def test_typed_list_i64_runtime_helpers_match_c_fast_path():
         "py_list_len",
     ):
         match = re.search(
-            rf'def {helper}\([^)]*\).*?(?=\n\n@c_abi_export|\n\n@c_abi_export|\Z)',
+            rf"def {helper}\([^)]*\).*?(?=\n\n@c_abi_export|\n\n@c_abi_export|\Z)",
             text,
             re.DOTALL,
         )
@@ -184,7 +333,8 @@ def test_typed_list_i64_runtime_helpers_match_c_fast_path():
         assert "_list_is_sane" not in body, body
 
 
-def test_typed_list_int_loop_runs_without_libpython(tmp_path):
+def test_unsafe_i64_typed_list_int_loop_runs_without_libpython(tmp_path, monkeypatch):
+    _enable_unsafe_i64(monkeypatch)
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "typed_list_int_loop_run.py"
@@ -206,7 +356,11 @@ def test_typed_list_int_loop_runs_without_libpython(tmp_path):
     assert run.stdout == "10\n"
 
 
-def test_typed_list_int_loop_falls_back_for_heap_int_elements(tmp_path):
+def test_unsafe_i64_typed_list_int_loop_falls_back_for_heap_int_elements(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_unsafe_i64(monkeypatch)
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "typed_list_heap_int_loop_run.py"
@@ -239,7 +393,29 @@ def test_typed_list_int_loop_falls_back_for_heap_int_elements(tmp_path):
     assert run.stdout == "4611686018427387905\n"
 
 
-def test_typed_float_loop_uses_unboxed_low_ir_function_abi(tmp_path):
+def test_typed_float_only_signature_uses_unboxed_low_ir_function_abi(tmp_path):
+    ir_text = _compile_to_ll(
+        tmp_path,
+        _TYPED_PURE_FLOAT,
+        "typed_pure_float_unboxed",
+    )
+    assert re.search(
+        r"define\s+double\s+@user_[A-Za-z0-9_]*_scale\s*"
+        r"\(double\s+%x,\s*double\s+%y\)",
+        ir_text,
+    ), ir_text
+    body = _fn_body(ir_text, "scale")
+    assert body is not None, ir_text
+    assert "fadd" in body, body
+    assert "fmul" in body, body
+    assert "@py_float_" not in body, body
+    assert "@py_int_" not in body, body
+    assert "@py_obj_call" not in body, body
+    assert "@py_cpy_" not in body, body
+
+
+def test_unsafe_i64_typed_float_loop_uses_int_counter_param(tmp_path, monkeypatch):
+    _enable_unsafe_i64(monkeypatch)
     ir_text = _compile_to_ll(tmp_path, _TYPED_FLOAT_LOOP, "typed_float_loop_unboxed")
     assert re.search(
         r"define\s+double\s+@user_[A-Za-z0-9_]*_bench\s*\(i64\s+%n\)",
@@ -258,10 +434,11 @@ def test_typed_float_loop_uses_unboxed_low_ir_function_abi(tmp_path):
     assert "@py_cpy_" not in body, body
 
 
-def test_typed_float_loop_low_ir_can_be_disabled_as_layer1_oracle(
+def test_unsafe_i64_typed_float_loop_low_ir_can_be_disabled_as_layer1_oracle(
     tmp_path,
     monkeypatch,
 ):
+    _enable_unsafe_i64(monkeypatch)
     monkeypatch.setenv("PCC_PYTHON_LOW_IR", "off")
     ir_text = _compile_to_ll(tmp_path, _TYPED_FLOAT_LOOP, "typed_float_loop_legacy")
     body = _fn_body(ir_text, "bench")
@@ -271,7 +448,8 @@ def test_typed_float_loop_low_ir_can_be_disabled_as_layer1_oracle(
     assert "@py_float_" not in body, body
 
 
-def test_typed_float_unboxed_loop_runs_without_libpython(tmp_path):
+def test_unsafe_i64_typed_float_loop_runs_without_libpython(tmp_path, monkeypatch):
+    _enable_unsafe_i64(monkeypatch)
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "typed_float_loop_run.py"
@@ -296,7 +474,7 @@ def test_typed_float_unboxed_loop_runs_without_libpython(tmp_path):
     assert run.stdout == f"{expected}\n"
 
 
-def test_typed_int_unboxed_abi_can_be_disabled(tmp_path, monkeypatch):
+def test_typed_int_abi_off_matches_boxed_tagged_shape(tmp_path, monkeypatch):
     monkeypatch.setenv("PCC_PYTHON_TYPED_INT_ABI", "off")
     ir_text = _compile_to_ll(tmp_path, _TYPED_LOOP, "typed_loop_boxed")
     assert re.search(
@@ -305,12 +483,19 @@ def test_typed_int_unboxed_abi_can_be_disabled(tmp_path, monkeypatch):
     ), ir_text
     body = _fn_body(ir_text, "bench")
     assert body is not None, ir_text
+    assert "int.tag.fast" in body, body
+    assert "tag.add" in body, body
     assert "@py_int_cmp" in body, body
     assert "@py_int_mod" in body, body
     assert "@py_int_floordiv" in body, body
+    _assert_no_class_or_valuebox_allocation(body)
 
 
-def test_typed_int_low_ir_can_be_disabled_as_layer1_oracle(tmp_path, monkeypatch):
+def test_unsafe_i64_typed_int_low_ir_can_be_disabled_as_layer1_oracle(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_unsafe_i64(monkeypatch)
     low_ir_text = _compile_to_ll(tmp_path, _TYPED_LOOP, "typed_loop_low_ir")
     low_body = _fn_body(low_ir_text, "bench")
     assert low_body is not None, low_ir_text
@@ -327,7 +512,11 @@ def test_typed_int_low_ir_can_be_disabled_as_layer1_oracle(tmp_path, monkeypatch
     assert "sdiv" in legacy_body, legacy_body
 
 
-def test_typed_int_unboxed_loop_runs_without_libpython(tmp_path):
+def test_unsafe_i64_typed_int_unboxed_loop_runs_without_libpython(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_unsafe_i64(monkeypatch)
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "typed_loop_run.py"
@@ -361,7 +550,174 @@ _TYPED_DIRECT_CALL = textwrap.dedent("""
     """)
 
 
-def test_typed_int_direct_call_uses_low_ir_and_runs_without_libpython(tmp_path):
+_TYPED_TAGGED_MUL = textwrap.dedent("""
+    def mul(a: int, b: int) -> int:
+        return a * b
+
+    def main():
+        print(mul(6, 7))
+        print(mul(4611686018427387903, 2))
+        print(mul(1099511627776, 1099511627776))
+
+    main()
+    """)
+
+
+def test_typed_int_annotations_default_to_boxed_tagged_abi(tmp_path):
+    ir_text = _compile_to_ll(tmp_path, _TYPED_DIRECT_CALL, "typed_direct_call_boxed")
+    assert re.search(
+        r"define\s+ptr\s+@user_[A-Za-z0-9_]*_add\s*" r"\(ptr\s+%a,\s*ptr\s+%b\)",
+        ir_text,
+    ), ir_text
+    assert not re.search(
+        r"define\s+i64\s+@user_[A-Za-z0-9_]*_add\s*\(",
+        ir_text,
+    ), ir_text
+    body = _fn_body(ir_text, "add")
+    assert body is not None, ir_text
+    assert "@py_int_add" in body, body
+
+
+def test_typed_int_direct_call_defaults_to_boxed_tagged_shape_and_runs(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    ir_text = _compile_to_ll(tmp_path, _TYPED_DIRECT_CALL, "typed_direct_call_tagged")
+    add_body = _fn_body(ir_text, "add")
+    bench_body = _fn_body(ir_text, "bench")
+    assert add_body is not None, ir_text
+    assert bench_body is not None, ir_text
+    assert "int.tag.fast" in add_body, add_body
+    assert "tag.add" in add_body, add_body
+    assert "@py_int_add" in add_body, add_body
+    assert re.search(
+        r"call\s+ptr\s+@user_[A-Za-z0-9_]*_add\s*\(ptr\s+%n,",
+        bench_body,
+    ), bench_body
+    assert "low.call" not in bench_body, bench_body
+    assert "@py_obj_call" not in bench_body, bench_body
+    _assert_no_class_or_valuebox_allocation(add_body)
+    _assert_no_class_or_valuebox_allocation(bench_body)
+
+    src = tmp_path / "typed_direct_call_tagged.py"
+    exe = tmp_path / "typed_direct_call_tagged.out"
+    src.write_text(_TYPED_DIRECT_CALL, encoding="utf-8")
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="off",
+        backend="self",
+    )
+    run = subprocess.run(
+        [str(exe)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    assert run.stdout == "42\n"
+
+
+def test_for_range_induction_keeps_raw_i64_lane_under_boxed_int_mode(tmp_path):
+    ir_text = _compile_to_ll(tmp_path, _TYPED_RANGE_LOOP, "typed_range_induction")
+    assert re.search(
+        r"define\s+ptr\s+@user_[A-Za-z0-9_]*_sum_range\s*\(ptr\s+%n\)",
+        ir_text,
+    ), ir_text
+    body = _fn_body(ir_text, "sum_range")
+    assert body is not None, ir_text
+    assert re.search(r"%i\.range\.addr[^=]*=\s+phi\s+i64", body), body
+    assert re.search(r"icmp\s+slt\s+i64\s+%i\.range\.addr", body), body
+    assert re.search(r"add\s+i64\s+%i\.range\.addr", body), body
+    assert "range.int.obj" in body, body
+    assert "@py_int_from_i64" in body, body
+    assert "@py_obj_call" not in body, body
+    assert "@py_cpy_" not in body, body
+
+
+def test_for_range_raw_lane_reboxes_before_dyn_and_typed_calls(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    ir_text = _compile_to_ll(tmp_path, _TYPED_RANGE_ESCAPE, "typed_range_escape")
+    body = _fn_body(ir_text, "last")
+    assert body is not None, ir_text
+    assert re.search(r"%i\.range\.addr[^=]*=\s+phi\s+i64", body), body
+    assert "range.int.obj" in body, body
+    assert "@py_int_from_i64" in body, body
+    assert re.search(
+        r"call\s+ptr\s+@user_[A-Za-z0-9_]*_keep\s*\(ptr\s+%",
+        body,
+    ), body
+    assert re.search(
+        r"call\s+ptr\s+@user_[A-Za-z0-9_]*_bump\s*\(ptr\s+%",
+        body,
+    ), body
+    assert not re.search(
+        r"call\s+i64\s+@user_[A-Za-z0-9_]*_(?:keep|bump)\s*\(",
+        body,
+    ), body
+    assert "@py_cpy_" not in body, body
+
+    src = tmp_path / "typed_range_escape.py"
+    exe = tmp_path / "typed_range_escape.out"
+    src.write_text(_TYPED_RANGE_ESCAPE, encoding="utf-8")
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="off",
+        backend="self",
+    )
+    run = subprocess.run(
+        [str(exe)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    assert run.stdout == "5\n"
+
+
+def test_tagged_int_mul_uses_inline_overflow_fast_path(tmp_path):
+    ir_text = _compile_to_ll(tmp_path, _TYPED_TAGGED_MUL, "typed_tagged_mul")
+    body = _fn_body(ir_text, "mul")
+    assert body is not None, ir_text
+    assert "int.tag.fast" in body, body
+    assert "llvm.smul.with.overflow.i64" in ir_text, ir_text
+    assert "tag.mul" in body, body
+    assert "@py_int_mul" in body, body
+    assert "tag.fits" in body, body
+
+
+def test_tagged_int_mul_fast_path_runs_without_libpython(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "typed_tagged_mul_run.py"
+    exe = tmp_path / "typed_tagged_mul_run.out"
+    src.write_text(_TYPED_TAGGED_MUL, encoding="utf-8")
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="off",
+        backend="self",
+    )
+    run = subprocess.run(
+        [str(exe)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    assert run.stdout.splitlines() == [
+        "42",
+        "9223372036854775806",
+        "1208925819614629174706176",
+    ]
+
+
+def test_unsafe_i64_typed_int_direct_call_uses_low_ir_and_runs_without_libpython(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_unsafe_i64(monkeypatch)
     from pcc.py_frontend.pipeline import compile_python
 
     ir_text = _compile_to_ll(tmp_path, _TYPED_DIRECT_CALL, "typed_direct_call")

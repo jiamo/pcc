@@ -1,13 +1,13 @@
 """Real-transform tests for LowerExpectPass (subset)."""
 
-import shutil
 import unittest
 
+from pcc.dependency_verdict import probe_executable_dependency
 from pcc.ir_passes.lower_expect import LowerExpectPass, lower_expect_text
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+_OPT_VERDICT = probe_executable_dependency("opt")
 
 
 class LowerExpectTests(unittest.TestCase):
@@ -137,7 +137,7 @@ else:
         self.assertIn("br i1 %cond, label %then, label %else", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@unittest.skipUnless(_OPT_VERDICT.available, _OPT_VERDICT.skip_reason())
 class UpstreamParityTests(unittest.TestCase):
     def test_expect_branch_matches_upstream_shape(self):
         report = assert_ir_parity("""

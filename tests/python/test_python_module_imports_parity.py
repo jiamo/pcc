@@ -47,7 +47,7 @@ def _run(exe: Path, timeout: float = 30.0) -> str:
     return result.stdout
 
 
-def test_import_math_floor_sqrt(tmp_path, monkeypatch):
+def test_import_math_floor_sqrt_ceil(tmp_path, monkeypatch):
     src = tmp_path / "imp_math.py"
     exe = tmp_path / "imp_math.out"
     src.write_text(textwrap.dedent("""
@@ -56,19 +56,23 @@ def test_import_math_floor_sqrt(tmp_path, monkeypatch):
         def main() -> None:
             print(math.floor(3.7))
             print(math.floor(-3.2))
+            print(math.ceil(3.2))
+            print(math.ceil(-3.2))
             print(int(math.sqrt(16.0)))
             print(int(math.sqrt(2.0) * 1000))
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     out = _run(exe).strip().splitlines()
     assert out[0] == "3"
     assert out[1] == "-4"
     assert out[2] == "4"
+    assert out[3] == "-3"
+    assert out[4] == "4"
     # sqrt(2) ≈ 1.414213562 → 1414
-    assert out[3] == "1414"
+    assert out[5] == "1414"
 
 
 def test_import_math_prod_iterable(tmp_path, monkeypatch):
@@ -83,10 +87,33 @@ def test_import_math_prod_iterable(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     out = _run(exe).strip().splitlines()
     assert out == ["24", "30"]
+
+
+def test_import_math_trunc_gcd(tmp_path, monkeypatch):
+    src = tmp_path / "imp_math_trunc_gcd.py"
+    exe = tmp_path / "imp_math_trunc_gcd.out"
+    src.write_text(textwrap.dedent("""
+        import math
+        from math import gcd, trunc
+
+        def main() -> None:
+            print(math.trunc(3.9))
+            print(math.trunc(-3.9))
+            print(math.gcd(12, 18))
+            print(math.gcd(-12, 18))
+            print(math.gcd(0, 5))
+            print(gcd(21, 6), trunc(-2.8))
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    _compile(monkeypatch, src, exe)
+    out = _run(exe).strip().splitlines()
+    assert out == ["3", "-3", "6", "6", "5", "3 -2"]
 
 
 def test_from_import(tmp_path, monkeypatch):
@@ -101,7 +128,7 @@ def test_from_import(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["5", "5"]
 
@@ -117,7 +144,7 @@ def test_import_as_alias(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "7"
 
@@ -133,7 +160,7 @@ def test_from_import_as_alias(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "9"
 
@@ -148,7 +175,7 @@ def test_import_inside_function_body(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "2"
 
@@ -165,7 +192,7 @@ def test_import_os_path(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["a/b", "foo.txt"]
 
@@ -184,12 +211,82 @@ def test_import_json_loads_dumps(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     out = _run(exe).strip().splitlines()
     assert out[0] == "1 2"
     # CPython's default dumps spacing:
     assert out[1] == '{"x": 10}'
+
+
+def test_import_json_string_escape_roundtrip(tmp_path, monkeypatch):
+    src = tmp_path / "imp_json_escapes.py"
+    exe = tmp_path / "imp_json_escapes.out"
+    src.write_text(textwrap.dedent(r"""
+        import json
+
+        def main() -> None:
+            text = "line1" + chr(10) + "line2"
+            slash = "a" + chr(92) + "b"
+            quote = 'a"b'
+            tab = "a" + chr(9) + "b"
+            cr = "a" + chr(13) + "b"
+            vtab = "a" + chr(11) + "b"
+            form = "a" + chr(12) + "b"
+            encoded = json.dumps({
+                "text": text,
+                "slash": slash,
+                "quote": quote,
+                "tab": tab,
+                "cr": cr,
+                "vtab": vtab,
+                "form": form,
+            })
+            decoded = json.loads(encoded)
+            print(decoded["text"] == text)
+            print(decoded["slash"] == slash)
+            print(decoded["quote"] == quote)
+            print(decoded["tab"] == tab)
+            print(decoded["cr"] == cr)
+            print(decoded["vtab"] == vtab)
+            print(decoded["form"] == form)
+            print(decoded["text"])
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    _compile(monkeypatch, src, exe)
+    out = _run(exe).splitlines()
+    assert out[:7] == ["True", "True", "True", "True", "True", "True", "True"]
+    assert out[7:] == ["line1", "line2"]
+
+
+def test_import_json_float_roundtrip(tmp_path, monkeypatch):
+    src = tmp_path / "imp_json_float.py"
+    exe = tmp_path / "imp_json_float.out"
+    src.write_text(textwrap.dedent("""
+        import json
+
+        def main() -> None:
+            values = json.loads('{"f": 1.25, "inf": Infinity, "ninf": -Infinity}')
+            print(values["f"] == 1.25)
+            print(values["inf"] > 999999)
+            print(values["ninf"] < -999999)
+            decoded = json.loads(json.dumps({
+                "f": values["f"],
+                "inf": values["inf"],
+                "ninf": values["ninf"],
+            }))
+            print(decoded["f"] == 1.25)
+            print(decoded["inf"] > 999999)
+            print(decoded["ninf"] < -999999)
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    _compile(monkeypatch, src, exe)
+    out = _run(exe).strip().splitlines()
+    assert out == ["True", "True", "True", "True", "True", "True"]
 
 
 def test_module_attribute_write(tmp_path, monkeypatch):
@@ -204,6 +301,6 @@ def test_module_attribute_write(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "42"

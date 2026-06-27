@@ -5,12 +5,7 @@ import subprocess
 import textwrap
 
 
-def test_format_runtime_builtin_and_user_dunder(tmp_path):
-    subprocess.run(
-        ["make", "-C", "pcc/py_runtime", "libpy_runtime.a"],
-        check=True,
-        env={**os.environ, "PATH": os.environ.get("PATH", "")},
-    )
+def test_format_runtime_builtin_and_user_dunder(tmp_path, c_runtime_archive):
     src = tmp_path / "format_probe.c"
     exe = tmp_path / "format_probe"
     src.write_text(
@@ -46,9 +41,9 @@ def test_format_runtime_builtin_and_user_dunder(tmp_path):
     subprocess.run(
         [
             os.environ.get("CC", "cc"),
-            "-I", "pcc/py_runtime/include",
-            "-I", "pcc/py_runtime/src",
-            str(src), "pcc/py_runtime/libpy_runtime.a",
+            "-I", str(c_runtime_archive.parent / "include"),
+            "-I", str(c_runtime_archive.parent / "src"),
+            str(src), str(c_runtime_archive),
             "-lm", "-o", str(exe),
         ],
         check=True,

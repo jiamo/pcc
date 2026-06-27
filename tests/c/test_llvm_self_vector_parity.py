@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 from pcc.backend.self_backend_dispatch import emit_self_asm
-from pcc.backend.self_backend_targets import is_supported_self_backend_target_triple
+from pcc.backend.self_backend_targets import classify_self_backend_target_triple
 from pcc.llvm_capi import binding as llvm
 from tests.c_testsuite_cases import PccCompileResult, _host_cc, subprocess_env
 from tests.self_backend_c_testsuite_common import assert_result_triplet_matches
@@ -78,7 +78,7 @@ def _run_llvm_from_ir(ir_text: str, tmp_path, triple: str) -> PccCompileResult:
     ir = _ensure_target_triple(ir_text, triple)
     executable_path = tmp_path / "llvm_case.out"
     ir_path = tmp_path / "llvm_case.ll"
-    ir_path.write_text(ir)
+    ir_path.write_text(ir, encoding="utf-8")
 
     compile_process = subprocess.run(
         [cc, "-x", "ir", str(ir_path), "-o", str(executable_path)],
@@ -108,7 +108,7 @@ def _run_self_from_ir(ir_text: str, tmp_path, triple: str) -> PccCompileResult:
     cc = _host_cc()
     asm_path = tmp_path / "self_case.s"
     executable_path = tmp_path / "self_case.out"
-    asm_path.write_text(asm)
+    asm_path.write_text(asm, encoding="utf-8")
 
     compile_process = subprocess.run(
         [cc, str(asm_path), "-o", str(executable_path)],
@@ -131,8 +131,10 @@ def _run_self_from_ir(ir_text: str, tmp_path, triple: str) -> PccCompileResult:
 
 def _host_self_supported() -> str:
     triple = _host_triple()
-    if not is_supported_self_backend_target_triple(triple):
-        pytest.skip(f"self backend target not supported: {triple}")
+    verdict = classify_self_backend_target_triple(triple)
+    if not verdict.supported:
+        pytest.skip(verdict.skip_reason())
+    assert verdict.target_identity is not None
     return triple
 
 

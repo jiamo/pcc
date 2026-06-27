@@ -27,7 +27,7 @@ def _locate_corpus_root() -> Path:
 def _load_expected(test_dir: Path) -> tuple[bytes, int]:
     stdout_path = test_dir / "expected.stdout"
     status_path = test_dir / "expected.status"
-    status_text = status_path.read_text().strip()
+    status_text = status_path.read_text(encoding="utf-8").strip()
     return (
         stdout_path.read_bytes(),
         int(status_text),

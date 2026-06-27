@@ -2823,7 +2823,7 @@ def test_pcc1_array_core_cli_does_not_need_host_python(tmp_path):
         skip_or_fail_no_current_pcc1("no current pcc1 binary with native array-core shim")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),

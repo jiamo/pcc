@@ -82,7 +82,15 @@ def _smoke_pcc_py_runtime(pcc_py_runtime_archive):
     ``Undefined symbols: _py_list_append, ...`` — a build-environment artifact,
     not a pcc1 codegen regression.
     """
-    return pcc_py_runtime_archive
+    previous = os.environ.get("PCC_RUNTIME_ARCHIVE")
+    os.environ["PCC_RUNTIME_ARCHIVE"] = str(pcc_py_runtime_archive)
+    try:
+        yield pcc_py_runtime_archive
+    finally:
+        if previous is None:
+            os.environ.pop("PCC_RUNTIME_ARCHIVE", None)
+        else:
+            os.environ["PCC_RUNTIME_ARCHIVE"] = previous
 
 
 def _compile_and_run(
@@ -100,7 +108,7 @@ def _compile_and_run(
     """
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(src_text).lstrip())
+    src.write_text(textwrap.dedent(src_text).lstrip(), encoding="utf-8")
 
     compile_cmd = [
         str(PCC1),
@@ -160,6 +168,301 @@ def test_pcc1_help_lists_bootstrap_cli_options():
     ):
         assert option in result.stdout
     assert "C/project inputs are" in result.stdout
+
+
+def test_pcc1_compiles_time_monotonic_float_literal_mul(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        import time
+
+        def main():
+            print(int(time.monotonic() * 1000.0) >= 0)
+
+        main()
+        """,
+    )
+    assert out.strip() == "True"
+
+
+def test_pcc1_hoists_value_nested_def_with_genexpr_body(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        def use(option, fn):
+            fn(option)
+
+
+        class Item:
+            def __init__(self, name):
+                self.name = name
+
+
+        class Failer:
+            def __init__(self):
+                self.protos = [Item("a"), Item("b")]
+                self.bind = "x"
+                self.sslclient = False
+
+            def start(self):
+                raise RuntimeError("boom")
+
+
+        def main():
+            def print_fn(option, bind=None):
+                names = ",".join(i.name for i in option.protos)
+                print("Serving on", (bind or option.bind), "by", names + ("(SSL)" if option.sslclient else ""))
+
+            for option in [Failer()]:
+                try:
+                    use(option, print_fn)
+                    option.start()
+                except Exception as ex:
+                    print_fn(option)
+                    print("failed", ex)
+
+
+        main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.splitlines() == [
+        "Serving on x by a,b",
+        "Serving on x by a,b",
+        "failed boom",
+    ]
+
+
+def test_pcc1_partial_legacy_starstar_kwargs_no_nameerror(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        import functools
+
+
+        def target(**kwargs):
+            return kwargs
+
+
+        def main():
+            left = {"a": 1}
+            right = {"b": 2}
+            functools.partial(target, **left, **right)
+            print("ok")
+
+
+        main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.strip() == "ok"
+
+
+def test_pcc1_partial_kwargs_calls_native_function(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        import functools
+
+
+        def target(a, b, c=3, **kwargs):
+            print(a, b, c, kwargs.get("x"))
+
+
+        def main():
+            handler = functools.partial(target, b=2, x=9)
+            handler(1)
+
+
+        main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.strip() == "1 2 3 9"
+
+
+def test_pcc1_partial_async_function_returns_coroutine(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        import asyncio
+        import functools
+
+
+        async def target(a, b=3, **kwargs):
+            print(a, b, kwargs.get("x"))
+
+
+        def main():
+            handler = functools.partial(target, b=2, x=9)
+            asyncio.run(handler(1))
+
+
+        main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.strip() == "1 2 9"
+
+
+def test_pcc1_module_runner_compiles_package_without_host_python(tmp_path):
+    pkg = tmp_path / "demo_mod"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "__main__.py").write_text(
+        textwrap.dedent("""
+            import sys
+
+            print(len(sys.argv))
+            print(sys.argv[1])
+            print(sys.argv[2])
+            """).lstrip(),
+        encoding="utf-8",
+    )
+    host_python = tmp_path / "host_python_probe.sh"
+    host_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ]; then\n"
+        "  echo host module shim invoked >&2\n"
+        "  exit 91\n"
+        "fi\n"
+        "exec python3 \"$@\"\n",
+        encoding="utf-8",
+    )
+    host_python.chmod(0o755)
+
+    result = subprocess.run(
+        [str(PCC1), "-m", "demo_mod", "left", "right"],
+        cwd=REPO,
+        env={
+            **os.environ,
+            "PCC_HOST_PYTHON": str(host_python),
+            "PYTHONPATH": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=120.0,
+    )
+
+    assert result.returncode == 0, (
+        f"pcc1 -m failed (exit {result.returncode})\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    assert result.stdout == "3\nleft\nright\n"
+
+
+def test_pcc1_module_runner_nested_async_closure_formats_captured_strings(tmp_path):
+    pkg = tmp_path / "demo_http"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "proto.py").write_text(
+        textwrap.dedent("""
+            import re
+            import urllib.parse
+
+            HTTP_LINE = re.compile("([^ ]+) +(.+?) +(HTTP/[^ ]+)$")
+
+            class Writer:
+                def __init__(self):
+                    self.payload = b""
+
+                def write(self, data):
+                    self.payload = data
+
+
+            class HTTP:
+                async def http_accept(self, user, method, path, authority, ver, lines, host, pauth, reply, authtable, users, httpget=None, **kw):
+                    url = urllib.parse.urlparse(path)
+                    if method == "CONNECT":
+                        return user, "example.com", 443, None
+                    host_name, port = "example.com", 80
+                    newpath = url._replace(netloc="", scheme="").geturl()
+
+                    async def connected(writer):
+                        writer.write(f"{method} {newpath} {ver}\\r\\n{lines}\\r\\n\\r\\n".encode())
+                        return True
+
+                    return user, host_name, port, connected
+
+            async def run():
+                lines = b"GET http://example.com/ HTTP/1.1\\r\\nHost: example.com\\r\\nProxy-Connection: Keep-Alive\\r\\n\\r\\n"
+                headers = lines[:-4].decode().split("\\r\\n")
+                method, path, ver = HTTP_LINE.match(headers.pop(0)).groups()
+                lines = "\\r\\n".join(i for i in headers if not i.startswith("Proxy-"))
+                headers = dict(i.split(": ", 1) for i in headers if ": " in i)
+                proto = HTTP()
+                user, host_name, port, connected = await proto.http_accept(
+                    True, method, path, None, ver, lines, headers.get("Host", ""),
+                    headers.get("Proxy-Authorization"), None, None, None,
+                )
+                writer = Writer()
+                ok = await connected(writer)
+                print(writer.payload)
+                print(host_name, port)
+                return ok
+            """).lstrip(),
+        encoding="utf-8",
+    )
+    (pkg / "__main__.py").write_text(
+        textwrap.dedent("""
+            import asyncio
+            from .proto import run
+
+            print(asyncio.run(run()))
+            """).lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(PCC1), "-m", "demo_http"],
+        cwd=REPO,
+        env={
+            **os.environ,
+            "PCC_GC_BACKEND": "4",
+            "PYTHONPATH": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=120.0,
+    )
+
+    assert result.returncode == 0, (
+        f"pcc1 -m failed (exit {result.returncode})\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    assert result.stdout.strip().splitlines() == [
+        "b'GET / HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n'",
+        "example.com 80",
+        "True",
+    ]
+
+
+def test_pcc1_urllib_parse_result_derived_authority_attrs(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        import urllib.parse
+
+        def main() -> None:
+            first = urllib.parse.urlparse("http://example.com/")
+            second = urllib.parse.urlparse("http://user:pass@Example.COM:8080/path")
+            third = urllib.parse.urlparse("s://:8081")
+            print(first.username, first.password, first.hostname, first.port)
+            print(second.username, second.password, second.hostname, second.port)
+            print(third.username, third.password, third.hostname, third.port)
+
+        if __name__ == "__main__":
+            main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.strip().splitlines() == [
+        "None None example.com None",
+        "user pass example.com 8080",
+        "None None None 8081",
+    ]
 
 
 def test_pcc1_accepts_host_pass_cli_for_python_inputs(tmp_path):
@@ -402,6 +705,32 @@ def test_pcc1_smoke_hello_arithmetic(tmp_path):
     assert out.strip().splitlines() == ["hello from pcc1", "10"]
 
 
+def test_pcc1_unsafe_i64_floor_division_uses_shared_low_and_guarded_paths(
+    tmp_path,
+):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        def low_literal(x: int) -> int:
+            return x // 3
+
+        def guarded_variable(x: int, y: int) -> int:
+            return x // y
+
+        def main() -> None:
+            print(low_literal(-10))
+            print(low_literal(10))
+            print(guarded_variable(-10, 3))
+            print(guarded_variable(10, -3))
+
+        if __name__ == "__main__":
+            main()
+        """,
+        compile_env={"PCC_PYTHON_TYPED_INT_ABI": "unsafe-i64"},
+    )
+    assert out.splitlines() == ["-4", "3", "-4", "-4"]
+
+
 def test_pcc1_accepts_bare_return_from_none_nested_function(tmp_path):
     out = _compile_and_run(
         tmp_path,
@@ -586,7 +915,7 @@ def test_pcc1_pcc_python_runtime_keeps_py_lex_token_constructor_args(tmp_path):
         f"pcc1 py_lex compile failed:\nstdout:\n{compile_proc.stdout}\n"
         f"stderr:\n{compile_proc.stderr}"
     )
-    ir_text = ll_out.read_text()
+    ir_text = ll_out.read_text(encoding="utf-8")
     for line in ir_text.splitlines():
         if "Token___init__" in line:
             assert "ptr null" not in line
@@ -750,7 +1079,12 @@ def test_pcc1_can_launch_pytest_for_test_directory(tmp_path):
     test_dir = tmp_path / "tests"
     test_dir.mkdir()
     (test_dir / "test_sample.py").write_text(
-        "def test_sample():\n" "    assert 1 + 1 == 2\n",
+        "from pcc.test_runner import fixture\n\n"
+        "@fixture\n"
+        "def value() -> int:\n"
+        "    return 42\n\n"
+        "def test_sample(value: int) -> None:\n"
+        "    assert value == 42\n",
         encoding="utf-8",
     )
 
@@ -763,6 +1097,120 @@ def test_pcc1_can_launch_pytest_for_test_directory(tmp_path):
     assert (
         result.returncode == 0
     ), f"pcc1 --pytest failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert "pcc1 pytest file(s) passed" in result.stdout
+
+
+@pytest.mark.integration
+def test_pcc1_pytest_marker_selection_matches_repo_gates(tmp_path):
+    if not _pcc1_supports_pytest():
+        pytest.skip("pcc1 binary predates --pytest launcher support")
+
+    default_dir = tmp_path / "default_tests"
+    default_dir.mkdir()
+    (default_dir / "test_sample.py").write_text(
+        "from pcc.test_runner import fixture\n"
+        "import pytest\n\n"
+        "@fixture\n"
+        "def value() -> int:\n"
+        "    return 5\n\n"
+        "def test_unit(value: int) -> None:\n"
+        "    assert value == 5\n\n"
+        "@pytest.mark.integration\n"
+        "def test_integration_is_excluded_by_default(value: int) -> None:\n"
+        "    assert value == 99\n",
+        encoding="utf-8",
+    )
+
+    integration_dir = tmp_path / "integration_tests"
+    integration_dir.mkdir()
+    (integration_dir / "test_sample.py").write_text(
+        "from pcc.test_runner import fixture\n"
+        "import pytest\n\n"
+        "@fixture\n"
+        "def value() -> int:\n"
+        "    return 7\n\n"
+        "def test_unit_is_excluded_by_integration_marker(value: int) -> None:\n"
+        "    assert value == 99\n\n"
+        "@pytest.mark.integration\n"
+        "def test_integration(value: int) -> None:\n"
+        "    assert value == 7\n",
+        encoding="utf-8",
+    )
+
+    default_result = subprocess.run(
+        [str(PCC1), "--pytest", str(default_dir), "-q", "-n0"],
+        capture_output=True,
+        text=True,
+        timeout=90.0,
+    )
+    assert default_result.returncode == 0, (
+        "default pcc1 pytest marker selection failed\n"
+        f"stdout:\n{default_result.stdout}\nstderr:\n{default_result.stderr}"
+    )
+
+    integration_result = subprocess.run(
+        [str(PCC1), "--pytest", "-m", "integration", str(integration_dir), "-q", "-n0"],
+        capture_output=True,
+        text=True,
+        timeout=90.0,
+    )
+    assert integration_result.returncode == 0, (
+        "integration pcc1 pytest marker selection failed\n"
+        f"stdout:\n{integration_result.stdout}\nstderr:\n{integration_result.stderr}"
+    )
+
+    module_mark_dir = tmp_path / "module_mark_integration_tests"
+    module_mark_dir.mkdir()
+    (module_mark_dir / "test_sample.py").write_text(
+        "from pcc.test_runner import fixture\n"
+        "import pytest\n"
+        "pytestmark = pytest.mark.integration\n\n"
+        "@fixture\n"
+        "def value() -> int:\n"
+        "    return 11\n\n"
+        "def test_module_marked_integration(value: int) -> None:\n"
+        "    assert value == 11\n",
+        encoding="utf-8",
+    )
+    module_mark_result = subprocess.run(
+        [str(PCC1), "--pytest", "-m", "integration", str(module_mark_dir), "-q", "-n0"],
+        capture_output=True,
+        text=True,
+        timeout=90.0,
+    )
+    assert module_mark_result.returncode == 0, (
+        "module-level integration pcc1 pytest marker selection failed\n"
+        f"stdout:\n{module_mark_result.stdout}\nstderr:\n{module_mark_result.stderr}"
+    )
+
+
+def test_pcc1_pytest_literal_skipif_matches_pytest_subset(tmp_path):
+    if not _pcc1_supports_pytest():
+        pytest.skip("pcc1 binary predates --pytest launcher support")
+
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_sample.py").write_text(
+        "import pytest\n\n"
+        "@pytest.mark.skipif(True, reason='skip')\n"
+        "def test_skipped_failure() -> None:\n"
+        "    assert 1 == 2\n\n"
+        "@pytest.mark.skipif(False, reason='run')\n"
+        "def test_kept() -> None:\n"
+        "    assert 2 + 2 == 4\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(PCC1), "--pytest", str(test_dir), "-q", "-n0"],
+        capture_output=True,
+        text=True,
+        timeout=90.0,
+    )
+    assert result.returncode == 0, (
+        "literal skipif pcc1 pytest subset failed\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
 
 
 def test_pcc1_compiles_and_runs_pytest_style_assertions(tmp_path):
@@ -1024,15 +1472,21 @@ def test_pcc1_smoke_str_methods(tmp_path):
     assert out.strip().splitlines() == ["HELLO WORLD", "world", "11", "abcabcabc"]
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Older pcc1 binaries (built before recent set / list / dict "
-        "native-method coverage) treat the combined ``set`` literal + "
-        "``add`` / ``len`` surface as needing libpython. Drops once "
-        "pcc1 is rebuilt against post-2026-05-08 codegen."
-    ),
-    strict=False,
-)
+def test_pcc1_smoke_print_many_dynamic_args_keep_slots(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        def main() -> None:
+            xs = [10, 20, 30]
+            print(xs[0], xs[1], xs[2])
+
+        if __name__ == "__main__":
+            main()
+        """,
+    )
+    assert out.strip() == "10 20 30"
+
+
 def test_pcc1_smoke_list_dict_set(tmp_path):
     out = _compile_and_run(
         tmp_path,
@@ -1056,6 +1510,310 @@ def test_pcc1_smoke_list_dict_set(tmp_path):
         """,
     )
     assert out.strip().splitlines() == ["4 1 4", "2 3", "4"]
+
+
+def test_pcc1_unannotated_set_binding_keeps_union_type(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        base = {"left"}
+        combined = base | set(["right"])
+        print(sorted(combined))
+        """,
+    )
+    assert out.strip() == "['left', 'right']"
+
+
+def test_pcc1_module_set_operators_survive_and_do_not_misfire(tmp_path):
+    # Set bindings use the first-class SetType projection. A self-hosted pcc
+    # used to encode them as DynType(name="set"), lose that discriminator,
+    # and lower these as integer bitwise ops. All four set operators must
+    # survive, and a same-shaped numeric expression must stay numeric.
+    out = _compile_and_run(
+        tmp_path,
+        """
+        a = {1, 2, 3}
+        b = {2, 3, 4}
+        print(sorted(a | b))
+        print(sorted(a & b))
+        print(sorted(a - b))
+        print(sorted(a ^ b))
+        n = 6
+        print(n - 2)
+        print(n | 1)
+        """,
+    )
+    assert out.strip().splitlines() == [
+        "[1, 2, 3, 4]",
+        "[2, 3]",
+        "[1]",
+        "[1, 4]",
+        "4",
+        "7",
+    ]
+
+
+def test_pcc1_cross_module_method_reads_provider_data_constant(tmp_path):
+    """Classify the module-data-constant self-host family with a real pcc1.
+
+    The provider owns both the tuple and the method that reads it; the entry
+    module imports the class through the compiled package path.  This keeps the
+    constant as data (not an inlined literal or reconstructing helper).
+    """
+    provider = tmp_path / "constant_provider.py"
+    provider.write_text(
+        textwrap.dedent(
+            """
+            VALUES = ("left", "right")
+
+            class ConstantReader:
+                def contains(self, value: str) -> bool:
+                    return value in VALUES
+            """
+        ),
+        encoding="utf-8",
+    )
+    out = _compile_and_run(
+        tmp_path,
+        """
+        from constant_provider import ConstantReader
+
+        reader = ConstantReader()
+        print(reader.contains("left"))
+        print(reader.contains("missing"))
+        """,
+        compile_env={"PCC_PACKAGE_SITE": str(tmp_path)},
+    )
+
+    assert out.strip().splitlines() == ["True", "False"]
+
+
+def test_pcc1_dynamic_list_pop_index_does_not_dispatch_as_dict(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        def pop_first(obj):
+            return obj.pop(0)
+
+        def main() -> None:
+            xs = ["a", "b"]
+            print(pop_first(xs))
+            print(xs)
+
+        if __name__ == "__main__":
+            main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.strip().splitlines() == ["a", "['b']"]
+
+
+def test_pcc1_if_return_then_tuple_unpack_keeps_codegen_function(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        def choose(flag):
+            if flag:
+                return "early"
+            left, right = "late", 7
+            return left + ":" + str(right)
+
+        def main() -> None:
+            print(choose(False))
+            print(choose(True))
+
+        if __name__ == "__main__":
+            main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.strip().splitlines() == ["late:7", "early"]
+
+
+def test_pcc1_class_attr_initializer_restores_codegen_env(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        class Config:
+            port = 80
+
+        def main() -> None:
+            print(Config.port)
+
+        if __name__ == "__main__":
+            main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "0"},
+    )
+    assert out.strip() == "80"
+
+
+def test_pcc1_filter_lambda_method_next_default(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        class Route:
+            def __init__(self):
+                self.alive = True
+
+            def match_rule(self, host, port):
+                return host == "example.com" and port == 80
+
+        def schedule(rserver, host_name, port):
+            filter_cond = lambda o: o.alive and o.match_rule(host_name, port)
+            return next(filter(filter_cond, rserver), None)
+
+        def main() -> None:
+            r = Route()
+            chosen = schedule([r], "example.com", 80)
+            print(chosen is r)
+
+        if __name__ == "__main__":
+            main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.strip() == "True"
+
+
+def test_pcc1_nested_async_closure_formats_captured_strings(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        import asyncio
+        import re
+        import urllib.parse
+
+        class Writer:
+            def __init__(self):
+                self.payload = b""
+
+            def write(self, data):
+                self.payload = data
+
+
+        class HTTP:
+            async def http_accept(self, user, method, path, authority, ver, lines, host, pauth, reply, authtable, users, httpget=None, **kw):
+                url = urllib.parse.urlparse(path)
+                if method == "CONNECT":
+                    return user, "example.com", 443, None
+                host_name, port = "example.com", 80
+                newpath = url._replace(netloc="", scheme="").geturl()
+
+                async def connected(writer):
+                    writer.write(f"{method} {newpath} {ver}\\r\\n{lines}\\r\\n\\r\\n".encode())
+                    return True
+
+                return user, host_name, port, connected
+
+        async def outer():
+            http_line = re.compile("([^ ]+) +(.+?) +(HTTP/[^ ]+)$")
+            lines = b"GET http://example.com/ HTTP/1.1\\r\\nHost: example.com\\r\\nProxy-Connection: Keep-Alive\\r\\n\\r\\n"
+            headers = lines[:-4].decode().split("\\r\\n")
+            method, path, ver = http_line.match(headers.pop(0)).groups()
+            lines = "\\r\\n".join(i for i in headers if not i.startswith("Proxy-"))
+            headers = dict(i.split(": ", 1) for i in headers if ": " in i)
+            proto = HTTP()
+            user, host_name, port, connected = await proto.http_accept(
+                True, method, path, None, ver, lines, headers.get("Host", ""),
+                headers.get("Proxy-Authorization"), None, None, None,
+            )
+            writer = Writer()
+            ok = await connected(writer)
+            print(writer.payload)
+            print(host_name, port)
+            return ok
+
+        def main() -> None:
+            print(asyncio.run(outer()))
+
+        if __name__ == "__main__":
+            main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.strip().splitlines() == [
+        "b'GET / HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n'",
+        "example.com 80",
+        "True",
+    ]
+
+
+def test_pcc1_nested_async_closure_forwarded_through_method_parameter_keeps_writer(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        import asyncio
+
+        class Writer:
+            def __init__(self):
+                self.payload = b""
+
+            def write(self, data):
+                self.payload = data
+
+
+        class HTTP:
+            async def accept(self, writer):
+                async def reply(code, message, body=None, wait=False):
+                    print(type(writer).__name__)
+                    writer.write(message)
+                    return True
+
+                return await self.http_accept(reply)
+
+            async def http_accept(self, reply):
+                return lambda writer: reply(200, b"HTTP/1.1 200 Connection established\\r\\n\\r\\n")
+
+
+        async def outer():
+            client = Writer()
+            connected = await HTTP().accept(client)
+            ok = await connected(None)
+            print(client.payload)
+            return ok
+
+        def main() -> None:
+            print(asyncio.run(outer()))
+
+        if __name__ == "__main__":
+            main()
+        """,
+        compile_env={"PCC_GC_BACKEND": "4"},
+    )
+    assert out.strip().splitlines() == [
+        "Writer",
+        "b'HTTP/1.1 200 Connection established\\r\\n\\r\\n'",
+        "True",
+    ]
+
+
+def test_pcc1_smoke_starred_rhs_tuple_display_assignment(tmp_path):
+    out = _compile_and_run(
+        tmp_path,
+        """
+        def make_pair():
+            return (10, 20)
+
+        def main() -> None:
+            first, second, third = [], *make_pair()
+            print(first)
+            print(second)
+            print(third)
+            print((*[1, 2], 3))
+            print([0, *[1, 2], 3])
+
+        if __name__ == "__main__":
+            main()
+        """,
+    )
+    assert out.strip().splitlines() == [
+        "[]",
+        "10",
+        "20",
+        "(1, 2, 3)",
+        "[0, 1, 2, 3]",
+    ]
 
 
 def test_pcc1_smoke_inheritance_super(tmp_path):
@@ -1097,12 +1855,23 @@ def test_pcc1_smoke_json_loads(tmp_path):
         def main() -> None:
             d = json.loads("{\\\"a\\\": 1, \\\"b\\\": 2}")
             print(d["a"], d["b"])
+            text = "line1" + chr(10) + "line2"
+            slash = "a" + chr(92) + "b"
+            quote = 'a"b'
+            decoded = json.loads(json.dumps({
+                "text": text,
+                "slash": slash,
+                "quote": quote,
+            }))
+            print(decoded["text"] == text)
+            print(decoded["slash"] == slash)
+            print(decoded["quote"] == quote)
 
         if __name__ == "__main__":
             main()
         """,
     )
-    assert out.strip() == "1 2"
+    assert out.strip().splitlines() == ["1 2", "True", "True", "True"]
 
 
 def test_pcc1_smoke_threading_basic_lock(tmp_path):

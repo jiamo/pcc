@@ -35,7 +35,7 @@ def _multi_compile_ll(src_paths, module_names, name: str, *, mode: str) -> str:
         module_names=list(module_names),
         ir_scaffold_mode=mode,
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _externs_called(ir_text: str) -> set[str]:
@@ -76,7 +76,7 @@ _FAKELAYER1_PROGRAM = (
 @pytest.fixture
 def fakelayer1_path():
     src = _BUILD / "linkres_fakelayer1.py"
-    src.write_text(_FAKELAYER1_PROGRAM)
+    src.write_text(_FAKELAYER1_PROGRAM, encoding="utf-8")
     return src
 
 

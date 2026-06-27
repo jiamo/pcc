@@ -59,7 +59,7 @@ def test_set_add_remove(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["3", "True", "2", "False"]
 
@@ -79,7 +79,7 @@ def test_set_intersection(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["2", "True", "True", "False"]
 
@@ -98,7 +98,7 @@ def test_set_union(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["5", "True", "True"]
 
@@ -118,7 +118,7 @@ def test_set_difference(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["2", "True", "True", "False"]
 
@@ -136,7 +136,7 @@ def test_set_in_operator(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True", "False", "False", "True"]
 
@@ -154,7 +154,7 @@ def test_set_iteration_count(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "15"
 
@@ -172,7 +172,7 @@ def test_set_discard_no_error(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["2", "2"]
 
@@ -188,7 +188,7 @@ def test_set_from_list_dedup(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "4"
 
@@ -206,6 +206,6 @@ def test_set_subset_superset(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True", "True", "False"]

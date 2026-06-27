@@ -24,7 +24,7 @@ def test_native_enumerate_index_stays_numeric(tmp_path):
                 main()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
     run = subprocess.run(
         [str(exe)],

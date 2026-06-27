@@ -31,13 +31,13 @@ def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _function_body(ir_text: str, fn_name_suffix: str) -> str | None:
@@ -136,6 +136,25 @@ def test_gep_zero_indices():
     )
     ir_text = _compile_to_ll(program, "v_gep0", mode="on")
     assert "@user_pcc_llvm_capi_ir_IRBuilder_gep0" in ir_text
+
+
+def test_gep_dynamic_indices_inbounds_uses_exported_helper():
+    program = textwrap.dedent(
+        """
+        def f(builder, ptr, indices):
+            return builder.gep(ptr, indices, inbounds=True)
+        """
+    )
+    ir_text = _compile_to_ll(program, "v_gep_dyn_inbounds", mode="on")
+    body = _function_body(ir_text, "f")
+    assert body is not None
+    assert "@user_pcc_llvm_capi_ir_IRBuilder_gep_dyn_inbounds" in body, body
+    assert "py_cpy_" not in body, body
+
+    helper_source = (_REPO_ROOT / "pcc" / "llvm_capi" / "ir.py").read_text(
+        encoding="utf-8"
+    )
+    assert "def IRBuilder_gep_dyn_inbounds" in helper_source
 
 
 # -- phi ---------------------------------------------------------------

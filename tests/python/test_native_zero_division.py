@@ -19,6 +19,7 @@ Python 3.14's unified "division by zero".
 Runs under ``--backend self --python-libpython=off`` in DEFAULT runtime mode.
 """
 from __future__ import annotations
+import ast
 import os, subprocess
 from pathlib import Path
 
@@ -104,3 +105,93 @@ def test_nonzero_constant_divisor_still_works(tmp_path):
         "    print(100 // 7, 100 % 7)\n"  # 14 2
         "main()\n")
     assert out.split("\n")[:3] == ["10", "2.5", "14 2"], out
+
+
+def _function_node(tree: ast.Module, name: str) -> ast.FunctionDef:
+    return next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def _named_calls(node: ast.AST, name: str) -> list[ast.Call]:
+    return [
+        call
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == name
+    ]
+
+
+def test_i64_floor_division_has_one_behavior_owner():
+    root = Path(__file__).absolute().parents[2]
+    codegen = root / "pcc" / "py_frontend" / "codegen"
+    helper_tree = ast.parse(
+        (codegen / "expr_helper_lowering.py").read_text(encoding="utf-8")
+    )
+    user_tree = ast.parse(
+        (codegen / "user_function_lowering.py").read_text(encoding="utf-8")
+    )
+
+    owner = _function_node(helper_tree, "emit_python_floordiv_i64_unchecked")
+    owner_attrs = [
+        call.func.attr
+        for call in ast.walk(owner)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+    ]
+    assert owner_attrs.count("sdiv") == 1
+    assert owner_attrs.count("srem") == 1
+
+    regular = _function_node(helper_tree, "_python_floordiv_i64")
+    assert len(_named_calls(regular, "emit_python_floordiv_i64_unchecked")) == 1
+    assert not {
+        call.func.attr
+        for call in ast.walk(regular)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+    }.intersection({"sdiv", "srem"})
+
+    low_emit = _function_node(user_tree, "_low_ir_emit_value")
+    floor_branches = [
+        node
+        for node in ast.walk(low_emit)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Attribute)
+        and node.test.left.attr == "op"
+        and any(
+            isinstance(comp, ast.Constant) and comp.value == "//"
+            for comp in node.test.comparators
+        )
+    ]
+    assert len(floor_branches) == 1
+    assert len(
+        _named_calls(floor_branches[0], "emit_python_floordiv_i64_unchecked")
+    ) == 1
+    assert not {
+        call.func.attr
+        for call in ast.walk(floor_branches[0])
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+    }.intersection({"sdiv", "srem"})
+
+
+def test_i64_floor_division_shared_owner_covers_low_and_guarded_paths(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("PCC_PYTHON_TYPED_INT_ABI", "unsafe-i64")
+    out = _run(
+        tmp_path,
+        "def low_literal(x: int) -> int:\n"
+        "    return x // 3\n"
+        "def guarded_variable(x: int, y: int) -> int:\n"
+        "    return x // y\n"
+        "def main():\n"
+        "    print(low_literal(-10))\n"
+        "    print(low_literal(10))\n"
+        "    print(guarded_variable(-10, 3))\n"
+        "    print(guarded_variable(10, -3))\n"
+        "main()\n",
+    )
+    assert out.splitlines() == ["-4", "3", "-4", "-4"]

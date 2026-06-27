@@ -56,7 +56,7 @@ def test_str_split_join(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["a b c d", "a,b,c,d", "x-y-z"]
 
@@ -72,7 +72,7 @@ def test_str_replace(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["hello pcc", "bbb", "X bar foo"]
 
@@ -89,7 +89,7 @@ def test_str_strip(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["spaces", "hello", "left", "right"]
 
@@ -108,7 +108,7 @@ def test_str_find_startswith_endswith(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "6", "-1", "True", "False", "True", "False",
@@ -126,7 +126,7 @@ def test_str_case_conversion(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["HELLO", "hello", "Hello world"]
 
@@ -147,7 +147,7 @@ def test_str_slicing(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "a", "f", "f", "bcd", "abc", "def", "ace",
@@ -165,7 +165,7 @@ def test_str_concat_repeat(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).splitlines() == ["foobar", "ababab", ""]
 
@@ -181,7 +181,7 @@ def test_str_in_operator(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True", "False", "True"]
 
@@ -198,7 +198,7 @@ def test_str_len(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["0", "1", "5", "5"]
 
@@ -216,7 +216,7 @@ def test_str_fstring_basic(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "x=42", "name=pcc", "42 + 42 = 84",
@@ -237,7 +237,7 @@ def test_str_fstring_format_spec(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1234.50", "1,234,567", "007"]
 
@@ -258,6 +258,6 @@ def test_str_bytes_literal_nonascii(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["3", "255", "bcd", "1", "1", "255"]

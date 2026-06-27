@@ -26,7 +26,7 @@ def _run_self_compile(src_text: str, tmp_path: Path, name: str = "stress") -> su
     from pcc.py_frontend.pipeline import compile_python
     src = tmp_path / f"{name}.py"
     exe = tmp_path / f"{name}.out"
-    src.write_text(src_text)
+    src.write_text(src_text, encoding="utf-8")
     compile_python(
         str(src), str(exe),
         ir_scaffold_mode="on",

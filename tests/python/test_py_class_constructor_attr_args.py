@@ -1,10 +1,46 @@
 from __future__ import annotations
 
 import re
+import textwrap
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).absolute().parents[2]
+
+
+def test_class_instance_is_pinned_across_init(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "constructor_root.py"
+    out = tmp_path / "constructor_root.ll"
+    src.write_text(
+        textwrap.dedent("""
+            class Holder:
+                def __init__(self, value: str):
+                    self.value = value
+
+            def make(value: str) -> Holder:
+                return Holder(value)
+            """).lstrip(),
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(src),
+        str(out),
+        emit_llvm_only=True,
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        backend="self",
+    )
+
+    text = out.read_text(encoding="utf-8")
+    body = text.split("define external ptr @user_constructor_root_make", 1)[1]
+    body = body.split("\n}", 1)[0]
+    new_pos = body.index("@py_instance_new")
+    pin_pos = body.index("@pcc_gc_pin", new_pos)
+    init_pos = body.index("@user_constructor_root_Holder___init__", pin_pos)
+    unpin_pos = body.index("@pcc_gc_unpin", init_pos)
+    assert new_pos < pin_pos < init_pos < unpin_pos
 
 
 def test_classgen_typed_null_bool_literal_arg_uses_bool_fallback():
@@ -64,7 +100,6 @@ def test_dataclass_constructor_attr_args_do_not_lower_to_null(tmp_path, monkeypa
 
     text = out.read_text(encoding="utf-8")
     bad_name_ctor = re.compile(
-        r"@user_pcc_parse_py_parse__Name___init__"
-        r"\(ptr [^,]+, ptr null, i64 null\)"
+        r"@user_pcc_parse_py_parse__Name___init__" r"\(ptr [^,]+, ptr null, i64 null\)"
     )
     assert bad_name_ctor.search(text) is None

@@ -1,29 +1,14 @@
-"""typed-int unboxed arithmetic must overflow to bignum, like CPython.
+"""typed-int annotations must keep Python bignum overflow semantics.
 
-KNOWN BUG (xfail) — see docs/investigations/typed-int-unboxed-overflow-silent-
-wraparound.md. Explicit ``int``-typed function params force the unboxed-i64
-fast path (`_emit_binop_int` emits raw `builder.add/sub/mul`), so arithmetic
-that overflows i64 SILENTLY WRAPS instead of producing CPython's arbitrary-
-precision result. e.g. ``def mul(a:int,b:int): return a*b; mul(2**40, 2**40)``
-gives 0 (2^80 mod 2^64) instead of 1208925819614629174706176. This violates
-obligation 2 (the fast path's assumption fails — the result no longer fits i64 —
-and the slow path must preserve Python semantics, i.e. promote to bignum).
-
-The fix is design-sensitive (unboxed-i64 cannot represent the bignum overflow
-result; the typed-int result representation must become tagged-int/boxed), so it
-is tracked as a focused-session P0, not a quick patch. This test is xfail until
-that lands; when it does, the xfail flips to xpass -> remove the marker.
-
-Marked strict=False so it neither blocks CI nor silently rots: it documents the
-known-wrong behavior and will surface (xpass) the moment the fix lands.
+Default ``int`` annotations use the boxed/tagged Python-int ABI. The raw i64
+function ABI is a mode-labeled diagnostic escape, not the default meaning of
+``int``.
 """
 from __future__ import annotations
 
 import os
 import subprocess
 from pathlib import Path
-
-import pytest
 
 
 def _run_pcc_program(tmp_path: Path, source: str) -> str:
@@ -47,11 +32,6 @@ def _run_pcc_program(tmp_path: Path, source: str) -> str:
     return run.stdout
 
 
-@pytest.mark.xfail(
-    reason="typed-int unboxed i64 arithmetic wraps on overflow; see "
-    "docs/investigations/typed-int-unboxed-overflow-silent-wraparound.md",
-    strict=False,
-)
 def test_typed_int_param_overflow_promotes_to_bignum(tmp_path):
     out = _run_pcc_program(
         tmp_path,
@@ -72,20 +52,11 @@ def test_typed_int_param_overflow_promotes_to_bignum(tmp_path):
     ], out
 
 
-# --- Additional overflow-surface cases (Phase 0: define the fix's acceptance
-# criteria). Probed 2026-05-31: ``-`` and ``a*b > literal`` ALREADY box
-# correctly; the cases below (``*`` chained into ``+``, the overflow value
-# carried through a return ABI / a local slot, and ``<<``) still wrap, so they
-# capture the part of the bug the conservative fix must close. xfail until the
-# fix lands (then they flip to xpass -> remove the markers). ---
+# --- Additional overflow-surface cases. Probed 2026-05-31: ``-`` and
+# ``a*b > literal`` already used the boxed path. The cases below capture the
+# former raw-i64 failure surface for explicit ``int`` annotations. ---
 
 
-@pytest.mark.xfail(
-    reason="typed-int * overflow must keep participating in a chained + (a*b "
-    "wraps to i64 then + adds to the wrong value); see "
-    "docs/investigations/typed-int-unboxed-overflow-silent-wraparound.md",
-    strict=False,
-)
 def test_typed_int_chained_overflow_propagates(tmp_path):
     out = _run_pcc_program(
         tmp_path,
@@ -98,11 +69,6 @@ def test_typed_int_chained_overflow_propagates(tmp_path):
     assert out.split("\n")[0] == "1208925819614629174706183", out
 
 
-@pytest.mark.xfail(
-    reason="typed-int overflow result must survive the function return ABI "
-    "(currently returned as wrapped i64); see investigation doc",
-    strict=False,
-)
 def test_typed_int_overflow_through_return_abi(tmp_path):
     out = _run_pcc_program(
         tmp_path,
@@ -116,11 +82,6 @@ def test_typed_int_overflow_through_return_abi(tmp_path):
     assert out.split("\n")[0] == "1208925819614629174706177", out
 
 
-@pytest.mark.xfail(
-    reason="typed-int overflow result must survive storage in a local slot "
-    "(currently stored as wrapped i64); see investigation doc",
-    strict=False,
-)
 def test_typed_int_overflow_through_local_slot(tmp_path):
     out = _run_pcc_program(
         tmp_path,
@@ -134,11 +95,6 @@ def test_typed_int_overflow_through_local_slot(tmp_path):
     assert out.split("\n")[0] == "1208925819614629174706177", out
 
 
-@pytest.mark.xfail(
-    reason="typed-int left shift must promote to bignum (raw i64 shl masks the "
-    "count and wraps); see investigation doc",
-    strict=False,
-)
 def test_typed_int_left_shift_promotes_to_bignum(tmp_path):
     out = _run_pcc_program(
         tmp_path,

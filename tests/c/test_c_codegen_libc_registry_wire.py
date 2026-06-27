@@ -42,3 +42,12 @@ def test_errno_location_is_not_duplicated_in_declarative_registry():
     assert len(linux) == 1
     assert darwin == []
 
+
+def test_declarative_libc_names_have_no_legacy_codegen_shadow():
+    from pcc.c_libc_registry import iter_signatures
+    from pcc.codegen import c_codegen
+
+    declarative_names = {sig.name for sig in iter_signatures()}
+    assert c_codegen.libc_registry_shadow_names() == ()
+    assert declarative_names.isdisjoint(c_codegen._LEGACY_LIBC_FUNCTIONS)
+    assert declarative_names <= c_codegen.LIBC_FUNCTIONS.keys()

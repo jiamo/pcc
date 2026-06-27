@@ -1,27 +1,12 @@
 from __future__ import annotations
 
-import os
-import shutil
 import subprocess
 import textwrap
-from pathlib import Path
-
-import pytest
 
 
-def _wipe_repo_runtime_archive() -> None:
-    repo = Path(__file__).absolute().parents[2]
-    runtime = repo / "pcc" / "py_runtime"
-    archive = runtime / "libpy_runtime.a"
-    stamp = Path(str(archive) + ".target")
-    if archive.exists():
-        archive.unlink()
-    if stamp.exists():
-        stamp.unlink()
-    shutil.rmtree(runtime / "build", ignore_errors=True)
-
-
-def test_list_indexed_method_dispatch_parity(tmp_path, monkeypatch):
+def test_list_indexed_method_dispatch_parity(
+    tmp_path, monkeypatch, threaded_c_runtime_archive
+):
     """One parity gate for ``list[index].method(...)`` dispatch.
 
     Covers the three shapes that should stay equivalent to assigning the
@@ -31,14 +16,12 @@ def test_list_indexed_method_dispatch_parity(tmp_path, monkeypatch):
     * native ``Thread.start`` / ``Thread.join`` dispatch;
     * native ``Lock.acquire`` / ``Lock.release`` dispatch under contention.
     """
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        pytest.skip("threaded runtime archive tests mutate libpy_runtime.a; run with -n0")
     from pcc.py_frontend.pipeline import compile_python
 
     monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
     monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
     monkeypatch.setenv("PCC_WITH_THREADS", "1")
-    _wipe_repo_runtime_archive()
+    monkeypatch.setenv("PCC_RUNTIME_ARCHIVE", str(threaded_c_runtime_archive))
 
     src = tmp_path / "list_indexed_method_dispatch_parity.py"
     exe = tmp_path / "list_indexed_method_dispatch_parity.out"
@@ -89,29 +72,26 @@ def test_list_indexed_method_dispatch_parity(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    try:
-        compile_python(
-            str(src),
-            str(exe),
-            ir_scaffold_mode="on",
-            libpython_mode="off",
+    compile_python(
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+    )
+    outputs: list[list[str]] = []
+    for _ in range(3):
+        result = subprocess.run(
+            [str(exe)],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        outputs: list[list[str]] = []
-        for _ in range(3):
-            result = subprocess.run(
-                [str(exe)],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            assert result.returncode == 0, result.stderr
-            outputs.append(result.stdout.strip().splitlines())
-        assert outputs == [
-            ["15", "27", "15", "start", "worker", "done", "4000"],
-            ["15", "27", "15", "start", "worker", "done", "4000"],
-            ["15", "27", "15", "start", "worker", "done", "4000"],
-        ]
-    finally:
-        _wipe_repo_runtime_archive()
+        assert result.returncode == 0, result.stderr
+        outputs.append(result.stdout.strip().splitlines())
+    assert outputs == [
+        ["15", "27", "15", "start", "worker", "done", "4000"],
+        ["15", "27", "15", "start", "worker", "done", "4000"],
+        ["15", "27", "15", "start", "worker", "done", "4000"],
+    ]

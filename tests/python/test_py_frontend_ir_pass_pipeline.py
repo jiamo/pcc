@@ -30,27 +30,54 @@ def test_python_frontend_worker_timing_is_opt_in(monkeypatch):
     monkeypatch.delenv("PCC_PY_FRONTEND_WORKER_TIMING", raising=False)
 
     assert pipeline._python_frontend_worker_timing_enabled() is False
+    assert pipeline._python_frontend_worker_env_prefix() == "PCC_PY_FRONTEND_JOBS=1"
 
     monkeypatch.setenv("PCC_PY_FRONTEND_WORKER_TIMING", "1")
 
     assert pipeline._python_frontend_worker_timing_enabled() is True
+    assert pipeline._python_frontend_worker_env_prefix() == (
+        "PCC_PY_FRONTEND_JOBS=1 PCC_PY_FRONTEND_WORKER_TIMING=1"
+    )
 
 
-def test_python_frontend_native_workers_keep_one_chunk_per_worker(tmp_path):
+def test_python_frontend_native_workers_keep_one_module_per_process(tmp_path):
     native_worker = tmp_path / "pcc1"
 
     assert (
         pipeline._python_frontend_codegen_chunk_count(111, 10, [str(native_worker)])
-        == 10
+        == 111
+    )
+
+
+def test_python_frontend_single_native_worker_still_isolates_each_module(tmp_path):
+    native_worker = tmp_path / "pcc1"
+
+    assert (
+        pipeline._python_frontend_codegen_chunk_count(111, 1, [str(native_worker)])
+        == 111
+    )
+
+
+def test_python_frontend_single_source_worker_keeps_one_chunk():
+    assert (
+        pipeline._python_frontend_codegen_chunk_count(
+            111,
+            1,
+            ["python", "-m", "pcc"],
+        )
+        == 1
     )
 
 
 def test_python_frontend_source_workers_keep_one_chunk_per_worker():
-    assert pipeline._python_frontend_codegen_chunk_count(
-        111,
-        10,
-        ["python", "-m", "pcc"],
-    ) == 10
+    assert (
+        pipeline._python_frontend_codegen_chunk_count(
+            111,
+            10,
+            ["python", "-m", "pcc"],
+        )
+        == 10
+    )
 
 
 def test_python_frontend_worker_executable_skips_text_console_script(
@@ -106,7 +133,13 @@ def test_native_export_wire_preserves_expression_defaults(tmp_path):
     pipeline._write_native_exports_wire(str(path), native_exports, derived)
     restored_exports, _restored_derived = pipeline._read_native_exports_wire(str(path))
 
-    sig = restored_exports["pkg.mod"]["f"]["call_sig"]
+    export = restored_exports["pkg.mod"]["f"]
+    param_types = export["param_types"]
+    assert isinstance(param_types, tuple)
+    assert param_types[0] == ("dyn",)
+
+    sig = export["call_sig"]
+    assert isinstance(sig, tuple)
     assert sig[0]["has_default"] is True
     assert sig[0]["default"].ident == "int"
     assert sig[1]["has_default"] is True
@@ -517,8 +550,7 @@ def test_python_ir_pass_memory_transport_strict_no_libpython_allows_cpy_decls(
     monkeypatch.setenv("PCC_PYTHON_IR_PASS_CACHE", "off")
     ir_text = _OPT_DEFAULT_PIPELINE_IR.replace(
         "define i32 @main()",
-        "declare ptr @py_cpy_import(ptr)\n\n"
-        "define i32 @main()",
+        "declare ptr @py_cpy_import(ptr)\n\n" "define i32 @main()",
     )
 
     out = ir_pass_pipeline.run_python_ir_pass_pipeline(
@@ -1032,7 +1064,7 @@ def test_compile_python_emit_llvm_applies_python_ir_pass_pipeline(
     monkeypatch,
 ):
     src = tmp_path / "main.py"
-    src.write_text("print(1)\n")
+    src.write_text("print(1)\n", encoding="utf-8")
     out = tmp_path / "main.ll"
     seen = []
 
@@ -1056,12 +1088,12 @@ def test_compile_python_emit_llvm_applies_python_ir_pass_pipeline(
     pipeline.compile_python(str(src), str(out), emit_llvm_only=True)
 
     assert seen == [("main", False)]
-    assert "; pass marker" in out.read_text()
+    assert "; pass marker" in out.read_text(encoding="utf-8")
 
 
 def test_string_literals_emit_immortal_globals_not_py_str_new(tmp_path):
     src = tmp_path / "main.py"
-    src.write_text('print("same")\nprint("same")\n')
+    src.write_text('print("same")\nprint("same")\n', encoding="utf-8")
     out = tmp_path / "main.ll"
 
     pipeline.compile_python(
@@ -1071,7 +1103,7 @@ def test_string_literals_emit_immortal_globals_not_py_str_new(tmp_path):
         libpython_mode="off",
     )
 
-    text = out.read_text()
+    text = out.read_text(encoding="utf-8")
     assert "call ptr @py_str_new" not in text
     assert text.count('c"same\\00"') == 1
     assert "i32 4, i32 1" in text
@@ -1083,8 +1115,8 @@ def test_compile_python_multi_batches_python_ir_pass_pipeline(
 ):
     entry = tmp_path / "entry.py"
     helper = tmp_path / "helper.py"
-    entry.write_text("print(1)\n")
-    helper.write_text("print(2)\n")
+    entry.write_text("print(1)\n", encoding="utf-8")
+    helper.write_text("print(2)\n", encoding="utf-8")
     out = tmp_path / "combined.ll"
     seen = []
 
@@ -1125,7 +1157,7 @@ def test_compile_python_multi_batches_python_ir_pass_pipeline(
     )
 
     assert seen == [["entry", "helper"]]
-    text = out.read_text()
+    text = out.read_text(encoding="utf-8")
     assert "; pass marker entry" in text
     assert "; pass marker helper" in text
 
@@ -1141,8 +1173,8 @@ def test_compile_python_multi_strict_no_libpython_fails_after_first_fallback_mod
 
     entry = tmp_path / "entry.py"
     helper = tmp_path / "helper.py"
-    entry.write_text("print(1)\n")
-    helper.write_text("print(2)\n")
+    entry.write_text("print(1)\n", encoding="utf-8")
+    helper.write_text("print(2)\n", encoding="utf-8")
     out = tmp_path / "combined.ll"
     generated = []
 
@@ -1169,7 +1201,9 @@ def test_compile_python_multi_strict_no_libpython_fails_after_first_fallback_mod
         return ast_mod
 
     def fail_pipeline_many(*_args, **_kwargs):
-        raise AssertionError("strict no-libpython fallback should fail before IR passes")
+        raise AssertionError(
+            "strict no-libpython fallback should fail before IR passes"
+        )
 
     monkeypatch.setattr(
         pipeline,
@@ -1237,8 +1271,8 @@ def test_compile_python_multi_reuses_export_pass_ast(tmp_path, monkeypatch):
 
     entry = tmp_path / "entry.py"
     helper = tmp_path / "helper.py"
-    entry.write_text("from .helper import value\nprint(value())\n")
-    helper.write_text("def value() -> int:\n    return 3\n")
+    entry.write_text("from .helper import value\nprint(value())\n", encoding="utf-8")
+    helper.write_text("def value() -> int:\n    return 3\n", encoding="utf-8")
     out = tmp_path / "combined.ll"
     calls = []
     real_parse_and_lift = py_lift.parse_and_lift
@@ -1264,8 +1298,8 @@ def test_compile_python_multi_reuses_export_pass_ast(tmp_path, monkeypatch):
 def test_parallel_frontend_codegen_uses_shared_export_context(tmp_path, monkeypatch):
     entry = tmp_path / "entry.py"
     helper = tmp_path / "helper.py"
-    entry.write_text("def main() -> int:\n    return 0\n\nmain()\n")
-    helper.write_text("def value() -> int:\n    return 3\n")
+    entry.write_text("def main() -> int:\n    return 0\n\nmain()\n", encoding="utf-8")
+    helper.write_text("def value() -> int:\n    return 3\n", encoding="utf-8")
     out = tmp_path / "program.out"
     context_lift_indices = []
     seen_exports = []
@@ -1362,7 +1396,7 @@ def test_parallel_frontend_codegen_uses_shared_export_context(tmp_path, monkeypa
         pipeline,
         "_link_with_self_backend_ir_texts",
         lambda ir_texts, out_path, runtime_archive, verbose, **_kwargs: out.write_text(
-            "linked"
+            "linked", encoding="utf-8"
         ),
     )
 
@@ -1379,7 +1413,7 @@ def test_parallel_frontend_codegen_uses_shared_export_context(tmp_path, monkeypa
     assert codegen_manifests
     assert seen_exports
     assert all(exports == {"entry": {}, "helper": {}} for exports, _ in seen_exports)
-    assert out.read_text() == "linked"
+    assert out.read_text(encoding="utf-8") == "linked"
 
 
 def test_self_backend_native_compile_defaults_python_ir_passes_off(
@@ -1388,8 +1422,8 @@ def test_self_backend_native_compile_defaults_python_ir_passes_off(
 ):
     entry = tmp_path / "entry.py"
     helper = tmp_path / "helper.py"
-    entry.write_text("from .helper import value\nprint(value())\n")
-    helper.write_text("def value() -> int:\n    return 3\n")
+    entry.write_text("from .helper import value\nprint(value())\n", encoding="utf-8")
+    helper.write_text("def value() -> int:\n    return 3\n", encoding="utf-8")
     out = tmp_path / "program.out"
     defaults = []
 
@@ -1419,16 +1453,15 @@ def test_self_backend_native_compile_defaults_python_ir_passes_off(
         pipeline,
         "_link_native",
         lambda ll_paths, out_path, runtime_archive, verbose, *, backend, needs_libpython=False: out.write_text(
-            "linked"
+            "linked", encoding="utf-8"
         ),
     )
     monkeypatch.setattr(
         pipeline,
         "_link_with_self_backend_ir_texts",
-        lambda ir_texts, out_path, runtime_archive, verbose, *,
-        needs_libpython=False,
-        needs_native_extension_exports=False,
-        profile=None: out.write_text("linked"),
+        lambda ir_texts, out_path, runtime_archive, verbose, *, needs_libpython=False, needs_native_extension_exports=False, profile=None: out.write_text(
+            "linked", encoding="utf-8"
+        ),
     )
 
     pipeline.compile_python_multi(
@@ -1448,8 +1481,8 @@ def test_self_backend_emit_llvm_defaults_python_ir_passes_off(
 ):
     entry = tmp_path / "entry.py"
     helper = tmp_path / "helper.py"
-    entry.write_text("from .helper import value\nprint(value())\n")
-    helper.write_text("def value() -> int:\n    return 3\n")
+    entry.write_text("from .helper import value\nprint(value())\n", encoding="utf-8")
+    helper.write_text("def value() -> int:\n    return 3\n", encoding="utf-8")
     out = tmp_path / "combined.ll"
     defaults = []
 
@@ -1638,4 +1671,6 @@ def test_batch_pass_skip_survives_large_module_sharding(monkeypatch, tmp_path):
         "pcc.py_frontend.codegen.class_gen.__pass_shard_0",
         "pcc.py_frontend.codegen.class_gen.__pass_shard_1",
     ]
-    assert not telemetry_path.exists() or telemetry_path.read_text() == ""
+    assert (
+        not telemetry_path.exists() or telemetry_path.read_text(encoding="utf-8") == ""
+    )

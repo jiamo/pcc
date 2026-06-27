@@ -43,7 +43,7 @@ def test_hoisted_sibling_function_call_is_not_captured(tmp_path):
                 main()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     compile_python(
         str(src),
         str(exe),
@@ -66,7 +66,7 @@ def _compile_to_ll(source: str, name: str) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
         str(src),
         str(out),
@@ -74,12 +74,12 @@ def _compile_to_ll(source: str, name: str) -> str:
         libpython_mode="off",
         ir_scaffold_mode="on",
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _read_key_value_profile(path: Path) -> dict[str, int]:
     values: dict[str, int] = {}
-    for raw in path.read_text().splitlines():
+    for raw in path.read_text(encoding="utf-8").splitlines():
         if "=" not in raw:
             continue
         key, value = raw.split("=", 1)
@@ -121,7 +121,7 @@ def test_nested_hoist_free_name_analysis_is_cached(monkeypatch, tmp_path):
                 return f4(1)
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
 
     compile_python(
         str(src),
@@ -209,7 +209,7 @@ def test_mem2reg_self_compile_emits_llvm_after_nested_capture_propagation():
     src = _REPO_ROOT / "pcc" / "ir_passes" / "mem2reg.py"
     out = _BUILD / "mem2reg_nested_capture_probe.ll"
     compile_python(str(src), str(out), emit_llvm_only=True)
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "@user_pcc_ir_passes_mem2reg__ssa_plan_for_alloca" in ir
     assert re.search(
         r"define (?:external )?ptr "

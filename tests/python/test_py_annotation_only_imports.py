@@ -16,7 +16,7 @@ def _compile_to_ll(source: str, name: str) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
         str(src),
         str(out),
@@ -24,7 +24,7 @@ def _compile_to_ll(source: str, name: str) -> str:
         libpython_mode="off",
         ir_scaffold_mode="on",
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def test_llvmlite_import_used_only_in_annotations_does_not_emit_cpython_import():

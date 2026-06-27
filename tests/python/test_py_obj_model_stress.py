@@ -18,7 +18,7 @@ else:
 
 def _run_test(tmp_path, monkeypatch, source, compiler):
     src = tmp_path / "stress.py"; exe = tmp_path / "stress.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     if compiler == "pcc1":
         if not PCC1.exists(): pytest.skip("no pcc1")
         subprocess.run(

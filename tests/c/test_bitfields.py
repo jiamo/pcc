@@ -220,6 +220,32 @@ class TestBitfields(unittest.TestCase):
         )
         assert ret == 0
 
+    def test_anonymous_bitfield_struct_field_assignment_reuses_layout_type(self):
+        ret = CEvaluator().evaluate(
+            r'''
+            struct Item {
+                struct {
+                    unsigned a:1;
+                    unsigned b:1;
+                } fg;
+                int x;
+            };
+
+            int main(void) {
+                struct Item dst;
+                struct Item src;
+                src.fg.a = 1;
+                src.fg.b = 0;
+                dst.fg = src.fg;
+                dst.fg.b = 1;
+                return (dst.fg.a == 1 && dst.fg.b == 1) ? 0 : 1;
+            }
+            ''',
+            optimize=False,
+            use_system_cpp=False,
+        )
+        assert ret == 0
+
 
 if __name__ == "__main__":
     unittest.main()

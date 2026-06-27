@@ -30,13 +30,7 @@ def test_type_infer_preserves_bytes_type():
     assert isinstance(second.value.ty, BytesType)
 
 
-def test_runtime_bytes_len_getitem_and_slice_native(tmp_path):
-    subprocess.run(
-        ["make", "-C", "pcc/py_runtime", "libpy_runtime.a"],
-        check=True,
-        env={**os.environ, "PATH": os.environ.get("PATH", "")},
-    )
-
+def test_runtime_bytes_len_getitem_and_slice_native(tmp_path, c_runtime_archive):
     src = tmp_path / "bytes_probe.c"
     exe = tmp_path / "bytes_probe"
     src.write_text(
@@ -69,6 +63,12 @@ def test_runtime_bytes_len_getitem_and_slice_native(tmp_path):
                 PyObject *ba = py_bytearray_from_obj(b);
                 PyObject *ba_rep = py_bytes_repeat(ba, 2);
                 if (py_bytearray_setitem(ba_rep, py_int_from_i64(0), py_int_from_i64(65)) != 0) return 10;
+                PyObject *upper = py_bytes_upper(py_bytes_new("a1z", 3));
+                if (py_int_to_i64(py_bytes_getitem(upper, py_int_from_i64(0)), 0) != 65) return 11;
+                if (py_int_to_i64(py_bytes_getitem(upper, py_int_from_i64(1)), 0) != 49) return 12;
+                if (py_int_to_i64(py_bytes_getitem(upper, py_int_from_i64(2)), 0) != 90) return 13;
+                PyObject *ba_upper = py_bytes_upper(py_bytearray_from_obj(py_bytes_new("az", 2)));
+                if (py_bytearray_setitem(ba_upper, py_int_from_i64(0), py_int_from_i64(65)) != 0) return 14;
                 printf("bytes-ok\n");
                 return 0;
             }
@@ -80,9 +80,9 @@ def test_runtime_bytes_len_getitem_and_slice_native(tmp_path):
         [
             os.environ.get("CC", "cc"),
             "-I",
-            "pcc/py_runtime/include",
+            str(c_runtime_archive.parent / "include"),
             str(src),
-            "pcc/py_runtime/libpy_runtime.a",
+            str(c_runtime_archive),
             "-lm",
             "-o",
             str(exe),

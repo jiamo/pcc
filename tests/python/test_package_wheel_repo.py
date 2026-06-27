@@ -108,7 +108,7 @@ def test_pcc1_wheel_repo_does_not_need_host_python(tmp_path):
     _write_wheel(repo / "demo_pkg-0.1-py3-none-any.whl")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),

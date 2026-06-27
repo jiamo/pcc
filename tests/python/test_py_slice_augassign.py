@@ -14,7 +14,7 @@ def test_list_slice_augassign_lowers_without_libpython(tmp_path):
             print(values)
             """
         )
-    )
+    , encoding="utf-8")
     exe = tmp_path / "slice_augassign.out"
     compile_python(str(src), str(exe), libpython_mode="off", ir_scaffold_mode="on")
     out = subprocess.check_output([str(exe)], text=True).strip()
@@ -34,7 +34,7 @@ def test_class_type_slice_assignment_compiles_without_libpython_self_backend(tmp
             print("compiled")
             """
         )
-    )
+    , encoding="utf-8")
     exe = tmp_path / "class_slice_assignment.out"
     compile_python(
         str(src),

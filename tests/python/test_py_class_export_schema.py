@@ -76,7 +76,20 @@ def test_class_method_registration_uses_stable_function_ref(tmp_path, monkeypatc
     )
 
     text = out.read_text(encoding="utf-8")
-    assert "bitcast ptr @user_method_ref_Box_value to ptr" in text
+    # Method registration must reference the method by a STABLE, named
+    # function symbol derived from the method (so cross-module class schema
+    # is deterministic), not an anonymous/inlined ref. After the method
+    # dispatch rework the registration passes the method's stable native
+    # adapter symbol to py_func_new_named (previously a `bitcast ptr
+    # @user_method_ref_Box_value to ptr`); the raw method symbol is still
+    # emitted and called.
+    assert (
+        "@py_func_new_named(ptr @user_method_ref_Box_value_method_native_adapter"
+        in text
+    ), text
+    assert "define external ptr @user_method_ref_Box_value(" in text, text
+    # the original malformed-ref guard: the function ref must never be
+    # serialized with the module header glued on.
     assert "bitcast ; ModuleID" not in text
 
 

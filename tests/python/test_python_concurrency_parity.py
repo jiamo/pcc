@@ -34,43 +34,59 @@ Reference: CPython
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
-import pytest
+from tests.runtime_build_cache import cache_runtime_build
 
 
-def _wipe_repo_runtime_archive() -> None:
-    repo = Path(__file__).absolute().parents[2]
-    runtime = repo / "pcc" / "py_runtime"
-    archive = runtime / "libpy_runtime.a"
-    stamp = Path(str(archive) + ".target")
-    if archive.exists():
-        archive.unlink()
-    if stamp.exists():
-        stamp.unlink()
-    shutil.rmtree(runtime / "build", ignore_errors=True)
+REPO_ROOT = Path(__file__).absolute().parents[2]
+RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
 
-def _compile_threaded(monkeypatch, src: Path, exe: Path) -> None:
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        pytest.skip("threaded runtime archive tests mutate libpy_runtime.a; run with -n0")
+@cache_runtime_build
+def _build_threaded_runtime(tmp_path: Path) -> Path:
+    work_runtime = tmp_path / "py_runtime_threads"
+    shutil.copytree(
+        RUNTIME_DIR,
+        work_runtime,
+        ignore=shutil.ignore_patterns(
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
+        ),
+    )
+    result = subprocess.run(
+        [
+            "make",
+            "-B",
+            "-C",
+            str(work_runtime),
+            "PCC_WITH_THREADS=1",
+            "libpy_runtime.a",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return work_runtime
+
+
+def _compile_threaded(monkeypatch, tmp_path: Path, src: Path, exe: Path) -> None:
     monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
     monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
     monkeypatch.setenv("PCC_WITH_THREADS", "1")
-    _wipe_repo_runtime_archive()
-    try:
-        from pcc.py_frontend.pipeline import compile_python
+    work_runtime = _build_threaded_runtime(tmp_path)
+    from pcc.py_frontend.pipeline import compile_python
 
-        compile_python(
-            str(src), str(exe),
-            ir_scaffold_mode="on", libpython_mode="off",
-        )
-    finally:
-        _wipe_repo_runtime_archive()
+    compile_python(
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        runtime_archive=str(work_runtime / "libpy_runtime.a"),
+    )
 
 
 def _run(exe: Path, timeout: float = 30.0) -> str:
@@ -102,9 +118,9 @@ def test_lock_acquire_release_roundtrip(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    _compile_threaded(monkeypatch, src, exe)
+    _compile_threaded(monkeypatch, tmp_path, src, exe)
     out = _run(exe).strip().splitlines()
     assert out == ["True", "True", "DONE"], (
         f"acquire/release roundtrip broken.\noutput: {out}"
@@ -143,9 +159,9 @@ def test_lock_acquire_contended_counter(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    _compile_threaded(monkeypatch, src, exe)
+    _compile_threaded(monkeypatch, tmp_path, src, exe)
     # Run 3 times — non-determinism would manifest as inconsistent values.
     seen = []
     for _ in range(3):
@@ -180,9 +196,9 @@ def test_rlock_recursion_count_single_thread(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    _compile_threaded(monkeypatch, src, exe)
+    _compile_threaded(monkeypatch, tmp_path, src, exe)
     out = _run(exe).strip().splitlines()
     assert out == ["True", "True", "True", "True", "DONE"], (
         f"RLock recursion broken.\noutput: {out}"
@@ -218,9 +234,9 @@ def test_event_broadcast_releases_all_waiters(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    _compile_threaded(monkeypatch, src, exe)
+    _compile_threaded(monkeypatch, tmp_path, src, exe)
     out = _run(exe).strip()
     assert out == "4", (
         f"Event.set did not wake all 4 waiters (CPython contract).\noutput: {out}"
@@ -258,9 +274,9 @@ def test_disjoint_slot_writes_no_lock(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    _compile_threaded(monkeypatch, src, exe)
+    _compile_threaded(monkeypatch, tmp_path, src, exe)
     out = _run(exe).strip()
     assert out == "1000 1000 1000 1000", (
         "disjoint slot writes lost updates — pcc's free-threaded "
@@ -301,9 +317,9 @@ def test_list_indexed_lock_contended_counter(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
-    _compile_threaded(monkeypatch, src, exe)
+    _compile_threaded(monkeypatch, tmp_path, src, exe)
     seen = []
     for _ in range(3):
         seen.append(_run(exe).strip())

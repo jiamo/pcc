@@ -23,7 +23,7 @@ def test_chained_comparison_uses_python_and_semantics(tmp_path):
                 main()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     compile_python(
         str(src),
         str(exe),

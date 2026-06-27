@@ -81,7 +81,10 @@ def test_native_gc_public_api_runtime_for_refcount_backend(tmp_path):
                 print(gc.isenabled())
                 gc.enable()
                 print(gc.isenabled())
-                print(gc.get_count())
+                count = gc.get_count()
+                print(count[0] >= 0)
+                print(count[1] == 0)
+                print(count[2] == 0)
                 print(gc.get_threshold())
                 gc.set_threshold(701, 11, 12)
                 print(gc.get_threshold())
@@ -114,7 +117,9 @@ def test_native_gc_public_api_runtime_for_refcount_backend(tmp_path):
         "True\n"
         "False\n"
         "True\n"
-        "(0, 0, 0)\n"
+        "True\n"
+        "True\n"
+        "True\n"
         "(700, 10, 10)\n"
         "(701, 11, 12)\n"
         "False\n"

@@ -24,7 +24,7 @@ def test_dyn_float_value_can_enter_object_container(tmp_path):
                 main()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     compile_python(
         str(src),
         str(exe),

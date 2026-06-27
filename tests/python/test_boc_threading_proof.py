@@ -14,13 +14,11 @@ Pass criteria:
      pthread substrate runs in parallel rather than serializing through
      a GIL or shared lock.
 
-Side effect: rebuilds ``pcc/py_runtime/libpy_runtime.a`` with
-``PCC_WITH_THREADS=1`` and removes it on teardown so subsequent tests
-get their own (default) build.
+Both binaries link an isolated ``PCC_WITH_THREADS=1`` runtime fixture; the
+repository's shared runtime archive is never replaced or deleted.
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import time
@@ -30,7 +28,6 @@ import pytest
 
 
 REPO = Path(__file__).absolute().parents[2]
-PY_RUNTIME = REPO / "pcc" / "py_runtime"
 PARALLEL_SRC = REPO / "benchmarks" / "python" / "boc_bank_demo.py"
 SERIAL_SRC = REPO / "benchmarks" / "python" / "boc_bank_demo_serial.py"
 
@@ -44,31 +41,12 @@ MIN_SPEEDUP = 2.5
 N_WORKERS = 4
 
 
-def _archive_paths() -> tuple[Path, Path]:
-    archive = PY_RUNTIME / "libpy_runtime.a"
-    stamp = Path(str(archive) + ".target")
-    return archive, stamp
-
-
-def _wipe_archive() -> None:
-    archive, stamp = _archive_paths()
-    if archive.exists():
-        archive.unlink()
-    if stamp.exists():
-        stamp.unlink()
-    shutil.rmtree(PY_RUNTIME / "build", ignore_errors=True)
-
-
 @pytest.fixture
-def threaded_runtime(monkeypatch):
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        pytest.skip("BoC threading proof mutates the shared runtime archive; run with -n0")
+def threaded_runtime(monkeypatch, threaded_c_runtime_archive):
     monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
     monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
     monkeypatch.setenv("PCC_WITH_THREADS", "1")
-    _wipe_archive()
-    yield
-    _wipe_archive()
+    monkeypatch.setenv("PCC_RUNTIME_ARCHIVE", str(threaded_c_runtime_archive))
 
 
 def _run_binary(exe: Path, timeout: float = 60.0) -> tuple[float, str]:

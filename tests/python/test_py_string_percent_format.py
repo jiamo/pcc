@@ -15,7 +15,7 @@ def test_string_percent_tuple_formats_without_libpython(tmp_path):
             print("%s=%r" % ("name", "bob"))
             """
         )
-    )
+    , encoding="utf-8")
     exe = tmp_path / "string_percent_tuple.out"
     compile_python(str(src), str(exe), libpython_mode="off", ir_scaffold_mode="on")
     out = subprocess.check_output([str(exe)], text=True).splitlines()
@@ -36,7 +36,7 @@ def test_string_percent_mapping_formats_without_libpython(tmp_path):
             print("%(name)r" % d)
             """
         )
-    )
+    , encoding="utf-8")
     exe = tmp_path / "string_percent_mapping.out"
     compile_python(str(src), str(exe), libpython_mode="off", ir_scaffold_mode="on")
     out = subprocess.check_output([str(exe)], text=True).splitlines()

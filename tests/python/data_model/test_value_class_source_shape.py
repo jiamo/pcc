@@ -33,10 +33,7 @@ def test_valueclass_accepts_typed_fields_and_typed_initializer():
     ("source", "message"),
     [
         (
-            "import pcc\n"
-            "@pcc.valueclass\n"
-            "class Bad:\n"
-            "    x = 1\n",
+            "import pcc\n" "@pcc.valueclass\n" "class Bad:\n" "    x = 1\n",
             "needs an explicit type annotation",
         ),
         (
@@ -75,10 +72,7 @@ def test_valueclass_accepts_typed_fields_and_typed_initializer():
             "cannot define __del__",
         ),
         (
-            "import pcc\n"
-            "@pcc.valueclass\n"
-            "class Bad:\n"
-            "    child: 'Bad'\n",
+            "import pcc\n" "@pcc.valueclass\n" "class Bad:\n" "    child: 'Bad'\n",
             "recursive valueclass",
         ),
         (
@@ -125,3 +119,56 @@ def test_valueclass_rejects_identity_escape_operations():
             "p = Point(1)\n"
             "ident = id(p)\n"
         )
+
+
+@pytest.mark.parametrize(
+    ("operation", "message"),
+    [
+        ("leak = p.__dict__", "instance dictionary"),
+        ("leak = p.__weakref__", "weak reference slot"),
+        ("leak = vars(p)", r"vars\(\)"),
+        ("leak = getattr(p, '__dict__')", "instance dictionary"),
+        ("leak = hasattr(p, '__weakref__')", "weak reference slot"),
+        ("setattr(p, 'extra', 2)", "attribute mutation"),
+        ("delattr(p, 'x')", "attribute mutation"),
+    ],
+)
+def test_valueclass_rejects_instance_identity_surfaces(operation: str, message: str):
+    source = (
+        "import pcc\n"
+        "@pcc.valueclass\n"
+        "class Point:\n"
+        "    x: int\n"
+        "p = Point(1)\n" + operation + "\n"
+    )
+
+    with pytest.raises(PyFrontendError, match=message):
+        _infer(source)
+
+
+def test_valueclass_identity_diagnostics_do_not_capture_shadowed_builtin_names():
+    _infer(
+        "import pcc\n"
+        "@pcc.valueclass\n"
+        "class Point:\n"
+        "    x: int\n"
+        "def id(value):\n"
+        "    return value\n"
+        "def vars(value):\n"
+        "    return value\n"
+        "def getattr(value, name):\n"
+        "    return value\n"
+        "def hasattr(value, name):\n"
+        "    return True\n"
+        "def setattr(value, name, replacement):\n"
+        "    return None\n"
+        "def delattr(value, name):\n"
+        "    return None\n"
+        "p = Point(1)\n"
+        "same = id(p)\n"
+        "mapping = vars(p)\n"
+        "field = getattr(p, '__dict__')\n"
+        "present = hasattr(p, '__weakref__')\n"
+        "setattr(p, 'extra', 2)\n"
+        "delattr(p, 'x')\n"
+    )

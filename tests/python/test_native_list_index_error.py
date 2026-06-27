@@ -16,9 +16,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
-
-
 def _run_pcc_program(tmp_path: Path, source: str) -> str:
     src = tmp_path / "prog.py"
     src.write_text(source, encoding="utf-8")
@@ -41,24 +38,6 @@ def _run_pcc_program(tmp_path: Path, source: str) -> str:
     return run.stdout
 
 
-@pytest.mark.xfail(
-    reason=(
-        "list a[i] out-of-range returns <null> instead of raising IndexError. "
-        "A working fix (runtime py_list_get_checked + frontend err-check on the "
-        "exact_int_lowering + subscript_lowering list-subscript-load paths) made "
-        "user programs correct (a[5]/[][0] raise + iteration unaffected) BUT "
-        "BROKE the self-host bootstrap (2026-05-30): adding _emit_post_call_err_"
-        "check after EVERY list subscript-load means pcc's own heavy list "
-        "indexing gets a py_err_occurred() branch after each read, which either "
-        "spuriously fires on a stale TLS exception (the documented hazard in "
-        "_emit_post_call_err_check) or changes the CFG enough to break stage2. "
-        "Reverted per feedback_test_first. A bootstrap-safe fix needs a NARROWER "
-        "err-check (only when the subscript is inside a try/except that can catch "
-        "IndexError, or a non-branching propagation) — a focused-session item. "
-        "Same gap for dict d[missing] -> KeyError."
-    ),
-    strict=False,
-)
 def test_list_out_of_range_raises_indexerror_native_no_libpython(tmp_path):
     out = _run_pcc_program(
         tmp_path,

@@ -41,7 +41,7 @@ def ir_py_on_counts() -> dict:
             emit_llvm_only=True,
             ir_scaffold_mode="on",
         )
-        text = out.read_text()
+        text = out.read_text(encoding="utf-8")
         # Per-symbol call counts: only CALL instructions (excludes
         # declare/define lines so we don't over-count by the number of
         # extern declarations).

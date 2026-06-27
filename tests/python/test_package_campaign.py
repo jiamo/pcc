@@ -17,8 +17,9 @@ from pcc.package.campaign import (
     select_test_files,
 )
 
-
 REPO = Path(__file__).resolve().parents[2]
+
+
 def _find_current_pcc1() -> Path | None:
     return find_current_pcc1(REPO)
 
@@ -64,7 +65,9 @@ def test_compatibility_matrix_is_stable_and_json_ready():
 def test_campaign_selection_filters_and_marks_xfail(tmp_path):
     tests = tmp_path / "numpy" / "_core" / "tests"
     tests.mkdir(parents=True)
-    (tests / "test_multiarray.py").write_text("def test_shape(): pass\n", encoding="utf-8")
+    (tests / "test_multiarray.py").write_text(
+        "def test_shape(): pass\n", encoding="utf-8"
+    )
     (tests / "test_umath.py").write_text("def test_add(): pass\n", encoding="utf-8")
     (tests / "test_object.py").write_text("def test_object(): pass\n", encoding="utf-8")
     report = campaign_selection(
@@ -112,6 +115,18 @@ def test_numpy_core_l6_profile_selects_documented_subset(tmp_path):
     assert first["feature"] == "array-repr-print"
     assert report["dashboard"]["by_status"]["selected"] == 3
 
+    import pcc.cli_bootstrap as cb
+
+    native = json.loads(
+        cb._native_campaign_json(
+            str(tmp_path), "test_*.py", "core", [], [], [], "numpy-core-l6"
+        )
+    )
+    assert native["area"] == report["area"]
+    assert native["profile_description"] == report["profile_description"]
+    assert native["selection_rule"] == report["selection_rule"]
+    assert native["task_counts"] == report["task_counts"]
+
 
 def test_pcc_package_campaign_cli_writes_report(tmp_path):
     tests = tmp_path / "tests"
@@ -154,7 +169,9 @@ def test_pcc_package_campaign_cli_writes_report(tmp_path):
 def test_pcc_package_campaign_cli_numpy_core_l6_profile(tmp_path):
     tests = tmp_path / "numpy" / "_core" / "tests"
     tests.mkdir(parents=True)
-    (tests / "test_indexing.py").write_text("def test_indexing(): pass\n", encoding="utf-8")
+    (tests / "test_indexing.py").write_text(
+        "def test_indexing(): pass\n", encoding="utf-8"
+    )
     (tests / "test_umath.py").write_text("def test_umath(): pass\n", encoding="utf-8")
     (tests / "test_linalg.py").write_text("def test_linalg(): pass\n", encoding="utf-8")
     out = tmp_path / "numpy-l6-campaign.json"
@@ -206,7 +223,7 @@ def test_pcc1_campaign_cli_does_not_need_host_python(tmp_path):
     out = tmp_path / "campaign.json"
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -237,8 +254,12 @@ def test_pcc1_campaign_cli_does_not_need_host_python(tmp_path):
 
     numpy_tests = tmp_path / "numpy" / "_core" / "tests"
     numpy_tests.mkdir(parents=True)
-    (numpy_tests / "test_multiarray.py").write_text("def test_shape(): pass\n", encoding="utf-8")
-    (numpy_tests / "test_linalg.py").write_text("def test_linalg(): pass\n", encoding="utf-8")
+    (numpy_tests / "test_multiarray.py").write_text(
+        "def test_shape(): pass\n", encoding="utf-8"
+    )
+    (numpy_tests / "test_linalg.py").write_text(
+        "def test_linalg(): pass\n", encoding="utf-8"
+    )
     proc = subprocess.run(
         [
             str(pcc1),

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import subprocess
 import textwrap
+import re
 from pathlib import Path
 
 
@@ -53,7 +54,7 @@ def test_dict_basic_get_set(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1", "2", "2"]
 
@@ -70,7 +71,7 @@ def test_dict_get_default(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1", "None", "-1"]
 
@@ -89,7 +90,7 @@ def test_dict_setdefault(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1", "1", "1", "2", "2"]
 
@@ -111,9 +112,61 @@ def test_dict_keys_values_items(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["a b c", "1 2 3", "3"]
+
+
+def test_dict_items_for_loop_direct_lowering(tmp_path, monkeypatch):
+    monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
+    monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "dict_items_for.py"
+    exe = tmp_path / "dict_items_for.out"
+    ll = tmp_path / "dict_items_for.ll"
+    src.write_text(textwrap.dedent("""
+        def main() -> None:
+            d: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+            total = 0
+            seen = ""
+            for k, v in d.items():
+                seen = seen + k
+                total = total + v
+            print(seen)
+            print(total)
+            box = Box()
+            print(box.total())
+
+        class Box:
+            def __init__(self):
+                self.d = {"x": 4, "y": 5}
+
+            def total(self):
+                n = 0
+                for k, v in self.d.items():
+                    n = n + v
+                return n
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+
+    compile_python(
+        str(src), str(ll),
+        ir_scaffold_mode="on", libpython_mode="off", emit_llvm_only=True,
+    )
+    ir_text = ll.read_text(encoding="utf-8")
+    assert "py_dict_entries_used" in ir_text
+    assert "py_dict_entry_key_at" in ir_text
+    assert "py_dict_entry_value_at" in ir_text
+    assert re.search(r"\bcall\b.*@py_dict_items\b", ir_text) is None
+
+    compile_python(
+        str(src), str(exe),
+        ir_scaffold_mode="on", libpython_mode="off",
+    )
+    assert _run(exe).strip().splitlines() == ["abc", "6", "9"]
 
 
 def test_dict_update(tmp_path, monkeypatch):
@@ -129,7 +182,7 @@ def test_dict_update(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["99", "2", "2"]
 
@@ -153,7 +206,7 @@ def test_dict_union_operator_self_backend(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     compile_python(
         str(src),
         str(exe),
@@ -187,7 +240,7 @@ def test_dict_union_optional_dict_pattern_self_backend(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     compile_python(
         str(src),
         str(exe),
@@ -217,7 +270,7 @@ def test_chained_assignment_to_dict_subscript_self_backend(tmp_path, monkeypatch
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     compile_python(
         str(src),
         str(exe),
@@ -241,7 +294,7 @@ def test_dict_in_operator(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True", "False", "False", "True"]
 
@@ -260,7 +313,7 @@ def test_dict_pop(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["2", "2", "-1"]
 
@@ -281,7 +334,7 @@ def test_dict_iteration_order(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     # Insertion order: c, a, b — CPython 3.7+ guarantees.
     assert _run(exe).strip() == "c a b"
@@ -300,7 +353,7 @@ def test_dict_clear(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["2", "0", "False"]
 
@@ -321,6 +374,6 @@ def test_dict_int_keys(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["two", "3", "True", "False"]

@@ -27,13 +27,13 @@ def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _function_body(ir_text: str, fn_name_suffix: str) -> str | None:
@@ -79,9 +79,9 @@ def test_on_mode_use_lookup_body_uses_pcc_dict_access():
     ir_on = _compile_to_ll(_RUNTIME_LOOKUP_PROGRAM, "rt_on", mode="on")
     body_on = _function_body(ir_on, "use_lookup")
     assert body_on is not None
-    assert re.search(r"@py_(?:dict_get|obj_getitem)\b", body_on), (
+    assert re.search(r"@py_(?:dict|obj)_getitem\b", body_on), (
         "ON body should keep self.runtime[...] as a pcc-native "
-        "dict/object lookup; got:\n" + body_on
+        "raising dict/object subscript lookup; got:\n" + body_on
     )
     assert "@py_cpy_call_noargs" not in body_on, (
         "ON body must not directly reference @py_cpy_call_noargs:\n"

@@ -134,6 +134,9 @@ SUPPORTED_CASES: tuple[FeatureCase, ...] = (
             z = 1 + 2j
             print(z.real)
             print(z.imag)
+            c = complex(1, 2)
+            print(c.real)
+            print(c.imag)
         if __name__ == "__main__":
             main()
         """,
@@ -1416,6 +1419,24 @@ SUPPORTED_CASES: tuple[FeatureCase, ...] = (
             print(hasattr(a, "x"))
             delattr(a, "x")
             print(hasattr(a, "x"))
+        if __name__ == "__main__":
+            main()
+        """,
+    ),
+    FeatureCase(
+        "object_dunder_setattr",
+        """
+        class Box:
+            def __init__(self):
+                self.value = "before"
+
+            def normalize(self):
+                object.__setattr__(self, "value", "after")
+
+        def main() -> None:
+            box = Box()
+            box.normalize()
+            print(box.value)
         if __name__ == "__main__":
             main()
         """,

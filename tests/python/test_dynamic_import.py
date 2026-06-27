@@ -28,7 +28,7 @@ def _compile_and_run(tmp_path, source: str) -> subprocess.CompletedProcess[str]:
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     # importlib.import_module / runtime getattr legitimately need the
     # libpython fallback today; the strict ``off`` default refuses the
     # build.  Tests in this file specifically exercise the dynamic

@@ -48,3 +48,11 @@ def test_bootstrap_stage_barrier_exec_smokes_published_stage_binary():
     assert '--ir-scaffold=on' in src
     assert '--python-libpython "${BOOTSTRAP_PYTHON_LIBPYTHON}"' in src
     assert '"publish_barrier_returncode": int(barrier_returncode)' in src
+
+
+def test_darwin_self_backend_keeps_lc_uuid_and_normalizes_at_compare_time():
+    pipeline_src = Path("pcc/py_frontend/pipeline.py").read_text(encoding="utf-8")
+    bootstrap_src = Path("scripts/bootstrap.sh").read_text(encoding="utf-8")
+
+    assert "-Wl,-no_uuid" not in pipeline_src
+    assert "pcc.macho_normalize" in bootstrap_src

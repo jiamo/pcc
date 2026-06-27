@@ -7,6 +7,7 @@ e.g. ``keyword`` into the multi-file compile set, the codegen for an
   - register keyword as a native module alias so subsequent
     ``keyword.X`` accesses route to native ``user_keyword_X`` symbols
 """
+
 from __future__ import annotations
 
 import re
@@ -14,7 +15,6 @@ import textwrap
 from pathlib import Path
 
 import pytest
-
 
 _REPO_ROOT = Path(__file__).absolute().parents[2]
 _BUILD = _REPO_ROOT / "build"
@@ -26,13 +26,14 @@ def _compile_to_ll(source: str, name: str, *, recursive: bool) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
-        str(src), str(out),
+        str(src),
+        str(out),
         emit_llvm_only=True,
         recursive_stdlib=recursive,
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _count_py_cpy_import_for(ir_text: str, mod_name: str) -> int:
@@ -52,13 +53,11 @@ def test_recursive_import_skips_py_cpy_import():
     """``import keyword`` with recursive_stdlib=True should NOT
     emit ``py_cpy_import("keyword")`` because keyword is now in the
     native compile closure."""
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import keyword
         def f(s: str):
             pass
-        """
-    )
+        """)
     ir_text = _compile_to_ll(program, "rec_import_keyword_on", recursive=True)
     n = _count_py_cpy_import_for(ir_text, "keyword")
     assert n == 0, (
@@ -70,13 +69,11 @@ def test_recursive_import_skips_py_cpy_import():
 def test_pcc_py_stdlib_constant_import_stays_native():
     """``import string`` should use the pcc/py_stdlib port and resolve
     exported literal constants without CPython module fallback."""
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import string
         def f():
             return string.ascii_lowercase
-        """
-    )
+        """)
     ir_text = _compile_to_ll(program, "rec_import_string_on", recursive=True)
     assert "call ptr @py_cpy_import" not in ir_text
     assert "@.cpy.mod.string" not in ir_text
@@ -87,16 +84,16 @@ def test_pcc_py_stdlib_from_import_constant_stays_native():
     """``from string import CONST`` should bind the exported pcc/py_stdlib
     constant directly, using normal CPython spelling without a module
     fallback."""
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         from string import ascii_lowercase as letters
         def f():
             return letters
         print(f())
-        """
-    )
+        """)
     ir_text = _compile_to_ll(
-        program, "rec_from_import_string_const_on", recursive=True,
+        program,
+        "rec_from_import_string_const_on",
+        recursive=True,
     )
     assert "call ptr @py_cpy_import" not in ir_text
     assert "@.cpy.mod.string" not in ir_text
@@ -107,16 +104,16 @@ def test_dotted_pcc_py_stdlib_import_routes_to_native_submodule():
     """``import urllib.parse`` should bind the top-level CPython name
     while routing ``urllib.parse.fn`` to the native pcc/py_stdlib
     submodule."""
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import urllib.parse
         def f():
             return urllib.parse.quote("a/b", "/")
         print(f())
-        """
-    )
+        """)
     ir_text = _compile_to_ll(
-        program, "rec_import_urllib_parse_on", recursive=True,
+        program,
+        "rec_import_urllib_parse_on",
+        recursive=True,
     )
     assert "call ptr @py_cpy_import" not in ir_text
     assert "@.cpy.mod.urllib" not in ir_text
@@ -132,17 +129,12 @@ def test_native_sibling_import_alias_value_position_stays_native():
     pkg = root / "pkg_alias_value"
     pkg.mkdir(parents=True, exist_ok=True)
     (pkg / "__init__.py").write_text(
-        "def get_sub():\n"
-        "    import pkg_alias_value.sub as sub\n"
-        "    return sub\n",
+        "def get_sub():\n" "    import pkg_alias_value.sub as sub\n" "    return sub\n",
         encoding="utf-8",
     )
     (pkg / "sub.py").write_text("VALUE = 7\n", encoding="utf-8")
     (root / "main.py").write_text(
-        "import pkg_alias_value\n"
-        "def main():\n"
-        "    print('ok')\n"
-        "main()\n",
+        "import pkg_alias_value\n" "def main():\n" "    print('ok')\n" "main()\n",
         encoding="utf-8",
     )
     out = root / "out.ll"
@@ -170,14 +162,14 @@ def test_default_off_mode_auto_routes_available_native_stdlib():
     """With libpython off by default, an available pcc/py_stdlib provider
     should be selected automatically; users should not need a private
     ``std.*`` spelling or an explicit recursive_stdlib flag."""
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import string
         print(string.ascii_lowercase)
-        """
-    )
+        """)
     ir_text = _compile_to_ll(
-        program, "rec_import_string_auto_native", recursive=False,
+        program,
+        "rec_import_string_auto_native",
+        recursive=False,
     )
     assert "call ptr @py_cpy_import" not in ir_text
     assert "@.cpy.mod.string" not in ir_text
@@ -187,32 +179,74 @@ def test_default_off_mode_auto_routes_available_native_stdlib():
 def test_default_off_mode_auto_routes_warnings_native():
     """``import warnings`` should route to the native stdlib shim instead
     of emitting a CPython module import in no-libpython package closures."""
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import warnings
         def f():
             warnings.warn("x", stacklevel=2)
             warnings.filterwarnings("ignore")
             warnings.simplefilter("default")
-        """
-    )
+        """)
     ir_text = _compile_to_ll(
-        program, "rec_import_warnings_auto_native", recursive=False,
+        program,
+        "rec_import_warnings_auto_native",
+        recursive=False,
     )
     assert "call ptr @py_cpy_import" not in ir_text
     assert "@.cpy.mod.warnings" not in ir_text
 
 
+def test_contextvar_constructor_and_sys_maxsize_stay_native():
+    program = textwrap.dedent("""
+        import sys
+        from contextvars import ContextVar
+
+        defaults = {"legacy": sys.maxsize}
+        options = ContextVar("options", default=defaults)
+        """)
+    ir_text = _compile_to_ll(program, "native_contextvar_sys_maxsize", recursive=False)
+    assert "call ptr @py_cpy_import" not in ir_text
+    assert "call ptr @py_cpy_call" not in ir_text
+    assert "call ptr @PyContextVar_New" in ir_text
+    assert "9223372036854775807" in ir_text
+
+
+def test_sys_byteorder_stays_native():
+    program = textwrap.dedent("""
+        import sys
+        little_endian = sys.byteorder == "little"
+        print(little_endian)
+        """)
+    ir_text = _compile_to_ll(program, "native_sys_byteorder", recursive=False)
+    assert re.search(r"\bcall\b[^\n]*@py_cpy_import", ir_text) is None
+    assert re.search(r"\bcall\b[^\n]*@py_cpy_getattr", ir_text) is None
+    assert "little" in ir_text
+
+
+def test_sys_implementation_stays_native():
+    program = textwrap.dedent("""
+        import sys
+        cache_tag = sys.implementation.cache_tag
+        implementation_name = sys.implementation.name
+        print(cache_tag or implementation_name)
+        """)
+    ir_text = _compile_to_ll(
+        program,
+        "native_sys_implementation",
+        recursive=False,
+    )
+    assert re.search(r"\bcall\b[^\n]*@py_cpy_import", ir_text) is None
+    assert re.search(r"\bcall\b[^\n]*@py_cpy_getattr", ir_text) is None
+    assert "pcc" in ir_text
+
+
 def test_off_mode_preserves_py_cpy_import():
     """recursive_stdlib=False (default) keeps the historical
     ``py_cpy_import`` path."""
-    program = textwrap.dedent(
-        """
+    program = textwrap.dedent("""
         import keyword
         def f(s: str):
             pass
-        """
-    )
+        """)
     ir_text = _compile_to_ll(program, "rec_import_keyword_off", recursive=False)
     # Without recursive_stdlib, status quo: py_cpy_import is emitted.
     assert "@py_cpy_import" in ir_text

@@ -13,6 +13,7 @@ def _compile_and_run(
     extra_files: dict[str, str] | None = None,
 ) -> list[str]:
     from pcc.py_frontend.pipeline import compile_python
+
     src = tmp_path / "probe.py"
     exe = tmp_path / "probe.out"
     src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
@@ -23,7 +24,9 @@ def _compile_and_run(
     compile_python(str(src), str(exe), ir_scaffold_mode="on", libpython_mode="off")
     env = os.environ.copy()
     env["PCC_PYTHON_LIBPYTHON"] = "off"
-    proc = subprocess.run([str(exe)], text=True, capture_output=True, timeout=30, cwd=tmp_path, env=env)
+    proc = subprocess.run(
+        [str(exe)], text=True, capture_output=True, timeout=30, cwd=tmp_path, env=env
+    )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return proc.stdout.strip().splitlines()
 
@@ -90,6 +93,94 @@ def test_t1_metaclass_type_enum_abcmeta_compiled(tmp_path):
         """,
     )
     assert lines == ["ok", "3", "True", "RED", "2", "True"]
+
+
+def test_t1_metaclass_super_new_can_set_class_attributes(tmp_path):
+    lines = _compile_and_run(
+        tmp_path,
+        """
+        class Meta(type):
+            def __new__(mcls, name, bases, ns):
+                cls = super().__new__(mcls, name, bases, ns)
+                cls.marker = "ok"
+                return cls
+
+        class Host(metaclass=Meta):
+            pass
+
+        print(Host.marker)
+        """,
+    )
+    assert lines == ["ok"]
+
+
+def test_t1_native_unary_class_decorator_rebinds_class(tmp_path):
+    lines = _compile_and_run(
+        tmp_path,
+        """
+        def label(cls):
+            cls.marker = "decorated"
+            return cls
+
+        @label
+        class Host:
+            pass
+
+        print(Host.marker)
+        """,
+    )
+    assert lines == ["decorated"]
+
+
+def test_t1_dynamic_issubclass_class_argument(tmp_path):
+    lines = _compile_and_run(
+        tmp_path,
+        """
+        class Base:
+            pass
+
+        class Child(Base):
+            pass
+
+        def is_base(cls):
+            return issubclass(cls, Base)
+
+        print(is_base(Child))
+        print(is_base(Base))
+        """,
+    )
+    assert lines == ["True", "True"]
+
+
+def test_t1_class_base_metadata(tmp_path):
+    lines = _compile_and_run(
+        tmp_path,
+        """
+        class Base:
+            pass
+
+        class Child(Base):
+            pass
+
+        print(Child.__base__.__name__)
+        """,
+    )
+    assert lines == ["Base"]
+
+
+def test_t1_memory_error_keeps_builtin_exception_hierarchy(tmp_path):
+    lines = _compile_and_run(
+        tmp_path,
+        """
+        class AllocationError(MemoryError):
+            pass
+
+        print(issubclass(AllocationError, MemoryError))
+        print(issubclass(AllocationError, Exception))
+        print(AllocationError.__base__.__name__)
+        """,
+    )
+    assert lines == ["True", "True", "MemoryError"]
 
 
 def test_t2_typing_runtime_protocol_generic_compiled(tmp_path):

@@ -12,6 +12,8 @@ import pytest
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 
 from pcc.package.build_exec import execute_build_actions
+from pcc.package.metadata import current_platform_tag
+from pcc.package_schema import pcc_native_extension_suffix
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -29,6 +31,29 @@ def _write_exec_project(root: Path) -> Path:
         "int native_value(void) { return 1; }\n", encoding="utf-8"
     )
     (root / "solver.f90").write_text("subroutine solver()\nend\n", encoding="utf-8")
+    return root
+
+
+def _write_single_c_extension_project(root: Path) -> Path:
+    package = root / "generic_ext"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (package / "_native.c").write_text(
+        "#include <Python.h>\n"
+        "static int generic_exec(PyObject *module) {\n"
+        '    return PyModule_AddIntConstant(module, "ready", 1);\n'
+        "}\n"
+        "static PyModuleDef_Slot slots[] = {\n"
+        "    {Py_mod_exec, generic_exec}, {0, NULL}\n"
+        "};\n"
+        "static PyModuleDef module = {\n"
+        '    PyModuleDef_HEAD_INIT, "_native", NULL, 0, NULL, slots\n'
+        "};\n"
+        "PyMODINIT_FUNC PyInit__native(void) {\n"
+        "    return PyModuleDef_Init(&module);\n"
+        "}\n",
+        encoding="utf-8",
+    )
     return root
 
 
@@ -55,7 +80,7 @@ def _write_fake_toolchain(tmp_path: Path) -> tuple[Path, Path]:
         "fi\n"
         "exit 0\n"
     )
-    for name in ("cc", "gfortran", "cython", "f2py"):
+    for name in ("cc", "c++", "gfortran", "cython", "f2py"):
         tool = bin_dir / name
         tool.write_text(script, encoding="utf-8")
         tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
@@ -141,6 +166,72 @@ def _write_compile_commands(project: Path) -> None:
     (project / "compile_commands.json").write_text(
         json.dumps(entries), encoding="utf-8"
     )
+
+
+def _write_meson_target_replay_graph(project: Path) -> str:
+    (project / "main.c").write_text(
+        "int main_value(void) { return 1; }\n", encoding="utf-8"
+    )
+    (project / "dep.cpp").write_text(
+        "int dep_value() { return 2; }\n", encoding="utf-8"
+    )
+    (project / "unrelated.c").write_text(
+        "int unrelated(void) { return 3; }\n", encoding="utf-8"
+    )
+    build_dir = project / "build" / "pcc-package" / "meson-build"
+    scaffold_dir = project / "build" / "scaffold"
+    build_dir.mkdir(parents=True)
+    scaffold_dir.mkdir(parents=True)
+    python_include = "/opt/python3.14/include/python3.14"
+    entries = [
+        {
+            "directory": str(project),
+            "file": str(project / "main.c"),
+            "command": (
+                f"cc -I{python_include} -c {project / 'main.c'} "
+                f"-o {scaffold_dir / 'main.o'}"
+            ),
+        },
+        {
+            "directory": str(project),
+            "file": str(project / "dep.cpp"),
+            "command": (
+                f"c++ -I{python_include} -D_LIBCPP_ENABLE_ASSERTIONS=1 "
+                f"-MD -MF old.d -c {project / 'dep.cpp'} "
+                f"-o {scaffold_dir / 'dep.o'}"
+            ),
+        },
+        {
+            "directory": str(project),
+            "file": str(project / "unrelated.c"),
+            "command": (
+                f"cc -I{python_include} -c {project / 'unrelated.c'} "
+                f"-o {scaffold_dir / 'unrelated.o'}"
+            ),
+        },
+    ]
+    (project / "compile_commands.json").write_text(
+        json.dumps(entries), encoding="utf-8"
+    )
+    target = "demo/_native.cpython-314-darwin.so"
+    (build_dir / "build.ninja").write_text(
+        "\n".join(
+            [
+                "build demo/_native.cpython-314-darwin.so.p/main.c.o: "
+                "c_COMPILER ../../../main.c",
+                "build demo/libdep.a.p/dep.cpp.o: cpp_COMPILER ../../../dep.cpp",
+                "build demo/libdep.a: STATIC_LINKER demo/libdep.a.p/dep.cpp.o",
+                "build demo/unrelated.c.o: c_COMPILER ../../../unrelated.c",
+                f"build {target}: cpp_LINKER "
+                "demo/_native.cpython-314-darwin.so.p/main.c.o | demo/libdep.a",
+                " LINK_ARGS = -bundle -undefined dynamic_lookup demo/libdep.a "
+                "-Wl,-dead_strip",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return target
 
 
 def _write_meson_introspection(project: Path) -> None:
@@ -257,17 +348,11 @@ def test_pcc_native_redirects_cpython_includes_to_pcc_capi(tmp_path):
     package-specific rules. Package-own includes and macros are preserved."""
     project = tmp_path / "demo_pkg"
     project.mkdir()
-    (project / "native.c").write_text(
-        "int demo(void){return 0;}\n", encoding="utf-8"
-    )
+    (project / "native.c").write_text("int demo(void){return 0;}\n", encoding="utf-8")
     meson_info = project / "meson-info"
     meson_info.mkdir()
-    (project / "meson.build").write_text(
-        "project('demo_pkg', 'c')\n", encoding="utf-8"
-    )
-    cpython_inc = (
-        "/opt/Frameworks/Python.framework/Versions/3.14/include/python3.14"
-    )
+    (project / "meson.build").write_text("project('demo_pkg', 'c')\n", encoding="utf-8")
+    cpython_inc = "/opt/Frameworks/Python.framework/Versions/3.14/include/python3.14"
     own_inc = str(project / "src")
     entries = [
         {
@@ -319,17 +404,11 @@ def test_pcc_native_redirect_absent_in_cpython_compat_mode(tmp_path):
     own (CPython) include dirs untouched."""
     project = tmp_path / "demo_pkg"
     project.mkdir()
-    (project / "native.c").write_text(
-        "int demo(void){return 0;}\n", encoding="utf-8"
-    )
+    (project / "native.c").write_text("int demo(void){return 0;}\n", encoding="utf-8")
     meson_info = project / "meson-info"
     meson_info.mkdir()
-    (project / "meson.build").write_text(
-        "project('demo_pkg', 'c')\n", encoding="utf-8"
-    )
-    cpython_inc = (
-        "/opt/Frameworks/Python.framework/Versions/3.14/include/python3.14"
-    )
+    (project / "meson.build").write_text("project('demo_pkg', 'c')\n", encoding="utf-8")
+    cpython_inc = "/opt/Frameworks/Python.framework/Versions/3.14/include/python3.14"
     entries = [
         {
             "name": "demo_native",
@@ -364,6 +443,34 @@ def test_pcc_native_redirect_absent_in_cpython_compat_mode(tmp_path):
     cmd = c_actions[0]["command"]
     assert ("-I" + cpython_inc) in cmd, cmd
     assert not any(tok.endswith("pcc-capi-include") for tok in cmd), cmd
+
+
+def test_single_c_source_build_gets_pcc_headers_suffix_and_no_libpython(tmp_path):
+    project = _write_single_c_extension_project(tmp_path / "generic-ext-0.1")
+    suffix = pcc_native_extension_suffix(current_platform_tag())
+    output = "generic_ext/_native" + suffix
+
+    report = execute_build_actions(
+        "generic-ext",
+        project,
+        execute=True,
+        link_output=output,
+        abi_mode="pcc-native",
+    )
+
+    assert report["ok"] is True, report
+    assert (project / output).is_file()
+    compile_action = next(
+        action for action in report["actions"] if action["kind"] == "c_compile"
+    )
+    assert "-fPIC" in compile_action["command"]
+    assert any(
+        token.startswith("-I") and token.endswith("pcc-capi-include")
+        for token in compile_action["command"]
+    )
+    assert report["linkage"]["execution_mode"] == "pcc-native"
+    assert report["linkage"]["links_libpython"] is False
+    assert report["linkage"]["uses_cpython_extension_abi"] is False
 
 
 def test_generated_c_policy_blocks_missing_artifact(tmp_path):
@@ -526,7 +633,8 @@ def test_execute_build_actions_builds_reusable_numpy_capi_provider_with_include_
 ):
     if shutil.which("cc") is None:
         pytest.skip("C compiler is required for native provider build smoke")
-    provider_source = Path("utils/pcc_numpy_capi_provider/pccnpapi.c").resolve()
+    provider_dir = Path("utils/pcc_numpy_capi_provider").resolve()
+    provider_source = provider_dir / "pccnpapi.c"
     fake_include = Path("utils/fake_libc_include").resolve()
     runtime_include = Path("pcc/py_runtime/include").resolve()
     runtime_lib = Path("pcc/py_runtime").resolve()
@@ -535,10 +643,7 @@ def test_execute_build_actions_builds_reusable_numpy_capi_provider_with_include_
     if not (runtime_lib / "libpy_runtime.a").exists():
         pytest.skip("pcc runtime archive is required for native provider link smoke")
     project = tmp_path / "pccnpapi-src"
-    project.mkdir()
-    (project / "pccnpapi.c").write_text(
-        provider_source.read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    shutil.copytree(provider_dir, project)
 
     report = execute_build_actions(
         "pccnpapi",
@@ -597,6 +702,66 @@ def test_execute_build_actions_uses_compile_commands_as_action_graph(
     assert "native_ccdb.o" in log_text
     assert "solver_ccdb.o" in log_text
     assert "-lopenblas" in log_text
+
+
+def test_execute_build_actions_replays_one_meson_target_into_fresh_objects(
+    tmp_path, monkeypatch
+):
+    project = _write_exec_project(tmp_path / "demo_pkg-0.1")
+    target = _write_meson_target_replay_graph(project)
+    bin_dir, log = _write_fake_toolchain(tmp_path)
+    monkeypatch.setenv("PCC_BUILD_LOG", str(log))
+
+    report = execute_build_actions(
+        "demo-pkg",
+        project,
+        search_paths=[str(bin_dir)],
+        execute=True,
+        from_compile_commands=True,
+        meson_target=target,
+        link_output="demo_pkg/_native.pcc3-pcc_native-macosx_14_0_arm64.so",
+        jobs=2,
+    )
+
+    assert report["ok"] is True
+    assert report["meson_target"] == target
+    assert report["jobs"] == 2
+    assert report["meson_target_replay"]["objects"] == [
+        "demo/_native.cpython-314-darwin.so.p/main.c.o",
+        "demo/libdep.a.p/dep.cpp.o",
+    ]
+    compile_actions = [
+        action
+        for action in report["actions"]
+        if action["kind"].startswith("compile_command_")
+    ]
+    assert [action["kind"] for action in compile_actions] == [
+        "compile_command_c",
+        "compile_command_cxx",
+    ]
+    assert all(
+        "build/pcc-package/pcc-native-target/objects" in action["output"]
+        for action in compile_actions
+    )
+    assert not any(
+        "python3.14" in token
+        for action in compile_actions
+        for token in action["command"]
+    )
+    cxx_command = compile_actions[1]["command"]
+    assert "-D_LIBCPP_ENABLE_ASSERTIONS=1" not in cxx_command
+    assert "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST" in cxx_command
+    assert "-MD" not in cxx_command
+    assert "-MF" not in cxx_command
+    link_action = next(
+        action for action in report["actions"] if action["kind"] == "native_link"
+    )
+    assert Path(link_action["command"][0]).name == "c++"
+    assert sum(token.endswith(".o") for token in link_action["command"]) == 2
+    assert "demo/libdep.a" not in link_action["command"]
+    assert not any("unrelated" in token for token in link_action["command"])
+    assert "-Wl,-dead_strip" in link_action["command"]
+    assert Path(link_action["output"]).name.endswith("pcc_native-macosx_14_0_arm64.so")
 
 
 def test_execute_build_actions_uses_meson_introspection_as_action_graph(
@@ -805,7 +970,7 @@ def test_pcc1_build_exec_does_not_need_host_python(tmp_path):
     include_dir.mkdir()
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     env["PCC_BUILD_LOG"] = str(log)
     proc = subprocess.run(
         [
@@ -860,7 +1025,8 @@ def test_pcc1_build_exec_builds_reusable_numpy_capi_provider_without_host_python
     cc_path = shutil.which("cc")
     if cc_path is None:
         pytest.skip("C compiler is required for native provider build smoke")
-    provider_source = Path("utils/pcc_numpy_capi_provider/pccnpapi.c").resolve()
+    provider_dir = Path("utils/pcc_numpy_capi_provider").resolve()
+    provider_source = provider_dir / "pccnpapi.c"
     fake_include = Path("utils/fake_libc_include").resolve()
     runtime_include = Path("pcc/py_runtime/include").resolve()
     runtime_lib = Path("pcc/py_runtime").resolve()
@@ -869,13 +1035,10 @@ def test_pcc1_build_exec_builds_reusable_numpy_capi_provider_without_host_python
     if not (runtime_lib / "libpy_runtime.a").exists():
         pytest.skip("pcc runtime archive is required for native provider link smoke")
     project = tmp_path / "pccnpapi-src"
-    project.mkdir()
-    (project / "pccnpapi.c").write_text(
-        provider_source.read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    shutil.copytree(provider_dir, project)
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
 
     proc = subprocess.run(
         [
@@ -929,7 +1092,7 @@ def test_pcc1_generated_c_policy_blocks_missing_artifact(tmp_path):
     project = _write_exec_project(tmp_path / "demo_pkg-0.1")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -964,7 +1127,7 @@ def test_pcc1_build_exec_compile_commands_does_not_need_host_python(tmp_path):
     bin_dir, log = _write_fake_toolchain(tmp_path)
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     env["PCC_BUILD_LOG"] = str(log)
     proc = subprocess.run(
         [
@@ -1007,7 +1170,7 @@ def test_pcc1_build_exec_meson_introspection_does_not_need_host_python(tmp_path)
     bin_dir, log = _write_fake_toolchain(tmp_path)
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     env["PCC_BUILD_LOG"] = str(log)
     proc = subprocess.run(
         [
@@ -1054,7 +1217,7 @@ def test_pcc1_build_exec_can_configure_meson_without_host_python(tmp_path):
     _write_fake_meson_tool(bin_dir)
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     env["PCC_BUILD_LOG"] = str(log)
     env["PCC_FAKE_MESON_SOURCE"] = str(project / "native.c")
     proc = subprocess.run(
@@ -1106,7 +1269,7 @@ def test_pcc1_build_exec_materializes_meson_generated_targets_without_host_pytho
     _write_fake_ninja_tool(bin_dir)
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     env["PCC_BUILD_LOG"] = str(log)
     env["PCC_FAKE_NINJA_TARGETS"] = "\n".join(
         [

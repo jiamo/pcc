@@ -28,12 +28,14 @@ class _ClassLoweringProbe:
         field_names,
         methods,
         local_name,
+        field_types=(),
     ):
         self.declared.append((owning_module, class_name, local_name))
         info = SimpleNamespace(
             name=local_name,
             owning_module=owning_module,
             field_names=list(field_names),
+            field_types=tuple(field_types),
             bases_ast=(),
             methods={m["name"]: object() for m in methods},
             method_kinds={m["name"]: m.get("kind", "instance") for m in methods},

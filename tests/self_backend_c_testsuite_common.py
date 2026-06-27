@@ -9,7 +9,7 @@ from tests.c_testsuite_cases import PccCompileResult, read_expected_output
 REPO_ROOT = Path(__file__).resolve().parents[1]
 C_TESTSUITE_DIR = REPO_ROOT / "projects" / "c-testsuite"
 C_TESTSUITE_MANIFEST_PATH = REPO_ROOT / "tests" / "c_testsuite_manifest.json"
-C_TESTSUITE_MANIFEST = json.loads(C_TESTSUITE_MANIFEST_PATH.read_text())
+C_TESTSUITE_MANIFEST = json.loads(C_TESTSUITE_MANIFEST_PATH.read_text(encoding="utf-8"))
 C_TESTSUITE_RUNTIME_EXACT_MATCH_CASES = tuple(
     C_TESTSUITE_MANIFEST.get("runtime_exact_match", [])
 )

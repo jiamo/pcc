@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from pcc.dependency_verdict import probe_executable_dependency
+
 from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.project import TranslationUnit
 from tests.worker_process import run_worker_process
@@ -31,7 +33,13 @@ from tests.worker_process import run_worker_process
 # Configuration
 # ---------------------------------------------------------------------------
 
-CSMITH_BIN = shutil.which("csmith")
+# Structured generator verdict: a missing csmith is an UNAVAILABLE optional
+# corpus generator, never C-semantics proof; availability (this verdict),
+# generated-case execution (the skips inside test_csmith_seed), and semantic
+# parity (the hard result-equality asserts) stay distinct
+# (AUD-P2-DEPENDENCY-CSMITH-VERDICT).
+CSMITH_VERDICT = probe_executable_dependency("csmith")
+CSMITH_BIN = CSMITH_VERDICT.resolved_path
 CSMITH_INCLUDE = None
 
 # Auto-detect csmith include directory
@@ -66,9 +74,6 @@ CSMITH_FLAGS = (
     "--no-packed-struct",
     "--no-longlong",
 )
-
-pytestmark = pytest.mark.xdist_group(name="csmith")
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -198,10 +203,13 @@ def _run_seed(seed: int) -> CsmithResult:
 # ---------------------------------------------------------------------------
 
 _skip_reason = None
-if CSMITH_BIN is None:
-    _skip_reason = "csmith not found on PATH"
+if not CSMITH_VERDICT.available:
+    _skip_reason = CSMITH_VERDICT.skip_reason()
 elif CSMITH_INCLUDE is None:
-    _skip_reason = "csmith runtime headers not found"
+    _skip_reason = (
+        f"UNAVAILABLE[headers:csmith.h]: runtime headers not found near "
+        f"{CSMITH_VERDICT.resolved_path}; feature_claimed=false; runtime_executed=false"
+    )
 
 
 @pytest.mark.skipif(_skip_reason is not None, reason=_skip_reason or "")
@@ -225,3 +233,18 @@ def test_csmith_seed(seed):
         f"  pcc:    {r.pcc_stdout}\n"
         f"  stderr: {r.pcc_stderr[:300]}"
     )
+
+
+def test_csmith_tool_identity_recorded_when_present(record_property):
+    """Seed identity lives in each test id; tool identity is recorded here."""
+    if _skip_reason is not None:
+        pytest.skip(_skip_reason)
+    version = subprocess.run(
+        [CSMITH_BIN, "--version"], text=True, capture_output=True, timeout=30
+    )
+    assert version.returncode == 0, version.stderr
+    identity = version.stdout.strip() or version.stderr.strip()
+    assert identity, "csmith --version produced no identity"
+    record_property("csmith_path", CSMITH_BIN)
+    record_property("csmith_version", identity)
+    record_property("csmith_include", CSMITH_INCLUDE)

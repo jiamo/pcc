@@ -4,6 +4,7 @@ click or any external deps — verifies the multi-file compile
 infrastructure can produce a native binary that calls a sibling
 module's entry function from ``__main__.py``'s top-level body.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -15,7 +16,6 @@ import tempfile
 import textwrap
 import unittest
 from unittest import mock
-
 
 _COMPILED_REPO_MAIN_CACHE_DIR = None
 _COMPILED_REPO_MAIN_CACHE = {}
@@ -46,8 +46,7 @@ def _repo_source_fingerprint(repo_root):
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [
-                d for d in dirnames
-                if d not in {"__pycache__", ".pytest_cache"}
+                d for d in dirnames if d not in {"__pycache__", ".pytest_cache"}
             ]
             for filename in filenames:
                 if not filename.endswith((".py", ".c", ".h")):
@@ -126,12 +125,17 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         invokes it at top level; the sibling defines ``run`` plus
         a helper function it dispatches to.  Matches the bootstrap
         shape with zero runtime dependencies on click or argparse."""
-        entry = self._write("main.py", """
+        entry = self._write(
+            "main.py",
+            """
             from .pcc import run
 
             run(5)
-        """)
-        lib = self._write("pcc.py", """
+        """,
+        )
+        lib = self._write(
+            "pcc.py",
+            """
             def helper(x: int) -> int:
                 return x * x
 
@@ -139,11 +143,14 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             def run(n: int) -> None:
                 print(helper(n))
                 print(helper(n + 1))
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "shim.out")
         compile_python_multi(
-            [entry, lib], exe,
+            [entry, lib],
+            exe,
             module_names=["pkg.__main__", "pkg.pcc"],
             entry_module="pkg.__main__",
         )
@@ -155,7 +162,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         # this is the bootstrap gate's whole point.
         if os.uname().sysname == "Darwin":
             lk = subprocess.run(
-                ["otool", "-L", exe], capture_output=True, text=True,
+                ["otool", "-L", exe],
+                capture_output=True,
+                text=True,
             )
             self.assertEqual(lk.returncode, 0)
             self.assertNotIn("Python", lk.stdout)
@@ -166,15 +175,20 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         extern + synthesises an external function for each method, so
         ``MyClass(args)`` and ``instance.method()`` stay on the
         pcc-native dispatch path with zero libpython dep."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             from .lib import Point
 
             p = Point(3, 4)
             print(p.x)
             print(p.y)
             print(p.area())
-        """)
-        self._write("lib.py", """
+        """,
+        )
+        self._write(
+            "lib.py",
+            """
             class Point:
                 def __init__(self, x: int, y: int) -> None:
                     self.x = x
@@ -182,8 +196,10 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
                 def area(self) -> int:
                     return self.x * self.y
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "klass.out")
         compile_python_multi(
             [
@@ -200,7 +216,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
         if os.uname().sysname == "Darwin":
             lk = subprocess.run(
-                ["otool", "-L", exe], capture_output=True, text=True,
+                ["otool", "-L", exe],
+                capture_output=True,
+                text=True,
             )
             self.assertNotIn("Python", lk.stdout)
 
@@ -209,18 +227,25 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         inference, so ``result = lib.compute(); total = result * 2``
         types ``result`` as int (not DynType) and lets the ``*``
         emit a native integer multiply instead of erroring."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             from .lib import compute
 
             result = compute(5)
             total = result * 2
             print(total)
-        """)
-        self._write("lib.py", """
+        """,
+        )
+        self._write(
+            "lib.py",
+            """
             def compute(x: int) -> int:
                 return x + 10
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "typed.out")
         compile_python_multi(
             [
@@ -239,23 +264,33 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         """Entry imports from mid, which imports from base — tests
         that the native-extern path propagates through a chain of
         sibling modules."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             from .mid import combine
 
             print(combine(3, 4))
-        """)
-        self._write("mid.py", """
+        """,
+        )
+        self._write(
+            "mid.py",
+            """
             from .base import add
 
 
             def combine(a: int, b: int) -> int:
                 return add(a, b) * 2
-        """)
-        self._write("base.py", """
+        """,
+        )
+        self._write(
+            "base.py",
+            """
             def add(a: int, b: int) -> int:
                 return a + b
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "chain.out")
         compile_python_multi(
             [
@@ -275,20 +310,27 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         """Cross-module string args should compare equal inside list
         membership tests. This exercises the runtime list-contains path
         that bootstrap helpers use for ``entry_module in module_names``."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             from .helper import contains_module
 
             if contains_module("pkg.main"):
                 print("yes")
             else:
                 print("no")
-        """)
-        self._write("helper.py", """
+        """,
+        )
+        self._write(
+            "helper.py",
+            """
             def contains_module(name: str) -> bool:
                 module_names = ["pkg.main"]
                 return name in module_names
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "contains.out")
         compile_python_multi(
             [
@@ -307,7 +349,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         """``from . import defs as d`` should let ``d.Node(...)`` and
         ``isinstance(x, d.Node)`` stay on the native sibling-module path
         instead of routing through CPython module objects."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             from . import defs as d
 
             node = d.Node(5)
@@ -315,13 +359,18 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 print(node.value)
             else:
                 print(0)
-        """)
-        self._write("defs.py", """
+        """,
+        )
+        self._write(
+            "defs.py",
+            """
             class Node:
                 def __init__(self, value: int) -> None:
                     self.value = value
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "alias_class.out")
         compile_python_multi(
             [
@@ -338,7 +387,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(r.stdout, "5\n")
         if os.uname().sysname == "Darwin":
             lk = subprocess.run(
-                ["otool", "-L", exe], capture_output=True, text=True,
+                ["otool", "-L", exe],
+                capture_output=True,
+                text=True,
             )
             self.assertEqual(lk.returncode, 0)
             self.assertNotIn("Python", lk.stdout)
@@ -348,19 +399,26 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         """A callee defaulted as ``arg=None`` should stay optional in
         multi-file mode. This guards the AST/codegen distinction between
         "no default" and "default literal None"."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             from .helper import run
 
             run()
-        """)
-        self._write("helper.py", """
+        """,
+        )
+        self._write(
+            "helper.py",
+            """
             def run(argv=None) -> None:
                 if argv is None:
                     print("none")
                 else:
                     print("value")
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "default_none.out")
         compile_python_multi(
             [
@@ -375,17 +433,70 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, msg=r.stderr)
         self.assertEqual(r.stdout, "none\n")
 
+    def test_cross_module_attribute_defaults_keep_defining_module_owner(self):
+        """Attribute defaults must load their root from the defining module.
+
+        Re-emitting ``PATTERN.match`` in the caller makes ``PATTERN`` resolve
+        in the wrong namespace. Cover both exported functions and exported
+        class methods because they consume separate extern-signature paths.
+        """
+        self._write(
+            "entry.py",
+            """
+            from .helper import Checker, matches
+
+            print(matches("aaa"))
+            print(Checker().matches("bbb"))
+        """,
+        )
+        self._write(
+            "helper.py",
+            r"""
+            import re
+
+            PATTERN = re.compile("a+")
+
+            def matches(text, match=PATTERN.match):
+                return match(text) is not None
+
+            class Checker:
+                def matches(self, text, match=PATTERN.match):
+                    return match(text) is not None
+        """,
+        )
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        exe = os.path.join(self.td, "attribute_default_owner.out")
+        compile_python_multi(
+            [
+                os.path.join(self.td, "entry.py"),
+                os.path.join(self.td, "helper.py"),
+            ],
+            exe,
+            module_names=["pkg.entry", "pkg.helper"],
+            entry_module="pkg.entry",
+            libpython_mode="off",
+        )
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertEqual(r.stdout, "True\nFalse\n")
+
     def test_cross_module_dataclass_kwargs_resolve_via_synthetic_init(self):
         """Extern dataclass imports should export a synthetic
         ``__init__`` signature so keyword construction stays native."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             from .lib import TranslationUnit
 
             unit = TranslationUnit(name="main.c", path="/tmp/main.c", source="int main(void) { return 0; }")
             print(unit.name)
             print(unit.path)
-        """)
-        self._write("lib.py", """
+        """,
+        )
+        self._write(
+            "lib.py",
+            """
             from dataclasses import dataclass
 
             @dataclass(frozen=True)
@@ -393,8 +504,10 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 name: str
                 path: str
                 source: str
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "extern_dataclass.out")
         compile_python_multi(
             [
@@ -413,20 +526,27 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         """Function-scope ``from .lib import Helper`` should still
         register the extern class so a following ``Helper.method()``
         resolves through the native class-method table."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             def main() -> None:
                 from .lib import Helper
                 print(Helper.greet("pcc"))
 
             main()
-        """)
-        self._write("lib.py", """
+        """,
+        )
+        self._write(
+            "lib.py",
+            """
             class Helper:
                 @staticmethod
                 def greet(name: str) -> str:
                     return "hello " + name
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "function_scope_class_import.out")
         compile_python_multi(
             [
@@ -444,13 +564,18 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_cross_module_inherited_dataclass_kwargs(self):
         """Synthetic extern dataclass ``__init__`` should inherit base
         dataclass fields, matching local dataclass expansion."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             from .lib import DynType
 
             value = DynType(name="dyn")
             print(value.name)
-        """)
-        self._write("lib.py", """
+        """,
+        )
+        self._write(
+            "lib.py",
+            """
             from dataclasses import dataclass
 
             @dataclass(frozen=True)
@@ -460,8 +585,10 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             @dataclass(frozen=True)
             class DynType(Type):
                 pass
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "extern_inherited_dataclass.out")
         compile_python_multi(
             [
@@ -483,22 +610,32 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         pkg_dir = os.path.join(self.td, "pkg")
         os.makedirs(pkg_dir, exist_ok=True)
         self._write("pkg/__init__.py", "")
-        main_py = self._write("pkg/__main__.py", """
+        main_py = self._write(
+            "pkg/__main__.py",
+            """
             from .child import B
 
             print(123)
-        """)
-        self._write("pkg/base.py", """
+        """,
+        )
+        self._write(
+            "pkg/base.py",
+            """
             class A:
                 pass
-        """)
-        self._write("pkg/child.py", """
+        """,
+        )
+        self._write(
+            "pkg/child.py",
+            """
             from .base import A
 
             class B(A):
                 pass
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python
+
         exe = os.path.join(self.td, "inherit_order.out")
         compile_python(main_py, exe, libpython_mode="auto")
         r = subprocess.run([exe], capture_output=True, text=True, timeout=20)
@@ -511,7 +648,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         as if an implicit class receiver were still required."""
         from pcc.py_frontend.pipeline import compile_python
 
-        main_py = self._write("base_dispatch.py", """
+        main_py = self._write(
+            "base_dispatch.py",
+            """
             class Base:
                 def greet(self, name: str) -> str:
                     return "hello " + name
@@ -521,7 +660,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                     return Base.greet(self, name) + "!"
 
             print(Child().greet("pcc"))
-        """)
+        """,
+        )
         ll = os.path.join(self.td, "base_dispatch.ll")
         compile_python(main_py, ll, emit_llvm_only=True)
         self.assertTrue(os.path.isfile(ll))
@@ -529,7 +669,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_nested_helper_reads_module_import_without_capture(self):
         """Nested helpers should treat top-level imported names as
         module-scope bindings rather than synthetic closure captures."""
-        self._write("entry.py", """
+        self._write(
+            "entry.py",
+            """
             from .lib import add_one
 
             def outer() -> None:
@@ -539,12 +681,17 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 print(inner(4))
 
             outer()
-        """)
-        self._write("lib.py", """
+        """,
+        )
+        self._write(
+            "lib.py",
+            """
             def add_one(value: int) -> int:
                 return value + 1
-        """)
+        """,
+        )
         from pcc.py_frontend.pipeline import compile_python_multi
+
         exe = os.path.join(self.td, "nested_module_import.out")
         compile_python_multi(
             [
@@ -565,12 +712,15 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         CPython refs inside pcc-native list/tuple objects."""
         from pcc.py_frontend.pipeline import compile_python
 
-        main_py = self._write("callable_alias.py", """
+        main_py = self._write(
+            "callable_alias.py",
+            """
             from collections.abc import Callable
 
             SelfAsmEmitter = Callable[[str], str]
             print(1)
-        """)
+        """,
+        )
         exe = os.path.join(self.td, "callable_alias.out")
         compile_python(main_py, exe, libpython_mode="auto")
         r = subprocess.run(
@@ -588,17 +738,23 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         module, not ``getattr(pkg, 'submod')`` on an empty package."""
         from pcc.py_frontend.pipeline import compile_python
 
-        main_py = self._write("pkg/__main__.py", """
+        main_py = self._write(
+            "pkg/__main__.py",
+            """
             from .ast import c_ast
 
             print(c_ast.answer())
-        """)
+        """,
+        )
         self._write("pkg/__init__.py", "")
         self._write("pkg/ast/__init__.py", "")
-        self._write("pkg/ast/c_ast.py", """
+        self._write(
+            "pkg/ast/c_ast.py",
+            """
             def answer() -> int:
                 return 123
-        """)
+        """,
+        )
         exe = os.path.join(self.td, "import_submodule.out")
         compile_python(main_py, exe)
         r = subprocess.run(
@@ -616,18 +772,27 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         segment and looking for ``pkg.context``."""
         from pcc.py_frontend.pipeline import compile_python
 
-        main_py = self._write("pkg/__main__.py", """
+        main_py = self._write(
+            "pkg/__main__.py",
+            """
             from .passes import VALUE
 
             print(VALUE)
-        """)
+        """,
+        )
         self._write("pkg/__init__.py", "")
-        self._write("pkg/passes/__init__.py", """
+        self._write(
+            "pkg/passes/__init__.py",
+            """
             from .context import VALUE
-        """)
-        self._write("pkg/passes/context.py", """
+        """,
+        )
+        self._write(
+            "pkg/passes/context.py",
+            """
             VALUE = 123
-        """)
+        """,
+        )
         exe = os.path.join(self.td, "package_init_relative.out")
         compile_python(main_py, exe, libpython_mode="auto")
         r = subprocess.run(
@@ -645,16 +810,22 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         through the native multi-file closure."""
         from pcc.py_frontend.pipeline import compile_python
 
-        main_py = self._write("pkg/__main__.py", """
+        main_py = self._write(
+            "pkg/__main__.py",
+            """
             from .ast import c_ast
 
             print(getattr(c_ast, "Pragma", 123))
-        """)
+        """,
+        )
         self._write("pkg/__init__.py", "")
         self._write("pkg/ast/__init__.py", "")
-        self._write("pkg/ast/c_ast.py", """
+        self._write(
+            "pkg/ast/c_ast.py",
+            """
             VALUE = 1
-        """)
+        """,
+        )
         exe = os.path.join(self.td, "getattr_default_submodule.out")
         compile_python(main_py, exe, libpython_mode="auto")
         r = subprocess.run(
@@ -672,14 +843,17 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         falling through the pcc-native list/str paths."""
         from pcc.py_frontend.pipeline import compile_python
 
-        main_py = self._write("argv_probe.py", """
+        main_py = self._write(
+            "argv_probe.py",
+            """
             import sys
 
             argv = sys.argv[1:]
             print(len(argv))
             print(argv[0] == "--help")
             print(argv[0] in ("-h", "--help"))
-        """)
+        """,
+        )
         exe = os.path.join(self.td, "argv_probe.out")
         compile_python(main_py, exe)
         r = subprocess.run(
@@ -757,13 +931,16 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         exe = os.path.join(self.td, "pcc_main_compile.out")
         _compile_repo_main_binary(main_py, exe)
 
-        toy_src = self._write("toy_main.py", """
+        toy_src = self._write(
+            "toy_main.py",
+            """
             def main() -> None:
                 print(123)
 
             if __name__ == "__main__":
                 main()
-        """)
+        """,
+        )
         toy_bin = os.path.join(self.td, "toy_main.bin")
         build = subprocess.run(
             [exe, toy_src, "-o", toy_bin],
@@ -861,14 +1038,23 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 os.path.join(repo_root, "scripts", "pcc_multi.py"),
                 "--python-libpython",
                 "off",
-                "--entry", "bootstrap.pcc_multi",
-                "--out", pair,
+                "--entry",
+                "bootstrap.pcc_multi",
+                "--out",
+                pair,
                 os.path.join(
-                    repo_root, "scripts", "pcc_multi.py",
-                ) + "=bootstrap.pcc_multi",
+                    repo_root,
+                    "scripts",
+                    "pcc_multi.py",
+                )
+                + "=bootstrap.pcc_multi",
                 os.path.join(
-                    repo_root, "pcc", "py_frontend", "pipeline.py",
-                ) + "=pcc.py_frontend.pipeline",
+                    repo_root,
+                    "pcc",
+                    "py_frontend",
+                    "pipeline.py",
+                )
+                + "=pcc.py_frontend.pipeline",
             ],
             cwd=repo_root,
             env={
@@ -884,7 +1070,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         )
         self.assertEqual(build.returncode, 0, msg=build.stderr)
 
-        toy_entry = self._write("toypkg/main.py", """
+        toy_entry = self._write(
+            "toypkg/main.py",
+            """
             class ToyError(Exception):
                 pass
 
@@ -897,14 +1085,18 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
             if __name__ == "__main__":
                 main()
-        """)
+        """,
+        )
         toy_bin = os.path.join(self.td, "toybin")
         run = subprocess.run(
             [
                 pair,
-                "--entry", "toypkg.main",
-                "--python-libpython", "off",
-                "--out", toy_bin,
+                "--entry",
+                "toypkg.main",
+                "--python-libpython",
+                "off",
+                "--out",
+                toy_bin,
                 toy_entry + "=toypkg.main",
             ],
             cwd=repo_root,
@@ -936,15 +1128,21 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         pkg_dir = os.path.join(self.td, "pkg")
         os.makedirs(pkg_dir, exist_ok=True)
         self._write("pkg/__init__.py", "")
-        main_py = self._write("pkg/__main__.py", """
+        main_py = self._write(
+            "pkg/__main__.py",
+            """
             from .tool import run
 
             run()
-        """)
-        self._write("pkg/tool.py", """
+        """,
+        )
+        self._write(
+            "pkg/tool.py",
+            """
             def run() -> None:
                 print("pkg ok")
-        """)
+        """,
+        )
         exe = os.path.join(self.td, "pkg_main.out")
         compile_python(main_py, exe)
         r = subprocess.run(
@@ -976,16 +1174,22 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         pkg_dir = os.path.join(self.td, "pkg")
         os.makedirs(pkg_dir, exist_ok=True)
         self._write("pkg/__init__.py", "")
-        main_py = self._write("pkg/__main__.py", """
+        main_py = self._write(
+            "pkg/__main__.py",
+            """
             from .tool import parts
 
             left, right = parts()
             print(left + right)
-        """)
-        self._write("pkg/tool.py", """
+        """,
+        )
+        self._write(
+            "pkg/tool.py",
+            """
             def parts():
                 return 10, 20
-        """)
+        """,
+        )
         exe = os.path.join(self.td, "pkg_unpack.out")
         compile_python(main_py, exe)
         r = subprocess.run(
@@ -1014,7 +1218,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         instead of failing with an unbound ``self`` during codegen."""
         from pcc.py_frontend.pipeline import compile_python
 
-        main_py = self._write("nested_self.py", """
+        main_py = self._write(
+            "nested_self.py",
+            """
             class Box:
                 def __init__(self, x: int) -> None:
                     self.x = x
@@ -1035,7 +1241,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
             if __name__ == "__main__":
                 main()
-        """)
+        """,
+        )
         out_ll = os.path.join(self.td, "nested_self.ll")
         compile_python(main_py, out_ll, emit_llvm_only=True)
         self.assertTrue(os.path.isfile(out_ll))
@@ -1045,7 +1252,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         object pointers instead of erroring on ``ClassType``."""
         from pcc.py_frontend.pipeline import compile_python
 
-        main_py = self._write("class_tuple.py", """
+        main_py = self._write(
+            "class_tuple.py",
+            """
             class A:
                 pass
 
@@ -1058,7 +1267,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
             if __name__ == "__main__":
                 main()
-        """)
+        """,
+        )
         exe = os.path.join(self.td, "class_tuple.out")
         compile_python(main_py, exe)
         r = subprocess.run(
@@ -1080,9 +1290,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         repo_root = os.path.dirname(os.path.dirname(__file__))
         cases = [
             (
-                os.path.join(
-                    repo_root, "pcc", "py_frontend", "codegen", "layer1.py"
-                ),
+                os.path.join(repo_root, "pcc", "py_frontend", "codegen", "layer1.py"),
                 os.path.join(self.td, "layer1_self.ll"),
             ),
             (
@@ -1131,7 +1339,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
         in_ll = os.path.join(self.td, "in.ll")
         with open(in_ll, "w", encoding="utf-8") as f:
-            f.write('define i32 @main() { ret i32 0 }\n')
+            f.write("define i32 @main() { ret i32 0 }\n")
         env = dict(os.environ)
         env["PCC_PYTHON_LDFLAGS"] = "-L/test/python -lpython9.9"
         env["PCC_PYTHON_CONFIG"] = "/definitely/missing/python-config"
@@ -1142,7 +1350,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                     "pcc.py_frontend.pipeline.subprocess.check_output"
                 ) as check_output_mock:
                     run_mock.return_value = subprocess.CompletedProcess(
-                        ["clang"], 0,
+                        ["clang"],
+                        0,
                     )
                     pipeline._link_with_clang(
                         [in_ll],
@@ -1157,6 +1366,49 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertIn("-L/test/python", cmd)
         self.assertIn("-lpython9.9", cmd)
         self.assertNotIn("/definitely/missing/python-config", " ".join(cmd))
+
+    def test_ensure_runtime_passes_absolute_host_python_to_make(self):
+        from pcc.py_frontend import pipeline
+
+        make_cmds = []
+
+        def fake_run_runtime_make(cmd, *, verbose):
+            make_cmds.append(cmd)
+
+        with mock.patch(
+            "pcc.py_frontend.pipeline._runtime_cc_mode", return_value="pcc"
+        ):
+            with mock.patch(
+                "pcc.py_frontend.pipeline._runtime_high_mode", return_value="py"
+            ):
+                with mock.patch(
+                    "pcc.py_frontend.pipeline._resolve_pcc_binary",
+                    return_value="/tmp/pcc1",
+                ):
+                    with mock.patch(
+                        "pcc.py_frontend.pipeline._host_python_command",
+                        return_value=".venv/bin/python3",
+                    ):
+                        with mock.patch(
+                            "pcc.py_frontend.pipeline.os.path.isfile"
+                        ) as isfile:
+                            isfile.side_effect = lambda path: str(path).endswith(
+                                "Makefile"
+                            )
+                            with mock.patch(
+                                "pcc.py_frontend.pipeline._run_runtime_make",
+                                side_effect=fake_run_runtime_make,
+                            ):
+                                pipeline._ensure_runtime(
+                                    verbose=False,
+                                    needs_libpython=True,
+                                )
+
+        self.assertEqual(len(make_cmds), 1)
+        python_args = [arg for arg in make_cmds[0] if arg.startswith("PYTHON=")]
+        self.assertEqual(len(python_args), 1)
+        self.assertTrue(os.path.isabs(python_args[0].split("=", 1)[1]))
+        self.assertNotEqual(python_args[0], "PYTHON=/tmp/pcc1")
 
     def test_runtime_archive_link_args_only_force_capi_for_native_extensions(self):
         from pcc.py_frontend import pipeline
@@ -1182,6 +1434,36 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 ["-Wl,-export_dynamic"],
             )
 
+    def test_absolute_from_import_detects_native_extension_alias(self):
+        from pcc.parse.py_lift import parse_and_lift
+        from pcc.py_frontend import pipeline
+
+        ast_mod = parse_and_lift(
+            "from generic_ext import _native\n",
+            "/tmp/native_extension_import.py",
+            "entry",
+        )
+        resolved = []
+
+        def resolve_extension(module_name):
+            resolved.append(module_name)
+            if module_name == "generic_ext._native":
+                return "/tmp/generic_ext/_native.pcc3-pcc_native-test.so"
+            return None
+
+        with mock.patch(
+            "pcc.py_frontend.pipeline._resolve_pcc_native_extension_path",
+            side_effect=resolve_extension,
+        ):
+            needs_exports = pipeline._module_imports_pcc_native_extension(
+                ast_mod,
+                native_modules=["entry", "generic_ext"],
+                ir_scaffold_mode="on",
+            )
+
+        self.assertTrue(needs_exports)
+        self.assertIn("generic_ext._native", resolved)
+
     def test_compile_python_backend_llvm_uses_legacy_clang_link(self):
         from pcc.py_frontend.pipeline import compile_python
 
@@ -1191,9 +1473,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             "pcc.py_frontend.pipeline._ensure_runtime",
             return_value="/tmp/libpy_runtime.a",
         ):
-            with mock.patch(
-                "pcc.py_frontend.pipeline._link_with_clang"
-            ) as clang_link:
+            with mock.patch("pcc.py_frontend.pipeline._link_with_clang") as clang_link:
                 with mock.patch(
                     "pcc.py_frontend.pipeline._link_with_self_backend"
                 ) as self_link:
@@ -1226,7 +1506,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self_link.assert_called_once()
         clang_link.assert_not_called()
 
-    def test_self_native_link_reaches_self_emitter_and_host_triple(self):
+    def test_self_native_link_reaches_in_process_emitter_and_host_triple(self):
         from pcc.py_frontend import pipeline
 
         ll_path = os.path.join(self.td, "self_input.ll")
@@ -1245,38 +1525,47 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             "  ret\n"
             ".subsections_via_symbols\n"
         )
-        def fake_check_output(cmd, *, text=False):
-            self.assertTrue(text)
-            with open(cmd[-1], "r", encoding="utf-8") as f:
-                host_ir = f.read()
-            self.assertIn(
-                'target triple = "arm64-apple-darwin23.6.0"',
-                host_ir,
-            )
-            return "self-aarch64-darwin-v0\n" + asm_text
 
         with mock.patch(
             "pcc.py_frontend.pipeline._host_target_triple_for_self_backend",
             return_value="arm64-apple-darwin23.6.0",
-        ):
+        ) as host_triple_mock:
             with mock.patch(
                 "pcc.py_frontend.pipeline.subprocess.check_output",
-                side_effect=fake_check_output,
+                side_effect=AssertionError("host emitter must not run"),
             ) as check_output_mock:
-                with mock.patch(
-                    "pcc.py_frontend.pipeline.subprocess.run",
-                    return_value=subprocess.CompletedProcess(["cc"], 0),
-                ) as run_mock:
-                    pipeline._link_with_self_backend(
-                        [ll_path],
-                        os.path.join(self.td, "self.out"),
-                        "/tmp/libpy_runtime.a",
-                        False,
-                    )
+                with mock.patch.object(
+                    pipeline,
+                    "_emit_aarch64_darwin_asm_native",
+                    return_value=asm_text,
+                ) as emit_mock:
+                    with mock.patch(
+                        "pcc.py_frontend.pipeline.subprocess.run",
+                        return_value=subprocess.CompletedProcess(["cc"], 0),
+                    ) as run_mock:
+                        pipeline._link_with_self_backend(
+                            [ll_path],
+                            os.path.join(self.td, "self.out"),
+                            "/tmp/libpy_runtime.a",
+                            False,
+                        )
 
-        check_output_mock.assert_called_once()
-        self.assertIn("self_backend_dispatch", check_output_mock.call_args.args[0][2])
+        check_output_mock.assert_not_called()
+        host_triple_mock.assert_called()
+        emit_mock.assert_called_once()
+        self.assertIn(
+            'target triple = "arm64-apple-darwin23.6.0"',
+            emit_mock.call_args.args[0],
+        )
+        self.assertFalse(emit_mock.call_args.args[1])
         run_cmds = [call.args[0] for call in run_mock.call_args_list]
+        self.assertTrue(
+            any(
+                cmd[0] == "cc" and any(part.endswith("self_backend.s") for part in cmd)
+                for cmd in run_cmds
+            ),
+            msg=run_cmds,
+        )
         self.assertTrue(
             any("/tmp/libpy_runtime.a" in cmd for cmd in run_cmds),
             msg=run_cmds,
@@ -1287,7 +1576,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 msg=run_cmds,
             )
 
-    def test_self_native_link_keeps_host_emission_for_multiple_modules(self):
+    def test_self_native_link_keeps_in_process_emission_for_multiple_modules(self):
         from pcc.py_frontend import pipeline
 
         ll_paths = []
@@ -1303,47 +1592,22 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 )
             ll_paths.append(ll_path)
 
-        host_runs = []
-
         def fake_run(cmd, **kwargs):
-            if len(cmd) > 2 and cmd[1] == "-c":
-                host_runs.append(cmd)
-                self.assertEqual(cmd[3], "2")
-                self.assertEqual(cmd[4], "cc")
-                self.assertEqual(cmd[5], "0")
-                result_path = cmd[6]
-                paths = cmd[7:]
-                lines = []
-                for idx, path in enumerate(paths):
-                    with open(path, "r", encoding="utf-8") as f:
-                        host_ir = f.read()
-                    self.assertIn(
-                        'target triple = "arm64-apple-darwin23.6.0"',
-                        host_ir,
-                    )
-                    obj_path = path + ".o"
-                    with open(obj_path, "w", encoding="utf-8") as f:
-                        f.write("object")
-                    lines.append(
-                        f"{idx}\tself-aarch64-darwin-v0\t{obj_path}"
-                    )
-                with open(result_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(lines) + "\n")
-                return subprocess.CompletedProcess(cmd, 0)
             return subprocess.CompletedProcess(cmd, 0)
 
-        def unused_check_output(cmd, *, text=False):
-            raise AssertionError("multi-module self backend should use result-file run")
-
-        with mock.patch.dict(os.environ, {"PCC_SELF_BACKEND_JOBS": "2"}):
+        with mock.patch(
+            "pcc.py_frontend.pipeline._host_target_triple_for_self_backend",
+            return_value="arm64-apple-darwin23.6.0",
+        ):
             with mock.patch(
-                "pcc.py_frontend.pipeline._host_target_triple_for_self_backend",
-                return_value="arm64-apple-darwin23.6.0",
-            ):
-                with mock.patch(
-                    "pcc.py_frontend.pipeline.subprocess.check_output",
-                    side_effect=unused_check_output,
-                ) as check_output_mock:
+                "pcc.py_frontend.pipeline.subprocess.check_output",
+                side_effect=AssertionError("host emitter must not run"),
+            ) as check_output_mock:
+                with mock.patch.object(
+                    pipeline,
+                    "_emit_aarch64_darwin_asm_native",
+                    return_value=".text\n",
+                ) as emit_mock:
                     with mock.patch(
                         "pcc.py_frontend.pipeline.subprocess.run",
                         side_effect=fake_run,
@@ -1356,20 +1620,528 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                         )
 
         check_output_mock.assert_not_called()
-        self.assertEqual(len(host_runs), 1)
+        self.assertEqual(emit_mock.call_count, 2)
+        object_compile_cmds = [
+            call.args[0]
+            for call in run_mock.call_args_list
+            if len(call.args[0]) > 1 and call.args[0][1] == "-c"
+        ]
+        self.assertEqual(len(object_compile_cmds), 2)
         link_cmds = [
-            call.args[0] for call in run_mock.call_args_list
+            call.args[0]
+            for call in run_mock.call_args_list
             if "/tmp/libpy_runtime.a" in call.args[0]
         ]
         self.assertEqual(len(link_cmds), 1)
         link_cmd = link_cmds[0]
-        linked_objects = [
-            part for part in link_cmd
-            if part.endswith(".ll.o")
-        ]
+        linked_objects = [part for part in link_cmd if "self_backend_native_" in part]
         self.assertEqual(len(linked_objects), 2)
         self.assertIn("/tmp/libpy_runtime.a", link_cmd)
-        self.assertNotIn("self_backend.s", " ".join(link_cmd))
+        self.assertNotIn("self_backend_input_", " ".join(link_cmd))
+
+    def test_self_native_emitter_collects_incrementally(self):
+        from pcc.py_frontend import pipeline
+
+        ir_text = (
+            'target triple = "arm64-apple-darwin23.6.0"\n'
+            "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+        )
+        with mock.patch.object(
+            pipeline,
+            "_emit_aarch64_darwin_asm_native",
+            return_value=".text\n",
+        ):
+            with mock.patch.object(
+                pipeline,
+                "_python_frontend_worker_command_prefix",
+                return_value=[],
+            ):
+                with mock.patch(
+                    "pcc.py_frontend.pipeline.subprocess.run",
+                    return_value=subprocess.CompletedProcess(["cc"], 0),
+                ):
+                    with mock.patch.object(pipeline.gc, "collect") as collect_mock:
+                        pairs = pipeline._emit_self_objects_many_in_process(
+                            [ir_text] * 5,
+                            self.td,
+                            "cc",
+                            split_large_modules=False,
+                            profile=None,
+                        )
+
+        self.assertEqual(len(pairs), 5)
+        self.assertEqual(collect_mock.call_count, 2)
+
+    def test_self_native_emitter_uses_short_lived_compiled_stage_workers(self):
+        from pcc.py_frontend import pipeline
+
+        ir_text = (
+            'target triple = "arm64-apple-darwin23.6.0"\n'
+            "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+        )
+
+        def fake_worker_commands(commands, max_parallel=None):
+            self.assertEqual(max_parallel, 2)
+            for command in commands:
+                parts = command.split()
+                with open(parts[4], "w", encoding="utf-8") as f:
+                    f.write("object\n")
+                with open(parts[3], "w", encoding="utf-8") as f:
+                    f.write("self-aarch64-darwin-v0\n" + parts[4])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with mock.patch.object(
+            pipeline,
+            "_python_frontend_worker_executable",
+            return_value="/tmp/pcc1",
+        ):
+            with mock.patch.object(
+                pipeline,
+                "_split_self_backend_large_ir_modules",
+                side_effect=AssertionError("parent process must not split"),
+            ) as split_mock:
+                with mock.patch.object(
+                    pipeline,
+                    "_emit_aarch64_darwin_asm_native",
+                    side_effect=AssertionError("parent process must not emit"),
+                ) as emit_mock:
+                    with mock.patch.object(
+                        pipeline,
+                        "_run_python_frontend_worker_commands",
+                        side_effect=fake_worker_commands,
+                    ) as worker_commands_mock:
+                        with mock.patch.object(pipeline.gc, "collect") as collect_mock:
+                            with mock.patch(
+                                "pcc.py_frontend.pipeline.subprocess.run",
+                                side_effect=fake_run,
+                            ):
+                                pairs = pipeline._emit_self_objects_many_in_process(
+                                    [ir_text] * 2,
+                                    self.td,
+                                    "cc",
+                                    split_large_modules=True,
+                                    profile=None,
+                                )
+
+        self.assertEqual(len(pairs), 2)
+        split_mock.assert_not_called()
+        emit_mock.assert_not_called()
+        worker_commands_mock.assert_called_once()
+        collect_mock.assert_not_called()
+        commands = worker_commands_mock.call_args.args[0]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(
+            all(pipeline._SELF_BACKEND_EMIT_WORKER_ARG in cmd for cmd in commands)
+        )
+
+    def test_self_native_emitter_skips_compiled_workers_for_cache_hits(self):
+        from pcc.py_frontend import pipeline
+
+        ir_text = (
+            'target triple = "arm64-apple-darwin23.6.0"\n'
+            "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+        )
+
+        def fake_cache_plan(worker_items, target_id, cc, tmp_dir):
+            self.assertEqual(target_id, "self-aarch64-darwin-v0")
+            self.assertEqual(cc, "cc")
+            self.assertEqual(tmp_dir, self.td)
+            plan = []
+            for index, item in enumerate(worker_items):
+                result_path, obj_path, _ir_path = item
+                with open(obj_path, "wb") as f:
+                    f.write(b"cached-object")
+                with open(result_path, "w", encoding="utf-8") as f:
+                    f.write("self-aarch64-darwin-v0\n" + obj_path + "\nhit\n")
+                plan.append((os.path.join(self.td, f"cache-{index}.o"), "hit"))
+            return plan
+
+        with mock.patch.object(
+            pipeline,
+            "_python_frontend_worker_executable",
+            return_value="/tmp/pcc1",
+        ):
+            with mock.patch.object(
+                pipeline,
+                "_plan_self_backend_object_cache",
+                side_effect=fake_cache_plan,
+            ):
+                with mock.patch.object(
+                    pipeline,
+                    "_run_python_frontend_worker_commands",
+                    side_effect=AssertionError("cache hits must not launch emit workers"),
+                ) as worker_commands_mock:
+                    with mock.patch.object(pipeline.gc, "collect") as collect_mock:
+                        pairs = pipeline._emit_self_objects_many_in_process(
+                            [ir_text, ir_text],
+                            self.td,
+                            "cc",
+                            split_large_modules=False,
+                            profile=None,
+                        )
+
+        self.assertEqual(len(pairs), 2)
+        worker_commands_mock.assert_not_called()
+        collect_mock.assert_not_called()
+
+    def test_self_native_emitter_splits_large_ir_in_compiled_stage_worker(self):
+        from pcc.py_frontend import pipeline
+
+        ir_text = (
+            'target triple = "arm64-apple-darwin23.6.0"\n'
+            "define i32 @first() {\nentry:\n  ret i32 1\n}\n"
+            "define i32 @second() {\nentry:\n  ret i32 2\n}\n"
+        )
+        command_batches = []
+
+        def fake_worker_commands(commands, max_parallel=None):
+            command_batches.append((commands, max_parallel))
+            for command in commands:
+                parts = command.split()
+                if pipeline._SELF_BACKEND_SPLIT_WORKER_ARG in parts:
+                    status = pipeline.run_self_backend_split_worker(
+                        parts[2], parts[3], parts[4], parts[5], parts[6]
+                    )
+                    self.assertEqual(status, 0)
+                    continue
+                with open(parts[4], "w", encoding="utf-8") as f:
+                    f.write("object\n")
+                with open(parts[3], "w", encoding="utf-8") as f:
+                    f.write("self-aarch64-darwin-v0\n" + parts[4])
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PCC_SELF_BACKEND_SPLIT_LARGE_MODULES": "1",
+                "PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES": "1",
+                "PCC_SELF_BACKEND_SPLIT_SHARD_BYTES": "1",
+            },
+        ):
+            with mock.patch.object(
+                pipeline,
+                "_python_frontend_worker_executable",
+                return_value="/tmp/pcc1",
+            ):
+                with mock.patch.object(
+                    pipeline,
+                    "_split_self_backend_large_ir_modules",
+                    side_effect=AssertionError("parent process must not split"),
+                ) as split_mock:
+                    with mock.patch.object(
+                        pipeline,
+                        "_run_python_frontend_worker_commands",
+                        side_effect=fake_worker_commands,
+                    ):
+                        pairs = pipeline._emit_self_objects_many_in_process(
+                            [ir_text],
+                            self.td,
+                            "cc",
+                            split_large_modules=True,
+                            profile=None,
+                        )
+
+        split_mock.assert_not_called()
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(len(command_batches), 2)
+        self.assertEqual(command_batches[0][1], 1)
+        self.assertIn(pipeline._SELF_BACKEND_SPLIT_WORKER_ARG, command_batches[0][0][0])
+        self.assertEqual(command_batches[1][1], 2)
+        self.assertTrue(
+            all(
+                pipeline._SELF_BACKEND_EMIT_WORKER_ARG in command
+                for command in command_batches[1][0]
+            )
+        )
+
+    def test_self_source_emitter_uses_python_module_workers_after_parent_split(self):
+        from pcc.py_frontend import pipeline
+
+        ir_text = (
+            'target triple = "arm64-apple-darwin23.6.0"\n'
+            "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+        )
+        command_batches = []
+
+        def fake_worker_commands(commands, max_parallel=None):
+            command_batches.append((commands, max_parallel))
+            for command in commands:
+                parts = command.split()
+                worker_index = parts.index(pipeline._SELF_BACKEND_EMIT_WORKER_ARG)
+                result_path = parts[worker_index + 2]
+                obj_path = parts[worker_index + 3]
+                with open(obj_path, "w", encoding="utf-8") as f:
+                    f.write("object\n")
+                with open(result_path, "w", encoding="utf-8") as f:
+                    f.write("self-aarch64-darwin-v0\n" + obj_path)
+
+        with mock.patch.object(
+            pipeline,
+            "_python_frontend_worker_executable",
+            return_value="",
+        ):
+            with mock.patch.object(
+                pipeline,
+                "_python_frontend_worker_command_prefix",
+                return_value=["/usr/bin/python3", "-m", "pcc"],
+            ):
+                with mock.patch.object(
+                    pipeline,
+                    "_source_self_backend_emit_workers_worthwhile",
+                    return_value=True,
+                ):
+                    with mock.patch.object(
+                        pipeline,
+                        "_split_self_backend_large_ir_modules",
+                        return_value=[ir_text, ir_text],
+                    ) as split_mock:
+                        with mock.patch.object(
+                            pipeline,
+                            "_run_python_frontend_worker_commands",
+                            side_effect=fake_worker_commands,
+                        ):
+                            pairs = pipeline._emit_self_objects_many_in_process(
+                                [ir_text],
+                                self.td,
+                                "cc",
+                                split_large_modules=True,
+                                profile=None,
+                            )
+
+        split_mock.assert_called_once_with([ir_text])
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(len(command_batches), 1)
+        self.assertEqual(command_batches[0][1], 2)
+        self.assertTrue(
+            all(
+                command.startswith("/usr/bin/python3 -m pcc ")
+                for command in command_batches[0][0]
+            )
+        )
+
+    def test_self_native_emit_worker_writes_target_and_assembly(self):
+        from pcc.py_frontend import pipeline
+
+        ir_path = os.path.join(self.td, "worker.ll")
+        result_path = os.path.join(self.td, "worker.result")
+        with open(ir_path, "w", encoding="utf-8") as f:
+            f.write('target triple = "arm64-apple-darwin23.6.0"\n')
+        with mock.patch.object(
+            pipeline,
+            "_emit_aarch64_darwin_asm_native",
+            return_value=".text\n",
+        ):
+            status = pipeline.run_self_backend_emit_worker(ir_path, result_path)
+
+        self.assertEqual(status, 0)
+        with open(result_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "self-aarch64-darwin-v0\n.text\n")
+
+    def test_self_native_emit_worker_normalizes_missing_target_triple(self):
+        from pcc.py_frontend import pipeline
+
+        ir_path = os.path.join(self.td, "worker-missing-target.ll")
+        result_path = os.path.join(self.td, "worker-missing-target.result")
+        with open(ir_path, "w", encoding="utf-8") as f:
+            f.write("define i32 @main() {\nentry:\n  ret i32 0\n}\n")
+        observed_ir = []
+
+        def emit(ir_text, _debug):
+            observed_ir.append(ir_text)
+            return ".text\n"
+
+        with mock.patch.object(
+            pipeline,
+            "_host_target_triple_for_self_backend",
+            return_value="arm64-apple-darwin23.6.0",
+        ), mock.patch.object(
+            pipeline,
+            "_emit_aarch64_darwin_asm_native",
+            side_effect=emit,
+        ):
+            status = pipeline.run_self_backend_emit_worker(ir_path, result_path)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(observed_ir), 1)
+        self.assertTrue(
+            observed_ir[0].startswith(
+                'target triple = "arm64-apple-darwin23.6.0"\n'
+            )
+        )
+
+    def test_frontend_worker_empty_ir_fails_with_module_name(self):
+        from pcc.py_frontend import pipeline
+
+        ir_path = os.path.join(self.td, "empty-worker.ll")
+        with open(ir_path, "w", encoding="utf-8"):
+            pass
+
+        with self.assertRaisesRegex(
+            pipeline.PyPipelineError,
+            "empty LLVM IR for module pcc.example",
+        ):
+            pipeline._read_python_frontend_worker_ir(ir_path, "pcc.example")
+
+    def test_self_native_object_cache_publisher_enables_next_plan_hit(self):
+        from pcc.py_frontend import pipeline
+
+        ir_path = os.path.join(self.td, "cached-worker.ll")
+        cache_dir = os.path.join(self.td, "object-cache")
+        with open(ir_path, "w", encoding="utf-8") as f:
+            f.write(
+                'target triple = "arm64-apple-darwin23.6.0"\n'
+                "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+            )
+        env = {
+            "PCC_SELF_BACKEND_OBJECT_CACHE": "1",
+            "PCC_SELF_BACKEND_OBJECT_CACHE_DIR": cache_dir,
+            "PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY": "source-a",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            first_result = os.path.join(self.td, "cached-worker-first.result")
+            first_object = os.path.join(self.td, "cached-worker-first.o")
+            first_items = [(first_result, first_object, ir_path)]
+            first_plan = pipeline._plan_self_backend_object_cache(
+                first_items,
+                "self-aarch64-darwin-v0",
+                "cc",
+                self.td,
+            )
+            self.assertEqual(first_plan[0][1], "miss")
+            with open(first_object, "wb") as f:
+                f.write(b"deterministic-object")
+            self.assertTrue(
+                pipeline._publish_self_backend_object_cache(
+                    first_items,
+                    first_plan,
+                    self.td,
+                )
+            )
+
+            second_result = os.path.join(self.td, "cached-worker-second.result")
+            second_object = os.path.join(self.td, "cached-worker-second.o")
+            second_items = [(second_result, second_object, ir_path)]
+            second_plan = pipeline._plan_self_backend_object_cache(
+                second_items,
+                "self-aarch64-darwin-v0",
+                "cc",
+                self.td,
+            )
+            self.assertEqual(second_plan, [(first_plan[0][0], "hit")])
+            with open(second_object, "rb") as f:
+                self.assertEqual(f.read(), b"deterministic-object")
+            with open(second_result, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read().splitlines()[-1], "hit")
+
+    def test_self_native_object_cache_plan_binds_identity_and_ir(self):
+        from pcc.py_frontend import pipeline
+
+        cache_dir = os.path.join(self.td, "planned-object-cache")
+        ir_path = os.path.join(self.td, "planned-worker.ll")
+        result_path = os.path.join(self.td, "planned-worker.result")
+        object_path = os.path.join(self.td, "planned-worker.o")
+        with open(ir_path, "w", encoding="utf-8") as f:
+            f.write('target triple = "arm64-apple-darwin23.6.0"\n')
+        worker_items = [(result_path, object_path, ir_path)]
+        env = {
+            "PCC_SELF_BACKEND_OBJECT_CACHE": "1",
+            "PCC_SELF_BACKEND_OBJECT_CACHE_DIR": cache_dir,
+            "PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY": "source-a",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            first_plan = pipeline._plan_self_backend_object_cache(
+                worker_items,
+                "self-aarch64-darwin-v0",
+                "cc",
+                self.td,
+            )
+            self.assertEqual(first_plan[0][1], "miss")
+            first_cache_path = first_plan[0][0]
+            with open(object_path, "wb") as f:
+                f.write(b"cached-object")
+            self.assertTrue(
+                pipeline._publish_self_backend_object_cache(
+                    worker_items,
+                    first_plan,
+                    self.td,
+                )
+            )
+            second_plan = pipeline._plan_self_backend_object_cache(
+                worker_items,
+                "self-aarch64-darwin-v0",
+                "cc",
+                self.td,
+            )
+            self.assertEqual(second_plan, [(first_cache_path, "hit")])
+            with open(object_path, "rb") as f:
+                self.assertEqual(f.read(), b"cached-object")
+
+            with open(first_cache_path, "wb") as f:
+                f.write(b"tampered-object")
+            tampered_plan = pipeline._plan_self_backend_object_cache(
+                worker_items,
+                "self-aarch64-darwin-v0",
+                "cc",
+                self.td,
+            )
+            self.assertEqual(tampered_plan[0][1], "miss")
+
+            with mock.patch.dict(
+                os.environ,
+                {"PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY": "source-b"},
+                clear=False,
+            ):
+                changed_identity_plan = pipeline._plan_self_backend_object_cache(
+                    worker_items,
+                    "self-aarch64-darwin-v0",
+                    "cc",
+                    self.td,
+                )
+            self.assertEqual(changed_identity_plan[0][1], "miss")
+            self.assertNotEqual(changed_identity_plan[0][0], first_cache_path)
+
+            with open(ir_path, "a", encoding="utf-8") as f:
+                f.write("; changed\n")
+            changed_ir_plan = pipeline._plan_self_backend_object_cache(
+                worker_items,
+                "self-aarch64-darwin-v0",
+                "cc",
+                self.td,
+            )
+            self.assertEqual(changed_ir_plan[0][1], "miss")
+            self.assertNotEqual(changed_ir_plan[0][0], first_cache_path)
+
+    def test_self_backend_split_worker_writes_isolated_shard_manifest(self):
+        from pcc.py_frontend import pipeline
+
+        ir_path = os.path.join(self.td, "large-worker.ll")
+        result_path = os.path.join(self.td, "large-worker.result")
+        output_prefix = os.path.join(self.td, "large-worker-shard-")
+        with open(ir_path, "w", encoding="utf-8") as f:
+            f.write(
+                'target triple = "arm64-apple-darwin23.6.0"\n'
+                "define i32 @first() {\nentry:\n  ret i32 1\n}\n"
+                "define i32 @second() {\nentry:\n  ret i32 2\n}\n"
+            )
+
+        status = pipeline.run_self_backend_split_worker(
+            ir_path,
+            result_path,
+            output_prefix,
+            "__probe_",
+            "1",
+        )
+
+        self.assertEqual(status, 0)
+        with open(result_path, "r", encoding="utf-8") as f:
+            manifest_lines = f.read().splitlines()
+        self.assertEqual(manifest_lines[0], "pcc.self_backend.split.v1")
+        self.assertEqual(len(manifest_lines), 3)
+        for shard_path in manifest_lines[1:]:
+            self.assertTrue(os.path.isfile(shard_path))
+            with open(shard_path, "r", encoding="utf-8") as f:
+                self.assertIn('target triple = "arm64-apple-darwin23.6.0"', f.read())
 
     def test_self_backend_large_ir_module_split_keeps_one_global_definition(self):
         from pcc.py_frontend import pipeline
@@ -1405,14 +2177,14 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertGreaterEqual(len(shards), 3)
         exported_name = "@__pco0_counter"
         global_defs = [
-            shard for shard in shards
-            if exported_name + " = global i64 0" in shard
+            shard for shard in shards if exported_name + " = global i64 0" in shard
         ]
         self.assertEqual(len(global_defs), 1)
         self.assertNotIn("@counter = internal global", "\n".join(shards))
         self.assertNotIn("@counter = global", "\n".join(shards))
         function_shards = [
-            shard for shard in shards
+            shard
+            for shard in shards
             if "define i64 @load_counter" in shard
             or "define void @store_counter" in shard
         ]
@@ -1421,7 +2193,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             self.assertIn(exported_name, shard)
             self.assertNotIn(exported_name + " = global i64 0", shard)
 
-    def test_self_backend_large_ir_module_split_namespaces_internal_symbols_per_module(self):
+    def test_self_backend_large_ir_module_split_namespaces_internal_symbols_per_module(
+        self,
+    ):
         from pcc.py_frontend import pipeline
 
         def module_ir(func_name):
@@ -1450,10 +2224,12 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 "PCC_SELF_BACKEND_SPLIT_SHARD_BYTES": "120",
             },
         ):
-            shards = pipeline._split_self_backend_large_ir_modules([
-                module_ir("load_a"),
-                module_ir("load_b"),
-            ])
+            shards = pipeline._split_self_backend_large_ir_modules(
+                [
+                    module_ir("load_a"),
+                    module_ir("load_b"),
+                ]
+            )
 
         joined = "\n".join(shards)
         self.assertIn("@__pco0_counter = global i64 0", joined)
@@ -1534,29 +2310,39 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(split_flags, [True])
         link_cmds = [call.args[0] for call in run_mock.call_args_list]
         linked_objects = [
-            part
-            for cmd in link_cmds
-            for part in cmd
-            if part.endswith(".o")
+            part for cmd in link_cmds for part in cmd if part.endswith(".o")
         ]
         self.assertEqual(len(linked_objects), 1)
 
     def test_self_backend_skip_ll_temp_defaults_to_direct_module_ir_texts(self):
         from pcc.py_frontend import pipeline
 
-        main_py = self._write("main.py", """
+        main_py = self._write(
+            "main.py",
+            """
             def main() -> None:
                 print("ok")
 
             if __name__ == "__main__":
                 main()
-        """)
+        """,
+        )
         exe = os.path.join(self.td, "skip_ll_temp.out")
         linked = []
 
-        def fake_link(ir_texts, out_path, runtime, verbose, *,
-                      needs_libpython=False, needs_native_extension_exports=False,
-                      tmp_dir=None, profile=None):
+        def fake_link(
+            ir_texts,
+            out_path,
+            runtime,
+            verbose,
+            *,
+            needs_libpython=False,
+            needs_native_extension_exports=False,
+            extra_link_inputs=(),
+            extra_link_args=(),
+            tmp_dir=None,
+            profile=None,
+        ):
             linked.append((ir_texts, out_path, runtime, needs_libpython))
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write("linked")
@@ -1602,10 +2388,10 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         from pcc.py_frontend import pipeline
 
         ir_text = (
-            '; module without target in header\n'
-            + ('; filler\n' * 600)
+            "; module without target in header\n"
+            + ("; filler\n" * 600)
             + 'target triple = "x-should-not-count"\n'
-            + 'define i32 @main() { ret i32 0 }\n'
+            + "define i32 @main() { ret i32 0 }\n"
         )
 
         normalized = pipeline._self_backend_ir_text(ir_text)
@@ -1665,15 +2451,15 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
         main_py = self._write("bootstrap_backend.py", "print(1)\n")
         exe = os.path.join(self.td, "bootstrap_backend.out")
-        with mock.patch(
-            "pcc.cli_bootstrap._compile_python"
-        ) as compile_mock:
-            rc = cli_bootstrap.bootstrap_cli_main([
-                "--backend=self",
-                main_py,
-                "-o",
-                exe,
-            ])
+        with mock.patch("pcc.cli_bootstrap._compile_python") as compile_mock:
+            rc = cli_bootstrap.bootstrap_cli_main(
+                [
+                    "--backend=self",
+                    main_py,
+                    "-o",
+                    exe,
+                ]
+            )
 
         self.assertEqual(rc, 0)
         compile_mock.assert_called_once()
@@ -1705,7 +2491,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                         resolved = pipeline._resolve_python_config_command()
 
         self.assertEqual(
-            resolved, "/opt/homebrew/python/bin/python3.13-config",
+            resolved,
+            "/opt/homebrew/python/bin/python3.13-config",
         )
 
     def test_dataclass_field_imports_stay_off_libpython_path(self):
@@ -1887,7 +2674,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_pcc_unsafe_memory_intrinsics_compile_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        src = self._write("unsafe_probe.py", """
+        src = self._write(
+            "unsafe_probe.py",
+            """
             from pcc.unsafe import (
                 free,
                 load_i32,
@@ -1919,7 +2708,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
 
         out_ll = os.path.join(self.td, "unsafe_probe.ll")
         compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
@@ -1949,9 +2739,57 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         )
         out_ll = os.path.join(self.td, "py_gc_backend.ll")
 
-        compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
+        compile_python(
+            src,
+            out_ll,
+            emit_llvm_only=True,
+            libpython_mode="off",
+            python_library=True,
+        )
         self.assertTrue(os.path.isfile(out_ll))
         self._assert_no_libpython_fallback_calls(out_ll)
+        with open(out_ll, "r", encoding="utf-8") as f:
+            ir_text = f.read()
+        marker = "@pcc_gc_note_frame_enter("
+        start = ir_text.rfind("\ndefine ", 0, ir_text.index(marker))
+        body = ir_text[start:]
+        body = body.split("\ndefine ", 1)[0]
+        self.assertNotIn("@pcc_gc_frame_enter", body)
+
+    def test_py_obj_runtime_refcount_primitives_do_not_self_root(self):
+        from pcc.py_frontend.pipeline import compile_python
+
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+        src = os.path.join(
+            repo_root,
+            "pcc",
+            "py_runtime",
+            "py",
+            "py_obj.py",
+        )
+        out_ll = os.path.join(self.td, "py_obj.ll")
+
+        compile_python(
+            src,
+            out_ll,
+            emit_llvm_only=True,
+            libpython_mode="off",
+            python_library=True,
+        )
+        self.assertTrue(os.path.isfile(out_ll))
+        self._assert_no_libpython_fallback_calls(out_ll)
+        with open(out_ll, "r", encoding="utf-8") as f:
+            ir_text = f.read()
+        marker = "\ndefine ptr @pcc_gc_retain("
+        start = ir_text.index(marker)
+        retain_body = ir_text[start:]
+        retain_body = retain_body.split("\ndefine ", 1)[0]
+        self.assertNotIn("call ptr @pcc_gc_retain", retain_body)
+        marker = "@user_py_obj__ptr_can_have_header("
+        start = ir_text.rfind("\ndefine ", 0, ir_text.index(marker))
+        ptr_body = ir_text[start:]
+        ptr_body = ptr_body.split("\ndefine ", 1)[0]
+        self.assertNotIn("@pcc_gc_frame_enter", ptr_body)
 
     def test_py_gc_telemetry_runtime_file_compiles_without_libpython_fallback(self):
         from pcc.py_frontend.pipeline import compile_python
@@ -1973,7 +2811,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_py_gc_telemetry_split_preserves_runtime_api(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        src = self._write("gc_telemetry_split_probe.py", """
+        src = self._write(
+            "gc_telemetry_split_probe.py",
+            """
             from pcc.extern import extern, c_int64, c_void
 
             pcc_gc_telemetry = extern("pcc_gc_telemetry", (c_int64,), c_int64)
@@ -1996,7 +2836,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
 
         exe = os.path.join(self.td, "gc_telemetry_split_probe.out")
         compile_python(src, exe, libpython_mode="off")
@@ -2078,14 +2919,17 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_py_obj_mod_split_preserves_int_and_string_modulo_runtime(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        src = self._write("obj_mod_split_probe.py", """
+        src = self._write(
+            "obj_mod_split_probe.py",
+            """
             def main() -> None:
                 print(7 % 3)
                 print("hello %s" % "world")
 
 
             main()
-        """)
+        """,
+        )
 
         exe = os.path.join(self.td, "obj_mod_split_probe.out")
         compile_python(src, exe, libpython_mode="off")
@@ -2093,7 +2937,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "1\nhello world\n")
 
-    def test_list_set_slice_split_runtime_files_compile_without_libpython_fallback(self):
+    def test_list_set_slice_split_runtime_files_compile_without_libpython_fallback(
+        self,
+    ):
         import pcc
         from pcc.py_frontend.pipeline import compile_python
 
@@ -2131,7 +2977,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_list_set_slice_split_preserves_slice_assignment_runtime(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        src = self._write("list_set_slice_split_probe.py", """
+        src = self._write(
+            "list_set_slice_split_probe.py",
+            """
             def main() -> None:
                 xs = [1, 2, 3, 4]
                 xs[1:3] = [8, 9, 10]
@@ -2147,7 +2995,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
 
         exe = os.path.join(self.td, "list_set_slice_split_probe.out")
         compile_python(src, exe, libpython_mode="off")
@@ -2226,7 +3075,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_slice_split_preserves_string_list_and_tuple_slice_runtime(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        src = self._write("slice_split_probe.py", """
+        src = self._write(
+            "slice_split_probe.py",
+            """
             def main() -> None:
                 print("abcdef"[1:5:2])
                 print("héllo"[1:4])
@@ -2241,18 +3092,27 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
 
         exe = os.path.join(self.td, "slice_split_probe.out")
         compile_python(src, exe, libpython_mode="off")
-        r = subprocess.run([exe], capture_output=True, text=True, timeout=20)
+        # The program prints "héllo"[1:4] -> "éll" (UTF-8 0xc3 0xa9); decode the
+        # captured output as UTF-8 explicitly so it does not depend on the
+        # ambient locale (LC_ALL=C would otherwise pick ASCII and raise
+        # UnicodeDecodeError on the 0xc3 byte under `uv run pytest`).
+        r = subprocess.run(
+            [exe], capture_output=True, text=True, encoding="utf-8", timeout=20
+        )
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "bd\néll\n2\n4\n7\n5\n")
 
     def test_pcc_unsafe_tagged_int_intrinsics_compile_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        src = self._write("unsafe_tagged_int_probe.py", """
+        src = self._write(
+            "unsafe_tagged_int_probe.py",
+            """
             from pcc.unsafe import is_tagged_int, tag_int, untag_int
 
 
@@ -2265,7 +3125,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
 
         out_ll = os.path.join(self.td, "unsafe_tagged_int_probe.ll")
         compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
@@ -2285,7 +3146,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_pcc_unsafe_f64_intrinsics_compile_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        src = self._write("unsafe_f64_probe.py", """
+        src = self._write(
+            "unsafe_f64_probe.py",
+            """
             from pcc.unsafe import free, load_f64, malloc, store_f64
 
 
@@ -2297,7 +3160,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
 
         out_ll = os.path.join(self.td, "unsafe_f64_probe.ll")
         compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
@@ -2317,7 +3181,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_pcc_unsafe_libc_buffer_intrinsics_compile_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        src = self._write("unsafe_libc_probe.py", """
+        src = self._write(
+            "unsafe_libc_probe.py",
+            """
             from pcc.unsafe import (
                 calloc,
                 free,
@@ -2353,7 +3219,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
 
         out_ll = os.path.join(self.td, "unsafe_libc_probe.ll")
         compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
@@ -2378,7 +3245,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         with open(marker, "w", encoding="utf-8") as f:
             f.write("present\n")
 
-        src = self._write("unsafe_env_probe.py", f"""
+        src = self._write(
+            "unsafe_env_probe.py",
+            f"""
             from pcc.unsafe import (
                 access,
                 cstr,
@@ -2404,7 +3273,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
 
         out_ll = os.path.join(self.td, "unsafe_env_probe.ll")
         compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
@@ -2425,7 +3295,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_pcc_unsafe_external_pointer_globals_compile_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        src = self._write("unsafe_global_probe.py", """
+        src = self._write(
+            "unsafe_global_probe.py",
+            """
             from pcc.unsafe import (
                 global_addr,
                 global_load_ptr,
@@ -2440,7 +3312,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
 
         out_ll = os.path.join(self.td, "unsafe_global_probe.ll")
         compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
@@ -2457,7 +3330,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "False\n")
 
-        store_src = self._write("unsafe_global_store_probe.py", """
+        store_src = self._write(
+            "unsafe_global_store_probe.py",
+            """
             from pcc.unsafe import global_addr, global_store_ptr, null
 
 
@@ -2470,10 +3345,14 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
 
             main()
-        """)
+        """,
+        )
         store_ll = os.path.join(self.td, "unsafe_global_store_probe.ll")
         compile_python(
-            store_src, store_ll, emit_llvm_only=True, libpython_mode="off",
+            store_src,
+            store_ll,
+            emit_llvm_only=True,
+            libpython_mode="off",
         )
         self.assertTrue(os.path.isfile(store_ll))
         self._assert_no_libpython_fallback_calls(store_ll)

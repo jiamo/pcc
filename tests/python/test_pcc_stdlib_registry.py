@@ -9,6 +9,7 @@ internals, ``collections.OrderedDict`` with unsupported decorators).
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -55,6 +56,100 @@ def test_locator_supports_dotted_pcc_py_stdlib_packages():
     assert located.endswith("pcc/py_stdlib/urllib/parse.py"), located
 
 
+def test_locator_finds_py_stdlib_from_stage_binary_ancestor(tmp_path, monkeypatch):
+    """Compiled pcc1 has a synthetic ``__file__`` value, so native stdlib
+    discovery must also work from the stage binary path."""
+    from pcc.py_frontend import pipeline
+
+    repo = tmp_path / "repo"
+    py_stdlib = repo / "pcc" / "py_stdlib"
+    py_stdlib.mkdir(parents=True)
+    (py_stdlib / "__init__.py").write_text("", encoding="utf-8")
+    (py_stdlib / "string.py").write_text("ascii_lowercase = 'abc'\n", encoding="utf-8")
+    stage = repo / "build" / "bootstrap-pytest-self"
+    stage.mkdir(parents=True)
+    pcc1 = stage / "pcc1"
+    pcc1.write_text("", encoding="utf-8")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    monkeypatch.setattr(pipeline, "_PCC_DIR", str(tmp_path / "missing_pcc"))
+    monkeypatch.setattr(pipeline, "_PIPELINE_DIR", str(tmp_path / "missing_frontend"))
+    monkeypatch.setattr(pipeline, "_PY_RUNTIME_DIR", str(tmp_path / "missing_runtime"))
+    monkeypatch.setattr(sys, "argv", [str(pcc1), "--backend", "self"])
+
+    located = pipeline._locate_stdlib_module_source("string")
+    assert located == str(py_stdlib / "string.py")
+    assert pipeline._native_stdlib_root_for_path(located) == str(py_stdlib)
+
+
+def test_pcc_owned_stdlib_provider_bypasses_fail_soft_probe(monkeypatch):
+    from pcc.py_frontend import pipeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "_native_stdlib_root_for_path",
+        lambda _path: "/fake/pcc/py_stdlib",
+    )
+
+    assert pipeline._stdlib_module_compiles("/missing/provider.py", "provider")
+
+
+def test_locator_accepts_host_stdlib_provider(monkeypatch, tmp_path):
+    from pcc.py_frontend import pipeline
+
+    stdlib = tmp_path / "python" / "lib"
+    stdlib.mkdir(parents=True)
+    provider = stdlib / "hostmod.py"
+    provider.write_text("VALUE = 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "_pcc_package_dir_candidates", lambda: [])
+    monkeypatch.setattr(
+        pipeline,
+        "_host_find_spec_origin",
+        lambda _mod_name: str(provider),
+    )
+    monkeypatch.setattr(pipeline, "_host_stdlib_roots", lambda: [str(stdlib)])
+    monkeypatch.setattr(pipeline, "_host_site_roots", lambda: [])
+
+    assert pipeline._locate_stdlib_module_source("hostmod") == str(provider)
+
+
+def test_locator_rejects_host_site_packages_provider(monkeypatch, tmp_path):
+    from pcc.py_frontend import pipeline
+
+    stdlib = tmp_path / "python" / "lib"
+    site = stdlib / "site-packages"
+    site.mkdir(parents=True)
+    provider = site / "ThirdParty" / "__init__.py"
+    provider.parent.mkdir()
+    provider.write_text("VALUE = 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "_pcc_package_dir_candidates", lambda: [])
+    monkeypatch.setattr(
+        pipeline,
+        "_host_find_spec_origin",
+        lambda _mod_name: str(provider),
+    )
+    monkeypatch.setattr(pipeline, "_host_stdlib_roots", lambda: [str(stdlib)])
+    monkeypatch.setattr(pipeline, "_host_site_roots", lambda: [str(site)])
+
+    assert pipeline._locate_stdlib_module_source("ThirdParty") is None
+
+
+def test_host_subprocess_source_root_uses_repo_parent(monkeypatch, tmp_path):
+    from pcc.py_frontend import pipeline
+
+    repo = tmp_path / "repo"
+    pcc_dir = repo / "pcc"
+    pcc_dir.mkdir(parents=True)
+    monkeypatch.setattr(pipeline, "_PCC_DIR", str(pcc_dir))
+
+    assert pipeline._pcc_source_root_for_host_subprocess() == str(repo)
+
+
+
 def test_import_classifier_keeps_cpython_spelling_with_native_provider():
     from pcc.py_frontend.pipeline import _classify_python_import
 
@@ -75,7 +170,7 @@ def test_locator_prefers_pcc_stdlib_when_present(tmp_path):
     # Drop a probe port file
     probe_name = "_pcc_test_probe_module"
     probe = _STDLIB_DIR / f"{probe_name}.py"
-    probe.write_text("# pcc-stdlib probe port\n")
+    probe.write_text("# pcc-stdlib probe port\n", encoding="utf-8")
     try:
         located = _locate_stdlib_module_source(probe_name)
         assert located is not None, "probe should resolve"
@@ -112,13 +207,13 @@ def test_pcc_stdlib_port_with_recursive_compile(tmp_path):
     probe = _STDLIB_DIR / f"{probe_name}.py"
     probe.write_text(
         "def hello() -> int:\n    return 42\n"
-    )
+    , encoding="utf-8")
     try:
         u = tmp_path / "u.py"
         u.write_text(
             f"import {probe_name}\n"
             f"def f() -> int:\n    return {probe_name}.hello()\n"
-        )
+        , encoding="utf-8")
         srcs, mods = _collect_multi_source_relative_closure(
             [str(u)], ["u"], recursive_stdlib=True,
         )

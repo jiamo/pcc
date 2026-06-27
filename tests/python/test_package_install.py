@@ -764,7 +764,7 @@ def test_pcc1_package_install_writes_manifest_without_host_python(tmp_path):
     project = _write_demo_project(tmp_path / "demo_pkg-0.1")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     env["PCC_PLATFORM_TAG"] = current_platform_tag()
     _write_demo_meson_build_overlay(project)
     proc = subprocess.run(

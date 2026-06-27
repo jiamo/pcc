@@ -138,6 +138,7 @@ GENERIC_MAPPING_LONG_EXCEPTION_SYMBOLS = [
     "PyExc_ReferenceError",
     "PyExc_BufferError",
     "PyExc_ImportError",
+    "PyExc_ModuleNotFoundError",
     "PyExc_ImportWarning",
     "PyExc_FloatingPointError",
     "PyExc_RecursionError",
@@ -300,6 +301,9 @@ GENERIC_CAPSULE_SYMBOLS = [
     "PyCapsule_CheckExact",
     "PyCapsule_SetContext",
     "PyCapsule_SetName",
+    "PyCapsule_SetPointer",
+    "PyCapsule_GetDestructor",
+    "PyCapsule_SetDestructor",
     "PyCapsule_Import",
 ]
 
@@ -398,6 +402,16 @@ def test_capi_header_manifest_tracks_headers_and_unknown_symbols():
         "pycapsule.h",
     ]
     assert manifest["unknown_symbols"] == ["Missing_Symbol"]
+
+
+def test_extension_abi_plan_require_capsule_includes_full_generic_surface():
+    plan = extension_abi_plan(provider="capsule", require_capsule=True)
+    assert plan["ok"] is True
+    for symbol in GENERIC_CAPSULE_SYMBOLS:
+        assert symbol in plan["required_symbols"]
+        assert symbol not in plan["missing_symbols"]
+    assert plan["unknown_symbols"] == []
+    assert plan["diagnostics"] == []
 
 
 def test_extension_abi_plan_reports_capsule_buffer_memoryview_and_version_gaps():
@@ -607,59 +621,674 @@ def test_extension_abi_plan_reports_capsule_buffer_memoryview_and_version_gaps()
     }
 
 
-def test_extension_abi_plan_keeps_numpy_capi_as_explicit_missing_bucket():
+def test_extension_abi_plan_tracks_numpy_capi_provider_subset():
     plan = extension_abi_plan(
         ["Py_Initialize"],
         provider="numpy-capi",
         require_numpy_capi=True,
     )
-    assert plan["ok"] is False
+    assert plan["ok"] is True
     assert "PyArray_API" in plan["required_symbols"]
-    assert "PyArray_API" in plan["missing_symbols"]
-    assert "PyArray_Type" in plan["missing_symbols"]
-    assert "PyArrayDescr_Type" in plan["missing_symbols"]
-    assert "PyArray_SimpleNew" in plan["missing_symbols"]
-    assert "PyArray_GETITEM" in plan["missing_symbols"]
-    assert "PyArray_SIZE" in plan["missing_symbols"]
-    assert "PyArray_Check" in plan["missing_symbols"]
-    assert "PyArray_DIM" in plan["missing_symbols"]
-    assert "PyUFunc_API" in plan["missing_symbols"]
-    assert "PyUFunc_FromFuncAndData" in plan["missing_symbols"]
+    for symbol in [
+        "PyArray_malloc",
+        "PyArray_free",
+        "PyArray_realloc",
+        "PyDimMem_NEW",
+        "PyDimMem_FREE",
+        "PyDimMem_RENEW",
+    ]:
+        assert symbol in plan["required_symbols"]
+    assert "PyArray_DescrCheck" in plan["required_symbols"]
+    assert "PyArray_DescrNewFromType" in plan["required_symbols"]
+    assert "PyArray_DescrNew" in plan["required_symbols"]
+    assert "PyArray_DescrNewByteorder" in plan["required_symbols"]
+    assert "PyArray_CanCastSafely" in plan["required_symbols"]
+    assert "PyArray_CanCastTo" in plan["required_symbols"]
+    assert "PyArray_Zero" in plan["required_symbols"]
+    assert "PyArray_One" in plan["required_symbols"]
+    assert "PyArray_TypeObjectFromType" in plan["required_symbols"]
+    assert "PyArray_ObjectType" in plan["required_symbols"]
+    assert "PyArray_DescrFromObject" in plan["required_symbols"]
+    assert "PyArray_Size" in plan["required_symbols"]
+    assert "PyArray_DescrFromScalar" in plan["required_symbols"]
+    assert "PyArray_DescrFromTypeObject" in plan["required_symbols"]
+    assert "PyArray_ScalarAsCtype" in plan["required_symbols"]
+    assert "PyArray_FromScalar" in plan["required_symbols"]
+    assert "PyArray_CastScalarToCtype" in plan["required_symbols"]
+    assert "PyArray_CastScalarDirect" in plan["required_symbols"]
+    assert "PyArray_Pack" in plan["required_symbols"]
+    assert "PyArray_CastToType" in plan["required_symbols"]
+    assert "PyArray_Cast" in plan["required_symbols"]
+    assert "PyArray_FillWithScalar" in plan["required_symbols"]
+    assert "PyArray_ToList" in plan["required_symbols"]
+    assert "PyArray_ToString" in plan["required_symbols"]
+    assert "PyArray_Byteswap" in plan["required_symbols"]
+    assert "PyArray_FromString" in plan["required_symbols"]
+    assert "PyArray_FromBuffer" in plan["required_symbols"]
+    assert "PyArray_CheckFromAny" in plan["required_symbols"]
+    assert "PyArray_FromArray" in plan["required_symbols"]
+    assert "PyArray_MultiplyList" in plan["required_symbols"]
+    assert "PyArray_MultiplyIntList" in plan["required_symbols"]
+    assert "PyArray_GetPtr" in plan["required_symbols"]
+    assert "PyArray_ElementStrides" in plan["required_symbols"]
+    assert "PyArray_ValidType" in plan["required_symbols"]
+    assert "PyArray_Item_INCREF" in plan["required_symbols"]
+    assert "PyArray_Item_XDECREF" in plan["required_symbols"]
+    assert "PyArray_NewCopy" in plan["required_symbols"]
+    assert "PyArray_INCREF" in plan["required_symbols"]
+    assert "PyArray_XDECREF" in plan["required_symbols"]
+    assert "PyArray_DTYPE" in plan["required_symbols"]
+    assert "PyDataType_TYPE" in plan["required_symbols"]
+    assert "PyTypeNum_ISFLOAT" in plan["required_symbols"]
+    assert "PyDataType_ISNUMBER" in plan["required_symbols"]
+    assert "PyArray_ISOBJECT" in plan["required_symbols"]
+    assert "PyArray_ISONESEGMENT" in plan["required_symbols"]
+    assert "PyArray_ISNBO" in plan["required_symbols"]
+    assert "PyDataType_ISBYTESWAPPED" in plan["required_symbols"]
+    assert "PyArray_SAFEALIGNEDCOPY" in plan["required_symbols"]
+    assert "PyArray_FROMANY" in plan["required_symbols"]
+    assert "PyArray_FROM_OF" in plan["required_symbols"]
+    assert "PyArray_FromObject" in plan["required_symbols"]
+    assert "PyArray_CopyFromObject" in plan["required_symbols"]
+    assert "PyArray_TYPE" in plan["required_symbols"]
+    assert "PyArray_NBYTES" in plan["required_symbols"]
+    assert "PyArray_FILLWBYTE" in plan["required_symbols"]
+    assert "PyArray_EquivByteorders" in plan["required_symbols"]
+    assert "PyArray_SHAPE" in plan["required_symbols"]
+    assert "PyArray_FLAGS" in plan["required_symbols"]
+    assert "PyArray_CompareLists" in plan["required_symbols"]
+    assert "PyArray_Empty" in plan["required_symbols"]
+    assert "PyArray_Zeros" in plan["required_symbols"]
+    assert "PyArray_EMPTY" in plan["required_symbols"]
+    assert "PyArray_ZEROS" in plan["required_symbols"]
+    assert "PyArray_EquivTypes" in plan["required_symbols"]
+    assert "PyArray_EquivArrTypes" in plan["required_symbols"]
+    assert "PyArray_NewFromDescr" in plan["required_symbols"]
+    assert "PyArray_SimpleNewFromDescr" in plan["required_symbols"]
+    assert "PyArray_BASE" in plan["required_symbols"]
+    assert "PyArray_SetBaseObject" in plan["required_symbols"]
+    assert "PyArray_Return" in plan["required_symbols"]
+    assert "PyArray_ENABLEFLAGS" in plan["required_symbols"]
+    assert "PyArray_CLEARFLAGS" in plan["required_symbols"]
+    assert "PyArray_UpdateFlags" in plan["required_symbols"]
+    assert "PyArray_CopyInto" in plan["required_symbols"]
+    assert "PyArray_CopyAnyInto" in plan["required_symbols"]
+    assert "PyArray_ToScalar" in plan["required_symbols"]
+    assert "PyArray_Copy" in plan["required_symbols"]
+    assert "PyArray_EnsureArray" in plan["required_symbols"]
+    assert "PyArray_EnsureAnyArray" in plan["required_symbols"]
+    assert "PyArray_SAMESHAPE" in plan["required_symbols"]
+    assert "PyArray_ISCONTIGUOUS" in plan["required_symbols"]
+    assert "PyArray_STRIDE" in plan["required_symbols"]
+    assert "PyArray_GETPTR2" in plan["required_symbols"]
+    assert "PyArray_API" not in plan["missing_symbols"]
+    for symbol in [
+        "PyArray_malloc",
+        "PyArray_free",
+        "PyArray_realloc",
+        "PyDimMem_NEW",
+        "PyDimMem_FREE",
+        "PyDimMem_RENEW",
+    ]:
+        assert symbol not in plan["missing_symbols"]
+    assert "PyArray_Type" not in plan["missing_symbols"]
+    assert "PyArrayDescr_Type" not in plan["missing_symbols"]
+    assert "PyArray_DescrCheck" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromType" not in plan["missing_symbols"]
+    assert "PyArray_DescrNewFromType" not in plan["missing_symbols"]
+    assert "PyArray_DescrNew" not in plan["missing_symbols"]
+    assert "PyArray_DescrNewByteorder" not in plan["missing_symbols"]
+    assert "PyArray_CanCastSafely" not in plan["missing_symbols"]
+    assert "PyArray_CanCastTo" not in plan["missing_symbols"]
+    assert "PyArray_Zero" not in plan["missing_symbols"]
+    assert "PyArray_One" not in plan["missing_symbols"]
+    assert "PyArray_TypeObjectFromType" not in plan["missing_symbols"]
+    assert "PyArray_ObjectType" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromObject" not in plan["missing_symbols"]
+    assert "PyArray_Size" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromScalar" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromTypeObject" not in plan["missing_symbols"]
+    assert "PyArray_ScalarAsCtype" not in plan["missing_symbols"]
+    assert "PyArray_FromScalar" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarToCtype" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarDirect" not in plan["missing_symbols"]
+    assert "PyArray_Pack" not in plan["missing_symbols"]
+    assert "PyArray_CastToType" not in plan["missing_symbols"]
+    assert "PyArray_Cast" not in plan["missing_symbols"]
+    assert "PyArray_FillWithScalar" not in plan["missing_symbols"]
+    assert "PyArray_ToList" not in plan["missing_symbols"]
+    assert "PyArray_ToString" not in plan["missing_symbols"]
+    assert "PyArray_Byteswap" not in plan["missing_symbols"]
+    assert "PyArray_FromString" not in plan["missing_symbols"]
+    assert "PyArray_FromBuffer" not in plan["missing_symbols"]
+    assert "PyArray_CheckFromAny" not in plan["missing_symbols"]
+    assert "PyArray_FromArray" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyList" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyIntList" not in plan["missing_symbols"]
+    assert "PyArray_GetPtr" not in plan["missing_symbols"]
+    assert "PyArray_ElementStrides" not in plan["missing_symbols"]
+    assert "PyArray_ValidType" not in plan["missing_symbols"]
+    assert "PyArray_Item_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_Item_XDECREF" not in plan["missing_symbols"]
+    assert "PyArray_NewCopy" not in plan["missing_symbols"]
+    assert "PyArray_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_XDECREF" not in plan["missing_symbols"]
+    assert "PyArray_FromAny" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNew" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNewFromData" not in plan["missing_symbols"]
+    assert "PyArray_GETITEM" not in plan["missing_symbols"]
+    assert "PyArray_SETITEM" not in plan["missing_symbols"]
+    assert "PyArray_NDIM" not in plan["missing_symbols"]
+    assert "PyArray_DIMS" not in plan["missing_symbols"]
+    assert "PyArray_STRIDES" not in plan["missing_symbols"]
+    assert "PyArray_DATA" not in plan["missing_symbols"]
+    assert "PyArray_DESCR" not in plan["missing_symbols"]
+    assert "PyArray_SIZE" not in plan["missing_symbols"]
+    assert "PyArray_ITEMSIZE" not in plan["missing_symbols"]
+    assert "PyArray_DIM" not in plan["missing_symbols"]
+    assert "PyArray_BYTES" not in plan["missing_symbols"]
+    assert "PyArray_Check" not in plan["missing_symbols"]
+    assert "PyArray_CheckExact" not in plan["missing_symbols"]
+    assert "PyArray_DTYPE" not in plan["missing_symbols"]
+    assert "PyDataType_TYPE" not in plan["missing_symbols"]
+    assert "PyTypeNum_ISFLOAT" not in plan["missing_symbols"]
+    assert "PyDataType_ISNUMBER" not in plan["missing_symbols"]
+    assert "PyArray_ISOBJECT" not in plan["missing_symbols"]
+    assert "PyArray_ISONESEGMENT" not in plan["missing_symbols"]
+    assert "PyArray_ISNBO" not in plan["missing_symbols"]
+    assert "PyDataType_ISBYTESWAPPED" not in plan["missing_symbols"]
+    assert "PyArray_SAFEALIGNEDCOPY" not in plan["missing_symbols"]
+    assert "PyArray_FROMANY" not in plan["missing_symbols"]
+    assert "PyArray_FROM_OF" not in plan["missing_symbols"]
+    assert "PyArray_FromObject" not in plan["missing_symbols"]
+    assert "PyArray_CopyFromObject" not in plan["missing_symbols"]
+    assert "PyArray_TYPE" not in plan["missing_symbols"]
+    assert "PyArray_NBYTES" not in plan["missing_symbols"]
+    assert "PyArray_FILLWBYTE" not in plan["missing_symbols"]
+    assert "PyArray_EquivByteorders" not in plan["missing_symbols"]
+    assert "PyArray_SHAPE" not in plan["missing_symbols"]
+    assert "PyArray_FLAGS" not in plan["missing_symbols"]
+    assert "PyArray_CompareLists" not in plan["missing_symbols"]
+    assert "PyArray_Empty" not in plan["missing_symbols"]
+    assert "PyArray_Zeros" not in plan["missing_symbols"]
+    assert "PyArray_EMPTY" not in plan["missing_symbols"]
+    assert "PyArray_ZEROS" not in plan["missing_symbols"]
+    assert "PyArray_EquivTypes" not in plan["missing_symbols"]
+    assert "PyArray_EquivArrTypes" not in plan["missing_symbols"]
+    assert "PyArray_NewFromDescr" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNewFromDescr" not in plan["missing_symbols"]
+    assert "PyArray_BASE" not in plan["missing_symbols"]
+    assert "PyArray_SetBaseObject" not in plan["missing_symbols"]
+    assert "PyArray_Return" not in plan["missing_symbols"]
+    assert "PyArray_ENABLEFLAGS" not in plan["missing_symbols"]
+    assert "PyArray_CLEARFLAGS" not in plan["missing_symbols"]
+    assert "PyArray_UpdateFlags" not in plan["missing_symbols"]
+    assert "PyArray_CopyInto" not in plan["missing_symbols"]
+    assert "PyArray_CopyAnyInto" not in plan["missing_symbols"]
+    assert "PyArray_ToScalar" not in plan["missing_symbols"]
+    assert "PyArray_Copy" not in plan["missing_symbols"]
+    assert "PyArray_EnsureArray" not in plan["missing_symbols"]
+    assert "PyArray_EnsureAnyArray" not in plan["missing_symbols"]
+    assert "PyArray_SAMESHAPE" not in plan["missing_symbols"]
+    assert "PyArray_ISCONTIGUOUS" not in plan["missing_symbols"]
+    assert "PyArray_STRIDE" not in plan["missing_symbols"]
+    assert "PyArray_GETPTR2" not in plan["missing_symbols"]
+    assert "PyUFunc_API" not in plan["missing_symbols"]
+    assert "PyUFunc_FromFuncAndData" not in plan["missing_symbols"]
     assert plan["unknown_symbols"] == []
     assert "numpy/arrayobject.h" in plan["header_manifest"]["headers"]
     assert "numpy/ufuncobject.h" in plan["header_manifest"]["headers"]
-    assert {diag["code"] for diag in plan["diagnostics"]} == {
-        "PCC-EXT-MISSING-NUMPY-CAPI-SYMBOL",
-    }
-    numpy_diags = {
-        diag["symbol"]: diag
-        for diag in plan["diagnostics"]
-        if diag["code"] == "PCC-EXT-MISSING-NUMPY-CAPI-SYMBOL"
-    }
-    assert numpy_diags["PyArray_API"]["capability"] == "numpy_capi"
-    assert numpy_diags["PyArray_API"]["provider_shape"] == "array_api"
-    assert numpy_diags["PyArray_API"]["failure_mode"] == "missing_capsule_provider"
-    assert numpy_diags["PyArray_API"]["table"] == "_ARRAY_API"
-    assert numpy_diags["PyArray_API"]["slot"] is None
-    assert numpy_diags["PyArray_NDIM"]["slot"] == 6
-    assert numpy_diags["PyArray_NDIM"]["failure_mode"] == "unsupported_stub"
-    assert numpy_diags["PyArray_SIZE"]["slot"] == 13
-    assert numpy_diags["PyArray_ITEMSIZE"]["slot"] == 14
-    assert numpy_diags["PyArray_Check"]["slot"] == 15
-    assert numpy_diags["PyArray_CheckExact"]["slot"] == 16
-    assert numpy_diags["PyArray_DIM"]["slot"] == 7
-    assert numpy_diags["PyArray_BYTES"]["slot"] == 9
-    assert numpy_diags["PyUFunc_API"]["provider_shape"] == "ufunc_api"
-    assert numpy_diags["PyUFunc_FromFuncAndData"]["table"] == "_UFUNC_API"
-    assert numpy_diags["PyUFunc_FromFuncAndData"]["slot"] == 0
+    assert plan["diagnostics"] == []
     status = {row["symbol"]: row for row in plan["numpy_capi_status"]}
+    assert status["PyArray_API"]["implemented"] is True
+    assert status["PyArray_API"]["provider_shape"] == "array_api"
+    assert status["PyArray_API"]["table"] == "_ARRAY_API"
+    assert status["PyArray_API"]["slot"] is None
+    assert status["PyArray_API"]["failure_mode"] == "implemented_provider_table"
+    assert status["PyUFunc_API"]["implemented"] is True
+    assert status["PyUFunc_API"]["provider_shape"] == "ufunc_api"
+    assert status["PyUFunc_API"]["table"] == "_UFUNC_API"
+    assert status["PyUFunc_API"]["slot"] is None
+    assert status["PyUFunc_API"]["failure_mode"] == "implemented_provider_table"
+    assert status["PyArray_Type"]["implemented"] is True
     assert status["PyArray_Type"]["slot"] == 0
+    assert status["PyArray_Type"]["failure_mode"] == "implemented_provider_type_object"
+    assert status["PyArrayDescr_Type"]["implemented"] is True
     assert status["PyArrayDescr_Type"]["slot"] == 1
+    assert (
+        status["PyArrayDescr_Type"]["failure_mode"]
+        == "implemented_provider_type_object"
+    )
+    assert status["PyArray_DescrCheck"]["implemented"] is True
+    assert status["PyArray_DescrCheck"]["slot"] is None
+    assert status["PyArray_DescrCheck"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_DescrFromType"]["implemented"] is True
+    assert status["PyArray_DescrFromType"]["slot"] == 2
+    assert (
+        status["PyArray_DescrFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrNewFromType"]["implemented"] is True
+    assert status["PyArray_DescrNewFromType"]["slot"] == 35
+    assert (
+        status["PyArray_DescrNewFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrNew"]["implemented"] is True
+    assert status["PyArray_DescrNew"]["slot"] == 36
+    assert (
+        status["PyArray_DescrNew"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrNewByteorder"]["implemented"] is True
+    assert status["PyArray_DescrNewByteorder"]["slot"] == 37
+    assert (
+        status["PyArray_DescrNewByteorder"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CanCastSafely"]["implemented"] is True
+    assert status["PyArray_CanCastSafely"]["slot"] == 38
+    assert (
+        status["PyArray_CanCastSafely"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CanCastTo"]["implemented"] is True
+    assert status["PyArray_CanCastTo"]["slot"] == 52
+    assert (
+        status["PyArray_CanCastTo"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Zero"]["implemented"] is True
+    assert status["PyArray_Zero"]["slot"] == 53
+    assert (
+        status["PyArray_Zero"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_One"]["implemented"] is True
+    assert status["PyArray_One"]["slot"] == 54
+    assert (
+        status["PyArray_One"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_TypeObjectFromType"]["implemented"] is True
+    assert status["PyArray_TypeObjectFromType"]["slot"] == 55
+    assert (
+        status["PyArray_TypeObjectFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ObjectType"]["implemented"] is True
+    assert status["PyArray_ObjectType"]["slot"] == 39
+    assert (
+        status["PyArray_ObjectType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromObject"]["implemented"] is True
+    assert status["PyArray_DescrFromObject"]["slot"] == 56
+    assert (
+        status["PyArray_DescrFromObject"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Size"]["implemented"] is True
+    assert status["PyArray_Size"]["slot"] == 57
+    assert (
+        status["PyArray_Size"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromScalar"]["implemented"] is True
+    assert status["PyArray_DescrFromScalar"]["slot"] == 58
+    assert (
+        status["PyArray_DescrFromScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromTypeObject"]["implemented"] is True
+    assert status["PyArray_DescrFromTypeObject"]["slot"] == 59
+    assert (
+        status["PyArray_DescrFromTypeObject"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ScalarAsCtype"]["implemented"] is True
+    assert status["PyArray_ScalarAsCtype"]["slot"] == 60
+    assert (
+        status["PyArray_ScalarAsCtype"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromScalar"]["implemented"] is True
+    assert status["PyArray_FromScalar"]["slot"] == 61
+    assert (
+        status["PyArray_FromScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastScalarToCtype"]["implemented"] is True
+    assert status["PyArray_CastScalarToCtype"]["slot"] == 62
+    assert (
+        status["PyArray_CastScalarToCtype"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastScalarDirect"]["implemented"] is True
+    assert status["PyArray_CastScalarDirect"]["slot"] == 64
+    assert (
+        status["PyArray_CastScalarDirect"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Pack"]["implemented"] is True
+    assert status["PyArray_Pack"]["slot"] == 63
+    assert (
+        status["PyArray_Pack"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastToType"]["implemented"] is True
+    assert status["PyArray_CastToType"]["slot"] == 65
+    assert (
+        status["PyArray_CastToType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Cast"]["implemented"] is True
+    assert status["PyArray_Cast"]["slot"] is None
+    assert status["PyArray_Cast"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FillWithScalar"]["implemented"] is True
+    assert status["PyArray_FillWithScalar"]["slot"] == 66
+    assert (
+        status["PyArray_FillWithScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ToList"]["implemented"] is True
+    assert status["PyArray_ToList"]["slot"] == 67
+    assert (
+        status["PyArray_ToList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ToString"]["implemented"] is True
+    assert status["PyArray_ToString"]["slot"] == 68
+    assert (
+        status["PyArray_ToString"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Byteswap"]["implemented"] is True
+    assert status["PyArray_Byteswap"]["slot"] == 69
+    assert (
+        status["PyArray_Byteswap"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromString"]["implemented"] is True
+    assert status["PyArray_FromString"]["slot"] == 70
+    assert (
+        status["PyArray_FromString"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromBuffer"]["implemented"] is True
+    assert status["PyArray_FromBuffer"]["slot"] == 71
+    assert (
+        status["PyArray_FromBuffer"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromAny"]["implemented"] is True
+    assert status["PyArray_FromAny"]["slot"] == 3
+    assert status["PyArray_FromAny"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CheckFromAny"]["implemented"] is True
+    assert status["PyArray_CheckFromAny"]["slot"] == 40
+    assert (
+        status["PyArray_CheckFromAny"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromArray"]["implemented"] is True
+    assert status["PyArray_FromArray"]["slot"] == 41
+    assert (
+        status["PyArray_FromArray"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_MultiplyList"]["implemented"] is True
+    assert status["PyArray_MultiplyList"]["slot"] == 42
+    assert (
+        status["PyArray_MultiplyList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_MultiplyIntList"]["implemented"] is True
+    assert status["PyArray_MultiplyIntList"]["slot"] == 43
+    assert (
+        status["PyArray_MultiplyIntList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_GetPtr"]["implemented"] is True
+    assert status["PyArray_GetPtr"]["slot"] == 44
+    assert status["PyArray_GetPtr"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ElementStrides"]["implemented"] is True
+    assert status["PyArray_ElementStrides"]["slot"] == 45
+    assert (
+        status["PyArray_ElementStrides"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ValidType"]["implemented"] is True
+    assert status["PyArray_ValidType"]["slot"] == 46
+    assert (
+        status["PyArray_ValidType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Item_INCREF"]["implemented"] is True
+    assert status["PyArray_Item_INCREF"]["slot"] == 47
+    assert (
+        status["PyArray_Item_INCREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Item_XDECREF"]["implemented"] is True
+    assert status["PyArray_Item_XDECREF"]["slot"] == 48
+    assert (
+        status["PyArray_Item_XDECREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_NewCopy"]["implemented"] is True
+    assert status["PyArray_NewCopy"]["slot"] == 49
+    assert (
+        status["PyArray_NewCopy"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_INCREF"]["implemented"] is True
+    assert status["PyArray_INCREF"]["slot"] == 50
+    assert (
+        status["PyArray_INCREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_XDECREF"]["implemented"] is True
+    assert status["PyArray_XDECREF"]["slot"] == 51
+    assert (
+        status["PyArray_XDECREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_SimpleNew"]["implemented"] is True
+    assert status["PyArray_SimpleNew"]["slot"] == 4
+    assert status["PyArray_SimpleNew"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SimpleNewFromData"]["implemented"] is True
+    assert status["PyArray_SimpleNewFromData"]["slot"] == 5
+    assert (
+        status["PyArray_SimpleNewFromData"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_NDIM"]["implemented"] is True
+    assert status["PyArray_NDIM"]["slot"] == 6
+    assert status["PyArray_NDIM"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DIMS"]["implemented"] is True
+    assert status["PyArray_DIMS"]["slot"] == 7
+    assert status["PyArray_DIMS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_STRIDES"]["implemented"] is True
+    assert status["PyArray_STRIDES"]["slot"] == 8
+    assert status["PyArray_STRIDES"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DATA"]["implemented"] is True
+    assert status["PyArray_DATA"]["slot"] == 9
+    assert status["PyArray_DATA"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DESCR"]["implemented"] is True
+    assert status["PyArray_DESCR"]["slot"] == 10
+    assert status["PyArray_DESCR"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DIM"]["implemented"] is True
+    assert status["PyArray_DIM"]["slot"] == 7
+    assert status["PyArray_DIM"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_BYTES"]["implemented"] is True
+    assert status["PyArray_BYTES"]["slot"] == 9
+    assert status["PyArray_BYTES"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_SIZE"]["implemented"] is True
     assert status["PyArray_SIZE"]["slot"] == 13
-    assert status["PyArray_GETITEM"]["failure_mode"] == "unsupported_stub"
+    assert status["PyArray_SIZE"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ITEMSIZE"]["implemented"] is True
+    assert status["PyArray_ITEMSIZE"]["slot"] == 14
+    assert status["PyArray_ITEMSIZE"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_GETITEM"]["implemented"] is True
+    assert status["PyArray_GETITEM"]["slot"] == 11
+    assert status["PyArray_GETITEM"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SETITEM"]["implemented"] is True
+    assert status["PyArray_SETITEM"]["slot"] == 12
+    assert status["PyArray_SETITEM"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Check"]["implemented"] is True
+    assert status["PyArray_Check"]["slot"] == 15
+    assert status["PyArray_Check"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CheckExact"]["implemented"] is True
+    assert status["PyArray_CheckExact"]["slot"] == 16
+    assert status["PyArray_CheckExact"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DTYPE"]["implemented"] is True
+    assert status["PyArray_DTYPE"]["slot"] is None
+    assert status["PyArray_DTYPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyDataType_TYPE"]["implemented"] is True
+    assert status["PyDataType_TYPE"]["slot"] is None
+    assert status["PyDataType_TYPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyTypeNum_ISFLOAT"]["implemented"] is True
+    assert status["PyTypeNum_ISFLOAT"]["slot"] is None
+    assert status["PyTypeNum_ISFLOAT"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyDataType_ISNUMBER"]["implemented"] is True
+    assert status["PyDataType_ISNUMBER"]["slot"] is None
+    assert status["PyDataType_ISNUMBER"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISOBJECT"]["implemented"] is True
+    assert status["PyArray_ISOBJECT"]["slot"] is None
+    assert status["PyArray_ISOBJECT"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISONESEGMENT"]["implemented"] is True
+    assert status["PyArray_ISONESEGMENT"]["slot"] is None
+    assert status["PyArray_ISONESEGMENT"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISNBO"]["implemented"] is True
+    assert status["PyArray_ISNBO"]["slot"] is None
+    assert status["PyArray_ISNBO"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyDataType_ISBYTESWAPPED"]["implemented"] is True
+    assert status["PyDataType_ISBYTESWAPPED"]["slot"] is None
+    assert (
+        status["PyDataType_ISBYTESWAPPED"]["failure_mode"]
+        == "implemented_header_macro"
+    )
+    assert status["PyArray_SAFEALIGNEDCOPY"]["implemented"] is True
+    assert status["PyArray_SAFEALIGNEDCOPY"]["slot"] is None
+    assert status["PyArray_SAFEALIGNEDCOPY"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FROMANY"]["implemented"] is True
+    assert status["PyArray_FROMANY"]["slot"] is None
+    assert status["PyArray_FROMANY"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FROM_OF"]["implemented"] is True
+    assert status["PyArray_FROM_OF"]["slot"] is None
+    assert status["PyArray_FROM_OF"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FromObject"]["implemented"] is True
+    assert status["PyArray_FromObject"]["slot"] is None
+    assert status["PyArray_FromObject"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_CopyFromObject"]["implemented"] is True
+    assert status["PyArray_CopyFromObject"]["slot"] is None
+    assert status["PyArray_CopyFromObject"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_TYPE"]["implemented"] is True
+    assert status["PyArray_NBYTES"]["implemented"] is True
+    assert status["PyArray_FILLWBYTE"]["implemented"] is True
+    assert status["PyArray_FILLWBYTE"]["slot"] is None
+    assert status["PyArray_FILLWBYTE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_EquivByteorders"]["implemented"] is True
+    assert status["PyArray_EquivByteorders"]["slot"] is None
+    assert (
+        status["PyArray_EquivByteorders"]["failure_mode"]
+        == "implemented_header_macro"
+    )
+    assert status["PyArray_SHAPE"]["implemented"] is True
+    assert status["PyArray_SHAPE"]["slot"] is None
+    assert status["PyArray_SHAPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FLAGS"]["implemented"] is True
+    assert status["PyArray_FLAGS"]["slot"] == 17
+    assert status["PyArray_FLAGS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Check"]["implemented"] is True
+    assert status["PyArray_Check"]["slot"] == 15
+    assert status["PyArray_Check"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CheckExact"]["implemented"] is True
+    assert status["PyArray_CheckExact"]["slot"] == 16
+    assert status["PyArray_CheckExact"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CompareLists"]["implemented"] is True
+    assert status["PyArray_CompareLists"]["slot"] == 18
+    assert status["PyArray_CompareLists"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Empty"]["implemented"] is True
+    assert status["PyArray_Empty"]["slot"] == 19
+    assert status["PyArray_Empty"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Zeros"]["implemented"] is True
+    assert status["PyArray_Zeros"]["slot"] == 20
+    assert status["PyArray_Zeros"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EMPTY"]["implemented"] is True
+    assert status["PyArray_EMPTY"]["slot"] is None
+    assert status["PyArray_EMPTY"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ZEROS"]["implemented"] is True
+    assert status["PyArray_ZEROS"]["slot"] is None
+    assert status["PyArray_ZEROS"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_EquivTypes"]["implemented"] is True
+    assert status["PyArray_EquivTypes"]["slot"] == 21
+    assert status["PyArray_EquivTypes"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EquivArrTypes"]["implemented"] is True
+    assert status["PyArray_EquivArrTypes"]["slot"] is None
+    assert status["PyArray_EquivArrTypes"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_NewFromDescr"]["implemented"] is True
+    assert status["PyArray_NewFromDescr"]["slot"] == 22
+    assert status["PyArray_NewFromDescr"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SimpleNewFromDescr"]["implemented"] is True
+    assert status["PyArray_SimpleNewFromDescr"]["slot"] is None
+    assert (
+        status["PyArray_SimpleNewFromDescr"]["failure_mode"]
+        == "implemented_header_macro"
+    )
+    assert status["PyArray_BASE"]["implemented"] is True
+    assert status["PyArray_BASE"]["slot"] == 23
+    assert status["PyArray_BASE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_SetBaseObject"]["implemented"] is True
+    assert status["PyArray_SetBaseObject"]["slot"] == 24
+    assert status["PyArray_SetBaseObject"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Return"]["implemented"] is True
+    assert status["PyArray_Return"]["slot"] == 25
+    assert status["PyArray_Return"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ENABLEFLAGS"]["implemented"] is True
+    assert status["PyArray_ENABLEFLAGS"]["slot"] == 26
+    assert status["PyArray_ENABLEFLAGS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CLEARFLAGS"]["implemented"] is True
+    assert status["PyArray_CLEARFLAGS"]["slot"] == 27
+    assert status["PyArray_CLEARFLAGS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_UpdateFlags"]["implemented"] is True
+    assert status["PyArray_UpdateFlags"]["slot"] == 28
+    assert status["PyArray_UpdateFlags"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CopyInto"]["implemented"] is True
+    assert status["PyArray_CopyInto"]["slot"] == 29
+    assert status["PyArray_CopyInto"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CopyAnyInto"]["implemented"] is True
+    assert status["PyArray_CopyAnyInto"]["slot"] == 30
+    assert status["PyArray_CopyAnyInto"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ToScalar"]["implemented"] is True
+    assert status["PyArray_ToScalar"]["slot"] == 31
+    assert status["PyArray_ToScalar"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Copy"]["implemented"] is True
+    assert status["PyArray_Copy"]["slot"] == 32
+    assert status["PyArray_Copy"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EnsureArray"]["implemented"] is True
+    assert status["PyArray_EnsureArray"]["slot"] == 33
+    assert status["PyArray_EnsureArray"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EnsureAnyArray"]["implemented"] is True
+    assert status["PyArray_EnsureAnyArray"]["slot"] == 34
+    assert (
+        status["PyArray_EnsureAnyArray"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_SAMESHAPE"]["implemented"] is True
+    assert status["PyArray_SAMESHAPE"]["slot"] is None
+    assert status["PyArray_SAMESHAPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISCONTIGUOUS"]["implemented"] is True
+    assert status["PyArray_ISCONTIGUOUS"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_STRIDE"]["implemented"] is True
+    assert status["PyArray_STRIDE"]["slot"] is None
+    assert status["PyArray_STRIDE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_GETPTR2"]["implemented"] is True
+    assert status["PyArray_GETPTR2"]["slot"] is None
+    assert status["PyArray_GETPTR2"]["failure_mode"] == "implemented_header_macro"
 
 
-def test_extension_abi_plan_sees_fake_numpy_headers_without_claiming_capi():
+def test_extension_abi_plan_sees_fake_numpy_headers_and_provider_subset():
     fake_include = Path("utils/fake_libc_include").resolve()
     assert (fake_include / "numpy/arrayobject.h").exists()
     assert (fake_include / "numpy/ufuncobject.h").exists()
@@ -669,9 +1298,9 @@ def test_extension_abi_plan_sees_fake_numpy_headers_without_claiming_capi():
         include_dir=str(fake_include),
         require_numpy_capi=True,
     )
-    assert plan["ok"] is False
-    assert "PyArray_API" in plan["missing_symbols"]
-    assert "PyUFunc_API" in plan["missing_symbols"]
+    assert plan["ok"] is True
+    assert "PyArray_API" not in plan["missing_symbols"]
+    assert "PyUFunc_API" not in plan["missing_symbols"]
     assert "numpy/arrayobject.h" in plan["header_manifest"]["provided_headers"]
     assert "numpy/ufuncobject.h" in plan["header_manifest"]["provided_headers"]
     assert "numpy/arrayobject.h" not in plan["header_manifest"]["missing_headers"]
@@ -759,35 +1388,597 @@ def test_pcc_package_ext_abi_cli_reports_numpy_capi_bucket():
         timeout=60,
         env=env,
     )
-    assert proc.returncode == 2
+    assert proc.returncode == 0
     plan = json.loads(proc.stdout)
     assert plan["provider"] == "numpy-capi"
-    assert "PyArray_API" in plan["missing_symbols"]
-    assert "PyArrayDescr_Type" in plan["missing_symbols"]
-    assert "PyArray_GETITEM" in plan["missing_symbols"]
-    assert "PyArray_SIZE" in plan["missing_symbols"]
-    assert "PyArray_CheckExact" in plan["missing_symbols"]
-    assert "PyUFunc_API" in plan["missing_symbols"]
-    assert "PyUFunc_FromFuncAndData" in plan["missing_symbols"]
+    assert "PyArray_API" not in plan["missing_symbols"]
+    assert "PyArray_Type" not in plan["missing_symbols"]
+    assert "PyArrayDescr_Type" not in plan["missing_symbols"]
+    assert "PyArray_DescrCheck" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromType" not in plan["missing_symbols"]
+    assert "PyArray_DescrNewFromType" not in plan["missing_symbols"]
+    assert "PyArray_DescrNew" not in plan["missing_symbols"]
+    assert "PyArray_DescrNewByteorder" not in plan["missing_symbols"]
+    assert "PyArray_CanCastSafely" not in plan["missing_symbols"]
+    assert "PyArray_CanCastTo" not in plan["missing_symbols"]
+    assert "PyArray_Zero" not in plan["missing_symbols"]
+    assert "PyArray_One" not in plan["missing_symbols"]
+    assert "PyArray_TypeObjectFromType" not in plan["missing_symbols"]
+    assert "PyArray_ObjectType" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromObject" not in plan["missing_symbols"]
+    assert "PyArray_Size" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromScalar" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromTypeObject" not in plan["missing_symbols"]
+    assert "PyArray_ScalarAsCtype" not in plan["missing_symbols"]
+    assert "PyArray_FromScalar" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarToCtype" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarDirect" not in plan["missing_symbols"]
+    assert "PyArray_Pack" not in plan["missing_symbols"]
+    assert "PyArray_CastToType" not in plan["missing_symbols"]
+    assert "PyArray_Cast" not in plan["missing_symbols"]
+    assert "PyArray_FillWithScalar" not in plan["missing_symbols"]
+    assert "PyArray_ToList" not in plan["missing_symbols"]
+    assert "PyArray_ToString" not in plan["missing_symbols"]
+    assert "PyArray_Byteswap" not in plan["missing_symbols"]
+    assert "PyArray_CheckFromAny" not in plan["missing_symbols"]
+    assert "PyArray_FromArray" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyList" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyIntList" not in plan["missing_symbols"]
+    assert "PyArray_GetPtr" not in plan["missing_symbols"]
+    assert "PyArray_ElementStrides" not in plan["missing_symbols"]
+    assert "PyArray_ValidType" not in plan["missing_symbols"]
+    assert "PyArray_Item_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_Item_XDECREF" not in plan["missing_symbols"]
+    assert "PyArray_NewCopy" not in plan["missing_symbols"]
+    assert "PyArray_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_XDECREF" not in plan["missing_symbols"]
+    assert "PyArray_FromAny" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNew" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNewFromData" not in plan["missing_symbols"]
+    assert "PyArray_GETITEM" not in plan["missing_symbols"]
+    assert "PyArray_SETITEM" not in plan["missing_symbols"]
+    assert "PyArray_NDIM" not in plan["missing_symbols"]
+    assert "PyArray_DIMS" not in plan["missing_symbols"]
+    assert "PyArray_STRIDES" not in plan["missing_symbols"]
+    assert "PyArray_DATA" not in plan["missing_symbols"]
+    assert "PyArray_DESCR" not in plan["missing_symbols"]
+    assert "PyArray_SIZE" not in plan["missing_symbols"]
+    assert "PyArray_ITEMSIZE" not in plan["missing_symbols"]
+    assert "PyArray_DIM" not in plan["missing_symbols"]
+    assert "PyArray_BYTES" not in plan["missing_symbols"]
+    assert "PyUFunc_API" not in plan["missing_symbols"]
+    assert "PyUFunc_FromFuncAndData" not in plan["missing_symbols"]
+    assert plan["diagnostics"] == []
+    assert "PyArray_DTYPE" in plan["required_symbols"]
+    assert "PyDataType_TYPE" in plan["required_symbols"]
+    assert "PyTypeNum_ISFLOAT" in plan["required_symbols"]
+    assert "PyDataType_ISNUMBER" in plan["required_symbols"]
+    assert "PyArray_ISOBJECT" in plan["required_symbols"]
+    assert "PyArray_ISONESEGMENT" in plan["required_symbols"]
+    assert "PyArray_ISNBO" in plan["required_symbols"]
+    assert "PyDataType_ISBYTESWAPPED" in plan["required_symbols"]
+    assert "PyArray_SAFEALIGNEDCOPY" in plan["required_symbols"]
+    assert "PyArray_FROMANY" in plan["required_symbols"]
+    assert "PyArray_FROM_OF" in plan["required_symbols"]
+    assert "PyArray_FromObject" in plan["required_symbols"]
+    assert "PyArray_CopyFromObject" in plan["required_symbols"]
+    assert "PyArray_TYPE" in plan["required_symbols"]
+    assert "PyArray_NBYTES" in plan["required_symbols"]
+    assert "PyArray_FILLWBYTE" in plan["required_symbols"]
+    assert "PyArray_EquivByteorders" in plan["required_symbols"]
+    assert "PyArray_SHAPE" in plan["required_symbols"]
+    assert "PyArray_FLAGS" in plan["required_symbols"]
+    assert "PyArray_CompareLists" in plan["required_symbols"]
+    assert "PyArray_Empty" in plan["required_symbols"]
+    assert "PyArray_Zeros" in plan["required_symbols"]
+    assert "PyArray_EMPTY" in plan["required_symbols"]
+    assert "PyArray_ZEROS" in plan["required_symbols"]
+    assert "PyArray_EquivTypes" in plan["required_symbols"]
+    assert "PyArray_EquivArrTypes" in plan["required_symbols"]
+    assert "PyArray_NewFromDescr" in plan["required_symbols"]
+    assert "PyArray_SimpleNewFromDescr" in plan["required_symbols"]
+    assert "PyArray_BASE" in plan["required_symbols"]
+    assert "PyArray_SetBaseObject" in plan["required_symbols"]
+    assert "PyArray_Return" in plan["required_symbols"]
+    assert "PyArray_ENABLEFLAGS" in plan["required_symbols"]
+    assert "PyArray_CLEARFLAGS" in plan["required_symbols"]
+    assert "PyArray_UpdateFlags" in plan["required_symbols"]
+    assert "PyArray_CopyInto" in plan["required_symbols"]
+    assert "PyArray_CopyAnyInto" in plan["required_symbols"]
+    assert "PyArray_ToScalar" in plan["required_symbols"]
+    assert "PyArray_Copy" in plan["required_symbols"]
+    assert "PyArray_EnsureArray" in plan["required_symbols"]
+    assert "PyArray_EnsureAnyArray" in plan["required_symbols"]
+    assert "PyArray_SAMESHAPE" in plan["required_symbols"]
+    assert "PyArray_ISCONTIGUOUS" in plan["required_symbols"]
+    assert "PyArray_STRIDE" in plan["required_symbols"]
+    assert "PyArray_GETPTR2" in plan["required_symbols"]
+    assert "PyArray_TYPE" not in plan["missing_symbols"]
+    assert "PyArray_NBYTES" not in plan["missing_symbols"]
+    assert "PyArray_FILLWBYTE" not in plan["missing_symbols"]
+    assert "PyArray_EquivByteorders" not in plan["missing_symbols"]
+    assert "PyArray_SHAPE" not in plan["missing_symbols"]
+    assert "PyArray_FLAGS" not in plan["missing_symbols"]
+    assert "PyArray_CompareLists" not in plan["missing_symbols"]
+    assert "PyArray_Empty" not in plan["missing_symbols"]
+    assert "PyArray_Zeros" not in plan["missing_symbols"]
+    assert "PyArray_EMPTY" not in plan["missing_symbols"]
+    assert "PyArray_ZEROS" not in plan["missing_symbols"]
+    assert "PyArray_EquivTypes" not in plan["missing_symbols"]
+    assert "PyArray_EquivArrTypes" not in plan["missing_symbols"]
+    assert "PyArray_NewFromDescr" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNewFromDescr" not in plan["missing_symbols"]
+    assert "PyArray_BASE" not in plan["missing_symbols"]
+    assert "PyArray_SetBaseObject" not in plan["missing_symbols"]
+    assert "PyArray_Return" not in plan["missing_symbols"]
+    assert "PyArray_ENABLEFLAGS" not in plan["missing_symbols"]
+    assert "PyArray_CLEARFLAGS" not in plan["missing_symbols"]
+    assert "PyArray_UpdateFlags" not in plan["missing_symbols"]
+    assert "PyArray_CopyInto" not in plan["missing_symbols"]
+    assert "PyArray_CopyAnyInto" not in plan["missing_symbols"]
+    assert "PyArray_ToScalar" not in plan["missing_symbols"]
+    assert "PyArray_Copy" not in plan["missing_symbols"]
+    assert "PyArray_EnsureArray" not in plan["missing_symbols"]
+    assert "PyArray_EnsureAnyArray" not in plan["missing_symbols"]
+    assert "PyArray_SAMESHAPE" not in plan["missing_symbols"]
+    assert "PyArray_ISCONTIGUOUS" not in plan["missing_symbols"]
+    assert "PyArray_ISONESEGMENT" not in plan["missing_symbols"]
+    assert "PyArray_ISNBO" not in plan["missing_symbols"]
+    assert "PyDataType_ISBYTESWAPPED" not in plan["missing_symbols"]
+    assert "PyArray_SAFEALIGNEDCOPY" not in plan["missing_symbols"]
+    assert "PyArray_FROMANY" not in plan["missing_symbols"]
+    assert "PyArray_FROM_OF" not in plan["missing_symbols"]
+    assert "PyArray_FromObject" not in plan["missing_symbols"]
+    assert "PyArray_CopyFromObject" not in plan["missing_symbols"]
+    assert "PyArray_Check" not in plan["missing_symbols"]
+    assert "PyArray_CheckExact" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromObject" not in plan["missing_symbols"]
+    assert "PyArray_Size" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromScalar" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromTypeObject" not in plan["missing_symbols"]
+    assert "PyArray_ScalarAsCtype" not in plan["missing_symbols"]
+    assert "PyArray_FromScalar" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarToCtype" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarDirect" not in plan["missing_symbols"]
+    assert "PyArray_Pack" not in plan["missing_symbols"]
+    assert "PyArray_CastToType" not in plan["missing_symbols"]
+    assert "PyArray_Cast" not in plan["missing_symbols"]
+    assert "PyArray_FillWithScalar" not in plan["missing_symbols"]
+    assert "PyArray_ToList" not in plan["missing_symbols"]
+    assert "PyArray_ToString" not in plan["missing_symbols"]
+    assert "PyArray_Byteswap" not in plan["missing_symbols"]
+    assert "PyArray_CheckFromAny" not in plan["missing_symbols"]
+    assert "PyArray_FromArray" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyList" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyIntList" not in plan["missing_symbols"]
+    assert "PyArray_GetPtr" not in plan["missing_symbols"]
+    assert "PyArray_ElementStrides" not in plan["missing_symbols"]
+    assert "PyArray_ValidType" not in plan["missing_symbols"]
+    assert "PyArray_Item_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_Item_XDECREF" not in plan["missing_symbols"]
+    assert "PyArray_NewCopy" not in plan["missing_symbols"]
+    assert "PyArray_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_XDECREF" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromType" not in plan["missing_symbols"]
+    assert "PyArray_FromAny" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNew" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNewFromData" not in plan["missing_symbols"]
+    assert "PyArray_GETITEM" not in plan["missing_symbols"]
+    assert "PyArray_SETITEM" not in plan["missing_symbols"]
+    assert "PyArray_NDIM" not in plan["missing_symbols"]
+    assert "PyArray_DIMS" not in plan["missing_symbols"]
+    assert "PyArray_STRIDES" not in plan["missing_symbols"]
+    assert "PyArray_DATA" not in plan["missing_symbols"]
+    assert "PyArray_DESCR" not in plan["missing_symbols"]
+    assert "PyArray_SIZE" not in plan["missing_symbols"]
+    assert "PyArray_ITEMSIZE" not in plan["missing_symbols"]
+    assert "PyArray_DIM" not in plan["missing_symbols"]
+    assert "PyArray_BYTES" not in plan["missing_symbols"]
+    assert "PyArray_STRIDE" not in plan["missing_symbols"]
+    assert "PyArray_GETPTR2" not in plan["missing_symbols"]
     assert plan["unknown_symbols"] == []
-    assert {diag["code"] for diag in plan["diagnostics"]} == {
-        "PCC-EXT-MISSING-NUMPY-CAPI-SYMBOL"
-    }
-    numpy_diags = {
-        diag["symbol"]: diag
-        for diag in plan["diagnostics"]
-        if diag["code"] == "PCC-EXT-MISSING-NUMPY-CAPI-SYMBOL"
-    }
-    assert numpy_diags["PyArray_API"]["provider_shape"] == "array_api"
-    assert numpy_diags["PyArray_NDIM"]["slot"] == 6
-    assert numpy_diags["PyArray_SIZE"]["slot"] == 13
-    assert numpy_diags["PyArray_Check"]["slot"] == 15
-    assert numpy_diags["PyArray_NDIM"]["failure_mode"] == "unsupported_stub"
-    assert numpy_diags["PyUFunc_API"]["provider_shape"] == "ufunc_api"
+    assert plan["diagnostics"] == []
+    assert plan["numpy_capi_status"]
     status = {row["symbol"]: row for row in plan["numpy_capi_status"]}
     assert status["PyArray_DATA"]["table"] == "_ARRAY_API"
+    assert status["PyArray_DescrCheck"]["implemented"] is True
+    assert status["PyArray_DescrCheck"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_DescrNewFromType"]["implemented"] is True
+    assert (
+        status["PyArray_DescrNewFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrNew"]["implemented"] is True
+    assert (
+        status["PyArray_DescrNew"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrNewByteorder"]["implemented"] is True
+    assert (
+        status["PyArray_DescrNewByteorder"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CanCastSafely"]["implemented"] is True
+    assert (
+        status["PyArray_CanCastSafely"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CanCastTo"]["implemented"] is True
+    assert status["PyArray_CanCastTo"]["slot"] == 52
+    assert (
+        status["PyArray_CanCastTo"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Zero"]["implemented"] is True
+    assert status["PyArray_Zero"]["slot"] == 53
+    assert (
+        status["PyArray_Zero"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_One"]["implemented"] is True
+    assert status["PyArray_One"]["slot"] == 54
+    assert (
+        status["PyArray_One"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_TypeObjectFromType"]["implemented"] is True
+    assert status["PyArray_TypeObjectFromType"]["slot"] == 55
+    assert (
+        status["PyArray_TypeObjectFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ObjectType"]["implemented"] is True
+    assert (
+        status["PyArray_ObjectType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromObject"]["implemented"] is True
+    assert status["PyArray_DescrFromObject"]["slot"] == 56
+    assert (
+        status["PyArray_DescrFromObject"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Size"]["implemented"] is True
+    assert status["PyArray_Size"]["slot"] == 57
+    assert (
+        status["PyArray_Size"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromScalar"]["implemented"] is True
+    assert status["PyArray_DescrFromScalar"]["slot"] == 58
+    assert (
+        status["PyArray_DescrFromScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromTypeObject"]["implemented"] is True
+    assert status["PyArray_DescrFromTypeObject"]["slot"] == 59
+    assert (
+        status["PyArray_DescrFromTypeObject"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ScalarAsCtype"]["implemented"] is True
+    assert status["PyArray_ScalarAsCtype"]["slot"] == 60
+    assert (
+        status["PyArray_ScalarAsCtype"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromScalar"]["implemented"] is True
+    assert status["PyArray_FromScalar"]["slot"] == 61
+    assert (
+        status["PyArray_FromScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastScalarToCtype"]["implemented"] is True
+    assert status["PyArray_CastScalarToCtype"]["slot"] == 62
+    assert (
+        status["PyArray_CastScalarToCtype"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastScalarDirect"]["implemented"] is True
+    assert status["PyArray_CastScalarDirect"]["slot"] == 64
+    assert (
+        status["PyArray_CastScalarDirect"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Pack"]["implemented"] is True
+    assert status["PyArray_Pack"]["slot"] == 63
+    assert (
+        status["PyArray_Pack"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastToType"]["implemented"] is True
+    assert status["PyArray_CastToType"]["slot"] == 65
+    assert (
+        status["PyArray_CastToType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Cast"]["implemented"] is True
+    assert status["PyArray_Cast"]["slot"] is None
+    assert status["PyArray_Cast"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FillWithScalar"]["implemented"] is True
+    assert status["PyArray_FillWithScalar"]["slot"] == 66
+    assert (
+        status["PyArray_FillWithScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ToList"]["implemented"] is True
+    assert status["PyArray_ToList"]["slot"] == 67
+    assert (
+        status["PyArray_ToList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ToString"]["implemented"] is True
+    assert status["PyArray_ToString"]["slot"] == 68
+    assert (
+        status["PyArray_ToString"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Byteswap"]["implemented"] is True
+    assert status["PyArray_Byteswap"]["slot"] == 69
+    assert (
+        status["PyArray_Byteswap"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromType"]["implemented"] is True
+    assert status["PyArray_DescrFromType"]["slot"] == 2
+    assert (
+        status["PyArray_DescrFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromAny"]["implemented"] is True
+    assert status["PyArray_FromAny"]["slot"] == 3
+    assert status["PyArray_FromAny"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CheckFromAny"]["implemented"] is True
+    assert status["PyArray_CheckFromAny"]["slot"] == 40
+    assert (
+        status["PyArray_CheckFromAny"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromArray"]["implemented"] is True
+    assert status["PyArray_FromArray"]["slot"] == 41
+    assert (
+        status["PyArray_FromArray"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_MultiplyList"]["implemented"] is True
+    assert status["PyArray_MultiplyList"]["slot"] == 42
+    assert (
+        status["PyArray_MultiplyList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_MultiplyIntList"]["implemented"] is True
+    assert status["PyArray_MultiplyIntList"]["slot"] == 43
+    assert (
+        status["PyArray_MultiplyIntList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_GetPtr"]["implemented"] is True
+    assert status["PyArray_GetPtr"]["slot"] == 44
+    assert status["PyArray_GetPtr"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ElementStrides"]["implemented"] is True
+    assert status["PyArray_ElementStrides"]["slot"] == 45
+    assert (
+        status["PyArray_ElementStrides"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ValidType"]["implemented"] is True
+    assert status["PyArray_ValidType"]["slot"] == 46
+    assert (
+        status["PyArray_ValidType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Item_INCREF"]["implemented"] is True
+    assert status["PyArray_Item_INCREF"]["slot"] == 47
+    assert (
+        status["PyArray_Item_INCREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Item_XDECREF"]["implemented"] is True
+    assert status["PyArray_Item_XDECREF"]["slot"] == 48
+    assert (
+        status["PyArray_Item_XDECREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_NewCopy"]["implemented"] is True
+    assert status["PyArray_NewCopy"]["slot"] == 49
+    assert (
+        status["PyArray_NewCopy"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_INCREF"]["implemented"] is True
+    assert status["PyArray_INCREF"]["slot"] == 50
+    assert (
+        status["PyArray_INCREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_XDECREF"]["implemented"] is True
+    assert status["PyArray_XDECREF"]["slot"] == 51
+    assert (
+        status["PyArray_XDECREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_SimpleNew"]["implemented"] is True
+    assert status["PyArray_SimpleNew"]["slot"] == 4
+    assert status["PyArray_SimpleNew"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SimpleNewFromData"]["implemented"] is True
+    assert status["PyArray_SimpleNewFromData"]["slot"] == 5
+    assert (
+        status["PyArray_SimpleNewFromData"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_NDIM"]["implemented"] is True
+    assert status["PyArray_NDIM"]["slot"] == 6
+    assert status["PyArray_NDIM"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DIMS"]["implemented"] is True
+    assert status["PyArray_DIMS"]["slot"] == 7
+    assert status["PyArray_DIMS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_STRIDES"]["implemented"] is True
+    assert status["PyArray_STRIDES"]["slot"] == 8
+    assert status["PyArray_STRIDES"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DATA"]["implemented"] is True
+    assert status["PyArray_DATA"]["slot"] == 9
+    assert status["PyArray_DATA"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DESCR"]["implemented"] is True
+    assert status["PyArray_DESCR"]["slot"] == 10
+    assert status["PyArray_DESCR"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DIM"]["implemented"] is True
+    assert status["PyArray_DIM"]["slot"] == 7
+    assert status["PyArray_DIM"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_BYTES"]["implemented"] is True
     assert status["PyArray_BYTES"]["slot"] == 9
+    assert status["PyArray_BYTES"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_TYPE"]["implemented"] is True
+    assert status["PyArray_TYPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_NBYTES"]["implemented"] is True
+    assert status["PyArray_NBYTES"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FILLWBYTE"]["implemented"] is True
+    assert status["PyArray_FILLWBYTE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_EquivByteorders"]["implemented"] is True
+    assert status["PyArray_EquivByteorders"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_SHAPE"]["implemented"] is True
+    assert status["PyArray_SHAPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FLAGS"]["implemented"] is True
+    assert status["PyArray_FLAGS"]["slot"] == 17
+    assert status["PyArray_FLAGS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_GETITEM"]["implemented"] is True
+    assert status["PyArray_GETITEM"]["slot"] == 11
+    assert status["PyArray_GETITEM"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SETITEM"]["implemented"] is True
+    assert status["PyArray_SETITEM"]["slot"] == 12
+    assert status["PyArray_SETITEM"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SIZE"]["implemented"] is True
+    assert status["PyArray_SIZE"]["slot"] == 13
+    assert status["PyArray_SIZE"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ITEMSIZE"]["implemented"] is True
+    assert status["PyArray_ITEMSIZE"]["slot"] == 14
+    assert status["PyArray_ITEMSIZE"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CompareLists"]["implemented"] is True
+    assert status["PyArray_CompareLists"]["slot"] == 18
+    assert status["PyArray_CompareLists"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Empty"]["implemented"] is True
+    assert status["PyArray_Empty"]["slot"] == 19
+    assert status["PyArray_Empty"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Zeros"]["implemented"] is True
+    assert status["PyArray_Zeros"]["slot"] == 20
+    assert status["PyArray_Zeros"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EMPTY"]["implemented"] is True
+    assert status["PyArray_EMPTY"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ZEROS"]["implemented"] is True
+    assert status["PyArray_ZEROS"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_EquivTypes"]["implemented"] is True
+    assert status["PyArray_EquivTypes"]["slot"] == 21
+    assert status["PyArray_EquivTypes"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EquivArrTypes"]["implemented"] is True
+    assert status["PyArray_EquivArrTypes"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_NewFromDescr"]["implemented"] is True
+    assert status["PyArray_NewFromDescr"]["slot"] == 22
+    assert status["PyArray_NewFromDescr"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SimpleNewFromDescr"]["implemented"] is True
+    assert (
+        status["PyArray_SimpleNewFromDescr"]["failure_mode"]
+        == "implemented_header_macro"
+    )
+    assert status["PyArray_BASE"]["implemented"] is True
+    assert status["PyArray_BASE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_SetBaseObject"]["implemented"] is True
+    assert status["PyArray_SetBaseObject"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Return"]["implemented"] is True
+    assert status["PyArray_Return"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ENABLEFLAGS"]["implemented"] is True
+    assert status["PyArray_ENABLEFLAGS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CLEARFLAGS"]["implemented"] is True
+    assert status["PyArray_CLEARFLAGS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_UpdateFlags"]["implemented"] is True
+    assert status["PyArray_UpdateFlags"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CopyInto"]["implemented"] is True
+    assert status["PyArray_CopyInto"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CopyAnyInto"]["implemented"] is True
+    assert status["PyArray_CopyAnyInto"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ToScalar"]["implemented"] is True
+    assert status["PyArray_ToScalar"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Copy"]["implemented"] is True
+    assert status["PyArray_Copy"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EnsureArray"]["implemented"] is True
+    assert status["PyArray_EnsureArray"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EnsureAnyArray"]["implemented"] is True
+    assert (
+        status["PyArray_EnsureAnyArray"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_SAMESHAPE"]["implemented"] is True
+    assert status["PyArray_SAMESHAPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISCONTIGUOUS"]["implemented"] is True
+    assert status["PyArray_ISCONTIGUOUS"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISONESEGMENT"]["implemented"] is True
+    assert status["PyArray_ISONESEGMENT"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISNBO"]["implemented"] is True
+    assert status["PyArray_ISNBO"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyDataType_ISBYTESWAPPED"]["implemented"] is True
+    assert status["PyDataType_ISBYTESWAPPED"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_SAFEALIGNEDCOPY"]["implemented"] is True
+    assert status["PyArray_SAFEALIGNEDCOPY"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FROMANY"]["implemented"] is True
+    assert status["PyArray_FROMANY"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FROM_OF"]["implemented"] is True
+    assert status["PyArray_FROM_OF"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FromObject"]["implemented"] is True
+    assert status["PyArray_FromObject"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_CopyFromObject"]["implemented"] is True
+    assert status["PyArray_CopyFromObject"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_STRIDE"]["implemented"] is True
+    assert status["PyArray_STRIDE"]["slot"] is None
+    assert status["PyArray_STRIDE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_GETPTR2"]["implemented"] is True
+    assert status["PyArray_GETPTR2"]["slot"] is None
+    assert status["PyArray_GETPTR2"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyUFunc_FromFuncAndData"]["implemented"] is True
     assert status["PyUFunc_FromFuncAndData"]["slot"] == 0
+    assert (
+        status["PyUFunc_FromFuncAndData"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+
+
+def test_pcc1_ext_abi_no_host_matches_host_capability_flag_plan():
+    pcc1 = _find_current_pcc1()
+    if pcc1 is None:
+        skip_or_fail_no_current_pcc1("no current pcc1 binary with native ext-abi shim")
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    proc = subprocess.run(
+        [
+            str(pcc1),
+            "-m",
+            "pcc.package",
+            "ext-abi",
+            "--provider",
+            "combined",
+            "--require-capsule",
+            "--require-buffer",
+            "--require-memoryview",
+            "--require-numpy-capi",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    assert proc.returncode == 0
+    pcc1_plan = json.loads(proc.stdout)
+    host_plan = extension_abi_plan(
+        provider="combined",
+        require_capsule=True,
+        require_buffer=True,
+        require_memoryview=True,
+        require_numpy_capi=True,
+    )
+    assert pcc1_plan["provider"] == host_plan["provider"]
+    assert pcc1_plan["required_symbols"] == host_plan["required_symbols"]
+    assert pcc1_plan["missing_symbols"] == host_plan["missing_symbols"]
+    assert pcc1_plan["unknown_symbols"] == host_plan["unknown_symbols"]
+    assert pcc1_plan["numpy_capi_status"] == host_plan["numpy_capi_status"]
 
 
 def test_pcc_package_ext_abi_cli_reports_supplied_headers(tmp_path):
@@ -827,7 +2018,7 @@ def test_pcc1_ext_abi_does_not_need_host_python():
         skip_or_fail_no_current_pcc1("no current pcc1 binary with native ext-abi shim")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -1161,32 +2352,336 @@ def test_pcc1_ext_abi_does_not_need_host_python():
     assert "PyBuffer_Release" not in plan["missing_symbols"]
     for symbol in GENERIC_MEMORYVIEW_SYMBOLS:
         assert symbol not in plan["missing_symbols"]
-    assert "PyArray_API" in plan["missing_symbols"]
-    assert "PyArrayDescr_Type" in plan["missing_symbols"]
-    assert "PyArray_GETITEM" in plan["missing_symbols"]
-    assert "PyArray_SIZE" in plan["missing_symbols"]
-    assert "PyArray_Check" in plan["missing_symbols"]
-    assert "PyUFunc_API" in plan["missing_symbols"]
-    assert "PyUFunc_FromFuncAndData" in plan["missing_symbols"]
+    assert "PyArray_API" not in plan["missing_symbols"]
+    assert "PyArray_Type" not in plan["missing_symbols"]
+    assert "PyArrayDescr_Type" not in plan["missing_symbols"]
+    assert "PyArray_DescrCheck" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromType" not in plan["missing_symbols"]
+    assert "PyArray_DescrNewFromType" not in plan["missing_symbols"]
+    assert "PyArray_DescrNew" not in plan["missing_symbols"]
+    assert "PyArray_DescrNewByteorder" not in plan["missing_symbols"]
+    assert "PyArray_CanCastSafely" not in plan["missing_symbols"]
+    assert "PyArray_CanCastTo" not in plan["missing_symbols"]
+    assert "PyArray_Zero" not in plan["missing_symbols"]
+    assert "PyArray_One" not in plan["missing_symbols"]
+    assert "PyArray_TypeObjectFromType" not in plan["missing_symbols"]
+    assert "PyArray_ObjectType" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromObject" not in plan["missing_symbols"]
+    assert "PyArray_Size" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromScalar" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromTypeObject" not in plan["missing_symbols"]
+    assert "PyArray_ScalarAsCtype" not in plan["missing_symbols"]
+    assert "PyArray_FromScalar" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarToCtype" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarDirect" not in plan["missing_symbols"]
+    assert "PyArray_Pack" not in plan["missing_symbols"]
+    assert "PyArray_CastToType" not in plan["missing_symbols"]
+    assert "PyArray_Cast" not in plan["missing_symbols"]
+    assert "PyArray_FillWithScalar" not in plan["missing_symbols"]
+    assert "PyArray_ToList" not in plan["missing_symbols"]
+    assert "PyArray_ToString" not in plan["missing_symbols"]
+    assert "PyArray_Byteswap" not in plan["missing_symbols"]
+    assert "PyArray_FromAny" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNew" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNewFromData" not in plan["missing_symbols"]
+    assert "PyArray_GETITEM" not in plan["missing_symbols"]
+    assert "PyArray_SETITEM" not in plan["missing_symbols"]
+    assert "PyArray_NDIM" not in plan["missing_symbols"]
+    assert "PyArray_DIMS" not in plan["missing_symbols"]
+    assert "PyArray_STRIDES" not in plan["missing_symbols"]
+    assert "PyArray_DATA" not in plan["missing_symbols"]
+    assert "PyArray_DESCR" not in plan["missing_symbols"]
+    assert "PyArray_SIZE" not in plan["missing_symbols"]
+    assert "PyArray_ITEMSIZE" not in plan["missing_symbols"]
+    assert "PyArray_DIM" not in plan["missing_symbols"]
+    assert "PyArray_BYTES" not in plan["missing_symbols"]
+    assert "PyArray_Check" not in plan["missing_symbols"]
+    assert "PyArray_CheckExact" not in plan["missing_symbols"]
+    assert "PyArray_CheckFromAny" not in plan["missing_symbols"]
+    assert "PyArray_FromArray" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyList" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyIntList" not in plan["missing_symbols"]
+    assert "PyArray_GetPtr" not in plan["missing_symbols"]
+    assert "PyArray_ElementStrides" not in plan["missing_symbols"]
+    assert "PyArray_ValidType" not in plan["missing_symbols"]
+    assert "PyArray_Item_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_Item_XDECREF" not in plan["missing_symbols"]
+    assert "PyArray_NewCopy" not in plan["missing_symbols"]
+    assert "PyArray_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_XDECREF" not in plan["missing_symbols"]
+    assert "PyUFunc_API" not in plan["missing_symbols"]
+    assert "PyUFunc_FromFuncAndData" not in plan["missing_symbols"]
     assert plan["unknown_symbols"] == []
-    assert {diag["code"] for diag in plan["diagnostics"]} >= {
-        "PCC-EXT-MISSING-NUMPY-CAPI-SYMBOL",
+    assert "PCC-EXT-MISSING-NUMPY-CAPI-SYMBOL" not in {
+        diag["code"] for diag in plan["diagnostics"]
     }
-    numpy_diags = {
-        diag["symbol"]: diag
-        for diag in plan["diagnostics"]
-        if diag["code"] == "PCC-EXT-MISSING-NUMPY-CAPI-SYMBOL"
-    }
-    assert numpy_diags["PyArray_API"]["provider_shape"] == "array_api"
-    assert numpy_diags["PyArray_API"]["failure_mode"] == "missing_capsule_provider"
-    assert numpy_diags["PyArray_NDIM"]["slot"] == 6
-    assert numpy_diags["PyArray_SIZE"]["slot"] == 13
-    assert numpy_diags["PyArray_CheckExact"]["slot"] == 16
-    assert numpy_diags["PyUFunc_API"]["provider_shape"] == "ufunc_api"
     status = {row["symbol"]: row for row in plan["numpy_capi_status"]}
+    assert status["PyArray_DescrCheck"]["implemented"] is True
+    assert status["PyArray_DescrCheck"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_DescrNewFromType"]["implemented"] is True
+    assert (
+        status["PyArray_DescrNewFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrNew"]["implemented"] is True
+    assert (
+        status["PyArray_DescrNew"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrNewByteorder"]["implemented"] is True
+    assert (
+        status["PyArray_DescrNewByteorder"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CanCastSafely"]["implemented"] is True
+    assert (
+        status["PyArray_CanCastSafely"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CanCastTo"]["implemented"] is True
+    assert status["PyArray_CanCastTo"]["slot"] == 52
+    assert (
+        status["PyArray_CanCastTo"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Zero"]["implemented"] is True
+    assert status["PyArray_Zero"]["slot"] == 53
+    assert (
+        status["PyArray_Zero"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_One"]["implemented"] is True
+    assert status["PyArray_One"]["slot"] == 54
+    assert (
+        status["PyArray_One"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_TypeObjectFromType"]["implemented"] is True
+    assert status["PyArray_TypeObjectFromType"]["slot"] == 55
+    assert (
+        status["PyArray_TypeObjectFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ObjectType"]["implemented"] is True
+    assert (
+        status["PyArray_ObjectType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromObject"]["implemented"] is True
+    assert status["PyArray_DescrFromObject"]["slot"] == 56
+    assert (
+        status["PyArray_DescrFromObject"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Size"]["implemented"] is True
+    assert status["PyArray_Size"]["slot"] == 57
+    assert (
+        status["PyArray_Size"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromScalar"]["implemented"] is True
+    assert status["PyArray_DescrFromScalar"]["slot"] == 58
+    assert (
+        status["PyArray_DescrFromScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromTypeObject"]["implemented"] is True
+    assert status["PyArray_DescrFromTypeObject"]["slot"] == 59
+    assert (
+        status["PyArray_DescrFromTypeObject"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ScalarAsCtype"]["implemented"] is True
+    assert status["PyArray_ScalarAsCtype"]["slot"] == 60
+    assert (
+        status["PyArray_ScalarAsCtype"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromScalar"]["implemented"] is True
+    assert status["PyArray_FromScalar"]["slot"] == 61
+    assert (
+        status["PyArray_FromScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastScalarToCtype"]["implemented"] is True
+    assert status["PyArray_CastScalarToCtype"]["slot"] == 62
+    assert (
+        status["PyArray_CastScalarToCtype"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastScalarDirect"]["implemented"] is True
+    assert status["PyArray_CastScalarDirect"]["slot"] == 64
+    assert (
+        status["PyArray_CastScalarDirect"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Pack"]["implemented"] is True
+    assert status["PyArray_Pack"]["slot"] == 63
+    assert (
+        status["PyArray_Pack"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastToType"]["implemented"] is True
+    assert status["PyArray_CastToType"]["slot"] == 65
+    assert (
+        status["PyArray_CastToType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Cast"]["implemented"] is True
+    assert status["PyArray_Cast"]["slot"] is None
+    assert status["PyArray_Cast"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FillWithScalar"]["implemented"] is True
+    assert status["PyArray_FillWithScalar"]["slot"] == 66
+    assert (
+        status["PyArray_FillWithScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ToList"]["implemented"] is True
+    assert status["PyArray_ToList"]["slot"] == 67
+    assert (
+        status["PyArray_ToList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ToString"]["implemented"] is True
+    assert status["PyArray_ToString"]["slot"] == 68
+    assert (
+        status["PyArray_ToString"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Byteswap"]["implemented"] is True
+    assert status["PyArray_Byteswap"]["slot"] == 69
+    assert (
+        status["PyArray_Byteswap"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromType"]["implemented"] is True
+    assert status["PyArray_DescrFromType"]["slot"] == 2
+    assert (
+        status["PyArray_DescrFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromAny"]["implemented"] is True
+    assert status["PyArray_FromAny"]["slot"] == 3
+    assert status["PyArray_FromAny"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CheckFromAny"]["implemented"] is True
+    assert status["PyArray_CheckFromAny"]["slot"] == 40
+    assert (
+        status["PyArray_CheckFromAny"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromArray"]["implemented"] is True
+    assert status["PyArray_FromArray"]["slot"] == 41
+    assert (
+        status["PyArray_FromArray"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_MultiplyList"]["implemented"] is True
+    assert status["PyArray_MultiplyList"]["slot"] == 42
+    assert (
+        status["PyArray_MultiplyList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_MultiplyIntList"]["implemented"] is True
+    assert status["PyArray_MultiplyIntList"]["slot"] == 43
+    assert (
+        status["PyArray_MultiplyIntList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_GetPtr"]["implemented"] is True
+    assert status["PyArray_GetPtr"]["slot"] == 44
+    assert status["PyArray_GetPtr"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ElementStrides"]["implemented"] is True
+    assert status["PyArray_ElementStrides"]["slot"] == 45
+    assert (
+        status["PyArray_ElementStrides"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ValidType"]["implemented"] is True
+    assert status["PyArray_ValidType"]["slot"] == 46
+    assert (
+        status["PyArray_ValidType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Item_INCREF"]["implemented"] is True
+    assert status["PyArray_Item_INCREF"]["slot"] == 47
+    assert (
+        status["PyArray_Item_INCREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Item_XDECREF"]["implemented"] is True
+    assert status["PyArray_Item_XDECREF"]["slot"] == 48
+    assert (
+        status["PyArray_Item_XDECREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_NewCopy"]["implemented"] is True
+    assert status["PyArray_NewCopy"]["slot"] == 49
+    assert (
+        status["PyArray_NewCopy"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_INCREF"]["implemented"] is True
+    assert status["PyArray_INCREF"]["slot"] == 50
+    assert (
+        status["PyArray_INCREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_XDECREF"]["implemented"] is True
+    assert status["PyArray_XDECREF"]["slot"] == 51
+    assert (
+        status["PyArray_XDECREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_SimpleNew"]["implemented"] is True
+    assert status["PyArray_SimpleNew"]["slot"] == 4
+    assert status["PyArray_SimpleNew"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SimpleNewFromData"]["implemented"] is True
+    assert status["PyArray_SimpleNewFromData"]["slot"] == 5
+    assert (
+        status["PyArray_SimpleNewFromData"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
     assert status["PyArray_SETITEM"]["slot"] == 12
+    assert status["PyArray_GETITEM"]["implemented"] is True
+    assert status["PyArray_GETITEM"]["slot"] == 11
+    assert status["PyArray_GETITEM"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SETITEM"]["implemented"] is True
+    assert status["PyArray_SETITEM"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_NDIM"]["implemented"] is True
+    assert status["PyArray_NDIM"]["slot"] == 6
+    assert status["PyArray_NDIM"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DIMS"]["implemented"] is True
+    assert status["PyArray_DIMS"]["slot"] == 7
+    assert status["PyArray_DIMS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_STRIDES"]["implemented"] is True
+    assert status["PyArray_STRIDES"]["slot"] == 8
+    assert status["PyArray_STRIDES"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DATA"]["implemented"] is True
+    assert status["PyArray_DATA"]["slot"] == 9
+    assert status["PyArray_DATA"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DESCR"]["implemented"] is True
+    assert status["PyArray_DESCR"]["slot"] == 10
+    assert status["PyArray_DESCR"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_DIM"]["implemented"] is True
+    assert status["PyArray_DIM"]["slot"] == 7
+    assert status["PyArray_DIM"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_BYTES"]["implemented"] is True
+    assert status["PyArray_BYTES"]["slot"] == 9
+    assert status["PyArray_BYTES"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_SIZE"]["implemented"] is True
+    assert status["PyArray_SIZE"]["slot"] == 13
+    assert status["PyArray_SIZE"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ITEMSIZE"]["implemented"] is True
     assert status["PyArray_ITEMSIZE"]["slot"] == 14
-    assert status["PyUFunc_FromFuncAndData"]["failure_mode"] == "unsupported_stub"
+    assert status["PyArray_ITEMSIZE"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Check"]["implemented"] is True
+    assert status["PyArray_Check"]["slot"] == 15
+    assert status["PyArray_Check"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CheckExact"]["implemented"] is True
+    assert status["PyArray_CheckExact"]["slot"] == 16
+    assert status["PyArray_CheckExact"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyUFunc_FromFuncAndData"]["implemented"] is True
+    assert status["PyUFunc_FromFuncAndData"]["failure_mode"] == "implemented_provider_slot"
     assert plan["abi_version"]["code"] == "PCC-EXT-ABI-VERSION-MISMATCH"
 
 
@@ -1199,7 +2694,7 @@ def test_pcc1_ext_abi_scans_include_dir_without_host_python(tmp_path):
     (include / "Python.h").write_text("int Py_Initialize(void);\n", encoding="utf-8")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -1229,7 +2724,7 @@ def test_pcc1_ext_abi_no_host_reports_generic_plan_ok():
         skip_or_fail_no_current_pcc1("no current pcc1 binary with native ext-abi shim")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -1255,13 +2750,43 @@ def test_pcc1_ext_abi_no_host_reports_generic_plan_ok():
     assert plan["provider"] == "extension"
 
 
-def test_pcc1_ext_abi_no_host_requires_numpy_capi_diagnostics():
+def test_pcc1_ext_abi_no_host_require_capsule_includes_full_surface():
     pcc1 = _find_current_pcc1()
     if pcc1 is None:
         skip_or_fail_no_current_pcc1("no current pcc1 binary with native ext-abi shim")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    proc = subprocess.run(
+        [
+            str(pcc1),
+            "-m",
+            "pcc.package",
+            "ext-abi",
+            "--require-capsule",
+            "--json",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    plan = json.loads(proc.stdout)
+    assert plan["ok"] is True
+    for symbol in GENERIC_CAPSULE_SYMBOLS:
+        assert symbol in plan["required_symbols"]
+        assert symbol not in plan["missing_symbols"]
+    assert plan["unknown_symbols"] == []
+
+
+def test_pcc1_ext_abi_no_host_reports_numpy_capi_provider_subset_ok():
+    pcc1 = _find_current_pcc1()
+    if pcc1 is None:
+        skip_or_fail_no_current_pcc1("no current pcc1 binary with native ext-abi shim")
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     proc = subprocess.run(
         [
             str(pcc1),
@@ -1278,13 +2803,479 @@ def test_pcc1_ext_abi_no_host_requires_numpy_capi_diagnostics():
         timeout=30,
         env=env,
     )
-    assert proc.returncode == 2
+    assert proc.returncode == 0
     plan = json.loads(proc.stdout)
     assert plan["provider"] == "numpy-capi"
-    assert "PyArray_API" in plan["missing_symbols"]
-    assert "PyArrayDescr_Type" in plan["missing_symbols"]
-    assert "PyArray_CheckExact" in plan["missing_symbols"]
-    assert "PyUFunc_FromFuncAndData" in plan["missing_symbols"]
-    assert {diag["code"] for diag in plan["diagnostics"]} == {
-        "PCC-EXT-MISSING-NUMPY-CAPI-SYMBOL",
-    }
+    assert "PyArray_API" not in plan["missing_symbols"]
+    assert "PyArray_Type" not in plan["missing_symbols"]
+    assert "PyArrayDescr_Type" not in plan["missing_symbols"]
+    assert "PyArray_DescrCheck" not in plan["missing_symbols"]
+    assert "PyUFunc_API" not in plan["missing_symbols"]
+    assert "PyUFunc_FromFuncAndData" not in plan["missing_symbols"]
+    assert "PyArray_DescrCheck" in plan["required_symbols"]
+    assert "PyArray_DescrNewFromType" in plan["required_symbols"]
+    assert "PyArray_DescrNew" in plan["required_symbols"]
+    assert "PyArray_DescrNewByteorder" in plan["required_symbols"]
+    assert "PyArray_CanCastSafely" in plan["required_symbols"]
+    assert "PyArray_CanCastTo" in plan["required_symbols"]
+    assert "PyArray_Zero" in plan["required_symbols"]
+    assert "PyArray_One" in plan["required_symbols"]
+    assert "PyArray_TypeObjectFromType" in plan["required_symbols"]
+    assert "PyArray_ObjectType" in plan["required_symbols"]
+    assert "PyArray_DescrFromObject" in plan["required_symbols"]
+    assert "PyArray_Size" in plan["required_symbols"]
+    assert "PyArray_DescrFromScalar" in plan["required_symbols"]
+    assert "PyArray_DescrFromTypeObject" in plan["required_symbols"]
+    assert "PyArray_ScalarAsCtype" in plan["required_symbols"]
+    assert "PyArray_FromScalar" in plan["required_symbols"]
+    assert "PyArray_CastScalarToCtype" in plan["required_symbols"]
+    assert "PyArray_CastScalarDirect" in plan["required_symbols"]
+    assert "PyArray_Pack" in plan["required_symbols"]
+    assert "PyArray_CastToType" in plan["required_symbols"]
+    assert "PyArray_Cast" in plan["required_symbols"]
+    assert "PyArray_FillWithScalar" in plan["required_symbols"]
+    assert "PyArray_ToList" in plan["required_symbols"]
+    assert "PyArray_ToString" in plan["required_symbols"]
+    assert "PyArray_Byteswap" in plan["required_symbols"]
+    assert "PyArray_FromString" in plan["required_symbols"]
+    assert "PyArray_FromBuffer" in plan["required_symbols"]
+    assert "PyArray_CheckFromAny" in plan["required_symbols"]
+    assert "PyArray_FromArray" in plan["required_symbols"]
+    assert "PyArray_MultiplyList" in plan["required_symbols"]
+    assert "PyArray_MultiplyIntList" in plan["required_symbols"]
+    assert "PyArray_GetPtr" in plan["required_symbols"]
+    assert "PyArray_ElementStrides" in plan["required_symbols"]
+    assert "PyArray_ValidType" in plan["required_symbols"]
+    assert "PyArray_Item_INCREF" in plan["required_symbols"]
+    assert "PyArray_Item_XDECREF" in plan["required_symbols"]
+    assert "PyArray_NewCopy" in plan["required_symbols"]
+    assert "PyArray_INCREF" in plan["required_symbols"]
+    assert "PyArray_XDECREF" in plan["required_symbols"]
+    assert "PyArray_DTYPE" in plan["required_symbols"]
+    assert "PyDataType_TYPE" in plan["required_symbols"]
+    assert "PyArray_TYPE" in plan["required_symbols"]
+    assert "PyArray_NBYTES" in plan["required_symbols"]
+    assert "PyArray_FILLWBYTE" in plan["required_symbols"]
+    assert "PyArray_EquivByteorders" in plan["required_symbols"]
+    assert "PyArray_SHAPE" in plan["required_symbols"]
+    assert "PyArray_FLAGS" in plan["required_symbols"]
+    assert "PyArray_CompareLists" in plan["required_symbols"]
+    assert "PyArray_Empty" in plan["required_symbols"]
+    assert "PyArray_Zeros" in plan["required_symbols"]
+    assert "PyArray_EMPTY" in plan["required_symbols"]
+    assert "PyArray_ZEROS" in plan["required_symbols"]
+    assert "PyArray_EquivTypes" in plan["required_symbols"]
+    assert "PyArray_EquivArrTypes" in plan["required_symbols"]
+    assert "PyArray_NewFromDescr" in plan["required_symbols"]
+    assert "PyArray_SimpleNewFromDescr" in plan["required_symbols"]
+    assert "PyArray_BASE" in plan["required_symbols"]
+    assert "PyArray_SetBaseObject" in plan["required_symbols"]
+    assert "PyArray_Return" in plan["required_symbols"]
+    assert "PyArray_ENABLEFLAGS" in plan["required_symbols"]
+    assert "PyArray_CLEARFLAGS" in plan["required_symbols"]
+    assert "PyArray_UpdateFlags" in plan["required_symbols"]
+    assert "PyArray_CopyInto" in plan["required_symbols"]
+    assert "PyArray_CopyAnyInto" in plan["required_symbols"]
+    assert "PyArray_ToScalar" in plan["required_symbols"]
+    assert "PyArray_Copy" in plan["required_symbols"]
+    assert "PyArray_EnsureArray" in plan["required_symbols"]
+    assert "PyArray_EnsureAnyArray" in plan["required_symbols"]
+    assert "PyArray_SAMESHAPE" in plan["required_symbols"]
+    assert "PyArray_ISCONTIGUOUS" in plan["required_symbols"]
+    assert "PyArray_ISONESEGMENT" in plan["required_symbols"]
+    assert "PyArray_ISNBO" in plan["required_symbols"]
+    assert "PyDataType_ISBYTESWAPPED" in plan["required_symbols"]
+    assert "PyArray_SAFEALIGNEDCOPY" in plan["required_symbols"]
+    assert "PyArray_FROMANY" in plan["required_symbols"]
+    assert "PyArray_FROM_OF" in plan["required_symbols"]
+    assert "PyArray_FromObject" in plan["required_symbols"]
+    assert "PyArray_CopyFromObject" in plan["required_symbols"]
+    assert "PyArray_DTYPE" not in plan["missing_symbols"]
+    assert "PyDataType_TYPE" not in plan["missing_symbols"]
+    assert "PyTypeNum_ISFLOAT" not in plan["missing_symbols"]
+    assert "PyDataType_ISNUMBER" not in plan["missing_symbols"]
+    assert "PyArray_ISOBJECT" not in plan["missing_symbols"]
+    assert "PyArray_TYPE" not in plan["missing_symbols"]
+    assert "PyArray_NBYTES" not in plan["missing_symbols"]
+    assert "PyArray_FILLWBYTE" not in plan["missing_symbols"]
+    assert "PyArray_EquivByteorders" not in plan["missing_symbols"]
+    assert "PyArray_SHAPE" not in plan["missing_symbols"]
+    assert "PyArray_FLAGS" not in plan["missing_symbols"]
+    assert "PyArray_CompareLists" not in plan["missing_symbols"]
+    assert "PyArray_Empty" not in plan["missing_symbols"]
+    assert "PyArray_Zeros" not in plan["missing_symbols"]
+    assert "PyArray_EMPTY" not in plan["missing_symbols"]
+    assert "PyArray_ZEROS" not in plan["missing_symbols"]
+    assert "PyArray_EquivTypes" not in plan["missing_symbols"]
+    assert "PyArray_EquivArrTypes" not in plan["missing_symbols"]
+    assert "PyArray_NewFromDescr" not in plan["missing_symbols"]
+    assert "PyArray_SimpleNewFromDescr" not in plan["missing_symbols"]
+    assert "PyArray_BASE" not in plan["missing_symbols"]
+    assert "PyArray_SetBaseObject" not in plan["missing_symbols"]
+    assert "PyArray_Return" not in plan["missing_symbols"]
+    assert "PyArray_ENABLEFLAGS" not in plan["missing_symbols"]
+    assert "PyArray_CLEARFLAGS" not in plan["missing_symbols"]
+    assert "PyArray_UpdateFlags" not in plan["missing_symbols"]
+    assert "PyArray_CopyInto" not in plan["missing_symbols"]
+    assert "PyArray_CopyAnyInto" not in plan["missing_symbols"]
+    assert "PyArray_ToScalar" not in plan["missing_symbols"]
+    assert "PyArray_Copy" not in plan["missing_symbols"]
+    assert "PyArray_EnsureArray" not in plan["missing_symbols"]
+    assert "PyArray_EnsureAnyArray" not in plan["missing_symbols"]
+    assert "PyArray_SAMESHAPE" not in plan["missing_symbols"]
+    assert "PyArray_ISCONTIGUOUS" not in plan["missing_symbols"]
+    assert "PyArray_ISONESEGMENT" not in plan["missing_symbols"]
+    assert "PyArray_ISNBO" not in plan["missing_symbols"]
+    assert "PyDataType_ISBYTESWAPPED" not in plan["missing_symbols"]
+    assert "PyArray_SAFEALIGNEDCOPY" not in plan["missing_symbols"]
+    assert "PyArray_FROMANY" not in plan["missing_symbols"]
+    assert "PyArray_FromObject" not in plan["missing_symbols"]
+    assert "PyArray_CopyFromObject" not in plan["missing_symbols"]
+    assert "PyArray_FROM_OF" not in plan["missing_symbols"]
+    assert "PyArray_Check" not in plan["missing_symbols"]
+    assert "PyArray_CheckExact" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromObject" not in plan["missing_symbols"]
+    assert "PyArray_Size" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromScalar" not in plan["missing_symbols"]
+    assert "PyArray_DescrFromTypeObject" not in plan["missing_symbols"]
+    assert "PyArray_ScalarAsCtype" not in plan["missing_symbols"]
+    assert "PyArray_FromScalar" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarToCtype" not in plan["missing_symbols"]
+    assert "PyArray_CastScalarDirect" not in plan["missing_symbols"]
+    assert "PyArray_Pack" not in plan["missing_symbols"]
+    assert "PyArray_CastToType" not in plan["missing_symbols"]
+    assert "PyArray_Cast" not in plan["missing_symbols"]
+    assert "PyArray_FillWithScalar" not in plan["missing_symbols"]
+    assert "PyArray_ToList" not in plan["missing_symbols"]
+    assert "PyArray_ToString" not in plan["missing_symbols"]
+    assert "PyArray_Byteswap" not in plan["missing_symbols"]
+    assert "PyArray_FromString" not in plan["missing_symbols"]
+    assert "PyArray_FromBuffer" not in plan["missing_symbols"]
+    assert "PyArray_CheckFromAny" not in plan["missing_symbols"]
+    assert "PyArray_FromArray" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyList" not in plan["missing_symbols"]
+    assert "PyArray_MultiplyIntList" not in plan["missing_symbols"]
+    assert "PyArray_GetPtr" not in plan["missing_symbols"]
+    assert "PyArray_ElementStrides" not in plan["missing_symbols"]
+    assert "PyArray_ValidType" not in plan["missing_symbols"]
+    assert "PyArray_Item_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_Item_XDECREF" not in plan["missing_symbols"]
+    assert "PyArray_NewCopy" not in plan["missing_symbols"]
+    assert "PyArray_INCREF" not in plan["missing_symbols"]
+    assert "PyArray_XDECREF" not in plan["missing_symbols"]
+    assert plan["diagnostics"] == []
+    status = {row["symbol"]: row for row in plan["numpy_capi_status"]}
+    assert status["PyArray_DTYPE"]["implemented"] is True
+    assert status["PyArray_DTYPE"]["slot"] is None
+    assert status["PyArray_DTYPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyDataType_TYPE"]["implemented"] is True
+    assert status["PyDataType_TYPE"]["slot"] is None
+    assert status["PyDataType_TYPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyTypeNum_ISFLOAT"]["implemented"] is True
+    assert status["PyTypeNum_ISFLOAT"]["slot"] is None
+    assert status["PyTypeNum_ISFLOAT"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyDataType_ISNUMBER"]["implemented"] is True
+    assert status["PyDataType_ISNUMBER"]["slot"] is None
+    assert status["PyDataType_ISNUMBER"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISOBJECT"]["implemented"] is True
+    assert status["PyArray_ISOBJECT"]["slot"] is None
+    assert status["PyArray_ISOBJECT"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_TYPE"]["implemented"] is True
+    assert status["PyArray_TYPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_NBYTES"]["implemented"] is True
+    assert status["PyArray_NBYTES"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FILLWBYTE"]["implemented"] is True
+    assert status["PyArray_FILLWBYTE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_EquivByteorders"]["implemented"] is True
+    assert status["PyArray_EquivByteorders"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_SHAPE"]["implemented"] is True
+    assert status["PyArray_SHAPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FLAGS"]["implemented"] is True
+    assert status["PyArray_FLAGS"]["slot"] == 17
+    assert status["PyArray_FLAGS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Check"]["implemented"] is True
+    assert status["PyArray_Check"]["slot"] == 15
+    assert status["PyArray_Check"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CheckFromAny"]["implemented"] is True
+    assert status["PyArray_CheckFromAny"]["slot"] == 40
+    assert (
+        status["PyArray_CheckFromAny"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromArray"]["implemented"] is True
+    assert status["PyArray_FromArray"]["slot"] == 41
+    assert (
+        status["PyArray_FromArray"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_MultiplyList"]["implemented"] is True
+    assert status["PyArray_MultiplyList"]["slot"] == 42
+    assert (
+        status["PyArray_MultiplyList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_MultiplyIntList"]["implemented"] is True
+    assert status["PyArray_MultiplyIntList"]["slot"] == 43
+    assert (
+        status["PyArray_MultiplyIntList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_GetPtr"]["implemented"] is True
+    assert status["PyArray_GetPtr"]["slot"] == 44
+    assert status["PyArray_GetPtr"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ElementStrides"]["implemented"] is True
+    assert status["PyArray_ElementStrides"]["slot"] == 45
+    assert (
+        status["PyArray_ElementStrides"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ValidType"]["implemented"] is True
+    assert status["PyArray_ValidType"]["slot"] == 46
+    assert (
+        status["PyArray_ValidType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Item_INCREF"]["implemented"] is True
+    assert status["PyArray_Item_INCREF"]["slot"] == 47
+    assert (
+        status["PyArray_Item_INCREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Item_XDECREF"]["implemented"] is True
+    assert status["PyArray_Item_XDECREF"]["slot"] == 48
+    assert (
+        status["PyArray_Item_XDECREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_NewCopy"]["implemented"] is True
+    assert status["PyArray_NewCopy"]["slot"] == 49
+    assert (
+        status["PyArray_NewCopy"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_INCREF"]["implemented"] is True
+    assert status["PyArray_INCREF"]["slot"] == 50
+    assert (
+        status["PyArray_INCREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_XDECREF"]["implemented"] is True
+    assert status["PyArray_XDECREF"]["slot"] == 51
+    assert (
+        status["PyArray_XDECREF"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CheckExact"]["implemented"] is True
+    assert status["PyArray_CheckExact"]["slot"] == 16
+    assert status["PyArray_CheckExact"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CompareLists"]["implemented"] is True
+    assert status["PyArray_CompareLists"]["slot"] == 18
+    assert status["PyArray_CompareLists"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Empty"]["implemented"] is True
+    assert status["PyArray_Empty"]["slot"] == 19
+    assert status["PyArray_Empty"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Zeros"]["implemented"] is True
+    assert status["PyArray_Zeros"]["slot"] == 20
+    assert status["PyArray_Zeros"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EMPTY"]["implemented"] is True
+    assert status["PyArray_EMPTY"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ZEROS"]["implemented"] is True
+    assert status["PyArray_ZEROS"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_EquivTypes"]["implemented"] is True
+    assert status["PyArray_EquivTypes"]["slot"] == 21
+    assert status["PyArray_EquivTypes"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EquivArrTypes"]["implemented"] is True
+    assert status["PyArray_EquivArrTypes"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_NewFromDescr"]["implemented"] is True
+    assert status["PyArray_NewFromDescr"]["slot"] == 22
+    assert status["PyArray_NewFromDescr"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_SimpleNewFromDescr"]["implemented"] is True
+    assert (
+        status["PyArray_SimpleNewFromDescr"]["failure_mode"]
+        == "implemented_header_macro"
+    )
+    assert status["PyArray_BASE"]["implemented"] is True
+    assert status["PyArray_BASE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_SetBaseObject"]["implemented"] is True
+    assert status["PyArray_SetBaseObject"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Return"]["implemented"] is True
+    assert status["PyArray_Return"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ENABLEFLAGS"]["implemented"] is True
+    assert status["PyArray_ENABLEFLAGS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CLEARFLAGS"]["implemented"] is True
+    assert status["PyArray_CLEARFLAGS"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_UpdateFlags"]["implemented"] is True
+    assert status["PyArray_UpdateFlags"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CopyInto"]["implemented"] is True
+    assert status["PyArray_CopyInto"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_CopyAnyInto"]["implemented"] is True
+    assert status["PyArray_CopyAnyInto"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_ToScalar"]["implemented"] is True
+    assert status["PyArray_ToScalar"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_Copy"]["implemented"] is True
+    assert status["PyArray_Copy"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EnsureArray"]["implemented"] is True
+    assert status["PyArray_EnsureArray"]["failure_mode"] == "implemented_provider_slot"
+    assert status["PyArray_EnsureAnyArray"]["implemented"] is True
+    assert (
+        status["PyArray_EnsureAnyArray"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrCheck"]["implemented"] is True
+    assert status["PyArray_DescrCheck"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_DescrNewFromType"]["implemented"] is True
+    assert (
+        status["PyArray_DescrNewFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrNew"]["implemented"] is True
+    assert (
+        status["PyArray_DescrNew"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrNewByteorder"]["implemented"] is True
+    assert (
+        status["PyArray_DescrNewByteorder"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CanCastSafely"]["implemented"] is True
+    assert (
+        status["PyArray_CanCastSafely"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CanCastTo"]["implemented"] is True
+    assert status["PyArray_CanCastTo"]["slot"] == 52
+    assert (
+        status["PyArray_CanCastTo"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Zero"]["implemented"] is True
+    assert status["PyArray_Zero"]["slot"] == 53
+    assert (
+        status["PyArray_Zero"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_One"]["implemented"] is True
+    assert status["PyArray_One"]["slot"] == 54
+    assert (
+        status["PyArray_One"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_TypeObjectFromType"]["implemented"] is True
+    assert status["PyArray_TypeObjectFromType"]["slot"] == 55
+    assert (
+        status["PyArray_TypeObjectFromType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ObjectType"]["implemented"] is True
+    assert (
+        status["PyArray_ObjectType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromObject"]["implemented"] is True
+    assert status["PyArray_DescrFromObject"]["slot"] == 56
+    assert (
+        status["PyArray_DescrFromObject"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Size"]["implemented"] is True
+    assert status["PyArray_Size"]["slot"] == 57
+    assert (
+        status["PyArray_Size"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromScalar"]["implemented"] is True
+    assert status["PyArray_DescrFromScalar"]["slot"] == 58
+    assert (
+        status["PyArray_DescrFromScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_DescrFromTypeObject"]["implemented"] is True
+    assert status["PyArray_DescrFromTypeObject"]["slot"] == 59
+    assert (
+        status["PyArray_DescrFromTypeObject"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ScalarAsCtype"]["implemented"] is True
+    assert status["PyArray_ScalarAsCtype"]["slot"] == 60
+    assert (
+        status["PyArray_ScalarAsCtype"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_FromScalar"]["implemented"] is True
+    assert status["PyArray_FromScalar"]["slot"] == 61
+    assert (
+        status["PyArray_FromScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastScalarToCtype"]["implemented"] is True
+    assert status["PyArray_CastScalarToCtype"]["slot"] == 62
+    assert (
+        status["PyArray_CastScalarToCtype"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastScalarDirect"]["implemented"] is True
+    assert status["PyArray_CastScalarDirect"]["slot"] == 64
+    assert (
+        status["PyArray_CastScalarDirect"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Pack"]["implemented"] is True
+    assert status["PyArray_Pack"]["slot"] == 63
+    assert (
+        status["PyArray_Pack"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_CastToType"]["implemented"] is True
+    assert status["PyArray_CastToType"]["slot"] == 65
+    assert (
+        status["PyArray_CastToType"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Cast"]["implemented"] is True
+    assert status["PyArray_Cast"]["slot"] is None
+    assert status["PyArray_Cast"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FillWithScalar"]["implemented"] is True
+    assert status["PyArray_FillWithScalar"]["slot"] == 66
+    assert (
+        status["PyArray_FillWithScalar"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ToList"]["implemented"] is True
+    assert status["PyArray_ToList"]["slot"] == 67
+    assert (
+        status["PyArray_ToList"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_ToString"]["implemented"] is True
+    assert status["PyArray_ToString"]["slot"] == 68
+    assert (
+        status["PyArray_ToString"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_Byteswap"]["implemented"] is True
+    assert status["PyArray_Byteswap"]["slot"] == 69
+    assert (
+        status["PyArray_Byteswap"]["failure_mode"]
+        == "implemented_provider_slot"
+    )
+    assert status["PyArray_SAMESHAPE"]["implemented"] is True
+    assert status["PyArray_SAMESHAPE"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISCONTIGUOUS"]["implemented"] is True
+    assert status["PyArray_ISCONTIGUOUS"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISONESEGMENT"]["implemented"] is True
+    assert status["PyArray_ISONESEGMENT"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_ISNBO"]["implemented"] is True
+    assert status["PyArray_ISNBO"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyDataType_ISBYTESWAPPED"]["implemented"] is True
+    assert status["PyDataType_ISBYTESWAPPED"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_SAFEALIGNEDCOPY"]["implemented"] is True
+    assert status["PyArray_SAFEALIGNEDCOPY"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FROMANY"]["implemented"] is True
+    assert status["PyArray_FROMANY"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FROM_OF"]["implemented"] is True
+    assert status["PyArray_FROM_OF"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_FromObject"]["implemented"] is True
+    assert status["PyArray_FromObject"]["failure_mode"] == "implemented_header_macro"
+    assert status["PyArray_CopyFromObject"]["implemented"] is True
+    assert status["PyArray_CopyFromObject"]["failure_mode"] == "implemented_header_macro"

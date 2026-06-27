@@ -29,7 +29,7 @@ def _compile_and_run(tmp_path, source: str) -> subprocess.CompletedProcess[str]:
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
     return subprocess.run(
         [str(exe)], capture_output=True, text=True, timeout=20,
@@ -91,6 +91,173 @@ def test_await_round_trip(tmp_path):
         """)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "43"
+
+
+def test_await_result_survives_returned_nested_async_function(tmp_path):
+    result = _compile_and_run(tmp_path, """
+        import asyncio
+
+        async def outer():
+            fut = asyncio.Future()
+            fut.set_result(b"payload")
+            value = await fut
+
+            async def nested(wait=False):
+                if wait:
+                    await asyncio.sleep(0)
+                return "nested"
+
+            return value, nested
+
+        def main() -> None:
+            value, nested = asyncio.run(outer())
+            print(len(value), value[:3])
+            print(type(nested()).__name__)
+
+        if __name__ == "__main__":
+            main()
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == ["7 b'pay'", "coroutine"]
+
+
+def test_nested_async_closure_formats_captured_strings(tmp_path):
+    result = _compile_and_run(tmp_path, """
+        import asyncio
+        import re
+        import urllib.parse
+
+        class Writer:
+            def __init__(self):
+                self.payload = b""
+
+            def write(self, data):
+                self.payload = data
+
+
+        class HTTP:
+            async def http_accept(self, user, method, path, authority, ver, lines, host, pauth, reply, authtable, users, httpget=None, **kw):
+                url = urllib.parse.urlparse(path)
+                if method == "CONNECT":
+                    return user, "example.com", 443, None
+                host_name, port = "example.com", 80
+                newpath = url._replace(netloc="", scheme="").geturl()
+
+                async def connected(writer):
+                    writer.write(f"{method} {newpath} {ver}\\r\\n{lines}\\r\\n\\r\\n".encode())
+                    return True
+
+                return user, host_name, port, connected
+
+        async def outer():
+            http_line = re.compile("([^ ]+) +(.+?) +(HTTP/[^ ]+)$")
+            lines = b"GET http://example.com/ HTTP/1.1\\r\\nHost: example.com\\r\\nProxy-Connection: Keep-Alive\\r\\n\\r\\n"
+            headers = lines[:-4].decode().split("\\r\\n")
+            method, path, ver = http_line.match(headers.pop(0)).groups()
+            lines = "\\r\\n".join(i for i in headers if not i.startswith("Proxy-"))
+            headers = dict(i.split(": ", 1) for i in headers if ": " in i)
+            proto = HTTP()
+            user, host_name, port, connected = await proto.http_accept(
+                True, method, path, None, ver, lines, headers.get("Host", ""),
+                headers.get("Proxy-Authorization"), None, None, None,
+            )
+            writer = Writer()
+            ok = await connected(writer)
+            print(writer.payload)
+            print(host_name, port)
+            return ok
+
+        def main() -> None:
+            print(asyncio.run(outer()))
+
+        if __name__ == "__main__":
+            main()
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == [
+        "b'GET / HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n'",
+        "example.com 80",
+        "True",
+    ]
+
+
+def test_nested_async_closure_forwarded_through_method_parameter_keeps_writer(tmp_path):
+    result = _compile_and_run(tmp_path, """
+        import asyncio
+
+        class Writer:
+            def __init__(self):
+                self.payload = b""
+
+            def write(self, data):
+                self.payload = data
+
+
+        class HTTP:
+            async def accept(self, writer):
+                async def reply(code, message, body=None, wait=False):
+                    print(type(writer).__name__)
+                    writer.write(message)
+                    return True
+
+                return await self.http_accept(reply)
+
+            async def http_accept(self, reply):
+                return lambda writer: reply(200, b"HTTP/1.1 200 Connection established\\r\\n\\r\\n")
+
+
+        async def outer():
+            client = Writer()
+            connected = await HTTP().accept(client)
+            ok = await connected(None)
+            print(client.payload)
+            return ok
+
+        def main() -> None:
+            print(asyncio.run(outer()))
+
+        if __name__ == "__main__":
+            main()
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == [
+        "Writer",
+        "b'HTTP/1.1 200 Connection established\\r\\n\\r\\n'",
+        "True",
+    ]
+
+
+def test_cross_module_async_function_attr_call_returns_coroutine(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    mod = tmp_path / "moda.py"
+    mod.write_text(
+        "async def accept():\n"
+        "    return (1, 2, 3)\n",
+        encoding="utf-8",
+    )
+    src = tmp_path / "prog.py"
+    src.write_text(
+        "import asyncio\n"
+        "import moda\n"
+        "async def main_async():\n"
+        "    x = moda.accept()\n"
+        "    print(type(x).__name__)\n"
+        "    y = await x\n"
+        "    print(y[0], y[2])\n"
+        "def main() -> None:\n"
+        "    asyncio.run(main_async())\n"
+        "if __name__ == \"__main__\":\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+    exe = tmp_path / "prog.out"
+    compile_python(str(src), str(exe), ir_scaffold_mode="on")
+    result = subprocess.run(
+        [str(exe)], capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == ["coroutine", "1 3"]
 
 
 def test_coroutine_cannot_be_awaited_twice(tmp_path):

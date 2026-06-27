@@ -6,9 +6,12 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+
+from pcc.macho_normalize import normalize_macho_metadata
 
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
@@ -4160,36 +4163,78 @@ def _supported_self_host() -> bool:
     return False
 
 
+def _shared_self_host_oracle_dir(tmp_path_factory, worker_id: str) -> Path:
+    """Return one artifact directory shared by every xdist worker.
+
+    ``getbasetemp()`` is worker-specific under xdist; its parent is the
+    controller run directory shared by all workers.  The directory therefore
+    cannot leak artifacts across pytest invocations or source revisions.
+    """
+    base = tmp_path_factory.getbasetemp()
+    if worker_id != "master":
+        base = base.parent
+    shared = base / "self_host_oracle_shared"
+    shared.mkdir(parents=True, exist_ok=True)
+    return shared
+
+
+@contextmanager
+def _self_host_artifact_lock(path: Path):
+    import fcntl
+
+    stream = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
+
+
 @pytest.fixture(scope="session")
-def pcc1_self_host_binary(tmp_path_factory):
+def pcc1_self_host_binary(tmp_path_factory, worker_id):
     if not _supported_self_host():
         pytest.skip("self backend oracle supports macOS arm64 and Linux x86_64")
-    out_dir = tmp_path_factory.mktemp("self_host_oracle")
+    explicit_pcc1 = os.environ.get("PCC1_BINARY")
+    if explicit_pcc1:
+        pcc1 = Path(explicit_pcc1).resolve()
+        assert pcc1.is_file(), f"PCC1_BINARY does not exist: {pcc1}"
+        return pcc1
+    out_dir = _shared_self_host_oracle_dir(tmp_path_factory, worker_id)
     pcc1 = out_dir / "pcc1"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pcc",
-            "--python-libpython",
-            "off",
-            "--backend",
-            "self",
-            "pcc/__main__.py",
-            "-o",
-            str(pcc1),
-        ],
-        cwd=str(REPO_ROOT),
-        env=_child_env(),
-        capture_output=True,
-        text=True,
-        timeout=_SELF_HOST_BUILD_TIMEOUT_SECONDS,
-    )
-    assert result.returncode == 0, (
-        "failed to build pcc1 for self-host oracle\n"
-        f"stdout:\n{result.stdout}\n"
-        f"stderr:\n{result.stderr}"
-    )
+    with _self_host_artifact_lock(out_dir / "pcc1.lock"):
+        if pcc1.is_file():
+            return pcc1
+        temporary = out_dir / f".pcc1.{os.getpid()}.tmp"
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pcc",
+                    "--python-libpython",
+                    "off",
+                    "--backend",
+                    "self",
+                    "pcc/__main__.py",
+                    "-o",
+                    str(temporary),
+                ],
+                cwd=str(REPO_ROOT),
+                env=_child_env(),
+                capture_output=True,
+                text=True,
+                timeout=_SELF_HOST_BUILD_TIMEOUT_SECONDS,
+            )
+            assert result.returncode == 0, (
+                "failed to build pcc1 for self-host oracle\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+            os.replace(temporary, pcc1)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
     return pcc1
 
 
@@ -4223,15 +4268,45 @@ def _build_next_stage(
 
 
 @pytest.fixture(scope="session")
-def pcc2_self_host_binary(tmp_path_factory, pcc1_self_host_binary):
-    out_dir = tmp_path_factory.mktemp("self_host_oracle_stage2")
-    return _build_next_stage(pcc1_self_host_binary, out_dir / "pcc2")
+def pcc2_self_host_binary(tmp_path_factory, worker_id, pcc1_self_host_binary):
+    explicit_pcc2 = os.environ.get("PCC2_BINARY")
+    if explicit_pcc2:
+        pcc2 = Path(explicit_pcc2).resolve()
+        assert pcc2.is_file(), f"PCC2_BINARY does not exist: {pcc2}"
+        return pcc2
+    out_dir = _shared_self_host_oracle_dir(tmp_path_factory, worker_id)
+    pcc2 = out_dir / "pcc2"
+    with _self_host_artifact_lock(out_dir / "pcc2.lock"):
+        if not pcc2.is_file():
+            temporary = out_dir / f".pcc2.{os.getpid()}.tmp"
+            try:
+                _build_next_stage(pcc1_self_host_binary, temporary)
+                os.replace(temporary, pcc2)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+    return pcc2
 
 
 @pytest.fixture(scope="session")
-def pcc3_self_host_binary(tmp_path_factory, pcc2_self_host_binary):
-    out_dir = tmp_path_factory.mktemp("self_host_oracle_stage3")
-    return _build_next_stage(pcc2_self_host_binary, out_dir / "pcc3")
+def pcc3_self_host_binary(tmp_path_factory, worker_id, pcc2_self_host_binary):
+    explicit_pcc3 = os.environ.get("PCC3_BINARY")
+    if explicit_pcc3:
+        pcc3 = Path(explicit_pcc3).resolve()
+        assert pcc3.is_file(), f"PCC3_BINARY does not exist: {pcc3}"
+        return pcc3
+    out_dir = _shared_self_host_oracle_dir(tmp_path_factory, worker_id)
+    pcc3 = out_dir / "pcc3"
+    with _self_host_artifact_lock(out_dir / "pcc3.lock"):
+        if not pcc3.is_file():
+            temporary = out_dir / f".pcc3.{os.getpid()}.tmp"
+            try:
+                _build_next_stage(pcc2_self_host_binary, temporary)
+                os.replace(temporary, pcc3)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+    return pcc3
 
 
 def _links_libpython(binary: Path) -> bool:
@@ -4263,6 +4338,7 @@ def _signature_stripped_copy(src: Path, dst: Path) -> Path:
             stderr=subprocess.DEVNULL,
             timeout=30,
         )
+        normalize_macho_metadata(dst)
     return dst
 
 
@@ -4359,6 +4435,94 @@ def _compile_and_run_artifact_no_host(
     )
 
 
+def test_pcc2_hoists_nested_closure_across_try_handler(
+    pcc2_self_host_binary,
+    tmp_path,
+):
+    src = tmp_path / "nested_closure_try.py"
+    src.write_text(
+        textwrap.dedent(
+            """
+            def locate(mod_name: str):
+                def candidates(root: str) -> list[str]:
+                    return [root + mod_name]
+
+                try:
+                    origin = candidates("root")[0]
+                except Exception:
+                    return None
+                return origin
+
+            print(locate("x"))
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    result = _compile_and_run(
+        [str(pcc2_self_host_binary)],
+        src,
+        tmp_path / "nested_closure_try.out",
+    )
+    assert result.returncode == 0
+    assert result.stdout == "rootx\n"
+
+
+def test_pcc1_bare_reraise_preserves_active_exception(
+    pcc1_self_host_binary,
+    tmp_path,
+):
+    src = tmp_path / "bare_reraise.py"
+    src.write_text(
+        textwrap.dedent(
+            """
+            def main() -> None:
+                try:
+                    try:
+                        raise ValueError("inner")
+                    except ValueError:
+                        try:
+                            try:
+                                raise KeyError("nested")
+                            except KeyError:
+                                raise
+                        except KeyError:
+                            pass
+                        raise
+                except ValueError as exc:
+                    print("outer caught", str(exc))
+
+                try:
+                    raise
+                except RuntimeError as exc:
+                    print("after handler", str(exc))
+
+            if __name__ == "__main__":
+                main()
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+
+    cpython = _run_python(src)
+    pcc1 = _compile_and_run_artifact_no_host(
+        [str(pcc1_self_host_binary)],
+        src,
+        tmp_path / "bare_reraise.pcc1.out",
+    )
+
+    assert cpython.returncode == 0
+    assert pcc1.returncode == cpython.returncode
+    cpython_lines = cpython.stdout.splitlines()
+    pcc1_lines = pcc1.stdout.splitlines()
+    assert cpython_lines[0] == "outer caught inner"
+    assert pcc1_lines[0] == cpython_lines[0]
+    # The runtime's existing message starts with lower-case ``no`` while
+    # CPython starts with ``No``.  This probe owns handler-stack cleanup, not
+    # that separate diagnostic-capitalization parity boundary.
+    assert pcc1_lines[1].lower() == cpython_lines[1].lower()
+    assert pcc1.stderr == cpython.stderr
+
+
 @pytest.mark.parametrize("name, source", CASES)
 def test_pcc1_matches_stage0_for_python_idioms(
     pcc1_self_host_binary,
@@ -4367,7 +4531,7 @@ def test_pcc1_matches_stage0_for_python_idioms(
     source,
 ):
     src = tmp_path / f"{name}.py"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
 
     stage0 = _compile_and_run(
         [sys.executable, "-m", "pcc"],
@@ -6815,7 +6979,7 @@ def test_pcc2_pcc3_match_stage0_for_smoke_idioms(
     source,
 ):
     src = tmp_path / f"{name}.py"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
 
     stage0 = _compile_and_run(
         [sys.executable, "-m", "pcc"],

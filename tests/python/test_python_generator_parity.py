@@ -61,7 +61,7 @@ def test_generator_simple_yield(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1", "2", "3"]
 
@@ -86,7 +86,7 @@ def test_generator_state_persists_across_yields(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "0", "1", "1", "2", "3", "5", "8",
@@ -111,7 +111,7 @@ def test_generator_yield_from(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["0", "1", "2", "3"]
 
@@ -132,9 +132,42 @@ def test_generator_explicit_next_calls(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["10", "20", "30"]
+
+
+def test_generator_overwrite_releases_suspended_frame_local_backend0(
+    tmp_path,
+    monkeypatch,
+):
+    src = tmp_path / "gen_overwrite_release.py"
+    exe = tmp_path / "gen_overwrite_release.out"
+    src.write_text(textwrap.dedent("""
+        import gc
+
+        class C:
+            def __del__(self):
+                print("del")
+
+        def gen():
+            c = C()
+            yield 1
+            yield 2
+
+        def main() -> None:
+            it = gen()
+            print(next(it))
+            it = None
+            gc.collect()
+            print("end")
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    _compile(monkeypatch, src, exe)
+    monkeypatch.setenv("PCC_GC_BACKEND", "0")
+    assert _run(exe).strip().splitlines() == ["1", "del", "end"]
 
 
 def test_generator_yields_implicit_tuple(tmp_path, monkeypatch):
@@ -164,7 +197,7 @@ def test_generator_yields_implicit_tuple(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "(1, 2)", "(3, 4)", "(5, 6)", "(7, 8)",
@@ -205,7 +238,7 @@ def test_generator_range_loop_resumes(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "100", "101", "102",
@@ -251,7 +284,7 @@ def test_generator_enumerate_resumes(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "0 a", "1 b", "2 c",
@@ -301,7 +334,7 @@ def test_generator_sibling_owned_flag_isolation(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "a0", "a1",
@@ -323,6 +356,357 @@ def test_async_def_basic(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "hi"
+
+
+def test_generator_for_over_cpython_iterable_compiles_and_runs(tmp_path):
+    # Failure LADDER regression for a generator body iterating a
+    # CPython-fallback iterable (e.g. itertools.chain under
+    # --python-libpython=auto). History: raw-SSA cpy iterator -> LLVM
+    # verifier "does not dominate" crash; slot spill alone -> runtime
+    # SIGSEGV (entry allocas are rebuilt per resume call) -> clear
+    # diagnostic guard. J1 now boxes the iterator handle as a pcc int in
+    # the persisted __pcc_for_iter_* frame slot and excludes the cpy
+    # loop target from frame saves (raw libpython pointers must never
+    # enter the frame py_list), so this shape COMPILES AND RUNS — the
+    # loop variable is never read after a yield suspension here.
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "gen_cpy_iter.py"
+    exe = tmp_path / "gen_cpy_iter"
+    src.write_text(
+        "import itertools\n"
+        "\n"
+        "def gen(items):\n"
+        "    for line in itertools.chain(items, ['end']):\n"
+        "        yield line\n"
+        "\n"
+        "def main():\n"
+        "    for v in gen(['a', 'b']):\n"
+        "        print(v)\n"
+        "\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="auto",
+        ir_scaffold_mode="on",
+    )
+    out = _run(Path(exe))
+    assert out.splitlines() == ["a", "b", "end"]
+
+
+def test_generator_cpy_loop_var_read_across_yield_runs(tmp_path):
+    # J2': the cpy loop variable lives in its slot as a CpyHandle box
+    # (frame-safe pcc object; the central name-load helper unboxes), so
+    # reading it AFTER a yield suspension now compiles and runs with
+    # CPython-equal output — this exact shape was J1's guarded boundary.
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "gen_cpy_cross.py"
+    exe = tmp_path / "gen_cpy_cross"
+    src.write_text(
+        "import itertools\n"
+        "\n"
+        "def gen(items):\n"
+        "    for line in itertools.chain(items, ['end']):\n"
+        "        yield 1\n"
+        "        print(line)\n"
+        "\n"
+        "def main():\n"
+        "    for v in gen(['a']):\n"
+        "        print(v)\n"
+        "\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="auto",
+        ir_scaffold_mode="on",
+    )
+    out = _run(Path(exe))
+    assert out.splitlines() == ["1", "a", "1", "end"]
+
+
+def test_generator_cpy_flat_unpack_across_yield_runs(tmp_path):
+    # J2' stage 2: FLAT tuple-unpack cpy targets (the os.walk
+    # dirpath/dirnames/filenames shape) are extracted via the cpy
+    # bridge and boxed like the single-name target, so reading them
+    # after a yield suspension compiles and runs CPython-equal.
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "gen_cpy_unpack.py"
+    exe = tmp_path / "gen_cpy_unpack"
+    src.write_text(
+        "import itertools\n"
+        "\n"
+        "def gen(items):\n"
+        "    for a, b in itertools.zip_longest(items, items):\n"
+        "        yield 1\n"
+        "        print(a, b)\n"
+        "\n"
+        "def main():\n"
+        "    for v in gen(['x', 'y']):\n"
+        "        print(v)\n"
+        "\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="auto",
+        ir_scaffold_mode="on",
+    )
+    out = _run(Path(exe))
+    assert out.splitlines() == ["1", "x x", "1", "y y"]
+
+
+def test_generator_cpy_nested_unpack_across_yield_still_guarded(tmp_path):
+    # J2' boundary: NESTED tuple-unpack cpy targets keep the J1
+    # skip-save + precise cross-yield guard naming the variable —
+    # never a verifier crash or a heap-corrupting binary.
+    import pytest
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "gen_cpy_nested.py"
+    exe = tmp_path / "gen_cpy_nested"
+    src.write_text(
+        "import itertools\n"
+        "\n"
+        "def gen(items):\n"
+        "    for (a, b), c in itertools.zip_longest(\n"
+        "        itertools.zip_longest(items, items), items\n"
+        "    ):\n"
+        "        yield 1\n"
+        "        print(a, b, c)\n"
+        "\n"
+        "def main():\n"
+        "    for v in gen(['x']):\n"
+        "        print(v)\n"
+        "\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(Exception) as exc_info:
+        compile_python(
+            str(src),
+            str(exe),
+            libpython_mode="auto",
+            ir_scaffold_mode="on",
+        )
+    msg = str(exc_info.value)
+    assert "yield" in msg or "unpack" in msg.lower()
+    assert "dominate" not in msg
+
+
+def test_generator_native_protocol_for_resumes(tmp_path, monkeypatch):
+    # Regression for the SECOND dominance site of the same ladder (numpy
+    # linalg/lapack_lite/fortran.py): a generator body iterating a
+    # pcc-NATIVE user-class iterator went through
+    # _emit_for_native_iterator, which kept the __iter__() result as raw
+    # SSA across the loop header. Under --emit-llvm the LLVM verifier
+    # failed ("Instruction does not dominate all uses" on the
+    # pcc_gc_load_ptr feeding __next__); under -o the broken IR slipped
+    # past verification and produced a binary printing WRONG VALUES
+    # (1 instead of 6). The iterator now lives in the persisted
+    # __pcc_for_iter_* generator frame slot like the dyn-protocol path.
+    src = tmp_path / "gen_native_iter.py"
+    exe = tmp_path / "gen_native_iter"
+    src.write_text(
+        textwrap.dedent(
+            """
+            class PB:
+                def __init__(self, n: int):
+                    self.n = n
+                    self.i = 0
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    if self.i >= self.n:
+                        raise StopIteration()
+                    self.i += 1
+                    return self.i
+
+
+            def gen(n: int):
+                pb = PB(n)
+                for x in pb:
+                    yield x
+
+
+            def nested(n: int):
+                outer = PB(n)
+                for x in outer:
+                    inner = PB(x)
+                    for y in inner:
+                        yield x * 10 + y
+
+
+            def main() -> int:
+                total = 0
+                for v in gen(3):
+                    total += v
+                print(total)
+                acc = []
+                for v in nested(2):
+                    acc.append(v)
+                print(acc)
+                return 0
+
+
+            main()
+            """
+        ),
+        encoding="utf-8",
+    )
+    _compile(monkeypatch, src, exe)
+    out = _run(exe)
+    assert out.splitlines() == ["6", "[11, 21, 22]"]
+
+
+def test_generator_cpy_flat_unpack_arity_mismatch_raises(tmp_path):
+    # J2' stage-2 arity check: unpacking a 3-element cpy item into two
+    # names raises ValueError like CPython (py_cpy_len-based; unsized
+    # items conservatively skip the check). The DYN-protocol unpack
+    # path's missing arity check is a separate pre-existing behavior.
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "gen_cpy_arity.py"
+    exe = tmp_path / "gen_cpy_arity"
+    src.write_text(
+        "import itertools\n"
+        "\n"
+        "def bad(seqs):\n"
+        "    for a, b in itertools.chain(seqs):\n"
+        "        yield a\n"
+        "\n"
+        "def main():\n"
+        "    try:\n"
+        "        for w in bad([(1, 2, 3)]):\n"
+        "            print(w)\n"
+        "    except ValueError:\n"
+        "        print('arity-error')\n"
+        "\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="auto",
+        ir_scaffold_mode="on",
+    )
+    out = _run(Path(exe))
+    assert out.splitlines() == ["arity-error"]
+
+
+def test_generator_throw_close_exception_routing(tmp_path):
+    # Audit Review 4: gen.throw/send/close emission sites had no
+    # post-call err-check (a thrown-in ValueError printed "throw-ok"
+    # then detonated later), and the err-check then exposed a runtime
+    # hole — py_gen_close left its injected GeneratorExit PENDING when
+    # the generator body didn't catch it (CPython: close() swallows
+    # that, it IS the normal close path; both tiers now compare the
+    # pending exception against the injected object by identity).
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "gen_throw_close.py"
+    exe = tmp_path / "gen_throw_close"
+    src.write_text(
+        "def gen():\n"
+        "    yield 1\n"
+        "    yield 2\n"
+        "\n"
+        "def main() -> int:\n"
+        "    g = gen()\n"
+        "    print(next(g))\n"
+        "    try:\n"
+        "        g.throw(ValueError('boom'))\n"
+        "        print('throw-ok')\n"
+        "    except ValueError:\n"
+        "        print('throw-err')\n"
+        "    g2 = gen()\n"
+        "    print(next(g2))\n"
+        "    g2.close()\n"
+        "    try:\n"
+        "        print(next(g2))\n"
+        "        print('after-close-ok')\n"
+        "    except StopIteration:\n"
+        "        print('after-close-stop')\n"
+        "    return 0\n"
+        "\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+        backend="self",
+    )
+    out = _run(Path(exe))
+    assert out.splitlines() == ["1", "throw-err", "1", "after-close-stop"]
+
+
+def test_contextmanager_swallow_and_propagate(tmp_path):
+    # Audit follow-up pin: the @contextmanager protocol's exception
+    # routing — a handler that catches the thrown-in exception SWALLOWS
+    # it (the with-statement completes), an unhandled one PROPAGATES to
+    # the enclosing except. Matches CPython line for line.
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "ctxmgr_probe.py"
+    exe = tmp_path / "ctxmgr_probe"
+    src.write_text(
+        "from contextlib import contextmanager\n"
+        "\n"
+        "@contextmanager\n"
+        "def swallow():\n"
+        "    try:\n"
+        "        yield 1\n"
+        "    except ValueError:\n"
+        "        pass\n"
+        "\n"
+        "@contextmanager\n"
+        "def passthru():\n"
+        "    yield 2\n"
+        "\n"
+        "def main() -> int:\n"
+        "    try:\n"
+        "        with swallow() as v:\n"
+        "            print('in', v)\n"
+        "            raise ValueError('boom')\n"
+        "        print('swallowed')\n"
+        "    except ValueError:\n"
+        "        print('leaked')\n"
+        "    try:\n"
+        "        with passthru() as w:\n"
+        "            print('in', w)\n"
+        "            raise ValueError('boom2')\n"
+        "        print('not-here')\n"
+        "    except ValueError:\n"
+        "        print('propagated')\n"
+        "    return 0\n"
+        "\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+        backend="self",
+    )
+    out = _run(Path(exe))
+    assert out.splitlines() == ["in 1", "swallowed", "in 2", "propagated"]

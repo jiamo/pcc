@@ -185,3 +185,42 @@ def test_native_nonlocal_counter_stays_libpython_free(tmp_path):
     )
     assert run.returncode == 0, run.stderr
     assert run.stdout == "2\n3\n"
+
+
+def test_native_closure_captures_starred_unpack_target(tmp_path):
+    src = tmp_path / "closure_starred_unpack.py"
+    src.write_text(
+        textwrap.dedent(
+            """
+            def outer():
+                split = (7, 3, 5)
+                mod, rem, *rest = split
+
+                def inner():
+                    offset = rest[0] if rest else 0
+                    return (mod + rem + offset) % 10
+
+                return inner()
+
+            print(outer())
+            """
+        ),
+        encoding="utf-8",
+    )
+    exe = tmp_path / "closure_starred_unpack.out"
+
+    compile_python(
+        str(src),
+        str(exe),
+        backend="self",
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    run = subprocess.run(
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "5\n"

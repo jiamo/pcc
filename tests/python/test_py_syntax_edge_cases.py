@@ -10,7 +10,7 @@ def _compile_and_run(tmp_path, monkeypatch, source: str) -> str:
     from pcc.py_frontend.pipeline import compile_python
     src = tmp_path / "case.py"
     exe = tmp_path / "case.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on", libpython_mode="off")
     result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30.0)
     assert result.returncode == 0
@@ -138,3 +138,26 @@ def test_decorator_comment_before_class(tmp_path, monkeypatch):
         if __name__ == "__main__": main()
     """
     assert _compile_and_run(tmp_path, monkeypatch, source).strip() == "1"
+
+
+def test_starred_rhs_tuple_display_assignment(tmp_path, monkeypatch):
+    source = """
+        def make_pair():
+            return (10, 20)
+
+        def main():
+            first, second, third = [], *make_pair()
+            print(first)
+            print(second)
+            print(third)
+            print((*[1, 2], 3))
+            print([0, *[1, 2], 3])
+        if __name__ == "__main__": main()
+    """
+    assert _compile_and_run(tmp_path, monkeypatch, source).splitlines() == [
+        "[]",
+        "10",
+        "20",
+        "(1, 2, 3)",
+        "[0, 1, 2, 3]",
+    ]

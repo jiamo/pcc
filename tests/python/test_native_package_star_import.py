@@ -98,3 +98,84 @@ def test_star_import_constant(tmp_path):
         "main()\n",
     )
     assert out == "100", out
+
+
+def test_star_import_respects_all_dunder_names(tmp_path):
+    def build(site):
+        pkg = site / "t"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(
+            "__description__ = 'native star'\n"
+            "__url__ = 'https://example.invalid'\n"
+            "try:\n"
+            "    __version__ = '1.2.3'\n"
+            "except Exception:\n"
+            "    __version__ = 'unknown'\n"
+            "_hidden = 'no'\n"
+            "__all__ = ['__version__', '__description__', '__url__']\n",
+            encoding="utf-8",
+        )
+    out = _compile_run(
+        tmp_path, build,
+        "from t import *\n"
+        "def main():\n"
+        "    print(__version__ + ' ' + __description__ + ' ' + __url__)\n"
+        "main()\n",
+    )
+    assert out == "1.2.3 native star https://example.invalid", out
+
+
+def test_star_import_copies_dynamic_globals_exports(tmp_path, monkeypatch):
+    monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
+    monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
+
+    def build(site):
+        pkg = site / "u"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "types.py").write_text(
+            "values = {'uint8': 7}\n"
+            "__all__ = []\n"
+            "for key in values:\n"
+            "    globals()[key] = values[key]\n"
+            "    __all__.append(key)\n",
+            encoding="utf-8",
+        )
+
+    out = _compile_run(
+        tmp_path,
+        build,
+        "from u.types import *\nprint(uint8)\n",
+    )
+    assert out == "7", out
+
+
+def test_star_import_publishes_metadata_decorated_function(tmp_path, monkeypatch):
+    monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
+    monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
+
+    def build(site):
+        pkg = site / "v"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "decorators.py").write_text(
+            "def finalize(fn):\n"
+            "    fn.__doc__ = fn.__doc__\n"
+            "    return fn\n",
+            encoding="utf-8",
+        )
+        (pkg / "api.py").write_text(
+            "from v.decorators import finalize\n"
+            "__all__ = ['require']\n"
+            "@finalize\n"
+            "def require(value):\n"
+            "    return value + 1\n",
+            encoding="utf-8",
+        )
+
+    out = _compile_run(
+        tmp_path,
+        build,
+        "from v.api import *\nprint(require(41))\n",
+    )
+    assert out == "42", out

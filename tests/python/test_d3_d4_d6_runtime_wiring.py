@@ -4,11 +4,11 @@ from pathlib import Path
 
 
 def test_d3_d4_d6_runtime_symbols_are_wired():
-    header = Path("pcc/py_runtime/include/py_runtime.h").read_text()
-    abi = Path("pcc/py_frontend/codegen/runtime_abi.py").read_text()
-    makefile = Path("pcc/py_runtime/Makefile").read_text()
-    coro_c = Path("pcc/py_runtime/src/py_coroutine.c").read_text()
-    coro_py = Path("pcc/py_runtime/py/py_coroutine.py").read_text()
+    header = Path("pcc/py_runtime/include/py_runtime.h").read_text(encoding="utf-8")
+    abi = Path("pcc/py_frontend/codegen/runtime_abi.py").read_text(encoding="utf-8")
+    makefile = Path("pcc/py_runtime/Makefile").read_text(encoding="utf-8")
+    coro_c = Path("pcc/py_runtime/src/py_coroutine.c").read_text(encoding="utf-8")
+    coro_py = Path("pcc/py_runtime/py/py_coroutine.py").read_text(encoding="utf-8")
 
     assert "py_coroutine_is_done" in header
     assert "py_context_enter" in header

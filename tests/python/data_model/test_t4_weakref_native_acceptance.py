@@ -16,7 +16,9 @@ def test_t4_weakref_callable_and_dealloc_clear_native(tmp_path):
     shutil.copytree(
         RUNTIME_DIR,
         work_runtime,
-        ignore=shutil.ignore_patterns("build", "build_pcc", "build_py", "build_libpython", "*.a"),
+        ignore=shutil.ignore_patterns(
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
+        ),
     )
     build_runtime = subprocess.run(
         ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],

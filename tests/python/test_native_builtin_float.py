@@ -24,9 +24,9 @@ def _compile_to_ll(source: str, name: str) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(str(src), str(out), emit_llvm_only=True)
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _fn_body(ir_text: str, fn_suffix: str) -> str | None:
@@ -82,8 +82,7 @@ def test_float_nan_no_py_cpy():
 
 
 def test_float_int_arg_already_native():
-    """Regression check: float(int_var) was already native; ensure
-    nothing broke."""
+    """float(int_var) stays native without truncating arbitrary-precision ints."""
     program = textwrap.dedent(
         """
         def f(x: int) -> float:
@@ -94,7 +93,11 @@ def test_float_int_arg_already_native():
     body = _fn_body(ir_text, "_f")
     assert body is not None
     assert "py_cpy_" not in body
-    assert "sitofp" in body  # int→float conversion instruction
+    # Function arguments are boxed Python ints. Converting through
+    # py_float_to_f64 preserves bignum semantics; unbox-to-i64+sitofp would
+    # silently truncate large Python ints.
+    assert "py_float_to_f64" in body
+    assert "py_int_to_i64" not in body
 
 
 def test_float_inf_emits_native_constant():

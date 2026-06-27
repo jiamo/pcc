@@ -19,14 +19,14 @@ def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
         str(src),
         str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _function_body(ir_text: str, fn_name_suffix: str) -> str | None:
@@ -106,7 +106,7 @@ def test_set_equality_runtime(tmp_path):
             print(set(["a"]) == set(["a", "b"]))
             """
         )
-    )
+    , encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
     run = subprocess.run(
         [str(exe)],

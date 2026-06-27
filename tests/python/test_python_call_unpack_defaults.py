@@ -10,6 +10,7 @@ from pcc.py_frontend.codegen.call_resolution_lowering import CallResolutionLower
 from pcc.py_frontend.py_ast import (
     Arg,
     Call,
+    DictExpr,
     DynType,
     IntType,
     Name,
@@ -124,6 +125,104 @@ def test_starred_unpack_accepts_nominal_call_name_nodes():
     arg.kwargs = ()
 
     assert resolver._is_starred_unpack_expr(arg)
+
+
+def test_multiple_starstar_kwargs_merge_for_missing_formals():
+    resolver = _Resolver()
+    span = None
+    first = Name(span=span, ty=DynType(name="dyn"), ident="first")
+    left = Name(span=span, ty=DynType(name="dyn"), ident="left")
+    right = Name(span=span, ty=DynType(name="dyn"), ident="right")
+    left_unpack = Call(
+        span=span,
+        ty=DynType(name="dyn"),
+        func=Name(span=span, ty=DynType(name="dyn"), ident="**"),
+        args=(left,),
+        kwargs=(),
+    )
+    right_unpack = Call(
+        span=span,
+        ty=DynType(name="dyn"),
+        func=Name(span=span, ty=DynType(name="dyn"), ident="**"),
+        args=(right,),
+        kwargs=(),
+    )
+    formals = (
+        Arg(name="a", annotation=DynType(name="dyn"), default=None, kind="pos"),
+        Arg(name="b", annotation=DynType(name="dyn"), default=None, kind="pos"),
+        Arg(name="c", annotation=DynType(name="dyn"), default=None, kind="pos"),
+    )
+
+    resolved = resolver._resolve_call_kwargs(
+        (first, left_unpack, right_unpack),
+        (),
+        formals,
+    )
+
+    assert resolved[0] is first
+    assert isinstance(resolved[1], Subscript)
+    assert isinstance(resolved[2], Subscript)
+    assert isinstance(resolved[1].obj, DictExpr)
+    assert resolved[1].obj is resolved[2].obj
+    assert [pair[1] for pair in resolved[1].obj.pairs] == [left, right]
+
+
+def test_parser_style_starstar_kwargs_merge_for_missing_formals():
+    resolver = _Resolver()
+    span = None
+    first = Name(span=span, ty=DynType(name="dyn"), ident="first")
+    left = Name(span=span, ty=DynType(name="dyn"), ident="left")
+    right = Name(span=span, ty=DynType(name="dyn"), ident="right")
+    formals = (
+        Arg(name="a", annotation=DynType(name="dyn"), default=None, kind="pos"),
+        Arg(name="b", annotation=DynType(name="dyn"), default=None, kind="pos"),
+        Arg(name="c", annotation=DynType(name="dyn"), default=None, kind="pos"),
+    )
+
+    resolved = resolver._resolve_call_kwargs(
+        (first,),
+        (("**", left), ("**", right)),
+        formals,
+    )
+
+    assert resolved[0] is first
+    assert isinstance(resolved[1], Subscript)
+    assert isinstance(resolved[2], Subscript)
+    assert isinstance(resolved[1].obj, DictExpr)
+    assert resolved[1].obj is resolved[2].obj
+    assert [pair[1] for pair in resolved[1].obj.pairs] == [left, right]
+
+
+def test_multiple_legacy_starstar_kwargs_split_to_splat_dict():
+    resolver = _Resolver()
+    span = None
+    first = Name(span=span, ty=DynType(name="dyn"), ident="first")
+    left = Name(span=span, ty=DynType(name="dyn"), ident="left")
+    right = Name(span=span, ty=DynType(name="dyn"), ident="right")
+    left_unpack = Call(
+        span=span,
+        ty=DynType(name="dyn"),
+        func=Name(span=span, ty=DynType(name="dyn"), ident="**"),
+        args=(left,),
+        kwargs=(),
+    )
+    right_unpack = Call(
+        span=span,
+        ty=DynType(name="dyn"),
+        func=Name(span=span, ty=DynType(name="dyn"), ident="**"),
+        args=(right,),
+        kwargs=(),
+    )
+
+    split = resolver._split_starstar_kwargs_unpack(
+        (first, left_unpack, right_unpack)
+    )
+
+    assert split is not None
+    positional, kwargs_expr = split
+    assert positional == (first,)
+    assert isinstance(kwargs_expr, DictExpr)
+    assert len(kwargs_expr.pairs) == 2
 
 
 def test_pcc1_starred_unknown_positional_uses_required_args(tmp_path):

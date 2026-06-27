@@ -16,14 +16,15 @@ def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
         str(src),
         str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
+        libpython_mode="auto",
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _function_body(ir_text: str, fn_name_suffix: str) -> str | None:
@@ -95,6 +96,7 @@ def test_cpython_str_result_equality_bridges_to_native_compare():
     body = _function_body(ir, "f")
     assert body is not None
     assert "@py_cpy_to_pcc_obj" in body, body
-    assert "@py_obj_eq" in body, body
+    assert "@py_obj_type_tag" in body, body
+    assert "@py_str_eq" in body, body
     assert "cpy.fn.__eq__" not in body, body
     assert "cpy.attr.__eq__" not in body, body

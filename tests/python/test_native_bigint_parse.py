@@ -58,7 +58,7 @@ def test_bigint_literal_and_int_str(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).splitlines() == [
         "123456789012345678901234567890",
@@ -69,4 +69,25 @@ def test_bigint_literal_and_int_str(tmp_path, monkeypatch):
         "255 1295",
         "1180591620717411303424",
         "1000000000000000000000000000001",
+    ]
+
+
+def test_sum_preserves_bignum_accumulator(tmp_path, monkeypatch):
+    src = tmp_path / "bigint_sum.py"
+    exe = tmp_path / "bigint_sum.out"
+    program = textwrap.dedent("""
+        def main() -> None:
+            print(sum([10**18] * 100))
+            print(sum([10**30, 10**30, 1]))
+            print(sum([10**18] * 3, 10**18))
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip()
+    src.write_text(program, encoding="utf-8")
+    _compile(monkeypatch, src, exe)
+    assert _run(exe).splitlines() == [
+        "100000000000000000000",
+        "2000000000000000000000000000001",
+        "4000000000000000000",
     ]

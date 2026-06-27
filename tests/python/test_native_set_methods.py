@@ -48,3 +48,46 @@ def test_set_methods(tmp_path):
         "True", "False", "True", "True", "False",
         "[1, 2, 3]", "[1, 2, 3]",
     ], out
+
+
+def test_set_pop_static_dynamic_and_empty(tmp_path):
+    out = _run(tmp_path,
+        "def main():\n"
+        "    s = {42}\n"
+        "    print(s.pop())\n"
+        "    print(len(s))\n"
+        "    t = {7}\n"
+        "    fn = getattr(t, 'pop')\n"
+        "    print(fn())\n"
+        "    print(len(t))\n"
+        "    try:\n"
+        "        t.pop()\n"
+        "    except KeyError:\n"
+        "        print('empty')\n"
+        "main()\n")
+    assert out.split("\n")[:5] == ["42", "0", "7", "0", "empty"], out
+
+
+def test_set_comparison_operators(tmp_path):
+    """``<=``/``>=`` (subset/superset) and ``<``/``>`` (proper) operators.
+    Set ordering is a PARTIAL order, so py_obj_le/lt/gt/ge special-case
+    SET&&SET to py_set_issubset/issuperset instead of the total 3-way compare
+    (which made ``<=`` always True and ``<`` always False)."""
+    out = _run(tmp_path,
+        "def main():\n"
+        "    print({1, 2} <= {1, 2, 3})\n"      # True
+        "    print({1, 2, 3} <= {1, 2})\n"      # False
+        "    print({1, 2} <= {1, 2})\n"         # True
+        "    print({1, 2} < {1, 2, 3})\n"       # True
+        "    print({1, 2} < {1, 2})\n"          # False
+        "    print({1, 2, 3} >= {1, 2})\n"      # True
+        "    print({1, 2} >= {1, 2, 3})\n"      # False
+        "    print({1, 2, 3} > {1, 2})\n"       # True
+        "    print({1, 2} > {1, 2})\n"          # False
+        "    print({1, 2} <= {2, 3})\n"         # False (incomparable)
+        "    print({1, 2} >= {2, 3})\n"         # False (incomparable)
+        "main()\n")
+    assert out.split("\n")[:11] == [
+        "True", "False", "True", "True", "False",
+        "True", "False", "True", "False", "False", "False",
+    ], out

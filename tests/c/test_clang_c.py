@@ -9,7 +9,7 @@ from tests.clang_c_cases import compile_native, compile_pcc, run_native, run_pcc
 REPO_ROOT = Path(__file__).absolute().parents[2]
 CLANG_C_TESTS_DIR = REPO_ROOT / "projects" / "clang-c-tests"
 CLANG_C_MANIFEST_PATH = REPO_ROOT / "tests" / "clang_c_manifest.json"
-CLANG_C_MANIFEST = json.loads(CLANG_C_MANIFEST_PATH.read_text())
+CLANG_C_MANIFEST = json.loads(CLANG_C_MANIFEST_PATH.read_text(encoding="utf-8"))
 
 CLANG_C_COMPILE_ONLY_SUCCESS_CASES = CLANG_C_MANIFEST.get("compile_only_success", [])
 CLANG_C_COMPILE_ONLY_BOTH_FAIL_CASES = CLANG_C_MANIFEST.get("compile_only_both_fail", [])

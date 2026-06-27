@@ -19,7 +19,6 @@ from tests.self_backend_c_testsuite_common import (
     REPO_ROOT,
     assert_result_triplet_matches,
     c_testsuite_case_path,
-    cases_with_expected_output,
     exact_match_cases,
 )
 
@@ -27,7 +26,8 @@ from tests.self_backend_c_testsuite_common import (
 # manifest, so keep the repository-scale gate at full width instead of a
 # curated prefix bucket.
 C_TESTSUITE_SELF_BACKEND_EXACT_MATCH_CASES = exact_match_cases()
-C_TESTSUITE_SELF_BACKEND_DIFFERENTIAL_CASES = C_TESTSUITE_SELF_BACKEND_EXACT_MATCH_CASES
+
+pytestmark = pytest.mark.integration
 
 
 def _case_params(cases):
@@ -81,49 +81,25 @@ def _run_backend(
 @pytest.mark.parametrize(
     "filename", _case_params(C_TESTSUITE_SELF_BACKEND_EXACT_MATCH_CASES)
 )
-def test_c_testsuite_self_backend_runtime_matches_native_exactly(filename):
+def test_c_testsuite_self_backend_matches_native_llvm_and_expected(filename):
     case_path = c_testsuite_case_path(filename)
     assert case_path.is_file(), f"missing c-testsuite case: {case_path}"
 
     native_result = run_native(case_path, REPO_ROOT)
+    llvm_result = _run_llvm_backend(case_path)
     self_result = _run_self_backend(case_path)
 
     assert_result_triplet_matches(
         filename, "self", self_result, "native", native_result
     )
-
-
-@pytest.mark.parametrize(
-    "filename", _case_params(C_TESTSUITE_SELF_BACKEND_DIFFERENTIAL_CASES)
-)
-def test_c_testsuite_self_backend_matches_llvm_on_exact_match_bucket(filename):
-    case_path = c_testsuite_case_path(filename)
-    assert case_path.is_file(), f"missing c-testsuite case: {case_path}"
-
-    llvm_result = _run_llvm_backend(case_path)
-    self_result = _run_self_backend(case_path)
-
     assert_result_triplet_matches(filename, "self", self_result, "llvm", llvm_result)
-
-
-C_TESTSUITE_SELF_BACKEND_CASES_WITH_EXPECTED_OUTPUT = cases_with_expected_output(
-    C_TESTSUITE_SELF_BACKEND_EXACT_MATCH_CASES
-)
-
-
-@pytest.mark.parametrize(
-    "filename", _case_params(C_TESTSUITE_SELF_BACKEND_CASES_WITH_EXPECTED_OUTPUT)
-)
-def test_c_testsuite_self_backend_output_matches_expected_file(filename):
-    case_path = c_testsuite_case_path(filename)
     expected_output = read_expected_output(case_path)
-    self_result = _run_self_backend(case_path)
-
-    assert self_result.returncode == 0, (
-        f"{filename} self backend returned {self_result.returncode}:\n"
-        f"{self_result.stderr}"
-    )
-    assert self_result.stdout == expected_output, (
-        f"{filename} output vs .expected mismatch:\n"
-        f"expected={expected_output!r}\nself={self_result.stdout!r}"
-    )
+    if expected_output.strip():
+        assert self_result.returncode == 0, (
+            f"{filename} self backend returned {self_result.returncode}:\n"
+            f"{self_result.stderr}"
+        )
+        assert self_result.stdout == expected_output, (
+            f"{filename} output vs .expected mismatch:\n"
+            f"expected={expected_output!r}\nself={self_result.stdout!r}"
+        )

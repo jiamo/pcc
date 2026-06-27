@@ -19,14 +19,14 @@ def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
         str(src),
         str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _function_body(ir_text: str, fn_name_suffix: str) -> str | None:
@@ -103,6 +103,56 @@ def test_dict_pop_without_default_raises_keyerror(tmp_path):
     assert result.stdout == "KeyError\n"
 
 
+def test_dynamic_pop_attr_on_list_and_dict_no_libpython(
+    tmp_path,
+    monkeypatch,
+    pcc_py_runtime_archive,
+):
+    monkeypatch.setenv("PCC_RUNTIME_ARCHIVE", str(pcc_py_runtime_archive))
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "dynamic_pop_attr.py"
+    exe = tmp_path / "dynamic_pop_attr.out"
+    src.write_text(
+        textwrap.dedent("""
+            def pop_index(obj, idx):
+                fn = getattr(obj, "pop")
+                return fn(idx)
+
+            def pop_key(obj, key, default):
+                fn = getattr(obj, "pop")
+                return fn(key, default)
+
+            def main() -> None:
+                xs = ["a", "b"]
+                values = {"x": 1}
+                print(pop_index(xs, 0))
+                print(xs)
+                print(pop_key(values, "missing", 9))
+                print(pop_key(values, "x", 0))
+                print(values)
+
+            if __name__ == "__main__":
+                main()
+            """).lstrip(),
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+    )
+    result = subprocess.run(
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["a", "['b']", "9", "1", "{}"]
+
+
 @pytest.mark.parametrize("mode", ["off", "on"])
 def test_dict_clear_uses_native_runtime(mode):
     program = textwrap.dedent("""
@@ -154,3 +204,39 @@ def test_abc_imports_are_compile_time_only():
     assert "cpy.fromimport.abc" not in ir, ir
     assert "cpy.from.ABC" not in ir, ir
     assert "cpy.from.abstractmethod" not in ir, ir
+
+
+def test_dict_popitem_lifo_and_keyerror(tmp_path):
+    """``dict.popitem()`` removes+returns the LAST-inserted (key, value) pair
+    (insertion-ordered dicts), and raises KeyError when empty. Previously
+    unsupported (libpython fallback) on the no-libpython path."""
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "popitem.py"
+    src.write_text(textwrap.dedent("""
+        def main():
+            d = {}
+            d['x'] = 1
+            d['y'] = 2
+            d['z'] = 3
+            print(d.popitem())           # ('z', 3)  -- LIFO
+            print(d.popitem())           # ('y', 2)
+            print(sorted(d.items()))     # [('x', 1)]
+            print(d.popitem())           # ('x', 1)
+            print(len(d))                # 0
+            try:
+                d.popitem()
+                print("NO_RAISE")
+            except KeyError:
+                print("empty raises KeyError")
+        main()
+    """), encoding="utf-8")
+    exe = tmp_path / "popitem.out"
+    compile_python(str(src), str(exe), ir_scaffold_mode="on",
+                   libpython_mode="off", backend="self")
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == (
+        "('z', 3)\n('y', 2)\n[('x', 1)]\n('x', 1)\n0\n"
+        "empty raises KeyError\n"
+    ), r.stdout

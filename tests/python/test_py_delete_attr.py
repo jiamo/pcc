@@ -19,7 +19,7 @@ def test_delete_attribute_statement_compiles_no_libpython_self_backend(tmp_path)
         del wrapper.value
         print(hasattr(wrapper, "value"))
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "delete_attr.out"
     compile_python(
         str(src),

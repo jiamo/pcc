@@ -69,7 +69,7 @@ def test_valueclass_compiles_and_keeps_frozen_semantics(tmp_path):
         "    y: int\n"
         "p = Point(4, 5)\n"
         "print(p.x + p.y)\n"
-    )
+    , encoding="utf-8")
     compile_python(str(src), str(exe), libpython_mode="off", ir_scaffold_mode="on")
     proc = subprocess.run([str(exe)], text=True, capture_output=True, check=True, timeout=30)
     assert proc.stdout.strip() == "9"
@@ -79,7 +79,8 @@ def test_value_model_status_distinguishes_implementation_from_scaffolding():
     status = value_model_status()
     assert (
         status["implemented_through"]
-        == "V1-direct-scalar-payload-checked-marshal-eq-v2-pointer-boundary-partial"
+        == "V1-direct-scalar-and-nested-payload-eq-checked-marshal-"
+        "v2-pointer-and-nested-dyn-boundary-partial"
     )
     assert status["scaffolding_through"] == "V6"
     assert status["production_runtime"] is False
@@ -95,6 +96,10 @@ def test_value_model_status_distinguishes_implementation_from_scaffolding():
         "V1 direct method receiver payload ABI for scalar-field valueclasses"
     )
     v1_payload_eq = "V1 fieldwise equality for direct scalar-field valueclass payloads"
+    v1_nested_payload_eq = (
+        "V1 recursive fieldwise equality for non-recursive nested valueclass "
+        "direct payloads"
+    )
     v1_payload_box = (
         "V1 scalar-field value payload to ordinary pcc object boxing at "
         "Dyn/object boundaries"
@@ -110,14 +115,24 @@ def test_value_model_status_distinguishes_implementation_from_scaffolding():
     v1_recursive_reject = (
         "V1 diagnostics rejecting recursive and mutually-recursive valueclass payloads"
     )
+    v2_nested_dyn_return = (
+        "V2 selected nested valueclass constructor returns to Any/Dyn through "
+        "ValueBox projection"
+    )
     assert v1_local_payload in status["implemented"]
     assert v1_arg_return_payload in status["implemented"]
     assert v1_method_receiver in status["implemented"]
     assert v1_payload_eq in status["implemented"]
+    assert v1_nested_payload_eq in status["implemented"]
+    assert (
+        "V1 non-recursive nested valueclass direct payload ABI for focused typed calls/returns"
+        in status["implemented"]
+    )
     assert v1_payload_box in status["implemented"]
     assert v1_payload_unbox in status["implemented"]
     assert v1_payload_checked_unbox in status["implemented"]
     assert v1_recursive_reject in status["implemented"]
+    assert v2_nested_dyn_return in status["implemented"]
     assert "C runtime PyValueBox object and GC tracing" in status["implemented"]
     migrations = migrated_value_model_hot_objects()
     assert {m.name for m in migrations} >= {"SourceSpan", "ValuePayload"}

@@ -372,6 +372,24 @@ def test_system_cpp_normalizes_choose_expr_malloc_abs_and_sync_add_fetch():
     ), f"builtin macro compat failed:\n{result.stdout}\n{result.stderr}"
 
 
+def test_llabs_builtin_shadowing_does_not_call_later_abort_definition():
+    source = r"""
+        long long a = -1;
+        long long llabs(long long);
+        void abort(void);
+
+        int main(void) {
+            return llabs(a) == 1 ? 0 : 1;
+        }
+
+        long long llabs(long long b) {
+            abort();
+        }
+    """
+
+    assert _evaluate(source, optimize=False) == 0
+
+
 def test_builtin_overflow_helpers_track_result_and_flag():
     source = r"""
         int main(void) {
@@ -813,6 +831,23 @@ def test_system_cpp_normalizes_asm_volatile_and_simple_range_designators():
     assert (
         result.returncode == 0
     ), f"asm/range-designator compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_c23_fixed_width_enum_base_is_accepted_after_preprocessing():
+    source = r"""
+        typedef unsigned int uint32_t;
+        typedef enum : uint32_t {
+            FLAG_A = 1,
+            FLAG_B = 2,
+        } flags_t;
+
+        int main(void) {
+            flags_t f = FLAG_B;
+            return f == 2 ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source, optimize=False) == 0
 
 
 def test_file_scope_struct_with_floats_and_bitfields_keeps_custom_layout():
@@ -1353,6 +1388,79 @@ def test_system_cpp_normalizes_atomic_type_sugar():
     ), f"_Atomic compat failed:\n{result.stdout}\n{result.stderr}"
 
 
+def test_fake_stdatomic_header_lowers_c11_operations_to_supported_builtins():
+    source = r"""
+        #include <stdatomic.h>
+
+        static atomic_flag lock = ATOMIC_FLAG_INIT;
+        static _Atomic(long long) counter = 0;
+
+        int main(void) {
+            if (atomic_flag_test_and_set_explicit(
+                    &lock, memory_order_acquire) != 0) return 1;
+            atomic_flag_clear_explicit(&lock, memory_order_release);
+            if (atomic_flag_test_and_set(&lock) != 0) return 2;
+            atomic_flag_clear(&lock);
+
+            if (atomic_fetch_add_explicit(
+                    &counter, 3, memory_order_relaxed) != 0) return 3;
+            if (atomic_load_explicit(
+                    &counter, memory_order_acquire) != 3) return 4;
+            atomic_store_explicit(&counter, 7, memory_order_release);
+            if (atomic_load(&counter) != 7) return 5;
+            return 0;
+        }
+    """
+
+    result = _run_with_system_link(source)
+
+    assert (
+        result.returncode == 0
+    ), f"stdatomic compat failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_large_struct_assignment_uses_bounded_aggregate_copy_ir():
+    source = r"""
+        struct Big {
+            int start;
+            int patch[4096];
+            int end;
+        };
+
+        static struct Big source_value;
+        static struct Big dest_value;
+
+        static int copy_and_sum(struct Big *dest, struct Big *source) {
+            *dest = *source;
+            return dest->start + dest->patch[0] +
+                   dest->patch[4095] + dest->end;
+        }
+
+        int main(void) {
+            source_value.start = 3;
+            source_value.patch[0] = 5;
+            source_value.patch[4095] = 7;
+            source_value.end = 11;
+            return copy_and_sum(&dest_value, &source_value) == 26 ? 0 : 1;
+        }
+    """
+
+    evaluator = CEvaluator()
+    unit = TranslationUnit("large_struct_copy.c", "/dev/null", source)
+    compiled = evaluator.compile_translation_units(
+        [unit], base_dir="/tmp", use_compile_cache=False
+    )
+    ir_text = compiled[0][1]
+
+    assert "llvm.memmove.p0.p0.i64" in ir_text
+    assert ir_text.count("extractvalue") < 64
+
+    result = evaluator.run_compiled_translation_units_with_system_cc(
+        compiled, optimize=True
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_gcc_atomic_fetch_and_lock_builtins_lower_to_llvm_atomics():
     source = r"""
         int main(void) {
@@ -1379,6 +1487,7 @@ def test_gcc_atomic_fetch_and_lock_builtins_lower_to_llvm_atomics():
             if (__atomic_load_n(&lock, __ATOMIC_ACQUIRE) == 0) return 10;
             __atomic_clear(&lock, __ATOMIC_RELEASE);
             if (__atomic_load_n(&lock, __ATOMIC_ACQUIRE) != 0) return 11;
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
             return 0;
         }
     """

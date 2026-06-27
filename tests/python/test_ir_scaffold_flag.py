@@ -30,7 +30,7 @@ def simple_py_src(tmp_path):
             print(add(3, 4))
             """
         )
-    )
+    , encoding="utf-8")
     return str(src)
 
 

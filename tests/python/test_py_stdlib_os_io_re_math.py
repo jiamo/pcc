@@ -18,6 +18,16 @@ def test_os_path_string_helpers():
     assert p.commonpath(["a/b/c", "a/b/d"]) == "a/b"
 
 
+def test_os_fspath_protocol():
+    class PathLikeImpl(pcc_os.PathLike):
+        def __fspath__(self):
+            return "/tmp/value"
+
+    assert pcc_os.fspath("/tmp/plain") == "/tmp/plain"
+    assert pcc_os.fspath(b"/tmp/bytes") == b"/tmp/bytes"
+    assert pcc_os.fspath(PathLikeImpl()) == "/tmp/value"
+
+
 def test_stringio_and_bytesio_seek_tell_readline():
     s = io.StringIO("hello\nworld")
     assert s.readline() == "hello\n"
@@ -53,4 +63,5 @@ def test_math_non_extern_helpers():
     assert math.copysign(2.0, -1.0) == -2.0
     assert math.prod([2, 3, 4]) == 24
     assert math.factorial(5) == 120
+    assert math.gcd(84, -30) == 6
     assert round(math.radians(180.0), 6) == round(math.pi, 6)

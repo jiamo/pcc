@@ -19,7 +19,7 @@ def test_pep604_type_union_expression_compiles_self_backend(tmp_path):
         Alias = Left | Right
         print("ok")
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "typing_union_expr.out"
     compile_python(
         str(src),

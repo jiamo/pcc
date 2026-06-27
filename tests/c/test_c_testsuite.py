@@ -8,19 +8,20 @@ from tests.c_testsuite_cases import read_expected_output, run_native, run_pcc
 REPO_ROOT = Path(__file__).absolute().parents[2]
 C_TESTSUITE_DIR = REPO_ROOT / "projects" / "c-testsuite"
 C_TESTSUITE_MANIFEST_PATH = REPO_ROOT / "tests" / "c_testsuite_manifest.json"
-C_TESTSUITE_MANIFEST = json.loads(C_TESTSUITE_MANIFEST_PATH.read_text())
+C_TESTSUITE_MANIFEST = json.loads(C_TESTSUITE_MANIFEST_PATH.read_text(encoding="utf-8"))
 
 C_TESTSUITE_RUNTIME_EXACT_MATCH_CASES = C_TESTSUITE_MANIFEST.get(
     "runtime_exact_match", []
 )
-C_TESTSUITE_RUNTIME_SUCCESS_CASES = (
-    C_TESTSUITE_RUNTIME_EXACT_MATCH_CASES
-    + C_TESTSUITE_MANIFEST.get("runtime_returncode_match_only", [])
+C_TESTSUITE_RUNTIME_RETURNCODE_CASES = C_TESTSUITE_MANIFEST.get(
+    "runtime_returncode_match_only", []
 )
 C_TESTSUITE_RUNTIME_NATIVE_PASS_PCC_FAIL_CASES = C_TESTSUITE_MANIFEST.get(
     "runtime_native_pass_pcc_fail", []
 )
 C_TESTSUITE_RUNTIME_TIMEOUT_CASES = C_TESTSUITE_MANIFEST.get("runtime_timeout", [])
+
+pytestmark = pytest.mark.integration
 
 
 def _case_params(cases):
@@ -37,8 +38,8 @@ def _case_path(filename: str) -> Path:
     return C_TESTSUITE_DIR / filename
 
 
-@pytest.mark.parametrize("filename", _case_params(C_TESTSUITE_RUNTIME_SUCCESS_CASES))
-def test_c_testsuite_runtime_succeeds_under_native_and_pcc(filename):
+@pytest.mark.parametrize("filename", _case_params(C_TESTSUITE_RUNTIME_RETURNCODE_CASES))
+def test_c_testsuite_runtime_returncode_matches_native(filename):
     case_path = _case_path(filename)
     assert case_path.is_file(), f"missing c-testsuite case: {case_path}"
 
@@ -69,6 +70,12 @@ def test_c_testsuite_runtime_matches_native_exactly(filename):
     assert (
         pcc_result.stderr == native_result.stderr
     ), f"{filename} stderr mismatch:\nnative={native_result.stderr!r}\npcc={pcc_result.stderr!r}"
+    expected_output = read_expected_output(case_path)
+    if expected_output.strip():
+        assert pcc_result.stdout == expected_output, (
+            f"{filename} output vs .expected mismatch:\n"
+            f"expected={expected_output!r}\npcc={pcc_result.stdout!r}"
+        )
 
 
 if C_TESTSUITE_RUNTIME_NATIVE_PASS_PCC_FAIL_CASES:
@@ -87,30 +94,6 @@ if C_TESTSUITE_RUNTIME_NATIVE_PASS_PCC_FAIL_CASES:
             native_result.returncode == 0
         ), f"native runtime unexpectedly rejected {filename}:\n{native_result.stderr}"
         assert pcc_result.returncode != 0, f"pcc unexpectedly accepted {filename}"
-
-
-C_TESTSUITE_CASES_WITH_EXPECTED_OUTPUT = [
-    filename
-    for filename in C_TESTSUITE_RUNTIME_EXACT_MATCH_CASES
-    if read_expected_output(_case_path(filename)).strip()
-]
-
-
-@pytest.mark.parametrize(
-    "filename", _case_params(C_TESTSUITE_CASES_WITH_EXPECTED_OUTPUT)
-)
-def test_c_testsuite_pcc_output_matches_expected_file(filename):
-    case_path = _case_path(filename)
-    expected_output = read_expected_output(case_path)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
-
-    assert (
-        pcc_result.returncode == 0
-    ), f"{filename} pcc returned {pcc_result.returncode}:\n{pcc_result.stderr}"
-    assert pcc_result.stdout == expected_output, (
-        f"{filename} output vs .expected mismatch:\n"
-        f"expected={expected_output!r}\npcc={pcc_result.stdout!r}"
-    )
 
 
 def test_c_testsuite_runtime_timeout_cases_are_explicitly_tracked():

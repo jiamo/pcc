@@ -9,7 +9,7 @@ from tests import c_testsuite_cases
 
 def test_run_native_uses_longer_timeout_under_xdist(monkeypatch, tmp_path):
     case_path = tmp_path / "case.c"
-    case_path.write_text("int main(void) { return 0; }\n")
+    case_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
     timeouts = []
 
     def fake_run(args, **kwargs):
@@ -29,7 +29,7 @@ def test_run_native_uses_longer_timeout_under_xdist(monkeypatch, tmp_path):
 
 def test_run_pcc_uses_longer_timeout_under_xdist(monkeypatch, tmp_path):
     case_path = tmp_path / "case.c"
-    case_path.write_text("int main(void) { return 0; }\n")
+    case_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
     captured = {}
 
     def fake_run_worker_process(target, args, timeout):

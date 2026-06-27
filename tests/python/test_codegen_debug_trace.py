@@ -6,10 +6,12 @@ from pathlib import Path
 
 import pytest
 
+from pcc.diagnostics import DiagnosticSpan
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 from pcc.parse.py_lift import parse_and_lift
 from pcc.py_frontend import type_infer
 from pcc.py_frontend.codegen import layer1
+from pcc.py_frontend.codegen.errors import CodegenDiagnosticError
 
 
 REPO = Path(__file__).absolute().parents[2]
@@ -40,10 +42,12 @@ def _build_codegen(source: str) -> layer1.L1CodeGen:
 def test_codegen_trace_breadcrumb_and_boundary_context(monkeypatch, capfd):
     monkeypatch.setenv("PCC_DEBUG_CODEGEN_PHASES", "1")
     cg = _build_codegen(_UNSUPPORTED_SOURCE)
-    with pytest.raises(Exception):
+    with pytest.raises(CodegenDiagnosticError) as caught:
         cg.generate(cg.ast_module)
     err = capfd.readouterr().err
 
+    assert caught.value.diagnostic_span == DiagnosticSpan("<test>", 4, 1, 4, 1)
+    assert caught.value.original_exception_type == "ScaffoldUnsupportedError"
     assert "PCC_CODEGEN_EXCEPTION type=ScaffoldUnsupportedError" in err
     assert "PCC_CODEGEN_EXCEPTION_CONTEXT" in err
     assert "expr_kind=Call" in err
@@ -68,10 +72,10 @@ def test_codegen_trace_disabled_is_quiet(monkeypatch, capfd):
 def test_codegen_trace_no_host_pcc1_enabled(tmp_path):
     pcc1 = _find_current_pcc1()
     source = tmp_path / "bad_codegen.py"
-    source.write_text(_UNSUPPORTED_SOURCE)
+    source.write_text(_UNSUPPORTED_SOURCE, encoding="utf-8")
     exe = tmp_path / "bad_codegen.out"
     env = os.environ.copy()
-    env["PCC_HOST_PYTHON"] = "/bin/false"
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     env["PCC_DEBUG_CODEGEN_PHASES"] = "1"
 
     proc = subprocess.run(
@@ -91,9 +95,7 @@ def test_codegen_trace_no_host_pcc1_enabled(tmp_path):
 
     assert proc.returncode != 0
     err = proc.stderr
-    assert "PCC_CODEGEN_EXCEPTION type=ScaffoldUnsupportedError" in err
-    assert "PCC_CODEGEN_EXCEPTION_CONTEXT" in err
-    assert "PCC_CODEGEN_BREADCRUMB" in err
-    assert "expr_kind=Call" in err
-    assert "stmt_index=0" in err
-    assert "function=f" in err
+    assert "PCC-PY-COMPILE-001" in err
+    assert "ir.Argument has no scaffold lowering yet" in err
+    assert "exception_type=" in err
+    assert f"{source}:4:1: error: PCC-PY-COMPILE-001" in err

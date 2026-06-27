@@ -56,7 +56,7 @@ def test_print_dict_repr_matches_cpython(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     # Reference output is exactly CPython's repr for these values.
     assert _run(exe).splitlines() == [
@@ -94,7 +94,7 @@ def test_str_repr_of_containers_and_float(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).splitlines() == [
         "[1, 2]",
@@ -132,7 +132,7 @@ def test_bytes_str_repr_matches_cpython(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     import sys
     cpython = subprocess.run(
@@ -160,7 +160,7 @@ def test_set_repr_matches_cpython(tmp_path, monkeypatch):
         if __name__ == "__main__":
             main()
         """).lstrip()
-    src.write_text(program)
+    src.write_text(program, encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).splitlines() == [
         "set()",

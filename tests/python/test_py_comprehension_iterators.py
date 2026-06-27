@@ -47,7 +47,7 @@ values = [0 for _ in range(3)]
 print(len(values))
 print(values[2])
 """
-    )
+    , encoding="utf-8")
     exe = tmp_path / "comp_range_discard_rebind.out"
     compile_python(str(src), str(exe), libpython_mode="off", ir_scaffold_mode="on")
     out = subprocess.check_output([str(exe)], text=True).splitlines()
@@ -64,7 +64,7 @@ values = [k for k in range(3)]
 print(len(values))
 print(values[2])
 """
-    )
+    , encoding="utf-8")
     exe = tmp_path / "comp_range_named_rebind.out"
     compile_python(str(src), str(exe), libpython_mode="off", ir_scaffold_mode="on")
     out = subprocess.check_output([str(exe)], text=True).splitlines()

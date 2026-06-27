@@ -11,6 +11,7 @@ Reference contract (from CPython):
   * ``lambda`` is an inline anonymous ``def``
   * closures capture enclosing locals by reference
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -24,14 +25,19 @@ def _compile(monkeypatch, src: Path, exe: Path) -> None:
     from pcc.py_frontend.pipeline import compile_python
 
     compile_python(
-        str(src), str(exe),
-        ir_scaffold_mode="on", libpython_mode="off",
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
     )
 
 
 def _run(exe: Path, timeout: float = 30.0) -> str:
     result = subprocess.run(
-        [str(exe)], capture_output=True, text=True, timeout=timeout,
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
     )
     assert result.returncode == 0, (
         f"{exe.name} exited {result.returncode}\n"
@@ -43,7 +49,8 @@ def _run(exe: Path, timeout: float = 30.0) -> str:
 def test_default_args_basic(tmp_path, monkeypatch):
     src = tmp_path / "fn_default.py"
     exe = tmp_path / "fn_default.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def greet(name: str = "world") -> str:
             return "hello " + name
 
@@ -53,7 +60,9 @@ def test_default_args_basic(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["hello world", "hello pcc"]
 
@@ -61,7 +70,8 @@ def test_default_args_basic(tmp_path, monkeypatch):
 def test_keyword_args(tmp_path, monkeypatch):
     src = tmp_path / "fn_kwargs.py"
     exe = tmp_path / "fn_kwargs.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def f(a: int, b: int, c: int = 0) -> int:
             return a * 100 + b * 10 + c
 
@@ -73,7 +83,9 @@ def test_keyword_args(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["120", "123", "123", "120"]
 
@@ -81,7 +93,8 @@ def test_keyword_args(tmp_path, monkeypatch):
 def test_lambda_basic(tmp_path, monkeypatch):
     src = tmp_path / "fn_lambda.py"
     exe = tmp_path / "fn_lambda.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             sq = lambda x: x * x
             print(sq(3))
@@ -91,7 +104,9 @@ def test_lambda_basic(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["9", "49", "30"]
 
@@ -99,7 +114,8 @@ def test_lambda_basic(tmp_path, monkeypatch):
 def test_closure_capture(tmp_path, monkeypatch):
     src = tmp_path / "fn_closure.py"
     exe = tmp_path / "fn_closure.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def make_adder(n: int):
             def add(x: int) -> int:
                 return x + n
@@ -114,15 +130,57 @@ def test_closure_capture(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["8", "13", "5"]
+
+
+def test_nested_function_default_captures_enclosing_parameter(tmp_path, monkeypatch):
+    src = tmp_path / "fn_nested_default.py"
+    exe = tmp_path / "fn_nested_default.out"
+    src.write_text(
+        textwrap.dedent("""
+            def outer(value):
+                def inner(delta, saved=value):
+                    return saved + delta
+                return inner(2)
+
+            print(outer(40))
+            """).lstrip(),
+        encoding="utf-8",
+    )
+    _compile(monkeypatch, src, exe)
+    assert _run(exe).strip() == "42"
+
+
+def test_nested_function_defaults_are_fresh_per_def_execution(tmp_path, monkeypatch):
+    src = tmp_path / "fn_nested_default_fresh.py"
+    exe = tmp_path / "fn_nested_default_fresh.out"
+    src.write_text(
+        textwrap.dedent("""
+            def make_reader(value):
+                def read(saved=value):
+                    return saved
+                return read
+
+            first = make_reader("first")
+            second = make_reader("second")
+            print(first())
+            print(second())
+            """).lstrip(),
+        encoding="utf-8",
+    )
+    _compile(monkeypatch, src, exe)
+    assert _run(exe).strip().splitlines() == ["first", "second"]
 
 
 def test_recursion_basic(tmp_path, monkeypatch):
     src = tmp_path / "fn_rec.py"
     exe = tmp_path / "fn_rec.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def fact(n: int) -> int:
             if n <= 1:
                 return 1
@@ -136,7 +194,9 @@ def test_recursion_basic(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1", "1", "120", "3628800"]
 
@@ -144,7 +204,8 @@ def test_recursion_basic(tmp_path, monkeypatch):
 def test_mutual_recursion(tmp_path, monkeypatch):
     src = tmp_path / "fn_mutrec.py"
     exe = tmp_path / "fn_mutrec.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def is_even(n: int) -> bool:
             if n == 0:
                 return True
@@ -162,7 +223,9 @@ def test_mutual_recursion(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True", "False", "True"]
 
@@ -170,7 +233,8 @@ def test_mutual_recursion(tmp_path, monkeypatch):
 def test_function_returns_function(tmp_path, monkeypatch):
     src = tmp_path / "fn_higher.py"
     exe = tmp_path / "fn_higher.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def compose(f, g):
             def composed(x: int) -> int:
                 return f(g(x))
@@ -186,14 +250,18 @@ def test_function_returns_function(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["8", "7"]
+
 
 def test_args_splat_at_callsite(tmp_path, monkeypatch):
     src = tmp_path / "fn_splat.py"
     exe = tmp_path / "fn_splat.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def f(a: int, b: int, c: int) -> int:
             return a + b + c
 
@@ -203,14 +271,18 @@ def test_args_splat_at_callsite(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "6"
+
 
 def test_decorator_runtime_effect(tmp_path, monkeypatch):
     src = tmp_path / "fn_decorator.py"
     exe = tmp_path / "fn_decorator.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def trace(fn):
             def wrapper(x: int) -> int:
                 print("before")
@@ -228,6 +300,8 @@ def test_decorator_runtime_effect(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["before", "after", "10"]

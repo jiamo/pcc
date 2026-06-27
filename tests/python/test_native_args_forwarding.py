@@ -63,3 +63,32 @@ def test_direct_and_fixed_regression(tmp_path):
         "    print(fixed(1, 2, 3))\n"    # 6
         "main()\n")
     assert out.split("\n")[:4] == ["6", "0", "15", "6"], out
+
+
+def test_runtime_splat_tuple_materialization_is_helper_call(tmp_path, monkeypatch):
+    monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
+    monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "p.py"
+    ll = tmp_path / "p.ll"
+    src.write_text(
+        "def g(*args):\n"
+        "    return args[0] + args[1]\n"
+        "def main():\n"
+        "    xs = [1, 2]\n"
+        "    print(g(*xs))\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(src),
+        str(ll),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        emit_llvm_only=True,
+    )
+    ir_text = ll.read_text(encoding="utf-8")
+    assert "py_tuple_from_splat" in ir_text
+    assert "tuple.src.len" not in ir_text

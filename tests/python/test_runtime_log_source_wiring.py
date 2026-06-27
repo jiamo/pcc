@@ -15,8 +15,10 @@ def test_refcount_log_events_are_in_c_and_pcc_python_dispatch_layers():
     c_src = _read("src/py_obj.c")
     py_src = _read("py/py_obj.py")
     log_map = _read("src/pcc_runtime_log.c")
+    assert "pcc_obj_runtime_log_event_code" in c_src
+    assert "pcc_runtime_log_event_code(category, event, value0, value1, ptr)" in c_src
     for event_code in ("(3, 1", "(3, 2", "(3, 3"):
-        assert f"pcc_runtime_log_event_code{event_code}" in c_src
+        assert f"pcc_obj_runtime_log_event_code{event_code}" in c_src
         assert f"pcc_runtime_log_event_code{event_code}" in py_src
     for event in ("incref", "decref", "free"):
         assert f'return "{event}";' in log_map

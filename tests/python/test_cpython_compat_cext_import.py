@@ -15,7 +15,7 @@ libpython's real C-API wins. The no-libpython archive keeps the shim, so
 self-host is unaffected. See
 ``docs/investigations/python-cpython-compat-import-numpy-multiarray-init-fails.md``.
 
-This uses ``unicodedata`` — a stdlib C extension present in any CPython, so no
+This uses ``unicodedata`` - a stdlib C extension present in any CPython, so no
 third-party install is needed; the test compares the pcc cpython-compat binary's
 output against the same program under CPython (differential).
 """
@@ -53,7 +53,7 @@ def test_cpython_compat_imports_stdlib_c_extension(tmp_path):
 
             def main() -> None:
                 # category()/name() rely on attributes set by the extension's
-                # module-init (Py_mod_exec) slot — the part that failed when the
+                # module-init (Py_mod_exec) slot - the part that failed when the
                 # shim shadowed libpython's C-API.
                 print(unicodedata.category("A"))
                 print(unicodedata.name("A"))
@@ -61,7 +61,8 @@ def test_cpython_compat_imports_stdlib_c_extension(tmp_path):
             if __name__ == "__main__":
                 main()
             """
-        ).lstrip()
+        ).lstrip(),
+        encoding="utf-8",
     )
 
     compile_python(str(src), str(exe), libpython_mode="on")
@@ -96,18 +97,18 @@ def test_chained_cpython_call_method_dispatches_via_libpython(tmp_path):
     ``docs/investigations/python-cpython-compat-import-numpy-multiarray-init-fails.md``.
 
     Compile-only (``emit_llvm_only``): no numpy install or libpython link needed
-    — ``import numpy`` marks ``numpy`` as a CPython module at compile time.
+    - ``import numpy`` marks ``numpy`` as a CPython module at compile time.
     """
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "chain.py"
     out = tmp_path / "chain.ll"
-    src.write_text("import numpy\ndef f():\n    return numpy.arange(10).sum()\n")
+    src.write_text("import numpy\ndef f():\n    return numpy.arange(10).sum()\n", encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     # The chained ``.sum`` must dispatch via libpython (cpy attr constant +
     # py_cpy_getattr), NOT native py_obj_getattr on a CPython object.
     assert "@.cpy.attr.sum" in ir, "chained .sum should use the libpython method path"
@@ -127,12 +128,12 @@ def test_type_builtin_on_cpython_value_dispatches_via_libpython(tmp_path):
 
     src = tmp_path / "ty.py"
     out = tmp_path / "ty.ll"
-    src.write_text("import numpy\ndef f():\n    return type(numpy.arange(5))\n")
+    src.write_text("import numpy\ndef f():\n    return type(numpy.arange(5))\n", encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "@.cpy.attr.__class__" in ir, "type() of a cpy value should use libpython __class__"
     assert "py_cpy_getattr" in ir
 
@@ -155,19 +156,19 @@ def test_cpython_value_binary_op_dispatches_via_libpython(tmp_path):
         "def f():\n"
         "    a = numpy.arange(3)\n"
         "    return a + a\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "py_cpy_binop" in ir, "a + a on a cpy value should route to py_cpy_binop"
 
 
 def test_cpython_binop_receiver_method_dispatches_via_libpython(tmp_path):
     """A method call on a BINARY-OP result must use libpython's getattr.
 
-    Regression: ``(a + b).sum()`` on numpy arrays — ``a + b`` produces a real
+    Regression: ``(a + b).sum()`` on numpy arrays - ``a + b`` produces a real
     CPython object (``py_cpy_binop``), but ``.sum`` lowered to NATIVE
     ``py_obj_getattr`` because the method-call lowering did not recognise a
     ``BinOp`` receiver as cpy (only ``Name``/``Attr``/``Call`` were handled).
@@ -186,12 +187,12 @@ def test_cpython_binop_receiver_method_dispatches_via_libpython(tmp_path):
         "    a = numpy.arange(3)\n"
         "    b = numpy.arange(3)\n"
         "    return (a + b).sum()\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "@.cpy.attr.sum" in ir, "(a+b).sum() should use the libpython method path"
     assert "@.pyattr.sum" not in ir, "(a+b).sum() must NOT use native py_obj_getattr"
     assert "py_cpy_binop" in ir
@@ -215,12 +216,12 @@ def test_cpython_value_power_op_dispatches_via_libpython(tmp_path):
         "def f():\n"
         "    a = numpy.arange(3)\n"
         "    return a ** 2\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "py_cpy_binop" in ir, "a ** 2 on a cpy value should route to py_cpy_binop"
 
 
@@ -229,7 +230,7 @@ def test_cpython_subscript_receiver_method_dispatches_via_libpython(tmp_path):
 
     Regression: ``a[1:4].sum()`` on a numpy slice raised ``AttributeError: sum``
     because the method-call lowering recognised ``Call``/``BinOp`` receivers as
-    cpy but not ``Subscript`` — so ``.sum`` lowered to NATIVE ``py_obj_getattr``
+    cpy but not ``Subscript`` - so ``.sum`` lowered to NATIVE ``py_obj_getattr``
     on the real CPython slice object. The lowering now routes a ``Subscript``
     receiver (whose object is cpy via ``_expr_looks_cpython``) through the
     libpython method path; this also unblocked ``np.sum(a)``/``np.dot(b,b)``/
@@ -245,12 +246,12 @@ def test_cpython_subscript_receiver_method_dispatches_via_libpython(tmp_path):
         "def f():\n"
         "    a = numpy.arange(5)\n"
         "    return a[1:4].sum()\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "@.cpy.attr.sum" in ir, "a[1:4].sum() should use the libpython method path"
     assert "@.pyattr.sum" not in ir, "a[1:4].sum() must NOT use native py_obj_getattr"
 
@@ -259,7 +260,7 @@ def test_cpython_value_matmul_op_dispatches_via_libpython(tmp_path):
     """The matmul operator ``@`` on a CPython value must use libpython.
 
     Regression: ``a @ b`` on numpy arrays raised ``TypeError: unsupported
-    operand type(s) for @`` — pcc lowered ``@`` to the native ``__matmul__``
+    operand type(s) for @`` - pcc lowered ``@`` to the native ``__matmul__``
     protocol (``py_user_matmul_dispatch``) on the real CPython object. ``a @ b``
     now routes through ``py_cpy_binop`` op 7 -> libpython
     ``PyNumber_MatrixMultiply``. Completes the cpy binary operator set
@@ -274,12 +275,12 @@ def test_cpython_value_matmul_op_dispatches_via_libpython(tmp_path):
         "def f():\n"
         "    a = numpy.arange(4)\n"
         "    return a @ a\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "py_cpy_binop" in ir, "a @ a on a cpy value should route to py_cpy_binop"
 
 
@@ -305,12 +306,12 @@ def test_cpython_augassign_on_cpython_name_dispatches_via_libpython(tmp_path):
         "    a = numpy.ones(3)\n"
         "    a += 2\n"
         "    return a\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "py_cpy_binop" in ir, "a += 2 on a cpy name should route to py_cpy_binop"
 
 
@@ -318,7 +319,7 @@ def test_cpython_deep_chain_method_dispatches_via_libpython(tmp_path):
     """A method call on a DEEP CPython call chain must use libpython.
 
     Regression: ``numpy.arange(4).reshape(2, 2).sum()`` raised ``AttributeError:
-    sum`` — the ``.sum()`` receiver is ``...reshape(2, 2)``, a ``Call`` whose
+    sum`` - the ``.sum()`` receiver is ``...reshape(2, 2)``, a ``Call`` whose
     callable is ``(Call).reshape`` (its ``cfunc.obj`` is a ``Call``, not a
     ``Name``), so the narrow Call-receiver fast path (which requires
     ``Name.attr``) missed it. The generalised receiver branch now includes
@@ -334,12 +335,12 @@ def test_cpython_deep_chain_method_dispatches_via_libpython(tmp_path):
         "import numpy\n"
         "def f():\n"
         "    return numpy.arange(4).reshape(2, 2).sum()\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "@.cpy.attr.sum" in ir, "deep chain .sum() should use the libpython method path"
     assert "@.pyattr.sum" not in ir, "deep chain .sum() must NOT use native py_obj_getattr"
 
@@ -364,12 +365,12 @@ def test_cpython_value_binop_is_generic_not_numpy_specific(tmp_path):
         "    a = decimal.Decimal('10')\n"
         "    b = decimal.Decimal('3')\n"
         "    return a + b\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "py_cpy_binop" in ir, (
         "decimal.Decimal + must route to py_cpy_binop (generic cpy routing, "
         "not a numpy special-case)"
@@ -380,7 +381,7 @@ def test_cpython_binop_receiver_attribute_dispatches_via_libpython(tmp_path):
     """Attribute LOAD on a BINARY-OP result must use libpython's getattr.
 
     Regression: ``(a + b).dtype`` on numpy arrays raised ``AttributeError:
-    dtype`` — the attr-load lowering routed ``(Attr, Subscript, Call)`` cpy
+    dtype`` - the attr-load lowering routed ``(Attr, Subscript, Call)`` cpy
     receivers through ``py_cpy_getattr`` but NOT ``BinOp``, so ``.dtype`` lowered
     to native ``py_obj_getattr`` on the real CPython binop result. Inline
     ``np.arange(5).shape`` (Call receiver) already worked; ``(a+b).dtype`` did
@@ -398,12 +399,12 @@ def test_cpython_binop_receiver_attribute_dispatches_via_libpython(tmp_path):
         "    a = numpy.arange(3)\n"
         "    b = numpy.arange(3)\n"
         "    return (a + b).dtype\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "@.cpy.attr.dtype" in ir, "(a+b).dtype should use the libpython attr path"
     assert "py_cpy_getattr" in ir
 
@@ -412,7 +413,7 @@ def test_cpython_type_name_inline_dispatches_via_libpython(tmp_path):
     """Inline ``type(x).__name__`` on a cpy value must use libpython.
 
     Regression: ``type(a).__name__`` (inline) hit the native ``type(x).__name__``
-    fast path, which calls ``py_obj_type_name`` using pcc's native type model —
+    fast path, which calls ``py_obj_type_name`` using pcc's native type model -
     that mishandles a real CPython object and SILENTLY failed (no output). The
     stored form ``t = type(a); t.__name__`` worked. The native fast path now
     skips cpy args (``_expr_looks_cpython``), so inline ``type(a).__name__`` falls
@@ -428,12 +429,12 @@ def test_cpython_type_name_inline_dispatches_via_libpython(tmp_path):
         "def f():\n"
         "    a = numpy.arange(3)\n"
         "    return type(a).__name__\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "@.cpy.attr.__name__" in ir, "inline type(a).__name__ should use py_cpy_getattr"
     assert "py_cpy_getattr" in ir
 
@@ -442,11 +443,11 @@ def test_cpython_list_of_cpy_values_builds_cpython_list(tmp_path):
     """A list literal containing cpy values must build a CPython list.
 
     Regression: ``numpy.concatenate([a, a])`` (a list whose elements are real
-    CPython arrays) SILENTLY failed — the native pcc-list path bridged each cpy
+    CPython arrays) SILENTLY failed - the native pcc-list path bridged each cpy
     element to a pcc object (``_emit_value_as_pcc_object_or_bridge``), round-
     tripping a numpy array cpy->pcc->cpy and losing it. The list-literal lowering
     now routes a literal with ANY cpy element through ``_emit_cpython_list_ops``
-    (builds a real CPython ``list`` and marshals each element — cpy borrowed,
+    (builds a real CPython ``list`` and marshals each element - cpy borrowed,
     native converted). Compile-only; ``import numpy`` marks ``numpy`` cpy.
     """
     from pcc.py_frontend.pipeline import compile_python
@@ -458,11 +459,11 @@ def test_cpython_list_of_cpy_values_builds_cpython_list(tmp_path):
         "def f():\n"
         "    a = numpy.arange(3)\n"
         "    return numpy.concatenate([a, a])\n"
-    )
+    , encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True, ir_scaffold_mode="auto", libpython_mode="on",
     )
-    ir = out.read_text()
+    ir = out.read_text(encoding="utf-8")
     assert "cpy.list" in ir, "[a, a] of cpy values should build a CPython list (cpy.list)"
     assert "@.cpy.attr.append" in ir, "CPython list build should use list.append via libpython"

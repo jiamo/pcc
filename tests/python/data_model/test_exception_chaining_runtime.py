@@ -6,13 +6,9 @@ import textwrap
 from pathlib import Path
 
 
-def test_exception_chaining_traceback_and_unhandled_print_native(tmp_path):
-    subprocess.run(
-        ["make", "-C", "pcc/py_runtime", "libpy_runtime.a"],
-        check=True,
-        env={**os.environ, "PATH": os.environ.get("PATH", "")},
-    )
-
+def test_exception_chaining_traceback_and_unhandled_print_native(
+    tmp_path, c_runtime_archive
+):
     src = tmp_path / "exc_chain_probe.c"
     exe = tmp_path / "exc_chain_probe"
     src.write_text(
@@ -46,9 +42,9 @@ def test_exception_chaining_traceback_and_unhandled_print_native(tmp_path):
         [
             os.environ.get("CC", "cc"),
             "-I",
-            "pcc/py_runtime/include",
+            str(c_runtime_archive.parent / "include"),
             str(src),
-            "pcc/py_runtime/libpy_runtime.a",
+            str(c_runtime_archive),
             "-lm",
             "-o",
             str(exe),
@@ -64,13 +60,7 @@ def test_exception_chaining_traceback_and_unhandled_print_native(tmp_path):
     assert "RuntimeError: outer" in err
 
 
-def test_implicit_context_is_set_by_raise_native(tmp_path):
-    subprocess.run(
-        ["make", "-C", "pcc/py_runtime", "libpy_runtime.a"],
-        check=True,
-        env={**os.environ, "PATH": os.environ.get("PATH", "")},
-    )
-
+def test_implicit_context_is_set_by_raise_native(tmp_path, c_runtime_archive):
     src = tmp_path / "exc_context_probe.c"
     exe = tmp_path / "exc_context_probe"
     src.write_text(
@@ -95,9 +85,9 @@ def test_implicit_context_is_set_by_raise_native(tmp_path):
         [
             os.environ.get("CC", "cc"),
             "-I",
-            "pcc/py_runtime/include",
+            str(c_runtime_archive.parent / "include"),
             str(src),
-            "pcc/py_runtime/libpy_runtime.a",
+            str(c_runtime_archive),
             "-lm",
             "-o",
             str(exe),

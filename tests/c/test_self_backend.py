@@ -5,7 +5,7 @@ import sys
 import pytest
 
 from pcc.backend import BackendUnavailable
-from pcc.backend.self_backend_analysis import value_has_uses
+from pcc.backend.self_backend_analysis import collect_used_values, value_has_uses
 from pcc.backend.self_backend_aarch64_darwin_abi import (
     aggregate_reg_chunks,
     assign_abi_arg_regs,
@@ -96,6 +96,7 @@ from pcc.backend.self_backend_aarch64_darwin_slots import (
 )
 from pcc.backend.self_backend import emit_aarch64_darwin_asm
 from pcc.backend.self_backend_aarch64_darwin import (
+    _forward_one_intervening_stack_store_load,
     _fold_zero_store_source,
     _fold_mov_store_source,
     _fold_zero_compare_immediate,
@@ -107,6 +108,7 @@ from pcc.backend.self_backend_aarch64_darwin import (
     _fold_cond_branch_to_fallthrough,
     _drop_fallthrough_uncond_branches,
     _drop_unreferenced_empty_local_labels,
+    _retarget_branch,
 )
 from pcc.backend.self_backend_dispatch import (
     emit_self_asm,
@@ -115,7 +117,13 @@ from pcc.backend.self_backend_dispatch import (
 from pcc.backend.self_backend_x86_64_linux import emit_x86_64_linux_asm
 from pcc.backend.self_backend_emit import emit_function_blocks
 from pcc.backend.self_backend_instruction_dispatch import emit_instruction_dispatch
-from pcc.backend.self_backend_ir import ArgInfo, SlotInfo, TypeDesc
+from pcc.backend.self_backend_ir import (
+    ArgInfo,
+    ParsedInstr,
+    SlotInfo,
+    TypeDesc,
+    text_key_mapping_get,
+)
 from pcc.backend.self_backend_module_symbols import prepare_module_symbols
 from pcc.backend.self_backend_parse import (
     aggregate_literal_to_bytes,
@@ -197,7 +205,7 @@ def _link_object_and_run(obj_path, tmp_path):
 
 def _compile_native_helper(source: str, obj_path):
     src_path = obj_path.with_suffix(".c")
-    src_path.write_text(source)
+    src_path.write_text(source, encoding="utf-8")
     subprocess.run(
         [
             "cc",
@@ -223,13 +231,85 @@ def test_self_backend_emits_aarch64_darwin_asm_for_const_return(tmp_path):
 
     ev.emit_compiled_units(compiled_units, emit_asm=str(asm_path), optimize=0)
 
-    asm_text = asm_path.read_text()
+    asm_text = asm_path.read_text(encoding="utf-8")
     assert "_main:" in asm_text
     assert "movz w0, #42" in asm_text
     assert "ret" in asm_text
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 42
+
+
+def test_self_backend_phi_parallel_copy_swap_stages_through_temp(tmp_path):
+    """Regression: paired phis on a back-edge form a parallel-copy swap.
+
+    Here ``%a`` takes ``%b`` and ``%b`` takes ``%a`` on the loop back-edge, so
+    their slots alias each other's destination. Emitting the copies
+    sequentially would store into ``%a``'s slot before the dependent
+    ``%b <- %a`` copy reads it (the classic lost-copy / phi-swap problem),
+    collapsing both values to the same number. ``emit_phi_assignments`` must
+    stage every source into a temp before writing any destination.
+
+    Loop runs twice (i: 0->1->2, exit when i+1 == 3) so (a,b) swaps back to
+    (3,5): result = 3*10 + 5 = 35. The buggy sequential lowering produced 55.
+    """
+    ir_text = (
+        'target triple = "arm64-apple-darwin25.5.0"\n'
+        "define i32 @main() {\n"
+        "entry:\n"
+        "  br label %loop\n"
+        "loop:\n"
+        "  %a = phi i32 [ 3, %entry ], [ %b, %loop ]\n"
+        "  %b = phi i32 [ 5, %entry ], [ %a, %loop ]\n"
+        "  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]\n"
+        "  %i1 = add i32 %i, 1\n"
+        "  %c = icmp slt i32 %i1, 3\n"
+        "  br i1 %c, label %loop, label %exit\n"
+        "exit:\n"
+        "  %r = mul i32 %a, 10\n"
+        "  %r2 = add i32 %r, %b\n"
+        "  ret i32 %r2\n"
+        "}\n"
+    )
+    asm_text = emit_self_asm(ir_text)
+    # The back-edge must buffer sources through a temp frame, not store
+    # directly into the (aliasing) destination slots.
+    assert "  sub sp, sp, #" in asm_text.split("L_main_loop:", 1)[1]
+
+    asm_path = tmp_path / "swap.s"
+    asm_path.write_text(asm_text, encoding="utf-8")
+    run = _assemble_and_run(asm_path, tmp_path)
+    assert run.returncode == 35
+
+
+def test_self_backend_smin_against_zero_keeps_zero_register(tmp_path):
+    """Regression: ``llvm.smin(x, 0)`` lowers to ``movz w10,#0; cmp w9,w10;
+    csel w11,w9,w10,le``. The ``_fold_zero_compare_immediate`` peephole used to
+    rewrite the compare to ``cmp w9,#0`` and *delete* the ``movz`` even though
+    the following ``csel`` still reads that register, leaving it undefined.
+    The fold must keep the ``movz`` when the register stays live.
+
+    smin(-7, 0) == -7; +107 == 100. The buggy lowering read a garbage register.
+    """
+    ir_text = (
+        'target triple = "arm64-apple-darwin25.5.0"\n'
+        "define i32 @main() {\n"
+        "bb0:\n"
+        "  %v = call i32 @llvm.smin.i32(i32 -7, i32 0)\n"
+        "  %r = add i32 %v, 107\n"
+        "  ret i32 %r\n"
+        "}\n"
+        "declare i32 @llvm.smin.i32(i32, i32)\n"
+    )
+    asm_text = emit_self_asm(ir_text)
+    # Every csel source register must be defined; the zero operand's movz must
+    # survive the peephole.
+    assert "movz w10, #0" in asm_text
+
+    asm_path = tmp_path / "smin0.s"
+    asm_path.write_text(asm_text, encoding="utf-8")
+    run = _assemble_and_run(asm_path, tmp_path)
+    assert run.returncode == 100
 
 
 def test_self_backend_dispatch_resolves_aarch64_darwin_target():
@@ -1395,6 +1475,28 @@ bb0:
     assert module.functions[0].blocks[0].instructions[1].data[-1] == "1.000000e+00"
 
 
+def test_self_backend_shared_parser_accepts_volatile_load_store():
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+
+define i32 @main() {
+entry:
+  %slot = alloca i32, align 4
+  store volatile i32 7, ptr %slot, align 4
+  %value = load volatile i32, ptr %slot, align 4
+  ret i32 %value
+}
+""".strip()
+
+    module = parse_self_backend_module(ir_text)
+    instrs = module.functions[0].blocks[0].instructions
+
+    assert instrs[1].kind == "store"
+    assert instrs[1].data[0] == TypeDesc("int", 32)
+    assert instrs[2].kind == "load"
+    assert instrs[2].data[1] == TypeDesc("int", 32)
+
+
 def test_self_backend_shared_parser_accepts_anonymous_struct_return_header():
     ir_text = """
 target triple = "arm64-apple-darwin23.6.0"
@@ -1633,6 +1735,147 @@ entry:
     assert func.frame_size > 0
 
 
+def test_self_backend_stackprep_materializes_discarded_indirect_aggregate_call():
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+%S = type { i64, i64, i64 }
+
+declare %S @make()
+
+define i32 @main() {
+entry:
+  %discarded = call %S @make()
+  ret i32 0
+}
+""".strip()
+
+    module = parse_self_backend_module(ir_text)
+    func = next(func for func in module.functions if func.name == "main")
+    prepare_parsed_function(func)
+
+    assign_stack_slots(
+        func,
+        aggregate_returned_indirect=lambda ty: ty.is_struct,
+    )
+
+    assert "discarded" not in collect_used_values(func)
+    assert func.value_slots["discarded"].type.slot_size == 24
+
+
+def test_self_backend_text_key_recovery_survives_inconsistent_native_hashes():
+    class DifferentHashText(str):
+        def __hash__(self):
+            return super().__hash__() ^ 1
+
+    stored_name = DifferentHashText("sum")
+    slot = SlotInfo(16, TypeDesc("int", 32))
+    mapping = {stored_name: slot}
+
+    assert mapping.get("sum") is None
+    assert text_key_mapping_get(mapping, "sum") is slot
+
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+
+define i32 @add() {
+entry:
+  %sum = add i32 1, 2
+  ret i32 %sum
+}
+""".strip()
+    module = parse_self_backend_module(ir_text)
+    func = module.functions[0]
+    prepare_parsed_function(func)
+    func.blocks[0].terminator = ParsedInstr("ret", (TypeDesc("int", 32), stored_name))
+
+    assert isinstance(collect_used_values(func), list)
+
+    assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
+
+    assert text_key_mapping_get(func.value_slots, "sum") is not None
+
+
+def test_self_backend_known_nonlocals_do_not_scan_false_hash_fallback():
+    class NoLinearScanMapping(dict):
+        def items(self):
+            raise AssertionError(
+                "known constants and globals must not scan local slots"
+            )
+
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+
+@g = global i64 0
+
+define void @probe() {
+entry:
+  ret void
+}
+""".strip()
+    module = parse_self_backend_module(ir_text)
+    func = module.functions[0]
+    prepare_parsed_function(func)
+    assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
+    func.value_slots = NoLinearScanMapping(func.value_slots)
+    symbols = prepare_module_symbols(
+        ir_text,
+        list(module.globals_),
+        list(module.functions),
+    )
+
+    assert materialize_value(func, "17", TypeDesc("int", 32), 9, symbols)
+    assert materialize_value(
+        func,
+        "@g",
+        TypeDesc("ptr", pointee=TypeDesc("void")),
+        9,
+        symbols,
+    )
+
+
+def test_self_backend_stackprep_treats_dot_number_values_as_ssa_names():
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+
+declare i1 @pred(ptr)
+declare ptr @make()
+
+define ptr @dot_values(ptr %arg) {
+entry:
+  %.6 = call i1 @pred(ptr %arg)
+  br i1 %.6, label %make, label %keep
+
+make:
+  %.9 = call ptr @make()
+  br label %end
+
+keep:
+  br label %end
+
+end:
+  %result = phi ptr [%.9, %make], [%arg, %keep]
+  ret ptr %result
+}
+""".strip()
+    module = parse_self_backend_module(ir_text)
+    func = module.functions[0]
+    prepare_parsed_function(func)
+
+    dot_six_def = func.blocks[0].instructions[0].data[0]
+    dot_six_use = func.blocks[0].terminator.data[0]
+    dot_nine_def = func.blocks[1].instructions[0].data[0]
+    dot_nine_use = func.blocks[3].phis[0].incoming[0].value
+    assert dot_six_def is dot_six_use
+    assert dot_nine_def is dot_nine_use
+
+    assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
+
+    assert "%.6" in func.used_values
+    assert "%.9" in func.used_values
+    assert text_key_mapping_get(func.value_slots, "%.6") is not None
+    assert text_key_mapping_get(func.value_slots, "%.9") is not None
+
+
 def test_self_backend_shared_module_symbols_capture_defined_and_internal_sets():
     ir_text = """
 target triple = "arm64-apple-darwin23.6.0"
@@ -1672,9 +1915,7 @@ entry:
   ret i32 0
 }
 """.strip()
-    same_symbols_different_text = ir_text.replace(
-        'c"x\\00"', "[i8 120, i8 0]"
-    )
+    same_symbols_different_text = ir_text.replace('c"x\\00"', "[i8 120, i8 0]")
 
     module_a = parse_self_backend_module(ir_text)
     module_b = parse_self_backend_module(same_symbols_different_text)
@@ -2212,6 +2453,50 @@ entry:
     assert extract_instr.data[5] == 4
 
 
+def test_self_backend_parse_supports_literal_nested_struct_return_type():
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+
+define { { i64, i64 }, { i64, i64 } } @mk_segment(i64 %a, i64 %b, i64 %c, i64 %d) {
+entry:
+  %p0 = insertvalue { i64, i64 } poison, i64 %a, 0
+  %p1 = insertvalue { i64, i64 } %p0, i64 %b, 1
+  %q0 = insertvalue { i64, i64 } poison, i64 %c, 0
+  %q1 = insertvalue { i64, i64 } %q0, i64 %d, 1
+  %s0 = insertvalue { { i64, i64 }, { i64, i64 } } poison, { i64, i64 } %p1, 0
+  %s1 = insertvalue { { i64, i64 }, { i64, i64 } } %s0, { i64, i64 } %q1, 1
+  %start = extractvalue { { i64, i64 }, { i64, i64 } } %s1, 0
+  %x = extractvalue { i64, i64 } %start, 0
+  ret { { i64, i64 }, { i64, i64 } } %s1
+}
+
+define i64 @caller() {
+entry:
+  %seg = call { { i64, i64 }, { i64, i64 } } (i64, i64, i64, i64) @mk_segment(i64 1, i64 2, i64 3, i64 4)
+  %start = extractvalue { { i64, i64 }, { i64, i64 } } %seg, 0
+  %x = extractvalue { i64, i64 } %start, 0
+  ret i64 %x
+}
+""".strip()
+    module = parse_self_backend_module(ir_text)
+    func = module.functions[0]
+    pair = TypeDesc(
+        "struct",
+        fields=(TypeDesc("int", 64), TypeDesc("int", 64)),
+    )
+    assert func.ret_type == TypeDesc("struct", fields=(pair, pair))
+    assert func.args[0].type == TypeDesc("int", 64)
+    extract_start = func.blocks[0].instructions[-2]
+    assert extract_start.kind == "extractvalue"
+    assert extract_start.data[1] == TypeDesc("struct", fields=(pair, pair))
+    assert extract_start.data[3] == (0,)
+    caller = module.functions[1]
+    aggregate_call = caller.blocks[0].instructions[0]
+    assert aggregate_call.kind == "call"
+    assert aggregate_call.data[1] == TypeDesc("struct", fields=(pair, pair))
+    assert aggregate_call.data[5] == 4
+
+
 def test_self_backend_parse_supports_insertvalue_and_parenthesized_scalar_constants():
     ir_text = """
 target triple = "arm64-apple-darwin23.6.0"
@@ -2585,6 +2870,34 @@ entry:
     assert extract_instr.data[:3] == ("value", pair_type, "mul")
 
 
+def test_self_backend_parse_supports_literal_struct_call_signature_args():
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+
+declare i64 @sum_pair({ i64, i64 }, i64)
+
+define i64 @main({ i64, i64 } %pair, i64 %extra) {
+entry:
+  %r = call i64 ({ i64, i64 }, i64) @sum_pair({ i64, i64 } %pair, i64 %extra)
+  ret i64 %r
+}
+""".strip()
+    module = parse_self_backend_module(ir_text)
+    call_instr = module.functions[0].blocks[0].instructions[0]
+    pair_type = TypeDesc("struct", fields=(TypeDesc("int", 64), TypeDesc("int", 64)))
+
+    assert call_instr.kind == "call"
+    assert call_instr.data == (
+        "r",
+        TypeDesc("int", 64),
+        "sum_pair",
+        False,
+        ((pair_type, "pair"), (TypeDesc("int", 64), "extra")),
+        2,
+        False,
+    )
+
+
 def test_self_backend_parse_strips_branch_loop_metadata_from_labels():
     ir_text = """
 target triple = "arm64-apple-darwin23.6.0"
@@ -2653,16 +2966,13 @@ done:
 }
 """.strip()
     module = parse_self_backend_module(ir_text)
-    entry, taken, skipped, bad = module.functions[0].blocks[:4]
+    blocks = {block.name: block for block in module.functions[0].blocks}
 
-    assert entry.terminator.kind == "br"
-    assert entry.terminator.data == ("taken",)
-    assert taken.terminator.kind == "br"
-    assert taken.terminator.data == ("done",)
-    assert skipped.terminator.kind == "br"
-    assert skipped.terminator.data == ("done",)
-    assert bad.terminator.kind == "br"
-    assert bad.terminator.data == ("done",)
+    assert set(blocks) == {"entry", "taken", "done"}
+    assert blocks["entry"].terminator.kind == "br"
+    assert blocks["entry"].terminator.data == ("taken",)
+    assert blocks["taken"].terminator.kind == "br"
+    assert blocks["taken"].terminator.data == ("done",)
 
 
 def test_self_backend_parse_folds_numeric_constant_conditional_branches():
@@ -2850,7 +3160,9 @@ entry:
 
     assert decode_value_token("nonnull inttoptr (i64 1 to ptr)") == "inttoptrconst:1"
     assert instr.kind == "call"
-    assert instr.data[4] == ((TypeDesc("ptr", pointee=TypeDesc("void")), "inttoptrconst:1"),)
+    assert instr.data[4] == (
+        (TypeDesc("ptr", pointee=TypeDesc("void")), "inttoptrconst:1"),
+    )
 
 
 def test_self_backend_parse_and_materialize_support_ptrtoint_constant_gep_expr():
@@ -3063,7 +3375,9 @@ entry:
     assert materialize_value(func, "1.000000e+00", TypeDesc("fp", 64), 0, symbols) == [
         "  fmov d0, #1.0",
     ]
-    assert materialize_value(func, "0x4000000000000000", TypeDesc("fp", 64), 1, symbols) == [
+    assert materialize_value(
+        func, "0x4000000000000000", TypeDesc("fp", 64), 1, symbols
+    ) == [
         "  fmov d1, #2.0",
     ]
     assert materialize_value(func, "poison", TypeDesc("int", 32), 9, symbols) == [
@@ -4963,13 +5277,16 @@ target triple = "arm64-apple-darwin23.6.0"
 
 declare <2 x i64> @llvm.fshl.v2i64(<2 x i64>, <2 x i64>, <2 x i64>)
 declare <8 x i16> @llvm.fshl.v8i16(<8 x i16>, <8 x i16>, <8 x i16>)
+declare <16 x i8> @llvm.fshl.v16i8(<16 x i8>, <16 x i8>, <16 x i8>)
 
-define void @main(<2 x i64> %q, <8 x i16> %h, ptr %outq, ptr %outh) {
+define void @main(<2 x i64> %q, <8 x i16> %h, <16 x i8> %c, ptr %outq, ptr %outh, ptr %outc) {
 entry:
   %rq = call <2 x i64> @llvm.fshl.v2i64(<2 x i64> %q, <2 x i64> %q, <2 x i64> splat (i64 56))
   %rh = call <8 x i16> @llvm.fshl.v8i16(<8 x i16> %h, <8 x i16> %h, <8 x i16> splat (i16 7))
+  %rc = call <16 x i8> @llvm.fshl.v16i8(<16 x i8> %c, <16 x i8> %c, <16 x i8> splat (i8 3))
   store <2 x i64> %rq, ptr %outq
   store <8 x i16> %rh, ptr %outh
+  store <16 x i8> %rc, ptr %outc
   ret void
 }
 """.strip()
@@ -4982,11 +5299,17 @@ entry:
     assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
     func.value_slots["q"] = SlotInfo(5000, func.value_slots["q"].type)
     func.value_slots["rq"] = SlotInfo(5032, func.value_slots["rq"].type)
-    fshl_q_instr, fshl_h_instr, _store_q_instr, _store_h_instr = func.blocks[
-        0
-    ].instructions
+    (
+        fshl_q_instr,
+        fshl_h_instr,
+        fshl_c_instr,
+        _store_q_instr,
+        _store_h_instr,
+        _store_c_instr,
+    ) = func.blocks[0].instructions
     q_lines = emit_call_instruction(func, *fshl_q_instr.data, symbols)
     h_lines = emit_call_instruction(func, *fshl_h_instr.data, symbols)
+    c_lines = emit_call_instruction(func, *fshl_c_instr.data, symbols)
 
     assert "  sub x16, x29, x15" not in q_lines
     assert "  sub x16, x29, x14" in q_lines
@@ -4996,6 +5319,10 @@ entry:
     assert h_lines.count("  and w11, w11, #15") == 8
     assert h_lines.count("  lslv w13, w9, w11") == 8
     assert h_lines.count("  lsrv w12, w10, w12") == 8
+    assert c_lines.count("  and w11, w11, #7") == 16
+    assert c_lines.count("  lslv w13, w9, w11") == 16
+    assert c_lines.count("  lsrv w12, w10, w12") == 16
+    assert c_lines.count("  strb w13, [x14]") + c_lines.count("  strb w13, [x17]") == 16
 
     i16_ir = """
 target triple = "arm64-apple-darwin23.6.0"
@@ -5021,6 +5348,35 @@ entry:
     assert "  lslv w14, w9, w11" in lines
     assert "  lsrv w13, w10, w12" in lines
     assert f"  sturh w14, [x29, #-{func.value_slots['rot'].offset}]" in lines
+
+
+def test_self_backend_aarch64_call_arg_uses_spilled_previous_call_result():
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+
+declare i32 @foo()
+declare i32 @bar(ptr, i32)
+
+define i32 @main(ptr %p) {
+entry:
+  %status = call i32 @foo()
+  %result = call i32 @bar(ptr %p, i32 %status)
+  ret i32 %result
+}
+""".strip()
+    module = parse_self_backend_module(ir_text)
+    symbols = prepare_module_symbols(
+        ir_text, list(module.globals_), list(module.functions)
+    )
+    func = module.functions[0]
+    prepare_parsed_function(func)
+    assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
+    _foo_instr, bar_instr = func.blocks[0].instructions
+
+    lines = emit_call_instruction(func, *bar_instr.data, symbols)
+
+    assert f"  ldur w1, [x29, #-{func.value_slots['status'].offset}]" in lines
+    assert "  mov w1, w0" not in lines
 
 
 def test_self_backend_aarch64_call_helpers_cover_fshr_intrinsic():
@@ -5322,11 +5678,14 @@ entry:
     prepare_parsed_function(func)
     assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
     prologue = emit_function_prologue(func, symbols)
-    assert prologue[:6] == [
+    # pac-ret (SEC-P1-CFI): `paciasp` signs LR with SP before the frame save; it
+    # doubles as a BTI `c` landing pad. Default-on for aarch64-darwin self output.
+    assert prologue[:7] == [
         "",
         ".p2align 2",
         ".globl _main",
         "_main:",
+        "  paciasp",
         "  stp x29, x30, [sp, #-16]!",
         "  mov x29, sp",
     ]
@@ -5443,13 +5802,16 @@ def test_self_backend_aarch64_phi_assignments_skip_temp_for_independent_scalar_s
     phi_ir = """
 target triple = "arm64-apple-darwin23.6.0"
 
-define ptr @main(ptr %p) {
+define ptr @main(ptr %p, i1 %cond) {
 entry:
   br label %loop
 
 loop:
   %cur = phi ptr [%p, %entry], [%next_keyword, %step]
   %opt = phi ptr [%p, %entry], [%next_opt, %step]
+  br i1 %cond, label %done, label %step
+
+done:
   ret ptr %cur
 
 step:
@@ -5556,12 +5918,15 @@ def test_self_backend_aarch64_phi_assignments_keep_temp_address_alive_for_large_
     phi_ir = f"""
 target triple = "arm64-apple-darwin23.6.0"
 
-define ptr @main({args}) {{
+define ptr @main({args}, i1 %cond) {{
 entry:
   br label %loop
 
 loop:
 {phi_lines}
+  br i1 %cond, label %done, label %step
+
+done:
   ret ptr %cur39
 
 step:
@@ -5619,9 +5984,12 @@ merge:
     prepare_parsed_function(func)
     assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
     func.frame_size = 32
+    # pac-ret (SEC-P1-CFI): `autiasp` authenticates the signed LR after the frame
+    # restore and immediately before `ret`; a corrupted return address faults.
     assert emit_epilogue(func) == [
         "  add sp, sp, #32",
         "  ldp x29, x30, [sp], #16",
+        "  autiasp",
         "  ret",
     ]
     # Older codegen materialized phi-incoming values via a
@@ -5734,6 +6102,7 @@ entry:
     ) == [
         "  movz w0, #7, lsl #0",
         "  ldp x29, x30, [sp], #16",
+        "  autiasp",  # pac-ret (SEC-P1-CFI): authenticate LR before ret
         "  ret",
     ]
 
@@ -5772,6 +6141,7 @@ bb0:
         "  str x14, [x16]",
         "  add sp, sp, #16",
         "  ldp x29, x30, [sp], #16",
+        "  autiasp",  # pac-ret (SEC-P1-CFI): authenticate LR before ret
         "  ret",
     ]
 
@@ -5820,7 +6190,7 @@ def test_self_backend_emits_direct_call_subset(tmp_path):
 
     ev.emit_compiled_units(compiled_units, emit_asm=str(asm_path), optimize=0)
 
-    asm_text = asm_path.read_text()
+    asm_text = asm_path.read_text(encoding="utf-8")
     assert "_helper:" in asm_text
     assert "_main:" in asm_text
     assert "bl _helper" in asm_text
@@ -5840,7 +6210,7 @@ def test_self_backend_emits_i32_arg_arithmetic_and_call(tmp_path):
 
     ev.emit_compiled_units(compiled_units, emit_asm=str(asm_path), optimize=0)
 
-    asm_text = asm_path.read_text()
+    asm_text = asm_path.read_text(encoding="utf-8")
     assert "_add:" in asm_text
     assert "add w11, w9, w10" in asm_text
     assert "bl _add" in asm_text
@@ -5859,7 +6229,7 @@ def test_self_backend_emits_branch_phi_subset(tmp_path):
 
     ev.emit_compiled_units(compiled_units, emit_asm=str(asm_path), optimize=0)
 
-    asm_text = asm_path.read_text()
+    asm_text = asm_path.read_text(encoding="utf-8")
     assert "cset w11, lt" in asm_text
     # Self-backend may emit either ``cbz`` directly on the bool
     # register or ``cmp w<n>, #0; b.eq`` (the longer two-instruction
@@ -6160,7 +6530,7 @@ bb0:
 """
 
     asm_path = tmp_path / "forward_named_type.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
 
@@ -6233,7 +6603,7 @@ bb0:
 """
 
     asm_path = tmp_path / "struct_stride_gep.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
 
@@ -6329,9 +6699,9 @@ bb0:
 """
 
     asm_path = tmp_path / "large_struct_gep.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
-    asm_text = asm_path.read_text()
+    asm_text = asm_path.read_text(encoding="utf-8")
     assert "add x11, x9, #5000" not in asm_text
 
     run = _assemble_and_run(asm_path, tmp_path)
@@ -6355,9 +6725,9 @@ bb0:
 """
 
     asm_path = tmp_path / "nested_array_global.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
-    asm_text = asm_path.read_text()
+    asm_text = asm_path.read_text(encoding="utf-8")
     assert "_tbl:" in asm_text
 
     run = _assemble_and_run(asm_path, tmp_path)
@@ -6380,7 +6750,7 @@ bb0:
 """
 
     asm_path = tmp_path / "aggregate_zero_store.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6420,7 +6790,7 @@ bb0:
 """
 
     asm_path = tmp_path / "large_byval_arg.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6471,7 +6841,7 @@ bb0:
 """
 
     asm_path = tmp_path / "large_agg_ret_and_byval.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6551,7 +6921,71 @@ merge:
 """
 
     asm_path = tmp_path / "large_aggregate_phi.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
+
+    run = _assemble_and_run(asm_path, tmp_path)
+    assert run.returncode == 0
+
+
+def test_self_backend_supports_nested_literal_aggregate_phi_in_ir(tmp_path):
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+target datalayout = "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
+
+@ga0 = internal global i64 10
+@ga1 = internal global i64 11
+@ga2 = internal global i64 12
+@ga3 = internal global i64 13
+@gb0 = internal global i64 20
+@gb1 = internal global i64 21
+@gb2 = internal global i64 22
+@gb3 = internal global i64 23
+
+define internal { { ptr, ptr }, ptr, ptr } @mk(ptr %p0, ptr %p1, ptr %p2, ptr %p3) {
+bb0:
+  %slot = alloca { { ptr, ptr }, ptr, ptr }
+  %nested = getelementptr inbounds { { ptr, ptr }, ptr, ptr }, ptr %slot, i64 0, i32 0
+  %n0 = getelementptr inbounds { ptr, ptr }, ptr %nested, i64 0, i32 0
+  %n1 = getelementptr inbounds { ptr, ptr }, ptr %nested, i64 0, i32 1
+  %trailer = getelementptr inbounds { { ptr, ptr }, ptr, ptr }, ptr %slot, i64 0, i32 1
+  %title = getelementptr inbounds { { ptr, ptr }, ptr, ptr }, ptr %slot, i64 0, i32 2
+  store ptr %p0, ptr %n0
+  store ptr %p1, ptr %n1
+  store ptr %p2, ptr %trailer
+  store ptr %p3, ptr %title
+  %v = load { { ptr, ptr }, ptr, ptr }, ptr %slot
+  ret { { ptr, ptr }, ptr, ptr } %v
+}
+
+define i32 @main() {
+bb0:
+  %cond = icmp eq i32 0, 0
+  br i1 %cond, label %t, label %f
+
+t:
+  %a = call { { ptr, ptr }, ptr, ptr } @mk(ptr @ga0, ptr @ga1, ptr @ga2, ptr @ga3)
+  br label %merge
+
+f:
+  %b = call { { ptr, ptr }, ptr, ptr } @mk(ptr @gb0, ptr @gb1, ptr @gb2, ptr @gb3)
+  br label %merge
+
+merge:
+  %phi = phi { { ptr, ptr }, ptr, ptr } [%a, %t], [%b, %f]
+  %slot = alloca { { ptr, ptr }, ptr, ptr }
+  store { { ptr, ptr }, ptr, ptr } %phi, ptr %slot
+  %nested = getelementptr inbounds { { ptr, ptr }, ptr, ptr }, ptr %slot, i64 0, i32 0
+  %n0 = getelementptr inbounds { ptr, ptr }, ptr %nested, i64 0, i32 0
+  %selected = load ptr, ptr %n0
+  %loaded = load i64, ptr %selected
+  %loaded32 = trunc i64 %loaded to i32
+  %ret = sub i32 %loaded32, 10
+  ret i32 %ret
+}
+"""
+
+    asm_path = tmp_path / "nested_literal_aggregate_phi.s"
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6582,7 +7016,7 @@ bb0:
 """
 
     asm_path = tmp_path / "large_agg_zero_ret.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6614,7 +7048,7 @@ bb0:
 """
 
     asm_path = tmp_path / "small_aggregate_vararg.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6640,7 +7074,7 @@ bb0:
 """
 
     asm_path = tmp_path / "inline_gep_call_arg.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6681,7 +7115,7 @@ bb0:
 """
 
     asm_path = tmp_path / "small_aggregate_fixed_stack_arg.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6714,7 +7148,7 @@ bb0:
 """
 
     asm_path = tmp_path / "bitcount_intrinsics.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6740,7 +7174,7 @@ bb0:
 """
 
     asm_path = tmp_path / "bitcount_intrinsics.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6763,7 +7197,7 @@ bb0:
 """
 
     asm_path = tmp_path / "copysign_intrinsic.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6787,7 +7221,7 @@ bb0:
 """
 
     asm_path = tmp_path / "nested_array_alloca.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6807,7 +7241,7 @@ bb0:
 """
 
     asm_path = tmp_path / "nested_aggregate_zero_store.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6829,7 +7263,7 @@ bb0:
 """
 
     asm_path = tmp_path / "large_aggregate_zero_store_big_offset.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6854,7 +7288,7 @@ bb0:
 """
 
     asm_path = tmp_path / "large_elem_gep.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -6880,7 +7314,7 @@ bb0:
 """
 
     asm_path = tmp_path / "global_gep_offset_init.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 0
@@ -7088,6 +7522,16 @@ bb0:
     )
 
 
+def test_self_backend_aarch64_does_not_forward_through_aliasing_intervening_load():
+    lines = [
+        "  stur w0, [x29, #-76]",
+        "  ldur x0, [x29, #-8]",
+        "  ldur w1, [x29, #-76]",
+    ]
+
+    assert _forward_one_intervening_stack_store_load(lines) == lines
+
+
 def test_self_backend_aarch64_threads_single_branch_trampoline():
     ir_text = """
 target triple = "arm64-apple-darwin23.6.0"
@@ -7114,6 +7558,28 @@ no:
     assert not any("_to_" in line for line in lines)
 
 
+def test_self_backend_aarch64_accepts_ir_without_explicit_target_triple():
+    ir_text = """
+target triple = "unknown-unknown-unknown"
+
+define i32 @main() {
+entry:
+  ret i32 0
+}
+"""
+
+    asm_text = emit_aarch64_darwin_asm(ir_text)
+
+    assert ".globl _main" in asm_text
+    assert "_main:" in asm_text
+
+
+def test_self_backend_aarch64_retarget_branch_always_returns_assembly_line():
+    assert _retarget_branch("  b L_old", "L_new") == "  b L_new"
+    assert _retarget_branch("  cbz w9, L_old", "L_new") == "  cbz w9, L_new"
+    assert _retarget_branch("  add x0, x0, x1", "L_new") == "  add x0, x0, x1"
+
+
 def test_self_backend_aarch64_threads_cbz_branch_trampoline():
     ir_text = """
 target triple = "arm64-apple-darwin23.6.0"
@@ -7135,8 +7601,7 @@ no:
     lines = asm_text.splitlines()
 
     assert any(
-        line.startswith("  cbz w") and line.endswith("L_main_no")
-        for line in lines
+        line.startswith("  cbz w") and line.endswith("L_main_no") for line in lines
     )
     assert "L_main_bb0_to_no:" not in lines
     assert not any("L_main_bb0_to_no" in line for line in lines)
@@ -7174,11 +7639,15 @@ def test_self_backend_aarch64_folds_conditional_branch_to_fallthrough_pair():
             "",
             "L_then:",
             "  ret",
+            "L_else:",
+            "  ret",
         ]
     ) == [
         "  b.ne L_else",
         "",
         "L_then:",
+        "  ret",
+        "L_else:",
         "  ret",
     ]
 
@@ -7246,7 +7715,8 @@ def test_self_backend_aarch64_folds_zero_compare_immediate():
             "  b.eq L_done",
         ]
     ) == [
-        "  cmp w9, #0",
+        "  movz w10, #0",
+        "  cmp w9, w10",
         "  b.eq L_done",
     ]
 
@@ -7812,7 +8282,7 @@ bb0:
 """
 
     asm_path = tmp_path / "fcmp_runtime.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
 
@@ -7838,7 +8308,7 @@ bb0:
 """
 
     asm_path = tmp_path / "fcmp_ord_runtime.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
 
@@ -7876,7 +8346,7 @@ fail_switch:
 """
 
     asm_path = tmp_path / "narrow_neg_const_runtime.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
 
@@ -7905,7 +8375,7 @@ bb0:
 """
 
     asm_path = tmp_path / "signed_narrow_icmp_runtime.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
 
@@ -7941,7 +8411,7 @@ fail:
 """
 
     asm_path = tmp_path / "signed_narrow_division_runtime.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
 
@@ -8037,7 +8507,7 @@ bb0:
 """
 
     asm_path = tmp_path / "varargs_runtime.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
 
@@ -8169,7 +8639,7 @@ entry:
 """
 
     asm_path = tmp_path / "large_stack_slot.s"
-    asm_path.write_text(emit_aarch64_darwin_asm(ir_text))
+    asm_path.write_text(emit_aarch64_darwin_asm(ir_text), encoding="utf-8")
 
     run = _assemble_and_run(asm_path, tmp_path)
     assert run.returncode == 42

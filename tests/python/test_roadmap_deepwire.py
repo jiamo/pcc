@@ -38,6 +38,6 @@ def test_profile_recorder_phase_shape(tmp_path):
     with recorder.phase("parse"):
         pass
     write_profile_json(str(profile), recorder)
-    data = json.loads(profile.read_text())
+    data = json.loads(profile.read_text(encoding="utf-8"))
     assert data["schema"] == "pcc.profile.v1"
     assert "parse" in data["phase_totals_ms"]

@@ -84,7 +84,13 @@ def test_check_output_text_stderr_stdout_dispatches_to_native_helper():
     assert "cpy.get.STDOUT" not in body, body
 
 
-def test_check_output_without_text_stays_cpython():
+def test_check_output_without_text_lowers_native_bytes():
+    # Previously a bare (no text=) check_output kept the CPython fallback —
+    # which made the program uncompilable under --python-libpython=off. The
+    # native helper already returns a real bytes object (verified equal to
+    # CPython for print/len/.decode()), so the no-text form now lowers to
+    # py_subprocess_check_output too; downstream bytes methods stay native
+    # via _maybe_emit_bytes_method_via_dyn.
     program = textwrap.dedent(
         """
         import subprocess
@@ -98,8 +104,8 @@ def test_check_output_without_text_stays_cpython():
     body = _function_body(ir_text, "f")
 
     assert body is not None
-    assert "@py_subprocess_check_output" not in body, body
-    assert "cpy.fn.check_output" in body, body
+    assert "@py_subprocess_check_output" in body, body
+    assert "cpy.fn.check_output" not in body, body
 
 
 def test_run_check_true_expr_statement_dispatches_native():
@@ -138,7 +144,8 @@ def test_run_timeout_keyword_still_dispatches_native():
     body = _function_body(ir_text, "f")
 
     assert body is not None
-    assert "@py_subprocess_run" in body, body
+    assert "@py_subprocess_run_timeout" in body, body
+    assert "subprocess.run.timed_out" in body, body
     assert "cpy.fn.run" not in body, body
 
 

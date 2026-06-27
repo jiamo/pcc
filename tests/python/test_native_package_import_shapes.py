@@ -98,3 +98,27 @@ def test_mixed_from_import_func_and_submodule(tmp_path):
         "main()\n",
     )
     assert out[0] == "15", out
+
+
+def test_dynamic_dunder_import_with_fromlist_returns_compiled_module(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("PCC_RUNTIME_CC", "cc")
+    monkeypatch.setenv("PCC_RUNTIME_HIGH", "c")
+
+    def build(site):
+        pkg = site / "dynamic_pkg"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+    out = _compile_run(
+        tmp_path,
+        build,
+        "import dynamic_pkg\n"
+        "def load(place, obj):\n"
+        "    module = __import__(place, globals(), {}, [obj])\n"
+        "    return getattr(module, obj)\n"
+        "print(load('dynamic_pkg', 'VALUE'))\n",
+    )
+    assert out[0] == "42", out

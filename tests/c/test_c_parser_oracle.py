@@ -39,7 +39,7 @@ def test_c_parser_oracle(name: str) -> None:
         pytest.fail(
             f"oracle missing for {name!r} — run scripts/build_c_oracle.py"
         )
-    expected = json.loads(oracle_path.read_text())
+    expected = json.loads(oracle_path.read_text(encoding="utf-8"))
     tree = _parser.parse(src, filename=f"<{name}>")
     actual = normalize(tree)
     diffs = diff(expected, actual)

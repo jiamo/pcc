@@ -121,7 +121,7 @@ def test_real_numpy_l5_build_smoke_and_pcc_native_abi_blocker(tmp_path):
         if not pcc1.exists():
             pytest.fail(f"PCC_CURRENT_PCC1 does not exist: {pcc1}")
         pcc1_env = pcc_env.copy()
-        pcc1_env["PCC_HOST_PYTHON"] = "/bin/false"
+        pcc1_env["PCC_HOST_PYTHON"] = "/usr/bin/false"
         pcc1_native = subprocess.run(
             [
                 str(pcc1),

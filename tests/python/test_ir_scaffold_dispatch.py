@@ -44,18 +44,29 @@ def _generate_ir(source: str, *, mode: str) -> str:
     return str(cg.generate(cg.ast_module))
 
 
+def _function_body(ir_text: str, fn_name_suffix: str) -> str | None:
+    pattern = re.compile(
+        r"define\s+[^\n]*?@[A-Za-z0-9_]*"
+        + re.escape(fn_name_suffix)
+        + r"\s*\([^)]*\)[^{]*\{(.+?)\n\}",
+        re.DOTALL,
+    )
+    m = pattern.search(ir_text)
+    return m.group(1) if m else None
+
+
 def _compile_pipeline_ir(source: str, name: str, *, mode: str) -> str:
     from pcc.py_frontend.pipeline import compile_python
 
     src = _BUILD / f"{name}.py"
     out = _BUILD / f"{name}.ll"
-    src.write_text(source)
+    src.write_text(source, encoding="utf-8")
     compile_python(
         str(src), str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
     )
-    return out.read_text()
+    return out.read_text(encoding="utf-8")
 
 
 def _zero_span():
@@ -187,9 +198,14 @@ def test_dyn_append_prefers_native_list_over_unrelated_class_method():
     )
 
     ir_text = _generate_ir(source, mode="on")
+    remember_body = _function_body(ir_text, "remember")
 
-    assert "@py_list_append" in ir_text
-    assert not re.search(r"\bcall [^\n]*@user_test_module_Block_append\b", ir_text)
+    assert remember_body is not None
+    assert "@py_list_append" in remember_body
+    assert not re.search(
+        r"\bcall [^\n]*@user_test_module_Block_append\b",
+        remember_body,
+    )
 
 
 def test_unimplemented_method_raises_via_dispatch(monkeypatch):
@@ -283,7 +299,7 @@ def test_off_mode_method_call_still_routes_to_py_cpy():
                 builder.fake_method(a, b)
             """
         )
-    )
+    , encoding="utf-8")
     out = src.with_suffix(".ll")
     compile_python(
         str(src),
@@ -291,7 +307,7 @@ def test_off_mode_method_call_still_routes_to_py_cpy():
         emit_llvm_only=True,
         ir_scaffold_mode="off",
     )
-    text = out.read_text()
+    text = out.read_text(encoding="utf-8")
     assert "py_cpy_" in text, (
         "OFF mode should keep the historical py_cpy_* dispatch path; "
         "found no py_cpy_* in IR — codegen route may have changed"

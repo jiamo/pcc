@@ -55,7 +55,7 @@ def test_list_append_extend(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1 2 3 3", "4 5 5"]
 
@@ -75,9 +75,31 @@ def test_list_insert_pop(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1 2 3 4", "4 3", "1 2"]
+
+
+def test_dynamic_pop_dispatches_list_and_dict_by_runtime_tag(tmp_path, monkeypatch):
+    src = tmp_path / "dynamic_pop.py"
+    exe = tmp_path / "dynamic_pop.out"
+    src.write_text(textwrap.dedent("""
+        def pop_one(obj, key):
+            return obj.pop(key)
+
+        def main() -> None:
+            xs = ["a", "b"]
+            table = {"a": 7, "b": 9}
+            print(pop_one(xs, 0))
+            print(xs)
+            print(pop_one(table, "b"))
+            print(table["a"], len(table))
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    _compile(monkeypatch, src, exe)
+    assert _run(exe).strip().splitlines() == ["a", "['b']", "9", "7 1"]
 
 
 def test_list_index_count(tmp_path, monkeypatch):
@@ -93,7 +115,7 @@ def test_list_index_count(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1", "2", "2", "0"]
 
@@ -109,7 +131,7 @@ def test_list_remove(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "1 3 2 1 4"
 
@@ -125,7 +147,7 @@ def test_list_reverse(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "4 3 2 1"
 
@@ -147,7 +169,7 @@ def test_list_slicing(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
         "20 30 40 3", "10 20 2", "40 50 2", "10 30 50 3",
@@ -166,7 +188,7 @@ def test_list_concat_repeat(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1 2 3 4 4", "0 0 0 0 0 5"]
 
@@ -184,7 +206,7 @@ def test_list_in_operator(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True", "False", "False", "True"]
 
@@ -202,7 +224,7 @@ def test_list_iteration(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "60"
 
@@ -217,7 +239,7 @@ def test_list_sort_method(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "1 1 2 3 4 5 6 9"
 
@@ -233,6 +255,6 @@ def test_list_sorted_function(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip() == "1 1 3 4 5 9"

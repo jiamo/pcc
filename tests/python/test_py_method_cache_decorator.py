@@ -22,7 +22,7 @@ def test_local_cache_method_decorator_is_noop_self_backend(tmp_path):
 
         print(Worker().value())
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "cache_method_decorator.out"
     compile_python(
         str(src),

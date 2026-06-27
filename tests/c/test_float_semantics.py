@@ -107,3 +107,54 @@ def test_float_arithmetic_emits_contract_flags():
     ir_text = _generate_ir(source)
     assert "fmul contract double" in ir_text
     assert "fadd contract double" in ir_text
+
+
+def test_implicit_float_to_unsigned_local_uses_fptoui():
+    source = r"""
+        unsigned int convert(double x) {
+            unsigned int y = x;
+            return y;
+        }
+    """
+
+    ir_text = _generate_ir(source)
+    assert "fptoui double" in ir_text
+    assert "fptosi double" not in ir_text
+
+
+def test_implicit_float_to_unsigned_return_uses_fptoui():
+    source = r"""
+        unsigned int convert(double x) {
+            return x;
+        }
+    """
+
+    ir_text = _generate_ir(source)
+    assert "fptoui double" in ir_text
+    assert "fptosi double" not in ir_text
+
+
+def test_implicit_float_to_unsigned_assignment_uses_fptoui():
+    source = r"""
+        unsigned int convert(double x) {
+            unsigned int y;
+            y = x;
+            return y;
+        }
+    """
+
+    ir_text = _generate_ir(source)
+    assert "fptoui double" in ir_text
+    assert "fptosi double" not in ir_text
+
+
+def test_implicit_float_to_signed_return_still_uses_fptosi():
+    source = r"""
+        int convert(double x) {
+            return x;
+        }
+    """
+
+    ir_text = _generate_ir(source)
+    assert "fptosi double" in ir_text
+    assert "fptoui double" not in ir_text

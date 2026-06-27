@@ -30,6 +30,7 @@ def test_diagnostic_json_text_and_error_state():
     assert payload["schema"] == "pcc.diagnostics.v1"
     assert payload["diagnostics"][0]["code"] == "PCC-PY-IMPORT-001"
     assert payload["diagnostics"][0]["span"]["file"] == "pkg/mod.py"
+    assert bag.format_json() == json.dumps(payload, indent=2, sort_keys=True)
     text = bag.format_text()
     assert "PCC-PY-IMPORT-001" in text
     assert "fallback:" in text
@@ -46,6 +47,7 @@ def test_fallback_diagnostic_and_sarif_output():
     assert diag.severity == DiagnosticSeverity.WARNING
     sarif_text = emit_diagnostics([diag], fmt="sarif")
     sarif = json.loads(sarif_text)
+    assert sarif_text == json.dumps(sarif, indent=2, sort_keys=True)
     assert sarif["version"] == "2.1.0"
     result = sarif["runs"][0]["results"][0]
     assert result["ruleId"] == "PCC-PY-FALLBACK-001"
@@ -58,3 +60,9 @@ def test_emit_diagnostics_json_format():
     ], fmt="json")
     payload = json.loads(out)
     assert payload["diagnostics"][0]["phase"] == "gc"
+
+
+def test_diagnostic_span_compact_format_matches_codegen_breadcrumb_contract():
+    span = DiagnosticSpan("pkg/mod.py", 3, 4, 3, 10)
+
+    assert span.format_compact() == "pkg/mod.py:3:4-3:10"

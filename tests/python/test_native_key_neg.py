@@ -62,3 +62,38 @@ def test_positive_key_regression(tmp_path):
         "    print(sorted(counts.items(), key=lambda kv: kv[1]))\n"   # ascending
         "main()\n")
     assert out.split("\n")[0] == "[('dog', 1), ('cat', 2), ('the', 3)]", out
+
+
+def test_identity_and_neg_identity_key_sorted(tmp_path):
+    out = _run(tmp_path,
+        "def main():\n"
+        "    print(sorted([3, 1, 2], key=lambda v: v))\n"
+        "    print(sorted([3, 1, 2], key=lambda v: -v))\n"
+        "main()\n")
+    assert out.split("\n")[:2] == ["[1, 2, 3]", "[3, 2, 1]"], out
+
+
+def test_builtin_len_key_sorted_min_max(tmp_path):
+    out = _run(tmp_path,
+        "def main():\n"
+        "    words = ['bb', 'a', 'ccc']\n"
+        "    print(sorted(words, key=len))\n"
+        "    print(max(words, key=len), min(words, key=len))\n"
+        "main()\n")
+    assert out.split("\n")[:2] == ["['a', 'bb', 'ccc']", "ccc a"], out
+
+
+def test_list_sort_with_key_in_place(tmp_path):
+    out = _run(tmp_path,
+        "def main():\n"
+        "    pairs = [(1, 'b'), (2, 'a')]\n"
+        "    pairs.sort(key=lambda t: t[1])\n"
+        "    print(pairs)\n"
+        "    words = ['bb', 'a', 'ccc']\n"
+        "    words.sort(key=len, reverse=True)\n"
+        "    print(words)\n"
+        "main()\n")
+    assert out.split("\n")[:2] == [
+        "[(2, 'a'), (1, 'b')]",
+        "['ccc', 'bb', 'a']",
+    ], out

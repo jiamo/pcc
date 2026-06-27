@@ -30,7 +30,7 @@ def _compile_and_run(tmp_path, source: str) -> subprocess.CompletedProcess[str]:
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
     return subprocess.run(
         [str(exe)], capture_output=True, text=True, timeout=20,
@@ -61,6 +61,43 @@ def test_property_getter_basic(tmp_path):
         """)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().split("\n") == ["42", "int"]
+
+
+def test_property_fget_can_alias_an_instance_method(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "property_fget_alias.py"
+    exe = tmp_path / "property_fget_alias.out"
+    src.write_text(
+        textwrap.dedent(
+            """
+            class Box:
+                @property
+                def value(self):
+                    return 42
+
+                get_value = value.fget
+
+            print(Box().get_value())
+            """
+        ),
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        backend="self",
+    )
+    result = subprocess.run(
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "42\n"
 
 
 def test_cached_property_getter_basic(tmp_path):

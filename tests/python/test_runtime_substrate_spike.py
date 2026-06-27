@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from unittest import mock
 
+from pcc.dependency_verdict import probe_artifact_dependency
+
 import pytest
 
 
@@ -227,8 +229,13 @@ def test_python_runtime_replacement_list_has_only_declared_c_islands():
 
 def test_pcc_python_archive_has_no_libpython_object():
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     result = subprocess.run(
         ["ar", "t", str(archive)],
@@ -281,7 +288,211 @@ def test_no_libpython_pcc_python_archive_staleness_ignores_libpython_bridge(tmp_
     os.utime(src_dir / "py_libpython.c", (newer, newer))
 
     with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
-        assert pipeline._runtime_archive_stale(str(archive)) is False
+        # This test isolates the py_libpython.c bridge-skip behavior. The
+        # archive-vs-pcc-compiler-source dependency is orthogonal (it scans the
+        # real _PCC_DIR, which the test does not stub), so neutralize it here.
+        with mock.patch.object(
+            pipeline,
+            "_runtime_archive_compiler_sources_newer_than",
+            return_value=False,
+        ):
+            assert pipeline._runtime_archive_stale(str(archive)) is False
+
+
+def test_pcc_python_archive_staleness_ignores_replaced_c_source(tmp_path):
+    from pcc.py_frontend import pipeline
+
+    runtime_dir = tmp_path / "py_runtime"
+    src_dir = runtime_dir / "src"
+    include_dir = runtime_dir / "include"
+    py_dir = runtime_dir / "py"
+    src_dir.mkdir(parents=True)
+    include_dir.mkdir()
+    py_dir.mkdir()
+
+    archive = runtime_dir / "libpy_runtime_pcc_py.a"
+    archive.write_text("archive", encoding="utf-8")
+    (runtime_dir / "Makefile").write_text(
+        "PY_MODULES = py_obj_gc\n"
+        "PY_REPLACED_C_MODULES = $(PY_MODULES) py_bytes\n",
+        encoding="utf-8",
+    )
+    (include_dir / "py_runtime.h").write_text("/* header */\n", encoding="utf-8")
+    replaced_c = src_dir / "py_obj_gc.c"
+    replaced_c.write_text("/* replaced C semantic runtime */\n", encoding="utf-8")
+    active_c = src_dir / "py_gc_index_table.c"
+    active_c.write_text("/* shared C kernel */\n", encoding="utf-8")
+    py_source = py_dir / "py_obj_gc.py"
+    py_source.write_text("# active pcc-Python semantic runtime\n", encoding="utf-8")
+
+    stamp = Path(pipeline._runtime_archive_target_stamp(str(archive)))
+    stamp.write_text(pipeline._runtime_archive_target_id() + "\n", encoding="utf-8")
+
+    old = 1_700_000_000
+    current = old + 10
+    newer = current + 10
+    for path in [
+        runtime_dir / "Makefile",
+        include_dir / "py_runtime.h",
+        active_c,
+        py_source,
+        stamp,
+    ]:
+        os.utime(path, (old, old))
+    os.utime(archive, (current, current))
+    os.utime(replaced_c, (newer, newer))
+
+    with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
+        with mock.patch.object(
+            pipeline,
+            "_runtime_archive_compiler_sources_newer_than",
+            return_value=False,
+        ):
+            assert pipeline._runtime_archive_stale(str(archive)) is False
+            os.utime(active_c, (newer, newer))
+            assert pipeline._runtime_archive_stale(str(archive)) is True
+
+
+def test_pcc_c_archive_staleness_tracks_runtime_c_sources(tmp_path):
+    from pcc.py_frontend import pipeline
+
+    runtime_dir = tmp_path / "py_runtime"
+    src_dir = runtime_dir / "src"
+    include_dir = runtime_dir / "include"
+    py_dir = runtime_dir / "py"
+    src_dir.mkdir(parents=True)
+    include_dir.mkdir()
+    py_dir.mkdir()
+
+    archive = runtime_dir / "libpy_runtime_pcc.a"
+    archive.write_text("archive", encoding="utf-8")
+    (runtime_dir / "Makefile").write_text("all:\n", encoding="utf-8")
+    (include_dir / "py_runtime.h").write_text("/* header */\n", encoding="utf-8")
+    (src_dir / "py_class.c").write_text("/* c runtime source */\n", encoding="utf-8")
+    (src_dir / "py_libpython.c").write_text("/* optional bridge */\n", encoding="utf-8")
+    (py_dir / "py_class.py").write_text("# pcc-python mirror\n", encoding="utf-8")
+
+    stamp = Path(pipeline._runtime_archive_target_stamp(str(archive)))
+    stamp.write_text(pipeline._runtime_archive_target_id() + "\n", encoding="utf-8")
+
+    old = 1_700_000_000
+    current = old + 10
+    newer = current + 10
+    for path in [
+        runtime_dir / "Makefile",
+        include_dir / "py_runtime.h",
+        src_dir / "py_libpython.c",
+        py_dir / "py_class.py",
+        stamp,
+    ]:
+        os.utime(path, (old, old))
+    os.utime(archive, (current, current))
+    os.utime(src_dir / "py_class.c", (newer, newer))
+
+    with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
+        assert pipeline._runtime_archive_stale(str(archive)) is True
+
+
+def test_pcc_emitted_archive_staleness_tracks_compiler_sources(tmp_path):
+    from pcc.py_frontend import pipeline
+
+    runtime_dir = tmp_path / "py_runtime"
+    include_dir = runtime_dir / "include"
+    src_dir = runtime_dir / "src"
+    py_dir = runtime_dir / "py"
+    include_dir.mkdir(parents=True)
+    src_dir.mkdir()
+    py_dir.mkdir()
+
+    archive = runtime_dir / "libpy_runtime_pcc_py.a"
+    archive.write_text("archive", encoding="utf-8")
+    (runtime_dir / "Makefile").write_text("all:\n", encoding="utf-8")
+    (include_dir / "py_runtime.h").write_text("/* header */\n", encoding="utf-8")
+    (src_dir / "py_gc_backend.c").write_text("/* c runtime source */\n", encoding="utf-8")
+    (py_dir / "py_gc_backend.py").write_text("# pcc-python runtime source\n", encoding="utf-8")
+
+    pcc_dir = tmp_path / "pcc"
+    codegen_dir = pcc_dir / "py_frontend" / "codegen"
+    codegen_dir.mkdir(parents=True)
+    codegen_file = codegen_dir / "user_function_lowering.py"
+    codegen_file.write_text("# compiler source\n", encoding="utf-8")
+
+    stamp = Path(pipeline._runtime_archive_target_stamp(str(archive)))
+    stamp.write_text(pipeline._runtime_archive_target_id() + "\n", encoding="utf-8")
+
+    old = 1_700_000_000
+    current = old + 10
+    newer = current + 10
+    for path in [
+        runtime_dir / "Makefile",
+        include_dir / "py_runtime.h",
+        src_dir / "py_gc_backend.c",
+        py_dir / "py_gc_backend.py",
+        stamp,
+    ]:
+        os.utime(path, (old, old))
+    os.utime(archive, (current, current))
+    os.utime(codegen_file, (newer, newer))
+
+    with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
+        with mock.patch.object(pipeline, "_PCC_DIR", str(pcc_dir)):
+            assert pipeline._runtime_archive_stale(str(archive)) is True
+
+
+def test_pcc_c_source_staleness_uses_incremental_runtime_rebuild(tmp_path):
+    from pcc.py_frontend import pipeline
+
+    runtime_dir = tmp_path / "py_runtime"
+    src_dir = runtime_dir / "src"
+    include_dir = runtime_dir / "include"
+    src_dir.mkdir(parents=True)
+    include_dir.mkdir()
+
+    archive = runtime_dir / "libpy_runtime_pcc.a"
+    archive.write_text("archive", encoding="utf-8")
+    (runtime_dir / "Makefile").write_text("all:\n", encoding="utf-8")
+    (include_dir / "py_runtime.h").write_text("/* header */\n", encoding="utf-8")
+    source = src_dir / "py_class.c"
+    source.write_text("/* newer c runtime source */\n", encoding="utf-8")
+
+    stamp = Path(pipeline._runtime_archive_target_stamp(str(archive)))
+    stamp.write_text(pipeline._runtime_archive_target_id() + "\n", encoding="utf-8")
+
+    old = 1_700_000_000
+    current = old + 10
+    newer = current + 10
+    for path in [runtime_dir / "Makefile", include_dir / "py_runtime.h", stamp]:
+        os.utime(path, (old, old))
+    os.utime(archive, (current, current))
+    os.utime(source, (newer, newer))
+
+    calls: list[list[str]] = []
+
+    def fake_runtime_make(make_cmd, *, verbose):
+        calls.append(list(make_cmd))
+        os.utime(archive, (newer + 10, newer + 10))
+
+    with mock.patch.dict(
+        os.environ,
+        {"PCC_RUNTIME_CC": "pcc", "PCC_RUNTIME_HIGH": "c"},
+        clear=True,
+    ):
+        with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
+            with mock.patch.object(pipeline, "_PY_RUNTIME_ARCHIVE_PCC", str(archive)):
+                with mock.patch.object(
+                    pipeline,
+                    "_runtime_archive_compiler_sources_newer_than",
+                    return_value=False,
+                ):
+                    with mock.patch.object(
+                        pipeline, "_run_runtime_make", side_effect=fake_runtime_make
+                    ):
+                        selected = pipeline._ensure_runtime(False, needs_libpython=False)
+
+    assert selected == str(archive)
+    assert calls, "stale libpy_runtime_pcc.a should trigger a runtime rebuild"
+    assert "-B" not in calls[0]
+    assert calls[0][-1] == "libpy_runtime_pcc.a"
 
 
 def test_libpython_pcc_python_archive_staleness_tracks_libpython_bridge(tmp_path):
@@ -391,6 +602,42 @@ def test_python_library_mode_emits_module_without_program_main(tmp_path):
     )
 
 
+def test_python_library_copied_runtime_source_suppresses_implicit_frame_roots(
+    tmp_path,
+):
+    from pcc.py_frontend.pipeline import compile_python
+
+    runtime_copy_py = tmp_path / "py_runtime_pcc_py" / "py"
+    runtime_copy_py.mkdir(parents=True)
+    src = runtime_copy_py / "frame_probe.py"
+    out_ll = tmp_path / "frame_probe.ll"
+    src.write_text(
+        "from pcc.extern import c_abi_export\n"
+        "from pcc.unsafe import null, ptr_is_null\n"
+        "\n"
+        "@c_abi_export('pcc_gc_note_frame_leave')\n"
+        "def pcc_gc_note_frame_leave(slots) -> None:\n"
+        "    prev = null()\n"
+        "    node = null()\n"
+        "    if ptr_is_null(slots) != 0:\n"
+        "        return\n"
+        "    node = slots\n"
+        "    prev = node\n"
+        "    return\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(src),
+        str(out_ll),
+        emit_llvm_only=True,
+        python_library=True,
+    )
+
+    ir_text = out_ll.read_text(encoding="utf-8")
+    assert "call void @pcc_gc_frame_enter" not in ir_text
+
+
 def test_pcc_python_libpython_archive_adds_only_bridge_object():
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py_libpython.a"
     if not archive.exists():
@@ -408,12 +655,48 @@ def test_pcc_python_libpython_archive_adds_only_bridge_object():
     assert "py_substrate.o" in members
     assert "py_int.o" in members
     assert "py_libpython.o" in members
+    assert "py_capi_shim.o" not in members
+
+    # Removing the no-libpython shim must not leave pcc runtime objects with
+    # unresolved references to its internal (non-Py*) protocol helpers.  The
+    # libpython bridge owns fail-closed definitions because this archive has no
+    # pcc C-extension object tags.
+    symbols = subprocess.run(
+        ["nm", "-g", str(archive)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(REPO_ROOT),
+        check=True,
+    ).stdout.splitlines()
+    defined = set()
+    for line in symbols:
+        fields = line.split()
+        if len(fields) >= 2 and fields[-2].upper() == "T":
+            defined.add(fields[-1].lstrip("_"))
+    assert {
+        "pcc_capi_cext_absolute",
+        "pcc_capi_cext_binary_number",
+        "pcc_capi_cext_object_getitem",
+        "pcc_capi_cext_object_iter",
+        "pcc_capi_cext_object_next",
+        "pcc_capi_cext_object_repr",
+        "pcc_capi_cext_richcompare_bool",
+        "pcc_capi_cext_subtract",
+        "pcc_capi_cext_truthy",
+        "py_cext_number_to_i64",
+    } <= defined
 
 
 def test_pcc_python_archive_uses_python_py_substrate_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_substrate.o"],
@@ -441,8 +724,13 @@ def test_pcc_python_archive_uses_python_py_substrate_object(tmp_path):
 
 def test_pcc_python_archive_uses_python_py_process_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_process.o"],
@@ -467,8 +755,13 @@ def test_pcc_python_archive_uses_python_py_process_object(tmp_path):
 
 def test_pcc_python_archive_uses_python_py_coroutine_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_coroutine.o"],
@@ -492,8 +785,13 @@ def test_pcc_python_archive_uses_python_py_coroutine_object(tmp_path):
 
 def test_pcc_python_archive_uses_python_py_func_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_func.o"],
@@ -518,8 +816,13 @@ def test_pcc_python_archive_uses_python_py_func_object(tmp_path):
 
 def test_pcc_python_archive_uses_python_py_re_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_re.o"],
@@ -543,8 +846,13 @@ def test_pcc_python_archive_uses_python_py_re_object(tmp_path):
 
 def test_pcc_python_archive_uses_python_py_dunder_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_dunder.o"],
@@ -569,8 +877,13 @@ def test_pcc_python_archive_uses_python_py_dunder_object(tmp_path):
 
 def test_pcc_python_archive_uses_python_py_file_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_file.o"],
@@ -595,8 +908,13 @@ def test_pcc_python_archive_uses_python_py_file_object(tmp_path):
 
 def test_pcc_python_archive_uses_python_py_os_substrate_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_os_substrate.o"],
@@ -621,8 +939,13 @@ def test_pcc_python_archive_uses_python_py_os_substrate_object(tmp_path):
 
 def test_pcc_python_archive_uses_python_py_process_substrate_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_process_substrate.o"],
@@ -647,8 +970,13 @@ def test_pcc_python_archive_uses_python_py_process_substrate_object(tmp_path):
 
 def test_pcc_python_archive_uses_python_py_int_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_int.o"],
@@ -671,8 +999,13 @@ def test_pcc_python_archive_uses_python_py_int_object(tmp_path):
 
 def test_pcc_python_runtime_bigint_divmod_matches_python(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     harness = tmp_path / "bigint_divmod_harness.c"
     harness.write_text(
@@ -757,8 +1090,13 @@ def test_pcc_python_runtime_bigint_divmod_matches_python(tmp_path):
 
 def test_pcc_python_traceback_archive_formats_exception(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     harness = tmp_path / "traceback_harness.c"
     harness.write_text(
@@ -807,8 +1145,13 @@ def test_pcc_python_traceback_archive_formats_exception(tmp_path):
 
 def test_pcc_python_relocate_copy_rejects_oversized_copy(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     harness = tmp_path / "relocate_copy_size_harness.c"
     harness.write_text(
@@ -819,10 +1162,14 @@ def test_pcc_python_relocate_copy_rejects_oversized_copy(tmp_path):
 
         int main(void) {
             setenv("PCC_GC_BACKEND", "4", 1);
-            PyObject *old = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0);
+            /* Leaf-tag scalars (FLOAT/STR/...) are deliberately malloc'd and
+             * excluded from the zpage relocation graph by the rework, so they
+             * are never relocation candidates. Use a non-leaf zpage-resident
+             * tag (TUPLE) to exercise the relocate-copy size guard. */
+            PyObject *old = pcc_gc_alloc(64, PY_TYPE_TUPLE, 0);
             if (old == NULL) return 2;
             printf("selected=%lld\\n", (long long)pcc_gc_select_relocation_set(1));
-            PyObject *moved = pcc_gc_relocate_copy(old, 32);
+            PyObject *moved = pcc_gc_relocate_copy(old, 96);
             printf("oversize_null=%d\\n", moved == NULL);
             if (moved != NULL) {
                 pcc_gc_release(moved);
@@ -862,8 +1209,13 @@ def test_pcc_python_relocate_copy_rejects_oversized_copy(tmp_path):
 
 def test_pcc_python_relocate_copy_consumes_relocation_entry(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     harness = tmp_path / "relocate_copy_single_forward_harness.c"
     harness.write_text(
@@ -874,14 +1226,16 @@ def test_pcc_python_relocate_copy_consumes_relocation_entry(tmp_path):
 
         int main(void) {
             setenv("PCC_GC_BACKEND", "4", 1);
-            PyObject *old = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0);
+            /* Non-leaf zpage-resident tag: leaf scalars are excluded from the
+             * relocation graph by the rework (see oversize test). */
+            PyObject *old = pcc_gc_alloc(64, PY_TYPE_TUPLE, 0);
             if (old == NULL) return 2;
             pcc_gc_reset_relocation_set();
             pcc_gc_select_relocation_set(1);
-            PyObject *moved = pcc_gc_relocate_copy(old, 24);
+            PyObject *moved = pcc_gc_relocate_copy(old, 64);
             printf("first_null=%d\\n", moved == NULL);
             printf("still_selected=%lld\\n", (long long)pcc_gc_relocation_set_contains(old));
-            PyObject *moved_again = pcc_gc_relocate_copy(old, 24);
+            PyObject *moved_again = pcc_gc_relocate_copy(old, 64);
             printf("second_null=%d\\n", moved_again == NULL);
             if (moved_again != NULL) {
                 pcc_gc_release(moved_again);
@@ -928,8 +1282,13 @@ def test_pcc_python_relocate_copy_consumes_relocation_entry(tmp_path):
 
 def test_pcc_python_relocating_step_copies_simple_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
-    if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+    # Structured artifact verdict: a missing prebuilt archive is an explicit
+    # UNAVAILABLE prerequisite, never evidence about the archive's contents;
+    # only the executed ``ar t`` probe below can claim runtime behavior
+    # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
+    verdict = probe_artifact_dependency(archive, kind="runtime-archive")
+    if not verdict.available:
+        pytest.skip(verdict.skip_reason())
 
     harness = tmp_path / "relocating_step_harness.c"
     harness.write_text(
@@ -940,7 +1299,9 @@ def test_pcc_python_relocating_step_copies_simple_object(tmp_path):
 
         int main(void) {
             setenv("PCC_GC_BACKEND", "4", 1);
-            PyObject *old = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0);
+            /* Non-leaf zpage-resident tag: leaf scalars are excluded from the
+             * relocation graph by the rework, so they never relocate. */
+            PyObject *old = pcc_gc_alloc(64, PY_TYPE_TUPLE, 0);
             if (old == NULL) return 2;
             int64_t old_id = pcc_gc_object_id(old);
             PyObject *slot = NULL;
@@ -1004,7 +1365,7 @@ def test_pcc_python_traceback_helpers_ignore_ambient_exception_tls(tmp_path):
         ir_scaffold_mode="on",
         libpython_mode="off",
     )
-    ir_text = ll.read_text()
+    ir_text = ll.read_text(encoding="utf-8")
     match = re.search(
         r"define (?:external )?i64 @user_py_exc_traceback__is_exception"
         r"\([^)]*\)[^{]*\{(?P<body>.*?)\n\}",
@@ -1015,7 +1376,7 @@ def test_pcc_python_traceback_helpers_ignore_ambient_exception_tls(tmp_path):
     assert "py_err_occurred" not in match.group("body")
 
 
-def test_pcc_python_dict_lookup_masks_signed_hash_perturb(tmp_path):
+def test_pcc_python_dict_lookup_matches_unsigned_hash_perturb(tmp_path):
     from pcc.py_frontend.pipeline import compile_python
 
     src = REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_dict.py"
@@ -1027,7 +1388,7 @@ def test_pcc_python_dict_lookup_masks_signed_hash_perturb(tmp_path):
         ir_scaffold_mode="on",
         libpython_mode="off",
     )
-    ir_text = ll.read_text()
+    ir_text = ll.read_text(encoding="utf-8")
     match = re.search(
         r"define (?:external )?i64 @user_py_dict__lookup"
         r"\([^)]*\)[^{]*\{(?P<body>.*?)\n\}",
@@ -1036,10 +1397,19 @@ def test_pcc_python_dict_lookup_masks_signed_hash_perturb(tmp_path):
     )
     assert match is not None
     body = match.group("body")
-    assert "9223372036854775807" in body
+    assert "user_py_dict__perturb_shift5" in body
+    assert "9223372036854775807" not in body
+    helper = re.search(
+        r"define (?:external )?i64 @user_py_dict__perturb_shift5"
+        r"\([^)]*\)[^{]*\{(?P<body>.*?)\n\}",
+        ir_text,
+        re.S,
+    )
+    assert helper is not None
+    assert "576460752303423488" in helper.group("body")
 
 
-def test_pcc_python_set_lookup_masks_signed_hash_perturb(tmp_path):
+def test_pcc_python_set_lookup_matches_unsigned_hash_perturb(tmp_path):
     from pcc.py_frontend.pipeline import compile_python
 
     src = REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_set.py"
@@ -1051,7 +1421,7 @@ def test_pcc_python_set_lookup_masks_signed_hash_perturb(tmp_path):
         ir_scaffold_mode="on",
         libpython_mode="off",
     )
-    ir_text = ll.read_text()
+    ir_text = ll.read_text(encoding="utf-8")
     # ``_lookup_slot`` takes the set ``s`` as its first parameter
     # (``_lookup_slot(s, entries, capacity, hash_val, key)`` in
     # py_set.py); the old regex required the signature to start
@@ -1067,7 +1437,51 @@ def test_pcc_python_set_lookup_masks_signed_hash_perturb(tmp_path):
     )
     assert match is not None
     body = match.group("body")
-    assert "9223372036854775807" in body
+    assert "user_py_set__perturb_shift5" in body
+    assert "9223372036854775807" not in body
+    helper = re.search(
+        r"define (?:external )?i64 @user_py_set__perturb_shift5"
+        r"\([^)]*\)[^{]*\{(?P<body>.*?)\n\}",
+        ir_text,
+        re.S,
+    )
+    assert helper is not None
+    assert "576460752303423488" in helper.group("body")
+
+
+def test_runtime_mirror_probe_and_backend0_latch_source_parity():
+    py_set = (REPO_ROOT / "pcc/py_runtime/py/py_set.py").read_text(encoding="utf-8")
+    py_dict = (REPO_ROOT / "pcc/py_runtime/py/py_dict.py").read_text(encoding="utf-8")
+    c_set = (REPO_ROOT / "pcc/py_runtime/src/py_set.c").read_text(encoding="utf-8")
+    c_dict = (REPO_ROOT / "pcc/py_runtime/src/py_dict.c").read_text(encoding="utf-8")
+
+    helper_pattern = r"def _perturb_shift5\(perturb: int\) -> int:\n(?P<body>.*?)(?=\n\ndef )"
+    set_helper = re.search(helper_pattern, py_set, re.S)
+    dict_helper = re.search(helper_pattern, py_dict, re.S)
+    assert set_helper is not None
+    assert dict_helper is not None
+    assert set_helper.group("body") == dict_helper.group("body")
+    assert "576460752303423488" in set_helper.group("body")
+
+    for source in (py_set, py_dict):
+        assert "perturb: int = hash_val" in source
+        assert "perturb = _perturb_shift5(perturb)" in source
+        assert "limit: int = capacity * 2" in source
+        assert "9223372036854775807" not in source
+    for source in (c_set, c_dict):
+        assert "uint64_t perturb = (uint64_t)hash;" in source
+        assert "perturb >>= 5;" in source
+        assert "capacity * 2" in source
+
+    c_gc = (REPO_ROOT / "pcc/py_runtime/src/py_gc_backend.c").read_text(encoding="utf-8")
+    py_gc = (REPO_ROOT / "pcc/py_runtime/py/py_gc_backend.py").read_text(encoding="utf-8")
+    substrate = (REPO_ROOT / "pcc/py_runtime/py/py_substrate.py").read_text(encoding="utf-8")
+    assert "pcc_gc_backend0_frame_roots_enabled = 0" in c_gc
+    assert 'define_global_i32("pcc_gc_backend0_frame_roots_enabled", 0)' in substrate
+    assert "pcc_gc_backend0_frame_roots_enabled = 1;" in c_gc
+    assert 'store_i32(global_addr("pcc_gc_backend0_frame_roots_enabled"), 0, 1)' in py_gc
+    assert "pcc_gc_backend0_frame_roots_enabled != 0" in c_gc
+    assert 'load_i32(global_addr("pcc_gc_backend0_frame_roots_enabled"), 0)' in py_gc
 
 
 def test_py_tuple_port_spike_runs_correctly(tmp_path):

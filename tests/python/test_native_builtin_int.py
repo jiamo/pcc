@@ -24,7 +24,7 @@ def test_dyn_int_add_result_marshal_does_not_emit_noop_sext(tmp_path):
                 main()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     compile_python(
         str(src),
         str(ll),
@@ -32,7 +32,7 @@ def test_dyn_int_add_result_marshal_does_not_emit_noop_sext(tmp_path):
         ir_scaffold_mode="on",
         libpython_mode="off",
     )
-    ir_text = ll.read_text()
+    ir_text = ll.read_text(encoding="utf-8")
     assert "sext i64" not in ir_text
     assert "m.dyn.sext64" not in ir_text
 
@@ -74,7 +74,7 @@ def test_dyn_int_builtin_handles_tagged_int_without_str_path(tmp_path):
                 main()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     compile_python(
         str(src),
         str(exe),
@@ -109,7 +109,7 @@ def test_cpython_dyn_int_builtin_uses_cpython_number_protocol(tmp_path):
                 main()
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     compile_python(
         str(src),
         str(exe),

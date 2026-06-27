@@ -1,5 +1,5 @@
-from pcc.py_frontend.export_meta import decode_type
-from pcc.py_frontend.py_ast import ClassType, IntType, ListType
+from pcc.py_frontend.export_meta import decode_type, encode_type
+from pcc.py_frontend.py_ast import ClassType, DynType, IntType, ListType, SetType
 
 
 def test_decode_type_caches_tuple_descriptors():
@@ -28,3 +28,12 @@ def test_decode_type_preserves_existing_type_passthrough():
     ty = IntType(name="int", width=32, signed=False)
 
     assert decode_type(ty) is ty
+
+
+def test_set_type_export_metadata_roundtrip():
+    ty = SetType(name="set", elem=DynType(name="dyn"))
+
+    recovered = decode_type(encode_type(ty))
+
+    assert recovered == ty
+    assert isinstance(recovered, SetType)

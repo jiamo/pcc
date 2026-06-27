@@ -17,7 +17,7 @@ def test_class_chained_assignment_initializes_all_aliases(tmp_path):
             print(C.c)
             """
         )
-    )
+    , encoding="utf-8")
     exe = tmp_path / "class_chained_assignment.out"
     compile_python(str(src), str(exe), libpython_mode="off", ir_scaffold_mode="on")
     out = subprocess.check_output([str(exe)], text=True).splitlines()

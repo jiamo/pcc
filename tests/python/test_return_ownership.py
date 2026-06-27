@@ -60,3 +60,31 @@ def test_returning_borrowed_parameter_retains_for_owned_call_result(tmp_path):
 
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "1\n1\n"
+
+
+def test_c_abi_raw_scaffold_returning_borrowed_parameter_still_retains(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "return_borrowed_c_abi.py"
+    src.write_text(
+        textwrap.dedent(
+            """
+            from pcc.extern import c_abi_export
+
+            @c_abi_export("identity_export")
+            def identity(xs: list) -> list:
+                return xs
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    ll = tmp_path / "return_borrowed_c_abi.ll"
+    compile_python(str(src), str(ll), emit_llvm_only=True, libpython_mode="off")
+    ir_text = ll.read_text(encoding="utf-8")
+    identity_ir = re.search(
+        r"define\s+[^@]*@identity_export[^{]*\{.*?\n\}",
+        ir_text,
+        re.S,
+    )
+    assert identity_ir is not None, ir_text
+    assert "pcc_gc_retain" in identity_ir.group(0)

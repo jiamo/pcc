@@ -25,8 +25,8 @@ def test_clean_restores_tracked_files_and_removes_generated_outputs(tmp_path, mo
     )
     pristine_header = "#define VALUE 41\n"
 
-    (dep_dir / "Makefile").write_text(pristine_makefile)
-    (dep_dir / "config.h").write_text(pristine_header)
+    (dep_dir / "Makefile").write_text(pristine_makefile, encoding="utf-8")
+    (dep_dir / "config.h").write_text(pristine_header, encoding="utf-8")
 
     _git(tmp_path, "init")
     _git(tmp_path, "config", "user.email", "test@example.com")
@@ -38,10 +38,10 @@ def test_clean_restores_tracked_files_and_removes_generated_outputs(tmp_path, mo
         "distclean:\n"
         "\trm -f build.o generated.pc\n"
         "\t@echo cleaned\n"
-    )
-    (dep_dir / "config.h").write_text("#define VALUE 99\n")
-    (dep_dir / "build.o").write_text("object\n")
-    (dep_dir / "generated.pc").write_text("pc\n")
+    , encoding="utf-8")
+    (dep_dir / "config.h").write_text("#define VALUE 99\n", encoding="utf-8")
+    (dep_dir / "build.o").write_text("object\n", encoding="utf-8")
+    (dep_dir / "generated.pc").write_text("pc\n", encoding="utf-8")
 
     monkeypatch.setattr(
         run_module,
@@ -62,8 +62,8 @@ def test_clean_restores_tracked_files_and_removes_generated_outputs(tmp_path, mo
 
     run_module.clean(["fake"], repo_root=str(tmp_path))
 
-    assert (dep_dir / "Makefile").read_text() == pristine_makefile
-    assert (dep_dir / "config.h").read_text() == pristine_header
+    assert (dep_dir / "Makefile").read_text(encoding="utf-8") == pristine_makefile
+    assert (dep_dir / "config.h").read_text(encoding="utf-8") == pristine_header
     assert not (dep_dir / "build.o").exists()
     assert not (dep_dir / "generated.pc").exists()
 
@@ -100,11 +100,19 @@ def test_auto_clean_targets_only_include_newly_dirty_project_trees():
     assert targets == ("generated", "readline")
 
 
+def test_pytest_auto_clean_is_opt_in(monkeypatch):
+    monkeypatch.delenv("PCC_PYTEST_AUTO_CLEAN", raising=False)
+    assert root_conftest._auto_clean_enabled() is False
+    monkeypatch.setenv("PCC_PYTEST_AUTO_CLEAN", "1")
+    assert root_conftest._auto_clean_enabled() is True
+
+
 def test_pytest_sessionfinish_cleans_controller_targets(monkeypatch):
     calls = []
 
     class FakeConfig:
         _pcc_initial_status_paths = {"README.md"}
+        _pcc_auto_clean_enabled = True
 
     class FakeSession:
         config = FakeConfig()
@@ -134,6 +142,7 @@ def test_pytest_sessionfinish_skips_auto_clean_when_lock_is_busy(monkeypatch):
     class FakeConfig:
         _pcc_initial_status_paths = {"README.md"}
         _pcc_auto_clean_lockfile = FakeLock()
+        _pcc_auto_clean_enabled = True
 
     class FakeSession:
         config = FakeConfig()

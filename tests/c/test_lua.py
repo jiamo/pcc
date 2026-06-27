@@ -15,6 +15,7 @@ import sys
 import tempfile
 import fcntl
 import hashlib
+from pathlib import Path
 import pytest
 import llvmlite.ir as ir
 import llvmlite.binding as llvm
@@ -65,6 +66,8 @@ _BACKGROUND_PID_LINE = re.compile(
 )
 LUA_CPP_ARGS = ("-DLUA_USE_JUMPTABLE=0", "-DLUA_NOBUILTIN")
 SELF_BACKEND_SMOKE_TEST_FILES = ("math.lua", "calls.lua")
+_CC_MISSING = shutil.which("cc") is None
+_MAKE_MISSING = shutil.which("make") is None
 
 
 def _test_cache_root():
@@ -254,14 +257,21 @@ LUA_TEST_FILES = (
 LUA_C_FILES_FILTERED = [f for f in LUA_C_FILES if f not in ("onelua.c", "ltests.c")]
 
 
+def test_lua_oracles_have_no_dynamic_xfails():
+    """A new compiler/reference/runtime regression must not become expected."""
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert "pytest." + "xfail" not in source
+    assert "system cc is required" in source
+    assert 'reason="onelua.c not found"' in source
+    assert 'reason="testes/ not found"' in source
+
+
+@pytest.mark.skipif(_CC_MISSING, reason="system cc is required for the Lua C oracle")
 @pytest.mark.parametrize("fname", LUA_C_FILES_FILTERED, ids=LUA_C_FILES_FILTERED)
 def test_lua_source_compile(fname):
     """Test Lua .c file: preprocess → parse → codegen → LLVM verify."""
     stage, result = _compile_lua_file(fname)
-    if stage == "ok":
-        pass  # Compiled + LLVM verified!
-    else:
-        pytest.xfail(f"Stage '{stage}': {result}")
+    assert stage == "ok", f"Lua source compile stage '{stage}': {result}"
 
 
 def _compile_onelua():
@@ -418,7 +428,7 @@ def _compile_self_backend_onelua():
 
     cache_key = _cache_key(
         "lua-self-backend",
-        "safe-O0-no-vectorize",
+        "safe-O0-no-vectorize-call-result-args",
         platform.system(),
         LUA_CPP_ARGS,
         _lua_preprocessor_prefix(),
@@ -489,7 +499,7 @@ def _compile_self_backend_lua_separate_tus():
 
     cache_key = _cache_key(
         "lua-self-backend-separate-tus",
-        "safe-O0-no-vectorize",
+        "safe-O0-no-vectorize-call-result-args",
         platform.system(),
         LUA_CPP_ARGS,
         _lua_preprocessor_prefix(),
@@ -733,36 +743,48 @@ def _normalize_runtime_stdout(stdout, bin_path):
 @pytest.fixture(scope="session")
 def pcc_lua_bin():
     """Compile onelua.c via pcc once per session."""
+    if _CC_MISSING:
+        pytest.skip("system cc is required to link the pcc-built Lua oracle")
     return _compile_onelua()
 
 
 @pytest.fixture(scope="session")
 def native_lua_bin():
     """Compile onelua.c via cc once per session."""
+    if _CC_MISSING:
+        pytest.skip("system cc is required for the native Lua oracle")
     return _compile_native_onelua()
 
 
 @pytest.fixture(scope="session")
 def self_lua_bin():
     """Compile onelua.c via the self backend once per session."""
+    if _CC_MISSING:
+        pytest.skip("system cc is required to link the self-backend Lua oracle")
     return _compile_self_backend_onelua()
 
 
 @pytest.fixture(scope="session")
 def self_lua_separate_tus_bin():
     """Compile Lua via self backend using make-derived separate translation units."""
+    if _CC_MISSING or _MAKE_MISSING:
+        pytest.skip("system cc and make are required for separate-TU Lua")
     return _compile_self_backend_lua_separate_tus()
 
 
 @pytest.fixture(scope="session")
 def makefile_lua_bin():
     """Build Lua via Makefile once per session."""
+    if _CC_MISSING or _MAKE_MISSING:
+        pytest.skip("system cc and make are required for the Makefile Lua oracle")
     return _compile_makefile_lua()
 
 
 @pytest.fixture(scope="session")
 def lua_runtime_tests_dir():
     """Prepare an isolated copy of the Lua tests with loadable C modules."""
+    if _CC_MISSING:
+        pytest.skip("system cc is required to build Lua test modules")
     return _prepare_runtime_tests_dir()
 
 
@@ -773,10 +795,8 @@ def lua_runtime_tests_dir():
 def test_onelua_compile_and_link(pcc_lua_bin):
     """Compile onelua.c (single TU) → .o → linked binary."""
     stage, result = pcc_lua_bin
-    if stage == "ok":
-        assert os.path.isfile(result), f"Binary not found: {result}"
-    else:
-        pytest.xfail(f"Stage '{stage}': {result}")
+    assert stage == "ok", f"pcc Lua build stage '{stage}': {result}"
+    assert os.path.isfile(result), f"Binary not found: {result}"
 
 
 @pytest.mark.skipif(not os.path.isdir(lua_tests_dir), reason="testes/ not found")
@@ -786,16 +806,13 @@ def test_pcc_runtime_matches_makefile(
 ):
     """Compare pcc-compiled onelua vs Makefile-built lua (official reference)."""
     pcc_stage, pcc_bin = pcc_lua_bin
-    if pcc_stage != "ok":
-        pytest.xfail(f"pcc stage '{pcc_stage}': {pcc_bin}")
+    assert pcc_stage == "ok", f"pcc stage '{pcc_stage}': {pcc_bin}"
 
     make_stage, make_bin = makefile_lua_bin
-    if make_stage != "ok":
-        pytest.xfail(f"makefile stage '{make_stage}': {make_bin}")
+    assert make_stage == "ok", f"makefile stage '{make_stage}': {make_bin}"
 
     tests_stage, tests_dir = lua_runtime_tests_dir
-    if tests_stage != "ok":
-        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+    assert tests_stage == "ok", f"runtime tests stage '{tests_stage}': {tests_dir}"
 
     pcc_r = _run_lua_script(pcc_bin, test_file, tests_dir)
     make_r = _run_lua_script(make_bin, test_file, tests_dir)
@@ -816,16 +833,13 @@ def test_pcc_runtime_matches_native(
 ):
     """Compare pcc-compiled onelua vs cc-compiled onelua (same source, test pcc as C compiler)."""
     pcc_stage, pcc_bin = pcc_lua_bin
-    if pcc_stage != "ok":
-        pytest.xfail(f"pcc stage '{pcc_stage}': {pcc_bin}")
+    assert pcc_stage == "ok", f"pcc stage '{pcc_stage}': {pcc_bin}"
 
     native_stage, native_bin = native_lua_bin
-    if native_stage != "ok":
-        pytest.xfail(f"native stage '{native_stage}': {native_bin}")
+    assert native_stage == "ok", f"native stage '{native_stage}': {native_bin}"
 
     tests_stage, tests_dir = lua_runtime_tests_dir
-    if tests_stage != "ok":
-        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+    assert tests_stage == "ok", f"runtime tests stage '{tests_stage}': {tests_dir}"
 
     pcc_r = _run_lua_script(pcc_bin, test_file, tests_dir)
     native_r = _run_lua_script(native_bin, test_file, tests_dir)
@@ -850,16 +864,13 @@ def test_self_backend_runtime_matches_native_smoke(
 ):
     """Smoke-test the self backend on the current real workload closure slice."""
     self_stage, self_bin = self_lua_bin
-    if self_stage != "ok":
-        pytest.xfail(f"self backend stage '{self_stage}': {self_bin}")
+    assert self_stage == "ok", f"self backend stage '{self_stage}': {self_bin}"
 
     native_stage, native_bin = native_lua_bin
-    if native_stage != "ok":
-        pytest.xfail(f"native stage '{native_stage}': {native_bin}")
+    assert native_stage == "ok", f"native stage '{native_stage}': {native_bin}"
 
     tests_stage, tests_dir = lua_runtime_tests_dir
-    if tests_stage != "ok":
-        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+    assert tests_stage == "ok", f"runtime tests stage '{tests_stage}': {tests_dir}"
 
     self_r = _run_lua_script(self_bin, test_file, tests_dir)
     native_r = _run_lua_script(native_bin, test_file, tests_dir)
@@ -882,16 +893,13 @@ def test_self_backend_runtime_matches_native_smoke(
 def test_makefile_lua_test_suite(test_file, makefile_lua_bin, lua_runtime_tests_dir):
     """Run full Lua test suite with Makefile-built binary."""
     make_stage, make_bin = makefile_lua_bin
-    if make_stage != "ok":
-        pytest.xfail(f"makefile stage '{make_stage}': {make_bin}")
+    assert make_stage == "ok", f"makefile stage '{make_stage}': {make_bin}"
 
     tests_stage, tests_dir = lua_runtime_tests_dir
-    if tests_stage != "ok":
-        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+    assert tests_stage == "ok", f"runtime tests stage '{tests_stage}': {tests_dir}"
 
     r = _run_lua_script(make_bin, test_file, tests_dir)
-    if r.returncode != 0:
-        pytest.xfail(f"exit={r.returncode}: {r.stderr[:200]}")
+    assert r.returncode == 0, f"exit={r.returncode}: {r.stderr[:200]}"
 
 
 @pytest.mark.skipif(
@@ -901,12 +909,10 @@ def test_makefile_lua_test_suite(test_file, makefile_lua_bin, lua_runtime_tests_
 def test_makefile_lua_all(makefile_lua_bin, lua_runtime_tests_dir):
     """Run all.lua — the official Lua test suite entry point."""
     make_stage, make_bin = makefile_lua_bin
-    if make_stage != "ok":
-        pytest.xfail(f"makefile stage '{make_stage}': {make_bin}")
+    assert make_stage == "ok", f"makefile stage '{make_stage}': {make_bin}"
 
     tests_stage, tests_dir = lua_runtime_tests_dir
-    if tests_stage != "ok":
-        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+    assert tests_stage == "ok", f"runtime tests stage '{tests_stage}': {tests_dir}"
 
     script_path = os.path.abspath(os.path.join(tests_dir, "all.lua"))
     # _port=true: skip non-portable tests (e.g. /dev/full on macOS)
@@ -928,16 +934,13 @@ def test_makefile_lua_all(makefile_lua_bin, lua_runtime_tests_dir):
 def test_self_backend_lua_all_smoke(self_lua_bin, native_lua_bin, lua_runtime_tests_dir):
     """Run all.lua through the self backend's current curated Lua closure path."""
     self_stage, self_bin = self_lua_bin
-    if self_stage != "ok":
-        pytest.xfail(f"self backend stage '{self_stage}': {self_bin}")
+    assert self_stage == "ok", f"self backend stage '{self_stage}': {self_bin}"
 
     native_stage, native_bin = native_lua_bin
-    if native_stage != "ok":
-        pytest.xfail(f"native stage '{native_stage}': {native_bin}")
+    assert native_stage == "ok", f"native stage '{native_stage}': {native_bin}"
 
     tests_stage, tests_dir = lua_runtime_tests_dir
-    if tests_stage != "ok":
-        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+    assert tests_stage == "ok", f"runtime tests stage '{tests_stage}': {tests_dir}"
 
     script_path = os.path.abspath(os.path.join(tests_dir, "all.lua"))
     self_r = subprocess.run(
@@ -967,12 +970,10 @@ def test_self_backend_lua_all_smoke(self_lua_bin, native_lua_bin, lua_runtime_te
 def test_self_backend_separate_tus_lua_all_smoke(self_lua_separate_tus_bin, lua_runtime_tests_dir):
     """Run all.lua through the self backend's separate-TU Lua build path."""
     self_stage, self_bin = self_lua_separate_tus_bin
-    if self_stage != "ok":
-        pytest.xfail(f"self separate-tus stage '{self_stage}': {self_bin}")
+    assert self_stage == "ok", f"self separate-tus stage '{self_stage}': {self_bin}"
 
     tests_stage, tests_dir = lua_runtime_tests_dir
-    if tests_stage != "ok":
-        pytest.xfail(f"runtime tests stage '{tests_stage}': {tests_dir}")
+    assert tests_stage == "ok", f"runtime tests stage '{tests_stage}': {tests_dir}"
 
     script_path = os.path.abspath(os.path.join(tests_dir, "all.lua"))
     self_r = subprocess.run(

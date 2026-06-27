@@ -18,7 +18,7 @@ def test_call_result_arithmetic_compiles_dynamic_dunder_self_backend(tmp_path):
 
         print(make() + Box())
         """
-    ))
+    ), encoding="utf-8")
     exe = tmp_path / "dynamic_dunder_arithmetic.out"
     compile_python(
         str(src),

@@ -775,7 +775,7 @@ def test_postgres_runtime_query_against_native_server(tmp_path):
         assert start.returncode == 0, (
             "postgres server start failed:\n"
             f"{start.stdout}\n{start.stderr}\n"
-            f"{log_path.read_text() if log_path.exists() else ''}"
+            f"{log_path.read_text(encoding="utf-8") if log_path.exists() else ''}"
         )
         started = True
 
@@ -880,7 +880,7 @@ def test_postgres_self_backend_runtime_query_against_native_server(tmp_path):
         assert start.returncode == 0, (
             "postgres server start failed:\n"
             f"{start.stdout}\n{start.stderr}\n"
-            f"{log_path.read_text() if log_path.exists() else ''}"
+            f"{log_path.read_text(encoding="utf-8") if log_path.exists() else ''}"
         )
         started = True
 
