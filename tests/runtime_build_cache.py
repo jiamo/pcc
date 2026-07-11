@@ -1,0 +1,277 @@
+"""Per-pytest-process cache for immutable native runtime build artifacts.
+
+Probe sources and executables remain in each test's ``tmp_path``.  Only a
+builder's copied runtime directory/archive is reused when its explicit
+arguments and build-relevant environment are identical.  A failed builder is
+never cached.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from functools import wraps
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Callable, ParamSpec, TypeVar
+
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+_BUILD_ENV_KEYS = (
+    "CC",
+    "CFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "PCC_BACKEND",
+    "PCC_GC_BACKEND",
+    "PCC_REFCOUNT_KIND",
+    "PCC_WITH_THREADS",
+    "PCC_WITH_LIBPYTHON",
+    "PCC_RUNTIME_CC",
+    "PCC_RUNTIME_HIGH",
+)
+_PCC_PY_ARCHIVE_ENV_KEYS = (
+    "CC",
+    "CFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "PCC_REFCOUNT_KIND",
+)
+
+_REPO_ROOT = Path(__file__).absolute().parents[1]
+_RUNTIME_DIR = _REPO_ROOT / "pcc" / "py_runtime"
+
+
+def _c_runtime_source_key() -> str:
+    """Hash inputs that can change the default C runtime archive."""
+
+    digest = hashlib.sha256()
+    for name in (
+        "CC",
+        "CFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "PCC_REFCOUNT_KIND",
+        "PCC_WITH_LIBPYTHON",
+    ):
+        digest.update(name.encode("utf-8"))
+        digest.update(str(os.environ.get(name, "")).encode("utf-8"))
+    files = []
+    for path in _RUNTIME_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part.startswith(".") or part == "__pycache__" for part in path.parts):
+            continue
+        if path.suffix not in {".c", ".h"} and path.name != "Makefile":
+            continue
+        files.append(path)
+    for path in sorted(files):
+        digest.update(path.relative_to(_RUNTIME_DIR).as_posix().encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:24]
+
+
+def cached_c_runtime() -> Path:
+    """Build/reuse one immutable default C runtime across pytest workers.
+
+    Tests must never rebuild or link the repository's mutable
+    ``pcc/py_runtime/libpy_runtime.a`` under xdist.  A content-addressed key,
+    inter-process lock, staging directory, and atomic publish make readers see
+    either a complete old artifact or a complete new artifact.
+    """
+
+    key = _c_runtime_source_key() + "-c-default"
+    cache_root = (
+        Path.home() / ".cache" / "pcc" / "test-artifacts" / "runtime-builds"
+    )
+    cache_root.mkdir(parents=True, exist_ok=True)
+    runtime = cache_root / key
+    marker_name = ".pcc-c-runtime-complete"
+    marker = runtime / marker_name
+    archive = runtime / "libpy_runtime.a"
+    lock_path = cache_root / (key + ".lock")
+
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - POSIX test environment
+            fcntl = None
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        staging_root: Path | None = None
+        try:
+            if archive.is_file() and marker.is_file():
+                if marker.read_text(encoding="utf-8") == key:
+                    return runtime
+            if runtime.exists():
+                shutil.rmtree(runtime)
+            staging_root = Path(
+                tempfile.mkdtemp(prefix=key + ".", dir=str(cache_root))
+            )
+            work_runtime = staging_root / "py_runtime"
+            shutil.copytree(
+                _RUNTIME_DIR,
+                work_runtime,
+                ignore=shutil.ignore_patterns(
+                    "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
+                ),
+            )
+            env = dict(os.environ)
+            env.pop("LC_ALL", None)
+            result = subprocess.run(
+                ["make", "-C", str(work_runtime), "libpy_runtime.a"],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=env,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            (work_runtime / marker_name).write_text(key, encoding="utf-8")
+            os.replace(work_runtime, runtime)
+            return runtime
+        finally:
+            if staging_root is not None:
+                shutil.rmtree(staging_root, ignore_errors=True)
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def cache_runtime_build(
+    builder: Callable[P, T],
+) -> Callable[P, T]:
+    """Cache a runtime builder while excluding its first ``tmp_path`` arg."""
+
+    cache: dict[tuple[object, ...], T] = {}
+
+    @wraps(builder)
+    def wrapped(tmp_path, *args, **kwargs):
+        env_key = tuple((name, os.environ.get(name)) for name in _BUILD_ENV_KEYS)
+        key = (
+            args,
+            tuple(sorted(kwargs.items())),
+            env_key,
+        )
+        if key in cache:
+            return cache[key]
+        artifact = builder(tmp_path, *args, **kwargs)
+        cache[key] = artifact
+        return artifact
+
+    return wrapped
+
+
+def _pcc_runtime_source_key(pcc_bin: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(sys.version.encode("utf-8"))
+    digest.update(os.path.realpath(pcc_bin).encode("utf-8"))
+    # PCC_BACKEND/PCC_GC_BACKEND do not affect ``--python-library
+    # --emit-llvm`` output. Including them would rebuild this identical
+    # archive for every meta-matrix label.
+    for name in _PCC_PY_ARCHIVE_ENV_KEYS:
+        digest.update(name.encode("utf-8"))
+        digest.update(str(os.environ.get(name, "")).encode("utf-8"))
+    roots = (
+        _RUNTIME_DIR,
+        _REPO_ROOT / "pcc" / "backend",
+        _REPO_ROOT / "pcc" / "codegen",
+        _REPO_ROOT / "pcc" / "evaluater",
+        _REPO_ROOT / "pcc" / "llvm_capi",
+        _REPO_ROOT / "pcc" / "parse",
+        _REPO_ROOT / "pcc" / "py_frontend",
+        _REPO_ROOT / "pcc" / "tools",
+    )
+    files = []
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(part.startswith(".") or part == "__pycache__" for part in path.parts):
+                continue
+            if path.suffix not in {".c", ".h", ".py"} and path.name != "Makefile":
+                continue
+            files.append(path)
+    for path in sorted(files):
+        digest.update(path.relative_to(_REPO_ROOT).as_posix().encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:24]
+
+
+def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
+    pcc_bin = _REPO_ROOT / ".venv" / "bin" / "pcc"
+    variant = "threaded-pcc-py" if threaded else "pcc-py"
+    key = _pcc_runtime_source_key(pcc_bin) + "-" + variant
+    cache_root = (
+        Path.home() / ".cache" / "pcc" / "test-artifacts" / "runtime-builds"
+    )
+    cache_root.mkdir(parents=True, exist_ok=True)
+    runtime = cache_root / key
+    marker = runtime / (".pcc-" + variant + "-complete")
+    archive = runtime / "libpy_runtime_pcc_py.a"
+    lock_path = cache_root / (key + ".lock")
+
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - POSIX test environment
+            fcntl = None
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            if archive.is_file() and marker.is_file():
+                if marker.read_text(encoding="utf-8") == key:
+                    return runtime
+            if runtime.exists():
+                shutil.rmtree(runtime)
+            staging_root = Path(
+                tempfile.mkdtemp(prefix=key + ".", dir=str(cache_root))
+            )
+            work_runtime = staging_root / "py_runtime"
+            shutil.copytree(
+                _RUNTIME_DIR,
+                work_runtime,
+                ignore=shutil.ignore_patterns(
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
+                ),
+            )
+            command = [
+                "make",
+                "-C",
+                str(work_runtime),
+                f"PCC={pcc_bin}",
+                f"PYTHON={sys.executable}",
+                f"PCC_REPO_ROOT={_REPO_ROOT}",
+            ]
+            if threaded:
+                command.append("PCC_WITH_THREADS=1")
+            command.append("libpy_runtime_pcc_py.a")
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            (work_runtime / marker.name).write_text(key, encoding="utf-8")
+            os.replace(work_runtime, runtime)
+            shutil.rmtree(staging_root, ignore_errors=True)
+            return runtime
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def cached_pcc_python_runtime() -> Path:
+    """Build/reuse one immutable default pcc-Python runtime source tree."""
+
+    return _cached_pcc_python_runtime(threaded=False)
+
+
+def cached_threaded_pcc_python_runtime() -> Path:
+    """Build/reuse one immutable threaded pcc-Python runtime source tree."""
+
+    return _cached_pcc_python_runtime(threaded=True)

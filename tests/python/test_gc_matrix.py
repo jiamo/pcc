@@ -19,7 +19,7 @@ def test_gc_matrix(tmp_path, backend):
         if __name__ == "__main__": main()
     """
     src = tmp_path / "gc.py"; exe = tmp_path / "gc.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
     env = os.environ.copy(); env["PCC_GC_BACKEND"] = str(backend)
     res = subprocess.run([str(exe)], capture_output=True, text=True, env=env, timeout=60)

@@ -1,6 +1,6 @@
 """5-GC common production contract: reachability through frames + containers.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track).
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track).
 Each program is compiled once under strict no-libpython and run under
 PCC_GC_BACKEND 0..4; every backend must keep the reachable objects alive across
 gc.collect() and produce the same correct output.
@@ -16,6 +16,8 @@ import os
 import subprocess
 
 import pytest
+
+pytestmark = pytest.mark.xdist_group(name="gc_root_graphs")
 
 _PROGRAMS = {
     # suspended generator frame local must survive gc.collect (frame roots)

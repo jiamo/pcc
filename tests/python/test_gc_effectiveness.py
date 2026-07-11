@@ -23,11 +23,6 @@ import textwrap
 
 import pytest
 
-# Same xdist concern as test_gc_performance.py — compiles race on the
-# runtime archive. Pin to a serial worker.
-pytestmark = pytest.mark.xdist_group(name="gc_eff_serial")
-
-
 BACKEND_TRICOLOR = 1
 BACKEND_CONCURRENT = 2
 BACKEND_GENERATIONAL = 3
@@ -39,7 +34,7 @@ def _compile_and_run(tmp_path, source: str) -> subprocess.CompletedProcess[str]:
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
     return subprocess.run(
         [str(exe)], capture_output=True, text=True, timeout=120,
@@ -59,7 +54,7 @@ def _compile_and_run_capture_rss(
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
 
     cmd = ["/usr/bin/time", "-l", str(exe)]
@@ -308,10 +303,11 @@ def test_cycle_collects_self_referential_list(tmp_path):
             xs.append(xs)
 
         def main() -> None:
+            baseline = pcc_gc_get_count(0)
             make_cycle()
             n = gc.collect()
             print(n >= 1)
-            print(pcc_gc_get_count(0) == 0)
+            print(pcc_gc_get_count(0) == baseline)
 
         if __name__ == "__main__":
             main()
@@ -385,6 +381,9 @@ def test_tuple_unpack_instance_return_no_growth(tmp_path):
     retain prior iteration values after re-assignment."""
     result = _compile_and_run(tmp_path, """
         import gc
+        from pcc.extern import extern, c_int32, c_int64
+
+        pcc_gc_get_count = extern('py_gc_get_count', (c_int32,), c_int64)
 
         class A:
             pass
@@ -393,17 +392,18 @@ def test_tuple_unpack_instance_return_no_growth(tmp_path):
             return A(), A()
 
         def main() -> None:
+            baseline = pcc_gc_get_count(0)
             i = 0
             while i < 20:
                 x, y = make()
                 i = i + 1
-            print(gc.get_count())
+            print(pcc_gc_get_count(0) - baseline)
 
         if __name__ == "__main__":
             main()
         """)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "(2, 0, 0)"
+    assert result.stdout.strip() == "2"
 
 
 def test_tuple_unpack_dict_self_cycle_reclaims_between_iterations(tmp_path):
@@ -411,6 +411,9 @@ def test_tuple_unpack_dict_self_cycle_reclaims_between_iterations(tmp_path):
     reclaim previous cycles each iteration when collection runs."""
     result = _compile_and_run(tmp_path, """
         import gc
+        from pcc.extern import extern, c_int32, c_int64
+
+        pcc_gc_get_count = extern('py_gc_get_count', (c_int32,), c_int64)
 
         class A:
             pass
@@ -422,11 +425,12 @@ def test_tuple_unpack_dict_self_cycle_reclaims_between_iterations(tmp_path):
             return d, A()
 
         def main() -> None:
+            baseline = pcc_gc_get_count(0)
             i = 0
             while i < 10:
                 x, y = make()
                 gc.collect()
-                print(gc.get_count())
+                print(pcc_gc_get_count(0) - baseline)
                 i = i + 1
 
         if __name__ == "__main__":
@@ -434,7 +438,7 @@ def test_tuple_unpack_dict_self_cycle_reclaims_between_iterations(tmp_path):
         """)
     assert result.returncode == 0, result.stderr
     lines = result.stdout.strip().split("\n")
-    assert lines == ["(3, 0, 0)"] * 10
+    assert lines == ["3"] * 10
 
 
 def test_cross_type_cycle_collected(tmp_path):

@@ -6,10 +6,11 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from tests.runtime_build_cache import cache_runtime_build
+
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
-THREADS_C = RUNTIME_DIR / "src" / "pcc_threads.c"
 PY_OBJ_C = RUNTIME_DIR / "src" / "py_obj.c"
 
 
@@ -28,24 +29,12 @@ def _cc() -> str:
 # refcount symbols, so the archive's pcc_threads.o is not pulled (no duplicate),
 # and the smoke never exercises the GC, so the archive's build config is
 # irrelevant to the assertions.
-def _ensure_c_runtime_archive() -> Path:
-    archive = RUNTIME_DIR / "libpy_runtime.a"
-    if archive.is_file():
-        return archive
-    env = dict(os.environ)
-    env.pop("LC_ALL", None)
-    subprocess.run(
-        ["make", "-C", str(RUNTIME_DIR), "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=400,
-        check=True,
-        env=env,
-    )
-    return archive
-
-
-def _compile_threads_strategy(tmp_path: Path, strategy: int, with_threads: int = 0) -> Path:
+def _compile_threads_strategy(
+    tmp_path: Path,
+    strategy: int,
+    c_runtime_archive: Path,
+    with_threads: int = 0,
+) -> Path:
     src = tmp_path / f"strategy_{strategy}.c"
     exe = tmp_path / f"strategy_{strategy}.out"
     src.write_text(textwrap.dedent(f"""
@@ -63,18 +52,18 @@ def _compile_threads_strategy(tmp_path: Path, strategy: int, with_threads: int =
             printf("ok\\n");
             return 0;
         }}
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     cmd = [
         _cc(),
         f"-DPCC_WITH_THREADS={with_threads}",
         f"-DPCC_REFCOUNT_STRATEGY={strategy}",
         "-std=c11",
         "-pthread",
-        f"-I{RUNTIME_DIR / 'include'}",
-        f"-I{RUNTIME_DIR / 'src'}",
+        f"-I{c_runtime_archive.parent / 'include'}",
+        f"-I{c_runtime_archive.parent / 'src'}",
         str(src),
-        str(THREADS_C),
-        str(_ensure_c_runtime_archive()),
+        str(c_runtime_archive.parent / "src" / "pcc_threads.c"),
+        str(c_runtime_archive),
         "-o",
         str(exe),
     ]
@@ -83,23 +72,60 @@ def _compile_threads_strategy(tmp_path: Path, strategy: int, with_threads: int =
     return exe
 
 
-def test_nonatomic_refcount_strategy_smoke(tmp_path):
-    exe = _compile_threads_strategy(tmp_path, strategy=0, with_threads=0)
+@cache_runtime_build
+def _build_refcount_runtime(tmp_path: Path, strategy: int) -> Path:
+    work_runtime = tmp_path / f"py_runtime_{strategy}"
+    shutil.copytree(
+        RUNTIME_DIR,
+        work_runtime,
+        ignore=shutil.ignore_patterns(
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
+        ),
+    )
+    result = subprocess.run(
+        [
+            "make",
+            "-B",
+            "-C",
+            str(work_runtime),
+            "PCC_WITH_THREADS=1",
+            f"PCC_REFCOUNT_KIND={strategy}",
+            "libpy_runtime.a",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return work_runtime
+
+
+def test_nonatomic_refcount_strategy_smoke(tmp_path, c_runtime_archive):
+    exe = _compile_threads_strategy(
+        tmp_path, strategy=0, with_threads=0, c_runtime_archive=c_runtime_archive
+    )
     result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
 
 
-def test_atomic_refcount_strategy_smoke(tmp_path):
-    exe = _compile_threads_strategy(tmp_path, strategy=1, with_threads=1)
+def test_atomic_refcount_strategy_smoke(tmp_path, c_runtime_archive):
+    exe = _compile_threads_strategy(
+        tmp_path, strategy=1, with_threads=1, c_runtime_archive=c_runtime_archive
+    )
     result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
 
 
-def test_biased_and_deferred_strategy_smoke(tmp_path):
+def test_biased_and_deferred_strategy_smoke(tmp_path, c_runtime_archive):
     for strategy in (2, 3):
-        exe = _compile_threads_strategy(tmp_path, strategy=strategy, with_threads=1)
+        exe = _compile_threads_strategy(
+            tmp_path,
+            strategy=strategy,
+            with_threads=1,
+            c_runtime_archive=c_runtime_archive,
+        )
         result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "ok"
@@ -120,29 +146,7 @@ def test_atomic_refcount_runtime_archive_builds_and_links(tmp_path):
     with normal no-libpython compile tests or leave the repository archive in
     an atomic/threaded configuration.
     """
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    make = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            "PCC_WITH_THREADS=1",
-            "PCC_REFCOUNT_KIND=1",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert make.returncode == 0, make.stdout + make.stderr
+    work_runtime = _build_refcount_runtime(tmp_path, 1)
 
     smoke = tmp_path / "archive_smoke.c"
     exe = tmp_path / "archive_smoke.out"
@@ -157,7 +161,7 @@ def test_atomic_refcount_runtime_archive_builds_and_links(tmp_path):
             if (pcc_resume_world() != 0) return 4;
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build = subprocess.run(
         [
             _cc(),
@@ -180,26 +184,4 @@ def test_atomic_refcount_runtime_archive_builds_and_links(tmp_path):
 
 def test_all_refcount_strategy_runtime_archives_build(tmp_path):
     for strategy in (0, 1, 2, 3):
-        work_runtime = tmp_path / f"py_runtime_{strategy}"
-        shutil.copytree(
-            RUNTIME_DIR,
-            work_runtime,
-            ignore=shutil.ignore_patterns(
-                "build", "build_pcc", "build_py", "build_libpython", "*.a"
-            ),
-        )
-        result = subprocess.run(
-            [
-                "make",
-                "-B",
-                "-C",
-                str(work_runtime),
-                "PCC_WITH_THREADS=1",
-                f"PCC_REFCOUNT_KIND={strategy}",
-                "libpy_runtime.a",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
+        assert (_build_refcount_runtime(tmp_path, strategy) / "libpy_runtime.a").is_file()

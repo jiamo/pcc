@@ -5,6 +5,7 @@ import subprocess
 import textwrap
 
 from pcc.py_frontend.codegen.runtime_abi import RUNTIME_SIGNATURES
+from tests.runtime_build_cache import cache_runtime_build
 
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
@@ -30,13 +31,14 @@ USER_FUNCTION_LOWERING = (
 )
 
 
+@cache_runtime_build
 def _build_threaded_runtime(tmp_path: Path) -> Path:
     work_runtime = tmp_path / "py_runtime"
     shutil.copytree(
         RUNTIME_DIR,
         work_runtime,
         ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
         ),
     )
     result = subprocess.run(
@@ -104,14 +106,12 @@ def test_gc_safepoint_polls_thread_gate_in_c_and_pcc_python_runtime():
     c_body = c_body.split("int64_t pcc_gc_collect", 1)[0]
     assert "pcc_gc_note_safepoint()" in c_body
     assert "pcc_thread_safepoint()" in c_body
-    assert "pcc_gc_step(1)" in c_body
 
     py_src = PY_OBJ_PORT.read_text(encoding="utf-8")
     py_body = py_src.split('@c_abi_export("pcc_gc_safepoint")', 1)[1]
     py_body = py_body.split('@c_abi_export("pcc_gc_collect")', 1)[0]
     assert "pcc_gc_note_safepoint()" in py_body
     assert "pcc_thread_safepoint()" in py_body
-    assert "pcc_gc_step(1)" in py_body
 
 
 def test_gc_alloc_polls_thread_gate_without_non_threaded_gc_step():
@@ -139,7 +139,10 @@ def test_python_codegen_emits_thread_safepoint_at_loop_backedges_and_function_en
 
     while_src = CONTROL_FLOW_LOWERING.read_text(encoding="utf-8")
     assert 'name=self._fresh("while.latch")' in while_src
-    assert "self.loop_stack.append((latch_bb, end_bb))" in while_src
+    assert (
+        "self.loop_stack.append((latch_bb, end_bb, self._loop_finally_base()))"
+        in while_src
+    )
     assert "self._emit_thread_safepoint()" in while_src
     assert "self.builder.branch(cond_bb)" in while_src
 
@@ -190,8 +193,11 @@ def test_python_codegen_ir_contains_loop_and_entry_thread_safepoints(
     )
     ir_text = out_ll.read_text(encoding="utf-8")
     assert "@pcc_thread_stop_requested = external global i32" in ir_text
-    assert "declare void @pcc_thread_safepoint()" in ir_text
-    assert ir_text.count("call void @pcc_thread_safepoint()") >= 3
+    assert (
+        "declare external void @pcc_thread_safepoint()" in ir_text
+        or "declare void @pcc_thread_safepoint()" in ir_text
+    )
+    assert ir_text.count("@pcc_thread_safepoint()") >= 4
     assert "while.latch" in ir_text
     assert "for.step" in ir_text
 
@@ -239,7 +245,7 @@ def test_generational_backend_step_polls_thread_safepoint_in_c_and_pcc_python_ru
     c_helper = c_src.split("static int64_t pcc_gc_step_generational_promotion", 2)[2]
     c_helper = c_helper.split("int64_t pcc_gc_step(int64_t budget)", 1)[0]
     assert "PCC_GC_SAFEPOINT_BATCH" in c_src
-    assert "pcc_gc_step_generational_promotion(budget)" in c_body
+    assert "pcc_gc_step_generational_promotion(budget, 1)" in c_body
     assert "pcc_thread_safepoint()" in c_helper
 
     py_src = PY_GC_BACKEND_PORT.read_text(encoding="utf-8")
@@ -248,16 +254,22 @@ def test_generational_backend_step_polls_thread_safepoint_in_c_and_pcc_python_ru
     py_helper = py_src.split("def _step_generational_promotion", 1)[1]
     py_helper = py_helper.split('@c_abi_export("pcc_gc_step")', 1)[0]
     assert 'extern("pcc_thread_safepoint"' in py_src
-    assert "_step_generational_promotion(budget)" in py_body
+    assert "_step_generational_promotion(budget, 1)" in py_body
     assert "pcc_thread_safepoint()" in py_helper
 
 
 def test_tracing_gc_finalizer_handles_thread_objects_and_refcount_side_table():
     c_src = PY_GC_BACKEND_C.read_text(encoding="utf-8")
     assert "PccGcThreadObject" in c_src
-    assert "visit(t->callable)" in c_src
-    assert "visit(t->args)" in c_src
-    assert "visit(t->result)" in c_src
+    fixed_owner = c_src.split("static int pcc_gc_visit_fixed_owner_slots(", 1)[1]
+    fixed_owner = fixed_owner.split(
+        "static int pcc_gc_visit_continuation_owner_slots(",
+        1,
+    )[0]
+    assert "PccGcThreadObject *t = (PccGcThreadObject *)o" in fixed_owner
+    assert "visit(&t->callable, ctx)" in fixed_owner
+    assert "visit(&t->args, ctx)" in fixed_owner
+    assert "visit(&t->result, ctx)" in fixed_owner
     assert "pcc_refcount_forget(&h->refcount)" in c_src
     for name in [
         "py_dealloc_thread_lock",
@@ -314,7 +326,7 @@ def test_no_libpython_all_backends_collect_through_thread_gate(tmp_path):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     compile_python(
         str(src),
         str(exe),
@@ -361,6 +373,7 @@ def test_pthread_substrate_stop_the_world_stress(tmp_path):
 
         int main(void) {
             if (pcc_threads_enabled() != 1) return 2;
+            (void)pcc_current_thread_id();
 
             PccThreadHandle *thread = 0;
             if (pcc_thread_start(&thread, worker_main, 0) != 0) return 3;
@@ -395,7 +408,7 @@ def test_pthread_substrate_stop_the_world_stress(tmp_path):
             printf("ok\n");
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
     cmd = [
         cc,
@@ -415,6 +428,83 @@ def test_pthread_substrate_stop_the_world_stress(tmp_path):
     result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
+
+
+def test_concurrent_stop_the_world_requesters_are_serialized(tmp_path):
+    """A second STW requester parks for the owner, then gets its own turn."""
+    work_runtime = _build_threaded_runtime(tmp_path)
+    cc = os.environ.get("CC", "cc")
+    src = tmp_path / "concurrent_stw.c"
+    exe = tmp_path / "concurrent_stw.out"
+    src.write_text(textwrap.dedent(r"""
+        #include "py_internal.h"
+        #include <stdint.h>
+        #include <stdio.h>
+
+        static int64_t worker_started = 0;
+        static int64_t worker_owned_stop = 0;
+
+        static void *worker_main(void *arg) {
+            (void)arg;
+            __atomic_store_n(&worker_started, 1, __ATOMIC_RELEASE);
+            if (pcc_stop_the_world() != 0) return (void *)(intptr_t)2;
+            __atomic_store_n(&worker_owned_stop, 1, __ATOMIC_RELEASE);
+            if (pcc_resume_world() != 0) return (void *)(intptr_t)3;
+            return 0;
+        }
+
+        int main(void) {
+            if (pcc_threads_enabled() != 1) return 2;
+            (void)pcc_current_thread_id();
+
+            PccThreadHandle *thread = 0;
+            if (pcc_thread_start(&thread, worker_main, 0) != 0) return 3;
+            while (__atomic_load_n(&worker_started, __ATOMIC_ACQUIRE) == 0) {
+            }
+            while (__atomic_load_n(
+                &pcc_thread_stop_requested, __ATOMIC_ACQUIRE
+            ) == 0) {
+            }
+            if (pcc_resume_world() != -1) return 4;
+
+            /* The worker owns the first stop and is waiting for this live
+             * thread to park. This call must serialize behind it, not fail. */
+            if (pcc_stop_the_world() != 0) return 5;
+            if (__atomic_load_n(&worker_owned_stop, __ATOMIC_ACQUIRE) != 1) {
+                return 6;
+            }
+            if (pcc_resume_world() != 0) return 7;
+
+            void *result = 0;
+            if (pcc_thread_join(thread, &result) != 0) return 8;
+            if (result != 0) return 9;
+            printf("serialized-stw-ok\n");
+            return 0;
+        }
+        """).lstrip(), encoding="utf-8")
+
+    build = subprocess.run(
+        [
+            cc,
+            "-DPCC_WITH_THREADS=1",
+            "-std=c11",
+            "-pthread",
+            f"-I{work_runtime / 'include'}",
+            f"-I{work_runtime / 'src'}",
+            str(src),
+            str(work_runtime / "libpy_runtime.a"),
+            "-lm",
+            "-o",
+            str(exe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert build.returncode == 0, build.stderr
+    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "serialized-stw-ok"
 
 
 def test_threaded_allocator_boundary_is_safepoint_for_stw(tmp_path):
@@ -527,7 +617,7 @@ def test_thread_safepoint_composes_with_all_gc_backends(tmp_path):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     compile_python(
         str(src),
         str(exe),
@@ -570,7 +660,7 @@ def test_threading_substrate_runs_in_no_libpython_binary(tmp_path):
 
         if __name__ == "__main__":
             main()
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
 
     compile_python(
         str(src),

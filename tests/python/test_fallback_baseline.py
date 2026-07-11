@@ -19,16 +19,25 @@ Run only this file:
 
 Closes Issue 9 (closure-probe baseline not in CI).
 """
+
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import os
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
+
+# Both closure fixtures compile the complete stage1 source closure.  Keep all
+# assertions on one xdist worker so each module-scoped snapshot is produced
+# once instead of once per worker.
+pytestmark = pytest.mark.xdist_group(name="fallback_baseline")
 
 _REPO_ROOT = Path(__file__).absolute().parents[2]
 _BASELINE_JSON = _REPO_ROOT / "tests" / "fallback_baseline.json"
@@ -36,10 +45,12 @@ _BASELINE_JSON = _REPO_ROOT / "tests" / "fallback_baseline.json"
 # Allow a small ratchet for noise. Anything beyond this fails the gate.
 # Path A's job is to push numbers DOWN; this just blocks creep upward.
 _RATCHET_PERCENT = 5.0
-_BRIDGE_CPY_SYMBOLS = frozenset({
-    "py_cpy_to_pcc_obj",
-    "py_cpy_to_pcc_str",
-})
+_BRIDGE_CPY_SYMBOLS = frozenset(
+    {
+        "py_cpy_to_pcc_obj",
+        "py_cpy_to_pcc_str",
+    }
+)
 
 
 def _load_baseline() -> dict:
@@ -105,13 +116,12 @@ def _check_contextual_per_module(
             failures.append(f"{mod}: contextual codegen failed")
             continue
         if require_zero and actual != 0:
-            failures.append(
-                f"{mod}: contextual fallback count {actual}; expected 0"
-            )
+            failures.append(f"{mod}: contextual fallback count {actual}; expected 0")
     if not enforce_ratchet:
-        assert not failures, (
-            f"{label} contextual per-module fallback regressions:\n  "
-            + "\n  ".join(failures)
+        assert (
+            not failures
+        ), f"{label} contextual per-module fallback regressions:\n  " + "\n  ".join(
+            failures
         )
         return
     for mod in sorted(contextual_modules):
@@ -137,9 +147,10 @@ def _check_contextual_per_module(
                 f"{mod}: contextual fallback count {actual} vs "
                 f"baseline {expected} (+{_RATCHET_PERCENT}%)"
             )
-    assert not failures, (
-        f"{label} contextual per-module fallback regressions:\n  "
-        + "\n  ".join(failures)
+    assert (
+        not failures
+    ), f"{label} contextual per-module fallback regressions:\n  " + "\n  ".join(
+        failures
     )
 
 
@@ -176,11 +187,107 @@ def test_pipeline_and_codegen_host_contract_do_not_drift():
         == host_contract.l1_codegen_lowering_host_contract()
     )
     assert (
-        pipeline.per_module_probe_policy(
-            "pcc.py_frontend.codegen.layer1_init"
-        )
+        pipeline.per_module_probe_policy("pcc.py_frontend.codegen.layer1_init")
         == host_contract.PROBE_POLICY_CONTEXTUAL_MIXIN
     )
+
+    from pcc.py_frontend.codegen.layer1_support import (
+        _default_native_module_exports,
+    )
+
+    for module_name in (
+        "pcc.py_frontend.pipeline",
+        "pcc.py_frontend.codegen.layer1_entrypoints",
+        "pcc.cli_bootstrap",
+        "pcc.cli_contract",
+        "unrelated.module",
+    ):
+        assert pipeline._module_uses_default_native_exports(module_name) == (
+            _default_native_module_exports(module_name) is not None
+        )
+
+    exports = _default_native_module_exports(
+        "pcc.py_frontend.codegen.layer1_entrypoints"
+    )
+    assert exports is not None
+    assert exports["pcc.diagnostics"]["DiagnosticSpan"]["field_names"] == (
+        "file",
+        "line",
+        "col",
+        "end_line",
+        "end_col",
+    )
+
+
+def test_l1_codegen_host_contract_covers_constructor_state_fields():
+    """Keep L1CodeGen's constructor fields in the contextual host schema."""
+    from pcc.py_frontend.codegen.host_contract import L1_CODEGEN_HOST_ATTRS
+    from pcc.py_frontend.codegen.layer1_init import Layer1InitMixin
+
+    source = textwrap.dedent(inspect.getsource(Layer1InitMixin._init_l1_state))
+    tree = ast.parse(source)
+    assigned = set()
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        for target in targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                assigned.add(target.attr)
+
+    missing = sorted(assigned.difference(L1_CODEGEN_HOST_ATTRS))
+    assert not missing
+
+
+def test_l1_codegen_lambda_counters_are_initialized():
+    """Fixed-layout pcc1 instances must not expose NULL lazy counters."""
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
+    from pcc.py_frontend.py_ast import Module
+
+    codegen = L1CodeGen(Module(name="lambda_counter_probe", body=[]))
+
+    assert codegen._native_lambda_func_counter == 0
+    assert codegen._native_lambda_callback_counter == 0
+    assert codegen._lambda_counter == []
+
+
+def test_l1_codegen_scaffold_binding_tables_are_initialized():
+    """Self-hosted fixed-layout scaffold slots must start as containers."""
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
+    from pcc.py_frontend.py_ast import Module
+
+    codegen = L1CodeGen(Module(name="scaffold_binding_probe", body=[]))
+
+    assert codegen._extern_bindings == {}
+    assert codegen._unsafe_bindings == {}
+    assert codegen._extern_decls == {}
+
+
+def test_l1_codegen_class_attr_mutation_state_is_initialized():
+    """pcc1 fixed-layout codegen must retain class-attr invalidation state."""
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
+    from pcc.py_frontend.py_ast import Module
+
+    codegen = L1CodeGen(Module(name="class_attr_state_probe", body=[]))
+
+    assert codegen._class_attr_runtime_state == {}
+    assert codegen._class_attr_mutation_in_loop_depth == 0
+
+
+def test_l1_codegen_active_handler_stack_is_initialized():
+    """pcc1 fixed-layout codegen must observe handler-stack push/pop state."""
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
+    from pcc.py_frontend.py_ast import Module
+
+    codegen = L1CodeGen(Module(name="active_handler_stack_probe", body=[]))
+
+    assert codegen._active_handler_excs == []
 
 
 def test_pipeline_static_cross_module_exports_stay_clean():
@@ -201,6 +308,32 @@ def test_pipeline_static_cross_module_exports_stay_clean():
     with open(src, "r", encoding="utf-8") as f:
         source = f.read()
     ast_mod = parse_and_lift(source, str(src), "pcc.py_frontend.pipeline")
+    typed = infer_module(ast_mod)
+    codegen = L1CodeGen(
+        typed,
+        emit_cpy_main_exitcode=False,
+        ir_scaffold_mode="on",
+    )
+    ir_text = str(codegen.generate(typed))
+    assert _count_py_cpy_calls(ir_text) == 0
+
+
+def test_cli_bootstrap_package_schema_static_imports_stay_native():
+    """Keep the standalone bootstrap CLI independent of libpython bridges.
+
+    Package behavior helpers live in ``pcc.package_schema`` and are compiled
+    into the closed-world bootstrap normally.  The independent per-module
+    ratchet still needs their static signatures; otherwise the imported calls
+    and every operation on their results regress to ``py_cpy_*``.
+    """
+    from pcc.parse.py_lift import parse_and_lift
+    from pcc.py_frontend.type_infer import infer_module
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
+
+    src = _REPO_ROOT / "pcc" / "cli_bootstrap.py"
+    with open(src, "r", encoding="utf-8") as f:
+        source = f.read()
+    ast_mod = parse_and_lift(source, str(src), "pcc.cli_bootstrap")
     typed = infer_module(ast_mod)
     codegen = L1CodeGen(
         typed,
@@ -245,6 +378,27 @@ def test_layer1_constants_cross_module_static_imports_stay_native():
         if "layer1_constants" in line and "@py_cpy_" in line
     ]
     assert layer1_constant_fallbacks == []
+    assert re.search(
+        r"store ptr @\.pystr\.obj\.\d+, ptr "
+        r"@\.classattr\.pcc_py_frontend_codegen_layer1\.L1CodeGen\."
+        r"_IR_RUNTIME_COMPAT_MODULE",
+        ir_text,
+    )
+
+
+def test_native_module_constant_bindings_are_contextual_host_state():
+    """Keep imported literals on the real ``L1CodeGen`` host object.
+
+    Contextual mixins use this table to carry ``from sibling import CONST``
+    bindings from import lowering to Name lowering.  If it is absent from the
+    closed-world host contract, compiled-stage ``setattr`` can bind the table
+    to an unrelated field and module-top class assignments observe ``None``.
+    """
+    from pcc.py_frontend.codegen.host_contract import L1_CODEGEN_HOST_ATTRS
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
+
+    assert "_native_module_constant_bindings" in L1_CODEGEN_HOST_ATTRS
+    assert hasattr(L1CodeGen, "_init_l1_state")
 
 
 def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
@@ -312,7 +466,8 @@ def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
             os.environ["PCC_PYTHON_IR_PASSES"] = saved_passes
     split = (
         _split_py_cpy_calls(ir_text)
-        if multi_ok else {"total": None, "bridge": None, "non_bridge": None}
+        if multi_ok
+        else {"total": None, "bridge": None, "non_bridge": None}
     )
     return {
         "per_module_ok": per_module_ok,
@@ -389,9 +544,9 @@ def test_closure_per_module_codegen_passes(closure_compile):
 
 def test_closure_multi_file_compile_succeeds(closure_compile):
     """The closure must still combine into one IR module."""
-    assert closure_compile["multi_ok"], (
-        "multi-file compile regressed; closure no longer assembles"
-    )
+    assert closure_compile[
+        "multi_ok"
+    ], "multi-file compile regressed; closure no longer assembles"
 
 
 def test_total_fallbacks_under_ratchet(closure_compile):
@@ -437,8 +592,7 @@ def test_per_module_fallbacks_under_ratchet(closure_compile):
             continue
         if not _within_ratchet(actual, expected):
             failures.append(
-                f"{mod}: {actual} vs baseline {expected} "
-                f"(+{_RATCHET_PERCENT}%)"
+                f"{mod}: {actual} vs baseline {expected} " f"(+{_RATCHET_PERCENT}%)"
             )
 
     for mod, actual in closure_compile["per_module"].items():
@@ -455,9 +609,7 @@ def test_per_module_fallbacks_under_ratchet(closure_compile):
                 f"a previously-clean module regressed"
             )
 
-    assert not failures, (
-        "per-module fallback regressions:\n  " + "\n  ".join(failures)
-    )
+    assert not failures, "per-module fallback regressions:\n  " + "\n  ".join(failures)
 
 
 def test_contextual_per_module_fallbacks_under_ratchet(closure_compile):
@@ -513,9 +665,7 @@ def test_on_mode_non_bridge_fallbacks_do_not_regress(closure_compile_on):
     baseline = _load_baseline()
     expected = baseline["on_mode_totals"]["non_bridge_fallbacks_multi"]
     actual = closure_compile_on["non_bridge_fallbacks"]
-    assert actual is not None, (
-        "no IR produced; cannot count non-bridge fallbacks"
-    )
+    assert actual is not None, "no IR produced; cannot count non-bridge fallbacks"
     assert actual <= expected, (
         f"ON-mode non-bridge py_cpy_* calls regressed: {actual} > "
         f"baseline {expected}. This tracks the original dynamic CPython "
@@ -543,8 +693,7 @@ def test_on_mode_per_module_fallbacks_under_ratchet(closure_compile_on):
             continue
         if not _within_ratchet(actual, expected):
             failures.append(
-                f"{mod}: {actual} vs ON baseline {expected} "
-                f"(+{_RATCHET_PERCENT}%)"
+                f"{mod}: {actual} vs ON baseline {expected} " f"(+{_RATCHET_PERCENT}%)"
             )
 
     for mod, actual in closure_compile_on["per_module"].items():
@@ -561,9 +710,8 @@ def test_on_mode_per_module_fallbacks_under_ratchet(closure_compile_on):
                 f"a previously-clean ON-mode module regressed"
             )
 
-    assert not failures, (
-        "ON-mode per-module fallback regressions:\n  "
-        + "\n  ".join(failures)
+    assert not failures, "ON-mode per-module fallback regressions:\n  " + "\n  ".join(
+        failures
     )
 
 
@@ -599,6 +747,62 @@ def test_on_mode_isinstance_helper_contextual_fallback_zero(
         "pcc.py_frontend.codegen.isinstance_lowering"
     )
     assert actual == 0
+
+
+def test_on_mode_assignment_statement_contextual_fallback_zero():
+    """Keep AST-use walking inside the self-host-safe helper surface.
+
+    ``assignment_statement_lowering`` is compiled as a contextual L1CodeGen
+    mixin. Its literal dispatch analysis must not call host-only dataclasses
+    reflection helpers and reintroduce ``py_cpy_*`` into the strict closure.
+    """
+    import importlib.util as _imputil
+
+    from pcc.py_frontend.pipeline import (
+        compile_contextual_per_module_fallback_counts,
+    )
+
+    spec = _imputil.spec_from_file_location(
+        "_probe_stage1_closure_assignment",
+        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
+    )
+    probe_mod = _imputil.module_from_spec(spec)
+    spec.loader.exec_module(probe_mod)
+    entry = str(_REPO_ROOT / "pcc" / "__main__.py")
+    srcs, mods = probe_mod._tightened_closure(entry)
+    target = "pcc.py_frontend.codegen.assignment_statement_lowering"
+
+    counts = compile_contextual_per_module_fallback_counts(
+        srcs,
+        mods,
+        {target},
+        ir_scaffold_mode="on",
+    )
+
+    assert counts[target] == 0
+
+
+def test_marshal_raw_per_module_fallbacks_stay_under_ratchet():
+    """Keep the legacy scaffold-off marshal helper under its hard ratchet."""
+    from pcc.parse.py_lift import parse_and_lift
+    from pcc.py_frontend.type_infer import infer_module
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
+
+    target = "pcc.py_frontend.codegen.marshal"
+    src = _REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "marshal.py"
+    source = src.read_text(encoding="utf-8")
+    typed = infer_module(parse_and_lift(source, str(src), target))
+    codegen = L1CodeGen(
+        typed,
+        emit_cpy_main_exitcode=False,
+        ir_scaffold_mode="off",
+    )
+    actual = _count_py_cpy_calls(str(codegen.generate(typed)))
+    expected = _load_baseline()["per_module"][target]
+
+    assert _within_ratchet(
+        actual, expected
+    ), f"{target}: {actual} vs baseline {expected} (+{_RATCHET_PERCENT}%)"
 
 
 def test_on_mode_user_function_low_ir_helpers_contextual_fallback_zero(

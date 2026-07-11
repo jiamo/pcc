@@ -13,7 +13,7 @@
 #
 # Status (2026-04-23): the script completes stage1/stage2/stage3 on the
 # supported macOS arm64 development host. Direct cmp still differs on
-# Mach-O code-signature metadata, so verification strips signatures from
+# Mach-O code-signature / LC_UUID metadata, so verification normalizes
 # temporary comparison copies before declaring success.
 #
 # Usage:
@@ -23,6 +23,13 @@
 #   scripts/bootstrap.sh --backend self --stage 1
 #   scripts/bootstrap.sh --backend llvm --stage 1
 #   scripts/bootstrap.sh --out-dir build/bootstrap-self --backend self --stage 1
+#   scripts/bootstrap.sh --stage 3 --reuse-stage1
+#                                      # reuse an existing OUT_DIR/pcc1 and run
+#                                      # only stage2/stage3 (pcc1 is backend-
+#                                      # agnostic; build it once, reuse it).
+#   scripts/bootstrap.sh --from-stage 3 --stage 3 --reuse-stage1
+#                                      # run only stage3 + pcc2/pcc3 verify
+#                                      # against an existing OUT_DIR/pcc2.
 #   scripts/bootstrap.sh --clean       # remove all stage artifacts
 #
 # Runtime defaults for every stage:
@@ -48,13 +55,21 @@ BOOTSTRAP_PROFILE_DIR="${PCC_BOOTSTRAP_PROFILE_DIR:-}"
 BOOTSTRAP_STAGE_EXEC_DELAY="${PCC_BOOTSTRAP_STAGE_EXEC_DELAY:-0.10}"
 
 STAGE_LIMIT=3
+START_STAGE=1
 CLEAN=0
 BACKEND=""
 BACKEND_EXPLICIT=0
+# When 1, skip the (backend-agnostic, CPython-hosted) stage1 build if a usable
+# pcc1 already exists in OUT_DIR and start from stage2. Lets callers build pcc1
+# once and reuse it across many stage2/stage3 runs (e.g. one bootstrap per GC
+# backend), since PCC_GC_BACKEND only affects stage2+ runtime, not pcc1.
+REUSE_STAGE1="${PCC_BOOTSTRAP_REUSE_STAGE1:-0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stage)   STAGE_LIMIT="$2"; shift 2 ;;
+        --from-stage|--start-stage) START_STAGE="$2"; shift 2 ;;
+        --reuse-stage1) REUSE_STAGE1=1; shift ;;
         --backend) BACKEND="$2"; BACKEND_EXPLICIT=1; shift 2 ;;
         --out-dir) OUT_DIR="$2"; shift 2 ;;
         --clean)   CLEAN=1; shift ;;
@@ -304,8 +319,11 @@ run_stage() {
 }
 
 # stage 1: CPython-hosted pcc produces pcc1.
-if [[ ${STAGE_LIMIT} -ge 1 ]]; then
-    if command -v uv >/dev/null 2>&1; then
+if [[ ${START_STAGE} -le 1 && ${STAGE_LIMIT} -ge 1 ]]; then
+    if [[ "${REUSE_STAGE1}" -eq 1 && -s "${OUT_DIR}/pcc1" && -x "${OUT_DIR}/pcc1" ]]; then
+        banner "stage 1: reuse existing ${OUT_DIR}/pcc1 (--reuse-stage1)"
+        echo "PCC_BOOTSTRAP_STAGE_RESULT stage=1 elapsed_ms=0 output=${OUT_DIR}/pcc1 reused=1"
+    elif command -v uv >/dev/null 2>&1; then
         if [[ -n "${LC_ALL:-}" ]]; then
             run_stage 1 "${OUT_DIR}/pcc1" env -u LC_ALL uv run python -m pcc
         else
@@ -318,12 +336,12 @@ if [[ ${STAGE_LIMIT} -ge 1 ]]; then
 fi
 
 # stage 2: pcc1 compiles pcc.py.
-if [[ ${STAGE_LIMIT} -ge 2 ]]; then
+if [[ ${START_STAGE} -le 2 && ${STAGE_LIMIT} -ge 2 ]]; then
     run_stage 2 "${OUT_DIR}/pcc2" "${OUT_DIR}/pcc1"
 fi
 
 # stage 3: pcc2 compiles pcc.py.
-if [[ ${STAGE_LIMIT} -ge 3 ]]; then
+if [[ ${START_STAGE} -le 3 && ${STAGE_LIMIT} -ge 3 ]]; then
     run_stage 3 "${OUT_DIR}/pcc3" "${OUT_DIR}/pcc2"
 
     banner "verify: cmp pcc2 pcc3"
@@ -338,10 +356,12 @@ if [[ ${STAGE_LIMIT} -ge 3 ]]; then
         cp "${OUT_DIR}/pcc3" "${tmp3}"
         codesign --remove-signature "${tmp2}" >/dev/null 2>&1 || true
         codesign --remove-signature "${tmp3}" >/dev/null 2>&1 || true
+        PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+            python3 -m pcc.macho_normalize "${tmp2}" "${tmp3}" >/dev/null 2>&1 || true
         if cmp -s "${tmp2}" "${tmp3}"; then
             rm -f "${tmp2}" "${tmp3}"
-            echo "OK — pcc2 and pcc3 differ only by Mach-O code-signature metadata."
-            echo "     Signature-normalized copies are byte-identical."
+            echo "OK — pcc2 and pcc3 differ only by Mach-O code-signature / LC_UUID metadata."
+            echo "     Metadata-normalized copies are byte-identical."
             exit 0
         fi
         rm -f "${tmp2}" "${tmp3}"

@@ -19,21 +19,49 @@ from __future__ import annotations
 
 import subprocess
 import textwrap
+from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.xdist_group(name="gc_trashcan_serial")
+REPO_ROOT = Path(__file__).absolute().parents[2]
+RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
 
-def _compile_and_run(tmp_path, source: str) -> subprocess.CompletedProcess[str]:
+def test_cc_trashcan_state_is_thread_local():
+    source = (RUNTIME_DIR / "src" / "py_obj_dealloc.c").read_text(
+        encoding="utf-8"
+    )
+    for declaration in (
+        "static _Thread_local int pcc_dealloc_depth",
+        "static _Thread_local PccDeallocTrashNode *pcc_dealloc_trash_head",
+        "static _Thread_local PccDeallocTrashNode *pcc_dealloc_trash_tail",
+    ):
+        assert declaration in source
+
+
+def _compile_and_run(
+    tmp_path, source: str, *, runtime_cc: bool = False, env=None
+) -> subprocess.CompletedProcess[str]:
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
-    compile_python(str(src), str(exe), ir_scaffold_mode="on")
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
+    if runtime_cc:
+        # cc tier links the C runtime (py_obj.c trash queue) instead of the
+        # pcc-Python port; the two must agree on which type tags defer.
+        import os
+
+        os.environ["PCC_RUNTIME_CC"] = "cc"
+    try:
+        compile_python(str(src), str(exe), ir_scaffold_mode="on")
+    finally:
+        if runtime_cc:
+            import os
+
+            os.environ.pop("PCC_RUNTIME_CC", None)
     return subprocess.run(
-        [str(exe)], capture_output=True, text=True, timeout=120,
+        [str(exe)], capture_output=True, text=True, timeout=120, env=env,
     )
 
 
@@ -292,3 +320,87 @@ def test_trashcan_with_del_no_overflow(tmp_path):
         """)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "True"
+
+
+# ---------------------------------------------------------------------------
+# cc tier: trash-defer type-tag set must match the pcc-Python port
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("runtime_cc", [False, True], ids=["port", "cc"])
+def test_list_of_finalizable_instances_cleared(tmp_path, runtime_cc):
+    """A list holding >= 2 ``__del__`` instances, then cleared.
+
+    Regression for a switch fall-through in the C runtime's
+    ``pcc_trash_should_defer``: every ``case`` (LIST/DICT/INSTANCE/...)
+    fell through to ``default: return type_tag >= PY_TYPE_USER``, so
+    those container/instance tags were dealloc'd recursively in cc mode
+    instead of deferred onto the trash queue like the pcc-Python port.
+    A list/instance-dict cascade then re-entered the drain and
+    double-freed a trash node (``del`` lines printed, then SIGTRAP in
+    ``pcc_trash_drain`` -> ``free``). One instance never triggered it;
+    two-or-more did. The port tier passed throughout, so the default-mode
+    trashcan tests above never covered this."""
+    result = _compile_and_run(
+        tmp_path,
+        """
+        class T:
+            def __init__(self, v: int):
+                self.v = v
+            def __del__(self):
+                print("del", self.v)
+
+        def main() -> None:
+            items = [T(0), T(1), T(2)]
+            items = []
+            print("end")
+
+        if __name__ == "__main__":
+            main()
+        """,
+        runtime_cc=runtime_cc,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = [l for l in result.stdout.splitlines() if l]
+    assert sorted(lines[:-1]) == ["del 0", "del 1", "del 2"], result.stdout
+    assert lines[-1] == "end", result.stdout
+
+
+def test_trash_defer_helpers_match_port_and_exclude_cext_tags_source():
+    """Lock the deferral family before C-extension dynamic tags reach it.
+
+    Dynamic pcc-native C-extension type tags are above PY_TYPE_USER, but they
+    are not pcc user instances and must not be admitted by the generic user-tag
+    catch-all. The split C dealloc helper also needs explicit per-case returns;
+    otherwise container tags fall through to the default expression.
+    """
+    py_obj_c = (RUNTIME_DIR / "src" / "py_obj.c").read_text(encoding="utf-8")
+    py_obj_dealloc_c = (RUNTIME_DIR / "src" / "py_obj_dealloc.c").read_text(
+        encoding="utf-8"
+    )
+    py_obj_dealloc_py = (RUNTIME_DIR / "py" / "py_obj_dealloc.py").read_text(
+        encoding="utf-8"
+    )
+
+    trash_start = py_obj_c.index("static int pcc_trash_should_defer(")
+    trash_body = py_obj_c[trash_start:py_obj_c.index("static void pcc_dealloc_dispatch", trash_start)]
+    assert "pcc_capi_is_cext_type_tag((int64_t)type_tag) != 0" in trash_body
+    assert trash_body.index("pcc_capi_is_cext_type_tag") < trash_body.index("switch (type_tag)")
+    assert "default:\n            return type_tag >= PY_TYPE_USER;" in trash_body
+
+    split_start = py_obj_dealloc_c.index("static int pcc_dealloc_should_defer(")
+    split_body = py_obj_dealloc_c[
+        split_start:py_obj_dealloc_c.index("static void pcc_dealloc_dispatch", split_start)
+    ]
+    assert "pcc_capi_is_cext_type_tag((int64_t)type_tag) != 0" in split_body
+    assert split_body.index("pcc_capi_is_cext_type_tag") < split_body.index("switch (type_tag)")
+    assert "return 1;" in split_body
+    assert "default:\n            return type_tag >= PY_TYPE_USER;" in split_body
+
+    port_start = py_obj_dealloc_py.index("def _dealloc_should_defer(tag: int) -> bool:")
+    port_body = py_obj_dealloc_py[
+        port_start:py_obj_dealloc_py.index("def _debug_check_dict_dealloc_slot", port_start)
+    ]
+    assert "pcc_capi_is_cext_type_tag = extern(" in py_obj_dealloc_py
+    assert "pcc_capi_is_cext_type_tag(tag) != 0" in port_body
+    assert port_body.index("pcc_capi_is_cext_type_tag(tag) != 0") < port_body.index("if tag >= 100:")

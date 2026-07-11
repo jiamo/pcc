@@ -1,6 +1,6 @@
 """5-GC common production contract: weakref callback fires on referent collection.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track).
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track).
 
 A weakref created with a callback — `weakref.ref(obj, cb)` — must, when its
 referent is reclaimed, (a) run the callback exactly once and (b) thereafter
@@ -14,12 +14,9 @@ and invalidates the weakref (`1 True`), matching CPython. Complements
 test_weakref_finalizer.py (which locks resolve-while-alive / invalidate /
 __del__-once).
 
-NOTE: a separate, narrow refcount-discipline bug — a weakref-call result used as
-an intermediate attribute-access receiver (`r().v`) leaks the temporary strong
-ref on #0 (refcount), keeping the referent alive — is tracked apart from this
-contract in docs/investigations/gc-weakref-call-intermediate-attr-refleak-no-libpython.md.
-This test deliberately binds/uses the resolve result so it does not depend on
-that leak.
+Weakref-call intermediate ownership (`r().v` and `r() is obj`) is locked in
+test_weakref_finalizer.py; this callback contract keeps its own bound-use shape
+so callback dispatch stays independently diagnosable.
 """
 from __future__ import annotations
 import os

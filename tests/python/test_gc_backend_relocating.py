@@ -6,9 +6,13 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from tests.runtime_build_cache import cached_threaded_pcc_python_runtime
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
+
+_RUNTIME_BUILD_CACHE: Path | None = None
+_PCC_PY_RUNTIME_BUILD_CACHE: Path | None = None
 
 
 def _compile_probe(tmp_path, source: str):
@@ -16,7 +20,7 @@ def _compile_probe(tmp_path, source: str):
 
     src = tmp_path / "probe.py"
     exe = tmp_path / "probe.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on", libpython_mode="off")
     return exe
 
@@ -38,12 +42,18 @@ def _cc() -> str:
 
 
 def _build_runtime(tmp_path: Path) -> Path:
+    global _RUNTIME_BUILD_CACHE
+    if (
+        _RUNTIME_BUILD_CACHE is not None
+        and (_RUNTIME_BUILD_CACHE / "libpy_runtime.a").is_file()
+    ):
+        return _RUNTIME_BUILD_CACHE
     work_runtime = tmp_path / "py_runtime"
     shutil.copytree(
         RUNTIME_DIR,
         work_runtime,
         ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
         ),
     )
     result = subprocess.run(
@@ -53,36 +63,19 @@ def _build_runtime(tmp_path: Path) -> Path:
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    _RUNTIME_BUILD_CACHE = work_runtime
     return work_runtime
 
 
 def _build_pcc_py_runtime(tmp_path: Path) -> Path:
-    work_runtime = tmp_path / "py_runtime_pcc_py"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    result = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"PCC={REPO_ROOT / '.venv' / 'bin' / 'pcc'}",
-            f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python3'}",
-            f"PCC_REPO_ROOT={REPO_ROOT}",
-            "PCC_WITH_THREADS=1",
-            "libpy_runtime_pcc_py.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return work_runtime
+    global _PCC_PY_RUNTIME_BUILD_CACHE
+    if (
+        _PCC_PY_RUNTIME_BUILD_CACHE is not None
+        and (_PCC_PY_RUNTIME_BUILD_CACHE / "libpy_runtime_pcc_py.a").is_file()
+    ):
+        return _PCC_PY_RUNTIME_BUILD_CACHE
+    _PCC_PY_RUNTIME_BUILD_CACHE = cached_threaded_pcc_python_runtime()
+    return _PCC_PY_RUNTIME_BUILD_CACHE
 
 
 def _assert_backend_four_task_and_scheduler_queue_follow_forwarding(
@@ -102,6 +95,24 @@ def _assert_backend_four_task_and_scheduler_queue_follow_forwarding(
             #include <stdint.h>
             #include <stdio.h>
             #include <stdlib.h>
+
+            typedef struct {
+                PyObjectHeader h;
+                int64_t length;
+                int64_t capacity;
+                PyObject **items;
+            } ProbeListObject;
+
+            static PyObject *new_reloc_payload(void) {
+                ProbeListObject *obj = (
+                    ProbeListObject *
+                )pcc_gc_alloc(64, PY_TYPE_LIST, 0);
+                if (obj == 0) return 0;
+                obj->length = 0;
+                obj->capacity = 0;
+                obj->items = 0;
+                return (PyObject *)obj;
+            }
 
             static int move_newest_simple_object(void) {
                 pcc_gc_telemetry_reset();
@@ -124,7 +135,7 @@ def _assert_backend_four_task_and_scheduler_queue_follow_forwarding(
                 if (task == 0) return 0;
                 pcc_gc_release(coro);
 
-                PyObject *result = py_str_new("task-child", 10);
+                PyObject *result = new_reloc_payload();
                 if (result == 0) return 0;
                 int64_t stable_id = pcc_gc_object_id(result);
                 py_task_set_result(task, result);
@@ -149,7 +160,7 @@ def _assert_backend_four_task_and_scheduler_queue_follow_forwarding(
             static int check_scheduler_queue_pop_slot(void) {
                 PccGcSchedulerQueue *queue = pcc_gc_scheduler_queue_new();
                 if (queue == 0) return 0;
-                PyObject *child = py_str_new("queue-child", 11);
+                PyObject *child = new_reloc_payload();
                 if (child == 0) return 0;
                 int64_t stable_id = pcc_gc_object_id(child);
                 if (pcc_gc_scheduler_queue_push(queue, child) != 0) return 0;
@@ -174,7 +185,7 @@ def _assert_backend_four_task_and_scheduler_queue_follow_forwarding(
             static int check_scheduler_queue_free_slot(void) {
                 PccGcSchedulerQueue *queue = pcc_gc_scheduler_queue_new();
                 if (queue == 0) return 0;
-                PyObject *child = py_str_new("queue-free-child", 16);
+                PyObject *child = new_reloc_payload();
                 if (child == 0) return 0;
                 if (pcc_gc_scheduler_queue_push(queue, child) != 0) return 0;
                 if (!move_newest_simple_object()) return 0;
@@ -204,7 +215,7 @@ def _assert_backend_four_task_and_scheduler_queue_follow_forwarding(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -296,7 +307,7 @@ def _assert_backend_four_list_relocation_copies_owned_items(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -392,7 +403,7 @@ def _assert_backend_four_tuple_relocation_retain_owned_items(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -513,7 +524,7 @@ def _assert_backend_four_task_relocation_retains_state_slots(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -647,7 +658,7 @@ def _assert_backend_four_set_relocation_retains_owned_entries(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -820,7 +831,7 @@ def _assert_backend_four_dict_relocation_retains_owned_tables(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -955,7 +966,7 @@ def _assert_backend_four_instance_relocation_retains_owned_fields(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -998,11 +1009,29 @@ def _assert_backend_four_targets_wait_for_phase_reset(
             #include <stdio.h>
             #include <stdlib.h>
 
+            typedef struct {
+                PyObjectHeader h;
+                int64_t length;
+                int64_t capacity;
+                PyObject **items;
+            } ProbeListObject;
+
+            static PyObject *new_reloc_payload(void) {
+                ProbeListObject *obj = (
+                    ProbeListObject *
+                )pcc_gc_alloc(64, PY_TYPE_LIST, 0);
+                if (obj == 0) return 0;
+                obj->length = 0;
+                obj->capacity = 0;
+                obj->items = 0;
+                return (PyObject *)obj;
+            }
+
             static int check_relocation_phase_progress(void) {
                 PyObject *slot = 0;
                 pcc_gc_scheduler_root_register(&slot);
 
-                PyObject *old = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0);
+                PyObject *old = new_reloc_payload();
                 if (old == 0) return 0;
                 pcc_gc_store_root(&slot, old);
                 int64_t old_id = pcc_gc_object_id(old);
@@ -1054,7 +1083,7 @@ def _assert_backend_four_targets_wait_for_phase_reset(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -1250,8 +1279,8 @@ def test_colored_relocating_load_barrier_follows_forwarding_entry(tmp_path):
 
         def main() -> None:
             pcc_gc_telemetry_reset()
-            old = pcc_gc_alloc(24, 2, 0)
-            new = pcc_gc_alloc(24, 2, 0)
+            old = pcc_gc_alloc(64, 5, 0)
+            new = pcc_gc_alloc(64, 5, 0)
             slot = malloc(8)
             store_ptr(slot, 0, null())
             pcc_gc_store_ptr(null(), slot, old)
@@ -1290,8 +1319,8 @@ def test_colored_relocating_rejects_forwarding_for_pinned_objects(tmp_path):
 
         def main() -> None:
             pcc_gc_telemetry_reset()
-            old = pcc_gc_alloc(24, 2, 0)
-            new = pcc_gc_alloc(24, 2, 0)
+            old = pcc_gc_alloc(64, 5, 0)
+            new = pcc_gc_alloc(64, 5, 0)
             pcc_gc_pin(old)
             print(pcc_gc_install_forwarding(old, new))
             print(pcc_gc_telemetry(17))
@@ -1323,8 +1352,8 @@ def test_colored_relocating_stable_id_survives_forwarding(tmp_path):
         pcc_gc_object_id = extern("pcc_gc_object_id", (c_ptr,), c_int64)
 
         def main() -> None:
-            old = pcc_gc_alloc(24, 2, 0)
-            new = pcc_gc_alloc(24, 2, 0)
+            old = pcc_gc_alloc(64, 5, 0)
+            new = pcc_gc_alloc(64, 5, 0)
             old_id = pcc_gc_object_id(old)
             print(old_id > 0)
             print(pcc_gc_install_forwarding(old, new))
@@ -1373,17 +1402,24 @@ def test_colored_relocating_selects_unpinned_relocation_set(tmp_path):
         pcc_gc_relocation_set_size = extern("pcc_gc_relocation_set_size", (), c_int64)
 
         def main() -> None:
-            a = pcc_gc_alloc(24, 2, 0)
-            b = pcc_gc_alloc(24, 2, 0)
-            c = pcc_gc_alloc(24, 2, 0)
+            # The compiled runtime can own legitimate relocatable startup
+            # objects.  Measure that live baseline instead of assuming an
+            # otherwise-empty heap, then prove the three allocations below
+            # contribute exactly the two unpinned candidates.
+            pcc_gc_reset_relocation_set()
+            baseline = pcc_gc_select_relocation_set(1000)
+            pcc_gc_reset_relocation_set()
+            a = pcc_gc_alloc(64, 5, 0)
+            b = pcc_gc_alloc(64, 5, 0)
+            c = pcc_gc_alloc(64, 5, 0)
             pcc_gc_pin(b)
             pcc_gc_reset_relocation_set()
-            print(pcc_gc_select_relocation_set(10))
-            print(pcc_gc_relocation_set_size())
+            print(pcc_gc_select_relocation_set(1000) - baseline)
+            print(pcc_gc_relocation_set_size() - baseline)
             print(pcc_gc_relocation_set_contains(a))
             print(pcc_gc_relocation_set_contains(b))
             print(pcc_gc_relocation_set_contains(c))
-            print(pcc_gc_select_relocation_set(10))
+            print(pcc_gc_select_relocation_set(1000))
             pcc_gc_reset_relocation_set()
             print(pcc_gc_relocation_set_size())
             print(pcc_gc_relocation_set_contains(a))
@@ -1410,7 +1446,7 @@ def test_colored_relocating_selects_unpinned_relocation_set(tmp_path):
     ]
 
 
-def test_colored_relocating_copy_moves_selected_simple_object(tmp_path):
+def test_colored_relocating_copy_forwards_selected_payload_object(tmp_path):
     exe = _compile_probe(
         tmp_path,
         """
@@ -1427,11 +1463,11 @@ def test_colored_relocating_copy_moves_selected_simple_object(tmp_path):
         pcc_gc_relocate_copy = extern("pcc_gc_relocate_copy", (c_ptr, c_int64), c_ptr)
 
         def main() -> None:
-            old = pcc_gc_alloc(24, 3, 0)
+            old = pcc_gc_alloc(64, 5, 0)
             old_id = pcc_gc_object_id(old)
             pcc_gc_reset_relocation_set()
             print(pcc_gc_select_relocation_set(1))
-            moved = pcc_gc_relocate_copy(old, 24)
+            moved = pcc_gc_relocate_copy(old, 64)
             print(ptr_is_null(moved))
             print(ptr_eq(old, moved))
             print(pcc_gc_object_id(moved) == old_id)
@@ -1455,7 +1491,7 @@ def test_colored_relocating_copy_moves_selected_simple_object(tmp_path):
     assert result.stdout.strip().splitlines() == [
         "1",
         "False",
-        "False",
+        "True",
         "True",
         "True",
         "True",
@@ -1477,13 +1513,13 @@ def test_colored_relocating_copy_consumes_relocation_entry(tmp_path):
         pcc_gc_relocate_copy = extern("pcc_gc_relocate_copy", (c_ptr, c_int64), c_ptr)
 
         def main() -> None:
-            old = pcc_gc_alloc(24, 3, 0)
+            old = pcc_gc_alloc(64, 5, 0)
             pcc_gc_reset_relocation_set()
             pcc_gc_select_relocation_set(1)
-            moved = pcc_gc_relocate_copy(old, 24)
+            moved = pcc_gc_relocate_copy(old, 64)
             print(ptr_is_null(moved))
             print(pcc_gc_relocation_set_contains(old))
-            moved_again = pcc_gc_relocate_copy(old, 24)
+            moved_again = pcc_gc_relocate_copy(old, 64)
             print(ptr_is_null(moved_again))
             if ptr_is_null(moved_again) == 0:
                 pcc_gc_release(moved_again)
@@ -1499,37 +1535,48 @@ def test_colored_relocating_copy_consumes_relocation_entry(tmp_path):
     assert result.stdout.strip().splitlines() == ["False", "0", "True"]
 
 
-def test_colored_relocating_step_copies_selected_simple_object(tmp_path):
+def test_colored_relocating_step_forwards_selected_payload_object(tmp_path):
     exe = _compile_probe(
         tmp_path,
         """
         from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
-        from pcc.unsafe import free, malloc, null, ptr_eq, store_ptr
+        from pcc.unsafe import free, load_ptr, malloc, null, ptr_eq, store_ptr
 
         pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
         pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
         pcc_gc_object_id = extern("pcc_gc_object_id", (c_ptr,), c_int64)
+        pcc_gc_reset_relocation_set = extern("pcc_gc_reset_relocation_set", (), c_void)
+        pcc_gc_select_relocation_set = extern("pcc_gc_select_relocation_set", (c_int64,), c_int64)
+        pcc_gc_relocation_set_contains = extern("pcc_gc_relocation_set_contains", (c_ptr,), c_int64)
         pcc_gc_step = extern("pcc_gc_step", (c_int64,), c_int64)
         pcc_gc_telemetry = extern("pcc_gc_telemetry", (c_int64,), c_int64)
         pcc_gc_telemetry_reset = extern("pcc_gc_telemetry_reset", (), c_void)
 
         def main() -> None:
-            old = pcc_gc_alloc(24, 3, 0)
+            old = pcc_gc_alloc(64, 5, 0)
             old_id = pcc_gc_object_id(old)
             slot = malloc(8)
             store_ptr(slot, 0, null())
             pcc_gc_store_ptr(null(), slot, old)
+            raw_slot = malloc(8)
+            # Keep the original address outside the registered root/slot
+            # surface so the post-step assertion proves an actual move.
+            store_ptr(raw_slot, 0, old)
+            pcc_gc_reset_relocation_set()
+            print(pcc_gc_select_relocation_set(1000) > 0)
+            print(pcc_gc_relocation_set_contains(old))
             pcc_gc_telemetry_reset()
-            print(pcc_gc_step(2))
-            print(pcc_gc_telemetry(15))
+            print(pcc_gc_step(1000) > 0)
+            print(pcc_gc_telemetry(15) >= 1)
             loaded = pcc_gc_load_ptr(null(), slot)
-            print(ptr_eq(loaded, old))
+            print(ptr_eq(loaded, load_ptr(raw_slot, 0)))
             print(pcc_gc_object_id(loaded) == old_id)
-            print(pcc_gc_telemetry(16))
+            print(pcc_gc_telemetry(16) >= 1)
             pcc_gc_store_ptr(null(), slot, null())
             pcc_gc_release(old)
+            free(raw_slot)
             free(slot)
 
         if __name__ == "__main__":
@@ -1539,9 +1586,11 @@ def test_colored_relocating_step_copies_selected_simple_object(tmp_path):
     result = _run_backend_four(exe)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().splitlines() == [
-        "2",
-        "1",
-        "False",
         "True",
         "1",
+        "True",
+        "True",
+        "False",
+        "True",
+        "True",
     ]

@@ -1,7 +1,7 @@
 """5-GC common production contract: basic object lifetime, cycle reclamation,
 and container reachability must behave IDENTICALLY under all five GC backends.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track): the
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track): the
 SAME Python program is compiled once under strict no-libpython
 (``--backend self --python-libpython=off``) and run under ``PCC_GC_BACKEND``
 0..4; every backend must produce the same correct output. Performance MAY

@@ -1,6 +1,6 @@
 """5-GC common production contract: roots survive gc.collect under threads.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track). The
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track). The
 concurrent backend (#2) is a 5-GC research pillar; threaded root survival must
 hold on ALL five backends, exercised with PCC_WITH_THREADS=1.
 

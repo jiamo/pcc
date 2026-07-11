@@ -6,6 +6,11 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from tests.runtime_build_cache import (
+    cache_runtime_build,
+    cached_threaded_pcc_python_runtime,
+)
+
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
@@ -15,38 +20,30 @@ def _cc() -> str:
     return os.environ.get("CC", "cc")
 
 
+@cache_runtime_build
 def _build_runtime(tmp_path: Path, *, pcc_python: bool = False) -> tuple[Path, str, list[str]]:
-    work_runtime = tmp_path / ("py_runtime_pcc_py" if pcc_python else "py_runtime")
+    if pcc_python:
+        return (
+            cached_threaded_pcc_python_runtime(),
+            "libpy_runtime_pcc_py.a",
+            ["-pthread"],
+        )
+    work_runtime = tmp_path / "py_runtime"
     shutil.copytree(
         RUNTIME_DIR,
         work_runtime,
         ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
         ),
     )
-    if pcc_python:
-        cmd = [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"PCC={REPO_ROOT / '.venv' / 'bin' / 'pcc'}",
-            f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python3'}",
-            f"PCC_REPO_ROOT={REPO_ROOT}",
-            "PCC_WITH_THREADS=1",
-            "libpy_runtime_pcc_py.a",
-        ]
-        archive = "libpy_runtime_pcc_py.a"
-        extra_link_args = ["-pthread"]
-    else:
-        cmd = ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"]
-        archive = "libpy_runtime.a"
-        extra_link_args = []
+    cmd = ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"]
+    archive = "libpy_runtime.a"
+    extra_link_args = []
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        timeout=900 if pcc_python else 120,
+        timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return work_runtime, archive, extra_link_args
@@ -123,7 +120,7 @@ def _assert_suspended_heap_frame_local_survives_collect_across_backends(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -235,7 +232,7 @@ def _assert_task_completion_releases_waiter_cycle_across_backends(
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",
@@ -391,7 +388,7 @@ def _assert_virtual_thread_scheduler_queues_keep_continuation_roots_across_backe
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     link = [
         _cc(),
         "-std=c11",

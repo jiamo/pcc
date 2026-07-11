@@ -10,7 +10,7 @@ What's checked:
 - Binary sizes haven't drifted dramatically from the captured baseline.
 - ``otool -L`` libpython linkage state matches baseline (currently
   ``false`` for every strict bootstrap binary).
-- pcc2 and pcc3 are byte-identical after Mach-O signature
+- pcc2 and pcc3 are byte-identical after Mach-O signature and LC_UUID
   normalization (the README's three-stage self-host gate).
 
 The Issue 1 no-libpython baseline is intentionally one-way: any
@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+
+from pcc.dependency_verdict import probe_platform_capability
 import shutil
 import subprocess
 import sys
@@ -29,12 +31,17 @@ from pathlib import Path
 
 import pytest
 
+from pcc.macho_normalize import normalize_macho_metadata
+
 
 _REPO_ROOT = Path(__file__).absolute().parents[2]
 _BASELINE_JSON = _REPO_ROOT / "tests" / "bootstrap_gate_baseline.json"
 _BUILD_ROOT = _REPO_ROOT / "build"
 
 
+# Structured capture-platform verdict: the authoritative baseline is
+# macOS-arm64-specific; elsewhere the verdict is UNAVAILABLE and never a
+# claim about bootstrap behavior (AUD-P2-PLATFORM-BOOTSTRAP-BASELINE-VERDICT).
 def _is_macos_arm64() -> bool:
     return sys.platform == "darwin" and platform.machine().lower() in {
         "arm64",
@@ -72,6 +79,7 @@ def _strip_signature_copy(src: Path, dst: Path) -> None:
             check=False,
             capture_output=True,
         )
+        normalize_macho_metadata(dst)
 
 
 def _byte_identical_after_normalize(a: Path, b: Path) -> bool:
@@ -100,8 +108,13 @@ def test_bootstrap_libpython_state_matches_baseline(backend):
     the baseline records. When Path A flips a binary from true→false,
     update the baseline JSON.
     """
-    if not _is_macos_arm64():
-        pytest.skip("baseline captured on macOS arm64 only")
+    platform_verdict = probe_platform_capability(
+        "macos-arm64-bootstrap-baseline",
+        supported=_is_macos_arm64(),
+        detail="the authoritative bootstrap baseline is captured on macOS arm64",
+    )
+    if not platform_verdict.available:
+        pytest.skip(platform_verdict.skip_reason())
     _require_bins(backend)
     baseline = _load_baseline()
     expected_state = baseline["current_state"][backend]
@@ -135,8 +148,13 @@ def test_bootstrap_pcc2_pcc3_byte_identical(backend):
     identical after Mach-O signature normalization. Path A must not
     break this — if it does, determinism regression in codegen.
     """
-    if not _is_macos_arm64():
-        pytest.skip("byte-identical gate captured on macOS arm64 only")
+    platform_verdict = probe_platform_capability(
+        "macos-arm64-bootstrap-baseline",
+        supported=_is_macos_arm64(),
+        detail="the byte-identical gate is captured on macOS arm64",
+    )
+    if not platform_verdict.available:
+        pytest.skip(platform_verdict.skip_reason())
     _require_bins(backend)
     pcc2 = _stage_bin(backend, 2)
     pcc3 = _stage_bin(backend, 3)

@@ -87,7 +87,7 @@ def test_bootstrap_profile_report_summarizes_stage_profiles_and_wall_log(tmp_pat
         publish_barrier_ms=0,
         wall_ms=350,
     )
-    stage3_result = json.loads((profile_dir / "stage3.result.json").read_text())
+    stage3_result = json.loads((profile_dir / "stage3.result.json").read_text(encoding="utf-8"))
     stage3_result["returncode"] = 139
     (profile_dir / "stage3.result.json").write_text(
         json.dumps(stage3_result),

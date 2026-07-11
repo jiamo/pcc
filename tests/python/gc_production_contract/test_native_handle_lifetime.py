@@ -1,6 +1,6 @@
 """5-GC common production contract: native file-handle lifetime.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track). A
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track). A
 native runtime handle wrapped in a Python object must keep working while the
 wrapper is reachable, and must release the native resource when the wrapper is
 dropped. This test uses the strict no-libpython file-object path, compiles once,

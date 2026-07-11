@@ -1,6 +1,6 @@
 """5-GC common production contract: container-graph reachability + safety.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track).
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track).
 Each program is compiled once under strict no-libpython and run under
 PCC_GC_BACKEND 0..4; every backend must keep the reachable objects alive across
 gc.collect() and produce the same correct output.

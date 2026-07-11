@@ -22,15 +22,12 @@ import textwrap
 
 import pytest
 
-pytestmark = pytest.mark.xdist_group(name="gc_regression_serial")
-
-
 def _compile_and_run(tmp_path, source: str) -> subprocess.CompletedProcess[str]:
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
     return subprocess.run(
         [str(exe)], capture_output=True, text=True, timeout=120,
@@ -45,7 +42,7 @@ def _compile_and_run_capture_rss(
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
 
     proc = subprocess.run(

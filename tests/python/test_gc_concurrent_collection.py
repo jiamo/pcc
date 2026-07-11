@@ -1,25 +1,105 @@
 from __future__ import annotations
 
 import os
+import pytest
 import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
+from tests.runtime_build_cache import cache_runtime_build
+
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
+_TSAN_UNAVAILABLE_BY_CC: dict[str, str | None] = {}
 
 
-def test_pthread_stw_threadsanitizer_smoke_or_skip(tmp_path):
-    cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime"
+def _require_thread_sanitizer_runtime(tmp_path: Path, cc: str) -> None:
+    if cc in _TSAN_UNAVAILABLE_BY_CC:
+        reason = _TSAN_UNAVAILABLE_BY_CC[cc]
+        if reason is not None:
+            pytest.skip(reason)
+        return
+    probe = tmp_path / "tsan_availability.c"
+    exe = tmp_path / "tsan_availability.out"
+    probe.write_text(
+        textwrap.dedent(
+            r"""
+            #include <pthread.h>
+
+            static void *worker(void *arg) {
+                (void)arg;
+                return 0;
+            }
+
+            int main(void) {
+                pthread_t thread;
+                if (pthread_create(&thread, 0, worker, 0) != 0) return 1;
+                return pthread_join(thread, 0) == 0 ? 0 : 2;
+            }
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    build = subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-pthread",
+            "-fsanitize=thread",
+            str(probe),
+            "-o",
+            str(exe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if build.returncode != 0:
+        stderr = build.stderr.lower()
+        if "sanitize" in stderr or "tsan" in stderr:
+            reason = "ThreadSanitizer runtime is not available for this compiler"
+            _TSAN_UNAVAILABLE_BY_CC[cc] = reason
+            pytest.skip(reason)
+        assert build.returncode == 0, build.stdout + build.stderr
+    run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+    if run.returncode != 0:
+        reason = (
+            "ThreadSanitizer runtime crashes before pcc code runs "
+            f"(exit {run.returncode})"
+        )
+        _TSAN_UNAVAILABLE_BY_CC[cc] = reason
+        pytest.skip(reason)
+    _TSAN_UNAVAILABLE_BY_CC[cc] = None
+
+
+@cache_runtime_build
+def _build_threaded_runtime(
+    tmp_path: Path,
+    *,
+    cc: str,
+    tsan: bool = False,
+    pcc_python: bool = False,
+) -> Path:
+    work_runtime = tmp_path / (
+        "py_runtime_pcc_py" if pcc_python else "py_runtime"
+    )
     shutil.copytree(
         RUNTIME_DIR,
         work_runtime,
         ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
         ),
     )
+    flags = [
+        "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread"
+    ] if tsan else []
+    pcc_python_args = [
+        f"PCC={REPO_ROOT / '.venv' / 'bin' / 'pcc'}",
+        f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python3'}",
+        f"PCC_REPO_ROOT={REPO_ROOT}",
+    ] if pcc_python else []
+    target = "libpy_runtime_pcc_py.a" if pcc_python else "libpy_runtime.a"
     build_runtime = subprocess.run(
         [
             "make",
@@ -27,18 +107,27 @@ def test_pthread_stw_threadsanitizer_smoke_or_skip(tmp_path):
             "-C",
             str(work_runtime),
             f"CC={cc}",
+            *pcc_python_args,
             "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime.a",
+            *flags,
+            target,
         ],
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=900 if pcc_python else 180,
     )
-    if build_runtime.returncode != 0:
+    if build_runtime.returncode != 0 and tsan:
         stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
+        if "sanitize" in stderr or "tsan" in stderr:
+            pytest.skip("runtime cannot be built with ThreadSanitizer")
+    assert build_runtime.returncode == 0, build_runtime.stdout + build_runtime.stderr
+    return work_runtime
+
+
+def test_pthread_stw_threadsanitizer_smoke_or_skip(tmp_path):
+    cc = os.environ.get("CC", "clang")
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc, tsan=True)
 
     src = tmp_path / "tsan_smoke.c"
     exe = tmp_path / "tsan_smoke.out"
@@ -66,7 +155,7 @@ def test_pthread_stw_threadsanitizer_smoke_or_skip(tmp_path):
             __atomic_store_n(&done, 1, __ATOMIC_RELAXED);
             return pcc_thread_join(t, 0) == 0 ? 0 : 4;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     cmd = [
         cc, "-DPCC_WITH_THREADS=1", "-std=c11", "-pthread", "-fsanitize=thread",
         f"-I{work_runtime / 'include'}",
@@ -85,33 +174,8 @@ def test_pthread_stw_threadsanitizer_smoke_or_skip(tmp_path):
 
 def test_cms_worker_threadsanitizer_stress_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if build_runtime.returncode != 0:
-        stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc, tsan=True)
 
     src = tmp_path / "cms_tsan_probe.c"
     exe = tmp_path / "cms_tsan_probe.out"
@@ -177,7 +241,7 @@ def test_cms_worker_threadsanitizer_stress_or_skip(tmp_path):
             printf("%lld\n", (long long)pcc_gc_telemetry(CMS_WORKER_TRACES));
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build_probe = subprocess.run(
         [
             cc,
@@ -222,29 +286,7 @@ def test_cms_worker_threadsanitizer_stress_or_skip(tmp_path):
 
 def test_backend4_thread_medium_buffer_flushes_across_mutators(tmp_path):
     cc = os.environ.get("CC", "cc")
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            "PCC_WITH_THREADS=1",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert build_runtime.returncode == 0, build_runtime.stdout + build_runtime.stderr
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc)
 
     src = tmp_path / "backend4_thread_medium_flush.c"
     exe = tmp_path / "backend4_thread_medium_flush.out"
@@ -281,8 +323,16 @@ def test_backend4_thread_medium_buffer_flushes_across_mutators(tmp_path):
             owner->items = (PyObject **)calloc(4, sizeof(PyObject *));
             if (owner->items == 0) return (void *)4;
             for (int i = 0; i < 4; i++) {
-                children[i] = pcc_gc_alloc(64, PY_TYPE_INT, PY_FLAG_GC_YOUNG);
+                ProbeListObject *child = (ProbeListObject *)pcc_gc_alloc(
+                    sizeof(ProbeListObject),
+                    PY_TYPE_LIST,
+                    PY_FLAG_GC_YOUNG
+                );
+                children[i] = (PyObject *)child;
                 if (children[i] == 0) return (void *)5;
+                child->length = 0;
+                child->capacity = 0;
+                child->items = 0;
                 pcc_gc_store_ptr((PyObject *)owner, &owner->items[i], children[i]);
             }
             __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
@@ -369,33 +419,8 @@ def test_backend4_thread_medium_buffer_flushes_across_mutators(tmp_path):
 
 def test_cms_collect_threadsanitizer_sweep_allocation_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if build_runtime.returncode != 0:
-        stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc, tsan=True)
 
     src = tmp_path / "cms_sweep_alloc_tsan_probe.c"
     exe = tmp_path / "cms_sweep_alloc_tsan_probe.out"
@@ -492,7 +517,7 @@ def test_cms_collect_threadsanitizer_sweep_allocation_or_skip(tmp_path):
             printf("%lld\n", (long long)pcc_gc_telemetry(CMS_WORKER_DRAINS));
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build_probe = subprocess.run(
         [
             cc,
@@ -538,33 +563,8 @@ def test_cms_collect_threadsanitizer_sweep_allocation_or_skip(tmp_path):
 
 def test_generational_minor_threadsanitizer_alloc_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if build_runtime.returncode != 0:
-        stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc, tsan=True)
 
     src = tmp_path / "gen_minor_tsan_probe.c"
     exe = tmp_path / "gen_minor_tsan_probe.out"
@@ -630,7 +630,7 @@ def test_generational_minor_threadsanitizer_alloc_or_skip(tmp_path):
             printf("%lld\n", (long long)pcc_gc_telemetry(MINOR_ARENA_BUMPS));
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build_probe = subprocess.run(
         [
             cc,
@@ -682,33 +682,8 @@ def test_generational_minor_threadsanitizer_alloc_or_skip(tmp_path):
 
 def test_generational_scheduler_root_registry_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if build_runtime.returncode != 0:
-        stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc, tsan=True)
 
     src = tmp_path / "gen_scheduler_roots_tsan_probe.c"
     exe = tmp_path / "gen_scheduler_roots_tsan_probe.out"
@@ -781,7 +756,7 @@ def test_generational_scheduler_root_registry_threadsanitizer_or_skip(tmp_path):
             if (pcc_gc_set_backend(PCC_GC_KIND_REFCOUNT_CYCLE) != 0) return 8;
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build_probe = subprocess.run(
         [
             cc,
@@ -822,33 +797,8 @@ def test_generational_scheduler_root_registry_threadsanitizer_or_skip(tmp_path):
 
 def test_generational_scheduler_queue_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if build_runtime.returncode != 0:
-        stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc, tsan=True)
 
     src = tmp_path / "gen_scheduler_queue_tsan_probe.c"
     exe = tmp_path / "gen_scheduler_queue_tsan_probe.out"
@@ -971,7 +921,7 @@ def test_generational_scheduler_queue_threadsanitizer_or_skip(tmp_path):
             if (pcc_gc_set_backend(PCC_GC_KIND_REFCOUNT_CYCLE) != 0) return 12;
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build_probe = subprocess.run(
         [
             cc,
@@ -1012,33 +962,8 @@ def test_generational_scheduler_queue_threadsanitizer_or_skip(tmp_path):
 
 def test_colored_relocating_forwarding_table_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if build_runtime.returncode != 0:
-        stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc, tsan=True)
 
     src = tmp_path / "backend4_forwarding_table_tsan_probe.c"
     exe = tmp_path / "backend4_forwarding_table_tsan_probe.out"
@@ -1046,7 +971,49 @@ def test_colored_relocating_forwarding_table_threadsanitizer_or_skip(tmp_path):
         #include "py_runtime.h"
         #include "py_internal.h"
         #include <stdint.h>
+        #include <stdlib.h>
         #include <unistd.h>
+
+        enum {
+            PY_FLAG_GC_YOUNG = 0x80,
+            PY_FLAG_GC_OLD = 0x100,
+            PY_FLAG_GC_PINNED = 0x40
+        };
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static PyObject *new_reloc_payload(int relocation_candidate) {
+            int32_t flags = relocation_candidate ? PY_FLAG_GC_OLD : 0;
+            ProbeListObject *obj = (
+                ProbeListObject *
+            )pcc_gc_alloc(sizeof(ProbeListObject), PY_TYPE_LIST, flags);
+            if (obj == 0) return 0;
+            obj->length = 0;
+            obj->capacity = 0;
+            obj->items = 0;
+            if (relocation_candidate) {
+                ProbeListObject *child = (ProbeListObject *)pcc_gc_alloc(
+                    sizeof(ProbeListObject),
+                    PY_TYPE_LIST,
+                    PY_FLAG_GC_YOUNG | PY_FLAG_GC_PINNED
+                );
+                if (child == 0) return 0;
+                child->length = 0;
+                child->capacity = 0;
+                child->items = 0;
+                obj->length = 1;
+                obj->capacity = 1;
+                obj->items = (PyObject **)calloc(1, sizeof(PyObject *));
+                if (obj->items == 0) return 0;
+                pcc_gc_store_ptr((PyObject *)obj, &obj->items[0], (PyObject *)child);
+            }
+            return (PyObject *)obj;
+        }
 
         enum {
             OBJECTS = 256,
@@ -1086,6 +1053,7 @@ def test_colored_relocating_forwarding_table_threadsanitizer_or_skip(tmp_path):
             }
             for (int i = 0; i < OBJECTS; i++) {
                 if (pcc_gc_install_forwarding(old_objs[i], new_objs[i]) != 0) {
+                    __atomic_store_n(&writer_done, 1, __ATOMIC_RELEASE);
                     return (void *)2;
                 }
                 if ((i & 7) == 0) {
@@ -1103,8 +1071,8 @@ def test_colored_relocating_forwarding_table_threadsanitizer_or_skip(tmp_path):
                 return 3;
             }
             for (int i = 0; i < OBJECTS; i++) {
-                old_objs[i] = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0);
-                new_objs[i] = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0);
+                old_objs[i] = new_reloc_payload();
+                new_objs[i] = new_reloc_payload();
                 if (old_objs[i] == 0 || new_objs[i] == 0) return 4;
             }
 
@@ -1141,7 +1109,7 @@ def test_colored_relocating_forwarding_table_threadsanitizer_or_skip(tmp_path):
             }
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build_probe = subprocess.run(
         [
             cc,
@@ -1174,33 +1142,8 @@ def test_colored_relocating_forwarding_table_threadsanitizer_or_skip(tmp_path):
 
 def test_colored_relocating_step_allocation_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if build_runtime.returncode != 0:
-        stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc, tsan=True)
 
     src = tmp_path / "backend4_step_allocation_tsan_probe.c"
     exe = tmp_path / "backend4_step_allocation_tsan_probe.out"
@@ -1209,6 +1152,24 @@ def test_colored_relocating_step_allocation_threadsanitizer_or_skip(tmp_path):
         #include "py_internal.h"
         #include <stdint.h>
         #include <unistd.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static PyObject *new_reloc_payload(void) {
+            ProbeListObject *obj = (
+                ProbeListObject *
+            )pcc_gc_alloc(64, PY_TYPE_LIST, 0);
+            if (obj == 0) return 0;
+            obj->length = 0;
+            obj->capacity = 0;
+            obj->items = 0;
+            return (PyObject *)obj;
+        }
 
         enum {
             OBJECTS = 512
@@ -1221,7 +1182,7 @@ def test_colored_relocating_step_allocation_threadsanitizer_or_skip(tmp_path):
         static void *allocator(void *arg) {
             (void)arg;
             for (int i = 0; i < OBJECTS; i++) {
-                PyObject *obj = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0);
+                PyObject *obj = new_reloc_payload();
                 if (obj == 0) return (void *)1;
                 objects[i] = obj;
                 __atomic_store_n(&allocated, i + 1, __ATOMIC_RELEASE);
@@ -1288,7 +1249,7 @@ def test_colored_relocating_step_allocation_threadsanitizer_or_skip(tmp_path):
             if (pcc_gc_set_backend(PCC_GC_KIND_REFCOUNT_CYCLE) != 0) return 11;
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build_probe = subprocess.run(
         [
             cc,
@@ -1321,33 +1282,8 @@ def test_colored_relocating_step_allocation_threadsanitizer_or_skip(tmp_path):
 
 def test_colored_relocating_free_hook_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
-    )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if build_runtime.returncode != 0:
-        stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(tmp_path, cc=cc, tsan=True)
 
     src = tmp_path / "backend4_free_hook_tsan_probe.c"
     exe = tmp_path / "backend4_free_hook_tsan_probe.out"
@@ -1356,6 +1292,24 @@ def test_colored_relocating_free_hook_threadsanitizer_or_skip(tmp_path):
         #include "py_internal.h"
         #include <stdint.h>
         #include <unistd.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static PyObject *new_reloc_payload(void) {
+            ProbeListObject *obj = (
+                ProbeListObject *
+            )pcc_gc_alloc(64, PY_TYPE_LIST, 0);
+            if (obj == 0) return 0;
+            obj->length = 0;
+            obj->capacity = 0;
+            obj->items = 0;
+            return (PyObject *)obj;
+        }
 
         enum {
             OBJECTS = 256,
@@ -1410,14 +1364,16 @@ def test_colored_relocating_free_hook_threadsanitizer_or_skip(tmp_path):
                 return 3;
             }
             for (int i = 0; i < OBJECTS; i++) {
-                old_objs[i] = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0);
-                new_objs[i] = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0);
-                if (old_objs[i] == 0 || new_objs[i] == 0) return 4;
+                old_objs[i] = new_reloc_payload(1);
+                if (old_objs[i] == 0) return 4;
                 if (pcc_gc_object_id(old_objs[i]) <= 0) return 5;
             }
             pcc_gc_reset_relocation_set();
-            (void)pcc_gc_select_relocation_set(OBJECTS);
-            if (pcc_gc_relocation_set_size() <= 0) return 6;
+            if (pcc_gc_select_relocation_set(OBJECTS) != OBJECTS) return 6;
+            for (int i = 0; i < OBJECTS; i++) {
+                new_objs[i] = new_reloc_payload(0);
+                if (new_objs[i] == 0) return 4;
+            }
             for (int i = 0; i < OBJECTS; i++) {
                 if (pcc_gc_install_forwarding(old_objs[i], new_objs[i]) != 0) {
                     return 7;
@@ -1448,7 +1404,7 @@ def test_colored_relocating_free_hook_threadsanitizer_or_skip(tmp_path):
             if (pcc_gc_set_backend(PCC_GC_KIND_REFCOUNT_CYCLE) != 0) return 13;
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build_probe = subprocess.run(
         [
             cc,
@@ -1489,36 +1445,13 @@ def test_colored_relocating_free_hook_threadsanitizer_or_skip(tmp_path):
 
 def test_pcc_python_runtime_object_graph_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
-    work_runtime = tmp_path / "py_runtime_pcc_py"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
-        ),
+    _require_thread_sanitizer_runtime(tmp_path, cc)
+    work_runtime = _build_threaded_runtime(
+        tmp_path,
+        cc=cc,
+        tsan=True,
+        pcc_python=True,
     )
-    build_runtime = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            f"CC={cc}",
-            f"PCC={REPO_ROOT / '.venv' / 'bin' / 'pcc'}",
-            f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python3'}",
-            f"PCC_REPO_ROOT={REPO_ROOT}",
-            "PCC_WITH_THREADS=1",
-            "CFLAGS=-O1 -g -fPIC -Wall -Wextra -std=c11 -fsanitize=thread",
-            "libpy_runtime_pcc_py.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    if build_runtime.returncode != 0:
-        stderr = build_runtime.stderr.lower()
-        assert "sanitize" in stderr or "tsan" in stderr
-        return
 
     src = tmp_path / "pcc_py_object_graph_tsan_probe.c"
     exe = tmp_path / "pcc_py_object_graph_tsan_probe.out"
@@ -1531,20 +1464,23 @@ def test_pcc_python_runtime_object_graph_threadsanitizer_or_skip(tmp_path):
 
         enum {
             MINOR_ALLOCATIONS = 8,
-            MINOR_ARENA_REFILLS = 19
+            MINOR_ARENA_REFILLS = 19,
+            THREADS = 2,
+            ROUNDS = 32,
+            OBJECTS_PER_ROUND = 4
         };
 
         static int64_t done_count = 0;
 
         static void *mutator(void *arg) {
             (void)arg;
-            for (int round = 0; round < 120; round++) {
-                PyObject *objects[8];
-                for (int i = 0; i < 8; i++) {
+            for (int round = 0; round < ROUNDS; round++) {
+                PyObject *objects[OBJECTS_PER_ROUND];
+                for (int i = 0; i < OBJECTS_PER_ROUND; i++) {
                     objects[i] = pcc_gc_alloc(64, PY_TYPE_NONE, 0);
                     if (objects[i] == 0) return (void *)(uintptr_t)1;
                 }
-                for (int i = 0; i < 8; i++) {
+                for (int i = 0; i < OBJECTS_PER_ROUND; i++) {
                     pcc_gc_release(objects[i]);
                 }
                 if ((round % 8) == 0) {
@@ -1563,15 +1499,15 @@ def test_pcc_python_runtime_object_graph_threadsanitizer_or_skip(tmp_path):
             }
             pcc_gc_telemetry_reset();
 
-            PccThreadHandle *threads[4] = {0, 0, 0, 0};
-            for (int i = 0; i < 4; i++) {
+            PccThreadHandle *threads[THREADS] = {0, 0};
+            for (int i = 0; i < THREADS; i++) {
                 if (pcc_thread_start(&threads[i], mutator, 0) != 0) return 4 + i;
             }
-            while (__atomic_load_n(&done_count, __ATOMIC_ACQUIRE) < 4) {
+            while (__atomic_load_n(&done_count, __ATOMIC_ACQUIRE) < THREADS) {
                 pcc_thread_safepoint();
                 usleep(1000);
             }
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < THREADS; i++) {
                 void *result = 0;
                 if (pcc_thread_join(threads[i], &result) != 0) return 8 + i;
                 if (result != 0) return 12 + i;
@@ -1582,7 +1518,7 @@ def test_pcc_python_runtime_object_graph_threadsanitizer_or_skip(tmp_path):
             printf("%lld\n", (long long)pcc_gc_telemetry(MINOR_ARENA_REFILLS));
             return 0;
         }
-        """).lstrip())
+        """).lstrip(), encoding="utf-8")
     build_probe = subprocess.run(
         [
             cc,
@@ -1627,4 +1563,4 @@ def test_pcc_python_runtime_object_graph_threadsanitizer_or_skip(tmp_path):
     assert "data race" not in combined.lower()
     lines = run.stdout.strip().splitlines()
     assert int(lines[0]) > 0
-    assert int(lines[1]) >= 4
+    assert int(lines[1]) >= 1

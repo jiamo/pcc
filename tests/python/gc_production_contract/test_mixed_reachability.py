@@ -1,6 +1,6 @@
 """5-GC common production contract: the collection BOUNDARY + scale.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track).
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track).
 
 A collection must keep everything reachable from a root and reclaim ONLY what is
 unreachable — the boundary between the two must be exact on all five backends,

@@ -1,7 +1,7 @@
 """5-GC common production contract: __del__ finalizers on members of an
 unreachable reference CYCLE must run (CPython PEP 442) under all five backends.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track).
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track).
 Compiled once under strict no-libpython and run under PCC_GC_BACKEND 0..4.
 
 HISTORY (2026-05-31): this contract test first surfaced that only #0 ran

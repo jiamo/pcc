@@ -1,6 +1,6 @@
 """5-GC common production contract: virtual-thread scheduler roots.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track) and
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track) and
 the virtual-thread T-track. Virtual-thread scheduler queues are currently a
 runtime ABI surface rather than a Python source construct, so this brick builds
 a focused C probe against pcc's no-libpython runtime archive and runs the same
@@ -159,11 +159,12 @@ def _virtual_thread_scheduler_exe(tmp_path_factory):
         RUNTIME_DIR,
         work_runtime,
         ignore=shutil.ignore_patterns(
+            "_native",
+            "__pycache__",
             "build",
-            "build_pcc",
-            "build_py",
-            "build_libpython",
+            "build_*",
             "*.a",
+            "*.a.target",
         ),
     )
     make = subprocess.run(

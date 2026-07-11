@@ -22,21 +22,13 @@ import subprocess
 import textwrap
 import time
 
-import pytest
-
-# Compiles share the runtime archive build; concurrent compiles under
-# pytest-xdist race on libpy_runtime_pcc_py.a. Pin all tests in this
-# file to the same xdist worker so they run serially.
-pytestmark = pytest.mark.xdist_group(name="gc_perf_serial")
-
-
 def _compile_program(tmp_path, source: str):
     """Compile a pcc-Python program and return the executable path."""
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
-    src.write_text(textwrap.dedent(source).lstrip())
+    src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     compile_python(str(src), str(exe), ir_scaffold_mode="on")
     return exe
 

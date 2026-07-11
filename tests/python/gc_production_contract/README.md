@@ -2,7 +2,7 @@
 
 This directory is the **common GC production contract**: Python runtime
 semantics that must hold IDENTICALLY under all five production GC backends
-(see the 5-GC Production Equality Rule in `codex-goal-prompt.md`, G-track).
+(see the 5-GC Production Equality Rule in `docs/goal/goal-prompt.md`, G-track).
 
 Run it under every backend with:
 
@@ -51,7 +51,7 @@ program is to consolidate them here under the uniform 0..4 gate.
 - `test_exception_traceback_roots.py`
 - `test_coroutine_frame_roots.py`       # suspended-frame local survives GC on 0..4
 - `test_virtual_thread_scheduler_roots.py` # runtime scheduler queues retain continuation roots
-- `test_valuebox_roots.py`                # boxed valueclass pointer payload roots
+- `test_valuebox_roots.py`                # boxed/nested valueclass pointer payload roots
 - `test_valueclass_pointer_payload.py`  # incl. payload-updates-after-relocation on #4
 - `test_extension_module_state_roots.py` # PyModule_GetState/m_traverse roots
 - `test_native_handle_lifetime.py`       # native FILE* wrapper close/flush lifetime
@@ -68,4 +68,4 @@ scheduler-root + non-traced scalar payloads + finalizer/resurrection behavior),
 consumed by all five backends via one `py_obj_visit_slots(obj, visitor)`
 contract — never per-type hand-coded graph walkers. The checklist also requires
 the five backend gates + C / pcc-Python mirror parity (2 impls x 5 backends) +
-the pcc1 no-host test. See the full checklist in `codex-goal-prompt.md`.
+the pcc1 no-host test. See the full checklist in `docs/goal/goal-prompt.md`.

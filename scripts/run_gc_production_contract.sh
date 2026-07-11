@@ -3,7 +3,7 @@
 #
 # Runs the common GC production-contract suite under ALL FIVE production GC
 # backends. A runtime/GC-touching feature is "5-GC production contract pass"
-# only when every backend is green here. See the rule in codex-goal-prompt.md
+# only when every backend is green here. See docs/goal/goal-prompt.md
 # (G-track) and tests/python/gc_production_contract/README.md.
 #
 # Performance MAY differ across backends; Python semantics / object safety may

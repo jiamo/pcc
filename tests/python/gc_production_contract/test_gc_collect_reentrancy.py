@@ -1,6 +1,6 @@
 """5-GC common production contract: gc.collect() reentrancy from a finalizer.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track).
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track).
 
 A finalizer (__del__) that calls gc.collect() while a collection is already in
 progress must be SAFE on all five backends: the reentrant collect is a no-op

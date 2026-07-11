@@ -6,6 +6,8 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from tests.runtime_build_cache import cache_runtime_build
+
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
@@ -15,13 +17,14 @@ def _cc() -> str:
     return os.environ.get("CC", "cc")
 
 
+@cache_runtime_build
 def _build_threaded_runtime(tmp_path: Path) -> Path:
     work_runtime = tmp_path / "py_runtime"
     shutil.copytree(
         RUNTIME_DIR,
         work_runtime,
         ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
         ),
     )
     result = subprocess.run(
@@ -96,7 +99,7 @@ def test_concurrent_backend_starts_worker_and_assists_allocations(tmp_path):
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     build = subprocess.run(
         [
             _cc(),
@@ -207,7 +210,7 @@ def test_concurrent_backend_worker_traces_gray_barrier_work(tmp_path):
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     build = subprocess.run(
         [
             _cc(),
@@ -303,7 +306,7 @@ def test_concurrent_backend_batches_gray_barrier_flushes(tmp_path):
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     build = subprocess.run(
         [
             _cc(),
@@ -389,7 +392,7 @@ def test_concurrent_backend_worker_traces_positive_allocation_work(tmp_path):
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     build = subprocess.run(
         [
             _cc(),
@@ -491,7 +494,7 @@ def test_concurrent_backend_worker_reaches_mark_termination_without_mutator_gc_s
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     build = subprocess.run(
         [
             _cc(),
@@ -595,7 +598,7 @@ def test_concurrent_backend_worker_stops_and_restarts_on_backend_switch(tmp_path
             }
             """
         ).lstrip()
-    )
+    , encoding="utf-8")
     build = subprocess.run(
         [
             _cc(),

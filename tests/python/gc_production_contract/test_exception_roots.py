@@ -1,7 +1,7 @@
 """5-GC common production contract: a live exception's message referent must
 survive gc.collect under all five backends.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track).
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track).
 
 CURRENT STATE (resolved 2026-05-31): all five backends keep a caught
 exception's message across gc.collect. The original gap was frontend root
@@ -30,7 +30,7 @@ _PROGRAM = (
     "main()\n"
 )
 _EXPECTED = "[1, 2, 3]"
-_XFAIL: set = set()  # hard gate on 0..4
+_ALL_BACKENDS = ("0", "1", "2", "3", "4")
 
 
 @pytest.fixture(scope="module")
@@ -50,19 +50,7 @@ def _exc_exe(tmp_path_factory):
     return str(exe)
 
 
-def _params():
-    out = []
-    for b in ("0", "1", "2", "3", "4"):
-        if b in _XFAIL:
-            out.append(pytest.param(b, marks=pytest.mark.xfail(
-                reason="tracing collect reclaims a live exception's message referent",
-                strict=False)))
-        else:
-            out.append(b)
-    return out
-
-
-@pytest.mark.parametrize("backend", _params())
+@pytest.mark.parametrize("backend", list(_ALL_BACKENDS))
 def test_exception_referents_survive_gc(_exc_exe, backend):
     env = os.environ.copy()
     env.pop("LC_ALL", None)

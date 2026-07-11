@@ -1,6 +1,6 @@
 """5-GC common production contract: object resurrection inside __del__ (PEP 442).
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track).
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track).
 
 If a finalizer (__del__) makes its object reachable again — e.g. stores `self`
 into a still-reachable global — that object MUST survive the collection intact
@@ -50,7 +50,7 @@ _PROGRAM = (
     "main()\n"
 )
 _EXPECTED = "2 [42, 43]"
-_XFAIL: set = set()  # was {1,2,3,4}; PEP-442 recheck landed -> hard gate on 0..4
+_ALL_BACKENDS = ("0", "1", "2", "3", "4")
 
 
 @pytest.fixture(scope="module")
@@ -70,20 +70,7 @@ def _exe(tmp_path_factory):
     return str(exe)
 
 
-def _params():
-    out = []
-    for b in ("0", "1", "2", "3", "4"):
-        if b in _XFAIL:
-            out.append(pytest.param(b, marks=pytest.mark.xfail(
-                reason="two-phase sweep clears/frees objects resurrected in __del__ "
-                       "(PEP-442 reachability recheck not yet implemented)",
-                strict=False)))
-        else:
-            out.append(b)
-    return out
-
-
-@pytest.mark.parametrize("backend", _params())
+@pytest.mark.parametrize("backend", list(_ALL_BACKENDS))
 def test_resurrected_object_survives_gc(_exe, backend):
     env = os.environ.copy()
     env.pop("LC_ALL", None)

@@ -4,14 +4,20 @@ The underlying test files spawn subprocesses; those subprocesses inherit
 ``PCC_GC_BACKEND`` from the pytest process. Running plain ``pytest <file>``
 without setting that env exercises only the default backend (#0). This
 wrapper parametrizes over the GC backends each gate originally covered and
-over the Python native backend:
+over the Python native backend where that environment can affect the test:
 
 * ``llvm`` is the baseline path.
 * ``self`` is the pcc-owned backend path.
 
-Each target runs as a separate subprocess with its own timeout so a slow
-backend does not hide the first actionable failure behind one long aggregate
-run. Most targets are files; known slow aggregate files are split to node ids.
+Most pure C probes select their GC algorithm through ``pcc_gc_set_backend`` and
+do not invoke the Python compiler, so the self variant normally keeps only
+compiler and pcc-Python-runtime nodes.  The GC4 production contract is retained
+in both frontend modes deliberately: its task-board claim requires the complete
+127-probe contract at both mode boundaries.  Each independent
+file/configuration runs in a bounded subprocess.  Node ids
+that share one file and build configuration stay in one inner pytest process
+so they can reuse the same immutable runtime archive; pytest still executes
+and reports every node independently.
 """
 from __future__ import annotations
 
@@ -83,9 +89,30 @@ _RELOCATING_TARGETS = (
     _node(_RELOCATING_FILE, "test_colored_relocating_rejects_forwarding_for_pinned_objects"),
     _node(_RELOCATING_FILE, "test_colored_relocating_stable_id_survives_forwarding"),
     _node(_RELOCATING_FILE, "test_colored_relocating_selects_unpinned_relocation_set"),
-    _node(_RELOCATING_FILE, "test_colored_relocating_copy_moves_selected_simple_object"),
+    _node(_RELOCATING_FILE, "test_colored_relocating_copy_forwards_selected_payload_object"),
     _node(_RELOCATING_FILE, "test_colored_relocating_copy_consumes_relocation_entry"),
-    _node(_RELOCATING_FILE, "test_colored_relocating_step_copies_selected_simple_object"),
+    _node(_RELOCATING_FILE, "test_colored_relocating_step_forwards_selected_payload_object"),
+)
+
+_CONCURRENT_COLLECTION_FILE = "tests/python/test_gc_concurrent_collection.py"
+_CONCURRENT_COLLECTION_PCC_PYTHON_TARGET = _node(
+    _CONCURRENT_COLLECTION_FILE,
+    "test_pcc_python_runtime_object_graph_threadsanitizer_or_skip",
+)
+_COROUTINE_ROOTS_FILE = "tests/python/test_gc_coroutine_roots.py"
+_COROUTINE_ROOTS_PCC_PYTHON_TARGETS = (
+    _node(
+        _COROUTINE_ROOTS_FILE,
+        "test_pcc_python_runtime_suspended_heap_frame_local_survives_collect_across_backends",
+    ),
+    _node(
+        _COROUTINE_ROOTS_FILE,
+        "test_pcc_python_runtime_task_completion_releases_waiter_cycle_across_backends",
+    ),
+    _node(
+        _COROUTINE_ROOTS_FILE,
+        "test_pcc_python_runtime_virtual_thread_scheduler_queues_keep_continuation_roots_across_backends",
+    ),
 )
 
 
@@ -93,33 +120,76 @@ _BACKEND_TEST_GROUPS = {
     "2": (
         "tests/python/test_gc_backend23_production.py",
         "tests/python/test_gc_backend_concurrent.py",
-        "tests/python/test_gc_concurrent_collection.py",
+        _CONCURRENT_COLLECTION_FILE,
         "tests/python/test_gc_threading_substrate.py",
     ),
     "3": (
         "tests/python/test_gc_backend23_production.py",
-        *_GENERATIONAL_TARGETS,
-        "tests/python/test_gc_concurrent_collection.py",
-        "tests/python/test_gc_coroutine_roots.py",
+        _GENERATIONAL_TARGETS,
+        _CONCURRENT_COLLECTION_FILE,
+        _COROUTINE_ROOTS_FILE,
     ),
     "4": (
-        *_RELOCATING_TARGETS,
+        _RELOCATING_TARGETS,
         "tests/python/test_gc_backend4_production.py",
         "tests/python/test_gc_abstraction_surface.py",
-        "tests/python/test_gc_coroutine_roots.py",
+        _COROUTINE_ROOTS_FILE,
     ),
 }
 
 
 _FRONTEND_BACKENDS = ("llvm", "self")
+_FRONTEND_INDEPENDENT_TARGETS = {
+    "tests/python/test_gc_backend23_production.py",
+    "tests/python/test_gc_backend_concurrent.py",
+}
+# These cases each spawn a full inner `pytest` that compiles + runs a GC suite
+# (some multi-core). Under the default `-n auto`, many of them ran at once and
+# oversubscribed the CPU, so an inner compile/run that finishes in ~100s solo
+# blew the old 240s subprocess timeout (and the threaded concurrent-collection
+# inner test even failed under starvation). Each `_iter_cases` param is now
+# pinned to a per-GC-backend xdist_group so `--dist=loadgroup` caps concurrent
+# heavy cases at one-per-backend; the timeouts keep generous headroom for the
+# residual contention with the rest of the suite.
 _SUBPROCESS_TIMEOUT_SECONDS = 240
-_SLOW_SUBPROCESS_TIMEOUT_SECONDS = 600
+_SLOW_SUBPROCESS_TIMEOUT_SECONDS = 300
 
 
-def _timeout_for_target(test_target: str) -> int:
-    if test_target == "tests/python/test_gc_backend4_production.py":
+def _timeout_for_target(test_target: str | tuple[str, ...]) -> int:
+    if "tests/python/test_gc_backend4_production.py" in _target_args(test_target):
         return _SLOW_SUBPROCESS_TIMEOUT_SECONDS
     return _SUBPROCESS_TIMEOUT_SECONDS
+
+
+def _target_args(test_target: str | tuple[str, ...]) -> tuple[str, ...]:
+    if isinstance(test_target, str):
+        return (test_target,)
+    return test_target
+
+
+def _self_frontend_target(
+    test_target: str | tuple[str, ...],
+) -> str | tuple[str, ...] | None:
+    """Return only nodes whose behavior can change under PCC_BACKEND=self."""
+
+    if isinstance(test_target, str):
+        if test_target in _FRONTEND_INDEPENDENT_TARGETS:
+            return None
+        if test_target == _CONCURRENT_COLLECTION_FILE:
+            return _CONCURRENT_COLLECTION_PCC_PYTHON_TARGET
+        if test_target == _COROUTINE_ROOTS_FILE:
+            return _COROUTINE_ROOTS_PCC_PYTHON_TARGETS
+        return test_target
+    if test_target is _GENERATIONAL_TARGETS:
+        compiler_nodes = set(_GENERATIONAL_TARGETS[:2])
+        return tuple(
+            node
+            for node in test_target
+            if node in compiler_nodes or "pcc_python" in node
+        )
+    if test_target is _RELOCATING_TARGETS:
+        return tuple(node for node in test_target if "pcc_python" in node)
+    return test_target
 
 
 def _timeout_output_text(value) -> str:
@@ -131,35 +201,52 @@ def _timeout_output_text(value) -> str:
 
 
 def _iter_cases():
-    for frontend_backend in _FRONTEND_BACKENDS:
-        for gc_backend, targets in _BACKEND_TEST_GROUPS.items():
-            for test_target in targets:
-                yield pytest.param(
-                    frontend_backend,
-                    gc_backend,
-                    test_target,
-                    id=(
-                        "frontend="
-                        + frontend_backend
-                        + "-gc="
-                        + gc_backend
-                        + "-"
-                        + test_target.rsplit("/", 1)[-1].replace("::", "-")
-                    ),
+    for gc_backend, targets in _BACKEND_TEST_GROUPS.items():
+        for frontend_backend in _FRONTEND_BACKENDS:
+            selected_targets = []
+            for complete_target in targets:
+                selected = (
+                    complete_target
+                    if frontend_backend == "llvm"
+                    else _self_frontend_target(complete_target)
                 )
+                if selected is None:
+                    continue
+                selected_targets.extend(_target_args(selected))
+            test_target = tuple(selected_targets)
+            yield pytest.param(
+                frontend_backend,
+                gc_backend,
+                test_target,
+                # One inner pytest owns the complete frontend/GC slice. This
+                # keeps module caches alive and avoids dozens of repeated
+                # pytest startup/teardown cycles.
+                marks=pytest.mark.xdist_group(name=f"gc_meta_{gc_backend}"),
+                # Keep the public node id independent of batch membership so
+                # exact task-board gates cannot silently select zero tests when
+                # a target is added, removed, or consolidated.
+                id="frontend=" + frontend_backend + "-gc=" + gc_backend,
+            )
 
 
 def _run_file_under_backends(
     frontend_backend: str,
     gc_backend: str,
-    test_target: str,
+    test_target: str | tuple[str, ...],
 ) -> None:
     env = {
         **os.environ,
         "PCC_BACKEND": frontend_backend,
         "PCC_GC_BACKEND": gc_backend,
     }
-    cmd = [sys.executable, "-m", "pytest", "-q", "-n0", test_target]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-n0",
+        *_target_args(test_target),
+    ]
     timeout_seconds = _timeout_for_target(test_target)
     try:
         proc = subprocess.run(
@@ -198,6 +285,6 @@ def _run_file_under_backends(
 def test_gc_backend_subset_under_frontend_backend(
     frontend_backend: str,
     gc_backend: str,
-    test_target: str,
+    test_target: str | tuple[str, ...],
 ) -> None:
     _run_file_under_backends(frontend_backend, gc_backend, test_target)

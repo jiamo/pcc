@@ -27,10 +27,13 @@ import textwrap
 
 import pytest
 
+from tests.runtime_build_cache import cache_runtime_build
+
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 
 
+@cache_runtime_build
 def _build_runtime(tmp_path: Path) -> Path:
     runtime = REPO_ROOT / "pcc" / "py_runtime"
     work = tmp_path / "py_runtime"
@@ -38,7 +41,7 @@ def _build_runtime(tmp_path: Path) -> Path:
         runtime,
         work,
         ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
         ),
     )
     make = subprocess.run(
@@ -53,7 +56,7 @@ def _compile_run(tmp_path: Path, c_src: str, name: str) -> subprocess.CompletedP
     runtime = _build_runtime(tmp_path)
     src = tmp_path / f"{name}.c"
     exe = tmp_path / f"{name}.out"
-    src.write_text(c_src)
+    src.write_text(c_src, encoding="utf-8")
     cc = os.environ.get("CC", "cc")
     build = subprocess.run(
         [

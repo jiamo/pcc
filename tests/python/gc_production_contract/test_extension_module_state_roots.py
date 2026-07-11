@@ -1,6 +1,6 @@
 """5-GC common production contract: pcc-native extension module state roots.
 
-Part of the 5-GC Production Equality Rule (codex-goal-prompt.md G-track).
+Part of the 5-GC Production Equality Rule (docs/goal/goal-prompt.md G-track).
 An imported pcc-native extension may own PyObject references only through its
 ``PyModuleDef.m_size`` module state. When it exposes those references through
 ``m_traverse``, every GC backend must treat them as roots.

@@ -6,6 +6,8 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from tests.runtime_build_cache import cache_runtime_build
+
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
@@ -14,13 +16,14 @@ def _cc() -> str:
     return os.environ.get("CC", "cc")
 
 
+@cache_runtime_build
 def _build_runtime(tmp_path: Path, *, with_threads: bool = False) -> Path:
     work_runtime = tmp_path / "py_runtime"
     shutil.copytree(
         RUNTIME_DIR,
         work_runtime,
         ignore=shutil.ignore_patterns(
-            "build", "build_pcc", "build_py", "build_libpython", "*.a"
+            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
         ),
     )
     result = subprocess.run(
@@ -140,6 +143,112 @@ def test_scheduler_and_frame_root_observability_across_backends(tmp_path):
     ]
 
 
+def test_scheduler_root_handle_unregister_keeps_legacy_api_observable(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        """
+        #include "py_runtime.h"
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        static int check_backend(int64_t backend) {
+            if (pcc_gc_set_backend(backend) != 0) return 0;
+
+            PyObject *handle_root = 0;
+            void *handle = pcc_gc_scheduler_root_register_handle(&handle_root);
+            if (handle == 0) return 0;
+            if (pcc_gc_scheduler_root_count() != 1) return 0;
+            if (pcc_gc_slot_is_runtime_root(&handle_root) != 1) return 0;
+
+            PyObject *legacy_root = 0;
+            pcc_gc_scheduler_root_register(&legacy_root);
+            if (pcc_gc_scheduler_root_count() != 2) return 0;
+
+            pcc_gc_scheduler_root_unregister_handle(handle);
+            if (pcc_gc_scheduler_root_count() != 1) return 0;
+            if (pcc_gc_slot_is_runtime_root(&handle_root) != 0) return 0;
+            if (pcc_gc_slot_is_runtime_root(&legacy_root) != 1) return 0;
+
+            pcc_gc_scheduler_root_unregister(&legacy_root);
+            return pcc_gc_scheduler_root_count() == 0;
+        }
+
+        int main(void) {
+            for (int64_t backend = 0; backend <= 4; backend++) {
+                int ok = check_backend(backend);
+                printf("%lld:%d\\n", (long long)backend, ok);
+                if (!ok) return (int)(20 + backend);
+            }
+            return 0;
+        }
+        """,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip().splitlines() == [
+        "0:1",
+        "1:1",
+        "2:1",
+        "3:1",
+        "4:1",
+    ]
+
+
+def test_scheduler_queue_entry_freelist_preserves_roots_across_backends(tmp_path):
+    proc = _compile_and_run(
+        tmp_path,
+        """
+        #include "py_runtime.h"
+        #include "py_internal.h"
+        #include <stdio.h>
+
+        static int check_backend(int64_t backend) {
+            if (pcc_gc_set_backend(backend) != 0) return 0;
+            PccGcSchedulerQueue *queue = pcc_gc_scheduler_queue_new();
+            if (queue == 0) return 0;
+
+            PyObject *out = 0;
+            void *out_handle = pcc_gc_scheduler_root_register_handle(&out);
+            if (out_handle == 0) return 0;
+
+            for (int64_t i = 0; i < 128; i++) {
+                PyObject *queued = py_int_from_i64(i);
+                if (queued == 0) return 0;
+                if (pcc_gc_scheduler_queue_push(queue, queued) != 0) return 0;
+                pcc_gc_release(queued);
+                if (pcc_gc_scheduler_queue_len(queue) != 1) return 0;
+                if (pcc_gc_scheduler_queue_pop_into(queue, &out) != 1) return 0;
+                int overflow = 0;
+                int64_t raw = py_int_to_i64(out, &overflow);
+                if (overflow || raw != i) return 0;
+                pcc_gc_store_root(&out, 0);
+                if (pcc_gc_scheduler_queue_len(queue) != 0) return 0;
+            }
+
+            pcc_gc_scheduler_root_unregister_handle(out_handle);
+            pcc_gc_scheduler_queue_free(queue);
+            return pcc_gc_scheduler_root_count() == 0;
+        }
+
+        int main(void) {
+            for (int64_t backend = 0; backend <= 4; backend++) {
+                int ok = check_backend(backend);
+                printf("%lld:%d\\n", (long long)backend, ok);
+                if (!ok) return (int)(30 + backend);
+            }
+            return 0;
+        }
+        """,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip().splitlines() == [
+        "0:1",
+        "1:1",
+        "2:1",
+        "3:1",
+        "4:1",
+    ]
+
+
 def test_continuation_root_map_rewrites_backend4_forwarded_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
@@ -148,12 +257,30 @@ def test_continuation_root_map_rewrites_backend4_forwarded_slot(tmp_path):
         #include "py_internal.h"
         #include <stdio.h>
 
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static PyObject *new_reloc_payload(void) {
+            ProbeListObject *obj = (
+                ProbeListObject *
+            )pcc_gc_alloc(64, PY_TYPE_LIST, 0);
+            if (obj == 0) return 0;
+            obj->length = 0;
+            obj->capacity = 0;
+            obj->items = 0;
+            return (PyObject *)obj;
+        }
+
         int main(void) {
             if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) return 2;
 
             int32_t frame_map[1] = {1};
             PyObject *slots[1] = {0};
-            PyObject *obj = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            PyObject *obj = new_reloc_payload();
             if (obj == 0) return 3;
             int64_t stable = pcc_gc_object_id(obj);
             if (stable <= 0) return 4;
@@ -193,7 +320,26 @@ def test_continuation_object_mount_unmount_scans_and_rewrites_slots(tmp_path):
         tmp_path,
         """
         #include "py_runtime.h"
+        #include "py_internal.h"
         #include <stdio.h>
+
+        typedef struct {
+            PyObjectHeader h;
+            int64_t length;
+            int64_t capacity;
+            PyObject **items;
+        } ProbeListObject;
+
+        static PyObject *new_reloc_payload(void) {
+            ProbeListObject *obj = (
+                ProbeListObject *
+            )pcc_gc_alloc(64, PY_TYPE_LIST, 0);
+            if (obj == 0) return 0;
+            obj->length = 0;
+            obj->capacity = 0;
+            obj->items = 0;
+            return (PyObject *)obj;
+        }
 
         static void resume_a(void) {}
         static void resume_b(void) {}
@@ -206,7 +352,7 @@ def test_continuation_object_mount_unmount_scans_and_rewrites_slots(tmp_path):
 
             int32_t frame_map[1] = {1};
             PyObject *slots[1] = {0};
-            PyObject *first = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            PyObject *first = new_reloc_payload();
             if (first == 0) return 3;
             int64_t first_id = pcc_gc_object_id(first);
             slots[0] = first;
@@ -246,7 +392,7 @@ def test_continuation_object_mount_unmount_scans_and_rewrites_slots(tmp_path):
             if (pcc_gc_continuation_root_slot_count() != 0) return 20;
             if (pcc_gc_object_id(mounted_slots[0]) != first_id) return 21;
 
-            PyObject *replacement = pcc_gc_alloc(64, PY_TYPE_INT, 0);
+            PyObject *replacement = new_reloc_payload();
             if (replacement == 0) return 22;
             int64_t replacement_id = pcc_gc_object_id(replacement);
             pcc_gc_store_root(&mounted_slots[0], replacement);
@@ -623,14 +769,21 @@ def test_virtual_thread_typed_resume_and_persistent_pool_pin_blocking(tmp_path):
 
 
 def test_coroutine_root_public_symbols_are_wired():
-    header = (RUNTIME_DIR / "include" / "py_runtime.h").read_text()
-    c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text()
-    py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text()
-    abi = (REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "runtime_abi.py").read_text()
+    header = (RUNTIME_DIR / "include" / "py_runtime.h").read_text(encoding="utf-8")
+    c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
+    py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
+    abi = (REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "runtime_abi.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "PCC_GC_COUNTER_SCHEDULER_ROOTS" in header
     assert "PCC_GC_COUNTER_FRAME_ROOT_SLOTS" in header
     assert "pcc_gc_scheduler_root_count" in header
+    assert "pcc_gc_scheduler_root_register_handle" in header
+    assert "pcc_gc_scheduler_root_unregister_handle" in header
+    assert "PCC_GC_SCHEDULER_QUEUE_ENTRY_POOL_LIMIT" in c_src
+    assert "free_head" in c_src
+    assert "pcc_gc_scheduler_queue_entry_recycle" in c_src
     assert "pcc_gc_register_continuation_root" in header
     assert "pcc_gc_rewrite_continuation_roots" in header
     assert "PY_TYPE_CONTINUATION" in header
@@ -649,6 +802,7 @@ def test_coroutine_root_public_symbols_are_wired():
     assert "py_virtual_thread_carrier_pool_start" in header
     assert "py_virtual_thread_carrier_pool_stop" in header
     assert "py_virtual_thread_carrier_steal_count" in header
+    assert "py_virtual_thread_node_pool_stat" in header
     assert "py_virtual_thread_result" in header
     assert "py_virtual_thread_sleep" in header
     assert "py_virtual_thread_block_on_fd" in header
@@ -656,22 +810,29 @@ def test_coroutine_root_public_symbols_are_wired():
     assert "py_threading_lock_acquire_vthread" in header
     assert "py_threading_event_wait_vthread" in header
     assert "py_dealloc_continuation" in c_src
-    assert (
-        "pcc_vthread_ready_queue" in (RUNTIME_DIR / "src" / "pcc_threads.c").read_text()
-    )
+    assert "pcc_vthread_ready_queue" in (
+        RUNTIME_DIR / "src" / "pcc_threads.c"
+    ).read_text(encoding="utf-8")
     assert "pcc_gc_frame_root_slot_count" in c_src
     assert "pcc_gc_continuation_root_slot_count" in c_src
     assert '@c_abi_export("pcc_gc_scheduler_root_count")' in py_src
+    assert '@c_abi_export("pcc_gc_scheduler_root_register_handle")' in py_src
+    assert '@c_abi_export("pcc_gc_scheduler_root_unregister_handle")' in py_src
+    assert "PCC_GC_SCHEDULER_QUEUE_ENTRY_POOL_LIMIT" in py_src
+    assert "_scheduler_queue_entry_recycle" in py_src
     assert '@c_abi_export("pcc_gc_register_continuation_root")' in py_src
-    assert (
-        '@c_abi_export("py_continuation_new")'
-        in (RUNTIME_DIR / "py" / "py_coroutine.py").read_text()
-    )
+    assert '@c_abi_export("py_continuation_new")' in (
+        RUNTIME_DIR / "py" / "py_coroutine.py"
+    ).read_text(encoding="utf-8")
     assert '"pcc_gc_coroutine_root_score": (_I64, [], False)' in abi
+    assert '"pcc_gc_scheduler_root_register_handle": (_PTR, [_PTR], False)' in abi
+    assert '"pcc_gc_scheduler_root_unregister_handle": (_VOID, [_PTR], False)' in abi
     assert '"py_continuation_mount": (_I64, [_PYOBJ, _PTR], False)' in abi
     assert '"py_continuation_new_typed": (_PYOBJ, [_PTR, _PTR, _PTR], False)' in abi
     assert '"py_continuation_resume_abi": (_I64, [_PYOBJ], False)' in abi
-    assert '"py_virtual_thread_resume_generator": (_I64, [_PYOBJ, _PYOBJ], False)' in abi
+    assert (
+        '"py_virtual_thread_resume_generator": (_I64, [_PYOBJ, _PYOBJ], False)' in abi
+    )
     assert '"py_virtual_thread_start": (_I64, [_PYOBJ], False)' in abi
     assert '"py_threading_lock_acquire_vthread": (_I64, [_PYOBJ], False)' in abi
     assert '"py_virtual_thread_poll_io": (_I64, [_I64], False)' in abi
@@ -679,5 +840,9 @@ def test_coroutine_root_public_symbols_are_wired():
     assert '"py_virtual_thread_run_carrier_pool": (_I64, [_I64, _I64], False)' in abi
     assert '"py_virtual_thread_carrier_pool_start": (_I64, [_I64], False)' in abi
     assert '"py_virtual_thread_carrier_steal_count": (_I64, [], False)' in abi
+    assert (
+        '"py_virtual_thread_node_pool_stat": (_I64, [_I64, _I64], False)'
+        in abi
+    )
     assert '"py_virtual_thread_result": (_PYOBJ, [_PYOBJ], False)' in abi
     assert '"pcc_gc_rewrite_continuation_roots": (_I64, [], False)' in abi
