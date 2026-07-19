@@ -1,0 +1,93 @@
+{
+  "schema": "pcc.m1-package-canary.v1",
+  "probe": {
+    "completed_on": "2026-07-11",
+    "scope": "source archive identity, package build-plan shape, PCC Python.h syntax boundary, init mechanism, and CPython behavior oracle",
+    "timebox_hours": 48
+  },
+  "selected": {
+    "behavior_oracle": {
+      "c_accelerator_check": "simplejson.encoder.c_make_encoder is simplejson._speedups.make_encoder",
+      "expected_json": "{\"items\":[1,\"two\",null],\"ok\":true}",
+      "input": {
+        "items": [
+          1,
+          "two",
+          null
+        ],
+        "ok": true
+      },
+      "operation": "simplejson.dumps(..., sort_keys=True, separators=(',', ':')) followed by simplejson.loads"
+    },
+    "distribution": "simplejson",
+    "extension_module": "simplejson._speedups",
+    "extension_source": "simplejson/_speedups.c",
+    "force_source_extension_env": {
+      "REQUIRE_SPEEDUPS": "1"
+    },
+    "init_contract": {
+      "kind": "pep-489",
+      "markers": [
+        "Py_mod_exec",
+        "PyModuleDef_Init"
+      ],
+      "per_module_state": true
+    },
+    "sha256": "c08eb9f7a90f77ae470e19a07472e9a79ebc0d1c2315d86a72767665bd5ba79f",
+    "source_archive": "simplejson-4.1.1.tar.gz",
+    "source_url": "https://files.pythonhosted.org/packages/source/s/simplejson/simplejson-4.1.1.tar.gz",
+    "version": "4.1.1"
+  },
+  "selected_first_boundaries": {
+    "behavior": {
+      "first_blocker": "No pcc-native extension artifact exists yet, so the pinned nested dict/list/string dumps-loads oracle cannot run under pcc1/self/no-libpython.",
+      "status": "not_reached"
+    },
+    "build": {
+      "diagnostic": "simplejson/_speedups.c:202:5: error: unknown type name 'PyUnicodeWriter'",
+      "first_blocker": "The PCC Python 3.14 C-API header and shim do not expose the public PyUnicodeWriter type and operations used by the extension.",
+      "generic_mechanism": "public Python 3.14 PyUnicodeWriter C-API surface",
+      "status": "blocked"
+    },
+    "link": {
+      "first_blocker": "Not observable until the PyUnicodeWriter compile boundary is implemented; no link-success or missing-symbol claim is made.",
+      "status": "not_reached"
+    },
+    "module_init": {
+      "first_blocker": "Package-specific PyInit__speedups/Py_mod_exec has not run because build and link have not completed; the runtime already has a generic PyModuleDef_Init/Py_mod_exec path, which remains unproven for this package.",
+      "status": "not_reached"
+    }
+  },
+  "candidates": [
+    {
+      "build_plan_c_actions": 1,
+      "distribution": "simplejson",
+      "first_build_boundary": "missing public PyUnicodeWriter C-API surface",
+      "init_contract": "pep-489",
+      "selection": "selected",
+      "sha256": "c08eb9f7a90f77ae470e19a07472e9a79ebc0d1c2315d86a72767665bd5ba79f",
+      "source_url": "https://files.pythonhosted.org/packages/source/s/simplejson/simplejson-4.1.1.tar.gz",
+      "version": "4.1.1"
+    },
+    {
+      "build_plan_c_actions": 1,
+      "distribution": "immutables",
+      "first_build_boundary": "conflicting PyFrame_GetCode declarations, followed by private _PyUnicodeWriter and Py_TRASHCAN gaps",
+      "init_contract": "legacy-single-phase",
+      "selection": "rejected: does not cover PEP 489 or PyType_FromSpec",
+      "sha256": "b55ffaf0449790242feb4c56ab799ea7af92801a0a43f9e2f4f8af2ab24dfc4a",
+      "source_url": "https://files.pythonhosted.org/packages/source/i/immutables/immutables-0.21.tar.gz",
+      "version": "0.21"
+    },
+    {
+      "build_plan_c_actions": 19,
+      "distribution": "pyahocorasick",
+      "first_build_boundary": "PCC Python.h does not provide the C alternate-token header needed for source use of 'and'; the generic planner also over-collects included .c files",
+      "init_contract": "legacy-single-phase",
+      "selection": "rejected: broad build surface and no PEP 489 or PyType_FromSpec",
+      "sha256": "9d0f6bb522237ed7f111ed59c9e8baea7d1e75813587b6773babd43bda35db9f",
+      "source_url": "https://files.pythonhosted.org/packages/source/p/pyahocorasick/pyahocorasick-2.3.1.tar.gz",
+      "version": "2.3.1"
+    }
+  ]
+}

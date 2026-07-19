@@ -99,3 +99,18 @@ The low_ir scaffold is the subtle one: it is the pure-leaf fast path with no
 error-exit, so the fix there is to *exclude* trap-capable division rather than to
 emit a raise it cannot route. Predecessor pattern: `_emit_negative_shift_count_check`
 (negative shift count → ValueError) is the same guard shape for the same reason.
+
+## Update 2026-06-18 — dyn `//` path was uncovered (follow-up fix)
+
+A full-suite run surfaced `test_zero_division_inline_dyn` failing on `fd <null>`
+(dyn `a // b`, both int, `b == 0`) while `md` (`%`) and `td` (`/`) raised
+correctly. Root cause: the dyn `//` block in `binary_op_lowering.py` only did
+`_emit_post_call_err_check(None)` after `py_obj_floordiv`, missing the
+`_emit_zero_division_if_null(...)` that the dyn `%` path has. `py_obj_floordiv`
+delegates INT // INT to `py_int_floordiv`, which returns NULL *without* raising on
+a zero divisor (the float path in `py_obj_floordiv` raises directly, so float `//`
+was fine — only int // int leaked NULL). Fix: mirror the mod path — add
+`_emit_zero_division_if_null(fdiv_res, "division by zero")` after the err-check.
+Verified: `tests/python/test_native_zero_division.py` 3/3 pass under
+`--backend self --python-libpython=off`. This was the seventh lowering surface;
+the "six paths" lesson holds — the dyn `//` guard had simply been omitted.

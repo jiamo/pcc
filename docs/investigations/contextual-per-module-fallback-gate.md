@@ -207,3 +207,26 @@ After fixing the split-local helper dependencies, these gates passed:
 env -u LC_ALL uv run pytest tests/python/test_fallback_baseline.py -q -n0
 env -u LC_ALL uv run pytest tests/python/test_pcc_bootstrap_full.py::test_full_three_stage_bootstrap_self -q -n0
 ```
+
+## Update 2026-07-10: assignment walker host-dataclasses regression
+
+Current HEAD added literal self-method dictionary dispatch analysis to
+`assignment_statement_lowering`. Its recursive AST-use walker called
+`dataclasses.is_dataclass()` and `dataclasses.fields()` directly, producing 17
+ON-mode contextual `py_cpy_*` calls. A focused regression reproduced `17 != 0`.
+
+## No.4 Use the existing self-host-safe dataclass field-name protocol
+
+### Code Change
+
+Replace host dataclasses reflection with the convention already used by other
+lowering walkers: `getattr(node, "__dataclass_fields__", None)` followed by
+`fields.keys()` and direct field access.
+
+### CONFIRMED
+
+The focused contextual count is zero after the change. Literal self-method
+dispatch runtime/IR gates pass (`3 passed`). The full fallback gate then moved
+from six assignment-related failures to one distinct legacy scaffold-off
+marshal raw-count failure, tracked separately in
+`fallback-baseline-marshal-raw-ratchet-2026-07-10.md`.

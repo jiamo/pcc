@@ -95,3 +95,23 @@ the `pcc_gc_minor_current` race is green.  This is a production-safety slice,
 not the full Backend #3 production close: OCaml-style copying oldification,
 pointer/reference updating, richer remembered-set behavior, and pcc-Python
 threaded-domain parity remain tracked in `goal.md` No.8.
+
+## Update 2026-07-19: restore thread-local trashcan state after source split
+
+The pcc1 real-pthread explicit-collection stress gate reproduced backend #3
+hangs and `SIGABRT` exits.  The macOS crash report placed the failing worker in
+`py_dealloc_dict`, freeing an invalid payload pointer while other workers were
+parked at GC safepoints.  `py_obj_dealloc.c` had regressed the trashcan depth,
+head, and tail from thread-local state to process-global `static` variables,
+contradicting the ownership fix recorded above.  Concurrent deallocation could
+therefore drain another mutator's pending nodes.
+
+All three C trashcan variables are thread-local again.  A structural regression
+locks that ownership, and the threaded pcc1 file is assigned one xdist group so
+its session archive is built once rather than once per worker.  Focused evidence:
+
+```text
+backend #3 explicit-GC stress, 100 direct runs: 1 passed in 16.97s
+pcc1 threaded five-backend gate + C trashcan neighbors:
+11 passed, 1 opt-in stress skip in 24.44s
+```

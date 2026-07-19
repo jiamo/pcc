@@ -1,0 +1,2214 @@
+version: 2
+source_protocol: docs/goal/goal-prompt.md
+active_milestone: M5
+milestone_order: ["M0", "M1", "M2", "M3", "M4", "M5"]
+tasks:
+  - id: M0-GOAL-CONTROL-PLANE
+    priority: P0
+    status: DONE_STRONG
+    track: governance/execution
+    title: "Make goal selection milestone-aware, dependency-aware, and order-independent"
+    latest_evidence: docs/goal/evidence/2026-07-10-m0-goal-control-plane-and-core-migration.md
+    open_boundary: ""
+    milestone: M0
+    depends_on: []
+    rank: 10
+    exit_criteria:
+      - "Every task has milestone, depends_on, rank, and exit_criteria fields."
+      - "next selects only dependency-ready tasks in the active milestone and never uses YAML position as a tie-breaker."
+      - "Validation rejects unknown dependencies, later-milestone dependencies, and dependency cycles."
+    required_gates:
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate"
+
+  - id: M0-CORE-TASK-MIGRATION
+    priority: P0
+    status: DONE_STRONG
+    track: governance/execution
+    title: "Migrate package, self-backend, GC, value, and virtual-thread milestones into the unique task board"
+    latest_evidence: docs/goal/evidence/2026-07-10-m0-goal-control-plane-and-core-migration.md
+    open_boundary: ""
+    milestone: M0
+    depends_on:
+      - M0-GOAL-CONTROL-PLANE
+    rank: 20
+    exit_criteria:
+      - "B-P0-PKG, S-P0-SELF, V-P1-VAL, G-P0-GC, G-P0-GCPERF, and T-P0-VTHREAD-* have finite executable rows in this board."
+      - "M1-M4 dependencies encode the package-first critical path and M5 holds deferred GPU, distributed, and ds4 breadth."
+      - "Open-ended future variants do not block M0-M4 selection."
+    required_gates:
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py next"
+
+  - id: M0-HEAD-GATE-MANIFEST
+    priority: P0
+    status: DONE_STRONG
+    track: release-evidence
+    title: "Generate a commit-bound machine-readable HEAD truth manifest"
+    latest_evidence: docs/goal/evidence/2026-07-10-head-truth-manifest.md
+    open_boundary: ""
+    milestone: M0
+    depends_on:
+      - M0-CORE-TASK-MIGRATION
+      - M0-HEAD-MARSHAL-RAW-FALLBACK-REGRESSION
+      - M0-HEAD-LLVM-FORMAT-AUTO-IDX-ABI
+    rank: 30
+    exit_criteria:
+      - "One checked schema records commit, platform, backend, gc_backend, links_libpython, pcc2_pcc3_equal, commands, results, duration, and artifact paths."
+      - "A current HEAD run produces the manifest without rewriting authoritative baselines."
+      - "Interrupted or timed-out gates cannot be recorded as passing."
+    required_gates:
+      - "gtimeout 90s env -u LC_ALL uv run pytest -q -n0 tests/test_head_truth_manifest.py"
+      - "gtimeout 1800s env -u LC_ALL uv run python scripts/head_truth_gate.py run --suite all --output build/head-truth/manifest.json --artifacts-root build/head-truth/logs --keep-going"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/head_truth_gate.py validate build/head-truth/manifest.json --require-complete"
+      - "gtimeout 12000s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+
+  - id: M0-HEAD-FALLBACK-RATCHET-REGRESSION
+    priority: P0
+    status: DONE_STRONG
+    track: bootstrap/fallback
+    title: "Restore the current HEAD contextual fallback ratchet before recording truth gates"
+    latest_evidence: docs/goal/evidence/2026-07-10-assignment-contextual-fallback-regression.md
+    open_boundary: ""
+    milestone: M0
+    depends_on:
+      - M0-CORE-TASK-MIGRATION
+    rank: 25
+    exit_criteria:
+      - "assignment_statement_lowering returns to zero ON-mode contextual py_cpy_* calls."
+      - "The fix preserves the literal self-method dispatch behavior that introduced the regression."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_fallback_baseline.py::test_on_mode_assignment_statement_contextual_fallback_zero"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_literal_method_dispatch.py tests/python/test_native_init_field_rhs_type.py::test_class_self_call_argument_types_reach_literal_dispatch_target"
+
+  - id: M0-HEAD-MARSHAL-RAW-FALLBACK-REGRESSION
+    priority: P0
+    status: DONE_STRONG
+    track: bootstrap/fallback
+    title: "Restore the legacy scaffold-off marshal raw per-module fallback ratchet"
+    latest_evidence: docs/goal/evidence/2026-07-10-marshal-raw-fallback-ratchet.md
+    open_boundary: ""
+    milestone: M0
+    depends_on:
+      - M0-HEAD-FALLBACK-RATCHET-REGRESSION
+    rank: 26
+    exit_criteria:
+      - "The focused marshal raw per-module probe is back within the existing 310 +5% ratchet without recapturing the baseline."
+      - "marshal scaffold-on remains zero fallback and marshalling behavior gates remain green."
+      - "The full fallback/no-libpython ratchet is strict green."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_fallback_baseline.py::test_marshal_raw_per_module_fallbacks_stay_under_ratchet"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py"
+
+  - id: M0-HEAD-LLVM-FORMAT-AUTO-IDX-ABI
+    priority: P0
+    status: DONE_STRONG
+    track: bootstrap/python-codegen
+    title: "Repair the boxed-int ABI mismatch in LLVM pcc0-to-pcc1 format lowering"
+    latest_evidence: docs/goal/evidence/2026-07-10-llvm-format-auto-index-abi.md
+    open_boundary: ""
+    milestone: M0
+    depends_on:
+      - M0-HEAD-MARSHAL-RAW-FALLBACK-REGRESSION
+    rank: 27
+    exit_criteria:
+      - "A focused regression rejects boxed-pointer versus i64 mismatches at the structured-format helper boundary."
+      - "Nested format-spec behavior still matches CPython."
+      - "Strict no-libpython LLVM pcc0-to-pcc1 compilation succeeds and links a pcc1 artifact."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_str_format_index.py"
+      - "gtimeout 240s env -u LC_ALL uv run pcc --backend llvm --python-libpython=off --ir-scaffold=on pcc/__main__.py -o build/head-truth/bootstrap-llvm-format-pcc1"
+
+
+  - id: M0-STARTUP-STATE-COMPACTION
+    priority: P0
+    status: DONE_STRONG
+    track: governance/context
+    title: "Replace million-character startup ledgers with generated summary and historical routing"
+    latest_evidence: docs/goal/evidence/2026-07-10-startup-state-compaction.md
+    open_boundary: ""
+    milestone: M0
+    depends_on: []
+    rank: 50
+    exit_criteria:
+      - "Required startup documents contain only protocol, active summary, claim authorities, and route links."
+      - "Historical detail remains preserved in explicitly routed archive documents."
+      - "The active summary is generated from the validated structured board and commit-bound gate manifest."
+    required_gates:
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py render-startup --check docs/current-goal-state.md"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate"
+
+  - id: M0-EXIT
+    priority: P0
+    status: DONE_STRONG
+    track: governance/release-evidence
+    title: "Close M0 and activate the pcc-native package canary milestone"
+    latest_evidence: docs/goal/evidence/2026-07-11-m0-publication-card-removal-and-exit.md
+    open_boundary: ""
+    milestone: M0
+    depends_on:
+      - M0-GOAL-CONTROL-PLANE
+      - M0-CORE-TASK-MIGRATION
+      - M0-HEAD-GATE-MANIFEST
+      - M0-STARTUP-STATE-COMPACTION
+    rank: 60
+    exit_criteria:
+      - "All M0 dependencies are DONE_STRONG and active_milestone is changed to M1."
+      - "goal_state.py next returns AUD-P0-GC-RELOCATION-SLOT-CONTRACT."
+    required_gates:
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py next"
+
+  - id: AUD-P0-CLAUDE-LOW-RISK-FIXES
+    priority: P0
+    status: DONE_STRONG
+    track: governance/runtime/cache/cli
+    title: "Land low-risk directly verifiable Claude audit corrections"
+    latest_evidence: docs/current-goal-state.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/c/test_compile_cache.py tests/python/test_cli_self_backend_vectorize_policy.py tests/python/test_builtin_exception_tags_source.py"
+      - "gtimeout 240s make -B -C pcc/py_runtime libpy_runtime.a"
+
+  - id: AUD-P0-GC-SLOT-VISITOR
+    priority: P0
+    status: DONE_STRONG
+    track: 5-GC/runtime
+    title: "Implement unified py_obj_visit_slots and py_obj_update_slot production contract"
+    latest_evidence: docs/goal/evidence/2026-07-17-gc-slot-visitor-current-source-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/gc_production_contract/test_valueclass_direct_payload_roots.py"
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/gc_production_contract"
+
+  - id: AUD-P0-GC-BARRIER-WRITE-AUDIT
+    priority: P0
+    status: DONE_STRONG
+    track: 5-GC/runtime
+    title: "Exact pointer-slot GC load/store barrier audit"
+    latest_evidence: docs/goal/evidence/2026-07-17-gc-barrier-peripheral-runtime-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_codegen_write_barrier.py"
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_backend4_production.py::test_backend4_list_mutations_load_forwarded_item_slots"
+
+  - id: AUD-P0-RUNTIME-ASSERTS
+    priority: P0
+    status: DONE_STRONG
+    track: runtime/GC safety
+    title: "Add production-safe runtime assertion tripwires"
+    latest_evidence: docs/goal/evidence/2026-07-17-runtime-tripwire-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 240s make -B -C pcc/py_runtime libpy_runtime.a"
+
+  - id: GPU-P0-TVM-TIRX-HOST-DEVICE-SPLIT
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Prove TVM/TIRx host-device split with Metal artifact and host launch boundary"
+    latest_evidence: docs/goal/evidence/2026-07-17-tirx-metal-host-device-split-closure.md
+    latest_update: "Current split, target, artifact, and runtime gates prove the finite host/device boundary; broader pass coverage remains separate work."
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tirx_metal_host_device_split.py tests/kernel/test_target_split.py tests/benchmarks/tile"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_metal_source_runtime.py tests/kernel/test_metal_package.py tests/kernel/test_metal_verify.py"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gpu_metal.py tests/kernel/test_metal_finalize.py tests/kernel/test_metal_package.py tests/kernel/test_metal_metallib_runtime.py"
+
+  - id: GPU-P0-METALLIB-OFFLINE-CHAIN
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Prove offline Metal AIR/metallib artifact chain and metallib-backed launch"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-metallib-offline-chain-closure.md
+    latest_update: "Current finalize/package/runtime gates plus strict pcc1 and GC0..4 consumers prove the finite offline metallib chain end to end."
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gpu_metal.py tests/kernel/test_metal_finalize.py tests/kernel/test_metal_package.py tests/kernel/test_metal_metallib_runtime.py"
+      - "gtimeout 300s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-gpu-level5-pcc1-shim/pcc1 PCC_GPU_HARDWARE_STRICT=1 uv run pytest -q -n0 tests/gpu_hardware/test_metal_dlpack_pcc1.py -rs"
+
+  - id: GPU-P0-METAL-RUNTIME-SOURCE-PACKAGE
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Promote runtime-source Metal command-buffer launch into package/runtime API"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-runtime-source-package-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_metal_source_runtime.py tests/kernel/test_metal_package.py tests/kernel/test_metal_verify.py"
+      - "gtimeout 120s env -u LC_ALL PCC_GPU_HARDWARE_STRICT=1 uv run pytest -q -n0 tests/gpu_hardware/test_metal_claim_levels.py::test_gpu_level4_copy_runtime_source_device_result_or_skip -rs"
+
+  - id: GPU-P0-DLPACK-TENSOR-OWNERSHIP
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Implement tensor/DLPack import ownership and fence-safe lifetime"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-dlpack-tensor-ownership-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_hmm_fence.py tests/kernel/test_metal_tensor.py"
+      - "env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_metal_dlpack_ownership.py"
+
+  - id: GPU-P0-TILELANG-GEMM-RUNTIME-ORACLE
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Run imported TileLang/TIRx GEMM on Metal and compare device output to CPU oracle"
+    latest_evidence: docs/goal/evidence/2026-07-17-tilelang-gemm-runtime-oracle-closure.md
+    latest_update: "Current importer/runtime gates prove the finite TileLang/TIRx GEMM device-vs-CPU-oracle claim; arbitrary future variants are separate work."
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tilelang_import.py tests/kernel/test_metal_tilelang_gemm_runtime.py"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_kernel_cpu_reference.py tests/kernel/test_metal_simdgroup_gemm.py"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_metal_source_runtime.py tests/kernel/test_metal_package.py tests/kernel/test_metal_verify.py"
+
+  - id: GPU-P0-SIMDGROUP-TENSORCORE-GEMM
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Lower simdgroup/tensorcore-style GEMM without weakening scalar fallback semantics"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-simdgroup-lowering-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_kernel_cpu_reference.py tests/kernel/test_metal_simdgroup_gemm.py"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gpu_metal.py tests/kernel/test_metal_finalize.py tests/kernel/test_metal_package.py tests/kernel/test_metal_metallib_runtime.py"
+
+  - id: GPU-P1-BROADER-TILELANG-TIRX-PASSES
+    priority: P1
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Broaden TileLang/TIRx import and pass coverage beyond the first static matmul subset"
+    latest_evidence: docs/goal/evidence/2026-07-17-tilelang-broader-phase1-closure.md
+    latest_update: "Closed the finite broader phase-1 static matmul/import/pass subset after adding fail-closed zero-valued T.fill through real Metal readback. Former arbitrary/unbounded remainder is split into five finite follow-up rows."
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tilelang_import.py tests/kernel/test_tirx_adapter.py tests/kernel/test_tvm_oracle.py tests/kernel/test_tilelang_import_broader.py -rs"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_metal_tilelang_gemm_runtime.py -rs"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_metal_metallib_runtime.py -rs"
+
+  - id: GPU-P1-TILELANG-GENERAL-FILL
+    priority: P1
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Lower finite nonzero TileLang fill values with dtype-correct CPU and Metal semantics"
+    latest_evidence: docs/goal/evidence/2026-07-17-tilelang-general-fill.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P1-BROADER-TILELANG-TIRX-PASSES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tilelang_general_fill.py tests/kernel/test_metal_tilelang_general_fill_runtime.py -rs"
+
+  - id: GPU-P1-TILELANG-EXECUTABLE-LOOP-BODIES
+    priority: P1
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Lower the first executable T.Parallel and T.vectorized elementwise loop bodies"
+    latest_evidence: docs/goal/evidence/2026-07-17-tilelang-executable-loop-bodies.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P1-BROADER-TILELANG-TIRX-PASSES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 420s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tilelang_executable_loop_bodies.py tests/kernel/test_metal_tilelang_executable_loop_runtime.py -rs"
+
+  - id: GPU-P1-TILELANG-SPARSE-METAL-FIRST
+    priority: P1
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Execute the first imported TileLang gemm_sp subset through pcc Metal"
+    latest_evidence: docs/goal/evidence/2026-07-17-tilelang-sparse-metal-first.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P1-BROADER-TILELANG-TIRX-PASSES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tilelang_sparse_metal_runtime.py tests/kernel/test_kernel_cpu_reference.py -rs"
+
+  - id: GPU-P2-TILELANG-DYNAMIC-SHAPE-CONTRACT
+    priority: P2
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Define the first bounded dynamic-shape TileLang import and specialization contract"
+    latest_evidence: docs/goal/evidence/2026-07-17-tilelang-dynamic-shape-contract.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P1-BROADER-TILELANG-TIRX-PASSES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tilelang_dynamic_shape_contract.py -rs"
+
+  - id: GPU-P2-TILELANG-ADVANCED-LAYOUT-LOWERING
+    priority: P2
+    status: DONE_STRONG
+    track: gpu/tvm-tirx
+    title: "Classify and lower the first advanced TileLang layout beyond make_swizzled_layout"
+    latest_evidence: docs/goal/evidence/2026-07-17-tilelang-wgmma-layout-classification.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P1-BROADER-TILELANG-TIRX-PASSES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tilelang_advanced_layout_lowering.py -rs"
+
+  - id: GPU-P0-CANONICAL-KERNEL-IR-PATH
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/kernel-ir
+    title: "Route all GPU frontends through Kernel IR before Metal/TIRx lowering"
+    latest_evidence: docs/goal/evidence/2026-07-17-gpu-canonical-kernel-ir-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_kernel_ir.py tests/kernel/test_tirx_adapter.py tests/kernel/test_tilelang_import.py tests/python/test_gpu_metal.py"
+
+  - id: GPU-P0-HARDWARE-LEVEL-GATES
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/hardware-claims
+    title: "Add GPU_LEVEL hardware gates for Metal primitives and claim hygiene"
+    latest_evidence: docs/goal/evidence/2026-07-17-gpu-level4-gate-closure.md
+    latest_update: "The exact strict Level-4 matrix proves eight real Metal device-result/owner cases and six claim-hygiene cases; Level-5/6, metallib, and DLPack remain independently owned rows instead of bloating this gate."
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL PCC_GPU_HARDWARE_STRICT=1 uv run pytest -q -n0 tests/gpu_hardware/test_metal_claim_levels.py -rs"
+
+  - id: GPU-P0-METAL-PCC1-LAUNCH-REAL
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/hardware-claims
+    title: "Run the Metal launcher path from a pcc1 no-libpython binary"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-pcc1-launch-closure.md
+    latest_update: "A current no-libpython pcc1 compiles and executes the real prebuilt-metallib launcher path with exact readback and native-buffer cleanup."
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-gpu-level5-pcc1-shim/pcc1 PCC_RUN_GPU_PCC1_LAUNCH=1 PCC_REQUIRE_CURRENT_PCC1=1 PCC_GPU_HARDWARE_STRICT=1 uv run pytest -q -n0 tests/gpu_hardware/test_metal_pcc1_launch_real.py::test_level5_pcc1_compiled_program_runs_real_metallib_copy -rs"
+
+  - id: GPU-P0-METAL-5GC-LIFETIME-REAL
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/hardware-claims
+    title: "Prove real Metal buffer/fence lifetime across PCC_GC_BACKEND=0..4"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-five-gc-lifetime-closure.md
+    latest_update: "A current strict pcc1 no-libpython Metal workload re-proves real fence-deferred lifetime under GC0..4; broader lowering variants remain separate feature claims."
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-gpu-level5-pcc1-shim/pcc1 PCC_RUN_GPU_5GC_LIFETIME=1 PCC_GPU_HARDWARE_STRICT=1 uv run pytest -q -n0 tests/gpu_hardware/test_metal_5gc_lifetime_real.py::test_gpu_level6_five_gc_local_tilelang_matmul_static_roller_metallib_lifetime_real_or_skipped -rs"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/gc/test_gpu_external_resource_gc0.py tests/python/gc/test_gpu_external_resource_gc1.py tests/python/gc/test_gpu_external_resource_gc2.py tests/python/gc/test_gpu_external_resource_gc3.py tests/python/gc/test_gpu_external_resource_gc4.py"
+
+  - id: PKG-P0-INSTALL-IMPORT-SEPARATION
+    priority: P0
+    status: DONE_STRONG
+    track: packages/abi-claim
+    title: "Separate pcc1 pip install success from import/native support claims"
+    latest_evidence: docs/goal/evidence/2026-07-08-pkg-install-import-separation.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_install_import_claims.py::test_pcc1_pip_install_pure_py_fixture_records_install_without_import"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_install_import_claims.py::test_pcc1_pip_install_cpython_extension_fixture_records_wheel_tags_without_native_claim"
+      - "manifest/diagnostic records install_success, import_attempted, import_success, abi_mode, install_native_package_claim/native_package_claim, and linkage_native_package_claim separately"
+
+  - id: PKG-P0-ABI-MODE-LABELS
+    priority: P0
+    status: DONE_STRONG
+    track: packages/abi-claim
+    title: "Make every package import result carry cpython-compat vs pcc-native labels"
+    latest_evidence: docs/goal/evidence/2026-07-08-pkg-abi-mode-labels.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_abi_mode_labels.py::test_libpython_auto_cpython_abi_fixture_reports_cpython_compat"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_abi_mode_labels.py::test_libpython_off_cpython_abi_fixture_rejects_with_pcc_pkg_004"
+      - "report/diagnostic includes execution_mode=cpython-compat, measured links_libpython=true when a libpython edge is found, and native_package_claim=false for cpython-compat imports"
+
+  - id: PKG-P0-PCC1-COMPAT-RUNNER
+    priority: P0
+    status: DONE_STRONG
+    track: pcc1/runner
+    title: "Document and gate pcc1 --python-libpython=auto as the compatibility runner"
+    latest_evidence: docs/goal/evidence/2026-07-17-pcc1-cpython-compat-runner-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL PCC_DEBUG_STRICT_NOLIB_STUB=_run_python_module_from_pcc1_with_mode uv run pcc --backend self --python-libpython=off --ir-scaffold=on pcc/__main__.py -o build/bootstrap-compat-runner-pcc1/pcc1"
+      - "gtimeout 120s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-compat-runner-pcc1/pcc1 uv run pytest -q -n0 tests/python/test_pcc1_compat_runner.py"
+      - "pcc1 has no libpython linkage; auto/on manifest reports execution_mode=cpython-compat, allows_libpython_fallback=true, links_libpython=false, native_package_claim=false; off/plain remain strict pcc-native"
+
+  - id: GPU-P0-TILELANG-NATIVE-NAMING-BOUNDARY
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/tilelang-claim
+    title: "Separate upstream tilelang package import from PCC TileLang-source subset"
+    latest_evidence: docs/goal/evidence/2026-07-08-gpu-tilelang-native-naming-boundary.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "docs define tilelang-package-cpython-compat and pcc-tilelang-source-subset as separate labels"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tilelang_import_claim_boundaries.py::test_normal_pcc1_kernel_py_does_not_silently_reinterpret_import_tilelang_as_kernel_ir"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tilelang_import_claim_boundaries.py::test_explicit_kernel_import_mode_required_for_tilelang_source_subset_routing"
+      - "diagnostics reject saying pcc-native import tilelang when only import_tilelang_source/import_tilelang_file was used"
+
+  - id: GPU-P0-OWNER-BACKEND-CONTRACT
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/owner-backends
+    title: "Design first-class optional GPU execution-owner backends under pcc semantic control"
+    latest_evidence: docs/goal/evidence/2026-07-16-gpu-owner-backend-contract.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 90
+    exit_criteria:
+      - "Define semantic ownership separately from execution ownership and keep Kernel IR/TIRx, ABI, buffers, fences, diagnostics, and claims under pcc control."
+      - "Define explicit pcc-metal and tvm-tilelang modes, a common driver boundary, dependency manifests, and a hard no-silent-fallback rule."
+      - "Define finite implementation slices through real device result, pcc1 no-libpython launch, and five-GC lifetime parity."
+    required_gates:
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate"
+      - "docs/design/pcc-gpu-owner-backends.md names requested/actual owner identity, driver operations, manifests, claim labels, delivery slices, and non-goals"
+
+  - id: GPU-P0-PCC-METAL-OWNER-DRIVER
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/owner-backends
+    title: "Refactor the pcc Metal path into the first common execution-owner driver"
+    latest_evidence: docs/goal/evidence/2026-07-17-pcc-metal-owner-driver.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P0-OWNER-BACKEND-CONTRACT
+    rank: 100
+    exit_criteria:
+      - "pcc-metal implements the common validate/compile/package/launch/synchronize/destroy boundary."
+      - "Requested and actual owner identities match, unsupported input fails closed, and tests prove no TVM/TileLang/LLVM/CPU fallback."
+      - "One copy and one GEMM pass Level 4 device result, Level 5 pcc1 no-libpython launch, and Level 6 GC0..4 lifetime gates."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_gpu_owner_backend.py tests/gpu_hardware/test_metal_claim_levels.py -rs"
+      - "pcc1 no-libpython launcher selects pcc-metal explicitly and the same workload passes with PCC_GC_BACKEND=0..4"
+
+  - id: GPU-P0-TVM-TILELANG-OWNER-DRIVER
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/owner-backends
+    title: "Add a pinned pcc-controlled TVM/TileLang optional execution-owner provider"
+    latest_evidence: docs/goal/evidence/2026-07-17-tvm-tilelang-owner-driver.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P0-PCC-METAL-OWNER-DRIVER
+    rank: 110
+    exit_criteria:
+      - "The provider source/version/build and ordered pass pipeline are pinned, inspectable, and recorded with canonical IR and artifact hashes."
+      - "Explicit tvm-tilelang selection produces requested=actual owner evidence and never falls back when unavailable, incompatible, or given unsupported semantics."
+      - "Provider-produced copy and GEMM match CPU and pcc-metal device results, then pass pcc1 no-libpython launcher and GC0..4 lifetime gates with provider-process dependencies disclosed."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_gpu_owner_backend.py tests/kernel/test_tvm_tilelang_owner_provider.py -rs"
+      - "strict hardware gate proves tvm-tilelang owner device result and differential parity with pcc-metal without fallback"
+      - "pcc1 no-libpython launcher selects tvm-tilelang explicitly and the same workload passes with PCC_GC_BACKEND=0..4"
+
+  - id: GPU-P0-DLPACK-EXTERNAL-CAPSULE-INTEROP
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/hmm
+    title: "Extend pcc-owned DLPack-shaped ownership to real external capsule/stream interop"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-dlmanagedtensor-interop-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_metal_dlpack_ownership.py tests/kernel/test_hmm_fence.py"
+
+  - id: GPU-P0-DLPACK-FRAMEWORK-MPS-ROUNDTRIP
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/hmm
+    title: "Round-trip an owned Metal tensor through an external DLPack framework"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-mlx-dlpack-roundtrip-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P0-DLPACK-EXTERNAL-CAPSULE-INTEROP
+      - GPU-P0-HARDWARE-LEVEL-GATES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL PCC_GPU_HARDWARE_STRICT=1 uv run --with mlx pytest -q -n0 tests/gpu_hardware/test_metal_dlpack_framework.py -rs"
+
+  - id: GPU-P0-DLPACK-PCC1-CAPSULE
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/hmm
+    title: "Run the DLPack capsule ownership path from pcc1 no-libpython"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-dlpack-pcc1-capsule-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P0-DLPACK-EXTERNAL-CAPSULE-INTEROP
+      - GPU-P0-METAL-PCC1-LAUNCH-REAL
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-gpu-level5-pcc1-shim/pcc1 PCC_GPU_HARDWARE_STRICT=1 uv run pytest -q -n0 tests/gpu_hardware/test_metal_dlpack_pcc1.py -rs"
+
+  - id: GPU-P0-DLPACK-5GC-DEVICE-LIFETIME
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/hmm
+    title: "Prove DLPack external ownership during real Metal work under GC0..4"
+    latest_evidence: docs/goal/evidence/2026-07-17-metal-dlpack-five-gc-device-lifetime.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P0-DLPACK-PCC1-CAPSULE
+      - GPU-P0-METAL-5GC-LIFETIME-REAL
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-gpu-level5-pcc1-shim/pcc1 PCC_GPU_HARDWARE_STRICT=1 uv run pytest -q -n0 tests/gpu_hardware/test_metal_dlpack_5gc.py -rs"
+
+  - id: GPU-P0-GC-EXTERNAL-RESOURCE-SEAM
+    priority: P0
+    status: DONE_STRONG
+    track: gpu/gc
+    title: "Expose GPU buffers and fences as five-GC-visible external resources"
+    latest_evidence: docs/goal/evidence/2026-07-17-gpu-gc-runtime-external-resource-closure.md
+    latest_update: "One opaque C-kernel registry now owns GPU buffer/fence retain, completion, and exactly-once driver release for GC0..4; C and pcc-Python safepoints/collections consume the same fast-path poll, and device memory stays outside the PyObject graph."
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/gpu_gc"
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/gc/test_gpu_external_resource_gc0.py tests/python/gc/test_gpu_external_resource_gc1.py tests/python/gc/test_gpu_external_resource_gc2.py tests/python/gc/test_gpu_external_resource_gc3.py tests/python/gc/test_gpu_external_resource_gc4.py"
+
+  - id: DIST-P0-LOCAL-COLLECTIVE-ORACLE-CODE
+    priority: P0
+    status: DONE_STRONG
+    track: distributed/runtime
+    title: "Keep pcc.dist local-only session/transport/collective/sharding/KV code aligned with design"
+    latest_evidence: docs/goal/evidence/2026-07-17-dist-local-oracle-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/dist"
+
+  - id: DIST-P0-TCP-TRANSPORT-OWNER
+    priority: P0
+    status: DONE_STRONG
+    track: distributed/runtime
+    title: "Implement an explicit localhost TCP transport owner"
+    latest_evidence: docs/goal/evidence/2026-07-17-dist-tcp-owner-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - DIST-P0-LOCAL-COLLECTIVE-ORACLE-CODE
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/dist/test_tcp_transport_owner.py"
+
+  - id: DIST-P0-TRANSPORT-COLLECTIVE-OWNER
+    priority: P0
+    status: DONE_STRONG
+    track: distributed/runtime
+    title: "Run deterministic collectives through the owned TCP transport"
+    latest_evidence: docs/goal/evidence/2026-07-17-dist-transport-collective-owner-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - DIST-P0-TCP-TRANSPORT-OWNER
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/dist/test_transport_collective_owner.py"
+
+  - id: DIST-P1-MULTI-MAC-TRANSPORT-E2E
+    priority: P1
+    status: BLOCKED
+    track: distributed/runtime
+    title: "Prove the owned transport and collectives across multiple Macs"
+    latest_evidence: docs/goal/evidence/2026-07-17-dist-multi-mac-owner-blocked.md
+    open_boundary: "Authenticated remote admission, explicit two-host/rank configuration, bounded cleanup, and the strict collective gate are implemented and locally covered. DONE_STRONG now requires concurrent passing strict-gate summaries from two reachable physical Macs; this environment has no PCC_DIST cluster inputs or second rank. Localhost success and SKIPPED_WITH_REASON remain non-proof."
+    milestone: M5
+    depends_on:
+      - DIST-P0-TRANSPORT-COLLECTIVE-OWNER
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL PCC_DIST_HARDWARE_STRICT=1 uv run pytest -q -n0 tests/dist/test_multi_mac_transport.py"
+
+  - id: DIST-P1-THROUGHPUT-SCALING
+    priority: P1
+    status: BLOCKED
+    track: distributed/performance
+    title: "Measure transport collective throughput and scaling honestly"
+    latest_evidence: docs/design/pcc-dist-runtime.md
+    open_boundary: "Measurement contract landed 2026-07-18: pcc/dist/perf_contract.py (schema pcc-dist-collective-perf-v1; fixed payload/world vectors; warmup>=3, samples>=10; p50/p95 + ring-allreduce effective bandwidth; localhost-single-host vs multi-mac labels with the multi-mac label FAIL-CLOSED on two distinct passing strict-gate host summaries) + tests/dist/test_collective_performance_contract.py (3 passed: real localhost tcp-ring measurement for 4KiB/64KiB world=2, fail-closed labeling, contract floors). Gates assert shape/labels/consistency, never machine-dependent absolute speeds. Remaining and BLOCKED on DIST-P1-MULTI-MAC-TRANSPORT-E2E: multi-host vectors and any scaling claim — localhost numbers cannot close this row."
+    milestone: M5
+    depends_on:
+      - DIST-P0-TRANSPORT-COLLECTIVE-OWNER
+      - DIST-P1-MULTI-MAC-TRANSPORT-E2E
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/dist/test_collective_performance_contract.py"
+
+  - id: DIST-P1-TRAINING-INFERENCE-EXECUTION
+    priority: P1
+    status: DONE_STRONG
+    track: distributed/runtime
+    title: "Bridge owned collectives to real tensor and KV execution"
+    latest_evidence: docs/goal/evidence/2026-07-17-dist-tensor-kv-execution.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - DIST-P0-TRANSPORT-COLLECTIVE-OWNER
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/dist/test_tensor_kv_execution.py"
+
+  - id: DS4-P0-INVENTORY-ORACLE
+    priority: P1
+    status: DONE_STRONG
+    track: ds4/port
+    title: "Pin ds4 and build PCC migration inventory plus external oracle"
+    latest_evidence: docs/goal/evidence/2026-07-17-ds4-golden-values-capture.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/ds4_oracle/test_ds4_inventory.py"
+
+  - id: DS4-P1-CPU-COMPILE-SUBSET
+    priority: P1
+    status: DONE_STRONG
+    track: ds4/port
+    title: "Compile a ds4 CPU-only subset through pcc and classify gaps"
+    latest_evidence: docs/goal/evidence/2026-07-17-ds4-cpu-compile-subset.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/ds4/test_ds4_cpu_compile_subset.py"
+
+  - id: DS4-P2-GPU-API-MAPPING
+    priority: P1
+    status: DONE_STRONG
+    track: ds4/port
+    title: "Map ds4 GPU tensor and command APIs to pcc HMM/Tensor/Fence concepts"
+    latest_evidence: docs/goal/evidence/2026-07-17-ds4-gpu-api-mapping.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/ds4/test_ds4_gpu_api_mapping.py tests/kernel/test_hmm_fence.py"
+
+  - id: DS4-P3-PRIMITIVE-ORACLE
+    priority: P1
+    status: DONE_STRONG
+    track: ds4/port
+    title: "Migrate the first ds4 primitive through CPU oracle, Kernel IR, Metal source, and real readback"
+    latest_evidence: docs/goal/evidence/2026-07-17-ds4-first-copy-primitive.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 420s env -u LC_ALL uv run pytest -q -n0 tests/ds4/test_ds4_primitive_oracle.py tests/kernel/test_metal_source_runtime.py -rs"
+
+  - id: AUD-P1-BOOTSTRAP-SUBPROCESS-TIMEOUTS
+    priority: P1
+    status: DONE_STRONG
+    track: bootstrap reliability
+    title: "Bound cli_bootstrap subprocess calls with self-host-safe timeout handling"
+    latest_evidence: docs/goal/evidence/2026-07-17-bootstrap-subprocess-timeout-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_subprocess_timeout_runtime.py::test_native_subprocess_timeout_kills_child_process_group"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_cli_bootstrap_observability.py tests/python/test_native_subprocess_check_output.py"
+      - "gtimeout 120s env -u LC_ALL PCC_DEBUG_STRICT_NOLIB_STUB=_bootstrap_subprocess_run uv run pcc --backend self --python-libpython=off --ir-scaffold=on pcc/__main__.py -o build/bootstrap-timeout-pcc1/pcc1"
+      - "gtimeout 30s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-timeout-pcc1/pcc1 uv run pytest -q -n0 tests/python/test_subprocess_timeout_runtime.py::test_pcc1_bootstrap_wrapper_enforces_timeout"
+      - "source/symbol guard: 88 cli_bootstrap calls use the bounded wrapper, one raw call remains inside it, and both runtime archives export exactly one py_subprocess_run_timeout"
+
+  - id: AUD-P1-DIAGNOSTICSPAN-ADOPTION
+    priority: P1
+    status: DONE_STRONG
+    track: diagnostics
+    title: "Adopt DiagnosticSpan in a real diagnostic path"
+    latest_evidence: docs/goal/evidence/2026-07-17-diagnostic-span-codegen-adoption-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/c/test_compile_observability_runtime.py tests/c/test_cli_observability.py tests/python/test_diagnostics_format.py"
+      - "gtimeout 90s env -u LC_ALL uv run pytest -q -n0 tests/python/test_codegen_debug_trace.py -k 'breadcrumb_and_boundary_context or disabled_is_quiet'"
+      - "gtimeout 180s env -u LC_ALL uv run pcc --backend self --python-libpython=off --ir-scaffold=on pcc/__main__.py -o build/bootstrap-diagnostic-span-pcc1/pcc1"
+      - "gtimeout 60s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-diagnostic-span-pcc1/pcc1 uv run pytest -q -n0 tests/python/test_codegen_debug_trace.py::test_codegen_trace_no_host_pcc1_enabled"
+
+  - id: AUD-P1-HOIST-LAYER1-SPLIT
+    priority: P1
+    status: DONE_STRONG
+    track: frontend/codegen maintainability
+    title: "Split hoist lowering and reduce layer1 mixin blast radius"
+    latest_evidence: docs/goal/evidence/2026-07-17-hoist-layer1-split-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/python/test_hoist_module_boundaries.py tests/python/test_py_nested_hoist.py tests/python/test_pcc_codegen_nested_closure.py tests/python/test_py_nested_hoist_comprehension_scope.py tests/python/test_py_nested_func_statement.py tests/python/test_py_frontend_ir_pass_pipeline.py::test_python_ir_pass_pipeline_timeout_is_bounded tests/python/test_py_frontend_ir_pass_pipeline.py::test_python_ir_pass_pipeline_many_timeout_is_bounded"
+      - "gtimeout 420s env -u LC_ALL uv run pytest -q -n0 tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py"
+      - "gtimeout 180s env -u LC_ALL uv run pcc --backend self --python-libpython=off --ir-scaffold=on pcc/__main__.py -o build/bootstrap-hoist-split-pcc1/pcc1"
+      - "gtimeout 300s env -u LC_ALL PCC1_BINARY=build/bootstrap-hoist-split-pcc1/pcc1 uv run pytest -q -n0 tests/python/test_pcc1_python_smoke.py"
+
+  - id: AUD-P1-XFAIL-ORACLE-CLAIM-AUDIT
+    priority: P1
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Make Lua compiler and runtime oracle regressions fail hard"
+    latest_evidence: docs/goal/evidence/2026-07-17-lua-xfail-claim-hygiene.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "source guard proves tests/c/test_lua.py has no dynamic pytest.xfail and preserves explicit prerequisite classification"
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/c/test_lua.py -k 'lua_source_compile or onelua_compile_and_link or (runtime_matches_native and (math or calls)) or self_backend_runtime_matches_native_smoke'"
+
+  - id: AUD-P1-IR-PASS-ORACLE-STRENGTH
+    priority: P1
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Replace IR-pass structural self-oracles with behavior or independent oracles"
+    latest_evidence: docs/goal/evidence/2026-07-17-lower-expect-semantic-oracle.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1001
+    exit_criteria:
+      - "Every selected IR-pass claim is backed by behavior or an independent oracle, and remaining families are separately schedulable."
+    required_gates:
+      - "focused selected-pass behavior/oracle tests plus a source guard rejecting the retired self-oracle shape"
+
+  - id: AUD-P2-IR-PASS-INSTSIMPLIFY-SEMANTIC-ORACLE
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Add an independent behavior oracle for the instsimplify family"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-IR-PASS-ORACLE-STRENGTH
+    rank: 1101
+    exit_criteria:
+      - "The selected instsimplify claims have an independent behavior oracle and explicit host-LLVM mode label."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/c/test_ir_passes_instsimplify_semantic_oracle.py tests/c/test_ir_passes_instsimplify.py -rs"
+
+  - id: AUD-P2-IR-PASS-LOOP-ROTATE-SEMANTIC-ORACLE
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Add an independent behavior oracle for the loop-rotate family"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-IR-PASS-ORACLE-STRENGTH
+    rank: 1102
+    exit_criteria:
+      - "The selected loop-rotate claim has independent behavior evidence and an explicit host-LLVM mode label."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/c/test_ir_passes_loop_rotate_semantic_oracle.py tests/c/test_ir_passes_loop_rotate_real.py -rs"
+
+  - id: AUD-P2-IR-PASS-MEM2REG-SEMANTIC-ORACLE
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Add an independent behavior oracle for the mem2reg family"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-IR-PASS-ORACLE-STRENGTH
+    rank: 1103
+    exit_criteria:
+      - "The selected mem2reg claim has independent behavior evidence and an explicit host-LLVM mode label."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/c/test_ir_passes_mem2reg_semantic_oracle.py tests/c/test_ir_passes_mem2reg_real.py -rs"
+
+  - id: AUD-P2-IR-PASS-INLINE-SEMANTIC-ORACLE
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Add an independent behavior oracle for the inline family"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-IR-PASS-ORACLE-STRENGTH
+    rank: 1104
+    exit_criteria:
+      - "The selected inline claim has independent behavior evidence and an explicit host-LLVM mode label."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/c/test_ir_passes_inline_semantic_oracle.py tests/c/test_ir_passes_inline_real.py -rs"
+
+  - id: AUD-P1-DEPENDENCY-GUARD-CLAIM-AUDIT
+    priority: P1
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Classify dependency guards without turning absence into feature proof"
+    latest_evidence: docs/goal/evidence/2026-07-17-opt-dependency-verdict.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1002
+    exit_criteria:
+      - "Selected dependency guards distinguish unavailable prerequisites from executed feature proof and remaining families are separately schedulable."
+    required_gates:
+      - "focused selected-family tests plus a source/manifest guard for dependency verdict labels"
+
+  - id: AUD-P2-DEPENDENCY-SYSTEM-CC-VERDICT
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Use structured dependency verdicts for a system-C-compiler mirror family"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-DEPENDENCY-GUARD-CLAIM-AUDIT
+    rank: 1201
+    exit_criteria:
+      - "The selected system-cc family separates prerequisite availability from executed parity proof."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/vthread/test_timer_heap_mirror.py tests/test_dependency_verdict.py -rs"
+
+  - id: AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Use structured dependency verdicts for prebuilt runtime-archive probes"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-DEPENDENCY-GUARD-CLAIM-AUDIT
+    rank: 1202
+    exit_criteria:
+      - "The selected archive family distinguishes missing build artifacts from executed runtime proof."
+    required_gates:
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/python/test_runtime_substrate_spike.py -rs"
+
+  - id: AUD-P2-DEPENDENCY-CSMITH-VERDICT
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Use structured dependency verdicts for the optional csmith corpus generator"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-DEPENDENCY-GUARD-CLAIM-AUDIT
+    rank: 1203
+    exit_criteria:
+      - "csmith availability, generated-case execution, and semantic parity are distinct verdict fields."
+    required_gates:
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/c/test_csmith.py -rs"
+
+  - id: AUD-P1-PLATFORM-GUARD-CLAIM-AUDIT
+    priority: P1
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Make platform guards explicit claim boundaries"
+    latest_evidence: docs/goal/evidence/2026-07-17-self-backend-platform-verdict.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1003
+    exit_criteria:
+      - "Selected platform guards emit explicit capability verdicts and do not count unexecuted paths as proof."
+    required_gates:
+      - "focused selected-platform tests plus a source/manifest guard for platform verdict labels"
+
+  - id: AUD-P2-PLATFORM-BOOTSTRAP-BASELINE-VERDICT
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Make macOS-arm64 bootstrap-baseline platform verdicts explicit"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-PLATFORM-GUARD-CLAIM-AUDIT
+    rank: 1301
+    exit_criteria:
+      - "Bootstrap baseline availability and executed baseline proof are distinct machine-readable states."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py -rs"
+
+  - id: AUD-P2-PLATFORM-BINARY-INSPECTION-VERDICT
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Make otool/ldd binary-inspection platform selection explicit"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-PLATFORM-GUARD-CLAIM-AUDIT
+    rank: 1302
+    exit_criteria:
+      - "Inspector selection, inspector execution, and linkage proof are separate verdict fields."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_intent_constraints.py -rs"
+
+  - id: AUD-P2-PLATFORM-POSIX-RUNTIME-VERDICT
+    priority: P2
+    status: DONE_STRONG
+    track: test quality/claim hygiene
+    title: "Make one POSIX-only runtime/process guard explicit"
+    latest_evidence: docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-PLATFORM-GUARD-CLAIM-AUDIT
+    rank: 1303
+    exit_criteria:
+      - "POSIX capability absence cannot count as process-group timeout proof."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_pcc_bootstrap_full.py -k 'process_group' -rs"
+
+  - id: AUD-P1-NUMPY-CAPI-PROVIDER-SPLIT
+    priority: P1
+    status: DONE_STRONG
+    track: package/C-API maintainability
+    title: "Split the reusable NumPy C-API provider into routed implementation shards"
+    latest_evidence: docs/goal/evidence/2026-07-07-numpy-capi-provider-split.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/python/test_pcc_native_extension_loader.py"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_build_exec.py::test_execute_build_actions_builds_reusable_numpy_capi_provider_with_include_dirs"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_build_exec.py::test_pcc1_build_exec_builds_reusable_numpy_capi_provider_without_host_python"
+
+  - id: BUG-P1-PCC1-LINKAGE-SCANNER-FALSE-LIBPYTHON-EDGE
+    priority: P1
+    status: DONE_STRONG
+    track: self-host/package-linkage
+    title: "pcc1-run linkage scanner fabricates a false libpython edge on a clean artifact"
+    latest_evidence: docs/goal/evidence/2026-07-18-bootstrap-critical-runtime-frontend-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_build_exec.py::test_pcc1_build_exec_builds_reusable_numpy_capi_provider_without_host_python"
+      - "gtimeout 700s env -u LC_ALL uv run pytest -q -n0 -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py"
+
+  - id: AUD-P0-GC-RELOCATION-SLOT-CONTRACT
+    priority: P0
+    status: DONE_STRONG
+    track: 5-GC/runtime
+    title: "Make backend-4 relocation consume the single slot visitor/update-slot contract"
+    latest_evidence: docs/goal/evidence/2026-07-11-gc4-relocation-shared-slot-contract.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - M0-EXIT
+    rank: 10
+    exit_criteria:
+      - "backend #4 relocation consumes py_obj_visit_slots/py_obj_update_slot or a mechanically generated equivalent."
+      - "No independent per-type owned-pointer layout switch remains in the C or pcc-Python relocation payload-copy path."
+      - "Focused relocation/valuebox/C-extension tests, the production contract, and all five bootstrap gates pass."
+    required_gates:
+      - "new source guard: backend-4 C `pcc_gc_relocate_copy_payload` and pcc-Python `_relocate_copy_payload` consume `py_obj_visit_slots` / `py_obj_update_slot` or one generated slot table, with no independent per-tag owned-slot layout switches"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_update_referents.py tests/python/test_gc_backend4_production.py tests/python/gc_production_contract"
+      - "gtimeout 900s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+
+  - id: AUD-P1-GC-INDEX-TABLE-SOURCE-OF-TRUTH
+    priority: P1
+    status: DONE_STRONG
+    track: 5-GC/runtime mirror
+    title: "Unify or mechanically verify GC object-to-node index table implementations"
+    latest_evidence: docs/goal/evidence/2026-07-17-gc-index-source-of-truth-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_backend_generational.py::test_gc_indexes_use_open_addressed_slots_and_tombstone_delete tests/python/test_gc_backend_generational.py::test_default_gc_implementations_share_object_node_index_source_of_truth"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_backend_generational.py::test_gc_open_addressed_indexes_preserve_probe_chains_after_delete"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_update_referents.py"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_effectiveness.py::test_cycle_collect_finds_simple_cycles"
+      - "gtimeout 90s env -u LC_ALL uv run pytest -q -n0 tests/python/test_runtime_substrate_spike.py -k 'archive_staleness'"
+      - "gtimeout 180s env -u LC_ALL uv run pcc --backend self --python-libpython=off --ir-scaffold=on pcc/__main__.py -o build/bootstrap-gc-index-pcc1/pcc1"
+      - "gtimeout 60s env -u LC_ALL PCC_HOST_PYTHON=/usr/bin/false PCC_RUNTIME_CC=pcc PCC_RUNTIME_HIGH=py build/bootstrap-gc-index-pcc1/pcc1 /tmp/pcc_runtime_index_prewarm.py -o /tmp/pcc_runtime_index_pcc1.out --backend self --python-libpython=off --ir-scaffold=on"
+      - "gtimeout 900s env -u LC_ALL uv run pytest -q -n0 -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+
+  - id: AUD-P1-RUNTIME-CLASS-LAYOUT-MIRROR
+    priority: P1
+    status: DONE_STRONG
+    track: runtime mirror
+    title: "Generate or verify PyClassObject layout and del_method mirror semantics"
+    latest_evidence: docs/goal/evidence/2026-07-17-runtime-pyclass-layout-mirror.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_update_referents.py tests/python/test_native_class_attr_subclass_override.py"
+      - "source guard proves PyClassObject size/offset constants and del_method behavior are synchronized across C and pcc-Python mirrors"
+
+  - id: AUD-P1-RUNTIME-MIRROR-PARITY
+    priority: P1
+    status: DONE_STRONG
+    track: runtime mirror
+    title: "Align set/dict negative-hash probing across C and pcc-Python mirrors"
+    latest_evidence: docs/goal/evidence/2026-07-17-runtime-set-dict-perturb-parity.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_update_referents.py tests/python/test_native_set_methods.py tests/python/test_native_set_update.py tests/python/test_native_dict_pop.py tests/python/test_native_dict_setdefault_1arg.py"
+      - "parity guard covers C and pcc-Python mirror constants/algorithms for the selected runtime family"
+
+  - id: AUD-P1-C-IR-POSTPROCESS-POLICY
+    priority: P1
+    status: DONE_STRONG
+    track: C codegen/backend policy
+    title: "Move AArch64 branch-protection IR text rewrite out of postprocess_ir_text"
+    latest_evidence: docs/goal/evidence/2026-07-17-c-ir-branch-protection-attribute-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "new source guard: `postprocess_ir_text_with_report` / `postprocess_ir_text` dispatch only the va_arg text rewrite exception; branch-protection is emitted by a target attribute/pass path without IR text surgery"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/c/test_c_branch_protection_policy.py tests/c/test_c_varargs_split.py tests/c/test_varargs.py tests/c/test_llvm_capi_ir_parity.py tests/python/test_cli_self_backend_vectorize_policy.py"
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/c/test_self_backend.py::test_self_backend_aarch64_prologue_helper_covers_arg_spills_and_hidden_sret tests/c/test_self_backend.py::test_self_backend_aarch64_terminator_helpers_cover_epilogue_branch_and_switch"
+
+  - id: AUD-P1-PACKAGE-NO-SPECIAL-CASE-CAMPAIGNS
+    priority: P0
+    status: DONE_STRONG
+    track: packages/governance
+    title: "Replace package-name-specific campaign branches with generic package capability profiles"
+    latest_evidence: docs/goal/evidence/2026-07-11-generic-package-campaign-profile.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - AUD-P1-PACKAGE-MANIFEST-SCHEMA-SOURCE
+    rank: 21
+    exit_criteria:
+      - "The numpy-core-l6 package-name branch is replaced by a generic capability profile consumed by host and pcc1 paths."
+      - "A source guard rejects compiler/runtime/package branches on package names."
+      - "The former campaign behavior remains mode-labeled and passes through the generic profile."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_no_numpy_special_cases.py tests/python/test_package_abi_mode_labels.py tests/python/test_package_install_import_claims.py tests/python/test_package_build_exec.py"
+      - "new source guard: compiler/runtime/package campaign code contains no package-name equality/switch for `numpy-core-l6`; accepted profiles come from a data registry or capability fixture"
+      - "campaign behavior gate: the former numpy-core-l6 scenario still produces the same mode-labeled campaign/report shape through the generic capability profile"
+
+  - id: AUD-P1-PACKAGE-MANIFEST-SCHEMA-SOURCE
+    priority: P0
+    status: DONE_STRONG
+    track: packages/abi-claim
+    title: "Create a single manifest schema and wheel-tag parser for host and pcc1 package paths"
+    latest_evidence: docs/goal/evidence/2026-07-11-package-manifest-schema-source.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - M0-EXIT
+    rank: 20
+    exit_criteria:
+      - "Host and pcc1 consume one manifest schema, wheel/extension tag parser, and capability-profile format."
+      - "Parity tests prove identical mode labels and rejection decisions for the same artifacts."
+      - "The shared representation remains self-host safe and does not add host Python fallback."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_abi_mode_labels.py tests/python/test_package_install_import_claims.py"
+      - "gtimeout 300s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-compat-runner-pcc1/pcc1 uv run pytest -q -n0 tests/python/test_package_abi_mode_labels_pcc1.py tests/python/test_package_install_import_claims_pcc1.py"
+
+  - id: AUD-P1-CLI-ENTRYPOINT-SOURCE-OF-TRUTH
+    priority: P1
+    status: DONE_STRONG
+    track: CLI/bootstrap maintainability
+    title: "Define source-of-truth boundaries for cli_core, cli_bootstrap, and pcc.py entrypoints"
+    latest_evidence: docs/goal/evidence/2026-07-17-cli-entrypoint-contract-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "new source guard: every shared CLI flag has one declarative owner consumed by `pcc/cli_core.py`, `pcc/cli_bootstrap.py`, and `pcc/pcc.py`, or an explicit pcc1/legacy divergence record"
+      - "gtimeout 90s env -u LC_ALL uv run pytest -q -n0 tests/python/test_cli_contract.py tests/python/test_cli.py tests/python/test_cli_launcher.py tests/python/test_cli_bootstrap_observability.py -k 'not pcc1'"
+      - "gtimeout 180s env -u LC_ALL PCC_DEBUG_STRICT_NOLIB_STUB=pcc.cli_contract uv run pcc --backend self --python-libpython=off --ir-scaffold=on pcc/__main__.py -o build/bootstrap-cli-contract-pcc1/pcc1"
+      - "gtimeout 60s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-cli-contract-pcc1/pcc1 uv run pytest -q -n0 tests/python/test_pcc1_compat_runner.py"
+
+  - id: AUD-P1-PY-FRONTEND-LOWERING-CONSOLIDATION
+    priority: P1
+    status: DONE_STRONG
+    track: frontend/codegen maintainability
+    title: "Consolidate duplicated signed-i64 floor-division lowering paths"
+    latest_evidence: docs/goal/evidence/2026-07-17-python-floordiv-lowering-owner.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Regular unboxed and pure low-IR signed-i64 floor division consume one floor-correction owner while retaining their distinct zero-divisor admission contracts."
+      - "Host and current-source pcc1 tests cover exact and negative-result correction through both callers."
+      - "The source guard prevents behavior-bearing sdiv/srem floor correction from returning to either caller."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_subscript_raise.py tests/python/test_native_zero_division.py"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_self_host_oracle_diff.py -k 'pcc1_matches_stage0 and int_ops and not bitwise'"
+      - "gtimeout 120s env -u LC_ALL PCC1_BINARY=<current-source-pcc1> uv run pytest -q -n0 tests/python/test_pcc1_python_smoke.py::test_pcc1_unsafe_i64_floor_division_uses_shared_low_and_guarded_paths"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py"
+
+  - id: AUD-P1-PCC1-DYNAMIC-CLASS-DESCRIPTOR-REGRESSION
+    priority: P1
+    status: DONE_STRONG
+    track: self-host codegen correctness
+    title: "Restore pcc1 binding metadata for runtime-replaced class functions"
+    latest_evidence: docs/goal/evidence/2026-07-17-pcc1-dynamic-class-descriptor-fixed-layout.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "The minimized pcc1 program exposes the underlying function name, binds `__self__` to the instance, remains callable, and leaves class lookup unbound as CPython does."
+      - "Causality identifies the regressed compiled-stage codegen/object-model/runtime boundary instead of adding a test-specific workaround."
+      - "The focused pcc1, pcc2/pcc3, and no-host descriptor cases return to green without weakening descriptor precedence."
+    required_gates:
+      - "gtimeout 360s env -u LC_ALL scripts/bootstrap.sh --from-stage 3 --stage 3 --reuse-stage1 --out-dir <current-source-bootstrap-dir> --backend self"
+      - "gtimeout 180s env -u LC_ALL PCC1_BINARY=<current-source-pcc1> PCC2_BINARY=<current-source-pcc2> PCC3_BINARY=<current-source-pcc3> uv run pytest -q -n0 tests/python/test_self_host_oracle_diff.py -k 'pcc2_hoists_nested_closure_across_try_handler or class_attr_function_descriptor_identity or class_attr_classmethod_bound or dynamic_class_attr_function_instance_bound'"
+      - "gtimeout 330s env -u LC_ALL uv run pytest -q -n0 tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py"
+
+  - id: AUD-P1-PCC1-BARE-RERAISE-ACTIVE-EXCEPTION
+    priority: P1
+    status: DONE_STRONG
+    track: self-host exception correctness
+    title: "Preserve the active exception across compiled bare re-raise"
+    latest_evidence: docs/goal/evidence/2026-07-17-pcc1-bare-reraise-active-exception.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1001
+    exit_criteria:
+      - "A current-source pcc1 artifact re-raises the original exception with CPython-compatible type/message and supports an outer matching handler under no-libpython."
+      - "Nested handlers and cleanup retain the active exception without leaking it after the handler exits."
+      - "The fix is generic exception-state ownership, not a source rewrite or compiler-module special case."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_python_exception_parity.py -k 'bare_raise or reraise'"
+      - "gtimeout 180s env -u LC_ALL PCC1_BINARY=<current-source-pcc1> uv run pytest -q -n0 tests/python/test_self_host_oracle_diff.py -k 'bare_reraise'"
+
+  - id: AUD-P1-PY-SUBSCRIPT-LOWERING-CONSOLIDATION
+    priority: P1
+    status: DONE_STRONG
+    track: frontend/codegen maintainability
+    title: "Consolidate one Python subscript lowering owner"
+    latest_evidence: docs/goal/evidence/2026-07-17-exact-container-getitem-lowering-owner.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1002
+    exit_criteria:
+      - "The selected subscript family has one behavior owner and parity coverage for each former duplicate path."
+      - "Exception type, message, and catchability remain Python-compatible under no-libpython."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_subscript_raise.py"
+      - "source guard proves the selected subscript family no longer has behavior-bearing duplicate lowering blocks"
+
+  - id: AUD-P2-PY-LIST-SUBSCRIPT-STORE-INDEXERROR
+    priority: P2
+    status: DONE_STRONG
+    track: frontend/runtime exception correctness
+    title: "Make user-visible list subscript stores raise catchable IndexError"
+    latest_evidence: docs/goal/evidence/2026-07-18-bootstrap-critical-runtime-frontend-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - AUD-P1-PY-SUBSCRIPT-LOWERING-CONSOLIDATION
+    rank: 1003
+    exit_criteria:
+      - "Valid positive and negative list stores remain correct, while out-of-range stores raise CPython-compatible catchable IndexError under no-libpython."
+      - "Ordinary assignment, unpack-target assignment, augmented assignment, and genuinely dynamic receivers share the raising user-visible contract without changing internal list setters."
+      - "The C runtime and pcc-Python runtime mirror the same public/internal split."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_list_setitem_index_error.py"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_subscript_raise.py tests/python/test_native_list_index_error.py"
+      - "gtimeout 700s env -u LC_ALL uv run pytest -q -n0 -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py"
+
+  - id: AUD-P1-PY-COMPARISON-LOWERING-CONSOLIDATION
+    priority: P1
+    status: DONE_STRONG
+    track: frontend/codegen maintainability
+    title: "Consolidate one Python comparison lowering owner"
+    latest_evidence: docs/goal/evidence/2026-07-17-runtime-object-comparison-owner.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1003
+    exit_criteria:
+      - "The selected comparison family has one behavior owner and every former path agrees with CPython."
+      - "NotImplemented/reverse dispatch and exception behavior remain intact where applicable."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_obj_compare_float.py tests/python/test_native_dyn_str_compare_fastpath.py tests/python/test_py_compare_chains.py"
+      - "source guard proves the selected comparison family no longer has behavior-bearing duplicate lowering blocks"
+
+  - id: AUD-P1-PY-DYNTYPE-OP-LOWERING-CONSOLIDATION
+    priority: P1
+    status: DONE_STRONG
+    track: frontend/codegen maintainability
+    title: "Consolidate one DynType binary-operation lowering owner"
+    latest_evidence: docs/goal/evidence/2026-07-17-dyntype-tagged-binop-owner.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1004
+    exit_criteria:
+      - "The selected DynType operation family has one mechanically checked dispatch/error contract shared by every active path."
+      - "Tagged fast paths, reflected dunder order, NotImplemented, and error propagation retain parity."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_dyn_tagged_int_binop.py tests/python/test_py_dynamic_dunder_binary.py"
+      - "source guard proves the selected DynType operation family no longer has behavior-bearing duplicate dispatch blocks"
+
+  - id: AUD-P1-C-CODEGEN-SOURCE-OF-TRUTH
+    priority: P1
+    status: DONE_STRONG
+    track: C codegen maintainability
+    title: "Remove core declarative libc signatures from the legacy C codegen shadow table"
+    latest_evidence: docs/goal/evidence/2026-07-17-c-libc-core-registry-source-closure.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/c/test_c_libc_registry.py tests/c/test_c_codegen_libc_registry_wire.py tests/c/test_libc.py tests/c/test_libc_extra.py tests/c/test_libc_math.py"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/c/test_float_semantics.py tests/c/test_clang_compat.py"
+      - "source guard proves declarative libc signature names have zero overlap with the legacy codegen table"
+
+  - id: AUD-P1-C-SIGNEDNESS-SOURCE-OF-TRUTH
+    priority: P1
+    status: DONE_STRONG
+    track: C codegen maintainability
+    title: "Consolidate one C signedness and usual-arithmetic-conversion source of truth"
+    latest_evidence: docs/goal/evidence/2026-07-17-c-integer-conversion-owner.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1001
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/c/test_float_semantics.py tests/c/test_clang_compat.py"
+      - "focused source/parity guard proves the selected conversion family has one shared signedness decision"
+
+  - id: AUD-P1-C-ABI-LAYOUT-SOURCE-OF-TRUTH
+    priority: P1
+    status: DONE_STRONG
+    track: C codegen maintainability
+    title: "Consolidate one C sizeof/align ABI layout source of truth"
+    latest_evidence: docs/goal/evidence/2026-07-17-c-scalar-pointer-layout-owner.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1002
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/c/test_clang_compat.py tests/c/test_sizeof.py tests/c/test_struct.py tests/c/test_bitfields.py"
+      - "focused source/parity guard proves the selected layout family has one shared size/alignment decision"
+
+  - id: AUD-P2-DEAD-ROADMAP-MODULE-INVENTORY
+    priority: P2
+    status: CLAIM_RISK
+    track: repository hygiene
+    title: "Classify dead or test-only roadmap modules before deletion or promotion"
+    latest_evidence: docs/goal/evidence/2026-07-09-claude-structural-audit-triage.md
+    open_boundary: "The audit identified dead or test-only modules across effects, Result/ADT helpers, libc extra registries, logging/profile helpers, and roadmap prototypes. No deletion is implied by this row. Each candidate must be classified as production, test-only oracle, docs-only prototype, or removable, with imports and tests proving the classification."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "source inventory lists each candidate module, importer set, test owner, and keep/promote/remove decision"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests"
+
+  - id: PKG-P1-NATIVE-EXTENSION-LADDER
+    priority: P1
+    status: DONE_STRONG
+    track: packages/native-extension
+    title: "Continue the pcc-native extension ABI ladder package by package"
+    latest_evidence: docs/goal/evidence/2026-07-18-native-extension-ladder-done-strong.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "One command-shaped E2E gate proves local-source -> pcc-native build -> site -> pcc1 import for a real package with no libpython edge."
+      - "A second package passes the same generic gate without package-name special-casing."
+      - "Unresolvable bare names keep failing with the documented acquire_hint (never silent, never fake network support)."
+    required_gates:
+      - "selected package builds against PCC Python.h/runtime"
+      - "produced extension has a pcc-native ABI tag"
+      - "PCC-PKG-004 rejects CPython ABI artifacts cleanly in pcc-native mode"
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_import_path.py::test_pip_install_unresolvable_bare_name_gets_acquire_hint tests/python/test_package_import_path.py::test_pip_install_pathlike_spec_failure_gets_no_acquire_hint"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_extension_ladder.py::test_selected_extension_imports_under_python_libpython_off"
+
+  - id: AUD-P2-BUILTIN-EXC-TAG-DEDUP
+    priority: P2
+    status: DONE_STRONG
+    track: frontend metadata
+    title: "Deduplicate builtin exception tag metadata"
+    latest_evidence: docs/current-goal-state.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/test_builtin_exception_tags_source.py"
+
+  - id: M1-PKG-CANARY-SELECTION
+    priority: P0
+    status: DONE_STRONG
+    track: packages/native-extension
+    title: "Select and pin one real source C-extension canary by generic gap cost"
+    latest_evidence: docs/goal/evidence/2026-07-11-m1-real-extension-canary-selection.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - AUD-P1-PACKAGE-MANIFEST-SCHEMA-SOURCE
+      - AUD-P1-PACKAGE-NO-SPECIAL-CASE-CAMPAIGNS
+    rank: 30
+    exit_criteria:
+      - "A 48-hour bounded probe compares real source C-extension candidates by generic missing mechanisms."
+      - "One package version, source URL, and SHA-256 are pinned with a checked gap report."
+      - "The selected canary is not an in-tree fixture and covers PEP 489 or PyType_FromSpec."
+    required_gates:
+      - "checked candidate report names first build, link, module-init, and behavior blockers"
+      - "source guard proves the selected package name does not appear in compiler/runtime dispatch"
+
+  - id: M1-PCC-NATIVE-SOURCE-BUILD
+    priority: P0
+    status: DONE_STRONG
+    track: packages/build-abi
+    title: "Build the pinned canary from source as a pcc-native extension"
+    latest_evidence: docs/goal/evidence/2026-07-11-m1-pcc-native-source-build.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - M1-PKG-CANARY-SELECTION
+    rank: 40
+    exit_criteria:
+      - "pcc1 -m pip install builds the pinned source package with host Python and host pcc disabled."
+      - "The artifact uses a pcc-native extension tag and contains no cpython-* or abi3 claim."
+      - "Linkage inspection and manifest both prove no libpython dependency."
+    required_gates:
+      - "PCC_HOST_PYTHON=/usr/bin/false PCC_HOST_PCC=/usr/bin/false ./pcc1 -m pip install <pinned-source-package> --abi pcc-native --target build/m1-site"
+      - "otool -L or ldd output and linkage manifest prove links_libpython=false and execution_mode=pcc-native"
+
+  - id: M1-PACKAGE-IMPORT-BEHAVIOR
+    priority: P0
+    status: DONE_STRONG
+    track: packages/import-runtime
+    title: "Import the real canary and cross a function plus object/container behavior boundary"
+    latest_evidence: docs/goal/evidence/2026-07-11-m1-simplejson-import-behavior.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - AUD-P0-GC-RELOCATION-SLOT-CONTRACT
+      - M1-PCC-NATIVE-SOURCE-BUILD
+    rank: 50
+    exit_criteria:
+      - "pcc1/self/no-libpython loads the installed extension and completes module init."
+      - "One function call and one object or container boundary match the CPython source-package oracle."
+      - "Initialization and behavior failures have stable mode-labeled diagnostics."
+    required_gates:
+      - "gtimeout 900s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-compat-runner-pcc1/pcc1 PCC_REQUIRE_CURRENT_PCC1=1 PCC_M1_SIMPLEJSON_SITE=build/m1-site/simplejson-4.1.1 uv run pytest -q -n0 tests/python/test_m1_simplejson_import_behavior.py"
+      - "positive gate proves active scanner/decoder/encoder C bindings and exact CPython nested-container behavior parity"
+      - "negative gate locks PCC-PYEXT-IMPORT-001 [pcc-native/no-libpython] for the reduced missing compiled dependency closure"
+
+  - id: S-P0-SELF
+    priority: P0
+    status: DONE_STRONG
+    track: self-backend/package-runtime
+    title: "Keep self-backend a strict execution root for the M1 package closure"
+    latest_evidence: docs/goal/evidence/2026-07-13-s-p0-self-m1-closure.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - M1-PACKAGE-IMPORT-BEHAVIOR
+    rank: 60
+    exit_criteria:
+      - "The M1 app executes with backend=self and python-libpython=off."
+      - "Process and linkage evidence shows no host Python, host pcc, LLVM fallback, or libpython edge."
+      - "Any shared compiler-source change preserves pcc1->pcc2->pcc3 normalized identity."
+    required_gates:
+      - "gtimeout 900s env -u LC_ALL PCC_CURRENT_PCC1=build/bootstrap-compat-runner-pcc1/pcc1 PCC_REQUIRE_CURRENT_PCC1=1 PCC_M1_SIMPLEJSON_SITE=build/m1-site/simplejson-4.1.1 uv run pytest -q -n0 tests/python/test_m1_simplejson_import_behavior.py"
+      - "gtimeout 3000s env -u LC_ALL uv run pytest -q -n0 -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py"
+
+  - id: G-P0-GC
+    priority: P0
+    status: DONE_STRONG
+    track: 5-GC/package-runtime
+    title: "Run the identical M1 pcc-native package artifact under all five GC backends"
+    latest_evidence: docs/goal/evidence/2026-07-14-g-p0-five-gc-real-package-closure.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - AUD-P0-GC-RELOCATION-SLOT-CONTRACT
+      - S-P0-SELF
+    rank: 70
+    exit_criteria:
+      - "The same installed canary artifact and app pass unchanged under PCC_GC_BACKEND=0..4."
+      - "Module teardown and extension-owned resources complete without UAF, stale slot, or leaked-root diagnostics."
+      - "The five-GC production contract and five-backend bootstrap matrix remain green."
+    required_gates:
+      - "M1 real-package integration test runs the same artifact under PCC_GC_BACKEND=0..4"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/gc_production_contract"
+      - "gtimeout 4200s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+
+  - id: B-P0-PKG
+    priority: P0
+    status: DONE_STRONG
+    track: packages/m1-exit
+    title: "Close the real pcc-native extension package vertical canary"
+    latest_evidence: docs/goal/evidence/2026-07-14-b-p0-package-vertical-canary.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - M1-PCC-NATIVE-SOURCE-BUILD
+      - M1-PACKAGE-IMPORT-BEHAVIOR
+      - S-P0-SELF
+      - G-P0-GC
+    rank: 80
+    exit_criteria:
+      - "One pinned real third-party C-extension package installs, imports, runs, and cleans up through pcc1/self/no-libpython."
+      - "The artifact is pcc-native, links no libpython, invokes no host Python/pcc, and passes unchanged under GC0..4."
+      - "No package-name special case exists and a second synthetic extension reuses every new generic mechanism."
+    required_gates:
+      - "complete M1 command chain with PCC_HOST_PYTHON=/usr/bin/false and PCC_HOST_PCC=/usr/bin/false"
+      - "second synthetic extension regression reuses the generic ABI/import mechanism"
+
+  - id: M1-BOOTSTRAP-PERF-REGRESSION
+    priority: P0
+    status: DONE_STRONG
+    track: self-host/performance
+    title: "Restore finite self-bootstrap latency after closure and IR growth"
+    latest_evidence: docs/goal/evidence/2026-07-14-m1-self-bootstrap-perf-regression.md
+    open_boundary: ""
+    milestone: M1
+    depends_on:
+      - S-P0-SELF
+    rank: 75
+    exit_criteria:
+      - "Current-source named IR evidence attributes the growth from the 112-module/84 MB reference to the 146-module/180 MB closure without excluding semantically reachable compiler/runtime modules."
+      - "On the 12-core macOS gate, a fresh single-GC0 pcc1-to-pcc2-to-pcc3 fixed-point run completes within 600 seconds after shared stage1 is available."
+      - "The optimization preserves strict self/no-libpython mode, normalized pcc2/pcc3 identity, fallback ratchets, and package behavior."
+    required_gates:
+      - "commit-bound per-module IR byte and self-emission profile before and after the optimization"
+      - "gtimeout 900s env -u LC_ALL uv run pytest -q -n0 -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py"
+
+  - id: M2-NUMPY-HEAD-GATE
+    priority: P1
+    status: DONE_STRONG
+    track: packages/numpy
+    title: "Rebuild the historical NumPy 137/137 build-loader-PEP489 evidence as a current HEAD gate"
+    latest_evidence: docs/goal/evidence/2026-07-14-m2-numpy-head-gate.md
+    open_boundary: ""
+    milestone: M2
+    depends_on:
+      - B-P0-PKG
+    rank: 10
+    exit_criteria:
+      - "Current HEAD automatically compiles and links the recorded NumPy core extension closure."
+      - "The gate enters PyInit and PEP 489 Py_mod_exec and records the first subsequent blocker."
+      - "All results are attached to the commit-bound gate manifest."
+    required_gates:
+      - "gtimeout 1300s env -u LC_ALL uv run python scripts/head_truth_gate.py run --gate numpy-core-head --output build/head-truth/m2-numpy-manifest.json --artifacts-root build/head-truth/logs"
+
+  - id: M2-NUMPY-PCC-NATIVE-ARTIFACT
+    priority: P1
+    status: DONE_STRONG
+    track: packages/numpy
+    title: "Produce pcc-native _multiarray_umath through the package pipeline"
+    latest_evidence: docs/goal/evidence/2026-07-14-m2-numpy-pcc-native-artifact.md
+    open_boundary: ""
+    milestone: M2
+    depends_on:
+      - M2-NUMPY-HEAD-GATE
+    rank: 20
+    exit_criteria:
+      - "The package pipeline builds _multiarray_umath with PCC headers/runtime and pcc-native tags."
+      - "The produced artifact links no libpython and is accepted by the strict pcc-native loader."
+      - "CPython artifact rejection remains a separate negative gate."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run python scripts/numpy_package_artifact_gate.py --jobs 8 --output build/head-truth/numpy-package/result.json"
+
+  - id: M2-NUMPY-FIRST-BLOCKER-RATCHET
+    priority: P1
+    status: DONE_STRONG
+    track: packages/numpy
+    title: "Ratchet NumPy progress by the first missing module, symbol, or semantic mismatch"
+    latest_evidence: docs/goal/evidence/2026-07-14-m2-numpy-first-blocker-ratchet.md
+    open_boundary: ""
+    milestone: M2
+    depends_on:
+      - M2-NUMPY-HEAD-GATE
+    rank: 30
+    exit_criteria:
+      - "Every NumPy integration run records exactly one first_missing_module, first_missing_symbol, or first_semantic_mismatch."
+      - "Progress promotion requires the recorded first blocker to move forward on the same pinned source and mode."
+      - "Standalone fake provider slot additions cannot satisfy this card."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/test_numpy_first_blocker.py tests/test_numpy_head_gate.py tests/test_head_truth_manifest.py tests/test_head_truth_workflows.py"
+
+  - id: M2-NUMPY-MODULE-GRAPH
+    priority: P1
+    status: DONE_STRONG
+    track: packages/import-runtime
+    title: "Join C-extension imports with pcc-compiled NumPy Python module graph"
+    latest_evidence: docs/goal/evidence/2026-07-14-m2-numpy-module-graph.md
+    open_boundary: ""
+    milestone: M2
+    depends_on:
+      - M2-NUMPY-PCC-NATIVE-ARTIFACT
+      - M2-NUMPY-FIRST-BLOCKER-RATCHET
+    rank: 40
+    exit_criteria:
+      - "C-API module imports and pcc-compiled Python package modules resolve through one module object graph."
+      - "The pinned first blocker advances through numpy.exceptions and required math/sys/time/gc/copy boundaries."
+      - "No package-name dispatch is introduced."
+    required_gates:
+      - "focused mixed native-extension/pcc-Python module graph regression"
+
+  - id: M2-NUMPY-L4
+    priority: P1
+    status: DONE_STRONG
+    track: packages/numpy
+    title: "Run import numpy and print its version in pcc1/self/no-libpython mode"
+    latest_evidence: "docs/goal/evidence/2026-07-16-m2-numpy-l4-frontier.md"
+    open_boundary: ""
+    milestone: M2
+    depends_on:
+      - M2-NUMPY-MODULE-GRAPH
+    rank: 50
+    exit_criteria:
+      - "import numpy as np; print(np.__version__) succeeds through pcc1/self/no-libpython."
+      - "The artifact and process tree contain no libpython or host Python/pcc edge."
+      - "The first-blocker record is empty for the L4 command."
+    required_gates:
+      - "PCC_RUN_NUMPY_L4_INTEGRATION=1 PCC1_BINARY=build/bootstrap/pcc1 env -u LC_ALL uv run pytest -q -n0 -m integration tests/integration/test_numpy_l4_pcc1_gate.py"
+
+  - id: M2-NUMPY-L5
+    priority: P1
+    status: DONE_STRONG
+    track: packages/numpy
+    title: "Run NumPy array construction and scalar addition under all five GC backends"
+    latest_evidence: "docs/goal/evidence/2026-07-16-m2-numpy-l5-frontier.md"
+    open_boundary: ""
+    milestone: M2
+    depends_on:
+      - M2-NUMPY-L4
+    rank: 60
+    exit_criteria:
+      - "np.array([1,2,3]) + 1 produces [2,3,4] through pcc1/self/no-libpython."
+      - "The identical installed artifact and app pass under PCC_GC_BACKEND=0..4."
+      - "No fake-only API slot or cpython-compat execution is counted as L5 success."
+    required_gates:
+      - "PCC_RUN_NUMPY_L5_ARRAY_INTEGRATION=1 PCC1_BINARY=build/bootstrap/pcc1 env -u LC_ALL uv run pytest -q -n0 -m integration tests/integration/test_numpy_l5_pcc1_gate.py"
+
+  - id: M3-GOAL-LEGACY-ENTRY-REMOVAL
+    priority: P0
+    status: DONE_STRONG
+    track: governance/context
+    title: "Remove the legacy codex-specific goal entrypoint and finish canonical routing"
+    latest_evidence: docs/goal/evidence/2026-07-16-goal-legacy-entry-removal.md
+    open_boundary: ""
+    milestone: M3
+    depends_on:
+      - M2-NUMPY-L5
+    rank: 5
+    exit_criteria:
+      - "The root codex-specific goal prompt compatibility file is absent and no active workflow depends on it."
+      - "All maintained protocol, task-board, README, agent, script, and test routing names docs/goal/goal-prompt.md as the canonical protocol."
+      - "Historical archives remain preserved as history while generated startup state matches the validated task board."
+    required_gates:
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py render-startup --check docs/current-goal-state.md"
+
+  - id: V-P1-VAL
+    priority: P1
+    status: DONE_STRONG
+    track: value-model/abi
+    title: "Complete the semantic-int projection and valueclass aggregate ABI needed by M3"
+    latest_evidence: docs/goal/evidence/2026-07-16-v-p1-val-complete.md
+    open_boundary: ""
+    milestone: M3
+    depends_on:
+      - AUD-P0-GC-RELOCATION-SLOT-CONTRACT
+      - M2-NUMPY-L5
+      - M3-FIVE-GC-MATRIX-PERF
+    rank: 10
+    exit_criteria:
+      - "Python int remains arbitrary precision while proven ranges may enter and safely leave a raw machine lane."
+      - "Self backend supports the selected scalar/aggregate valueclass ABI and recursive pointer payloads through the unified slot schema."
+      - "Every identity escape boxes or emits a stable diagnostic."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_value_class_unboxed.py tests/python/data_model/test_value_class_runtime.py"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+
+  - id: M3-FIVE-GC-MATRIX-PERF
+    priority: P0
+    status: DONE_STRONG
+    track: self-host/performance
+    title: "Make the serial five-GC fixed-point matrix finish or resume without weakening evidence"
+    latest_evidence: docs/goal/evidence/2026-07-16-five-gc-resumable-matrix.md
+    open_boundary: ""
+    milestone: M3
+    depends_on:
+      - M2-NUMPY-L5
+    rank: 5
+    exit_criteria:
+      - "An interrupted matrix never records a partial backend as passing and leaves no compiler/pytest children."
+      - "Completed backend evidence is either made cheap enough to rebuild inside 1800 seconds or is reused only through a content-addressed same-source, same-mode, complete-result manifest."
+      - "The exact aggregate gate ends with a five-test pytest summary and preserves no-libpython plus normalized pcc2/pcc3 identity under GC0..4."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/test_gc_bootstrap_xdist_group.py tests/python/test_pcc_bootstrap_full.py -k 'bootstrap_gc or success_manifest'"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+
+  - id: M3-VALUECLASS-ZERO-ALLOC
+    priority: P1
+    status: DONE_STRONG
+    track: value-model/performance
+    title: "Prove one valueclass hot loop with zero heap allocation and correct escape semantics"
+    latest_evidence: docs/goal/evidence/2026-07-16-valueclass-zero-allocation-hot-loop.md
+    open_boundary: ""
+    milestone: M3
+    depends_on:
+      - V-P1-VAL
+    rank: 20
+    exit_criteria:
+      - "The selected hot loop allocates no heap object and contains no ValueBox in its checked IR body."
+      - "The result matches an ordinary Python class oracle."
+      - "An escaping value boxes without changing id/is/weakref/dynamic-attribute semantics."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_value_class_unboxed.py"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/data_model/test_value_class_source_shape.py tests/python/data_model/test_value_class_runtime.py tests/python/test_valueclass_weakref_runtime.py -k 'rejects_identity_escape_operations or rejects_instance_identity_surfaces or identity_diagnostics_do_not_capture_shadowed_builtin_names or boxed_identity_observes_box_identity or dyn_valuebox_weakref_raises_typeerror'"
+
+  - id: M3-TYPED-ARRAY-PROJECTION
+    priority: P1
+    status: DONE_STRONG
+    track: value-model/arrays
+    title: "Make typed arrays consume the same value projection and aggregate ABI"
+    latest_evidence: docs/goal/evidence/2026-07-16-typed-array-value-projection.md
+    open_boundary: ""
+    milestone: M3
+    depends_on:
+      - M3-VALUECLASS-ZERO-ALLOC
+    rank: 30
+    exit_criteria:
+      - "One typed-array kernel consumes the shared value projection with no alternate object representation."
+      - "Overflow, out-of-range, and escape cases take a semantics-preserving slow path."
+      - "LLVM and self backends agree on result and aggregate ABI."
+    required_gates:
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/python/data_model/test_value_array_source_shape.py tests/python/test_type_annotations_optional_dotted.py tests/c/test_self_backend.py::test_self_backend_stackprep_materializes_discarded_indirect_aggregate_call"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_value_array_projection.py"
+
+  - id: M3-C-LIKE-PERFORMANCE
+    priority: P1
+    status: DONE_STRONG
+    track: value-model/performance
+    title: "Close the first honest C-like performance claim with IR and runtime evidence"
+    latest_evidence: docs/goal/evidence/2026-07-16-m3-c-like-value-array-performance.md
+    open_boundary: ""
+    milestone: M3
+    depends_on:
+      - M3-TYPED-ARRAY-PROJECTION
+    rank: 40
+    exit_criteria:
+      - "A pinned workload has allocation-free specialized IR and a measured runtime comparison against CPython and native C."
+      - "The same source has a tested dynamic/overflow/escape slow path preserving Python semantics."
+      - "LLVM and self results are separately mode-labeled and commit-bound."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run python benchmarks/run_value_array_c_like.py --runs 7 --warmups 1 --output /tmp/m3_value_array_c_like.json"
+      - "gtimeout 90s env -u LC_ALL uv run pytest -q -n0 tests/benchmarks/test_value_array_c_like.py"
+
+  - id: T-P0-VTHREAD-NODE-POOL
+    priority: P1
+    status: DONE_STRONG
+    track: virtual-thread/runtime
+    title: "Pool ready, waiter, timer, and IO runtime nodes without changing root ownership"
+    latest_evidence: docs/goal/evidence/2026-07-16-vthread-node-pools.md
+    open_boundary: ""
+    milestone: M4
+    depends_on:
+      - AUD-P0-GC-RELOCATION-SLOT-CONTRACT
+      - G-P0-GC
+    rank: 10
+    exit_criteria:
+      - "Each named runtime node family uses a bounded pool under its existing synchronization contract."
+      - "Scheduler-root handles are registered, updated, and unregistered exactly once under GC0..4."
+      - "Allocation-reuse behavior is measured without claiming 1M readiness."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/gc_production_contract/test_vthread_waiter_node_pool.py tests/python/gc_production_contract/test_vthread_timer_io_node_pool.py"
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/python/test_virtual_thread_ready_entry_pool.py"
+
+  - id: T-P0-VTHREAD-TIMER
+    priority: P1
+    status: DONE_STRONG
+    track: virtual-thread/runtime
+    title: "Integrate the timer heap or timing wheel into the production virtual-thread runtime"
+    latest_evidence: docs/goal/evidence/2026-07-16-vthread-production-timer.md
+    open_boundary: ""
+    milestone: M4
+    depends_on:
+      - T-P0-VTHREAD-NODE-POOL
+    rank: 20
+    exit_criteria:
+      - "The production runtime uses the scalable timer structure for sleep/timeout parking."
+      - "Ordering, cancellation, done-thread skip, and root retention pass under GC0..4."
+      - "The old O(n) sorted insertion path is absent from the production route."
+    required_gates:
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/python/gc_production_contract/test_vthread_timer_cancel.py"
+      - "gtimeout 420s env -u LC_ALL uv run pytest -q -n0 tests/python/test_vthread_timer_heap_scheduler.py"
+
+  - id: T-P0-VTHREAD-KQUEUE
+    priority: P1
+    status: DONE_STRONG
+    track: virtual-thread/runtime
+    title: "Integrate a macOS kqueue waitset with an explicit poll fallback"
+    latest_evidence: docs/goal/evidence/2026-07-16-vthread-production-io-waitset.md
+    open_boundary: ""
+    milestone: M4
+    depends_on:
+      - T-P0-VTHREAD-TIMER
+    rank: 30
+    exit_criteria:
+      - "Darwin runtime IO waits use kqueue for pipe/socket readiness and timeout."
+      - "Non-Darwin or unavailable paths use a tested poll fallback with explicit mode labels."
+      - "Parked continuation roots remain correct under GC0..4."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/gc_production_contract/test_vthread_io_waitset_runtime.py"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_coroutine_roots.py::test_pcc_python_runtime_virtual_thread_scheduler_queues_keep_continuation_roots_across_backends"
+
+  - id: T-P0-VTHREAD-SCALE
+    priority: P1
+    status: DONE_STRONG
+    track: virtual-thread/runtime-effects
+    title: "Connect production scheduler events to runtime-effect and root-lifecycle gates"
+    latest_evidence: docs/goal/evidence/2026-07-16-vthread-production-runtime-effects.md
+    open_boundary: ""
+    milestone: M4
+    depends_on:
+      - T-P0-VTHREAD-KQUEUE
+    rank: 40
+    exit_criteria:
+      - "Park, resume, timer, IO, cancel, and completion emit checked runtime-effect events."
+      - "Every scheduler transition preserves root-handle registration/update/unregistration laws under GC0..4."
+      - "The gate exercises production runtime events rather than only the logical scheduler model."
+    required_gates:
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/python/gc_production_contract/test_vthread_runtime_effect_events.py"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_runtime_effect_category.py tests/python/gc_production_contract/test_vthread_waiter_node_pool.py tests/python/gc_production_contract/test_vthread_timer_cancel.py tests/python/gc_production_contract/test_vthread_io_waitset_runtime.py"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_coroutine_roots.py::test_pcc_python_runtime_virtual_thread_scheduler_queues_keep_continuation_roots_across_backends"
+
+  - id: T-P0-VTHREAD-1M-GATE
+    priority: P1
+    status: DONE_STRONG
+    track: virtual-thread/performance
+    title: "Run the real one-million virtual-thread RSS, latency, and GC-pause gate"
+    latest_evidence: docs/goal/evidence/2026-07-16-vthread-1m-production-runtime.md
+    open_boundary: ""
+    milestone: M4
+    depends_on:
+      - T-P0-VTHREAD-SCALE
+    rank: 50
+    exit_criteria:
+      - "A current-machine production runtime run creates and completes 1M virtual threads."
+      - "The commit-bound result records peak RSS, enqueue/resume/timer/IO latency, throughput, and GC pause for GC0..4."
+      - "Skipped results name an external platform/resource blocker and never count as readiness."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/benchmarks/vthread/test_vthread_real_runtime.py"
+      - "gtimeout 300s env -u LC_ALL PCC_VTHREAD_1M=1 uv run python scripts/run_vthread_1m_gate.py --backend-timeout 120 --output /tmp/pcc-vthread-1m.json"
+
+  - id: G-P1-GC3-PCC-PY-OLDIFY-REGRESSION
+    priority: P1
+    status: DONE_STRONG
+    track: 5-GC/pcc-Python-parity
+    title: "Restore pcc-Python GC3 copy-oldification and forwarding parity"
+    latest_evidence: docs/goal/evidence/2026-07-16-gc3-pcc-py-oldify-parity.md
+    open_boundary: ""
+    milestone: M4
+    depends_on:
+      - T-P0-VTHREAD-1M-GATE
+    rank: 55
+    exit_criteria:
+      - "pcc-Python GC3 minor refill creates a distinct forwarded old copy and rewrites the owning slot."
+      - "Releasing a forwarded source consumes the source reference and retires forwarding state exactly as the C runtime does."
+      - "C and pcc-Python focused oldify/forwarded-source gates pass together without weakening minor-arena ownership."
+    required_gates:
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_backend_generational.py::test_generational_backend_minor_refill_oldifies_copy_for_remembered_child tests/python/test_gc_backend_generational.py::test_generational_backend_release_of_forwarded_source_consumes_source_ref tests/python/test_gc_backend_generational.py::test_generational_backend_pcc_python_runtime_minor_refill_oldifies_copy_for_remembered_child tests/python/test_gc_backend_generational.py::test_generational_backend_pcc_python_runtime_release_of_forwarded_source_consumes_source_ref"
+
+  - id: M0-P0-FIVE-GC-BOOTSTRAP-MATRIX-SCHEDULING
+    priority: P0
+    status: DONE_STRONG
+    track: goal-infrastructure/bootstrap-performance
+    title: "Cut five-GC bootstrap cost with verified object reuse and cache-warm scheduling"
+    latest_evidence: docs/goal/evidence/2026-07-17-five-gc-bootstrap-object-cache-scheduling.md
+    open_boundary: ""
+    milestone: M0
+    depends_on: []
+    rank: 56
+    exit_criteria:
+      - "The five GC items are independently schedulable by xdist while the bootstrap resource lease caps active full chains and per-chain worker budgets."
+      - "A source/target/toolchain/IR-addressed object cache verifies cached-object SHA-256, preserves real frontend execution under every GC, and fails open to native emission on cache miss or corruption."
+      - "GC0 warms a cold cache alone; only after its terminal marker may the remaining collectors run with bounded parallelism."
+      - "Focused scheduler tests prove collection, priority, active-limit, and CPU-budget behavior without compiling a bootstrap chain."
+      - "One current-source five-GC matrix completes with a final pytest summary inside its documented outer watchdog; no semantic gate is skipped or weakened."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_pcc_bootstrap_full.py tests/python/test_py_multi_file_bootstrap_shim.py -k 'parallel_slots or matrix_plan or active_gc or run_order or object_cache'"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+
+  - id: V-P1-NESTED-FUNC-DEFAULT-CACHE-OWNERSHIP-REGRESSION
+    priority: P1
+    status: DONE_STRONG
+    track: value-model/ownership
+    title: "Restore fresh nested-function defaults and release cached payload ownership"
+    latest_evidence: docs/goal/evidence/2026-07-17-nested-function-default-cache-ownership.md
+    open_boundary: ""
+    milestone: M4
+    depends_on:
+      - G-P1-GC3-PCC-PY-OLDIFY-REGRESSION
+    rank: 57
+    exit_criteria:
+      - "A minimized current-source regression proves that each execution of a nested def creates fresh defaults instead of reusing a process-global cached function object."
+      - "Dropping nested-function defaults releases pointer-bearing ValueBox payloads and runs finalizers under GC0..4 without changing generic call-return ownership."
+      - "The fix preserves direct payload roots, strict no-libpython fallback baselines, and the five-backend bootstrap contract."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_python_function_features_parity.py -k 'captured_default or nested_function_defaults_are_fresh_per_def_execution'"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/gc_production_contract/test_valuebox_roots.py tests/python/gc_production_contract/test_valueclass_direct_payload_roots.py"
+      - "gtimeout 420s env -u LC_ALL uv run pytest -q -n0 tests/python/gc_production_contract"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+
+  - id: G-P0-GCPERF
+    priority: P1
+    status: DONE_STRONG
+    track: 5-GC/performance
+    title: "Measure and close one finite long-running five-GC efficiency workload"
+    latest_evidence: docs/goal/evidence/2026-07-17-gc-longrun-five-backend.md
+    open_boundary: ""
+    milestone: M4
+    depends_on:
+      - T-P0-VTHREAD-1M-GATE
+    rank: 60
+    exit_criteria:
+      - "One pinned long-running workload records throughput, peak/steady RSS, pause distribution, and fragmentation for GC0..4."
+      - "Backend #4 retained-page handling has a proven remap/epoch release rule or an explicit bounded-retention result."
+      - "All finalizer, weakref, root, barrier, and bootstrap correctness gates remain green."
+    required_gates:
+      - "commit-bound five-GC long-running benchmark manifest plus production contract and bootstrap matrix"
+
+  - id: AUD-P1-NATIVE-OS-MAKEDIRS
+    priority: P1
+    status: DONE_STRONG
+    track: no-libpython/runtime
+    title: "Add native no-libpython lowering for os.makedirs"
+    latest_evidence: docs/goal/evidence/2026-07-17-native-os-makedirs.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1010
+    exit_criteria:
+      - "os.makedirs(path, exist_ok=True/False) lowers to a native py_os_makedirs call with no py_cpy_* fallback under --python-libpython=off."
+      - "The C runtime helper and its pcc-Python port mirror stay in sync and pass the bootstrap matrix."
+      - "A focused regression compiles and runs os.makedirs in no-libpython mode."
+    required_gates:
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/test_fallback_baseline.py"
+      - "gtimeout 700s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc*.py"
+
+  - id: AUD-P1-SELFHOST-MISCOMPILE-ROOT-FIXES
+    priority: P1
+    status: DONE_STRONG
+    track: self-host codegen correctness
+    title: "Root-fix the pcc1 self-host miscompile family instead of frontend workarounds"
+    latest_evidence: docs/goal/evidence/2026-07-18-selfhost-miscompile-root-fixes.md
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 1020
+    exit_criteria:
+      - "Each self-host miscompile class has a minimal pcc1 reproducer and a root-cause classification (codegen vs object-model vs runtime)."
+      - "At least the DynType-name-discriminator and isinstance-cross-module classes are fixed at the root, with the corresponding frontend workaround removed and the bootstrap still green."
+      - "A first-class SetType (or an equivalent stable set projection) removes the DynType(name='set') fragility."
+    required_gates:
+      - "gtimeout 700s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc*.py"
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/test_pcc1_python_smoke.py"
+
+  - id: M0-P0-RUNTIME-ARCHIVE-INCREMENTAL-REBUILD
+    priority: P0
+    status: DONE_STRONG
+    track: goal-infrastructure/bootstrap-performance
+    title: "Make stale pcc-Python runtime archive repair incremental"
+    latest_evidence: docs/goal/evidence/2026-07-17-runtime-archive-incremental-rebuild.md
+    open_boundary: ""
+    milestone: M0
+    depends_on: []
+    rank: 58
+    exit_criteria:
+      - "Ordinary source/header/helper-list staleness rebuilds only affected runtime objects without make -B."
+      - "Target, compiler, and explicit runtime configuration changes still force a full rebuild."
+      - "A stale archive repairs through pcc1 and a current real five-GC Metal workload links and runs afterward."
+    required_gates:
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/python/test_runtime_substrate_spike.py -k 'archive_staleness or source_staleness'"
+      - "gtimeout 30s env -u LC_ALL PCC_HOST_PYTHON=.venv/bin/python3 build/bootstrap-gpu-level5-pcc1-shim/pcc1 --python-library --emit-llvm=/tmp/pcc1_py_obj_incremental_gate.ll pcc/py_runtime/py/py_obj.py"
+
+  - id: BUG-P0-RUNTIME-ORACLE-ARCHIVE-BUILD
+    priority: P0
+    status: DONE_STRONG
+    track: runtime archive/test infrastructure
+    title: "Restore runtime-oracle archive construction on current source"
+    latest_evidence: docs/goal/evidence/2026-07-18-runtime-oracle-archive-and-large-aggregate-closure.md
+    open_boundary: ""
+    milestone: M0
+    depends_on: []
+    rank: 59
+    exit_criteria:
+      - "The failing archive command is reduced to one deterministic current-source reproducer with its stderr preserved in the investigation."
+      - "The root cause is fixed at the runtime archive/build mechanism and a focused regression prevents recurrence."
+      - "Both cc-vs-pcc and cc-vs-pcc-Python runtime oracle families complete with a final green pytest summary."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/c/test_clang_compat.py::test_fake_stdatomic_header_lowers_c11_operations_to_supported_builtins"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/c/test_clang_compat.py::test_large_struct_assignment_uses_bounded_aggregate_copy_ir tests/c/test_clang_compat.py::test_gcc_atomic_fetch_and_lock_builtins_lower_to_llvm_atomics"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 -m integration 'tests/python/test_py_runtime_pcc_emit.py::test_pcc_emits_object_for_runtime_source[py_re_engine.c]'"
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 'tests/python/test_runtime_oracle_diff.py::test_corpus_cc_vs_pcc_equivalence[class_basics]'"
+      - "gtimeout 240s env -u LC_ALL uv run pytest -q -n0 'tests/python/test_runtime_oracle_diff.py::test_corpus_cc_vs_pcc_py_equivalence[class_basics]'"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/python/test_runtime_oracle_diff.py"
+
+  - id: BUG-P0-GC-EFFECTIVENESS-REGRESSIONS
+    priority: P0
+    status: DONE_STRONG
+    track: 5-GC/object-graph correctness
+    title: "Restore current-source cycle collection and tuple-unpack ownership effectiveness"
+    latest_evidence: docs/goal/evidence/2026-07-18-gc-effectiveness-and-gc3-wrapper-closure.md
+    open_boundary: ""
+    milestone: M0
+    depends_on: []
+    rank: 60
+    exit_criteria:
+      - "Each of the four reported failures has an independent deterministic focused repro and root-cause classification."
+      - "Cycle collection and tuple-unpack cleanup regain the asserted counts/booleans without hiding leaks through baseline changes or skips."
+      - "The complete gc_effectiveness file has a final green summary."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_effectiveness.py::test_cycle_collects_self_referential_list tests/python/test_gc_effectiveness.py::test_tuple_unpack_instance_return_no_growth tests/python/test_gc_effectiveness.py::test_tuple_unpack_dict_self_cycle_reclaims_between_iterations tests/python/test_gc_effectiveness.py::test_closure_cell_cycle_collected"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_effectiveness.py"
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_gc_update_referents.py"
+
+  - id: BUG-P1-GC3-ENV-WRAPPER-INTERRUPT
+    priority: P1
+    status: DONE_STRONG
+    track: 5-GC/test infrastructure
+    title: "Classify GC3 nested frontend-backend test interruption"
+    latest_evidence: docs/goal/evidence/2026-07-18-gc-effectiveness-and-gc3-wrapper-closure.md
+    open_boundary: ""
+    milestone: M0
+    depends_on: []
+    rank: 61
+    exit_criteria:
+      - "Direct and wrapped commands have bounded deterministic outcomes with no surviving child processes."
+      - "If intrinsic, the first hanging runtime boundary is fixed; if external interruption, the wrapper reports that verdict without mislabeling it a GC semantic failure."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL PCC_GC_BACKEND=3 uv run pytest -q -n0 tests/python/test_gc_backend_generational.py::test_generational_backend_pcc_python_runtime_uses_minor_bump_arena"
+      - "gtimeout 420s env -u LC_ALL uv run pytest -q -n0 'tests/python/test_gc_backend_under_env.py::test_gc_backend_subset_under_frontend_backend[frontend=llvm-gc=3]'"
+
+  - id: TEST-P0-FULL-SUITE-BUILD-EFFICIENCY
+    priority: P0
+    status: IN_PROGRESS
+    track: test-infrastructure/performance
+    title: "Eliminate redundant full-runtime builds across the test tree without reducing coverage"
+    latest_evidence: ""
+    open_boundary: "Audit all tests for per-case forced archive rebuilds, large copytree setup, nested whole-file pytest invocations, duplicate parameter dimensions, and xdist oversubscription. Replace redundant identical work with immutable per-worker/session artifacts while retaining every semantic probe and mode boundary; add a regression guard and restore the documented full-suite time class."
+    milestone: M5
+    depends_on: []
+    rank: 990
+    exit_criteria:
+      - "Every test-tree make -B, runtime copytree, nested pytest, and equivalent heavyweight build site is inventoried and either justified or consolidated at the narrowest safe immutable-artifact scope."
+      - "The 127-case GC4 production suite still runs under both llvm and self meta modes, with all probes retained and no stale hand-written runtime object layouts."
+      - "A focused infrastructure regression prevents a per-test forced runtime rebuild pattern from returning."
+      - "The complete non-integration and integration suites finish with final pytest summaries under explicit bounded watchdogs."
+    required_gates:
+      - "gtimeout 150s env -u LC_ALL uv run pytest -q -n0 'tests/python/test_gc_backend_under_env.py::test_gc_backend_subset_under_frontend_backend[frontend=llvm-gc=4]' 'tests/python/test_gc_backend_under_env.py::test_gc_backend_subset_under_frontend_backend[frontend=self-gc=4]'"
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/test_test_infrastructure_efficiency.py"
+      - "gtimeout 900s env -u LC_ALL uv run pytest"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -m integration"

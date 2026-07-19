@@ -26,6 +26,25 @@ tracks the broader list-indexed receiver dispatch class because concurrent GC
 backend #2, scheduler queues, and BOC-style benchmarks all depend on native
 threading methods remaining mutually exclusive through this access pattern.
 
+## Update 2026-06-19 — list-iterated Thread receivers
+The remaining `tests/python/test_intent_constraints.py` xfail
+`threading_thread_start` exposed another list-held native receiver shape:
+
+```python
+ts = [threading.Thread(target=work, args=(i,)) for i in range(3)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+```
+
+The program compiled under strict self/no-libpython but failed at runtime with
+`AttributeError: start`. The older `threads[0].start()` fix did not cover
+loop-target binding from a list of native Thread objects. While gating that fix,
+`tests/python/test_boc_threading_proof.py` exposed the sibling shape
+`threads=[]; th=Thread(...); threads.append(th); for th in threads:
+th.start()`, which failed with the same `AttributeError: start`.
+
 ## Repro
 BOC benchmark gates:
 
@@ -67,7 +86,8 @@ Observed locally on 2026-05-08:
 - No.2 Generalize native threading method dispatch beyond `Name` receivers     [CONFIRMED]
 - No.3 Add focused regression tests for list-indexed Lock and Thread methods     [CONFIRMED]
 - No.4 Re-run BOC ring/cooking and GC threading gates     [CONFIRMED]
-- No.5 Split BOC ring speedup from lock correctness     [pending]
+- No.5 Tune BOC ring speedup workload after correctness fix     [CONFIRMED]
+- No.6 Propagate native Thread element kind through list comprehension, append(name), and for-loop targets     [CONFIRMED]
 
 ## No.1 Confirm BOC and minimal list-indexed repros
 ### Code Change
@@ -175,17 +195,77 @@ env -u LC_ALL /opt/homebrew/bin/timeout 300s \
 
 Result: `1 passed in 15.52s`.
 
-The BOC ring benchmark no longer fails the sum invariant; the pytest node
-still fails on its speedup floor (`serial=0.02s`, `parallel=0.05s`,
-`speedup=0.47x`, floor `2.0x`). That is now a benchmark/performance-threshold
-question, not the original list-indexed Lock correctness bug.
+The BOC ring benchmark no longer fails the sum invariant. A later workload
+tuning pass is recorded in No.5.
 
-## No.5 Split BOC ring speedup from lock correctness
+## No.5 Tune BOC ring speedup workload after correctness fix
 ### Code Change
-Pending. `tests/test_boc_benchmarks.py::test_boc_ring_correctness_and_speedup`
-currently combines a correctness assertion with an aggressive speedup floor.
-After the lock fix, correctness passes and only the speedup floor fails.
-### pending
-Decide whether to split the BOC ring correctness gate from the performance
-gate, tune the workload so the speedup floor is meaningful, or move the
-speedup assertion under the broader performance matrix goal.
+`benchmarks/python/boc_ring.py` and
+`benchmarks/python/boc_ring_serial.py` now keep roughly the same total CPU
+work but use fewer, larger chain steps (`ITERS=20000`,
+`CPU_WORK_ROUNDS=1000`). The previous `100000 * 200` shape spent most of its
+wall-clock in pcc's STW-safe Lock acquire/release protocol on macOS, so the
+ring speedup assertion measured lock handoff overhead more than free-threaded
+execution.
+### CONFIRMED
+Observed:
+
+```bash
+env -u LC_ALL uv run pytest tests/python/test_boc_benchmarks.py -q -n0 -s --maxfail=1
+```
+
+Result: `3 passed`. The ring node reported
+`serial=1.28s parallel=0.40s speedup=3.18x` against the `1.5x` floor.
+
+## No.6 Propagate native Thread element kind through list comprehension, append(name), and for-loop targets
+### Code Change
+The native-threading side-table now recognizes:
+
+- list-comprehension sentinels whose element expression is a native threading
+  constructor or a native threading receiver;
+- `lst.append(th)` when `th` is already known as a native `Thread`/`Lock`/etc.,
+  not only direct `lst.append(Thread(...))`;
+- index-based `for <target> in <list|tuple>` binding, where the loop target
+  inherits `_threading_env_flags` from the element type or the iterable's
+  `_threading_list_elem_flags`.
+
+Added focused regressions in `tests/python/test_threading_module_native.py` for
+both `ts = [Thread(...)] ; for t in ts: t.start()` and
+`threads.append(th); for th in threads: th.start()`. Promoted
+`threading_thread_start` from `GAP_CASES` into the normal intent semantics
+corpus.
+### CONFIRMED
+Observed:
+
+```bash
+env -u LC_ALL uv run pytest \
+  'tests/python/test_threading_module_native.py::test_thread_start_on_for_loop_target_from_thread_list' \
+  'tests/python/test_threading_module_native.py::test_thread_start_on_for_loop_target_from_appended_thread_name' \
+  -q -n0
+```
+
+Result: `2 passed`.
+
+```bash
+env -u LC_ALL uv run pytest \
+  'tests/python/test_intent_constraints.py::TestIntentGaps::test_unmet_obligation[threading_thread_start]' \
+  -q -n0 -m integration --runxfail
+```
+
+Result before promotion: `1 passed`.
+
+```bash
+env -u LC_ALL uv run pytest \
+  'tests/python/test_intent_constraints.py::TestPythonSemanticsDifferential::test_matches_cpython[threading_thread_start]' \
+  -q -n0 -m integration
+```
+
+Result after promotion: `1 passed`.
+
+Broader gates after the fix:
+
+- `tests/python/test_threading_module_native.py` -> `7 passed`;
+- `tests/python/test_boc_threading_proof.py tests/python/test_threading_lock_concurrency.py tests/python/test_python_concurrency_parity.py` -> `10 passed`;
+- fallback/no-libpython baselines -> `18 passed`;
+- `tests/python/gc/test_pcc_bootstrap_full_gc0.py::test_full_three_stage_bootstrap_self_gc0` -> `1 passed`;
+- live xfail audit -> `2 xfailed`, both `run=False` frontiers.

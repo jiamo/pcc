@@ -594,3 +594,46 @@ The comparison verdict now sets `production_virtual_threads=true` for this
 scoped pcc capability and records the remaining limitations separately: no
 Loom-style arbitrary native-stack copying, and no socket/file module-specific
 async wrappers beyond fd poller/file pin diagnostics.
+
+## Update 2026-07-16: production timer heap and Darwin IO waitset
+
+The scheduler's blocking indexes now use their previously landed executable
+specs in production:
+
+- `PccTimerHeap` owns deadline/FIFO ordering and lazy cancellation; stable
+  pooled timer nodes continue to own the registered virtual-thread roots.
+- `PccIoWaitSet` owns live-fd readiness. Darwin/BSD select real kqueue;
+  `PCC_VTHREAD_IO_BACKEND=poll` and platforms without kqueue select one live
+  `poll(2)` call over unique fds. `py_virtual_thread_io_backend()` makes the
+  selected mode explicit.
+- Multiple virtual threads may wait on the same fd. Their interest masks and
+  earliest deadline are aggregated only for the kernel registration; each
+  virtual thread retains its own pooled node, deadline, state, and GC root.
+- Timer/IO expiry transfers one scheduler root to the ready queue. Cancel,
+  complete, start, unpark, or switching wait kinds unregisters stale roots
+  immediately.
+
+Focused production gates cover timer ordering/cancel/root semantics and both
+IO backend modes across GC0..4, including the pcc-Python archive root boundary.
+This does not claim Linux epoll, one-million parked virtual threads, arbitrary
+native-stack suspension, or module-specific async socket/file wrappers.
+
+## Update 2026-07-16: production runtime-effect/root event contract
+
+The scoped production scheduler route now emits a bounded, allocation-free
+event stream at the operations that actually change scheduler visibility and
+root ownership. It covers ready enqueue/start/resume, explicit park/unpark,
+timer and IO park/wake, timer and IO cancellation, completion, and root-handle
+register/unregister for ready, waiter, timer, and IO node families.
+
+`pcc/runtime_effects.py` maps those observed C events into the shared
+`RuntimeEffect` vocabulary and checks the event schema, transition state,
+per-event root delta, nonnegative aggregate root balance, root presence while
+scheduler-visible, and final balance zero. A focused no-libpython C probe runs
+the real path under GC0..4 and verifies that no event was dropped. The
+pcc-Python archive continuation-root gate also remains green, proving the
+cross-translation-unit waiter/root hooks link against the shared scheduler.
+
+This closes the production-event enforcement slice. The trace is a bounded
+diagnostic/gate surface, not an unbounded telemetry store, and it does not
+claim the separate one-million-thread RSS/latency/pause result.

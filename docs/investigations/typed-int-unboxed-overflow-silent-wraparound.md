@@ -311,7 +311,7 @@ documented + captured by the 5 xfail tests.
 
 ## Update 2026-05-31 (d) — conceptual frame: this fix IS Python int's value/object projection (Valhalla projection model, NOT Java int)
 
-The fix is grounded in the value model's projection principle (codex-goal-prompt.md
+The fix is grounded in the value model's projection principle (docs/goal/goal-prompt.md
 V-track "Projection model"): `int` is a SEMANTIC type (arbitrary precision,
 always) with two projections — a VALUE projection (tagged small-int inline fast
 lane) and an OBJECT projection (boxed bignum). Overflow of the value projection
@@ -340,3 +340,333 @@ tagged-int-with-overflow-fast-lane (Proposal No.1) is the value projection;
 overflow-promoting. (The eventual `pcc.i64` explicit machine type is the separate
 home for raw-i64 semantics — a V-track type-system addition, not part of closing
 this bug, but the reason `int` must stop meaning i64.)
+
+## Update 2026-06-11 — DESIGN REVERSAL: the tagged value projection ALREADY EXISTS; the bug is only the unboxed-ABI admission predicate
+
+Source-level audit (2026-06-11, full chain read) found that the "dedicated
+subproject / viral ABI change" framing from Update (c) is obsolete. The
+repository already contains the correct representation; the bug is an
+over-permissive admission gate into an opt-in raw-i64 lane.
+
+### Facts (source-confirmed, with anchors)
+
+1. **Runtime tagged ints already exist** (`pcc/py_runtime/src/py_internal.h:221-236`):
+   `PY_IS_TAGGED_INT(p) = ((uintptr_t)p & 1) == 1` (LSB=1 = small int — the
+   GC-safe OCaml polarity; real pointers stay LSB=0), payload `bits >> 1`
+   (i63: `PY_TAGGED_INT_MIN = INT64_MIN >> 1`). `py_int_core.c` collapses
+   small bignum results back to tagged; `py_type_tag_of` handles tagged words
+   (`py_internal.h:795`). So GC discrimination of scalar-vs-pointer slot words
+   is ALREADY solved for all five backends — tagged ints flow through
+   PyObject* slots today.
+2. **Codegen already emits an inline tagged fast path** for `+ - & | ^` on
+   boxed operands: `_emit_inline_tagged_int_binop_or_call`
+   (`binary_op_lowering.py:912-1071`): both-LSB-tagged check -> `ashr 1`
+   untag -> raw op -> for `+`/`-` a range check against `[-2^62, 2^62-1]` ->
+   retag `(v<<1)|1` -> phi join with the `py_int_*` slow call. No heap
+   allocation on the fast path. `*` is MISSING from the op gate (line 919) —
+   boxed `*` always calls `py_int_mul`.
+3. **The boxed/tagged world is the DEFAULT.** `_should_box_python_ints()`
+   == `not _module_uses_raw_int_scaffold`, and that flag is only ever set
+   False (`layer1_init.py:83`) — so module code defaults to boxed ints with
+   `_box_int_locals=True` per function (`type_abi_lowering.py:136-165`,
+   `user_function_lowering.py:1164`). The boxed default is bignum-correct
+   end-to-end (params, returns, slots, prints).
+4. **The unboxed i64 lane is opt-in per function** via
+   `_funcdef_uses_unboxed_typed_int_abi` (`typed_int_abi.py:269-342`):
+   enabled by `PCC_PYTHON_TYPED_INT_ABI` (default `auto`=on; `off|boxed|0|
+   false`=off — a kill switch already exists, `typed_int_abi.py:68-78`);
+   admission = not async/method/decorated, return in (IntType, FloatType),
+   all params in (Int|Bool|Float|List[int]), plus a call-arg safety pre-pass.
+   Note the admission does NOT consult `_expr_is_native_typed_int_shape` /
+   `_stmt_block_is_native_typed_int_shape` — which is exactly why Update (c)
+   experiment 2 (excluding `*` from the body-shape predicate) had no effect.
+5. **The call-arg safety pre-pass checks the WRONG property.**
+   `_typed_int_expr_is_i64_safe` (`typed_int_abi.py:900-934`) proves "the
+   argument VALUE is representable in i64" (literal fits, safe name, closed
+   under `+ - * // % & | ^ << >>`), not "the callee's COMPUTATION cannot
+   leave i64". `mul(2**40, 2**40)`: both literals fit i64 -> args "safe" ->
+   function admitted to the raw-i64 lane -> `mul i64` wraps. The product
+   2^80 was never representable; the analysis never asks that question.
+
+### Revised design (supersedes the "subproject" framing; cost collapsed)
+
+"Demote to the boxed ABI" IS the i64->tagged-PyObject* representation change,
+done with machinery that already exists and is already the default. Plan:
+
+- **Slice 1 (correctness, small):** restrict `_funcdef_uses_unboxed_typed_int_abi`
+  admission to float-only signatures (FloatType return AND all-FloatType
+  params; Python float IS a machine double, no overflow-to-bignum exists).
+  Int/Bool/List[int] signatures take the default boxed/tagged ABI — the
+  existing bignum-correct value projection. Expected effect: all 5 xfail
+  cases in `tests/python/test_native_typed_int_overflow.py` flip to xpass
+  (remove markers). Optional: accept `PCC_PYTHON_TYPED_INT_ABI=unsafe-i64`
+  as an explicitly-labeled legacy/diagnostic escape that re-admits int
+  signatures (mode-labeled, never default). Keep the predicate body in the
+  same primitive direct-field style (the function's own comment records a
+  pcc1 miscompile of a fancier Optional-sentinel version).
+- **Slice 2 (perf mitigation, contained):** add `*` to
+  `_emit_inline_tagged_int_binop_or_call`: untag both -> `llvm.smul.with.
+  overflow.i64` -> overflow-bit OR out-of-tagged-range -> slow `py_int_mul`;
+  else retag. The self backend already implements this intrinsic
+  (`self_backend_aarch64_darwin_calls.py:1506` ->
+  `emit_smul_overflow_intrinsic_call`); the C frontend already emits it
+  elsewhere, so llvmlite/llvm_capi handle it. NOTE: the x86_64 Linux self
+  backend has NO `with.overflow` emitters yet — Darwin-arm64-only claim.
+- **Slice 3 (gates change SHAPE, not invert):** rewrite the int-function
+  assertions in `tests/python/test_py_typed_int_unboxed.py` (the ~14
+  obligation-7 gates) to the tagged-shape contract: boxed ABI signature +
+  inline `tag.fast`/`tag.add` blocks present + no `py_instance_new` /
+  no allocation on the fast path + slow-path `py_int_*` allowed. Float
+  gates stay as-is (float lane keeps the unboxed double ABI). Add a gate
+  asserting the for/range induction fast path (separate lane,
+  `for_loop_lowering.py` inline induction) still emits raw i64 — bounded
+  counters must not regress.
+- **Risks / measurements:** bootstrap compiles the compiler's own int-typed
+  helpers — demotion costs perf there; measure stage walls vs the current
+  off-mode baseline (5.9/12.8/13.0s) and record the delta here. Mandatory
+  full self bootstrap gate before claiming (AGENTS.md); fallback baselines
+  should be unaffected (no new fallbacks — all-native paths).
+- **Future (T2, separate):** a real interval/range analysis may re-admit
+  proven-bounded int signatures to the raw-i64 lane; the explicit `pcc.i64`
+  machine type (V-track) is the only legal home for wrap semantics.
+
+### External prior-art research
+A deep-research run on tagged-int designs (OCaml i63 / V8 Smi / mypyc tagged
+native int / SBCL fixnum->bignum promotion / CPython tagged-pointer plans,
+overflow-check codegen cost, AOT promotion strategies, check elision) was
+launched as workflow run `wf_06db2ba2-b06` (2026-06-11, this session); attach
+its synthesized report here when it completes. The local design above stands
+on source facts alone; the research is corroboration + cost numbers.
+
+### Status of this update
+Design ready for implementation (Slices 1-3). NO code changed yet in this
+update; the 5 xfail tests still capture the bug. Next session: implement
+Slice 1 behind the focused overflow tests, then Slice 2/3, then full
+bootstrap + record perf deltas.
+
+## Update 2026-06-11 — Slice 1 landed: default int annotations use boxed/tagged ABI
+
+Slice 1 is implemented and gated. The raw-i64 typed-int function ABI is no
+longer the default path for Python `int` annotations.
+
+### Code Change
+
+- `pcc/py_frontend/codegen/typed_int_abi.py` now parses
+  `PCC_PYTHON_TYPED_INT_ABI` into explicit modes: `off`, `auto`, and
+  `unsafe-i64`.
+- In default `auto` mode, `_funcdef_uses_unboxed_typed_int_abi(...)` admits
+  only float-only signatures: `FloatType` return plus all `FloatType`
+  parameters. Python `int`, `bool`, and `list[int]` signatures fall back to
+  the existing boxed/tagged Python-int ABI.
+- `unsafe-i64` preserves the old raw Int/Bool/Float/List[int] ABI as an
+  explicitly mode-labeled legacy/diagnostic escape. The old call-argument
+  i64-safety pre-pass is now consulted only in this unsafe mode, because it
+  proves only argument representability, not result representability.
+- `pcc/py_frontend/pipeline.py` mirrors the same mode and signature rules for
+  closed-world export metadata, avoiding cross-module ABI drift.
+- `tests/python/test_native_typed_int_overflow.py` no longer has xfail markers;
+  the five overflow cases are ordinary regression tests.
+- `tests/python/test_py_typed_int_unboxed.py` now has a default ABI guard that
+  `def add(a: int, b: int) -> int` lowers to a `ptr(ptr, ptr)` boxed/tagged
+  ABI with `py_int_add`, a default pure-float unboxed guard, and explicit
+  `PCC_PYTHON_TYPED_INT_ABI=unsafe-i64` labels for the legacy raw-i64 gates.
+
+### Evidence
+
+Focused red-before-green:
+
+- Before the patch,
+  `env -u LC_ALL uv run pytest tests/python/test_native_typed_int_overflow.py --runxfail -q -n0`
+  failed 5/5, with wrapped outputs such as `0`, `-9223372036854775804`,
+  `7`, `1`, and `68719476736`.
+- After the patch, the same `--runxfail` command passed: 5 passed in 36.01s.
+- After removing xfail markers,
+  `tests/python/test_native_typed_int_overflow.py` passed: 5 passed in 4.53s.
+- Typed-int shape gate:
+  `tests/python/test_py_typed_int_unboxed.py` passed: 16 passed in 4.84s.
+- Focused typed-int batch:
+  `tests/python/test_native_typed_int_overflow.py tests/python/test_py_typed_int_unboxed.py`
+  passed: 21 passed in 8.41s.
+
+Broader touched-path gates:
+
+- Multi-file frontend/bootstrap shim:
+  `tests/python/test_py_multi_file_compile.py tests/python/test_py_multi_file_bootstrap_shim.py`
+  passed: 106 passed in 205.09s.
+- LLVM-C API parity/end-to-end batch:
+  `tests/c/test_llvm_capi_ir_parity.py tests/c/test_llvm_capi_end_to_end.py`
+  passed: 24 passed in 0.24s.
+- Fallback/no-libpython baselines:
+  `tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py`
+  passed: 18 passed in 117.06s.
+- Self-host oracle diff:
+  `tests/python/test_self_host_oracle_diff.py` passed: 397 passed in 635.47s.
+- Bootstrap gate baseline:
+  `tests/python/test_bootstrap_gate_baseline.py` skipped in this environment:
+  4 skipped in 0.19s.
+- Full five-GC three-stage bootstrap matrix:
+  `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py -q -n0 -s`
+  passed: 5 passed in 413.86s; each backend reported pcc2/pcc3
+  byte-identical after signature normalization.
+- Direct off-mode three-stage bootstrap with profile output
+  `/tmp/pcc_int_slice1_boot.g62kbi/profile` passed and verified pcc2/pcc3
+  signature-normalized byte identity. Stage wall / compile wall:
+  stage1 15.2s / 14.1s, stage2 19.9s / 18.9s, stage3 21.2s / 19.9s.
+  Compared with the earlier prompt baseline 5.9s / 12.8s / 13.0s, this run
+  is +9.3s / +7.1s / +8.2s wall. This is recorded as an environment/run
+  measurement, not a performance completion claim.
+- Full GC production contract:
+  `tests/python/gc_production_contract` passed: 130 passed in 26.71s.
+- Hygiene passed: touched-file `py_compile`, `git diff --check`, and touched
+  docs/code trailing-whitespace check.
+
+### Status
+
+Slice 1 is `DONE_WEAK`: it closes the default Python-`int` silent-wrap
+correctness hole by routing annotated `int` functions through the existing
+boxed/tagged ABI. This does not claim Slice 2 tagged `*` fast-path support,
+Slice 3 obligation-gate shape rewrite, interval/range re-admission,
+`pcc.i64`, complete typed-int projection repair, full value-model completion,
+full GC research completion, or total-goal completion.
+
+## Update 2026-06-11 — Slice 2 landed: tagged multiplication fast path
+
+Slice 2 is implemented and gated. Boxed/tagged Python-int multiplication now
+has the same zero-allocation fast-lane shape as the existing tagged `+` / `-`
+paths, while keeping Python bignum semantics through the slow path.
+
+### Code Change
+
+- `pcc/py_frontend/codegen/binary_op_lowering.py` now admits `*` in
+  `_emit_inline_tagged_int_binop_or_call(...)`.
+- For both-tagged operands, the fast block untags both payloads, calls
+  `llvm.smul.with.overflow.i64`, and extracts the `{i64, i1}` result.
+- The result is retagged only when the intrinsic overflow bit is false and the
+  raw product is inside the tagged i63 range `[-2^62, 2^62 - 1]`.
+- Overflow or out-of-tagged-range products branch to the existing
+  `py_int_mul` slow path, so bignum results such as `2**40 * 2**40` remain
+  correct.
+- The overflow-pair extraction uses `[0]` / `[1]` field paths, not bare `0` /
+  `1`, because full self-host oracle testing exposed that pcc1's IR scaffold
+  supports the list-path shape used elsewhere by valueclass payload lowering.
+- `tests/python/test_py_typed_int_unboxed.py` adds a focused IR-shape guard
+  and a strict self-backend/no-libpython runtime guard for small tagged
+  products, tagged-range overflow to bignum, and signed-i64 overflow to bignum.
+
+### Evidence
+
+Focused red-before-green:
+
+- Before the patch,
+  `tests/python/test_py_typed_int_unboxed.py::test_tagged_int_mul_uses_inline_overflow_fast_path -q -n0`
+  failed because boxed/tagged `def mul(a: int, b: int) -> int` went straight
+  to `py_int_mul` with no `int.tag.fast` block and no
+  `llvm.smul.with.overflow.i64`.
+- After the first implementation, full `tests/python/test_self_host_oracle_diff.py`
+  exposed two pcc1 compile failures (`ternary_value` and `typed_args_return`).
+  Focused oracle repros passed after changing the new
+  `builder.extract_value(pair, 0/1, ...)` calls to
+  `builder.extract_value(pair, [0]/[1], ...)`.
+
+Final Slice 2 gates:
+
+- New focused IR/runtime tests:
+  `tests/python/test_py_typed_int_unboxed.py::test_tagged_int_mul_uses_inline_overflow_fast_path`
+  and
+  `tests/python/test_py_typed_int_unboxed.py::test_tagged_int_mul_fast_path_runs_without_libpython`
+  passed: 2 passed in 32.55s.
+- Focused oracle repro after the scaffold fix:
+  `tests/python/test_self_host_oracle_diff.py -q -n0 -k 'ternary_value or typed_args_return'`
+  passed: 2 passed, 395 deselected in 13.52s.
+- Full typed-int shape/runtime file:
+  `tests/python/test_py_typed_int_unboxed.py` passed: 18 passed in 5.74s.
+- Focused typed-int batch:
+  `tests/python/test_native_typed_int_overflow.py tests/python/test_py_typed_int_unboxed.py`
+  passed: 23 passed in 10.07s.
+- Adjacent int arithmetic / binary protocol / dunder dispatch batch:
+  `tests/python/test_python_int_arithmetic_parity.py tests/python/test_py_binary_protocols.py tests/python/test_py_dynamic_dunder_arithmetic.py tests/python/test_py_dynamic_dunder_binary.py tests/python/test_binary_dunder_dispatch_runtime.py`
+  passed: 18 passed, 3 skipped in 11.09s.
+- Self-backend overflow intrinsic guard:
+  `tests/c/test_self_backend.py::test_self_backend_aarch64_call_helpers_cover_umul_overflow_and_assume_intrinsics`
+  passed: 1 passed in 0.24s.
+- Fallback/no-libpython baselines:
+  `tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py`
+  passed: 18 passed in 127.37s.
+- Self-host oracle diff:
+  `tests/python/test_self_host_oracle_diff.py` passed: 397 passed in 647.07s.
+- Full five-GC three-stage bootstrap matrix:
+  `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py -q -n0 -s`
+  passed: 5 passed in 420.55s; GC0, GC1, GC2, GC3, and GC4 each reported
+  pcc2/pcc3 byte-identical.
+- Touched-file `py_compile` passed for the changed Python code and touched
+  Python tests.
+- Hygiene passed: `git diff --check`, touched-file trailing-whitespace search,
+  and residual `pcc`/`pytest`/`bootstrap.sh` process checks were clean.
+
+### Status
+
+Slice 2 is `DONE_WEAK`: it proves tagged multiplication has an inline
+overflow-checked fast path and a Python-semantics-preserving bignum slow path
+under the current Darwin-arm64 self-backend gate. This does not claim Slice 3
+obligation-gate shape rewrite, interval/range re-admission, `pcc.i64`,
+x86_64 Linux self-backend `with.overflow` support, complete typed-int
+projection repair, full value-model completion, full GC research completion,
+or total-goal completion.
+
+## Update 2026-06-12 — Slice 3 landed: obligation gates assert tagged shape
+
+Slice 3 is implemented and gated. The test suite no longer treats default
+annotated Python `int` functions as raw-i64 functions. The old raw-i64 gates
+remain only as explicitly mode-labeled `unsafe-i64` diagnostics.
+
+### Code Change
+
+- `tests/python/test_py_typed_int_unboxed.py` now asserts the default
+  tagged-shape contract for int loops, list-int loops, direct calls, and
+  function-call loops:
+  boxed `ptr` function ABI, `int.tag.fast` / `tag.add` fast blocks, retained
+  `py_int_*` slow paths, no CPython fallback, and no class/valuebox allocation
+  in the checked bodies.
+- The old raw-i64 tests were renamed to `unsafe_i64_*` and explicitly set
+  `PCC_PYTHON_TYPED_INT_ABI=unsafe-i64`, making that lane diagnostic/legacy
+  instead of the default Python-`int` claim.
+- The pure-float gate remains a default unboxed double ABI assertion.
+- A new `for range(n)` induction gate proves the bounded range lane still uses
+  raw `i64` phi/icmp/add under boxed-int mode, while boxing the loop variable
+  back to Python `int` for body semantics.
+
+### Evidence
+
+- Full typed-int shape/runtime file:
+  `tests/python/test_py_typed_int_unboxed.py` passed: 23 passed in 7.09s.
+- Focused typed-int batch:
+  `tests/python/test_native_typed_int_overflow.py tests/python/test_py_typed_int_unboxed.py`
+  passed: 28 passed in 10.51s.
+- Adjacent int arithmetic / binary protocol / dunder dispatch batch:
+  `tests/python/test_python_int_arithmetic_parity.py tests/python/test_py_binary_protocols.py tests/python/test_py_dynamic_dunder_arithmetic.py tests/python/test_py_dynamic_dunder_binary.py tests/python/test_binary_dunder_dispatch_runtime.py`
+  passed: 21 passed in 11.23s.
+- Fallback/no-libpython baselines:
+  `tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py`
+  passed: 18 passed in 122.76s.
+- Self-host oracle diff:
+  `tests/python/test_self_host_oracle_diff.py` passed: 397 passed in 798.96s.
+- Full five-GC three-stage bootstrap matrix:
+  `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py -q -n0 -s`
+  passed: 5 passed in 434.14s; GC0, GC1, GC2, GC3, and GC4 each reported
+  pcc2/pcc3 byte-identical.
+- Full GC production contract:
+  `tests/python/gc_production_contract` passed: 130 passed in 27.79s.
+- Touched-file `py_compile` passed for the changed Python test and relevant
+  typed-int/frontend Python files.
+- Hygiene passed: `git diff --check`, touched-file trailing-whitespace search,
+  and residual `pcc`/`pytest`/`bootstrap.sh` process checks were clean.
+
+### Status
+
+`INT-P0-PROJ` is `DONE_WEAK` as a typed-int silent-wrap/value-projection slice:
+default Python `int` no longer silently wraps through the raw-i64 typed-int
+ABI, tagged multiplication has an overflow-checked fast path, and the tests now
+assert the tagged-shape contract. This does not claim complete typed-int
+projection repair, interval/range re-admission, `pcc.i64`, x86_64 Linux
+self-backend `with.overflow` support, full value-model completion, full GC
+research completion, package ecosystem readiness, or total-goal completion.

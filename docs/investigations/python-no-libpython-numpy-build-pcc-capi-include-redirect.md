@@ -1,7 +1,7 @@
 # Investigation: wire the pcc-native C-API header surface into the real numpy build (pcc-native include redirect)
 
 ## Status
-active
+resolved
 
 ## Problem Description
 The `import numpy` no-libpython (Mode D / pcc-native) end-goal for `B-P0-PKG`
@@ -1470,3 +1470,41 @@ are inert decls/param-names). The no-libpython numpy C-extension BUILD + LOAD +
 multi-phase-exec track (the pcc-owned surface) is COMPLETE, PROVEN, and
 consolidated; the remaining (numpy Python package + array runtime) is the
 multi-month track.
+
+## Update: current-source automated HEAD gate (2026-07-14)
+
+The historical temporary-directory evidence is now a repository-owned gate:
+`scripts/numpy_head_gate.py`. It consumes the pinned NumPy 2.4.4 Meson graph,
+hashes its exact source/scaffold inputs, materializes fresh curated pcc C-API
+headers, and overwrites every object in a gate-owned build directory. It does
+not trust the old NumPy project objects or a stale `/tmp/pcc_capi` directory.
+
+The graph has two deliberately separate counts:
+
+- the recorded non-test `_core` compile surface is 137 actions (113 `.c`, 23
+  `.cpp`, one `.cc`);
+- the actual `_multiarray_umath` link closure is 136 objects. The one extra
+  compile-surface object is the separate `_simd` baseline dispatch action and
+  is not mislabeled as a link dependency.
+
+The first current-Xcode run was a useful red gate: 113/137 passed and all 24
+C++ actions failed for exactly one reason, removal of the stale Meson flag
+`_LIBCPP_ENABLE_ASSERTIONS=1` by current libc++. NumPy's vendored Meson already
+defines the correct AppleClang >=16 migration to
+`_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST`; the replay gate now
+applies that same toolchain normalization. A one-TU substitution (`abort.cc`)
+passed before the full rerun.
+
+Current result: 137/137 fresh compile actions pass; the 136-object pcc-native
+bundle links, exports `PyInit__multiarray_umath`, and depends only on Accelerate,
+libSystem, and libc++ (no libpython). A strict current-source host-pcc,
+self-backend, `--python-libpython=off`, `--ir-scaffold=on` executable loads the
+bundle, enters `PyInit`, enters its PEP 489 `Py_mod_exec`, and records the next
+boundary as `first_missing_module=math`. The gate result is attached to
+`build/head-truth/m2-numpy-manifest.json` through the registered
+`numpy-core-head` manifest card. Focused control-plane coverage is 26 passed.
+
+This resolves this build/header/load/PEP489 investigation. It does not claim
+`import numpy` L4 or array behavior L5; the pcc-native package artifact,
+first-blocker ratchet, Python module graph, and L4/L5 semantics remain separate
+M2 task-board rows.

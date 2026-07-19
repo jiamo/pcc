@@ -573,7 +573,7 @@ Clean stage1 result under bounded policy:
 
 Follow-up:
 
-- Track large multi-module IR-pass performance separately as `P-P1-IRPASS` in `codex-goal-prompt.md`.
+- Track large multi-module IR-pass performance separately as `P-P1-IRPASS` in `docs/goal/task-board.yaml`.
 - `PCC_PYTHON_IR_PASSES=off` is not a solution to IR-pass slowness; it is only a bounded bootstrap performance gate policy.
 
 ## 2026-05-24 IR-pass timeout guard

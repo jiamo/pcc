@@ -65,7 +65,7 @@ A direct rerun with fresh `build/bootstrap-pytest-self/pcc1` and the installed t
 
 ### Code Change
 
-Update `tests/python/test_package_import_path.py::test_pcc1_real_numpy_first_import_boundary_opt_in` so a non-zero compile must match the current strict no-libpython public fallback boundary rather than the superseded `NoneType` marshal blocker. Update `docs/current-goal-state.md` and `codex-goal-prompt.md` so the active blocker points at the current fallback surface.
+Update `tests/python/test_package_import_path.py::test_pcc1_real_numpy_first_import_boundary_opt_in` so a non-zero compile must match the current strict no-libpython public fallback boundary rather than the superseded `NoneType` marshal blocker. Update `docs/current-goal-state.md` and `docs/goal/task-board.yaml` so the active blocker points at the current fallback surface.
 
 ### CONFIRMED
 

@@ -398,7 +398,19 @@ So `/tmp` is useful only for a small target CodeGen test sample, not for the
 full LLVM implementation.
 
 For AArch64/X86 target-specific pass design, the useful source snapshot was
-downloaded separately:
+originally downloaded separately under `/tmp`. That historical `/tmp` path is
+no longer durable on this machine; do not use it as the active reference path.
+
+Current durable reference:
+
+```text
+~/pcc_refs/llvm-project-20.1.8-full-depth1
+tag: llvmorg-20.1.8
+commit: 87f0227cb60147a26a1eeb4fb06e3b505e9c7261
+checkout mode: full depth-1 clone
+```
+
+Historical path recorded by the original investigation:
 
 ```text
 /tmp/llvm-project-20.1.8-targets
@@ -406,7 +418,7 @@ tag: llvmorg-20.1.8
 commit: 87f0227cb60147a26a1eeb4fb06e3b505e9c7261
 ```
 
-Sparse checkout contents:
+Historical sparse checkout contents:
 
 ```text
 llvm/lib/Target/AArch64

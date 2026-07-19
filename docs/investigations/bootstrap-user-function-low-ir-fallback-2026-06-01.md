@@ -330,7 +330,7 @@ arms are `SubclassOf(T)` or `None`; until that exists, recursive bootstrap
 helpers that feed native field reads should carry explicit return annotations.
 
 The broader process improvement is now written into `AGENTS.md` and
-`codex-goal-prompt.md`: a long-green bootstrap regression starts with a
+`docs/goal/goal-prompt.md`: a long-green bootstrap regression starts with a
 causality audit of recent changes, separates stacked failures, and forbids
 weakening GC/runtime semantics to get a green stage.
 
