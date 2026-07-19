@@ -14,7 +14,8 @@ RING_SIZE = 16
 GROUP_SIZE = 2
 STRIDE = 1
 N_CHAINS = 4
-ITERS = 100000
+ITERS = 20000
+CPU_WORK_ROUNDS = 1000
 
 
 def cpu_work(rounds: int) -> int:
@@ -27,7 +28,7 @@ def cpu_work(rounds: int) -> int:
 
 
 def chain_step_serial(vals: list, head: int) -> int:
-    _ = cpu_work(200)
+    _ = cpu_work(CPU_WORK_ROUNDS)
     vals[head] = vals[head] + 1
     return (head + STRIDE) % RING_SIZE
 

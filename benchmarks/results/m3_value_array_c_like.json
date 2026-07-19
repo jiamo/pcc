@@ -1,0 +1,200 @@
+{
+  "allocation_probe": {
+    "hot_loop_alloc_object_delta": 0,
+    "mode": "self/no-libpython",
+    "observations": {
+      "0": {
+        "alloc_object_count": 89,
+        "type_tag_histogram": {
+          "10": 7,
+          "104": 1,
+          "12": 2,
+          "3": 4,
+          "4": 10,
+          "6": 1,
+          "7": 56,
+          "9": 8
+        }
+      },
+      "1000": {
+        "alloc_object_count": 89,
+        "type_tag_histogram": {
+          "10": 7,
+          "104": 1,
+          "12": 2,
+          "3": 4,
+          "4": 10,
+          "6": 1,
+          "7": 56,
+          "9": 8
+        }
+      }
+    },
+    "rounds": [
+      0,
+      1000
+    ]
+  },
+  "claim": {
+    "boundary": "One fixed pcc.array[Sample,2] kernel uses an allocation-free specialized hot path with Python semantic slow paths retained.",
+    "does_not_claim": [
+      "arbitrary dynamic Python is C-speed",
+      "compile or process startup is allocation-free",
+      "long-running GC pause, RSS, or fragmentation performance",
+      "LLVM and self have equal throughput"
+    ],
+    "measured_policy": {
+      "llvm_no_libpython_ratio_vs_cpython_max": 0.2,
+      "llvm_no_libpython_ratio_vs_native_c_max": 2.0,
+      "self_no_libpython": "result required and reported separately; no C-like ratio threshold claimed"
+    },
+    "name": "fixed value-array float recurrence"
+  },
+  "compile_commands": {
+    "llvm": [
+      "pcc",
+      "--backend",
+      "llvm",
+      "--python-libpython=off",
+      "--ir-scaffold=on"
+    ],
+    "native_c": [
+      "clang",
+      "-O3",
+      "-std=c11"
+    ],
+    "self": [
+      "pcc",
+      "--backend",
+      "self",
+      "--python-libpython=off",
+      "--ir-scaffold=on"
+    ]
+  },
+  "correctness": {
+    "host_llvm_self_exact_match": true,
+    "native_c_hot_checksum_match": true,
+    "python_stdout": "-1.325\n0.25\nindex-error\noverflow-error\nTrue\n",
+    "slow_path_lines": [
+      "0.25",
+      "index-error",
+      "overflow-error",
+      "True"
+    ]
+  },
+  "environment": {
+    "c_compiler": "Homebrew clang version 20.1.8",
+    "machine": "arm64",
+    "python": "3.13.2",
+    "release": "25.5.0",
+    "system": "Darwin"
+  },
+  "generated_at": "2026-07-19T05:54:52.237680+00:00",
+  "ir_shape": {
+    "direct_aggregate_abi": true,
+    "function_signature": "define double @user_value_array_c_like_hot({ { double, double }, { double, double } } %values, ptr %rounds) {",
+    "hot_ir_sha256": "d66d89f4d02e3f4793fa989276a57489e3a83897d07cc9740411aae9fc8c34da",
+    "instruction_counts": {
+      "extractvalue": 54,
+      "fadd": 16,
+      "fmul": 16,
+      "fsub": 16
+    },
+    "object_allocation_calls": [],
+    "slow_path_python_int_add_retained": true
+  },
+  "modes": {
+    "cpython_host": {
+      "command": [
+        "python",
+        "benchmarks/python/scenarios/value_array_c_like.py"
+      ],
+      "label": "CPython-host",
+      "links_libpython": "host-runtime",
+      "median_ns": 754878250,
+      "samples_ns": [
+        748000208,
+        754878250,
+        761155667,
+        756710875,
+        748093042,
+        758258125,
+        753063917
+      ]
+    },
+    "llvm_no_libpython": {
+      "command": [
+        "value_array_c_like_llvm"
+      ],
+      "label": "LLVM/no-libpython",
+      "links_libpython": false,
+      "median_ns": 59398584,
+      "ratio_vs_cpython": 0.07868631001091898,
+      "ratio_vs_native_c": 1.5799229037760127,
+      "samples_ns": [
+        59056000,
+        59251958,
+        59831542,
+        59398584,
+        59691000,
+        58676250,
+        59680458
+      ]
+    },
+    "native_c": {
+      "command": [
+        "value_array_c_like_c"
+      ],
+      "label": "native-C/clang-O3",
+      "links_libpython": false,
+      "median_ns": 37595875,
+      "samples_ns": [
+        37759750,
+        37160667,
+        37595875,
+        38392084,
+        37730709,
+        37438209,
+        36888458
+      ]
+    },
+    "self_no_libpython": {
+      "command": [
+        "value_array_c_like_self"
+      ],
+      "label": "self/no-libpython",
+      "links_libpython": false,
+      "median_ns": 283220083,
+      "ratio_vs_cpython": 0.3751864396675888,
+      "ratio_vs_native_c": 7.533275472375626,
+      "samples_ns": [
+        282534000,
+        283220083,
+        283215500,
+        282802208,
+        512851084,
+        283502125,
+        284394667
+      ]
+    }
+  },
+  "schema": "pcc.m3_c_like.value_array.v1",
+  "source_identity": {
+    "binding": "base commit plus exact content and emitted-IR hashes",
+    "frontend_ir_sha256": "a42d50acf682a1df8121cef54d702266b4393ea159a9508977f2b1f44f137c52",
+    "native_c_path": "benchmarks/c/value_array_c_like.c",
+    "native_c_sha256": "e8d3272cd43918430e662790b01298d06667f175794bf4bda191d470e46c1945",
+    "python_path": "benchmarks/python/scenarios/value_array_c_like.py",
+    "python_sha256": "a8381993e75531358fe8e169328c8dc4889dbf4d060a0e36cc6f5ac3144b3e92",
+    "repository_base_commit": "27eabf2ab716f11030ec2d206de8f28c965bab76",
+    "worktree_dirty": true
+  },
+  "workload": {
+    "checksum": -1.325,
+    "native_c_checksum": -1.325,
+    "recurrences_per_round": 16,
+    "rounds": 1000000,
+    "runtime_samples": 7,
+    "warmups": 1
+  }
+}

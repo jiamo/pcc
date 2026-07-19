@@ -35,11 +35,11 @@ RING_SIZE = 16
 GROUP_SIZE = 2
 STRIDE = 1
 N_CHAINS = 4
-# ITERS * cpu_work_rounds per chain dominates wall time; previous tuning
-# (50000 * 20) finished in ~10ms total and was swamped by thread spawn
-# overhead, hiding parallelism. Bumped so a 4-thread run amortizes
-# spawn cost.
-ITERS = 100000
+# Keep total CPU work high enough to prove real parallel execution, but do not
+# make lock handoff the benchmark's dominant signal. The older 100000 * 200
+# shape spent most wall-clock in pcc's STW-safe Lock protocol on macOS.
+ITERS = 20000
+CPU_WORK_ROUNDS = 1000
 
 
 def cpu_work(rounds: int) -> int:
@@ -62,7 +62,7 @@ def chain_step(locks: list[Lock], vals: list, head: int) -> int:
         second = a
     locks[first].acquire()
     locks[second].acquire()
-    _ = cpu_work(200)
+    _ = cpu_work(CPU_WORK_ROUNDS)
     vals[a] = vals[a] + 1
     locks[second].release()
     locks[first].release()
