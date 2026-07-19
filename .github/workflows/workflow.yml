@@ -5,8 +5,12 @@ on:
     types: [published]
 
 jobs:
+  head-truth:
+    uses: ./.github/workflows/head-truth-heavy.yml
+
   pypi-publish:
     name: Upload release to PyPI
+    needs: head-truth
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

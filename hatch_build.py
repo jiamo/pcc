@@ -64,6 +64,16 @@ class CustomBuildHook(BuildHookInterface):
 
         backend = os.environ.get("PCC_BUILD_BACKEND", "self")
 
+        # Cross-arch guard: `make` trusts mtimes only, so an archive
+        # built on another platform/arch (e.g. a host Darwin archive
+        # leaking into a Linux container through a bind mount) looks
+        # "fresh" and gets linked — GNU ld then silently skips the
+        # wrong-arch members and every runtime symbol goes undefined.
+        # The lazy pipeline path already stamps archives with a target
+        # id; honour the same stamp here and force a rebuild on
+        # mismatch. (docs/investigations/linux-x86-64-docker-harness-rot.md No.5)
+        self._discard_wrong_target_archives(runtime_dir)
+
         # ---- 1. runtime archive (soft-fail: lazy path can rebuild) ----
         ok = self._run_make(runtime_dir, target, backend)
         if not ok and backend != "llvm":
@@ -73,6 +83,7 @@ class CustomBuildHook(BuildHookInterface):
             )
             ok = self._run_make(runtime_dir, target, "llvm")
         if ok and archive.is_file():
+            self._write_archive_target_stamp(archive)
             rel = f"pcc/py_runtime/{target}"
             build_data.setdefault("force_include", {})[str(archive)] = rel
             self.app.display_info(f"bundled runtime archive: {rel}")
@@ -104,6 +115,79 @@ class CustomBuildHook(BuildHookInterface):
         build_data["pure_python"] = False
         build_data["infer_tag"] = True
         self.app.display_info("bundled native pcc1 binary at .data/scripts/pcc1")
+
+    def _archive_target_id(self) -> str:
+        """Mirror pipeline._runtime_archive_target_id (kept import-free:
+        pulling pcc.py_frontend.pipeline into the build hook would drag
+        llvmlite into hatchling's isolated env). The two MUST stay
+        format-identical or hook-built and lazily-built archives would
+        invalidate each other."""
+        import platform
+
+        cc = str(os.environ.get("CC", "") or "").strip() or "cc"
+        try:
+            triple = str(
+                subprocess.check_output([cc, "-dumpmachine"], text=True).strip()
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            if sys.platform == "darwin":
+                machine = platform.machine().lower()
+                if machine == "aarch64":
+                    machine = "arm64"
+                triple = f"{machine}-apple-darwin{platform.release()}"
+            elif sys.platform.startswith("linux"):
+                machine = platform.machine().lower()
+                if machine in ("amd64", "x64"):
+                    machine = "x86_64"
+                triple = f"{machine}-unknown-linux-gnu"
+            else:
+                triple = "unknown-unknown-unknown"
+        machine = platform.machine().lower()
+        if machine in ("amd64", "x64"):
+            machine = "x86_64"
+        return f"{sys.platform}:{machine}:{triple}"
+
+    def _discard_wrong_target_archives(self, runtime_dir: Path) -> None:
+        import shutil
+
+        want = self._archive_target_id()
+        mismatched = False
+        for archive in runtime_dir.glob("libpy_runtime*.a"):
+            stamp = Path(str(archive) + ".target")
+            have = ""
+            try:
+                have = stamp.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+            if have == want:
+                continue
+            mismatched = True
+            self.app.display_info(
+                f"discarding {archive.name}: target stamp "
+                f"{have or '<missing>'} != {want}"
+            )
+            try:
+                archive.unlink()
+            except OSError:
+                pass
+            try:
+                stamp.unlink()
+            except OSError:
+                pass
+        if mismatched:
+            # `make` would otherwise re-link the archive from the
+            # wrong-arch .o files it sees as up to date (the lazy
+            # pipeline path uses `make -B` for the same reason).
+            for objdir in ("build", "build_pcc", "build_py", "build_libpython"):
+                shutil.rmtree(runtime_dir / objdir, ignore_errors=True)
+
+    def _write_archive_target_stamp(self, archive: Path) -> None:
+        try:
+            Path(str(archive) + ".target").write_text(
+                self._archive_target_id() + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
 
     def _run_make(
         self, runtime_dir: Path, target: str, backend: str,

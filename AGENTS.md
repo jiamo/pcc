@@ -4,15 +4,23 @@ This file is for humans and AI agents working in this repository.
 
 ## Read Next
 
-Startup route for active goal work:
+Startup route for active goal work and direct human task intake:
 
 1. Read this file first for repository rules and safety constraints.
-2. Read `codex-goal-prompt.md` for the current goal contract and work protocol.
+2. Read `docs/goal/goal-prompt.md` for the single goal contract and work
+   protocol.
 3. Read `docs/current-goal-state.md` for the current audit state and the
    investigation/doc routing that should be read next.
-4. Use `docs/investigations/INDEX.md` to find relevant prior investigations
+4. Inspect `docs/goal/task-board.yaml` through `scripts/goal_state.py next` before
+   choosing active goal work. This structured task board is the source for
+   migrated rows and new actionable tasks; `DONE_WEAK` is still unfinished.
+   This applies to directly launched agents too, not only Codex `/goal` or
+   Claude loop sessions. If the startup prompt or current conversation contains
+   a new actionable task, normalize it into `docs/goal/task-board.yaml` and
+   validate the board before selecting active work.
+5. Use `docs/investigations/INDEX.md` to find relevant prior investigations
    before opening or continuing a non-trivial bug.
-5. **Task-conditional, required — not optional reference.** The moment the task
+6. **Task-conditional, required — not optional reference.** The moment the task
    becomes *debugging a failure*, read and follow
    [`docs/debugging-playbook.md`](docs/debugging-playbook.md) before guessing.
    The moment you *open or continue an investigation*, read and follow
@@ -20,13 +28,60 @@ Startup route for active goal work:
    These two were split out of this file to stay under the context budget;
    the split lowered their resident-in-context cost, **not** their authority.
 
+## Goal Task Board
+
+`docs/goal/task-board.yaml` is the structured execution queue for migrated and
+new actionable goal tasks. Use it even when the agent was launched directly
+instead of through a `/goal` or loop command. `docs/goal/goal-prompt.md` is the
+only protocol and claim-hygiene authority; task rows themselves should be
+agent-neutral and should not mention Codex, Claude, or any specific runner.
+
+For active goal work:
+
+```bash
+env -u LC_ALL uv run python scripts/goal_state.py next
+env -u LC_ALL uv run python scripts/goal_state.py validate
+```
+
+Add new actionable work as a task row in `docs/goal/task-board.yaml`, with a
+priority, status, track, title, open boundary, and required gate commands. Add
+one small evidence file under `docs/goal/evidence/` for each completed slice,
+then update that task row's `latest_evidence`, `status`, and
+`open_boundary`. Promote to `DONE_STRONG` only when the listed gates prove the
+full claim and the open boundary is empty.
+
+New-task ingestion rule: when a human asks to "add a P0/P1 task", "package this
+into the task board", or describes a new actionable goal, put it in
+`docs/goal/task-board.yaml` immediately instead of leaving it only in chat,
+`docs/goal/goal-prompt.md`, or `docs/current-goal-state.md`. Once the row exists,
+every directly launched agent, Claude loop, or Codex `/goal` run must see it
+through `scripts/goal_state.py next`; no extra `/goal` prompt or loop-specific
+bootstrap is required for the task to become eligible. Use
+`docs/goal/goal-prompt.md` only for protocol and long-form guardrails, not as
+the place where new executable tasks live. This is an `AGENTS.md` startup rule, so
+the user should not need to copy `docs/goal/goal-prompt.md` into each new agent
+session just to make newly added tasks visible.
+
+Direct human-task intake is part of startup state, not a separate loop mode. If
+the current conversation or startup prompt contains a new actionable task,
+normalize it into `docs/goal/task-board.yaml` first, run
+`env -u LC_ALL uv run python scripts/goal_state.py validate`, and then let the
+normal priority order choose it. Do not wait for a `/goal` command, cron loop,
+or agent-specific bootstrap before recording the task.
+
+If the human gives the task as ordinary prose, first normalize it into a
+task-board row with an agent-neutral id, priority, status, track, title,
+claim boundary, open boundary, and required gates. Example intent such as "add
+a P0 task: fix GPU TVM/TIRx host/device split" is already sufficient input; do
+not wait for a separate `/goal` command before recording it.
+
 ## Project Intent (north star — read before changing direction)
 
 > This section is the top-level design contract. It exists to keep autonomous
 > work aligned: when a change would trade away one of the obligations below for
 > a local win — a faster benchmark, a greener gate, a smaller diff, a passing
 > bootstrap by rewrite — **stop and surface the tradeoff instead of taking it
-> silently.** This section is the *why*; `codex-goal-prompt.md` is the *how*
+> silently.** This section is the *why*; `docs/goal/goal-prompt.md` is the *how*
 > (tracks, gates, claim hygiene, prohibitions). If you find yourself weakening
 > Python semantics, mislabeling a mode, or special-casing a package to make
 > progress, you are off the north star — re-read this section.
@@ -65,7 +120,7 @@ pcc2      -> pcc3     stable pcc2/pcc3 == a self-hosted fixed point
 ```
 
 **Seven obligations.** Each is operationalized by a track + gates in
-`codex-goal-prompt.md`; the one-line form here is the guardrail, and the
+`docs/goal/goal-prompt.md`; the one-line form here is the guardrail, and the
 parenthetical is where it is actually enforced:
 
 ```text
@@ -73,7 +128,7 @@ parenthetical is where it is actually enforced:
      host pcc != pcc1   |   cpython-compat != pcc-native
      libpython != no-libpython   |   LLVM-backed != self-backed
      stage1 != pcc1->pcc2->pcc3 fixed point
-   (codex-goal-prompt §0.10 claim hygiene, §9.2 mode boundaries)
+   (`docs/goal/goal-prompt.md` §0.10 claim hygiene, §9.2 mode boundaries)
 
 2. Performance must be proven. C-like claims require IR-shape evidence + runtime
    benchmark + a slow path that preserves Python semantics when assumptions fail.
@@ -128,6 +183,26 @@ Python-authored compiler self-hosts into a no-libpython fixed point while
 exposing a disciplined runtime laboratory") reinforce each other. **Every claim
 must say exactly what it proves and what it does not prove.**
 
+**Accelerator execution is an extension of the ownership thesis, not a sixth
+mission — and not the overclaim it is easy to make.** The repo already contains
+a real GPU/Metal thread (`pcc/kernel_ir/`, `pcc/gpu_gc/`, `pcc/dist/`) that the
+five pillars above did not name; this paragraph gives it an honest home so the
+intent stops lagging the code. It belongs to the same "ownable execution"
+thesis: the target is **native accelerator execution ownership** — a
+host/device-split kernel IR, no-libpython device launch, and GC-aware external
+resource lifetime — with **TVM/TIRx and TileLang used as oracles/reference
+shapes, never as runtime owners** (the same relationship the value model has to
+Valhalla and the self-backend has to LLVM). What is actually proven today is
+narrow and must be stated at its claim level (`pcc/kernel_ir/gpu_claims.py`
+levels 0-6): a real Metal kernel-IR path with on-device result proofs for small
+fixed-shape kernels, **local-machine and hardware-gated**. What is **not**
+provided: whole-program GPU, executing `import tvm` / `import tilelang`
+(only a fail-closed parser of a TileLang-*shaped* DSL subset exists), external
+framework interop, and any real distributed/ds4 runtime (`gpu_gc`/`dist` are
+CPU oracles). This thread **must not displace the self-host -> 5-GC -> value ->
+runtime-efficiency spine**: it is M5 breadth, and calling a GPU slice "done"
+requires the same mode-labeled claim hygiene as every pillar.
+
 **Runtime layering: shrink the C runtime to a kernel; do not eliminate it.**
 pcc does not aim to eliminate all low-level native runtime code. The long-term
 goal is to minimize the C-level runtime into a small ABI kernel — allocation,
@@ -154,7 +229,7 @@ C-API shim            KEEP but spec/generate: the ABI surface extensions see;
 
 This does not contradict no-libpython: no-libpython means not depending on the
 CPython runtime, NOT that the final binary contains zero C-level runtime. It
-ties directly to the **5-GC Production Equality Rule** (codex-goal-prompt.md,
+ties directly to the **5-GC Production Equality Rule** (`docs/goal/goal-prompt.md`,
 G-track): all five GC backends, the C kernel, and the pcc-Python mirror must
 consume ONE slot-based trace/update contract (`py_obj_visit_slots` /
 `py_obj_update_slot` / root + frame + native-handle registration) so there is
@@ -214,7 +289,38 @@ Do not do that here.
   ```
 
 - While debugging one failure, prefer `-n0` so xdist does not hide ordering or
-  temp-file problems.
+  temp-file problems. This is a debugging rule, not a blanket validation rule.
+  For independent bootstrap / GC matrix validation, do **not** serialize the
+  whole matrix with `-n0`; let pytest-xdist use its configured workers, or run
+  one explicitly chosen backend file with `-n0` when localizing that backend.
+  A five-backend bootstrap matrix should normally look like:
+
+  ```bash
+  gtimeout 1800s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc*.py
+  ```
+
+  Use the single-backend form only for focused diagnosis:
+
+  ```bash
+  gtimeout 360s env -u LC_ALL uv run pytest -q -n0 -m integration tests/python/gc/test_pcc_bootstrap_full_gc4.py
+  ```
+
+  Long bootstrap gates must provide meaningful progress updates: name the exact
+  command, backend/stage if known, elapsed time, and whether new output has
+  appeared. If a long gate is interrupted or times out, immediately check for
+  and terminate leftover `pytest`, `bootstrap.sh`, `pcc`, `pcc1`, `pcc2`, and
+  `pcc3` children. A run without a final pytest summary is not green evidence,
+  no matter how many progress dots were printed.
+- **Do not use the full five-GC bootstrap matrix as a diagnostic loop.** Any
+  change under `pcc/` invalidates the content-addressed bootstrap source hash
+  and can force five cold `pcc1 -> pcc2 -> pcc3` chains. Before launching the
+  matrix, read the routed bootstrap-performance/timeout investigations, inspect
+  existing stage profiles and success manifests, and measure one explicitly
+  chosen backend or an emit-only/profile probe. If one backend exceeds its
+  documented budget, or the projected cold matrix cannot fit its outer
+  watchdog, optimize/localize that regression first. Do not repeat the matrix
+  or widen its timeout to compensate. Run the full matrix once, only after the
+  focused fix and scheduler tests are green, as final cross-backend evidence.
 - Use ripgrep (`rg`) or your agent's built-in code search for source discovery.
 - Do not leave temporary `.c`/`.py` files inside real project directories.
   Directory-based source collection can accidentally compile them.
@@ -238,8 +344,19 @@ Do not do that here.
   probe silently burns the foreground turn and can leave zombie children
   pegging CPU for hours (this has happened — ~120 CPU-hours lost once).
   Before ending a session, `ps aux | grep <your-probe-name>` and `kill`
-  any leftover children. Prefer the Bash tool's `timeout` field; fall
-  back to a `timeout <Ns>` prefix when shelling out from a script.
+  any leftover children. Prefer the Bash tool's `timeout` field when
+  available. When shelling out on macOS, do not assume GNU `timeout`
+  exists; use `gtimeout` only if it is installed, or use a wrapper that
+  keeps a parent watchdog alive, forks the target into its own process
+  group, and kills that process group on expiry.
+- **Do not use `perl -e 'alarm shift; exec @ARGV' ...` or any
+  alarm-then-`exec` wrapper as a timeout for heavy commands.** That pattern
+  has already failed in this repository after `exec`, leaving an already
+  exec'd `pcc1` running for 11+ minutes. A valid fallback timeout wrapper
+  must keep the watchdog parent alive, create a child process group
+  (`setpgrp`/`setsid`), and on expiry send `TERM` then `KILL` to the child
+  process group. After any timed-out bootstrap/compiler run, verify with
+  `ps` that no `pcc`, `pcc1`, `pytest`, or named probe child survived.
 - **Never `git revert`, `git checkout -- <path>`, `git restore`, `git reset
   --hard`, `git clean -f`, `git stash`, branch switches that discard local
   edits, or any `--force`/`--hard` flag that drops uncommitted state — unless
@@ -285,20 +402,24 @@ Do not do that here.
 | `pcc/py_runtime/src/py_internal.h` | Runtime-internal object layouts such as `PyClassObject` |
 | `pcc/llvm_capi/` | In-repo LLVM-C builder; fallback path is `llvmlite` |
 | `pcc/backend/` | Experimental LLVM-free self backend (AArch64 Darwin, x86_64 Linux subsets) |
+| `pcc/kernel_ir/` | Kernel-only GPU IR, TIRx-like freeze, Metal finalization, launch packages, HMM/fence, and DLPack/tensor ownership slices |
+| `pcc/gpu_gc/` | GPU-GC metadata/oracle and external-resource lifetime seam; CPU-only unless a focused gate proves runtime integration |
+| `pcc/dist/` | Local-only distributed session, transport, collective, sharding, and KV oracles; not localhost TCP or multi-Mac execution by default |
 | `pcc/extern/`, `pcc/unsafe/` | Python→C extern decls; compiler-recognized intrinsics |
 | `utils/fake_libc_include/` | Fake libc headers (host ABI / decl mismatches surface here) |
 | `tests/` | Unit, parity, integration regression coverage |
 | `tests/py_corpus/phase*/` | End-to-end Python corpus retained from the earlier phase taxonomy. These tests still run; the phase framework is no longer the active task board. See current priorities in `docs/current-goal-state.md`. |
 | `tests/python/test_self_host_oracle_diff.py` | Core Python semantic oracle / pcc1-pcc2 parity ratchet |
-| `tests/python/test_pcc_bootstrap_full.py` | Full stage1→stage2→stage3 self-backend bootstrap gate |
+| `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py` | Full stage1→stage2→stage3 self-backend bootstrap gate, one file per GC backend (shared helpers live in `tests/python/test_pcc_bootstrap_full.py`) |
 | `tests/bootstrap_gate_baseline.json` | **Authoritative bootstrap state** (Issue 1 closure evidence) |
 | `tests/fallback_baseline.json` | **Authoritative no-libpython fallback state** |
 | `scripts/bootstrap.sh` | macOS arm64 three-stage bootstrap entry |
 | `scripts/pcc_multi.py` | Experimental multi-file Python entry |
 | `projects/lua-5.5.0/` | Real-program stress target |
 | `docs/refs_docs/gc-research/` | Reference impls for the 5 GC backends (Lua, Go, OCaml, ZGC, CPython) |
-| `codex-goal-prompt.md` | Active goal contract / work protocol index |
+| `docs/goal/goal-prompt.md` | Single active goal contract and work protocol |
 | `docs/current-goal-state.md` | Current goal audit, selected task state, and investigation routing |
+| `docs/design/pcc-gpu-next-work.md` | Durable GPU / TVM-TIRx / Metal / GPU-GC / distributed / ds4 route contract, reference pins, and GPU claim levels |
 | `docs/investigations/INDEX.md` | Index of investigation docs; keep it current when investigation docs change |
 
 
@@ -418,7 +539,7 @@ env -u LC_ALL uv run pytest tests/python/test_bootstrap_gate_baseline.py -q -n0
 The active multi-stage plan is to compile pcc's runtime in pcc-Python and
 shrink the libpython surface, while the current active goal prioritizes the
 package/import path when it blocks real `pip install` / `import` scenarios.
-Use `codex-goal-prompt.md` for the goal contract and
+Use `docs/goal/goal-prompt.md` for the goal contract and
 `docs/current-goal-state.md` for the current selected task, evidence, and
 investigation routing. Older plans such as
 `docs/plans/python-runtime-no-c-plan.md` are background, not the active task
@@ -577,8 +698,22 @@ class clearly defines X", it is almost always one of:
 1. layout drift between C `PyClassObject` and `py_class.py`
 2. missing `pcc_gc_load_ptr()` barrier on backend #3/#4
 3. missing `py_err_occurred()` check after a raising call
+4. the instance's **class object was freed by a stray over-release** — a
+   self-host codegen ownership bug decrefs a *borrowed* reference as if owned,
+   and because `py_class_new` does **not** mark user classes `PY_FLAG_IMMORTAL`
+   (only the `object` root is immortal), the class hits refcount 0 and is
+   `py_class_dealloc`'d + zeroed. Then `_lookup_field_index` reads `n_fields==0`
+   and every `getattr` on any instance of that class fails ("attr not found"),
+   or a moving backend segfaults in `class_lookup_in_mro`. Diagnose by
+   watchpointing the class object's `n_fields` (`cls+72`, where
+   `cls = *(inst+16)`) for a 119→0 transition and reading the `py_decref` stack.
+   Fatal on all backends; the host compiler hides it. See
+   `docs/investigations/pcc1-tuple-unpack-self-host-str-counter-corruption.md`.
 
-Check in that order before suspecting frontend codegen.
+Check in that order before suspecting frontend codegen. When one self-host
+over-release corrupts a *shared* object (a class, an interned singleton), the
+first visible symptom is usually far from the buggy release — chase the freed
+object, not the innocent reader.
 
 
 ## Common Pitfalls
@@ -612,8 +747,8 @@ work is considered fixed. This includes changes to `pcc/parse/py_lift.py`,
 `pcc/py_frontend/codegen/`, `pcc/cli_bootstrap.py`, the self backend, or any
 runtime object/class/dataclass semantics used by those paths. A local
 minimized reproducer is necessary but not sufficient: run the relevant
-bootstrap command or `tests/python/test_pcc_bootstrap_full.py` and do not
-claim the fix if stage1→stage2→stage3 is not demonstrated.
+bootstrap command or `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py` and
+do not claim the fix if stage1→stage2→stage3 is not demonstrated.
 
 Recommended focused gates for high-risk changes:
 
@@ -667,12 +802,12 @@ shape that only looks similar.
 - Native extension ABI compatibility and no-libpython behavior are separate
   claims. Keep `pcc-native` rejection, `cpython-compat` acceptance, and
   `PCC_HOST_PYTHON=/bin/false` evidence distinct.
-- See the full claim-hygiene table in `codex-goal-prompt.md` §0.10 for related
+- See the full claim-hygiene table in `docs/goal/goal-prompt.md` §0.10 for related
   distinctions such as host pcc vs pcc1, libpython mode vs no-libpython, fake
   package vs real package, and stage1 vs pcc1→pcc2→pcc3.
 - Current package priority and known blockers live in
   `docs/current-goal-state.md`; the active protocol lives in
-  `codex-goal-prompt.md`.
+  `docs/goal/goal-prompt.md`.
 
 
 ## Platform Gotchas (macOS)

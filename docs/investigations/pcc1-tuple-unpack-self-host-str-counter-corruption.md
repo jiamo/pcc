@@ -535,3 +535,46 @@ literal/lambda lowering plus self-backend branch-range guards. The pproxy gate
 (`test_pcc1_runs_project_python_proxy_test_mode_against_local_http`) passes
 on gc3 and gc4; direct worker and manual helper matrices pass on gc0..gc4; full
 bootstrap fixed point is green on all five GC backends.
+
+## Addendum 2026-07-20 — borrowed module-global function defaults
+
+A later current-source pproxy/GC4 run exposed a separate ownership defect with
+the same terminal `BAD_INCREF` shape. LLDB identified the dead function as
+`pproxy_server.DUMMY` and the first underflowing object as that function's
+captures tuple. Watchpoints proved that the GC root and module dictionary each
+retained `DUMMY`; no collector sweep removed either reference.
+
+The generated module top instead repeated this sequence while constructing
+native function signatures:
+
+```text
+%DUMMY = load ptr, ptr @.modvar.pproxy_server.DUMMY  ; borrowed
+call void @py_tuple_set_item(..., ptr %DUMMY)         ; tuple retains
+call void @pcc_gc_release(ptr %DUMMY)                 ; erroneous owned release
+```
+
+Each later signature-tuple destruction released its retained item again, so
+repeated defaults consumed the module root and attribute references and left a
+dangling global. The defect was in
+`user_function_lowering._emit_native_func_signature`, not in GC4 tracing or
+relocation. The lowering now uses `_container_store_temp_needs_release` (with
+the CPython-expression classification) before releasing the stored default.
+Compiler-created literals and new objects still release their temporary
+reference; borrowed globals and locals do not.
+
+The adjacent module-global publication path was also made root-first: pin and
+`pcc_gc_store_root` now precede `py_module_attr_set`, with the owned temporary
+released after publication. This is a generic root/publication invariant, not
+a pproxy special case.
+
+Current-source validation:
+
+- root-precision file plus generated-method catalogue: 14 passed in 34.57s;
+- rebuilt single-worker pcc1: completed in 4m10.807s;
+- pproxy GC4 original node: 1 passed in 34.64s;
+- pproxy GC3+GC4 pair: 2 passed in 57.08s;
+- complete non-integration suite: 9459 passed, 26 skipped in 875.73s;
+- complete integration suite: 4551 passed, 11 skipped in 1502.17s.
+
+This addendum supersedes any diagnosis of this particular `DUMMY` failure as
+a GC4 root-discovery or forwarding bug.

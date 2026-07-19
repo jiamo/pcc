@@ -1,0 +1,59 @@
+name: PCC HEAD truth light ratchets
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  head-truth-light:
+    name: Fallback and claim ratchets
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        timeout-minutes: 5
+        env:
+          PCC_BUILD_SKIP: "1"
+        run: uv sync --dev --locked
+
+      - name: Run light truth gates
+        id: truth
+        continue-on-error: true
+        timeout-minutes: 12
+        run: |
+          env -u LC_ALL uv run python scripts/head_truth_gate.py run \
+            --suite light \
+            --output build/head-truth/manifest.json \
+            --artifacts-root build/head-truth/logs \
+            --keep-going
+
+      - name: Upload light truth evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: head-truth-light-${{ github.sha }}
+          path: |
+            build/head-truth/manifest.json
+            build/head-truth/logs/
+          if-no-files-found: error
+
+      - name: Enforce light truth result
+        if: always()
+        timeout-minutes: 1
+        run: |
+          test "${{ steps.truth.outcome }}" = "success"
+          env -u LC_ALL uv run python scripts/head_truth_gate.py validate \
+            build/head-truth/manifest.json

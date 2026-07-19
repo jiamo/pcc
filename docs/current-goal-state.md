@@ -23,11 +23,10 @@ Historical startup ledger:
 - Tasks in milestone: `82`
 - `BLOCKED`: `2`
 - `CLAIM_RISK`: `1`
-- `DONE_STRONG`: `78`
-- `IN_PROGRESS`: `1`
-- Next dependency-ready task: `TEST-P0-FULL-SUITE-BUILD-EFFICIENCY`
-- Next title: Eliminate redundant full-runtime builds across the test tree without reducing coverage
-- Next open boundary: Audit all tests for per-case forced archive rebuilds, large copytree setup, nested whole-file pytest invocations, duplicate parameter dimensions, and xdist oversubscription. Replace redundant identical work with immutable per-worker/session artifacts while retaining every semantic probe and mode boundary; add a regression guard and restore the documented full-suite time class.
+- `DONE_STRONG`: `79`
+- Next dependency-ready task: `DIST-P1-MULTI-MAC-TRANSPORT-E2E`
+- Next title: Prove the owned transport and collectives across multiple Macs
+- Next open boundary: Authenticated remote admission, explicit two-host/rank configuration, bounded cleanup, and the strict collective gate are implemented and locally covered. DONE_STRONG now requires concurrent passing strict-gate summaries from two reachable physical Macs; this environment has no PCC_DIST cluster inputs or second rank. Localhost success and SKIPPED_WITH_REASON remain non-proof.
 
 ## Active task table
 
@@ -36,7 +35,7 @@ Historical startup ledger:
 | 90 | `GPU-P0-OWNER-BACKEND-CONTRACT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-16-gpu-owner-backend-contract.md |
 | 100 | `GPU-P0-PCC-METAL-OWNER-DRIVER` | `DONE_STRONG` | GPU-P0-OWNER-BACKEND-CONTRACT | docs/goal/evidence/2026-07-17-pcc-metal-owner-driver.md |
 | 110 | `GPU-P0-TVM-TILELANG-OWNER-DRIVER` | `DONE_STRONG` | GPU-P0-PCC-METAL-OWNER-DRIVER | docs/goal/evidence/2026-07-17-tvm-tilelang-owner-driver.md |
-| 990 | `TEST-P0-FULL-SUITE-BUILD-EFFICIENCY` | `IN_PROGRESS` | - | - |
+| 990 | `TEST-P0-FULL-SUITE-BUILD-EFFICIENCY` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-20-full-suite-build-efficiency-closure.md |
 | 1000 | `AUD-P0-CLAUDE-LOW-RISK-FIXES` | `DONE_STRONG` | - | docs/current-goal-state.md |
 | 1000 | `AUD-P0-GC-BARRIER-WRITE-AUDIT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-gc-barrier-peripheral-runtime-closure.md |
 | 1000 | `AUD-P0-GC-SLOT-VISITOR` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-gc-slot-visitor-current-source-closure.md |

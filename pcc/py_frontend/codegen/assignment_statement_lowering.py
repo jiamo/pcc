@@ -797,18 +797,19 @@ class AssignmentStatementLoweringMixin:
                 self._raw_scaffold_object_rhs_is_owned(stmt.value)
                 and self._expr_returns_owned_object(stmt.value)
             )
+            self._store_module_global_root_value(
+                gv,
+                value,
+                declared_ty=declared_ty,
+                value_is_owned=False,
+                is_cpy_value=is_cpy_value,
+            )
             self._publish_module_global_assignment(
                 target.ident,
                 value,
                 declared_ty,
                 is_cpy_value=is_cpy_value,
-            )
-            self._store_module_global_root_value(
-                gv,
-                value,
-                declared_ty=declared_ty,
                 value_is_owned=value_is_owned,
-                is_cpy_value=is_cpy_value,
             )
             return
 

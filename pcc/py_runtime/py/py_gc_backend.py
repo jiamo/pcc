@@ -2415,7 +2415,11 @@ def _generational_oldify_copy(from_obj):
     memmove(to_obj, from_obj, size)
     store_i64(to_obj, 0, 1)
     new_flags: int = load_i32(to_obj, 12)
-    store_i32(to_obj, 12, (new_flags & ~(128 | 4096 | 512 | 2048)) | 256)
+    store_i32(
+        to_obj,
+        12,
+        (new_flags & ~(128 | 4096 | 512 | 2048 | 262144)) | 256 | 262144,
+    )
     if _relocate_copy_payload(from_obj, to_obj, tag, size) == 0:
         py_decref(to_obj)
         return null()
@@ -5822,6 +5826,8 @@ def pcc_gc_free_object_memory(o) -> None:
                 _minor_release_block(block)
                 return
             _object_graph_unlock()
+            if backend == 3 and (flags & 262144) == 0:
+                return
             free(o)
             return
         _object_graph_unlock()
@@ -5832,9 +5838,8 @@ def pcc_gc_free_object_memory(o) -> None:
         if ptr_is_null(owner_block) == 0:
             _minor_release_block(owner_block)
             return
-        # Normal GC3 objects carry color/generation bits. A zero-flag object
-        # here is a stale/non-owned shell, not a safe malloc allocation.
-        if flags == 0:
+        # Only an explicit allocation-origin bit authorizes system free().
+        if (flags & 262144) == 0:
             return
     free(o)
 

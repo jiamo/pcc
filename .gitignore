@@ -74,6 +74,7 @@ yacctab.py
 # uv / venv
 .venv/
 uv.lock
+!/uv.lock
 
 # Temp files
 temp.*
@@ -187,7 +188,6 @@ pcc/py_runtime/libpy_runtime_pcc_py_libpython.a.target
 .antigravitycli/
 
 # Local-only active docs (top-level indexes + plans in progress)
-docs/current-goal-state.md
 docs/tasksV2.md
 docs/pcc_multi_year_roadmap.md
 docs/plans/python.md
@@ -199,9 +199,9 @@ docs/plans/numpy_plan.md
 docs/plans/numpy_ecosystem_plan.md
 docs/plans/numpy-capi-provider-design.md
 pcc/py_runtime/libpy_runtime_libpython.a.target
-codex-goal-prompt.md
 todo.md
 pcc/py_runtime/build_asan/
 pcc/py_runtime/libpy_runtime_asan.a
 .understand-anything/
 pcc/py_runtime/libpy_runtime_pcc.a.target
+

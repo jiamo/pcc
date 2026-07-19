@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
+
+from tests.runtime_build_cache import cached_c_runtime
 
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
@@ -13,22 +14,8 @@ RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
 
 def _build_runtime(tmp_path: Path) -> Path:
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    result = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return work_runtime
+    del tmp_path
+    return cached_c_runtime()
 
 
 def test_external_device_resources_use_one_runtime_registry_across_gc0_to_gc4(
@@ -214,10 +201,12 @@ def test_external_device_resources_use_one_runtime_registry_across_gc0_to_gc4(
 
 
 def test_external_resource_registry_is_opaque_and_shared_by_both_runtime_paths():
-    kernel = (RUNTIME_DIR / "src" / "pcc_gc_external_resource.c").read_text()
-    c_runtime = (RUNTIME_DIR / "src" / "py_obj.c").read_text()
-    py_runtime = (RUNTIME_DIR / "py" / "py_obj.py").read_text()
-    makefile = (RUNTIME_DIR / "Makefile").read_text()
+    kernel = (RUNTIME_DIR / "src" / "pcc_gc_external_resource.c").read_text(
+        encoding="utf-8"
+    )
+    c_runtime = (RUNTIME_DIR / "src" / "py_obj.c").read_text(encoding="utf-8")
+    py_runtime = (RUNTIME_DIR / "py" / "py_obj.py").read_text(encoding="utf-8")
+    makefile = (RUNTIME_DIR / "Makefile").read_text(encoding="utf-8")
 
     node = kernel.split("typedef struct PccGcExternalResourceNode", 1)[1].split(
         "} PccGcExternalResourceNode;", 1

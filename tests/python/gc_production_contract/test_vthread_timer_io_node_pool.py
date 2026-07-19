@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
 import pytest
+
+from tests.runtime_build_cache import cached_c_runtime
 
 
 REPO_ROOT = Path(__file__).absolute().parents[3]
@@ -119,21 +120,7 @@ int main(int argc, char **argv) {
 @pytest.fixture(scope="module")
 def _timer_io_pool_exe(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("gc_vthread_timer_io_pool")
-    work_runtime = tmp / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    make = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert make.returncode == 0, make.stdout + make.stderr
+    work_runtime = cached_c_runtime()
     src = tmp / "vthread_timer_io_node_pool.c"
     src.write_text(textwrap.dedent(_SOURCE).lstrip(), encoding="utf-8")
     exe = tmp / "vthread_timer_io_node_pool_bin"

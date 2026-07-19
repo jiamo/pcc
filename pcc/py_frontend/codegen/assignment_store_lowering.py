@@ -23,8 +23,16 @@ class AssignmentStoreLoweringMixin:
         declared_ty: Type,
         *,
         is_cpy_value: bool = False,
+        value_is_owned: bool = False,
     ) -> None:
-        """Expose an executed global assignment through the module object."""
+        """Expose a rooted global assignment through the module object.
+
+        Callers must install pointer values in the registered module-global
+        root before entering this helper: ``py_module_attr_set`` allocates and
+        can run a tracing collection.  Releasing an owned RHS here, after the
+        module dictionary has retained it, keeps that temporary live across
+        the publication call without leaking its original reference.
+        """
         if is_cpy_value or self._is_valueclass_payload_type(declared_ty):
             return
         published = marshal.marshal_to_object(
@@ -44,6 +52,11 @@ class AssignmentStoreLoweringMixin:
             [module_name_ptr, self._attr_name_ptr(name), published],
             name=self._fresh(f"pcc.assign.binding.publish.{name}"),
         )
+        if value_is_owned and isinstance(value.type, ir.PointerType):
+            self._gc_release(
+                value,
+                self._release_context_label("module_store_tmp"),
+            )
         if not isinstance(value.type, ir.PointerType):
             self._gc_release(
                 published,
@@ -232,18 +245,19 @@ class AssignmentStoreLoweringMixin:
             else:
                 self._cpy_module_flags.pop(target.ident, None)
                 is_cpy_value = False
+            self._store_module_global_root_value(
+                gv,
+                value,
+                declared_ty=declared_ty,
+                value_is_owned=False,
+                is_cpy_value=is_cpy_value,
+            )
             self._publish_module_global_assignment(
                 target.ident,
                 value,
                 declared_ty,
                 is_cpy_value=is_cpy_value,
-            )
-            self._store_module_global_root_value(
-                gv,
-                value,
-                declared_ty=declared_ty,
                 value_is_owned=value_is_owned,
-                is_cpy_value=is_cpy_value,
             )
             return
 

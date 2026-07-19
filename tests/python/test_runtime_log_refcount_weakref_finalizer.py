@@ -12,17 +12,12 @@ REPO = Path(__file__).absolute().parents[2]
 RUNTIME = REPO / "pcc" / "py_runtime"
 
 
-def _build_runtime() -> None:
-    result = subprocess.run(
-        ["make", "-C", str(RUNTIME), "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-def _compile_harness(tmp_path: Path, name: str, source: str) -> Path:
+def _compile_harness(
+    tmp_path: Path,
+    name: str,
+    source: str,
+    runtime_archive: Path,
+) -> Path:
     src = tmp_path / f"{name}.c"
     exe = tmp_path / name
     src.write_text(textwrap.dedent(source), encoding="utf-8")
@@ -33,7 +28,7 @@ def _compile_harness(tmp_path: Path, name: str, source: str) -> Path:
         f"-I{RUNTIME / 'include'}",
         f"-I{RUNTIME / 'src'}",
         str(src),
-        str(RUNTIME / "libpy_runtime.a"),
+        str(runtime_archive),
         "-lm",
         "-pthread",
         "-o",
@@ -64,8 +59,10 @@ def _run_with_log(exe: Path, tmp_path: Path, channels: str) -> list[dict[str, ob
     ]
 
 
-def test_refcount_and_weakref_events_reach_native_log_file(tmp_path):
-    _build_runtime()
+def test_refcount_and_weakref_events_reach_native_log_file(
+    tmp_path,
+    c_runtime_archive,
+):
     exe = _compile_harness(
         tmp_path,
         "refcount_weakref_probe",
@@ -83,6 +80,7 @@ def test_refcount_and_weakref_events_reach_native_log_file(tmp_path):
             return 0;
         }
         ''',
+        c_runtime_archive,
     )
     events = _run_with_log(exe, tmp_path, "refcount,weakref")
     names = {(event["category"], event["event"]) for event in events}
@@ -94,8 +92,7 @@ def test_refcount_and_weakref_events_reach_native_log_file(tmp_path):
     assert ("weakref", "dealloc") in names
 
 
-def test_finalizer_events_reach_native_log_file(tmp_path):
-    _build_runtime()
+def test_finalizer_events_reach_native_log_file(tmp_path, c_runtime_archive):
     exe = _compile_harness(
         tmp_path,
         "finalizer_probe",
@@ -121,6 +118,7 @@ def test_finalizer_events_reach_native_log_file(tmp_path):
             return finalizer_hits == 1 ? 0 : 4;
         }
         ''',
+        c_runtime_archive,
     )
     events = _run_with_log(exe, tmp_path, "finalizer,refcount")
     names = {(event["category"], event["event"]) for event in events}
@@ -132,5 +130,5 @@ def test_pcc_python_runtime_archive_links_runtime_log_helper():
     makefile = (RUNTIME / "Makefile").read_text(encoding="utf-8")
     assert "$(OBJDIR_PY)/pcc_runtime_log.o" in makefile
     py_obj = (RUNTIME / "py" / "py_obj.py").read_text(encoding="utf-8")
-    assert 'extern("pcc_runtime_log_event_code"' in py_obj
-
+    assert "pcc_runtime_log_event_code = extern(" in py_obj
+    assert '"pcc_runtime_log_event_code"' in py_obj

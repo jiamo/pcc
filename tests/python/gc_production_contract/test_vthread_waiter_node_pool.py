@@ -24,11 +24,12 @@ empty, and no waiter node leaks — identically across all five GC backends.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import textwrap
 
 import pytest
+
+from tests.runtime_build_cache import cached_c_runtime
 
 from pathlib import Path
 
@@ -197,26 +198,7 @@ int main(int argc, char **argv) {
 @pytest.fixture(scope="module")
 def _vthread_waiter_pool_exe(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("gc_vthread_waiter_pool")
-    work_runtime = tmp / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native",
-            "__pycache__",
-            "build",
-            "build_*",
-            "*.a",
-            "*.a.target",
-        ),
-    )
-    make = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert make.returncode == 0, make.stdout + make.stderr
+    work_runtime = cached_c_runtime()
 
     src = tmp / "vthread_waiter_node_pool.c"
     src.write_text(textwrap.dedent(_SOURCE).lstrip(), encoding="utf-8")

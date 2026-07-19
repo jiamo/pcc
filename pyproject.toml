@@ -60,11 +60,12 @@ include = [
 path = "hatch_build.py"
 
 [tool.pytest.ini_options]
-addopts = "-n auto --dist=loadgroup -m 'not integration'"
+addopts = "-n 6 --dist=loadgroup -m 'not integration'"
 testpaths = ["tests"]
 norecursedirs = ["projects", "build", "build_py", "build_pcc", "build_libpython", "refs_docs", "_tmp_*"]
 markers = [
     "integration: expensive end-to-end integration tests excluded from the default test run",
+    "intent: AGENTS.md design-intent constraint locks (fast source/contract-level checks)",
 ]
 
 [dependency-groups]

@@ -21,35 +21,20 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
-import shutil
 import subprocess
 import textwrap
 
 import pytest
 
-from tests.runtime_build_cache import cache_runtime_build
+from tests.runtime_build_cache import cached_c_runtime
 
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 
 
-@cache_runtime_build
 def _build_runtime(tmp_path: Path) -> Path:
-    runtime = REPO_ROOT / "pcc" / "py_runtime"
-    work = tmp_path / "py_runtime"
-    shutil.copytree(
-        runtime,
-        work,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    make = subprocess.run(
-        ["make", "-B", "-C", str(work), "libpy_runtime.a"],
-        capture_output=True, text=True, timeout=120,
-    )
-    assert make.returncode == 0, make.stdout + make.stderr
-    return work
+    del tmp_path
+    return cached_c_runtime()
 
 
 def _compile_run(tmp_path: Path, c_src: str, name: str) -> subprocess.CompletedProcess:

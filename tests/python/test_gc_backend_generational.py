@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 from unittest import mock
 
-from tests.runtime_build_cache import cached_threaded_pcc_python_runtime
+from tests.runtime_build_cache import (
+    cached_c_runtime,
+    cached_threaded_c_runtime,
+    cached_threaded_pcc_python_runtime,
+)
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
-_RUNTIME_BUILD_CACHE: Path | None = None
-_THREADED_RUNTIME_BUILD_CACHE: Path | None = None
 _PCC_PY_RUNTIME_BUILD_CACHE: Path | None = None
 
 
@@ -52,55 +53,13 @@ def _cc() -> str:
 
 
 def _build_runtime(tmp_path: Path) -> Path:
-    global _RUNTIME_BUILD_CACHE
-    if (
-        _RUNTIME_BUILD_CACHE is not None
-        and (_RUNTIME_BUILD_CACHE / "libpy_runtime.a").is_file()
-    ):
-        return _RUNTIME_BUILD_CACHE
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    result = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    _RUNTIME_BUILD_CACHE = work_runtime
-    return work_runtime
+    del tmp_path
+    return cached_c_runtime()
 
 
 def _build_threaded_runtime(tmp_path: Path) -> Path:
-    global _THREADED_RUNTIME_BUILD_CACHE
-    if (
-        _THREADED_RUNTIME_BUILD_CACHE is not None
-        and (_THREADED_RUNTIME_BUILD_CACHE / "libpy_runtime.a").is_file()
-    ):
-        return _THREADED_RUNTIME_BUILD_CACHE
-    work_runtime = tmp_path / "py_runtime_threads"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    result = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "PCC_WITH_THREADS=1", "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    _THREADED_RUNTIME_BUILD_CACHE = work_runtime
-    return work_runtime
+    del tmp_path
+    return cached_threaded_c_runtime()
 
 
 def _build_pcc_py_runtime(tmp_path: Path) -> Path:
@@ -2878,8 +2837,11 @@ def test_generational_backend_c_runtime_frees_minor_object_by_index_when_flag_cl
             #include "py_runtime.h"
             #include <stdio.h>
 
+            void pcc_gc_free_object_memory(PyObject *o);
+
             enum {
-                PY_FLAG_GC_MINOR_ARENA = 0x1000
+                PY_FLAG_GC_MINOR_ARENA = 0x1000,
+                PY_FLAG_GC_MALLOC_ALLOC = 0x40000
             };
 
             int main(void) {
@@ -2887,12 +2849,18 @@ def test_generational_backend_c_runtime_frees_minor_object_by_index_when_flag_cl
                     return 2;
                 }
 
+                PyObject *leading = pcc_gc_alloc(64, PY_TYPE_NONE, 0);
                 PyObject *o = pcc_gc_alloc(64, PY_TYPE_NONE, 0);
-                if (o == 0) return 3;
+                if (leading == 0 || o == 0) return 3;
                 PyObjectHeader *h = (PyObjectHeader *)o;
                 printf("%d\\n", (h->flags & PY_FLAG_GC_MINOR_ARENA) != 0);
                 h->flags &= ~PY_FLAG_GC_MINOR_ARENA;
-                pcc_gc_release(o);
+                printf("%d\\n", h->flags != 0);
+                pcc_gc_free_object_memory(o);
+                PyObject *heap = pcc_gc_alloc(256, PY_TYPE_NONE, 0);
+                if (heap == 0) return 4;
+                printf("%d\\n", (((PyObjectHeader *)heap)->flags & PY_FLAG_GC_MALLOC_ALLOC) != 0);
+                pcc_gc_free_object_memory(heap);
                 puts("ok");
                 return 0;
             }
@@ -2917,7 +2885,7 @@ def test_generational_backend_c_runtime_frees_minor_object_by_index_when_flag_cl
 
     result = _run_backend_three(exe)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().splitlines() == ["1", "ok"]
+    assert result.stdout.strip().splitlines() == ["1", "1", "1", "ok"]
 
 
 def test_generational_backend_c_runtime_retains_empty_minor_span_for_stale_release(
@@ -3208,16 +3176,23 @@ def test_generational_backend_pcc_python_runtime_frees_minor_object_by_index_whe
         from pcc.unsafe import load_i32, store_i32
 
         pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
-        pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
+        pcc_gc_free_object_memory = extern(
+            "pcc_gc_free_object_memory", (c_ptr,), c_void
+        )
         pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
 
         def main() -> None:
             print(pcc_gc_backend())
+            leading = pcc_gc_alloc(64, 0, 0)
             o = pcc_gc_alloc(64, 0, 0)
             flags: int = load_i32(o, 12)
             print(flags & 4096)
             store_i32(o, 12, flags & ~4096)
-            pcc_gc_release(o)
+            print((flags & ~4096) != 0)
+            pcc_gc_free_object_memory(o)
+            heap = pcc_gc_alloc(256, 0, 0)
+            print(load_i32(heap, 12) & 262144)
+            pcc_gc_free_object_memory(heap)
             print("ok")
 
         if __name__ == "__main__":
@@ -3232,7 +3207,13 @@ def test_generational_backend_pcc_python_runtime_frees_minor_object_by_index_whe
     assert result.returncode == 0, (
         f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    assert result.stdout.strip().splitlines() == ["3", "4096", "ok"]
+    assert result.stdout.strip().splitlines() == [
+        "3",
+        "4096",
+        "True",
+        "262144",
+        "ok",
+    ]
 
 
 def test_generational_backend_pcc_python_runtime_retains_empty_minor_span_for_stale_release(

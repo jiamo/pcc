@@ -16,44 +16,13 @@ TESTS = ROOT / "tests"
 THIS_FILE = Path(__file__).absolute()
 
 _RUNTIME_COPY_BUILD_STRATEGIES = {
-    "tests/gpu_gc/test_runtime_external_resource.py": "def _build_runtime",
-    "tests/python/conftest.py": 'fixture(scope="session")',
-    "tests/python/data_model/test_t4_weakref_native_acceptance.py":
-        "test_t4_weakref_callable_and_dealloc_clear_native",
-    "tests/python/gc_production_contract/test_virtual_thread_scheduler_roots.py":
-        'fixture(scope="module")',
-    "tests/python/gc_production_contract/test_vthread_io_waitset_runtime.py":
-        'fixture(scope="module")',
-    "tests/python/gc_production_contract/test_vthread_runtime_effect_events.py":
-        'fixture(scope="module")',
-    "tests/python/gc_production_contract/test_vthread_timer_cancel.py":
-        'fixture(scope="module")',
-    "tests/python/gc_production_contract/test_vthread_timer_io_node_pool.py":
-        'fixture(scope="module")',
-    "tests/python/gc_production_contract/test_vthread_waiter_node_pool.py":
-        'fixture(scope="module")',
-    "tests/python/test_gc_backend23_production.py": "@cache_runtime_build",
-    "tests/python/test_gc_backend3_barrier_behavior.py": "@cache_runtime_build",
-    "tests/python/test_gc_backend4_production.py": "_RUNTIME_BUILD_CACHE",
-    "tests/python/test_gc_backend_concurrent.py": "@cache_runtime_build",
-    "tests/python/test_gc_backend_generational.py": "_RUNTIME_BUILD_CACHE",
-    "tests/python/test_gc_backend_relocating.py": "_RUNTIME_BUILD_CACHE",
+    # These are real build variants, not copies of the default archives:
+    # per-strategy refcount macros, optional TSan instrumentation, and the
+    # runtime-tripwire macro. Each is cached at the narrowest safe module/file
+    # scope while preserving its distinct compile contract.
     "tests/python/test_gc_concurrent_collection.py": "@cache_runtime_build",
-    "tests/python/test_gc_coroutine_roots.py": "@cache_runtime_build",
-    "tests/python/test_gc_coroutine_scheduler_roots_production.py":
-        "@cache_runtime_build",
-    "tests/python/test_gc_pause_telemetry.py": "@cache_runtime_build",
     "tests/python/test_gc_refcount_strategies.py": "@cache_runtime_build",
-    "tests/python/test_gc_store_ptr_balance.py": "@cache_runtime_build",
-    "tests/python/test_gc_threading_substrate.py": "@cache_runtime_build",
-    "tests/python/test_gc_update_referents.py": "@cache_runtime_build",
-    "tests/python/test_os_heap_stats.py": "def _build_runtime",
-    "tests/python/test_os_rss_helper.py": "def _build_runtime",
-    "tests/python/test_python_concurrency_parity.py": "@cache_runtime_build",
     "tests/python/test_runtime_tripwires.py": 'fixture(scope="module")',
-    "tests/python/test_threading_module_native.py": "@cache_runtime_build",
-    "tests/python/test_virtual_thread_ready_entry_pool.py": "def _build_runtime",
-    "tests/python/test_vthread_timer_heap_scheduler.py": "pcc_python=True",
 }
 
 _STATELESS_GC_COMPILE_SUITES = (
@@ -170,6 +139,8 @@ def test_tests_do_not_build_or_link_mutable_repository_c_runtime_archive():
         "pcc/py_runtime/" + "libpy_runtime.a",
         'RUNTIME_DIR / "' + 'libpy_runtime.a"',
         '["make", "-C", "pcc/py_runtime", "' + 'libpy_runtime.a"]',
+        '["make", "-C", str(RUNTIME), "' + 'libpy_runtime.a"]',
+        'str(RUNTIME / "' + 'libpy_runtime.a")',
     )
     violations = []
     for path, source in _python_test_sources():
@@ -184,11 +155,25 @@ def test_tests_do_not_build_or_link_mutable_repository_c_runtime_archive():
     cache = (ROOT / "tests/runtime_build_cache.py").read_text(encoding="utf-8")
     assert "def c_runtime_archive" in fixtures
     assert "def cached_c_runtime" in cache
+    assert "def cached_threaded_c_runtime" in cache
     assert "def cached_pcc_python_runtime" in cache
     assert "_runtime_archive_stale" not in fixtures
     assert "_PCC_PY_RUNTIME_ARCHIVE" not in fixtures
     assert "fcntl.flock" in cache
     assert "os.replace(work_runtime, runtime)" in cache
+
+
+def test_default_xdist_keeps_bounded_workers_for_compiler_heavy_suite():
+    config = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert '-n 6 --dist=loadgroup -m \'not integration\'' in config
+    conftest = (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
+    assert "def pytest_xdist_auto_num_workers" not in conftest
+    assert 'os.environ.setdefault("PCC_OUTER_PARALLELISM", str(worker_count))' in conftest
+    assert "items[:] = warmup + remaining" in conftest
+    matrix = (
+        ROOT / "tests/python/test_gc_backend_under_env.py"
+    ).read_text(encoding="utf-8")
+    assert 'xdist_group(name=f"gc_meta_{gc_backend}")' in matrix
 
 
 def test_gc_meta_matrix_retains_required_modes_without_accidental_duplicates():
@@ -298,10 +283,15 @@ def test_self_host_oracle_stages_are_shared_across_xdist_workers():
     source = (
         ROOT / "tests/python/test_self_host_oracle_diff.py"
     ).read_text(encoding="utf-8")
-    assert "getbasetemp()" in source
-    assert 'worker_id != "master"' in source
-    assert 'base = base.parent' in source
+    cache = (ROOT / "tests/runtime_build_cache.py").read_text(encoding="utf-8")
+    conftest = (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
+    assert "cached_self_host_oracle_dir()" in source
+    assert "self_host_source_key()" in source
+    assert "PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY" in source
     assert "fcntl.flock" in source
     assert "os.replace(temporary, pcc1)" in source
     assert "os.replace(temporary, pcc2)" in source
     assert "os.replace(temporary, pcc3)" in source
+    assert "pcc.self-host-test-artifact.v1" in cache
+    assert "self-host-oracle" in cache
+    assert "test_000_self_host_oracle_stage_cache_warmup" in conftest

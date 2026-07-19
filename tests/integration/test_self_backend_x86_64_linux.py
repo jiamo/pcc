@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -13,12 +14,29 @@ CTESTSUITE_HARNESS = REPO_ROOT / "scripts" / "run_self_backend_linux_x86_64_c_te
 X86_64_LINUX_TRIPLE = "x86_64-unknown-linux-gnu"
 X86_64_LINUX_ALIAS_TRIPLE = "amd64-pc-linux-gnu"
 X86_64_LINUX_BUCKET_SIZE = 128
+DOCKER_PROBE_TIMEOUT_SECONDS = 5
+DOCKER_HARNESS_TIMEOUT_SECONDS = 900
 
 pytestmark = pytest.mark.integration
 
 
+@lru_cache(maxsize=1)
 def _docker_available() -> bool:
-    return shutil.which("docker") is not None and DOCKER_HARNESS.is_file()
+    docker = shutil.which("docker")
+    if docker is None or not DOCKER_HARNESS.is_file():
+        return False
+    try:
+        result = subprocess.run(
+            [docker, "info", "--format", "{{.ServerVersion}}"],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=DOCKER_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _run_linux_x86_64_harness(shell_script: str) -> subprocess.CompletedProcess[str]:
@@ -27,7 +45,30 @@ def _run_linux_x86_64_harness(shell_script: str) -> subprocess.CompletedProcess[
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        timeout=DOCKER_HARNESS_TIMEOUT_SECONDS,
     )
+
+
+def test_docker_availability_requires_reachable_daemon(monkeypatch):
+    calls = []
+
+    def unavailable_daemon(*args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args[0], 1)
+
+    _docker_available.cache_clear()
+    monkeypatch.setattr(shutil, "which", lambda _name: "/fake/docker")
+    monkeypatch.setattr(subprocess, "run", unavailable_daemon)
+
+    assert _docker_available() is False
+    assert calls[0][0][0] == [
+        "/fake/docker",
+        "info",
+        "--format",
+        "{{.ServerVersion}}",
+    ]
+    assert calls[0][1]["timeout"] == DOCKER_PROBE_TIMEOUT_SECONDS
+    _docker_available.cache_clear()
 
 
 @pytest.mark.skipif(not _docker_available(), reason="docker harness not available")

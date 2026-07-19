@@ -14,6 +14,7 @@ from pcc.py_frontend import ir_pass_pipeline, pipeline
 
 def test_python_frontend_jobs_defaults_to_auto(monkeypatch):
     monkeypatch.delenv("PCC_PY_FRONTEND_JOBS", raising=False)
+    monkeypatch.delenv("PCC_OUTER_PARALLELISM", raising=False)
     monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
 
     assert pipeline._python_frontend_jobs(111) == 10
@@ -24,6 +25,30 @@ def test_python_frontend_jobs_env_can_force_serial(monkeypatch):
     monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
 
     assert pipeline._python_frontend_jobs(111) == 1
+
+
+def test_nested_parallelism_shares_cpu_budget_across_outer_workers(monkeypatch):
+    monkeypatch.delenv("PCC_PY_FRONTEND_JOBS", raising=False)
+    monkeypatch.delenv("PCC_PYTHON_IR_PASS_JOBS", raising=False)
+    monkeypatch.delenv("PCC_SELF_BACKEND_JOBS", raising=False)
+    monkeypatch.setenv("PCC_OUTER_PARALLELISM", "6")
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
+
+    assert pipeline._python_frontend_jobs(111) == 2
+    assert pipeline._python_ir_pass_jobs(111) == 2
+    assert pipeline._self_backend_jobs(111) == 2
+
+
+def test_explicit_inner_jobs_override_outer_parallelism_budget(monkeypatch):
+    monkeypatch.setenv("PCC_OUTER_PARALLELISM", "6")
+    monkeypatch.setenv("PCC_PY_FRONTEND_JOBS", "5")
+    monkeypatch.setenv("PCC_PYTHON_IR_PASS_JOBS", "4")
+    monkeypatch.setenv("PCC_SELF_BACKEND_JOBS", "3")
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
+
+    assert pipeline._python_frontend_jobs(111) == 5
+    assert pipeline._python_ir_pass_jobs(111) == 4
+    assert pipeline._self_backend_jobs(111) == 3
 
 
 def test_python_frontend_worker_timing_is_opt_in(monkeypatch):

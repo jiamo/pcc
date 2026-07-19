@@ -9,7 +9,7 @@ never cached.
 from __future__ import annotations
 
 import hashlib
-from functools import wraps
+from functools import lru_cache, wraps
 import os
 from pathlib import Path
 import shutil
@@ -47,6 +47,75 @@ _REPO_ROOT = Path(__file__).absolute().parents[1]
 _RUNTIME_DIR = _REPO_ROOT / "pcc" / "py_runtime"
 
 
+@lru_cache(maxsize=1)
+def self_host_source_key() -> str:
+    """Fingerprint inputs that can change the self-host compiler stages."""
+
+    digest = hashlib.sha256()
+    digest.update(b"pcc.self-host-test-artifact.v1\0")
+    digest.update(str(_REPO_ROOT.resolve()).encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(sys.version.encode("utf-8"))
+    digest.update(b"\0")
+    for name in (
+        "CC",
+        "CFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "MACOSX_DEPLOYMENT_TARGET",
+        "PCC_SELF_TARGET_PASSES",
+        "PCC_SELF_TARGET_PASS_TRANSPORT",
+    ):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"=")
+        digest.update(str(os.environ.get(name, "")).encode("utf-8"))
+        digest.update(b"\0")
+    cc = os.environ.get("CC", "cc")
+    try:
+        toolchain = subprocess.check_output(
+            [cc, "--version"],
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        toolchain = b"<unknown-toolchain>"
+    digest.update(toolchain)
+    digest.update(b"\0")
+    files = []
+    for path in (_REPO_ROOT / "pcc").rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part.startswith(".") or part == "__pycache__" for part in path.parts):
+            continue
+        if path.suffix not in {".c", ".h", ".py"} and path.name != "Makefile":
+            continue
+        files.append(path)
+    for path in sorted(files):
+        relative = path.relative_to(_REPO_ROOT).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def cached_self_host_oracle_dir() -> Path:
+    """Return a source-addressed directory for immutable pcc1/pcc2/pcc3."""
+
+    root = Path.home() / ".cache" / "pcc" / "test-artifacts" / "self-host-oracle"
+    root.mkdir(parents=True, exist_ok=True)
+    artifact_dir = root / self_host_source_key()[:24]
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    return artifact_dir
+
+
+def self_host_object_cache_dir() -> Path:
+    """Return the persistent compiled self-backend object-cache directory."""
+
+    path = Path.home() / ".cache" / "pcc" / "test-artifacts" / "self-host-objects"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _c_runtime_source_key() -> str:
     """Hash inputs that can change the default C runtime archive."""
 
@@ -76,8 +145,8 @@ def _c_runtime_source_key() -> str:
     return digest.hexdigest()[:24]
 
 
-def cached_c_runtime() -> Path:
-    """Build/reuse one immutable default C runtime across pytest workers.
+def _cached_c_runtime(*, threaded: bool) -> Path:
+    """Build/reuse one immutable C runtime variant across pytest workers.
 
     Tests must never rebuild or link the repository's mutable
     ``pcc/py_runtime/libpy_runtime.a`` under xdist.  A content-addressed key,
@@ -85,7 +154,8 @@ def cached_c_runtime() -> Path:
     either a complete old artifact or a complete new artifact.
     """
 
-    key = _c_runtime_source_key() + "-c-default"
+    variant = "c-threaded" if threaded else "c-default"
+    key = _c_runtime_source_key() + "-" + variant
     cache_root = (
         Path.home() / ".cache" / "pcc" / "test-artifacts" / "runtime-builds"
     )
@@ -123,8 +193,12 @@ def cached_c_runtime() -> Path:
             )
             env = dict(os.environ)
             env.pop("LC_ALL", None)
+            command = ["make", "-C", str(work_runtime)]
+            if threaded:
+                command.append("PCC_WITH_THREADS=1")
+            command.append("libpy_runtime.a")
             result = subprocess.run(
-                ["make", "-C", str(work_runtime), "libpy_runtime.a"],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=180,
@@ -139,6 +213,18 @@ def cached_c_runtime() -> Path:
                 shutil.rmtree(staging_root, ignore_errors=True)
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def cached_c_runtime() -> Path:
+    """Return the immutable default C runtime source tree and archive."""
+
+    return _cached_c_runtime(threaded=False)
+
+
+def cached_threaded_c_runtime() -> Path:
+    """Return the immutable ``PCC_WITH_THREADS=1`` C runtime variant."""
+
+    return _cached_c_runtime(threaded=True)
 
 
 def cache_runtime_build(

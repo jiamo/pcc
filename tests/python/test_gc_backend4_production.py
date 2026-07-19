@@ -1,22 +1,19 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import textwrap
 from pathlib import Path
+
+from tests.runtime_build_cache import cached_c_runtime, cached_threaded_c_runtime
 
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
-# Every probe in this module links the same immutable runtime archive.  The
-# old helper copied py_runtime and forced a complete `make -B` for each of the
-# 127 tests (and the backend meta-gate runs this file in two frontend modes),
-# turning one source build into hundreds.  Keep probe source/executable paths
-# test-local, but build each archive variant once per pytest worker/process.
-_RUNTIME_BUILD_CACHE: Path | None = None
-_THREADED_RUNTIME_BUILD_CACHE: Path | None = None
+# Every probe in this module links the same content-addressed immutable runtime
+# archive. Probe sources/executables remain test-local; archive builds are
+# shared across modules, workers, and repeated runs.
 
 
 def _cc() -> str:
@@ -24,29 +21,8 @@ def _cc() -> str:
 
 
 def _build_runtime(tmp_path: Path) -> Path:
-    global _RUNTIME_BUILD_CACHE
-    if (
-        _RUNTIME_BUILD_CACHE is not None
-        and (_RUNTIME_BUILD_CACHE / "libpy_runtime.a").is_file()
-    ):
-        return _RUNTIME_BUILD_CACHE
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    result = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    _RUNTIME_BUILD_CACHE = work_runtime
-    return work_runtime
+    del tmp_path
+    return cached_c_runtime()
 
 
 def _compile_and_run(tmp_path: Path, source: str) -> subprocess.CompletedProcess[str]:
@@ -75,29 +51,8 @@ def _compile_and_run(tmp_path: Path, source: str) -> subprocess.CompletedProcess
 
 
 def _build_threaded_runtime(tmp_path: Path) -> Path:
-    global _THREADED_RUNTIME_BUILD_CACHE
-    if (
-        _THREADED_RUNTIME_BUILD_CACHE is not None
-        and (_THREADED_RUNTIME_BUILD_CACHE / "libpy_runtime.a").is_file()
-    ):
-        return _THREADED_RUNTIME_BUILD_CACHE
-    work_runtime = tmp_path / "py_runtime_threads"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    result = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "PCC_WITH_THREADS=1", "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    _THREADED_RUNTIME_BUILD_CACHE = work_runtime
-    return work_runtime
+    del tmp_path
+    return cached_threaded_c_runtime()
 
 
 def _compile_and_run_threaded(

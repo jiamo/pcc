@@ -1984,9 +1984,16 @@ class UserFunctionLoweringMixin:
                 name=self._fresh("func.sig.has_default"),
             )
             if has_default:
-                default_obj = self._emit_native_func_default_object(ast_arg.default)
+                default_expr = ast_arg.default
+                default_obj = self._emit_native_func_default_object(default_expr)
+                default_is_owned = self._container_store_temp_needs_release(
+                    default_expr,
+                    default_expr.ty,
+                    self._expr_looks_cpython(default_expr),
+                )
             else:
                 default_obj = self._emit_none_literal()
+                default_is_owned = True
             self.builder.call(
                 self.runtime["py_tuple_set_item"],
                 [names, ir.Constant(_I64, i), name_obj],
@@ -2006,7 +2013,8 @@ class UserFunctionLoweringMixin:
             self._gc_release(name_obj)
             self._gc_release(kind_obj)
             self._gc_release(has_default_obj)
-            self._gc_release(default_obj)
+            if default_is_owned:
+                self._gc_release(default_obj)
 
         sig = self.builder.call(
             self.runtime["py_tuple_new"],

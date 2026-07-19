@@ -38,6 +38,77 @@ def test_owned_object_locals_are_registered_as_gc_frame_roots(tmp_path):
     assert "call void @pcc_gc_frame_leave" in ir_text
 
 
+def test_owned_module_global_is_rooted_before_attribute_publication(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "module_global_publish_root.py"
+    out = tmp_path / "module_global_publish_root.ll"
+    src.write_text(
+        "DUMMY = lambda data: data\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(src),
+        str(out),
+        emit_llvm_only=True,
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    ir_text = out.read_text(encoding="utf-8")
+
+    pin_pos = ir_text.find("call void @pcc_gc_pin")
+    root_pos = ir_text.find("call void @pcc_gc_store_root", pin_pos)
+    publish_pos = ir_text.find("call i64 @py_module_attr_set", root_pos)
+
+    assert 0 <= pin_pos < root_pos < publish_pos, ir_text
+
+
+def test_borrowed_module_global_default_is_not_released_after_signature_store(
+    tmp_path,
+):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "borrowed_module_global_default.py"
+    out = tmp_path / "borrowed_module_global_default.ll"
+    src.write_text(
+        textwrap.dedent("""
+        DUMMY = lambda data: data
+
+        def transform(data=DUMMY):
+            return data
+
+        print(transform("ok"))
+        """).lstrip(),
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(src),
+        str(out),
+        emit_llvm_only=True,
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    ir_text = out.read_text(encoding="utf-8")
+
+    default_load = re.search(
+        r"(?P<value>%DUMMY\.[0-9.]+) = load ptr, ptr "
+        r"@\.modvar\.borrowed_module_global_default\.DUMMY",
+        ir_text,
+    )
+    assert default_load is not None, ir_text
+    value = re.escape(default_load.group("value"))
+    assert re.search(
+        rf"call void @py_tuple_set_item\([^\n]*ptr {value}\)",
+        ir_text,
+    ), ir_text
+    assert not re.search(
+        rf"call void @pcc_gc_release\(ptr {value}\)",
+        ir_text,
+    ), ir_text
+
+
 def test_native_with_open_file_is_an_owned_gc_frame_root(tmp_path):
     from pcc.py_frontend.pipeline import compile_python
 

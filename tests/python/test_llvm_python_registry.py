@@ -25,6 +25,16 @@ def _ir_needle_count(ir_text: str, needle: str) -> int:
     return ir_text.count(needle)
 
 
+def _defined_function_ir(ir_text: str, name: str) -> str:
+    pattern = re.compile(
+        rf'^define\b[^\n]*@(?:"{re.escape(name)}"|{re.escape(name)})\([^\n]*\).*?^\}}$',
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(ir_text)
+    assert match is not None, f"missing LLVM definition for {name}"
+    return match.group(0)
+
+
 def _pipeline_without_high_passes(*pass_names):
     pipeline = PassPipeline.default()
     disabled = set(pass_names)
@@ -1617,9 +1627,9 @@ def test_dse_translation_tracks_external_reference_with_mem2reg_bridge(monkeypat
     # After the source-level DSE boundary runs, the dead `x = 1;` store is
     # gone, but the remaining live local still lowers through the AST path
     # and keeps one stack store alongside the incoming-parameter spill.
-    assert default_artifact["ir_text"].count("store ") == 2
-    assert disabled_artifact["ir_text"].count("store ") == 3
-    assert llvm_ir.count("store ") == 0
+    assert _defined_function_ir(default_artifact["ir_text"], "f").count("store ") == 2
+    assert _defined_function_ir(disabled_artifact["ir_text"], "f").count("store ") == 3
+    assert _defined_function_ir(llvm_ir, "f").count("store ") == 0
     assert llvm_ctx.pass_report()["passes"]["mem2reg"]["runs"] >= 1
     assert llvm_ctx.pass_report()["passes"]["dse"]["runs"] >= 1
 

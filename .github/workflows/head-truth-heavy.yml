@@ -1,0 +1,70 @@
+name: PCC HEAD truth heavy matrix
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  head-truth-heavy:
+    name: LLVM, self, and five-GC fixed point
+    runs-on: macos-15
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require macOS arm64 runner
+        timeout-minutes: 1
+        run: |
+          test "$(uname)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        timeout-minutes: 5
+        env:
+          PCC_BUILD_SKIP: "1"
+        run: uv sync --dev --locked
+
+      - name: Run complete truth matrix
+        id: truth
+        continue-on-error: true
+        timeout-minutes: 100
+        run: |
+          env -u LC_ALL uv run python scripts/head_truth_gate.py run \
+            --suite all \
+            --output build/head-truth/manifest.json \
+            --artifacts-root build/head-truth/logs \
+            --keep-going
+
+      - name: Upload complete truth evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: head-truth-heavy-${{ github.sha }}
+          path: |
+            build/head-truth/manifest.json
+            build/head-truth/logs/
+            build/head-truth/numpy-core/
+          if-no-files-found: error
+
+      - name: Enforce clean commit-bound result
+        if: always()
+        timeout-minutes: 1
+        run: |
+          test "${{ steps.truth.outcome }}" = "success"
+          env -u LC_ALL uv run python scripts/head_truth_gate.py validate \
+            build/head-truth/manifest.json \
+            --require-complete \
+            --require-clean-commit

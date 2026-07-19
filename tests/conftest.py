@@ -61,3 +61,32 @@ def _patched_resolve(self: Path, *args, **kwargs):  # type: ignore[override]
 
 os.path.dirname = _patched_dirname
 Path.resolve = _patched_resolve
+
+
+_SELF_HOST_WARMUP_NODEID = (
+    "tests/python/test_self_host_oracle_diff.py::"
+    "test_000_self_host_oracle_stage_cache_warmup"
+)
+
+
+def pytest_configure(config):
+    """Publish xdist's outer width so pcc does not multiply parallelism."""
+
+    if not hasattr(config, "workerinput"):
+        return
+    raw_count = str(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "") or "").strip()
+    try:
+        worker_count = max(1, int(raw_count))
+    except ValueError:
+        worker_count = 1
+    os.environ.setdefault("PCC_OUTER_PARALLELISM", str(worker_count))
+
+
+def pytest_collection_modifyitems(items):
+    """Start the shared self-host stage cache before its semantic consumers."""
+
+    warmup = [item for item in items if item.nodeid == _SELF_HOST_WARMUP_NODEID]
+    if not warmup:
+        return
+    remaining = [item for item in items if item not in warmup]
+    items[:] = warmup + remaining

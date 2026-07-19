@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import textwrap
 from pathlib import Path
+
+from tests.runtime_build_cache import cached_c_runtime
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -12,21 +13,7 @@ RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
 
 def test_t4_weakref_callable_and_dealloc_clear_native(tmp_path):
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    build_runtime = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],
-        text=True,
-        capture_output=True,
-        timeout=180,
-    )
-    assert build_runtime.returncode == 0, build_runtime.stdout + build_runtime.stderr
+    work_runtime = cached_c_runtime()
     src = tmp_path / "weakref_probe.c"
     exe = tmp_path / "weakref_probe.out"
     src.write_text(

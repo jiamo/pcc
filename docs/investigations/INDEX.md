@@ -26,6 +26,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved locally 2026-06-04
 - [self-backend-nested-valueclass-payload-equality.md](self-backend-nested-valueclass-payload-equality.md) — **self-backend nested valueclass payload equality**
   - resolved locally 2026-06-04
+- [self-backend-sparse-ssa-cache-memory-explosion.md](self-backend-sparse-ssa-cache-memory-explosion.md) — **self-backend sparse SSA cache memory explosion**
+  - resolved locally 2026-07-20
 - [self-backend-torture-phi-swap-and-minmax-zero-fold.md](self-backend-torture-phi-swap-and-minmax-zero-fold.md) — **self-backend torture cluster: phi parallel-copy swap + smin/smax-against-zero peephole**
   - resolved (2026-06-18)
 - [self-backend-valueclass-aggregate-call-signature.md](self-backend-valueclass-aggregate-call-signature.md) — **self-backend aggregate call signatures for valueclass payloads**

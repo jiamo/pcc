@@ -2194,11 +2194,12 @@ tasks:
 
   - id: TEST-P0-FULL-SUITE-BUILD-EFFICIENCY
     priority: P0
-    status: IN_PROGRESS
+    status: DONE_STRONG
     track: test-infrastructure/performance
     title: "Eliminate redundant full-runtime builds across the test tree without reducing coverage"
-    latest_evidence: ""
-    open_boundary: "Audit all tests for per-case forced archive rebuilds, large copytree setup, nested whole-file pytest invocations, duplicate parameter dimensions, and xdist oversubscription. Replace redundant identical work with immutable per-worker/session artifacts while retaining every semantic probe and mode boundary; add a regression guard and restore the documented full-suite time class."
+    latest_evidence: docs/goal/evidence/2026-07-20-full-suite-build-efficiency-closure.md
+    latest_update: "Immutable content-addressed runtime/self-host artifacts, audited nested work, fixed six-worker scheduling, and structural regression guards retain every mode/probe; exact non-integration and integration suites completed under bounded watchdogs."
+    open_boundary: ""
     milestone: M5
     depends_on: []
     rank: 990

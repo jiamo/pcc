@@ -346,6 +346,8 @@ def pcc_gc_alloc(size: int, type_tag: int, flags: int):
             memset(obj, 0, size)
             if backend == 4:
                 stored_flags = (stored_flags & ~65536) | 262144
+            elif backend == 3:
+                stored_flags = (stored_flags & ~4096) | 262144
     if ptr_is_null(obj):
         return obj
     store_i64(obj, 0, 1)

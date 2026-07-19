@@ -1204,8 +1204,19 @@ def _run_bootstrap_stage(
 
 def _seed_shared_stage1(out_dir: Path, shared_pcc1: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(shared_pcc1, _stage_bin(out_dir, 1))
-    os.chmod(_stage_bin(out_dir, 1), 0o755)
+    seeded_pcc1 = _stage_bin(out_dir, 1)
+    temporary_pcc1 = out_dir / f".pcc1.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        shutil.copy2(shared_pcc1, temporary_pcc1)
+        os.chmod(temporary_pcc1, 0o755)
+        # Do not truncate an existing Mach-O executable in place.  Darwin can
+        # retain vnode/code-sign state for the old inode and SIGKILL the
+        # byte-identical replacement at launch.  A fresh inode plus atomic
+        # rename also prevents another worker from observing a partial copy.
+        os.replace(temporary_pcc1, seeded_pcc1)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary_pcc1.unlink()
 
 
 def _run_stage2_3(
@@ -1501,6 +1512,24 @@ def test_bootstrap_gc_object_cache_warmup_is_disabled_with_cache(monkeypatch, tm
     monkeypatch.setenv("PCC_SELF_BACKEND_OBJECT_CACHE", "off")
 
     assert _bootstrap_effective_active_limit_locked(tmp_path, 5, 3) == 3
+
+
+def test_seed_shared_stage1_atomically_replaces_existing_executable(tmp_path):
+    shared_pcc1 = tmp_path / "shared-pcc1"
+    shared_pcc1.write_bytes(b"new-stage1")
+    os.chmod(shared_pcc1, 0o755)
+    out_dir = tmp_path / "gc3"
+    out_dir.mkdir()
+    seeded_pcc1 = out_dir / "pcc1"
+    seeded_pcc1.write_bytes(b"old-stage1")
+    os.chmod(seeded_pcc1, 0o755)
+    old_inode = seeded_pcc1.stat().st_ino
+
+    _seed_shared_stage1(out_dir, shared_pcc1)
+
+    assert seeded_pcc1.read_bytes() == b"new-stage1"
+    assert seeded_pcc1.stat().st_mode & 0o111
+    assert seeded_pcc1.stat().st_ino != old_inode
 
 
 def _fake_completed_backend_tree(

@@ -13,12 +13,11 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
-from tests.runtime_build_cache import cache_runtime_build
+from tests.runtime_build_cache import cached_c_runtime
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
@@ -51,24 +50,9 @@ def _cc() -> str:
     return os.environ.get("CC", "cc")
 
 
-@cache_runtime_build
 def _build_runtime(tmp_path: Path) -> Path:
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    result = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return work_runtime
+    del tmp_path
+    return cached_c_runtime()
 
 
 def test_pyclass_layout_matches_pcc_python_mirror(tmp_path):

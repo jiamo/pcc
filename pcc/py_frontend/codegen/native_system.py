@@ -411,14 +411,16 @@ class NativeSystemLoweringMixin:
         )
 
     def _try_emit_native_file_stream_print(self, call: Call) -> bool:
-        """Lower ``print(*args, file=sys.stderr|sys.stdout[, sep=, end=])``
-        natively using ``py_sys_X_write``. Returns ``True`` when the
-        dispatch fires; ``False`` lets the caller fall back to the
-        CPython ``print`` path.
+        """Lower ``print(*args, file=sys.stderr|sys.stdout, ...)`` natively.
+
+        The runtime helpers write directly to file descriptors 1 and 2, so a
+        bool-literal ``flush=`` is a no-op: there is no userspace stream buffer
+        left to flush.  A dynamic flush expression still falls back because
+        evaluating its truthiness can have observable behavior.
 
         Restrictions: ``sep`` / ``end`` must be string literals when
-        present (otherwise we'd need a runtime helper to read their
-        bytes). ``flush`` and any other kwargs trigger fallback.
+        present (otherwise we'd need a runtime helper to read their bytes).
+        Other kwargs trigger fallback.
         """
         file_expr = None
         sep_expr = None
@@ -430,6 +432,8 @@ class NativeSystemLoweringMixin:
                 sep_expr = v
             elif k == "end":
                 end_expr = v
+            elif k == "flush" and isinstance(v, BoolLit):
+                continue
             else:
                 return False
         if file_expr is None:

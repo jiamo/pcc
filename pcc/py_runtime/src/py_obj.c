@@ -287,10 +287,16 @@ PyObject *pcc_gc_alloc(int64_t size, int32_t type_tag, int32_t flags) {
     }
     if (h == NULL) {
         h = (PyObjectHeader *)calloc(1, (size_t)size);
-        if (h != NULL && backend == PCC_GC_KIND_COLORED_RELOCATING) {
-            stored_flags =
-                (stored_flags & ~PY_FLAG_GC_ZPAGE_ALLOC)
-                | PY_FLAG_GC_MALLOC_ALLOC;
+        if (h != NULL) {
+            if (backend == PCC_GC_KIND_COLORED_RELOCATING) {
+                stored_flags =
+                    (stored_flags & ~PY_FLAG_GC_ZPAGE_ALLOC)
+                    | PY_FLAG_GC_MALLOC_ALLOC;
+            } else if (backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
+                stored_flags =
+                    (stored_flags & ~PY_FLAG_GC_MINOR_ARENA)
+                    | PY_FLAG_GC_MALLOC_ALLOC;
+            }
         }
     }
     if (h == NULL) return NULL;

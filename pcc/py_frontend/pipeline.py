@@ -266,6 +266,7 @@ _PYTHON_IR_PASS_SPLIT_THRESHOLD_BYTES_ENV = "PCC_PYTHON_IR_PASS_SPLIT_THRESHOLD_
 _PYTHON_IR_PASS_SPLIT_SHARD_BYTES_ENV = "PCC_PYTHON_IR_PASS_SPLIT_SHARD_BYTES"
 _PYTHON_IR_PASS_SKIP_MODULE_PREFIXES_ENV = "PCC_PYTHON_IR_PASS_SKIP_MODULE_PREFIXES"
 _PY_FRONTEND_JOBS_ENV = "PCC_PY_FRONTEND_JOBS"
+_OUTER_PARALLELISM_ENV = "PCC_OUTER_PARALLELISM"
 _PY_FRONTEND_WORKER_TIMING_ENV = "PCC_PY_FRONTEND_WORKER_TIMING"
 _PY_FRONTEND_WORKER_ARG = "--pcc-python-multi-codegen-worker"
 _SELF_BACKEND_EMIT_WORKER_ARG = "--pcc-self-backend-emit-worker"
@@ -6862,6 +6863,19 @@ def _resolve_python_ir_pass_names(
     return pass_names
 
 
+def _parallel_cpu_budget() -> int:
+    """Return this process's fair share of CPUs under outer parallelism."""
+
+    cpu_count = max(1, os.cpu_count() or 1)
+    raw = str(os.environ.get(_OUTER_PARALLELISM_ENV, "") or "").strip()
+    try:
+        outer_parallelism = int(raw) if raw else 1
+    except ValueError:
+        outer_parallelism = 1
+    outer_parallelism = max(1, outer_parallelism)
+    return max(1, cpu_count // outer_parallelism)
+
+
 def _python_ir_pass_jobs(item_count: int) -> int:
     raw = str(os.environ.get(_PYTHON_IR_PASS_JOBS_ENV, "") or "").strip()
     if raw:
@@ -6870,7 +6884,7 @@ def _python_ir_pass_jobs(item_count: int) -> int:
         except ValueError:
             value = 1
     else:
-        value = min(12, os.cpu_count() or 1)
+        value = min(12, _parallel_cpu_budget())
     return max(1, min(max(1, item_count), value))
 
 
@@ -8895,7 +8909,7 @@ def _self_backend_jobs(n_modules: int) -> int:
         except ValueError:
             jobs = 1
         return max(1, min(n_modules, jobs))
-    cpu_count = os.cpu_count() or 1
+    cpu_count = _parallel_cpu_budget()
     return max(1, min(n_modules, cpu_count))
 
 
@@ -10359,7 +10373,7 @@ def _python_frontend_jobs(job_count_hint: int) -> int:
     if raw in ("0", "off", "false", "no"):
         return 1
     if raw in ("auto", "on", "true", "yes"):
-        jobs = os.cpu_count() or 1
+        jobs = _parallel_cpu_budget()
         # Frontend workers now split closed-world export discovery into
         # parallel shards, then run codegen workers with a shared export table.
         # On the bootstrap closure, eight to ten workers win; twelve starts to

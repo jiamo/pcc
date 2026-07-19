@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
-from tests.runtime_build_cache import cache_runtime_build
+from tests.runtime_build_cache import cached_threaded_c_runtime
 
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
@@ -17,31 +16,9 @@ def _cc() -> str:
     return os.environ.get("CC", "cc")
 
 
-@cache_runtime_build
 def _build_threaded_runtime(tmp_path: Path) -> Path:
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    result = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work_runtime),
-            "PCC_WITH_THREADS=1",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return work_runtime
+    del tmp_path
+    return cached_threaded_c_runtime()
 
 
 def test_concurrent_backend_starts_worker_and_assists_allocations(tmp_path):

@@ -2,9 +2,9 @@
 ``py_sys_X_write`` instead of falling back through CPython's print.
 
 Restrictions: ``sep`` / ``end`` must be string literals when present
-(non-literal forms still fall back). Other kwargs (e.g. ``flush``)
-also fall back — verify the negative case so future relaxation is
-deliberate.
+(non-literal forms still fall back). A bool-literal ``flush=`` is native for
+the built-in stdout/stderr streams because their helpers write directly to
+file descriptors; a dynamic flush expression still falls back.
 """
 from __future__ import annotations
 
@@ -20,7 +20,13 @@ _BUILD = _REPO_ROOT / "build"
 _BUILD.mkdir(parents=True, exist_ok=True)
 
 
-def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
+def _compile_to_ll(
+    source: str,
+    name: str,
+    *,
+    mode: str,
+    libpython_mode: str = "off",
+) -> str:
     from pcc.py_frontend.pipeline import compile_python
 
     src = _BUILD / f"{name}.py"
@@ -30,6 +36,7 @@ def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
         str(src), str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
+        libpython_mode=libpython_mode,
     )
     return out.read_text(encoding="utf-8")
 
@@ -79,10 +86,9 @@ def test_print_to_stdout_dispatches_natively(mode):
     assert "cpy.builtin.print" not in body, body
 
 
-def test_print_with_flush_kwarg_still_falls_back():
-    """``flush=True`` is not a kwarg we can lower through py_sys_X_write
-    (no native flush primitive), so confirm the dispatch correctly
-    declines and the cpy fallback fires."""
+@pytest.mark.parametrize("mode", ["off", "on"])
+def test_print_with_literal_flush_kwarg_dispatches_natively(mode):
+    """Direct fd writes have no userspace buffer for literal flush to drain."""
     program = textwrap.dedent(
         """
         import sys
@@ -91,11 +97,49 @@ def test_print_with_flush_kwarg_still_falls_back():
             print(msg, file=sys.stderr, flush=True)
         """
     )
-    ir = _compile_to_ll(program, "pflush", mode="off")
+    ir = _compile_to_ll(program, f"pflush_{mode}", mode=mode)
+    body = _function_body(ir, "f")
+    assert body is not None
+    assert "@py_sys_stderr_write" in body, body
+    assert "cpy.builtin.print" not in body, body
+
+
+def test_print_with_dynamic_flush_kwarg_falls_back_in_auto_mode():
+    program = textwrap.dedent(
+        """
+        import sys
+
+        def f(msg: str, should_flush: bool) -> None:
+            print(msg, file=sys.stderr, flush=should_flush)
+        """
+    )
+    ir = _compile_to_ll(
+        program,
+        "pflush_dynamic_auto",
+        mode="off",
+        libpython_mode="auto",
+    )
     body = _function_body(ir, "f")
     assert body is not None
     assert "@py_sys_stderr_write" not in body, body
     assert "cpy.builtin.print" in body, body
+
+
+def test_print_with_dynamic_flush_kwarg_is_rejected_in_no_libpython_mode():
+    program = textwrap.dedent(
+        """
+        import sys
+
+        def f(msg: str, should_flush: bool) -> None:
+            print(msg, file=sys.stderr, flush=should_flush)
+        """
+    )
+    ir = _compile_to_ll(program, "pflush_dynamic_off", mode="off")
+    body = _function_body(ir, "f")
+    assert body is not None
+    assert "@py_sys_stderr_write" not in body, body
+    assert "strict.nolib.stub" in body, body
+    assert "cpy.builtin.print" not in body, body
 
 
 @pytest.mark.parametrize("mode", ["off", "on"])

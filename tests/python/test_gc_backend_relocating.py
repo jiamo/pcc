@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
-from tests.runtime_build_cache import cached_threaded_pcc_python_runtime
+from tests.runtime_build_cache import cached_c_runtime, cached_threaded_pcc_python_runtime
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
-_RUNTIME_BUILD_CACHE: Path | None = None
 _PCC_PY_RUNTIME_BUILD_CACHE: Path | None = None
 
 
@@ -42,29 +40,8 @@ def _cc() -> str:
 
 
 def _build_runtime(tmp_path: Path) -> Path:
-    global _RUNTIME_BUILD_CACHE
-    if (
-        _RUNTIME_BUILD_CACHE is not None
-        and (_RUNTIME_BUILD_CACHE / "libpy_runtime.a").is_file()
-    ):
-        return _RUNTIME_BUILD_CACHE
-    work_runtime = tmp_path / "py_runtime"
-    shutil.copytree(
-        RUNTIME_DIR,
-        work_runtime,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    result = subprocess.run(
-        ["make", "-B", "-C", str(work_runtime), "libpy_runtime.a"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    _RUNTIME_BUILD_CACHE = work_runtime
-    return work_runtime
+    del tmp_path
+    return cached_c_runtime()
 
 
 def _build_pcc_py_runtime(tmp_path: Path) -> Path:

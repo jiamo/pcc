@@ -12,6 +12,11 @@ from pathlib import Path
 import pytest
 
 from pcc.macho_normalize import normalize_macho_metadata
+from tests.runtime_build_cache import (
+    cached_self_host_oracle_dir,
+    self_host_object_cache_dir,
+    self_host_source_key,
+)
 
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
@@ -4151,6 +4156,12 @@ _SELF_HOST_BUILD_TIMEOUT_SECONDS = 600
 def _child_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("LC_ALL", None)
+    env.setdefault("PCC_SELF_BACKEND_OBJECT_CACHE", "1")
+    env.setdefault(
+        "PCC_SELF_BACKEND_OBJECT_CACHE_DIR",
+        str(self_host_object_cache_dir()),
+    )
+    env["PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY"] = self_host_source_key()
     return env
 
 
@@ -4164,18 +4175,10 @@ def _supported_self_host() -> bool:
 
 
 def _shared_self_host_oracle_dir(tmp_path_factory, worker_id: str) -> Path:
-    """Return one artifact directory shared by every xdist worker.
+    """Return one source-addressed artifact directory for every worker/run."""
 
-    ``getbasetemp()`` is worker-specific under xdist; its parent is the
-    controller run directory shared by all workers.  The directory therefore
-    cannot leak artifacts across pytest invocations or source revisions.
-    """
-    base = tmp_path_factory.getbasetemp()
-    if worker_id != "master":
-        base = base.parent
-    shared = base / "self_host_oracle_shared"
-    shared.mkdir(parents=True, exist_ok=True)
-    return shared
+    del tmp_path_factory, worker_id
+    return cached_self_host_oracle_dir()
 
 
 @contextmanager
@@ -4307,6 +4310,18 @@ def pcc3_self_host_binary(tmp_path_factory, worker_id, pcc2_self_host_binary):
                 if temporary.exists():
                     temporary.unlink()
     return pcc3
+
+
+def test_000_self_host_oracle_stage_cache_warmup(
+    pcc1_self_host_binary,
+    pcc2_self_host_binary,
+    pcc3_self_host_binary,
+):
+    """Start the unavoidable stage chain early so it overlaps other tests."""
+
+    assert pcc1_self_host_binary.is_file()
+    assert pcc2_self_host_binary.is_file()
+    assert pcc3_self_host_binary.is_file()
 
 
 def _links_libpython(binary: Path) -> bool:

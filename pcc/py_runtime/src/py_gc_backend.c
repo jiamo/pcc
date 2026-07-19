@@ -6910,8 +6910,9 @@ static PyObject *pcc_gc_generational_oldify_copy(PyObject *from) {
             | PY_FLAG_GC_MINOR_ARENA
             | PY_FLAG_GC_REMEMBERED
             | PY_FLAG_GC_RELOCATION_CANDIDATE
+            | PY_FLAG_GC_MALLOC_ALLOC
         )
-    ) | PY_FLAG_GC_OLD;
+    ) | PY_FLAG_GC_OLD | PY_FLAG_GC_MALLOC_ALLOC;
     if (pcc_gc_relocate_copy_payload(from, to, size) != 0) {
         py_decref(to);
         return NULL;
@@ -8957,35 +8958,14 @@ void pcc_gc_free_object_memory(PyObject *o) {
     ) {
         return;
     }
-    /* Every live GC3 object has an explicit allocation-origin split: an arena
-     * object carries MINOR_ARENA, while fallback/copy-oldified heap objects do
-     * not. Zero flags are reserved for stale/non-owned shells below. The
-     * refcount release path normally removed a heap object's index node in
-     * pcc_gc_note_object_freeing already; an O(1) lookup here also makes direct
-     * helper callers safe. Do not fall through to the historical object-list /
-     * minor-block address scans: doing so made N old-object releases O(N^2). */
-    if (
-        pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
-        && flags != 0
-        && (flags & PY_FLAG_GC_MINOR_ARENA) == 0
-    ) {
-        pcc_gc_graph_lock();
-        PccGcObjectNode *dead =
-            (PccGcObjectNode *)pcc_gc_object_index_find(o);
-        if (dead != NULL) {
-            if (!pcc_gc_object_node_is_freeing(dead) && dead->size > 0) {
-                pcc_gc_live_bytes_subtract(dead->size);
-            }
-            (void)pcc_gc_object_index_remove(o);
-            pcc_gc_object_node_unlink(dead);
-            pcc_gc_object_node_release(dead);
-        }
-        pcc_gc_graph_unlock();
-        free(o);
-        return;
-    }
+    /* GC3 allocation origin is explicit.  MINOR_ARENA identifies a live arena
+     * object and MALLOC_ALLOC identifies fallback/oldified heap storage.  The
+     * object index remains authoritative when semantic GC flags overwrite the
+     * minor bit; never infer malloc ownership merely from non-zero color or
+     * generation bits. */
     if (
         (flags & PY_FLAG_GC_MINOR_ARENA) != 0
+        || pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
     ) {
         pcc_gc_graph_lock();
         PccGcObjectNode *dead = (PccGcObjectNode *)pcc_gc_object_index_find(o);
@@ -9014,6 +8994,13 @@ void pcc_gc_free_object_memory(PyObject *o) {
                 return;
             }
             pcc_gc_graph_unlock();
+            if (
+                pcc_gc_selected_backend
+                    == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+                && (flags & PY_FLAG_GC_MALLOC_ALLOC) == 0
+            ) {
+                return;
+            }
             free(o);
             return;
         }
@@ -9028,10 +9015,8 @@ void pcc_gc_free_object_memory(PyObject *o) {
             pcc_gc_minor_release_block(block);
             return;
         }
-        /* A normal GC3 heap object has color/generation bits. A zero-flag
-         * object reaching this late free path is a stale/non-owned shell; do
-         * not hand it to malloc. */
-        if (flags == 0) {
+        /* Only an explicit allocation-origin bit authorizes system free(). */
+        if ((flags & PY_FLAG_GC_MALLOC_ALLOC) == 0) {
             return;
         }
     }

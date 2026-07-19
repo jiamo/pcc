@@ -127,9 +127,11 @@ from pcc.backend.self_backend_ir import (
 from pcc.backend.self_backend_module_symbols import prepare_module_symbols
 from pcc.backend.self_backend_parse import (
     aggregate_literal_to_bytes,
+    decode_ssa_name,
     decode_value_token,
     parse_self_backend_module,
 )
+import pcc.backend.self_backend_parse as self_backend_parse
 from pcc.backend.self_backend_prepare import (
     prepare_module_for_target,
     prepare_parsed_function,
@@ -2708,6 +2710,16 @@ bb0:
     assert store_instr.data[3] == "gepconst:v:0"
     assert func.blocks[0].terminator.kind == "br"
     assert func.blocks[0].terminator.data == ("1",)
+
+
+def test_self_backend_sparse_numeric_ssa_names_do_not_allocate_dense_tables():
+    self_backend_parse._NUMERIC_SSA_NAME_CACHE.clear()
+    self_backend_parse._DOT_NUMERIC_SSA_NAME_CACHE.clear()
+
+    assert decode_ssa_name("%1000000") == "%1000000"
+    assert decode_ssa_name("%.1000000") == "%.1000000"
+    assert len(self_backend_parse._NUMERIC_SSA_NAME_CACHE) == 1
+    assert len(self_backend_parse._DOT_NUMERIC_SSA_NAME_CACHE) == 1
 
 
 def test_self_backend_parse_supports_select_and_flagged_scalar_ops():

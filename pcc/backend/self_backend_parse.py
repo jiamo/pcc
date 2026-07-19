@@ -181,8 +181,8 @@ _TYPED_INIT_RE = re.compile(rf"^(?P<type>{_TYPE_TOKEN})\s+(?P<init>.+)$")
 _NAMED_TYPES: dict[str, TypeDesc] = {}
 _TYPE_CACHE: dict[str, TypeDesc] = {}
 _CALL_SIGNATURE_CACHE: dict[str, tuple[int, bool]] = {}
-_NUMERIC_SSA_NAME_CACHE: list[str] = []
-_DOT_NUMERIC_SSA_NAME_CACHE: list[str] = []
+_NUMERIC_SSA_NAME_CACHE: dict[int, str] = {}
+_DOT_NUMERIC_SSA_NAME_CACHE: dict[int, str] = {}
 _SPLIT_NESTING_MARKERS = '"{}[]()<>'
 
 
@@ -649,19 +649,15 @@ def decode_ssa_name(token: str) -> str:
     name = match.group(1) or match.group(2)
     if name.isdigit():
         numeric_name = int(name)
-        while len(_NUMERIC_SSA_NAME_CACHE) <= numeric_name:
-            _NUMERIC_SSA_NAME_CACHE.append("")
-        cached_name = _NUMERIC_SSA_NAME_CACHE[numeric_name]
-        if not cached_name:
+        cached_name = _NUMERIC_SSA_NAME_CACHE.get(numeric_name)
+        if cached_name is None:
             cached_name = f"%{numeric_name}"
             _NUMERIC_SSA_NAME_CACHE[numeric_name] = cached_name
         return cached_name
     if len(name) > 1 and name.startswith(".") and name[1:].isdigit():
         numeric_name = int(name[1:])
-        while len(_DOT_NUMERIC_SSA_NAME_CACHE) <= numeric_name:
-            _DOT_NUMERIC_SSA_NAME_CACHE.append("")
-        cached_name = _DOT_NUMERIC_SSA_NAME_CACHE[numeric_name]
-        if not cached_name:
+        cached_name = _DOT_NUMERIC_SSA_NAME_CACHE.get(numeric_name)
+        if cached_name is None:
             cached_name = f"%.{numeric_name}"
             _DOT_NUMERIC_SSA_NAME_CACHE[numeric_name] = cached_name
         return cached_name

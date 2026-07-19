@@ -5,18 +5,17 @@ Provides immutable C and pcc-Python runtime archives used by native probes.
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
-from tests.python.process_timeout import run_process_group_timeout
-from tests.runtime_build_cache import cached_c_runtime, cached_pcc_python_runtime
+from tests.runtime_build_cache import (
+    cached_c_runtime,
+    cached_pcc_python_runtime,
+    cached_threaded_c_runtime,
+)
 
-_REPO = Path(__file__).absolute().parents[2]
+
 @pytest.fixture(scope="session")
 def c_runtime_archive() -> Path:
     """Return a content-addressed immutable default C runtime archive."""
@@ -26,32 +25,10 @@ def c_runtime_archive() -> Path:
 
 @pytest.fixture(scope="session")
 def threaded_c_runtime_archive(tmp_path_factory):
-    """Build one isolated threaded C runtime archive per pytest worker."""
+    """Return one content-addressed threaded archive across all workers."""
 
-    source = _REPO / "pcc" / "py_runtime"
-    work = tmp_path_factory.mktemp("threaded_c_runtime") / "py_runtime"
-    shutil.copytree(
-        source,
-        work,
-        ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
-        ),
-    )
-    result = subprocess.run(
-        [
-            "make",
-            "-B",
-            "-C",
-            str(work),
-            "PCC_WITH_THREADS=1",
-            "libpy_runtime.a",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return work / "libpy_runtime.a"
+    del tmp_path_factory
+    return cached_threaded_c_runtime() / "libpy_runtime.a"
 
 
 @pytest.fixture(scope="session")
