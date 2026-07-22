@@ -106,10 +106,12 @@ toolchains have done per-TU parallelism for 50 years. Within a single
 .ll the pass pipeline stays sequential — that part is correctly
 sequential by SSA dependency.
 
-**Landed 2026-05-02:** the self-backend link path now launches multiple
-host self-backend emitter subprocesses concurrently for multi-module
-links. `PCC_SELF_BACKEND_JOBS=N` controls the fanout; by default it uses
-up to the host CPU count, capped by module count. Assembly fragments are
+**Updated 2026-07-21:** the self-backend link path uses a bounded pool of
+emitter subprocesses for multi-module links. `PCC_SELF_BACKEND_JOBS=N`
+controls the fanout. Direct commands default to a conservative two-process
+pool; measured bootstrap commands retain their explicit higher override. Each
+pool process consumes multiple object jobs from a versioned manifest instead
+of starting one complete compiler process per object. Assembly fragments are
 still joined in input-module order so bootstrap reproducibility does not
 depend on completion order.
 

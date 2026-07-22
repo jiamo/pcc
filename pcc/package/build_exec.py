@@ -8,6 +8,7 @@ metadata and explicit toolchain paths rather than package-specific rules.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -18,7 +19,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from pcc.package_schema import PCC_CAPI_HEADERS
+from pcc.package_schema import PCC_CAPI_HEADERS, pcc_native_extension_suffix
 
 from .build_plan import (
     BuildCommand,
@@ -26,7 +27,7 @@ from .build_plan import (
     load_meson_introspection_commands,
 )
 from .linkage import linkage_report
-from .metadata import inspect_artifact, is_build_relevant_path
+from .metadata import current_platform_tag, inspect_artifact, is_build_relevant_path
 from .toolchain import toolchain_report
 
 _C_SUFFIXES = {".c"}
@@ -352,6 +353,179 @@ def _meson_build_dir_from_intro_path(root: Path, intro_path: Path | None) -> Pat
     return root / "build" / "pcc-package" / "meson-build"
 
 
+def _meson_shared_extension_targets(root: Path) -> dict[str, str]:
+    """Map import-qualified module names to Meson target paths."""
+
+    intro_path = _meson_intro_targets_path(root)
+    if intro_path is None:
+        return {}
+    build_dir = _meson_build_dir_from_intro_path(root, intro_path).resolve()
+    try:
+        entries = json.loads(intro_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(entries, list):
+        return {}
+    targets: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "shared module":
+            continue
+        filenames = entry.get("filename")
+        if not isinstance(filenames, list):
+            continue
+        for raw_filename in filenames:
+            filename = Path(str(raw_filename)).expanduser()
+            if not filename.is_absolute():
+                filename = build_dir / filename
+            try:
+                relative = filename.resolve().relative_to(build_dir)
+            except ValueError:
+                continue
+            if relative.suffix.lower() not in {".so", ".pyd", ".dll", ".dylib"}:
+                continue
+            module_leaf = relative.stem.split(".", 1)[0]
+            module = ".".join((*relative.parent.parts, module_leaf))
+            targets[module] = relative.as_posix()
+    return targets
+
+
+def _module_source(
+    root: Path, build_dir: Path, module: str
+) -> tuple[Path | None, bool]:
+    parts = module.split(".")
+    for base in (build_dir, root):
+        module_file = base.joinpath(*parts).with_suffix(".py")
+        package_file = base.joinpath(*parts, "__init__.py")
+        if module_file.is_file():
+            return module_file, False
+        if package_file.is_file():
+            return package_file, True
+    return None, False
+
+
+def _module_scope_imports(statements: list[ast.stmt]):
+    """Yield imports executed in module control flow, excluding lazy bodies."""
+
+    for statement in statements:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            yield statement
+            continue
+        if isinstance(
+            statement,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            continue
+        for _, value in ast.iter_fields(statement):
+            if (
+                isinstance(value, list)
+                and value
+                and all(isinstance(item, ast.stmt) for item in value)
+            ):
+                yield from _module_scope_imports(value)
+
+
+def _import_candidates(
+    node: ast.Import | ast.ImportFrom, package: str
+) -> tuple[str, ...]:
+    if isinstance(node, ast.Import):
+        return tuple(alias.name for alias in node.names)
+    if node.level:
+        parts = package.split(".") if package else []
+        keep = max(0, len(parts) - node.level + 1)
+        base = ".".join(parts[:keep])
+        if node.module:
+            base = ".".join(item for item in (base, node.module) if item)
+    else:
+        base = node.module or ""
+    candidates = [base] if base else []
+    candidates.extend(
+        ".".join(item for item in (base, alias.name) if item)
+        for alias in node.names
+        if alias.name != "*"
+    )
+    return tuple(candidates)
+
+
+def discover_eager_meson_extension_targets(
+    name: str, path: str | Path
+) -> tuple[dict[str, str], ...]:
+    """Find Meson extensions reachable from package module-scope imports.
+
+    This is deliberately package-neutral. Imports nested inside functions or
+    classes are lazy and do not belong to the package's import-time extension
+    closure.
+    """
+
+    root = Path(path).expanduser().resolve()
+    intro_path = _meson_intro_targets_path(root)
+    if intro_path is None:
+        return ()
+    build_dir = _meson_build_dir_from_intro_path(root, intro_path).resolve()
+    targets = _meson_shared_extension_targets(root)
+    if not targets:
+        return ()
+    normalized_name = name.lower().replace("-", "_")
+    seeds: list[str] = []
+    direct_packages: set[str] = set()
+    for base in (build_dir, root):
+        try:
+            children = sorted(base.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            if child.is_dir() and (child / "__init__.py").is_file():
+                direct_packages.add(child.name)
+    preferred = sorted(
+        item
+        for item in direct_packages
+        if item.lower().replace("-", "_") == normalized_name
+    )
+    seeds.extend(preferred or sorted(direct_packages))
+
+    seen: set[str] = set()
+    queue = list(seeds)
+    selected: list[dict[str, str]] = []
+    suffix = pcc_native_extension_suffix(current_platform_tag())
+    while queue:
+        module = queue.pop(0)
+        if module in seen:
+            continue
+        seen.add(module)
+        target = targets.get(module)
+        if target is not None:
+            relative = Path(target)
+            output = relative.with_name(relative.stem.split(".", 1)[0] + suffix)
+            selected.append(
+                {
+                    "module": module,
+                    "target": target,
+                    "output": str((build_dir / output).resolve()),
+                }
+            )
+            continue
+        source, is_package = _module_source(root, build_dir, module)
+        if source is None:
+            continue
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        package = module if is_package else module.rpartition(".")[0]
+        for import_node in _module_scope_imports(tree.body):
+            for candidate in _import_candidates(import_node, package):
+                if not any(
+                    candidate == seed or candidate.startswith(seed + ".")
+                    for seed in seeds
+                ):
+                    continue
+                candidate_source, _ = _module_source(root, build_dir, candidate)
+                if candidate not in seen and (
+                    candidate in targets or candidate_source is not None
+                ):
+                    queue.append(candidate)
+    return tuple(selected)
+
+
 def _meson_ninja_target(build_dir: Path, raw_path: str) -> str:
     path = Path(raw_path)
     try:
@@ -498,6 +672,17 @@ def _resolve_command_tool(token: str, search_paths: list[str] | tuple[str, ...])
         return token
     found = shutil.which(token, path=_path_env(search_paths))
     return found or token
+
+
+def _compiler_behind_launcher(command: list[str]) -> str | None:
+    """Return the compiler executable from a possibly launcher-prefixed command."""
+
+    if not command:
+        return None
+    launcher = Path(command[0]).name
+    if launcher in {"ccache", "sccache", "distcc", "icecc"} and len(command) > 1:
+        return command[1]
+    return command[0]
 
 
 def _run_action(
@@ -894,7 +1079,7 @@ def execute_build_actions(
 
     selected_cxx_linker: str | None = None
     if graph_commands:
-        if from_meson_introspection:
+        if from_meson_introspection or target_replay is not None:
             build_root = _meson_build_dir_from_intro_path(
                 root, _meson_intro_targets_path(root)
             )
@@ -947,7 +1132,9 @@ def execute_build_actions(
             if command:
                 command[0] = _resolve_command_tool(command[0], search_paths)
             if command and build_command.language == "cxx":
-                selected_cxx_linker = command[0]
+                compiler = _compiler_behind_launcher(command)
+                if compiler is not None:
+                    selected_cxx_linker = _resolve_command_tool(compiler, search_paths)
             if pcc_native_capi_dir is not None and build_command.language in {
                 "c",
                 "cxx",
@@ -1257,6 +1444,126 @@ def execute_build_actions(
     }
 
 
+def execute_eager_meson_extensions(
+    name: str,
+    path: str | Path,
+    *,
+    execute: bool = False,
+    jobs: int = 1,
+    timeout: int = 30,
+) -> dict[str, object]:
+    """Configure Meson and replay the package's eager extension closure."""
+
+    root = Path(path).expanduser().resolve()
+    metadata = inspect_artifact(name, root)
+    build_dir = root / "build" / "pcc-package" / "meson-build"
+    actions: list[dict[str, object]] = []
+    target_reports: list[dict[str, object]] = []
+    diagnostics: list[dict[str, object]] = []
+    wrappers = None
+    search_paths: list[str] = []
+    try:
+        if execute:
+            from .install import _build_requirement_tool_wrappers
+
+            wrappers = _build_requirement_tool_wrappers(metadata.pyproject_requires)
+            if wrappers is not None:
+                search_paths.append(wrappers.name)
+        if not (build_dir / "build.ninja").is_file():
+            setup_command = _meson_setup_command(root, build_dir, search_paths)
+            setup = _run_action(
+                kind="meson_setup",
+                command=setup_command,
+                source=None,
+                output=build_dir,
+                cwd=root,
+                execute=execute,
+                search_paths=search_paths,
+                timeout=timeout,
+            )
+            setup["stdout"] = str(setup.get("stdout") or "")[-4000:]
+            setup["stderr"] = str(setup.get("stderr") or "")[-4000:]
+            actions.append(setup)
+            if execute and setup["status"] != "passed":
+                diagnostics.append(
+                    {
+                        "code": "PCC-PKG-MESON-SETUP-FAILED",
+                        "message": "Meson setup failed before pcc-native target replay",
+                    }
+                )
+                return {
+                    "ok": False,
+                    "build_backend": "host",
+                    "host_assisted": True,
+                    "selection": "module_scope_eager_import_closure",
+                    "actions": actions,
+                    "targets": target_reports,
+                    "diagnostics": diagnostics,
+                }
+        selected = discover_eager_meson_extension_targets(name, root)
+        for row in selected:
+            report = execute_build_actions(
+                name,
+                root,
+                search_paths=search_paths,
+                execute=execute,
+                from_compile_commands=True,
+                meson_target=row["target"],
+                link_output=row["output"],
+                abi_mode="pcc-native",
+                jobs=max(1, jobs),
+                timeout=timeout,
+            )
+            failed = [
+                action
+                for action in report["actions"]
+                if action["status"] not in {"passed", "planned"}
+            ]
+            target_row: dict[str, object] = dict(row)
+            target_row.update(
+                {
+                    "ok": report["ok"],
+                    "action_count": len(report["actions"]),
+                    "failed_actions": [
+                        {
+                            "kind": action["kind"],
+                            "source": action.get("source"),
+                            "stderr": str(action.get("stderr") or "")[-4000:],
+                        }
+                        for action in failed[:3]
+                    ],
+                    "diagnostics": report["diagnostics"],
+                    "linkage": report["linkage"],
+                }
+            )
+            target_reports.append(target_row)
+            actions.append(
+                {
+                    "kind": "pcc_native_meson_target",
+                    "module": row["module"],
+                    "target": row["target"],
+                    "output": row["output"],
+                    "status": "passed" if report["ok"] else "failed",
+                    "action_count": len(report["actions"]),
+                }
+            )
+        ok = all(bool(report["ok"]) for report in target_reports)
+        return {
+            "ok": ok,
+            "skipped": not bool(target_reports),
+            "reason": None if target_reports else "no_eager_extension_targets",
+            "build_backend": "host",
+            "host_assisted": True,
+            "selection": "module_scope_eager_import_closure",
+            "actions": actions,
+            "targets": target_reports,
+            "diagnostics": diagnostics,
+        }
+    finally:
+        if wrappers is not None:
+            wrappers.cleanup()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pcc.package build-exec")
     parser.add_argument("name", nargs="?", default="package")
@@ -1277,29 +1584,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--enforce-generated-c", action="store_true")
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--eager-meson-extensions", action="store_true")
+    parser.add_argument("--report", default=None)
     parser.add_argument("--json", action="store_true")
     ns = parser.parse_args(argv)
-    report = execute_build_actions(
-        ns.name,
-        ns.path,
-        search_paths=ns.search_path,
-        include_dirs=ns.include_dir,
-        library_dirs=ns.library_dir,
-        execute=ns.execute,
-        regenerate_cython=ns.regenerate_cython,
-        run_f2py=ns.run_f2py,
-        link_output=ns.link_output,
-        libraries=ns.library,
-        abi_mode=ns.abi_mode,
-        from_compile_commands=ns.from_compile_commands,
-        from_meson_introspection=ns.from_meson_introspection,
-        meson_target=ns.meson_target,
-        configure_meson=ns.configure_meson,
-        enforce_generated_c=ns.enforce_generated_c,
-        jobs=ns.jobs,
-        timeout=ns.timeout,
-    )
-    print(json.dumps(report, indent=2, sort_keys=True))
+    if ns.eager_meson_extensions:
+        report = execute_eager_meson_extensions(
+            ns.name,
+            ns.path,
+            execute=ns.execute,
+            jobs=ns.jobs,
+            timeout=ns.timeout,
+        )
+    else:
+        report = execute_build_actions(
+            ns.name,
+            ns.path,
+            search_paths=ns.search_path,
+            include_dirs=ns.include_dir,
+            library_dirs=ns.library_dir,
+            execute=ns.execute,
+            regenerate_cython=ns.regenerate_cython,
+            run_f2py=ns.run_f2py,
+            link_output=ns.link_output,
+            libraries=ns.library,
+            abi_mode=ns.abi_mode,
+            from_compile_commands=ns.from_compile_commands,
+            from_meson_introspection=ns.from_meson_introspection,
+            meson_target=ns.meson_target,
+            configure_meson=ns.configure_meson,
+            enforce_generated_c=ns.enforce_generated_c,
+            jobs=ns.jobs,
+            timeout=ns.timeout,
+        )
+    rendered = json.dumps(report, indent=2, sort_keys=True)
+    if ns.report:
+        report_path = Path(ns.report).expanduser()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
     return 0 if report["ok"] else 2
 
 

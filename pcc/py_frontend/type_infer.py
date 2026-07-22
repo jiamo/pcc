@@ -313,6 +313,11 @@ _BUILTIN_TYPES: dict[str, Type] = {
         params=(TYPE_DYN,),
         ret=TYPE_SET,
     ),
+    "globals": FuncType(
+        name="callable",
+        params=(),
+        ret=DictType(name="dict", key=TYPE_STR, value=TYPE_DYN),
+    ),
     "frozenset": FuncType(
         name="callable",
         params=(TYPE_DYN,),

@@ -16,6 +16,7 @@ from ..py_ast import (
     ListType,
     Name,
     NoneLit,
+    SetType,
     TupleExpr,
     TupleType,
 )
@@ -191,9 +192,10 @@ class ListBuiltinLoweringMixin:
             self.builder.branch(cond_bb)
             self.builder.position_at_end(end_bb)
             return new_list
-        if isinstance(arg_ty, (DynType, ClassType)):
-            # DynType / a user-class instance may be iterator-only (generator,
-            # or a custom __iter__/__next__ class: no length / __getitem__).
+        if isinstance(arg_ty, (DynType, ClassType, SetType)):
+            # DynType / a user-class instance / a set may be iterator-only
+            # (generator, custom __iter__/__next__, or unordered set: no
+            # positional __getitem__).
             # Consume via the iterator protocol — matching CPython's list(x),
             # the statement for-loop, and the comprehension path. Previously a
             # ClassType went through the py_obj_len + py_obj_getitem arm below,

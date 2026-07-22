@@ -20,21 +20,32 @@ Historical startup ledger:
 ## Active milestone
 
 - Milestone: `M5`
-- Tasks in milestone: `82`
+- Tasks in milestone: `92`
 - `BLOCKED`: `2`
 - `CLAIM_RISK`: `1`
-- `DONE_STRONG`: `79`
-- Next dependency-ready task: `DIST-P1-MULTI-MAC-TRANSPORT-E2E`
-- Next title: Prove the owned transport and collectives across multiple Macs
-- Next open boundary: Authenticated remote admission, explicit two-host/rank configuration, bounded cleanup, and the strict collective gate are implemented and locally covered. DONE_STRONG now requires concurrent passing strict-gate summaries from two reachable physical Macs; this environment has no PCC_DIST cluster inputs or second rank. Localhost success and SKIPPED_WITH_REASON remain non-proof.
+- `DONE_STRONG`: `84`
+- `TODO_READY`: `5`
+- Next dependency-ready task: `CLI-P0-PCC1-OWNER-DEFAULTS`
+- Next title: Make bare pcc1 Python execution default to the self owner with no libpython
+- Next open boundary: For Python inputs only, make pcc1 resolve an omitted backend to self, libpython mode to off, and IR scaffold to on. Preserve explicit --backend llvm as the oracle and explicit libpython auto/on as compatibility modes. Fail closed on unsupported self behavior with no implicit LLVM or libpython fallback.
 
 ## Active task table
 
 | Rank | ID | Status | Depends on | Evidence |
 |---:|---|---|---|---|
+| 69 | `C-P0-FAKE-DLFCN-RTLD-LAZY` | `DONE_STRONG` | PKG-P0-NETWORK-ACQUISITION-BACKENDS | docs/goal/evidence/2026-07-22-fake-dlfcn-rtld-lazy-runtime-oracle.md |
+| 69 | `TEST-P0-PACKAGE-ABI-UTF8-SOURCE-READ` | `DONE_STRONG` | C-P0-FAKE-DLFCN-RTLD-LAZY | docs/goal/evidence/2026-07-22-package-abi-utf8-source-read.md |
+| 70 | `PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL` | `DONE_STRONG` | TEST-P0-FULL-SUITE-BUILD-EFFICIENCY, PKG-P0-NETWORK-ACQUISITION-BACKENDS, C-P0-FAKE-DLFCN-RTLD-LAZY, TEST-P0-PACKAGE-ABI-UTF8-SOURCE-READ | docs/goal/evidence/2026-07-22-self-backend-bounded-worker-pool.md |
+| 71 | `TEST-P0-FULL-GC-MEMORY-BUDGET` | `DONE_STRONG` | PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL | docs/goal/evidence/2026-07-22-full-gc-aggregate-memory-budget.md |
+| 75 | `PKG-P0-NETWORK-ACQUISITION-BACKENDS` | `DONE_STRONG` | PKG-P0-INSTALL-IMPORT-SEPARATION, PKG-P0-ABI-MODE-LABELS, M2-NUMPY-L5 | docs/goal/evidence/2026-07-21-network-acquisition-backends-closure.md |
+| 80 | `CLI-P0-PCC1-OWNER-DEFAULTS` | `TODO_READY` | PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL | - |
+| 85 | `PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT` | `TODO_READY` | PKG-P0-NETWORK-ACQUISITION-BACKENDS, CLI-P0-PCC1-OWNER-DEFAULTS | - |
 | 90 | `GPU-P0-OWNER-BACKEND-CONTRACT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-16-gpu-owner-backend-contract.md |
+| 90 | `PKG-P0-UV-PROJECT-ENVIRONMENT` | `TODO_READY` | PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT | - |
 | 100 | `GPU-P0-PCC-METAL-OWNER-DRIVER` | `DONE_STRONG` | GPU-P0-OWNER-BACKEND-CONTRACT | docs/goal/evidence/2026-07-17-pcc-metal-owner-driver.md |
+| 100 | `PKG-P1-UV-LOCKED-NATIVE-SYNC` | `TODO_READY` | PKG-P0-UV-PROJECT-ENVIRONMENT | - |
 | 110 | `GPU-P0-TVM-TILELANG-OWNER-DRIVER` | `DONE_STRONG` | GPU-P0-PCC-METAL-OWNER-DRIVER | docs/goal/evidence/2026-07-17-tvm-tilelang-owner-driver.md |
+| 110 | `PKG-P1-RUNTIME-PROFILE-ENVIRONMENT-INVARIANCE` | `TODO_READY` | PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT | - |
 | 990 | `TEST-P0-FULL-SUITE-BUILD-EFFICIENCY` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-20-full-suite-build-efficiency-closure.md |
 | 1000 | `AUD-P0-CLAUDE-LOW-RISK-FIXES` | `DONE_STRONG` | - | docs/current-goal-state.md |
 | 1000 | `AUD-P0-GC-BARRIER-WRITE-AUDIT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-gc-barrier-peripheral-runtime-closure.md |

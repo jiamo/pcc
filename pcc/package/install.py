@@ -633,6 +633,15 @@ def _copy_importable_payload(
     source: Path, site: Path, metadata_name: str
 ) -> tuple[Path, list[str]]:
     importable = list(_iter_importable_roots(source))
+    preferred = [
+        payload
+        for payload in importable
+        if payload.is_dir()
+        and _normalized_package_name(payload.name)
+        == _normalized_package_name(metadata_name)
+    ]
+    if preferred:
+        importable = preferred
     if not importable:
         install_root = site / metadata_name
         if install_root.exists():
@@ -663,7 +672,7 @@ def _copy_importable_payload(
 
 
 def _overlay_meson_build_payloads(
-    source: Path, site: Path, installed: list[str]
+    source: Path, site: Path, installed: list[str], metadata_name: str
 ) -> list[str]:
     """Overlay pcc-managed Meson build outputs onto an installed source tree.
 
@@ -677,7 +686,17 @@ def _overlay_meson_build_payloads(
         return installed
     payloads = list(installed)
     seen = set(payloads)
-    for payload in _iter_importable_roots(build_root):
+    importable = list(_iter_importable_roots(build_root))
+    preferred = [
+        payload
+        for payload in importable
+        if payload.is_dir()
+        and _normalized_package_name(payload.name)
+        == _normalized_package_name(metadata_name)
+    ]
+    if preferred:
+        importable = preferred
+    for payload in importable:
         if payload.is_dir():
             dest = site / payload.name
             dest.mkdir(parents=True, exist_ok=True)
@@ -729,7 +748,13 @@ def _copy_or_extract(
     site.mkdir(parents=True, exist_ok=True)
     if source.is_dir():
         install_root, installed = _copy_importable_payload(source, site, metadata_name)
-        return install_root, _overlay_meson_build_payloads(source, site, installed)
+        installed = _overlay_meson_build_payloads(
+            source, site, installed, metadata_name
+        )
+        preferred_root = site / metadata_name.replace("-", "_")
+        if preferred_root.is_dir():
+            install_root = preferred_root
+        return install_root, installed
 
     lower = source.name.lower()
     install_root = site / metadata_name
@@ -846,7 +871,11 @@ def _ensure_meson_build_outputs(
             if setup.returncode != 0:
                 return {"ok": False, "skipped": False, "actions": actions}
         ninja = shutil.which("ninja", path=path_env) or "ninja"
-        build_command = [ninja, "-C", str(build_dir)]
+        try:
+            build_jobs = max(1, int(os.environ.get("PCC_PACKAGE_BUILD_JOBS", "2")))
+        except ValueError:
+            build_jobs = 2
+        build_command = [ninja, "-C", str(build_dir), "-j", str(build_jobs)]
         build = subprocess.run(
             build_command,
             cwd=source,

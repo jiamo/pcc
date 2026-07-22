@@ -13142,6 +13142,47 @@ def _compile_silent_null_init_extension(tmp_path: Path) -> Path:
     )
 
 
+def _compile_numpy_25_capi_batch_extension(tmp_path: Path) -> Path:
+    return _compile_extension(
+        tmp_path,
+        "capi25",
+        "#define PY_SSIZE_T_CLEAN\n"
+        "#include <Python.h>\n"
+        "static PyTypeObject SequenceType = {\n"
+        "    PyVarObject_HEAD_INIT(NULL, 0)\n"
+        '    .tp_name = "capi25.Sequence",\n'
+        "    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_SEQUENCE,\n"
+        "};\n"
+        "static PyObject *probe(PyObject *self, PyObject *args) {\n"
+        "    long score = 0;\n"
+        "    PyObject *zero = PyLong_FromLong(0);\n"
+        "    PyObject *one = PyLong_FromLong(1);\n"
+        '    PyObject *text = PyUnicode_FromString("ok");\n'
+        "    PyObject *copy = NULL;\n"
+        "    (void)self; (void)args;\n"
+        "    if (PYMEM_DOMAIN_RAW == 0) score += 1;\n"
+        "    if (PyLong_IsZero(zero) == 1 && PyLong_IsZero(one) == 0) score += 2;\n"
+        "    copy = PyUnicode_FromObject(text);\n"
+        "    if (copy == text) score += 4;\n"
+        "    PyType_Modified(&SequenceType);\n"
+        "    score += 8;\n"
+        "    if (SequenceType.tp_flags & Py_TPFLAGS_SEQUENCE) score += 16;\n"
+        "    if (PyLong_IsZero(text) == -1 && PyErr_ExceptionMatches(PyExc_TypeError)) score += 32;\n"
+        "    PyErr_Clear();\n"
+        "    Py_XDECREF(copy); Py_DECREF(text); Py_DECREF(one); Py_DECREF(zero);\n"
+        "    return PyLong_FromLong(score);\n"
+        "}\n"
+        "static PyMethodDef Methods[] = {\n"
+        '    {"probe", probe, METH_VARARGS, "probe NumPy 2.5 C-API batch"},\n'
+        "    {NULL, NULL, 0, NULL},\n"
+        "};\n"
+        "static PyModuleDef module = {\n"
+        '    PyModuleDef_HEAD_INIT, "capi25", NULL, -1, Methods,\n'
+        "};\n"
+        "PyMODINIT_FUNC PyInit_capi25(void) { return PyModule_Create(&module); }\n",
+    )
+
+
 def _compile_main(
     site: Path, main: Path, exe: Path
 ) -> subprocess.CompletedProcess[str]:
@@ -13226,6 +13267,58 @@ def test_pcc_native_extension_import_runs_under_self_backend_no_libpython(tmp_pa
     )
     assert run.returncode == 0, run.stderr
     assert run.stdout.strip() == "5"
+
+
+def test_relative_extension_import_publishes_wrapper_module_binding(tmp_path):
+    site = _compile_extension(
+        tmp_path,
+        "_native",
+        "#define PY_SSIZE_T_CLEAN\n"
+        "#include <Python.h>\n"
+        "static struct PyModuleDef module = {\n"
+        "    PyModuleDef_HEAD_INIT, \"_native\", NULL, -1, NULL,\n"
+        "};\n"
+        "PyMODINIT_FUNC PyInit__native(void) { return PyModule_Create(&module); }\n",
+    )
+    package = site / "pkg"
+    package.mkdir()
+    (site / "_native.so").replace(package / "_native.so")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "wrapper.py").write_text(
+        "from . import _native\n"
+        + "".join(f"module_value_{index} = {index}\n" for index in range(200)),
+        encoding="utf-8",
+    )
+    main = tmp_path / "main.py"
+    main.write_text(
+        "import pkg.wrapper as wrapper\n"
+        "print(hasattr(wrapper, '_native'))\n"
+        "print(wrapper._native.__name__)\n",
+        encoding="utf-8",
+    )
+    exe = tmp_path / "main_bin"
+
+    compiled = _compile_main(site, main, exe)
+    assert compiled.returncode == 0, compiled.stderr
+    run = _run_main(site, exe, {"PCC_PACKAGE_SITE": ""})
+
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "True\n_native\n"
+
+
+def test_pcc_native_extension_numpy_25_capi_batch_under_self_backend_no_libpython(
+    tmp_path,
+):
+    site = _compile_numpy_25_capi_batch_extension(tmp_path)
+    main = tmp_path / "main.py"
+    main.write_text("import capi25\nprint(capi25.probe())\n", encoding="utf-8")
+    exe = tmp_path / "main_bin"
+
+    compiled = _compile_main(site, main, exe)
+    assert compiled.returncode == 0, compiled.stderr
+    run = _run_main(site, exe)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == "63"
 
 
 def test_pcc_native_extension_star_import_publishes_compiled_module_names(tmp_path):
@@ -13932,8 +14025,7 @@ def test_pcc_native_type_number_slot_subtract_under_self_backend_no_libpython(
     run = _run_main(site, exe)
     assert run.returncode == 0, run.stderr
     assert (
-        "typenum 5 9 False True True 13 11 9.5 9.5 36 18 4.5 2.0"
-        in run.stdout
+        "typenum 5 9 False True True 13 11 9.5 9.5 36 18 4.5 2.0" in run.stdout
     ), run.stdout
 
 

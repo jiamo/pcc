@@ -285,6 +285,12 @@ class NativeOsLoweringMixin:
                 ],
                 name=self._fresh("os.pcc_http_download_to_file"),
             )
+        if name == "_pcc_sha256_file_hex" and len(expr.args) == 1:
+            return self.builder.call(
+                self.runtime["py_sha256_file_hex"],
+                [self._emit_as_object(expr.args[0])],
+                name=self._fresh("os.pcc_sha256_file_hex"),
+            )
         return None
 
     def _emit_native_os_uname_attr(self, expr: Attr) -> Optional[ir.Value]:

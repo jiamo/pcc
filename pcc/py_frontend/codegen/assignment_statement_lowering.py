@@ -28,6 +28,7 @@ from ..py_ast import (
     Name,
     NoneType,
     Slice,
+    SetType,
     StrLit,
     StrType,
     Subscript,
@@ -1167,6 +1168,96 @@ class AssignmentStatementLoweringMixin:
             self._gc_release_if_owned(tup_obj, rhs)
             return
 
+        if isinstance(rhs_ty, SetType):
+            # Sets are iterable but deliberately not subscriptable.  Check the
+            # exact unpack arity before materialising iteration order into a
+            # temporary list, then reuse the normal owned-result stores.
+            set_val = self._emit_expr(rhs)
+            set_obj = marshal.marshal_to_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                set_val,
+                rhs_ty,
+            )
+            actual_n = self.builder.call(
+                self.runtime["py_obj_len"],
+                [set_obj],
+                name=self._fresh("unpack.set.len"),
+            )
+            arity_ok = self.builder.icmp_signed(
+                "==",
+                actual_n,
+                ir.Constant(_I64, len(target.elems)),
+                name=self._fresh("unpack.set.arity.ok"),
+            )
+            fn = self.current_function
+            arity_ok_bb = fn.append_basic_block(
+                name=self._fresh("unpack.set.arity.match")
+            )
+            arity_bad_bb = fn.append_basic_block(
+                name=self._fresh("unpack.set.arity.mismatch")
+            )
+            self.builder.cbranch(arity_ok, arity_ok_bb, arity_bad_bb)
+            self.builder.position_at_end(arity_bad_bb)
+            arity_msg = self._ptr_to_cstr(
+                self._cstr_global(
+                    "cannot unpack set: arity mismatch "
+                    f"(expected {len(target.elems)})",
+                    ".set.unpack.arity",
+                )
+            )
+            arity_exc = self.builder.call(
+                self.runtime["py_exc_new"],
+                [ir.Constant(_I64, 2), arity_msg],
+                name=self._fresh("unpack.set.arity.exc"),
+            )
+            self.builder.call(self.runtime["py_raise"], [arity_exc])
+            arity_err_target = (
+                getattr(self, "_try_err_block", None) or self._ensure_fn_err_exit()
+            )
+            self.builder.branch(arity_err_target)
+            self.builder.position_at_end(arity_ok_bb)
+
+            unpack_list = self.builder.call(
+                self.runtime["py_list_new"],
+                [ir.Constant(_I64, 0)],
+                name=self._fresh("unpack.set.list"),
+            )
+            self._emit_list_append_via_iter(
+                unpack_list,
+                set_obj,
+                getattr(rhs, "span", None),
+            )
+            elem_ty = rhs_ty.elem
+            for i, lhs in enumerate(target.elems):
+                elem_obj = self.builder.call(
+                    self.runtime["py_list_get"],
+                    [unpack_list, ir.Constant(_I64, i)],
+                    name=self._fresh(f"unpack.set.{i}"),
+                )
+                native_val = elem_obj
+                if not _assign_is_dyn_type(elem_ty):
+                    native_val = marshal.marshal_from_object(
+                        self.builder,
+                        self.module,
+                        self.runtime,
+                        elem_obj,
+                        elem_ty,
+                    )
+                self._store_unpack_target(
+                    lhs,
+                    native_val,
+                    elem_ty,
+                    value_is_owned=True,
+                )
+            self._gc_release(
+                unpack_list,
+                self._release_context_label("unpack.set.list"),
+            )
+            self._gc_release_if_owned(set_obj, rhs)
+            return
+
         # DynType / ListType / TupleType-with-unknown-arity RHS:
         # assume a runtime sequence (any ``py_obj_getitem`` /
         # ``py_list_get``-friendly container). Indices are generated at
@@ -1471,6 +1562,25 @@ class AssignmentStatementLoweringMixin:
                 "%": 5,
             }.get(op_bare)
             if (
+                isinstance(declared_ty, SetType)
+                and isinstance(stmt.value.ty, (SetType, DynType))
+                and op_bare in ("|", "&", "-", "^")
+            ):
+                rhs_obj = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    rhs,
+                    stmt.value.ty,
+                )
+                result = self._emit_checked_set_inplace_values(
+                    op_bare,
+                    cur,
+                    rhs_obj,
+                    getattr(stmt, "span", None),
+                )
+                self._gc_release_if_owned(rhs_obj, stmt.value)
+            elif (
                 _inplace_code is not None
                 and isinstance(declared_ty, (DynType, ClassType))
                 and isinstance(cur.type, ir.PointerType)

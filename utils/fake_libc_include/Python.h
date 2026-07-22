@@ -661,6 +661,7 @@ void PyException_SetContext(PyObject *self, PyObject *context);
 int PyException_SetTraceback(PyObject *self, PyObject *tb);
 int PyObject_AsFileDescriptor(PyObject *o);
 int PyType_Ready(PyTypeObject *type);
+void PyType_Modified(PyTypeObject *type);
 PyObject *PyType_FromSpec(PyType_Spec *spec);
 PyObject *PyType_FromModuleAndSpec(
     PyObject *module,
@@ -674,6 +675,7 @@ PyObject *PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems);
 
 /* tp_flags bits (CPython values) */
 #define Py_TPFLAGS_DEFAULT 0UL
+#define Py_TPFLAGS_SEQUENCE (1UL << 5)
 #define Py_TPFLAGS_HEAPTYPE (1UL << 9)
 #define Py_TPFLAGS_BASETYPE (1UL << 10)
 #define Py_TPFLAGS_READY (1UL << 12)
@@ -825,6 +827,7 @@ PyThreadState *PyThreadState_Get(void);
 #define PyThreadState_GET() PyThreadState_Get()
 int PyTraceMalloc_Track(unsigned int domain, uintptr_t ptr, size_t size);
 int PyTraceMalloc_Untrack(unsigned int domain, uintptr_t ptr);
+#define PYMEM_DOMAIN_RAW 0
 PyObject *PyTuple_GetSlice(PyObject *tuple, Py_ssize_t low, Py_ssize_t high);
 int PyUnicode_KIND(PyObject *op);
 void Py_FatalError(const char *message);
@@ -980,6 +983,7 @@ Py_ssize_t PyLong_AsSsize_t(PyObject *obj);
 size_t PyLong_AsSize_t(PyObject *obj);
 int PyLong_Check(PyObject *obj);
 int PyLong_CheckExact(PyObject *obj);
+int PyLong_IsZero(PyObject *obj);
 PyObject *PyBool_FromLong(long value);
 int PyBool_Check(PyObject *obj);
 PyObject *PyFloat_FromDouble(double value);
@@ -997,6 +1001,7 @@ int PyComplex_CheckExact(PyObject *obj);
 
 PyObject *PyUnicode_FromString(const char *value);
 PyObject *PyUnicode_FromStringAndSize(const char *value, Py_ssize_t len);
+PyObject *PyUnicode_FromObject(PyObject *obj);
 PyObject *PyUnicode_New(Py_ssize_t size, Py_UCS4 maxchar);
 PyObject *PyUnicode_FromFormat(const char *format, ...);
 PyObject *PyUnicode_FromFormatV(const char *format, va_list vargs);

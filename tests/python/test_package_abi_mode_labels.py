@@ -119,9 +119,15 @@ def test_host_and_pcc1_share_wheel_tag_and_capability_contract():
     native = json.loads(cb._native_linkage_json([], [], [], "pcc-native"))
     assert native["capability_profile"] == host["capability_profile"]
 
-    install_source = (REPO_ROOT / "pcc" / "package" / "install.py").read_text()
-    metadata_source = (REPO_ROOT / "pcc" / "package" / "metadata.py").read_text()
-    bootstrap_source = (REPO_ROOT / "pcc" / "cli_bootstrap.py").read_text()
+    install_source = (REPO_ROOT / "pcc" / "package" / "install.py").read_text(
+        encoding="utf-8"
+    )
+    metadata_source = (REPO_ROOT / "pcc" / "package" / "metadata.py").read_text(
+        encoding="utf-8"
+    )
+    bootstrap_source = (REPO_ROOT / "pcc" / "cli_bootstrap.py").read_text(
+        encoding="utf-8"
+    )
     assert "fields = wheel_tag_fields(name)" in install_source
     assert "fields = wheel_tag_fields(str(path))" in metadata_source
     assert "return wheel_tag_fields(path)" in bootstrap_source

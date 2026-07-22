@@ -784,6 +784,7 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_os_access": (_I32, [_PYOBJ, _I32], False),
     "py_os_write": (_I32, [_I32, _PYOBJ], False),
     "py_http_download_to_file": (_I64, [_PYOBJ, _PYOBJ], False),
+    "py_sha256_file_hex": (_PYOBJ, [_PYOBJ], False),
     "py_os_cpu_count": (_PYOBJ, [], False),
     "py_os_uname": (_PYOBJ, [], False),
     "py_sys_platform_str": (_PYOBJ, [], False),

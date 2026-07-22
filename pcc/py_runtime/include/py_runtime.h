@@ -1275,6 +1275,7 @@ int32_t     py_os_write(int32_t fd, PyObject *data);
  * Supports plain http:// URLs and writes the response body to dest_path.
  * Arguments are pcc str objects. Returns 0 on success, negative on error. */
 int64_t     py_http_download_to_file(PyObject *url, PyObject *dest_path);
+PyObject   *py_sha256_file_hex(PyObject *path);
 
 /* ---- Exceptions (Phase 3) --------------------------------------------- */
 

@@ -23,6 +23,9 @@ from .package_schema import (
 
 from .py_frontend.pipeline import compile_python as _compile_python
 from .py_frontend.pipeline import (
+    run_self_backend_emit_batch_worker as _run_self_backend_emit_batch_worker,
+)
+from .py_frontend.pipeline import (
     run_self_backend_emit_worker as _run_self_backend_emit_worker,
 )
 from .py_frontend.pipeline import (
@@ -60,6 +63,7 @@ def _bootstrap_subprocess_run(args, *, check=False):
         timeout=_bootstrap_subprocess_timeout_seconds(),
     )
     return None
+
 
 _HELP_TEXT = """Usage: pcc [OPTIONS] PATH
 
@@ -4501,7 +4505,9 @@ def _native_build_exec_json(
     else:
         if execute:
             try:
-                _bootstrap_subprocess_run(["mkdir", "-p", root + "/build/pcc-package"], check=True)
+                _bootstrap_subprocess_run(
+                    ["mkdir", "-p", root + "/build/pcc-package"], check=True
+                )
             except Exception:
                 diagnostics.append("PCC-PKG-BUILD-DIR-FAILED")
                 ok = False
@@ -6818,6 +6824,8 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
     find_links = []
     index_urls = []
     no_index = False
+    acquire_mode = "auto"
+    target_python = os.environ.get("PCC_PACKAGE_TARGET_PYTHON") or "3.11"
     packages = []
     i = 1
     while i < len(raw):
@@ -6862,6 +6870,30 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
             find_links.append(arg.split("=", 1)[1])
         elif arg == "--no-index":
             no_index = True
+        elif arg == "--acquire":
+            if i + 1 >= len(raw):
+                _write_text(
+                    '{"command": "install", "error": "--acquire requires a value", "ok": false}'
+                )
+                return 2
+            acquire_mode = raw[i + 1]
+            i += 1
+        elif arg.startswith("--acquire="):
+            acquire_mode = arg.split("=", 1)[1]
+        elif arg == "--python-version" or arg == "--target-python":
+            if i + 1 >= len(raw):
+                _write_text(
+                    '{"command": "install", "error": "'
+                    + arg
+                    + ' requires a value", "ok": false}'
+                )
+                return 2
+            target_python = raw[i + 1]
+            i += 1
+        elif arg.startswith("--python-version=") or arg.startswith(
+            "--target-python="
+        ):
+            target_python = arg.split("=", 1)[1]
         elif arg == "--index-url" or arg == "-i":
             if i + 1 >= len(raw):
                 _write_text(
@@ -6909,16 +6941,142 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
             + ', "ok": false}'
         )
         return 2
+    if not (
+        acquire_mode == "auto"
+        or acquire_mode == "host"
+        or acquire_mode == "owned"
+        or acquire_mode == "offline"
+    ):
+        _write_text(
+            '{"command": "install", "diagnostic": '
+            '"PCC-PKG-ACQUIRE-MODE-INVALID", "error": '
+            '"PCC-PKG-ACQUIRE-MODE-INVALID", "ok": false}'
+        )
+        return 2
+    if not _native_target_python_valid(target_python):
+        _write_text(
+            '{"command": "install", "diagnostic": '
+            '"PCC-PKG-ACQUIRE-TARGET-PYTHON-INVALID", "error": '
+            '"PCC-PKG-ACQUIRE-TARGET-PYTHON-INVALID", "ok": false}'
+        )
+        return 2
     if no_index:
         index_urls = []
-    if len(find_links) > 0 or len(index_urls) > 0:
-        packages = _native_resolve_install_order(
-            packages, cache_dir, find_links, abi, index_urls
+        acquire_mode = "offline"
+    requested_packages = _copy_seq(packages)
+    effective_indexes = _copy_seq(index_urls)
+    if not no_index and len(effective_indexes) == 0:
+        effective_indexes.append("https://pypi.org/simple")
+    actual_acquire_mode = "host" if acquire_mode == "auto" else acquire_mode
+    install_packages = []
+    acquisition_jsons = []
+    acquisition_failed = False
+    acquisition_error = ""
+    k = 0
+    while k < len(packages):
+        spec = packages[k]
+        if dry_run != 0:
+            install_packages.append(spec)
+            k += 1
+            continue
+        local = _native_resolve_install_source_result(
+            spec, cache_dir, find_links, abi, []
         )
+        looks_local = False
+        if _native_find_from(spec, "/", 0) >= 0 or spec.startswith("."):
+            looks_local = True
+        if (
+            spec.endswith(".whl")
+            or spec.endswith(".tar.gz")
+            or spec.endswith(".tar.bz2")
+            or spec.endswith(".tar.xz")
+            or spec.endswith(".tgz")
+            or spec.endswith(".zip")
+        ):
+            looks_local = True
+        project_shadowed_by_online_acquire = (
+            local[1] == "projects" and actual_acquire_mode != "offline"
+        )
+        if (
+            local[0] is not None and not project_shadowed_by_online_acquire
+        ) or looks_local:
+            install_packages.append(spec)
+            k += 1
+            continue
+        if actual_acquire_mode == "offline":
+            acquired = [
+                None,
+                "",
+                "",
+                "",
+                "PCC-PKG-ACQUIRE-OFFLINE",
+            ]
+        elif actual_acquire_mode == "owned":
+            acquired = _native_acquire_owned_result(
+                spec, cache_dir, effective_indexes, abi, target_python
+            )
+        else:
+            acquired = _native_acquire_host_result(
+                spec, cache_dir, effective_indexes, abi, target_python
+            )
+        acquisition_jsons.append(
+            _native_acquisition_json(
+                spec,
+                acquire_mode,
+                actual_acquire_mode,
+                acquired,
+                [] if no_index else effective_indexes,
+                target_python,
+            )
+        )
+        if acquired[0] is not None and acquired[4] == "":
+            install_packages.append(acquired[0])
+        else:
+            acquisition_failed = True
+            acquisition_error = acquired[4]
+        k += 1
+    packages = install_packages
+    if len(find_links) > 0 or len(packages) != len(requested_packages):
+        packages = _native_resolve_install_order(
+            packages, cache_dir, find_links, abi, []
+        )
+    if dry_run == 0 and acquisition_failed:
+        acquisitions = "[" + ", ".join(acquisition_jsons) + "]"
+        out = "{"
+        out += '"command": "install"'
+        out += ', "abi": ' + _json_str(abi)
+        out += ', "acquire_mode_requested": ' + _json_str(acquire_mode)
+        out += ', "acquisitions": ' + acquisitions
+        out += ', "dry_run": false'
+        out += ', "error": ' + _json_str(acquisition_error)
+        out += ', "find_links": ' + _json_str_list(find_links)
+        out += ', "index_urls": ' + _json_str_list(
+            [] if no_index else effective_indexes
+        )
+        out += ', "installs": []'
+        out += ', "no_index": ' + ("true" if no_index else "false")
+        out += ', "ok": false'
+        out += ', "packages": ' + _json_str_list(requested_packages)
+        out += ', "target_python": ' + _json_str(target_python)
+        out += ', "report_path": ' + _json_str_or_null(
+            None if report_path == "" else report_path
+        )
+        out += ', "resolver_diagnostics": []'
+        out += "}"
+        if report_path != "":
+            try:
+                with open(report_path, "w") as fh:
+                    fh.write(out)
+            except Exception:
+                _write_text(
+                    '{"command": "install", "error": "failed to write report", "ok": false}'
+                )
+                return 2
+        _write_text(out)
+        return 2
     if dry_run == 0:
         installs = "["
         all_ok = True
-        unresolved_bare = []
         k = 0
         while k < len(packages):
             if k > 0:
@@ -6929,59 +7087,28 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
                 cache_dir,
                 find_links,
                 abi,
-                index_urls,
+                [],
             )
             if _native_find_from(install_json, '"ok": false', 0) >= 0:
                 all_ok = False
-                # A failed bare requirement name that never resolved to a
-                # local source/artifact (no "source_path" in the manifest)
-                # means the package needed network acquisition, which pcc's
-                # local-installer pip deliberately does not perform. A
-                # resolved-but-failed build must NOT get this hint. Mirrors
-                # pip_shim._acquire_delegation_hint; see
-                # docs/design/pcc-package-model.md.
-                spec = packages[k]
-                looks_local = False
-                if _native_find_from(spec, "/", 0) >= 0:
-                    looks_local = True
-                if spec.startswith("."):
-                    looks_local = True
-                if spec.endswith(".whl") or spec.endswith(".tar.gz"):
-                    looks_local = True
-                if _native_find_from(install_json, '"source_path"', 0) >= 0:
-                    looks_local = True
-                if not looks_local:
-                    unresolved_bare.append(spec)
             installs += install_json
             k += 1
         installs += "]"
         out = "{"
         out += '"command": "install"'
         out += ', "abi": ' + _json_str(abi)
-        if len(unresolved_bare) > 0:
-            names = " ".join(unresolved_bare)
-            out += ', "acquire_hint": ' + _json_str(
-                "acquire first with a host tool, then install locally: "
-                + "python3 -m pip download "
-                + names
-                + " -d ./wheels && pcc -m pip install "
-                + names
-                + " --find-links ./wheels"
-            )
+        out += ', "acquire_mode_requested": ' + _json_str(acquire_mode)
+        out += ', "acquisitions": [' + ", ".join(acquisition_jsons) + "]"
         out += ', "dry_run": false'
-        if len(unresolved_bare) > 0:
-            out += ', "error": ' + _json_str(
-                "cannot resolve locally: "
-                + " ".join(unresolved_bare)
-                + " (pcc's pip is a local installer; it does not download"
-                + " from PyPI)"
-            )
         out += ', "find_links": ' + _json_str_list(find_links)
-        out += ', "index_urls": ' + _json_str_list(index_urls)
+        out += ', "index_urls": ' + _json_str_list(
+            [] if no_index else effective_indexes
+        )
         out += ', "installs": ' + installs
         out += ', "no_index": ' + ("true" if no_index else "false")
         out += ', "ok": ' + ("true" if all_ok else "false")
-        out += ', "packages": ' + _json_str_list(packages)
+        out += ', "packages": ' + _json_str_list(requested_packages)
+        out += ', "target_python": ' + _json_str(target_python)
         out += ', "report_path": ' + _json_str_or_null(
             None if report_path == "" else report_path
         )
@@ -7009,13 +7136,16 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
     out = "{"
     out += '"command": "install"'
     out += ', "abi": ' + _json_str(abi)
+    out += ', "acquire_mode_requested": ' + _json_str(acquire_mode)
+    out += ', "acquisitions": []'
     out += ', "dry_run": true'
     out += ', "find_links": ' + _json_str_list(find_links)
-    out += ', "index_urls": ' + _json_str_list(index_urls)
+    out += ', "index_urls": ' + _json_str_list([] if no_index else effective_indexes)
     out += ', "inspections": ' + inspections
     out += ', "no_index": ' + ("true" if no_index else "false")
     out += ', "ok": true'
-    out += ', "packages": ' + _json_str_list(packages)
+    out += ', "packages": ' + _json_str_list(requested_packages)
+    out += ', "target_python": ' + _json_str(target_python)
     out += ', "report_path": ' + _json_str_or_null(
         None if report_path == "" else report_path
     )
@@ -7396,36 +7526,69 @@ def _native_index_package_url(index_url: str, spec: str) -> str:
     return base + _native_normalized_package_name(spec) + "/"
 
 
+def _native_html_attr_value(tag_text: str, attr_name: str) -> str:
+    lower = tag_text.lower()
+    pos = 0
+    while pos < len(tag_text):
+        idx = _native_find_from(lower, attr_name.lower(), pos)
+        if idx < 0:
+            return ""
+        before_ok = idx == 0 or not (
+            ("a" <= lower[idx - 1] <= "z")
+            or ("0" <= lower[idx - 1] <= "9")
+            or lower[idx - 1] == "-"
+            or lower[idx - 1] == "_"
+        )
+        i = idx + len(attr_name)
+        while i < len(tag_text) and tag_text[i] in (" ", "\n", "\t"):
+            i += 1
+        if not before_ok or i >= len(tag_text) or tag_text[i] != "=":
+            pos = idx + len(attr_name)
+            continue
+        i += 1
+        while i < len(tag_text) and tag_text[i] in (" ", "\n", "\t"):
+            i += 1
+        if i >= len(tag_text) or not (tag_text[i] == '"' or tag_text[i] == "'"):
+            return ""
+        quote = tag_text[i]
+        i += 1
+        start = i
+        while i < len(tag_text) and tag_text[i] != quote:
+            i += 1
+        return tag_text[start:i]
+    return ""
+
+
+def _native_html_unescape_attr(value: str) -> str:
+    out = value.replace("&gt;", ">")
+    out = out.replace("&lt;", "<")
+    out = out.replace("&#62;", ">")
+    out = out.replace("&#60;", "<")
+    out = out.replace("&amp;", "&")
+    return out
+
+
 def _native_extract_href_links(text: str, page_url: str):
     links = []
     lower_text = text.lower()
     pos = 0
     while pos < len(text):
-        href_idx = _native_find_from(lower_text, "href", pos)
-        if href_idx < 0:
+        anchor_idx = _native_find_from(lower_text, "<a", pos)
+        if anchor_idx < 0:
             break
-        eq_idx = _native_find_from(text, "=", href_idx)
-        if eq_idx < 0:
+        end_idx = _native_find_from(text, ">", anchor_idx + 2)
+        if end_idx < 0:
             break
-        i = eq_idx + 1
-        while i < len(text) and (text[i] == " " or text[i] == "\n" or text[i] == "\t"):
-            i += 1
-        if i >= len(text):
-            break
-        quote = text[i]
-        if quote != '"' and quote != "'":
-            pos = i + 1
-            continue
-        i += 1
-        start = i
-        while i < len(text) and text[i] != quote:
-            i += 1
-        href = text[start:i]
+        tag_text = text[anchor_idx : end_idx + 1]
+        href = _native_html_attr_value(tag_text, "href")
+        requires_python = _native_html_unescape_attr(
+            _native_html_attr_value(tag_text, "data-requires-python")
+        )
         url = _native_url_join(page_url, href)
         name = _native_url_basename(url)
-        if name != "":
-            links.append([url, name])
-        pos = i + 1
+        if href != "" and name != "":
+            links.append([url, name, requires_python])
+        pos = end_idx + 1
     return links
 
 
@@ -7493,6 +7656,497 @@ def _native_find_index_artifact_result(spec: str, cache_dir, index_urls, abi: st
     if os._pcc_http_download_to_file(best_url, dest) != 0:
         return [None, None]
     return [os.path.abspath(dest), "index-url"]
+
+
+def _native_requirement_parts(spec: str):
+    split = _native_find_from(spec, "==", 0)
+    if split >= 0:
+        name = spec[:split]
+        version = spec[split + 2 :]
+        if version == "" or _native_find_from(version, "=", 0) >= 0:
+            return [None, None]
+    else:
+        name = spec
+        version = ""
+    if name == "":
+        return [None, None]
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        allowed = (
+            ("a" <= ch <= "z")
+            or ("A" <= ch <= "Z")
+            or ("0" <= ch <= "9")
+            or ch == "_"
+            or ch == "-"
+            or ch == "."
+        )
+        if not allowed:
+            return [None, None]
+        i += 1
+    return [name, version]
+
+
+def _native_target_python_valid(value: str) -> bool:
+    parts = value.split(".")
+    if not (len(parts) == 2 or len(parts) == 3):
+        return False
+    i = 0
+    while i < len(parts):
+        if parts[i] == "":
+            return False
+        j = 0
+        while j < len(parts[i]):
+            if not ("0" <= parts[i][j] <= "9"):
+                return False
+            j += 1
+        i += 1
+    return True
+
+
+def _native_numeric_version(value: str):
+    parts = value.split(".")
+    out = []
+    i = 0
+    while i < len(parts):
+        if parts[i] == "":
+            return []
+        number = 0
+        j = 0
+        while j < len(parts[i]):
+            ch = parts[i][j]
+            if not ("0" <= ch <= "9"):
+                return []
+            number = number * 10 + (ord(ch) - ord("0"))
+            j += 1
+        out.append(number)
+        i += 1
+    return out
+
+
+def _native_compare_numeric_versions(left, right) -> int:
+    width = len(left)
+    if len(right) > width:
+        width = len(right)
+    i = 0
+    while i < width:
+        lhs = left[i] if i < len(left) else 0
+        rhs = right[i] if i < len(right) else 0
+        if lhs < rhs:
+            return -1
+        if lhs > rhs:
+            return 1
+        i += 1
+    return 0
+
+
+def _native_requires_python_allows(specifier: str, target_python: str) -> bool:
+    if specifier.strip() == "":
+        return True
+    target = _native_numeric_version(target_python)
+    if len(target) == 0:
+        return False
+    clauses = specifier.split(",")
+    i = 0
+    while i < len(clauses):
+        clause = clauses[i].strip()
+        op = ""
+        for candidate in ("===", "~=", "==", "!=", "<=", ">=", "<", ">"):
+            if clause.startswith(candidate):
+                op = candidate
+                break
+        if op == "" or op == "===":
+            return False
+        raw_bound = clause[len(op) :].strip()
+        if raw_bound.endswith(".*") and (op == "==" or op == "!="):
+            prefix = _native_numeric_version(raw_bound[:-2])
+            if len(prefix) == 0:
+                return False
+            same = True
+            j = 0
+            while j < len(prefix):
+                actual = target[j] if j < len(target) else 0
+                if actual != prefix[j]:
+                    same = False
+                j += 1
+            if (op == "==" and not same) or (op == "!=" and same):
+                return False
+            i += 1
+            continue
+        bound = _native_numeric_version(raw_bound)
+        if len(bound) == 0:
+            return False
+        comparison = _native_compare_numeric_versions(target, bound)
+        if op == "==" and comparison != 0:
+            return False
+        if op == "!=" and comparison == 0:
+            return False
+        if op == "<=" and comparison > 0:
+            return False
+        if op == ">=" and comparison < 0:
+            return False
+        if op == "<" and comparison >= 0:
+            return False
+        if op == ">" and comparison <= 0:
+            return False
+        if op == "~=":
+            if comparison < 0:
+                return False
+            prefix_len = len(bound) - 1
+            if prefix_len < 1:
+                prefix_len = 1
+            j = 0
+            while j < prefix_len:
+                actual = target[j] if j < len(target) else 0
+                if actual != bound[j]:
+                    return False
+                j += 1
+        i += 1
+    return True
+
+
+def _native_url_without_fragment(url: str) -> str:
+    marker = _native_find_from(url, "#", 0)
+    if marker < 0:
+        return url
+    return url[:marker]
+
+
+def _native_sha256_fragment(url: str) -> str:
+    marker = _native_find_from(url, "#sha256=", 0)
+    if marker < 0:
+        return ""
+    value = url[marker + 8 :]
+    amp = _native_find_from(value, "&", 0)
+    if amp >= 0:
+        value = value[:amp]
+    if len(value) != 64:
+        return ""
+    i = 0
+    out = ""
+    while i < len(value):
+        ch = value[i].lower()
+        if not (("0" <= ch <= "9") or ("a" <= ch <= "f")):
+            return ""
+        out += ch
+        i += 1
+    return out
+
+
+def _native_publish_acquired_artifact(
+    temp_path: str,
+    filename: str,
+    cache_root: str,
+    expected_sha256: str,
+):
+    actual = os._pcc_sha256_file_hex(temp_path)
+    if actual == "":
+        return [None, "", False]
+    verified = expected_sha256 != "" and actual == expected_sha256
+    if expected_sha256 != "" and not verified:
+        try:
+            _bootstrap_subprocess_run(["rm", "-f", temp_path], check=True)
+        except Exception:
+            pass
+        return [None, actual, False]
+    dest_dir = os.path.join(cache_root, "acquired", "sha256", actual)
+    dest = os.path.join(dest_dir, filename)
+    try:
+        _bootstrap_subprocess_run(["mkdir", "-p", dest_dir], check=True)
+        if os.path.isfile(dest):
+            if os._pcc_sha256_file_hex(dest) != actual:
+                return [None, actual, verified]
+            _bootstrap_subprocess_run(["rm", "-f", temp_path], check=True)
+        else:
+            _bootstrap_subprocess_run(["mv", temp_path, dest], check=True)
+    except Exception:
+        return [None, actual, verified]
+    return [os.path.abspath(dest), actual, verified]
+
+
+def _native_owned_shape_diagnostic(path: str, cache_root: str) -> str:
+    deps = _native_artifact_requires_dist(path, cache_root)
+    if len(deps) > 0:
+        return "PCC-PKG-ACQUIRE-DEPENDENCY-RESOLUTION-UNSUPPORTED"
+    if _native_is_source_archive(path):
+        prepared = _native_prepare_install_source_tree(path, cache_root, "owned-shape")
+        root = prepared[0]
+        pyproject = os.path.join(root, "pyproject.toml")
+        if os.path.isfile(pyproject):
+            try:
+                with open(pyproject, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+            except Exception:
+                text = ""
+            _native_cleanup_prepared_source(prepared[1])
+            if (
+                _native_find_from(text, "[build-system]", 0) >= 0
+                and _native_find_from(text, "requires", 0) >= 0
+            ):
+                return "PCC-PKG-ACQUIRE-BUILD-ISOLATION-UNSUPPORTED"
+        else:
+            _native_cleanup_prepared_source(prepared[1])
+    return ""
+
+
+def _native_acquire_owned_result(
+    spec: str, cache_dir, index_urls, abi: str, target_python: str
+):
+    requirement = _native_requirement_parts(spec)
+    if requirement[0] is None:
+        return [
+            None,
+            "",
+            "",
+            "",
+            "PCC-PKG-ACQUIRE-REQUIREMENT-UNSUPPORTED",
+        ]
+    name = requirement[0]
+    exact_version = requirement[1]
+    cache_root = (
+        cache_dir or os.environ.get("PCC_PACKAGE_CACHE") or "/tmp/pcc-package-cache"
+    )
+    scratch = os.path.join(cache_root, ".owned-acquire-" + str(os.getpid()))
+    try:
+        _bootstrap_subprocess_run(["mkdir", "-p", scratch], check=True)
+    except Exception:
+        return [None, "", "", "", "PCC-PKG-ACQUIRE-CACHE-FAILED"]
+    best_url = None
+    best_name = ""
+    best_reason = ""
+    best_hash = ""
+    i = 0
+    while i < len(index_urls):
+        page_url = _native_index_package_url(index_urls[i], name)
+        page_path = os.path.join(scratch, "index-" + str(i) + ".html")
+        if os._pcc_http_download_to_file(page_url, page_path) == 0:
+            try:
+                with open(page_path, "r", encoding="utf-8") as fh:
+                    page = fh.read()
+            except Exception:
+                page = ""
+            links = _native_extract_href_links(page, page_url)
+            j = 0
+            while j < len(links):
+                published_url = links[j][0]
+                requires_python = links[j][2]
+                if not _native_requires_python_allows(
+                    requires_python, target_python
+                ):
+                    j += 1
+                    continue
+                clean_url = _native_url_without_fragment(published_url)
+                filename = _native_url_basename(clean_url)
+                expected_hash = _native_sha256_fragment(published_url)
+                if expected_hash != "" and _native_is_repo_artifact(filename):
+                    project = _native_artifact_project_name(filename)
+                    version_ok = exact_version == "" or (
+                        _native_artifact_version_text(filename) == exact_version
+                    )
+                    if (
+                        _native_normalized_package_name(project)
+                        == _native_normalized_package_name(name)
+                        and version_ok
+                    ):
+                        compat = _native_artifact_compatibility_for_name(filename, abi)
+                        if compat[0] and (
+                            best_url is None
+                            or _native_artifact_better_for_reason(
+                                filename,
+                                compat[1],
+                                best_name,
+                                best_reason,
+                            )
+                        ):
+                            best_url = clean_url
+                            best_name = filename
+                            best_reason = compat[1]
+                            best_hash = expected_hash
+                j += 1
+        i += 1
+    if best_url is None:
+        return [None, "", "", "", "PCC-PKG-ACQUIRE-HASH-REQUIRED"]
+    temp_path = os.path.join(scratch, best_name + ".part")
+    if os._pcc_http_download_to_file(best_url, temp_path) != 0:
+        return [None, best_url, "", "", "PCC-PKG-ACQUIRE-DOWNLOAD-FAILED"]
+    published = _native_publish_acquired_artifact(
+        temp_path, best_name, cache_root, best_hash
+    )
+    if published[0] is None:
+        return [None, best_url, published[1], "", "PCC-PKG-ACQUIRE-HASH-MISMATCH"]
+    diagnostic = _native_owned_shape_diagnostic(published[0], cache_root)
+    if diagnostic != "":
+        return [
+            published[0],
+            best_url,
+            published[1],
+            _native_artifact_version_text(best_name),
+            diagnostic,
+        ]
+    return [
+        published[0],
+        best_url,
+        published[1],
+        _native_artifact_version_text(best_name),
+        "",
+    ]
+
+
+def _native_acquire_host_result(
+    spec: str, cache_dir, index_urls, abi: str, target_python: str
+):
+    requirement = _native_requirement_parts(spec)
+    if requirement[0] is None:
+        return [
+            None,
+            "",
+            "",
+            "",
+            "PCC-PKG-ACQUIRE-REQUIREMENT-UNSUPPORTED",
+        ]
+    name = requirement[0]
+    exact_version = requirement[1]
+    cache_root = (
+        cache_dir or os.environ.get("PCC_PACKAGE_CACHE") or "/tmp/pcc-package-cache"
+    )
+    stage = os.path.join(cache_root, ".host-acquire-" + str(os.getpid()))
+    configured_host_python = os.environ.get("PCC_HOST_PYTHON")
+    host_pythons = []
+    if configured_host_python:
+        host_pythons.append(configured_host_python)
+    else:
+        path_value = os.environ.get("PATH") or ""
+        path_parts = path_value.split(":")
+        i = 0
+        while i < len(path_parts):
+            if path_parts[i] != "":
+                for basename in ("python3", "python"):
+                    candidate = os.path.join(path_parts[i], basename)
+                    if os.path.isfile(candidate) and candidate not in host_pythons:
+                        host_pythons.append(candidate)
+            i += 1
+        if len(host_pythons) == 0:
+            host_pythons.append("python3")
+    try:
+        _bootstrap_subprocess_run(["rm", "-rf", stage], check=True)
+        _bootstrap_subprocess_run(["mkdir", "-p", stage], check=True)
+    except Exception:
+        return [None, "", "", "", "PCC-PKG-ACQUIRE-CACHE-FAILED"]
+    selected = None
+    selected_host_python = ""
+    i = 0
+    while i < len(host_pythons):
+        base = [
+            host_pythons[i],
+            "-m",
+            "pip",
+            "download",
+            "--disable-pip-version-check",
+            "--no-deps",
+            "--python-version",
+            target_python,
+            "--dest",
+            stage,
+        ]
+        if len(index_urls) > 0:
+            base += ["--index-url", index_urls[0]]
+            j = 1
+            while j < len(index_urls):
+                base += ["--extra-index-url", index_urls[j]]
+                j += 1
+        command = (
+            base + ["--no-binary=:all:", spec]
+            if abi == "pcc-native"
+            else base + [spec]
+        )
+        try:
+            names = os.listdir(stage)
+        except Exception:
+            names = []
+        j = 0
+        while j < len(names):
+            try:
+                _bootstrap_subprocess_run(
+                    ["rm", "-f", os.path.join(stage, names[j])], check=True
+                )
+            except Exception:
+                pass
+            j += 1
+        try:
+            _bootstrap_subprocess_run(command, check=True)
+        except Exception:
+            i += 1
+            continue
+        candidate = _native_find_links_artifact_result(name, [stage], abi)
+        if candidate[0] is not None and (
+            exact_version == ""
+            or _native_artifact_version_text(candidate[0]) == exact_version
+        ):
+            selected = candidate[0]
+            selected_host_python = host_pythons[i]
+            break
+        i += 1
+    if selected is None:
+        return [None, "", "", "", "PCC-PKG-ACQUIRE-HOST-FAILED"]
+    filename = os.path.basename(selected)
+    published = _native_publish_acquired_artifact(selected, filename, cache_root, "")
+    if published[0] is None:
+        return [None, "", published[1], "", "PCC-PKG-ACQUIRE-CACHE-FAILED"]
+    return [
+        published[0],
+        "",
+        published[1],
+        _native_artifact_version_text(filename),
+        "",
+        selected_host_python,
+    ]
+
+
+def _native_acquisition_json(
+    spec: str,
+    requested_mode: str,
+    actual_mode: str,
+    result,
+    index_urls,
+    target_python: str,
+) -> str:
+    ok = result[0] is not None and result[4] == ""
+    out = "{"
+    out += '"acquire_mode": ' + _json_str(actual_mode)
+    out += ', "acquire_mode_requested": ' + _json_str(requested_mode)
+    out += ', "artifact_origin": ' + _json_str(
+        "host-pip" if actual_mode == "host" else "simple-repository"
+    )
+    out += ', "artifact_path": ' + _json_str_or_null(result[0])
+    out += ', "artifact_url": ' + _json_str_or_null(
+        None if result[1] == "" else result[1]
+    )
+    out += ', "build_isolation": "not_attempted"'
+    out += ', "dependency_resolution": "not_attempted"'
+    out += ', "diagnostic": ' + _json_str_or_null(
+        None if result[4] == "" else result[4]
+    )
+    out += ', "hash_verified": ' + (
+        "true" if actual_mode == "owned" and result[0] is not None else "false"
+    )
+    out += ', "host_assisted": ' + ("true" if actual_mode == "host" else "false")
+    out += ', "host_python": ' + _json_str_or_null(
+        result[5] if actual_mode == "host" and len(result) > 5 else None
+    )
+    out += ', "immutable_cache": true'
+    out += ', "index_urls": ' + _json_str_list(index_urls)
+    out += ', "ok": ' + ("true" if ok else "false")
+    out += ', "requested_spec": ' + _json_str(spec)
+    out += ', "resolved_version": ' + _json_str_or_null(
+        None if result[3] == "" else result[3]
+    )
+    out += ', "sha256": ' + _json_str_or_null(None if result[2] == "" else result[2])
+    out += ', "target_python": ' + _json_str(target_python)
+    out += ', "transport_provider": ' + _json_str(
+        "host-python-pip" if actual_mode == "host" else "pcc-runtime-libcurl"
+    )
+    out += "}"
+    return out
 
 
 def _native_find_links_package_names(find_links):
@@ -7850,13 +8504,14 @@ def _native_meson_setup_shell_command(source: str, build_dir: str, tool_dir: str
 
 
 def _native_build_report_action_json(
-    kind: str, command: str, status: str, returncode
+    kind: str, command: str, status: str, returncode, output_tail: str
 ) -> str:
     out = "{"
     out += '"command": ' + _json_str(command)
     out += ', "kind": ' + _json_str(kind)
     out += ', "returncode": ' + ("null" if returncode is None else str(returncode))
     out += ', "status": ' + _json_str(status)
+    out += ', "output_tail": ' + _json_str(output_tail)
     out += "}"
     return out
 
@@ -7865,6 +8520,17 @@ def _native_redirected_shell_command(command: str, label: str) -> list:
     log_path = "/tmp/pcc_build_" + str(os.getpid()) + "_" + label + ".log"
     redirected = command + " > " + _native_shell_quote(log_path) + " 2>&1"
     return [redirected, log_path]
+
+
+def _native_build_log_tail(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except Exception:
+        return ""
+    if len(text) > 4000:
+        return text[len(text) - 4000 :]
+    return text
 
 
 def _native_ensure_meson_build_outputs_json(source) -> str:
@@ -7884,11 +8550,15 @@ def _native_ensure_meson_build_outputs_json(source) -> str:
     skipped = False
     reason = None
 
-    def add_action(kind: str, command: str, status: str, returncode) -> None:
+    def add_action(
+        kind: str, command: str, status: str, returncode, output_tail: str
+    ) -> None:
         nonlocal actions, ok
         if actions != "[":
             actions += ", "
-        actions += _native_build_report_action_json(kind, command, status, returncode)
+        actions += _native_build_report_action_json(
+            kind, command, status, returncode, output_tail
+        )
         if status != "passed":
             ok = False
 
@@ -7906,26 +8576,61 @@ def _native_ensure_meson_build_outputs_json(source) -> str:
                 )
                 try:
                     _bootstrap_subprocess_run(["mkdir", "-p", build_dir], check=True)
-                    _bootstrap_subprocess_run(["/bin/sh", "-c", redirected[0]], check=True)
-                    add_action("meson_setup", setup_command, "passed", 0)
+                    _bootstrap_subprocess_run(
+                        ["/bin/sh", "-c", redirected[0]], check=True
+                    )
+                    add_action(
+                        "meson_setup",
+                        setup_command,
+                        "passed",
+                        0,
+                        _native_build_log_tail(redirected[1]),
+                    )
                 except Exception:
-                    add_action("meson_setup", setup_command, "failed", 127)
+                    add_action(
+                        "meson_setup",
+                        setup_command,
+                        "failed",
+                        1,
+                        _native_build_log_tail(redirected[1]),
+                    )
                 try:
                     _bootstrap_subprocess_run(["rm", "-f", redirected[1]], check=True)
                 except Exception:
                     pass
         if ok and not skipped:
+            jobs_text = os.environ.get("PCC_PACKAGE_BUILD_JOBS") or "2"
+            try:
+                jobs = int(jobs_text)
+            except Exception:
+                jobs = 2
+            if jobs < 1:
+                jobs = 1
             ninja_command = (
                 _native_path_prefix(tool_dir)
                 + "ninja -C "
                 + _native_shell_quote(build_dir)
+                + " -j "
+                + str(jobs)
             )
             redirected = _native_redirected_shell_command(ninja_command, "meson_build")
             try:
                 _bootstrap_subprocess_run(["/bin/sh", "-c", redirected[0]], check=True)
-                add_action("meson_build", ninja_command, "passed", 0)
+                add_action(
+                    "meson_build",
+                    ninja_command,
+                    "passed",
+                    0,
+                    _native_build_log_tail(redirected[1]),
+                )
             except Exception:
-                add_action("meson_build", ninja_command, "failed", 127)
+                add_action(
+                    "meson_build",
+                    ninja_command,
+                    "failed",
+                    1,
+                    _native_build_log_tail(redirected[1]),
+                )
             try:
                 _bootstrap_subprocess_run(["rm", "-f", redirected[1]], check=True)
             except Exception:
@@ -8049,6 +8754,7 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
     _bootstrap_subprocess_run(["mkdir", "-p", target], check=True)
     copied = False
     first_install_root = ""
+    preferred_install_root = ""
 
     def remember_install_root(dest: str) -> None:
         nonlocal first_install_root
@@ -8101,11 +8807,21 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
                 top_name
             ):
                 visible_dirs.append(top_child)
+                if _native_normalized_package_name(
+                    top_name
+                ) == _native_normalized_package_name(name) and (
+                    os.path.isfile(os.path.join(top_child, "__init__.py"))
+                    or _native_has_direct_importable_payload(top_child)
+                ):
+                    preferred_install_root = top_child
             j += 1
-        if len(visible_dirs) == 1:
+        if preferred_install_root != "":
+            copy_payload(preferred_install_root)
+            copied = True
+        elif len(visible_dirs) == 1:
             bases.append(visible_dirs[0])
             bases.append(visible_dirs[0] + "/src")
-        for base in bases:
+        for base in ([] if preferred_install_root != "" else bases):
             if not os.path.isdir(base):
                 continue
             try:
@@ -8139,11 +8855,27 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
         except Exception:
             build_names = []
         b = 0
+        preferred_build_root = ""
+        while b < len(build_names):
+            build_name = build_names[b]
+            build_child = os.path.join(build_root, build_name)
+            if os.path.isdir(build_child) and _native_normalized_package_name(
+                build_name
+            ) == _native_normalized_package_name(name):
+                preferred_build_root = build_child
+                break
+            b += 1
+        b = 0
         while b < len(build_names):
             build_name = build_names[b]
             build_child = os.path.join(build_root, build_name)
             if (
                 os.path.isdir(build_child)
+                and (
+                    preferred_build_root == ""
+                    or os.path.abspath(build_child)
+                    == os.path.abspath(preferred_build_root)
+                )
                 and not _native_skip_importable_dir_name(build_name)
                 and (
                     os.path.isfile(os.path.join(build_child, "__init__.py"))
@@ -8155,6 +8887,8 @@ def _native_install_importable_payload(source, target: str, name: str) -> str:
             b += 1
     if not copied:
         _bootstrap_subprocess_run(["mkdir", "-p", install_root], check=True)
+    elif os.path.isdir(os.path.join(target, name.replace("-", "_"))):
+        install_root = os.path.abspath(os.path.join(target, name.replace("-", "_")))
     elif first_install_root != "":
         install_root = first_install_root
     elif not os.path.exists(install_root):
@@ -8211,7 +8945,9 @@ def _native_prepare_install_source_tree(source, cache_root: str, name: str):
         _bootstrap_subprocess_run(["rm", "-rf", staging], check=True)
         _bootstrap_subprocess_run(["mkdir", "-p", staging], check=True)
         if source.lower().endswith(".zip"):
-            _bootstrap_subprocess_run(["unzip", "-q", source, "-d", staging], check=True)
+            _bootstrap_subprocess_run(
+                ["unzip", "-q", source, "-d", staging], check=True
+            )
         else:
             _bootstrap_subprocess_run(["tar", "-xf", source, "-C", staging], check=True)
     except Exception:
@@ -8265,6 +9001,8 @@ def _native_build_install_source_json(name: str, source, abi: str) -> str:
         return (
             '{"actions": [], "ok": true, "reason": "not_source_tree", "skipped": true}'
         )
+    if os.path.isfile(os.path.join(source, "meson.build")) and abi == "pcc-native":
+        return _native_host_eager_meson_build_json(name, source)
     if os.path.isfile(os.path.join(source, "meson.build")):
         return _native_ensure_meson_build_outputs_json(source)
     c_files = _native_collect_suffix_files(source, [".c"], True)
@@ -8296,6 +9034,75 @@ def _native_build_install_source_json(name: str, source, abi: str) -> str:
     )
 
 
+def _native_host_eager_meson_build_json(name: str, source: str) -> str:
+    """Delegate generic Meson graph replay while keeping pcc1 as install owner."""
+    host_python = os.environ.get("PCC_HOST_PYTHON") or "python3"
+    build_root = os.path.join(source, "build", "pcc-package")
+    report_path = os.path.join(build_root, "eager-meson-build-report.json")
+    jobs_text = os.environ.get("PCC_PACKAGE_BUILD_JOBS") or "2"
+    timeout_text = os.environ.get("PCC_PACKAGE_BUILD_TIMEOUT") or "180"
+    command = [
+        host_python,
+        "-m",
+        "pcc.package.build_exec",
+        name,
+        "--path",
+        source,
+        "--execute",
+        "--eager-meson-extensions",
+        "--jobs",
+        jobs_text,
+        "--timeout",
+        timeout_text,
+        "--report",
+        report_path,
+        "--json",
+    ]
+    shell_command = ""
+    i = 0
+    while i < len(command):
+        if shell_command != "":
+            shell_command += " "
+        shell_command += _native_shell_quote(command[i])
+        i += 1
+    redirected = _native_redirected_shell_command(
+        shell_command, "pcc_native_meson_build"
+    )
+    try:
+        _bootstrap_subprocess_run(["mkdir", "-p", build_root], check=True)
+        _bootstrap_subprocess_run(["/bin/sh", "-c", redirected[0]], check=True)
+    except Exception:
+        try:
+            with open(report_path, "r", encoding="utf-8") as fh:
+                return fh.read()
+        except Exception:
+            return (
+                '{"actions": [], "build_backend": "host", '
+                '"diagnostics": [{"code": '
+                '"PCC-PKG-HOST-BUILD-BACKEND-FAILED", "message": '
+                + _json_str(_native_build_log_tail(redirected[1]))
+                + '}], "host_assisted": true, "ok": false, '
+                '"reason": "host_build_backend_failed", "skipped": false}'
+            )
+    finally:
+        try:
+            _bootstrap_subprocess_run(["rm", "-f", redirected[1]], check=True)
+        except Exception:
+            pass
+    try:
+        with open(report_path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
+        return (
+            '{"actions": [], "build_backend": "host", '
+            '"diagnostics": [{"code": '
+            '"PCC-PKG-HOST-BUILD-REPORT-MISSING", "message": '
+            '"host build backend did not write its report"}], '
+            '"host_assisted": true, "ok": false, '
+            '"reason": "host_build_report_missing", "skipped": false}'
+        )
+
+
 def _native_install_manifest_json(
     spec: str,
     target_dir,
@@ -8316,7 +9123,8 @@ def _native_install_manifest_json(
         # Mirror the host installer's not-found failure instead of
         # fabricating an empty phantom install with ok:true — creating a
         # bare site directory for an unresolved name was a fake success.
-        # See docs/design/pcc-package-model.md (acquire is delegated).
+        # Acquisition is an explicit outer phase. Reaching this local
+        # installer unresolved must stay a real failure, never a phantom site.
         return (
             '{"error": '
             + _json_str("package artifact not found locally or in pcc cache")
@@ -9617,6 +10425,14 @@ def bootstrap_cli_main(argv=None) -> int:
                 raw_argv[1], raw_argv[2], raw_argv[3], raw_argv[4]
             )
         return _run_self_backend_emit_worker(raw_argv[1], raw_argv[2])
+    if len(raw_argv) > 0 and raw_argv[0] == "--pcc-self-backend-emit-batch-worker":
+        if len(raw_argv) != 2:
+            _write_text(
+                "Error: --pcc-self-backend-emit-batch-worker requires a manifest path",
+                err=True,
+            )
+            return 2
+        return _run_self_backend_emit_batch_worker(raw_argv[1])
     if len(raw_argv) > 0 and raw_argv[0] == "--pcc-self-backend-split-worker":
         if len(raw_argv) != 6:
             _write_text(
@@ -9719,7 +10535,9 @@ def bootstrap_cli_main(argv=None) -> int:
                 return 1
         if cache_path is not None:
             try:
-                _bootstrap_subprocess_run(["mkdir", "-p", os.path.dirname(cache_path)], check=True)
+                _bootstrap_subprocess_run(
+                    ["mkdir", "-p", os.path.dirname(cache_path)], check=True
+                )
             except Exception:
                 cache_path = None
         if cache_path is not None:
@@ -9739,7 +10557,9 @@ def bootstrap_cli_main(argv=None) -> int:
             if formatted_error is not None:
                 return 1
             try:
-                _bootstrap_subprocess_run(["mv", "-f", exe_path, cache_path], check=True)
+                _bootstrap_subprocess_run(
+                    ["mv", "-f", exe_path, cache_path], check=True
+                )
             except Exception:
                 cache_path = exe_path
             try:

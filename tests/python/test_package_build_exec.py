@@ -11,7 +11,10 @@ import pytest
 
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 
-from pcc.package.build_exec import execute_build_actions
+from pcc.package.build_exec import (
+    discover_eager_meson_extension_targets,
+    execute_build_actions,
+)
 from pcc.package.metadata import current_platform_tag
 from pcc.package_schema import pcc_native_extension_suffix
 
@@ -702,6 +705,44 @@ def test_execute_build_actions_uses_compile_commands_as_action_graph(
     assert "native_ccdb.o" in log_text
     assert "solver_ccdb.o" in log_text
     assert "-lopenblas" in log_text
+
+
+def test_eager_meson_extension_selection_excludes_lazy_function_imports(tmp_path):
+    project = tmp_path / "demo_pkg-0.1"
+    package = project / "demo_pkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("from . import core\n", encoding="utf-8")
+    (package / "core.py").write_text(
+        "from . import _native\n"
+        "def load_optional():\n"
+        "    from . import _optional\n",
+        encoding="utf-8",
+    )
+    build = project / "build" / "pcc-package" / "meson-build"
+    meson_info = build / "meson-info"
+    meson_info.mkdir(parents=True)
+    entries = [
+        {
+            "name": name,
+            "type": "shared module",
+            "filename": [str(build / "demo_pkg" / filename)],
+        }
+        for name, filename in (
+            ("_native.cpython-313-darwin", "_native.cpython-313-darwin.so"),
+            ("_optional.cpython-313-darwin", "_optional.cpython-313-darwin.so"),
+        )
+    ]
+    (meson_info / "intro-targets.json").write_text(
+        json.dumps(entries), encoding="utf-8"
+    )
+
+    selected = discover_eager_meson_extension_targets("demo-pkg", project)
+
+    assert [row["module"] for row in selected] == ["demo_pkg._native"]
+    assert selected[0]["target"] == "demo_pkg/_native.cpython-313-darwin.so"
+    assert selected[0]["output"].endswith(
+        "demo_pkg/_native.pcc3-pcc_native-macosx_14_0_arm64.so"
+    )
 
 
 def test_execute_build_actions_replays_one_meson_target_into_fresh_objects(

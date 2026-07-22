@@ -505,7 +505,16 @@ class CallExpressionLoweringMixin:
                 name=self._fresh(f"globals.set.cls.{class_name}"),
             )
 
-        return globals_dict
+        # The module side table owns its dictionary and exposes it here as a
+        # borrowed reference.  A Python call result is owned, so retain before
+        # handing it to assignment/temporary cleanup.  Without this bridge, a
+        # function-local ``namespace = globals()`` releases the side table's
+        # sole reference when the local dies and leaves later module lookups
+        # pointing at freed memory.
+        return self._gc_retain(
+            globals_dict,
+            name=self._fresh("globals.result.retain"),
+        )
 
     def _function_arg_ir_type_or_none(self, fn, index: int, ir_arg):
         try:

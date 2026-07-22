@@ -1672,7 +1672,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(len(pairs), 5)
         self.assertEqual(collect_mock.call_count, 2)
 
-    def test_self_native_emitter_uses_short_lived_compiled_stage_workers(self):
+    def test_self_native_emitter_reuses_bounded_compiled_stage_workers(self):
         from pcc.py_frontend import pipeline
 
         ir_text = (
@@ -1682,20 +1682,33 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
         def fake_worker_commands(commands, max_parallel=None):
             self.assertEqual(max_parallel, 2)
+            self.assertEqual(len(commands), 2)
             for command in commands:
                 parts = command.split()
-                with open(parts[4], "w", encoding="utf-8") as f:
-                    f.write("object\n")
-                with open(parts[3], "w", encoding="utf-8") as f:
-                    f.write("self-aarch64-darwin-v0\n" + parts[4])
+                self.assertIn(pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG, parts)
+                with open(parts[2], "r", encoding="utf-8") as f:
+                    manifest_lines = f.read().splitlines()
+                self.assertEqual(
+                    manifest_lines[0], pipeline._SELF_BACKEND_EMIT_BATCH_MANIFEST_V1
+                )
+                payload = manifest_lines[1:]
+                self.assertEqual(len(payload) % 4, 0)
+                item = 0
+                while item < len(payload):
+                    _ir_path = payload[item]
+                    result_path = payload[item + 1]
+                    obj_path = payload[item + 2]
+                    with open(obj_path, "w", encoding="utf-8") as f:
+                        f.write("object\n")
+                    with open(result_path, "w", encoding="utf-8") as f:
+                        f.write("self-aarch64-darwin-v0\n" + obj_path)
+                    item += 4
 
         def fake_run(cmd, **kwargs):
             return subprocess.CompletedProcess(cmd, 0)
 
-        with mock.patch.object(
-            pipeline,
-            "_python_frontend_worker_executable",
-            return_value="/tmp/pcc1",
+        with mock.patch.dict(os.environ, {"PCC_SELF_BACKEND_JOBS": "2"}), mock.patch.object(
+            pipeline, "_python_frontend_worker_executable", return_value="/tmp/pcc1"
         ):
             with mock.patch.object(
                 pipeline,
@@ -1718,14 +1731,14 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                                 side_effect=fake_run,
                             ):
                                 pairs = pipeline._emit_self_objects_many_in_process(
-                                    [ir_text] * 2,
+                                    [ir_text] * 5,
                                     self.td,
                                     "cc",
                                     split_large_modules=True,
                                     profile=None,
                                 )
 
-        self.assertEqual(len(pairs), 2)
+        self.assertEqual(len(pairs), 5)
         split_mock.assert_not_called()
         emit_mock.assert_not_called()
         worker_commands_mock.assert_called_once()
@@ -1733,8 +1746,33 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         commands = worker_commands_mock.call_args.args[0]
         self.assertEqual(len(commands), 2)
         self.assertTrue(
-            all(pipeline._SELF_BACKEND_EMIT_WORKER_ARG in cmd for cmd in commands)
+            all(
+                pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG in cmd
+                for cmd in commands
+            )
         )
+
+    def test_self_backend_emit_batch_worker_stops_on_first_failure(self):
+        from pcc.py_frontend import pipeline
+
+        manifest_path = os.path.join(self.td, "emit-batch.manifest")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.write(pipeline._SELF_BACKEND_EMIT_BATCH_MANIFEST_V1 + "\n")
+            for index in range(3):
+                f.write(os.path.join(self.td, f"input-{index}.ll") + "\n")
+                f.write(os.path.join(self.td, f"result-{index}") + "\n")
+                f.write(os.path.join(self.td, f"object-{index}.o") + "\n")
+                f.write("cc\n")
+
+        with mock.patch.object(
+            pipeline,
+            "run_self_backend_emit_worker",
+            side_effect=[0, 1, 0],
+        ) as emit:
+            status = pipeline.run_self_backend_emit_batch_worker(manifest_path)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(emit.call_count, 2)
 
     def test_self_native_emitter_skips_compiled_workers_for_cache_hits(self):
         from pcc.py_frontend import pipeline
@@ -1806,10 +1844,18 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                     )
                     self.assertEqual(status, 0)
                     continue
-                with open(parts[4], "w", encoding="utf-8") as f:
-                    f.write("object\n")
-                with open(parts[3], "w", encoding="utf-8") as f:
-                    f.write("self-aarch64-darwin-v0\n" + parts[4])
+                self.assertIn(pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG, parts)
+                with open(parts[2], "r", encoding="utf-8") as f:
+                    payload = f.read().splitlines()[1:]
+                item = 0
+                while item < len(payload):
+                    result_path = payload[item + 1]
+                    obj_path = payload[item + 2]
+                    with open(obj_path, "w", encoding="utf-8") as f:
+                        f.write("object\n")
+                    with open(result_path, "w", encoding="utf-8") as f:
+                        f.write("self-aarch64-darwin-v0\n" + obj_path)
+                    item += 4
 
         with mock.patch.dict(
             os.environ,
@@ -1850,7 +1896,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(command_batches[1][1], 2)
         self.assertTrue(
             all(
-                pipeline._SELF_BACKEND_EMIT_WORKER_ARG in command
+                pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG in command
                 for command in command_batches[1][0]
             )
         )
@@ -1868,13 +1914,20 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             command_batches.append((commands, max_parallel))
             for command in commands:
                 parts = command.split()
-                worker_index = parts.index(pipeline._SELF_BACKEND_EMIT_WORKER_ARG)
-                result_path = parts[worker_index + 2]
-                obj_path = parts[worker_index + 3]
-                with open(obj_path, "w", encoding="utf-8") as f:
-                    f.write("object\n")
-                with open(result_path, "w", encoding="utf-8") as f:
-                    f.write("self-aarch64-darwin-v0\n" + obj_path)
+                worker_index = parts.index(
+                    pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG
+                )
+                with open(parts[worker_index + 1], "r", encoding="utf-8") as f:
+                    payload = f.read().splitlines()[1:]
+                item = 0
+                while item < len(payload):
+                    result_path = payload[item + 1]
+                    obj_path = payload[item + 2]
+                    with open(obj_path, "w", encoding="utf-8") as f:
+                        f.write("object\n")
+                    with open(result_path, "w", encoding="utf-8") as f:
+                        f.write("self-aarch64-darwin-v0\n" + obj_path)
+                    item += 4
 
         with mock.patch.object(
             pipeline,
@@ -2465,6 +2518,22 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         compile_mock.assert_called_once()
         self.assertEqual(compile_mock.call_args.kwargs["backend"], "self")
         self.assertIsNone(compile_mock.call_args.kwargs["libpython_mode"])
+
+    def test_bootstrap_cli_dispatches_self_backend_emit_batch_worker(self):
+        from pcc import cli_bootstrap
+
+        manifest = os.path.join(self.td, "emit-batch.manifest")
+        with mock.patch.object(
+            cli_bootstrap,
+            "_run_self_backend_emit_batch_worker",
+            return_value=7,
+        ) as worker:
+            rc = cli_bootstrap.bootstrap_cli_main(
+                ["--pcc-self-backend-emit-batch-worker", manifest]
+            )
+
+        self.assertEqual(rc, 7)
+        worker.assert_called_once_with(manifest)
 
     def test_resolve_python_config_command_uses_sysconfig_bindir(self):
         from pcc.py_frontend import pipeline

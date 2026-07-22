@@ -62,7 +62,11 @@ _BOOTSTRAP_SUCCESS_MANIFEST = "backend-success.json"
 _BOOTSTRAP_STAGE2_SUCCESS_SCHEMA = "pcc.bootstrap_full.stage2_success.v1"
 _BOOTSTRAP_STAGE2_SUCCESS_MANIFEST = "stage2-success.json"
 _GC_BOOTSTRAP_WEIGHT = {"0": 60, "4": 50, "3": 40, "1": 30, "2": 30}
-_GC_BOOTSTRAP_MAX_ACTIVE_BACKENDS = 3
+# A full stage2/stage3 chain retains several GiB while its frontend and native
+# emit workers are active.  Three concurrent chains measured 18.2 GiB RSS on
+# the 12-core development gate, so the unattended default admits at most two.
+# PCC_BOOTSTRAP_FULL_MAX_ACTIVE_GC remains the explicit operator override.
+_GC_BOOTSTRAP_MAX_ACTIVE_BACKENDS = 2
 _GC_BOOTSTRAP_PARALLEL_MIN_JOBS = 6
 # A clean stage currently takes about 10-11 minutes on the 12-core macOS gate
 # host.  This repository is also exercised by multiple concurrent goal loops;
@@ -1446,6 +1450,21 @@ def test_bootstrap_gc_backend_plan_partitions_worker_budget_for_parallel_files(
     assert gc4.cpu_ids == (10, 11)
     assert gc4.frontend_jobs == 4
     assert gc4.self_backend_jobs == 6
+
+
+def test_bootstrap_active_gc_limit_defaults_to_two_heavy_chains(monkeypatch):
+    monkeypatch.delenv("PCC_BOOTSTRAP_FULL_MAX_ACTIVE_GC", raising=False)
+
+    assert _bootstrap_gc_active_limit(1) == 1
+    assert _bootstrap_gc_active_limit(2) == 2
+    assert _bootstrap_gc_active_limit(5) == 2
+
+
+def test_bootstrap_active_gc_limit_keeps_explicit_operator_override(monkeypatch):
+    monkeypatch.setenv("PCC_BOOTSTRAP_FULL_MAX_ACTIVE_GC", "3")
+
+    assert _bootstrap_gc_active_limit(2) == 2
+    assert _bootstrap_gc_active_limit(5) == 3
 
 
 def test_bootstrap_gc_backend_plan_expands_for_not_yet_started_gc_after_done(

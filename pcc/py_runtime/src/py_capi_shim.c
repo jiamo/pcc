@@ -608,6 +608,12 @@ int PyType_Ready(PyTypeObject *type) {
     return 0;
 }
 
+void PyType_Modified(PyTypeObject *type) {
+    /* CPython invalidates its type lookup cache here. PCC performs no cached
+     * C-extension type lookup, so mutation is already immediately visible. */
+    (void)type;
+}
+
 int64_t pcc_capi_is_cext_type_tag(int64_t type_tag) {
     int64_t offset = type_tag - PCC_CAPI_CEXT_TAG_BASE;
     return offset >= 0 && offset < pcc_capi_cext_type_count;
@@ -2745,6 +2751,18 @@ int PyLong_CheckExact(PyObject *obj) {
     return py_type_of(obj) == PY_TYPE_INT;
 }
 
+int PyLong_IsZero(PyObject *obj) {
+    if (!PyLong_Check(obj)) {
+        PyErr_SetString(PyExc_TypeError, "expected int");
+        return -1;
+    }
+    if (obj == py_False) return 1;
+    if (obj == py_True) return 0;
+    if (PY_IS_TAGGED_INT(obj)) return py_untag_int(obj) == 0;
+    PyIntObject *value = (PyIntObject *)obj;
+    return value->sign == 0 || value->ndigits == 0;
+}
+
 PyObject *PyUnicode_FromString(const char *value) {
     if (value == NULL) value = "";
     return py_str_new(value, (int64_t)strlen(value));
@@ -2760,6 +2778,15 @@ PyObject *PyUnicode_FromStringAndSize(const char *value, Py_ssize_t len) {
         return NULL;
     }
     return py_str_new(value, (int64_t)len);
+}
+
+PyObject *PyUnicode_FromObject(PyObject *obj) {
+    if (!pcc_capi_is_exact_type(obj, PY_TYPE_STR)) {
+        PyErr_SetString(PyExc_TypeError, "expected str");
+        return NULL;
+    }
+    Py_INCREF(obj);
+    return obj;
 }
 
 PyObject *PyUnicode_New(Py_ssize_t size, Py_UCS4 maxchar) {

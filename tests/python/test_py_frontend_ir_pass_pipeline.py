@@ -27,6 +27,15 @@ def test_python_frontend_jobs_env_can_force_serial(monkeypatch):
     assert pipeline._python_frontend_jobs(111) == 1
 
 
+def test_self_backend_jobs_defaults_to_conservative_pool(monkeypatch):
+    monkeypatch.delenv("PCC_SELF_BACKEND_JOBS", raising=False)
+    monkeypatch.delenv("PCC_OUTER_PARALLELISM", raising=False)
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
+
+    assert pipeline._self_backend_jobs(111) == 2
+    assert pipeline._self_backend_jobs(1) == 1
+
+
 def test_nested_parallelism_shares_cpu_budget_across_outer_workers(monkeypatch):
     monkeypatch.delenv("PCC_PY_FRONTEND_JOBS", raising=False)
     monkeypatch.delenv("PCC_PYTHON_IR_PASS_JOBS", raising=False)

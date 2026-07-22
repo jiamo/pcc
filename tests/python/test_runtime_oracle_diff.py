@@ -218,6 +218,7 @@ def _runtime_oracle_build_key(pcc_bin: str) -> str:
         REPO_ROOT / "pcc" / "parse",
         REPO_ROOT / "pcc" / "py_frontend",
         REPO_ROOT / "pcc" / "tools",
+        REPO_ROOT / "utils" / "fake_libc_include",
     )
     files = []
     for root in roots:

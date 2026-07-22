@@ -4,6 +4,7 @@ This module does not build NumPy or any other package directly. It consumes
 package-agnostic build metadata such as compile_commands.json and reports the
 work pcc would need to perform or delegate for native extension builds.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -86,7 +87,9 @@ def _language_for_file(file_name: str) -> str:
     return "unknown"
 
 
-def _consume_joined_flag(tokens: list[str], index: int, prefix: str) -> tuple[str | None, int]:
+def _consume_joined_flag(
+    tokens: list[str], index: int, prefix: str
+) -> tuple[str | None, int]:
     token = tokens[index]
     if token == prefix:
         if index + 1 < len(tokens):
@@ -204,7 +207,12 @@ def _meson_intro_targets_path(path: Path | None) -> Path | None:
     candidates = (
         path / "meson-info" / "intro-targets.json",
         path / "build" / "meson-info" / "intro-targets.json",
-        path / "build" / "pcc-package" / "meson-build" / "meson-info" / "intro-targets.json",
+        path
+        / "build"
+        / "pcc-package"
+        / "meson-build"
+        / "meson-info"
+        / "intro-targets.json",
     )
     for candidate in candidates:
         if candidate.exists():
@@ -260,7 +268,6 @@ def load_meson_introspection_commands(
                 continue
             language = str(group.get("language") or "")
             compiler_values = _as_string_list(group.get("compiler"))
-            compiler = compiler_values[0] if compiler_values else ""
             parameters = _as_string_list(group.get("parameters"))
             sources = []
             sources.extend(_as_string_list(group.get("sources")))
@@ -275,10 +282,18 @@ def load_meson_introspection_commands(
                     command_language = _language_for_file(str(source_path))
                 if command_language not in {"c", "cxx", "fortran"}:
                     continue
-                selected_compiler = compiler or _default_compiler_for_language(command_language)
-                output = root / "build" / "pcc-package" / "meson" / f"{source_path.stem}_{index}.o"
+                selected_compiler = compiler_values or [
+                    _default_compiler_for_language(command_language)
+                ]
+                output = (
+                    root
+                    / "build"
+                    / "pcc-package"
+                    / "meson"
+                    / f"{source_path.stem}_{index}.o"
+                )
                 command = [
-                    selected_compiler,
+                    *selected_compiler,
                     *parameters,
                     "-c",
                     str(source_path),
@@ -302,8 +317,14 @@ def _compile_commands_path(path: Path | None) -> Path | None:
     if path is None:
         return None
     if path.is_dir():
-        candidate = path / "compile_commands.json"
-        return candidate if candidate.exists() else None
+        candidates = (
+            path / "compile_commands.json",
+            path / "build" / "compile_commands.json",
+            path / "build" / "pcc-package" / "meson-build" / "compile_commands.json",
+        )
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
     return None
 
 

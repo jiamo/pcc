@@ -133,8 +133,23 @@ print(m.add(3, 4))
 
 ### NumPy on pcc1 (repository example)
 
-From a repository checkout (macOS arm64), real NumPy 2.4.4 compiles into a
-native binary with no CPython anywhere:
+From a repository checkout (macOS arm64), `pcc1 -m pip install numpy` now
+performs a real network acquisition and pcc-native source install. The default
+`auto` acquisition mode is explicitly **host-assisted**: host pip resolves and
+downloads a NumPy 2.4.x source artifact for pcc's supported Python 3.11 target,
+then pcc owns the extension build/install and the emitted application runs
+without libpython or host Python.
+
+Package-site selection is not yet Python-like: the host and compiled CLIs have
+different implicit destinations, so the currently verified end-to-end command
+uses an explicit target/site pair below. This is a known design gap, not the
+intended public UX. The first-class environment work in
+[`docs/design/pcc-package-environments.md`](docs/design/pcc-package-environments.md)
+will make install followed by run discover the same uv/project or user
+environment without `PCC_PACKAGE_SITE`. It also makes the intended short form
+`build/bootstrap/pcc1 np_demo.py` mean self backend plus no-libpython by
+default; today `--backend self` remains explicit because an omitted backend
+still selects the LLVM oracle.
 
 ```python
 # np_demo.py
@@ -149,24 +164,29 @@ print([int(x) for x in a + 1])
 # 1. Build the compiler (~1 minute, once)
 scripts/bootstrap.sh --stage 1
 
-# 2. Build NumPy's C core against pcc's runtime (once, cached afterwards)
-uv run python scripts/numpy_head_gate.py run
+# 2. Acquire and install NumPy from the network (cached afterwards)
+build/bootstrap/pcc1 -m pip install numpy --target build/pcc-numpy-site
 
 # 3. Compile and run
-NUMPY_SITE="build/head-truth/numpy-core/site:projects/numpy-2.4.4/build/pcc-package/meson-build:projects/numpy-2.4.4"
-PCC_PACKAGE_SITE="$NUMPY_SITE" build/bootstrap/pcc1 --backend self np_demo.py -o np_demo
+PCC_PACKAGE_SITE=build/pcc-numpy-site \
+  build/bootstrap/pcc1 --backend self --python-libpython=off \
+  np_demo.py -o np_demo
 
 ./np_demo
-# 2.4.4
+# 2.4.x
 # [2, 3, 4]
 ```
 
 `otool -L np_demo` shows no libpython, and `PCC_GC_BACKEND=0..4` all print the
 same result. Scope today is import/version, array construction, scalar add, and
 element access — not the full array runtime (ufuncs, reductions, dtypes,
-broadcasting). Pinned gates:
+broadcasting). Acquisition supports a deliberately strict requirement subset;
+it does not claim a general dependency resolver or PEP 517 build isolation.
+For a pinned offline/reproducibility gate, the repository also retains
+`scripts/numpy_head_gate.py`. Gates:
 [`tests/integration/test_numpy_l4_pcc1_gate.py`](tests/integration/test_numpy_l4_pcc1_gate.py),
-[`test_numpy_l5_pcc1_gate.py`](tests/integration/test_numpy_l5_pcc1_gate.py).
+[`test_numpy_l5_pcc1_gate.py`](tests/integration/test_numpy_l5_pcc1_gate.py), and
+[`test_pcc1_pip_numpy_network.py`](tests/integration/test_pcc1_pip_numpy_network.py).
 
 ## Status
 
@@ -178,7 +198,7 @@ broadcasting). Pinned gates:
 | Self backend | Experimental LLVM-free emission for AArch64 Darwin and x86_64 Linux subsets; used by bootstrap/build gates. The public default backend is LLVM unless `self` is selected. |
 | Bootstrap | macOS arm64 three-stage `pcc1 → pcc2 → pcc3` completes in both the default and strict self-backend paths; strict-path `pcc2`/`pcc3` IR is byte-identical with 0 `py_cpy_*` calls and no `libpython`. Issue 1 closed 2026-05-01. |
 | GC | Five backends (0..4); all pass the full three-stage self-host bootstrap matrix. Backend #0 is the default/rollback reference. |
-| NumPy | Local NumPy 2.4.4: `import numpy` + `np.array(...) + scalar` run under strict pcc-native no-libpython across GC0..4. Narrow (import/version/array construct/scalar add/element access/iteration/`==`/`repr`); general ufuncs, reductions, dtypes, and broadcasting are not covered; CPython-ABI artifacts stay intentionally rejected (`PCC-PKG-004`). |
+| NumPy | `pcc1 -m pip install numpy` performs labeled host-assisted network acquisition of NumPy 2.4.x, then pcc-native source build/install; `import numpy` + `np.array(...) + scalar` run under strict self/no-libpython across GC0..4. Narrow (import/version/array construct/scalar add/element access/iteration/`==`/`repr`); general resolver/build isolation, ufuncs, reductions, dtypes, and broadcasting are not covered; CPython-ABI artifacts stay intentionally rejected (`PCC-PKG-004`). |
 | GPU kernel IR | Experimental, macOS/Metal only. Kernel-only IR with TIRx-style freeze and `.metallib` finalization; evidence is claim-leveled (`GPU_LEVEL_0`..`GPU_LEVEL_6`). Toolchain/device absence reports `SKIPPED_WITH_REASON`, never success. |
 | Distributed | Metadata-only first slice (`pcc.dist`): single process, CPU-only, no sockets. Every network mode reports `SKIPPED_WITH_REASON`. |
 

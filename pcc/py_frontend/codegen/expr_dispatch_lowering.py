@@ -409,6 +409,10 @@ class ExprDispatchLoweringMixin:
                 if -(1 << 63) <= folded <= (1 << 63) - 1:
                     return ir.Constant(_I64, folded)
 
+            dict_keys_result = self._maybe_emit_dict_keys_view_binop(expr)
+            if dict_keys_result is not None:
+                return dict_keys_result
+
             lhs = self._emit_expr(expr.lhs)
             if expr.op == "%" and self._is_valueclass_payload_type(expr.rhs.ty):
                 # direct valueclass constructors in %-format operands project

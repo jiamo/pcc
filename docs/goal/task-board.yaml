@@ -1514,12 +1514,12 @@ tasks:
     exit_criteria:
       - "One command-shaped E2E gate proves local-source -> pcc-native build -> site -> pcc1 import for a real package with no libpython edge."
       - "A second package passes the same generic gate without package-name special-casing."
-      - "Unresolvable bare names keep failing with the documented acquire_hint (never silent, never fake network support)."
+      - "Explicit offline acquisition keeps unresolved bare names fail-closed, while online acquisition remains a separately labeled phase."
     required_gates:
       - "selected package builds against PCC Python.h/runtime"
       - "produced extension has a pcc-native ABI tag"
       - "PCC-PKG-004 rejects CPython ABI artifacts cleanly in pcc-native mode"
-      - "env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_import_path.py::test_pip_install_unresolvable_bare_name_gets_acquire_hint tests/python/test_package_import_path.py::test_pip_install_pathlike_spec_failure_gets_no_acquire_hint"
+      - "env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_import_path.py::test_pip_install_offline_bare_name_fails_closed tests/python/test_package_import_path.py::test_pip_install_pathlike_spec_failure_gets_no_acquire_hint"
       - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_native_extension_ladder.py::test_selected_extension_imports_under_python_libpython_off"
 
   - id: AUD-P2-BUILTIN-EXC-TAG-DEDUP
@@ -2211,5 +2211,238 @@ tasks:
     required_gates:
       - "gtimeout 150s env -u LC_ALL uv run pytest -q -n0 'tests/python/test_gc_backend_under_env.py::test_gc_backend_subset_under_frontend_backend[frontend=llvm-gc=4]' 'tests/python/test_gc_backend_under_env.py::test_gc_backend_subset_under_frontend_backend[frontend=self-gc=4]'"
       - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/test_test_infrastructure_efficiency.py"
-      - "gtimeout 900s env -u LC_ALL uv run pytest"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest"
       - "gtimeout 1800s env -u LC_ALL uv run pytest -m integration"
+
+  - id: PKG-P0-NETWORK-ACQUISITION-BACKENDS
+    priority: P0
+    status: DONE_STRONG
+    track: packages/acquisition
+    title: "Make pcc1 -m pip install requirements work through explicit host and owned acquisition backends"
+    latest_evidence: docs/goal/evidence/2026-07-21-network-acquisition-backends-closure.md
+    latest_update: "Explicit auto/host/owned/offline acquisition, provenance and digest reporting, target-Python selection, owned Simple API HTTPS, the real pcc1 online NumPy five-GC command gate, complete bootstrap-shim regression, and goal-doc consistency are green."
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - PKG-P0-INSTALL-IMPORT-SEPARATION
+      - PKG-P0-ABI-MODE-LABELS
+      - M2-NUMPY-L5
+    rank: 75
+    exit_criteria:
+      - "pcc1 -m pip install accepts a bare requirement and records acquire_mode, index/artifact origin, sha256, resolved version, and host assistance separately from build/import/runtime claims."
+      - "The host backend performs bounded delegated download into an immutable cache and feeds the existing local installer; auto selection is explicit in diagnostics and never relabels host acquisition as owned."
+      - "The owned backend fetches and verifies an artifact through a standards-based Simple Repository endpoint with PCC_HOST_PYTHON and host pip unavailable, and fails closed with a stable diagnostic for unsupported dependency-resolution or build-isolation shapes."
+      - "A generic synthetic package proves both acquisition backends without package-name special cases."
+      - "The command-shaped NumPy gate acquires a source artifact, installs it, and passes the existing pcc1/self/no-libpython import plus basic array-add behavior; broader NumPy API compatibility remains outside this card."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_network_acquisition.py"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_import_path.py tests/python/test_package_install_import_claims.py tests/python/test_package_abi_mode_labels.py"
+      - "gtimeout 900s env -u LC_ALL uv run pytest -q -n0 -m integration tests/integration/test_pcc1_pip_numpy_network.py"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+
+  - id: PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL
+    priority: P0
+    status: DONE_STRONG
+    track: performance/self-backend
+    title: "Replace unbounded short-lived self-backend emit fanout with a resource-bounded efficient worker pool"
+    latest_evidence: docs/goal/evidence/2026-07-22-self-backend-bounded-worker-pool.md
+    latest_update: "The two-worker default batch pool reuses compiled workers across objects; 165 focused cases, pcc1 NumPy L5 across GC0..4, 9403 non-integration cases, and 4551 integration cases pass with final summaries."
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - TEST-P0-FULL-SUITE-BUILD-EFFICIENCY
+      - PKG-P0-NETWORK-ACQUISITION-BACKENDS
+      - C-P0-FAKE-DLFCN-RTLD-LAZY
+      - TEST-P0-PACKAGE-ABI-UTF8-SOURCE-READ
+    rank: 70
+    exit_criteria:
+      - "Unset-environment direct self-backend compilation uses a conservative bounded worker count and never silently expands to all host CPUs; explicit PCC_SELF_BACKEND_JOBS remains authoritative."
+      - "A compiled pcc1 processes multiple independent IR/object jobs per worker invocation, reducing process-start count without changing deterministic input-order publication or object-cache identity."
+      - "Focused tests prove worker batching, failure propagation, cache-hit behavior, and resource-bound selection without deleting or weakening existing compiler cases."
+      - "A current-source pcc1 compiles and runs the pinned NumPy L5 surface under the no-libpython self backend, and the complete non-integration and integration suites have final summaries."
+    required_gates:
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_frontend_ir_pass_pipeline.py tests/python/test_py_multi_file_bootstrap_shim.py"
+      - "gtimeout 300s env -u LC_ALL PCC_RUN_NUMPY_L5_ARRAY_INTEGRATION=1 uv run pytest -q -n0 -m integration tests/integration/test_numpy_l5_pcc1_gate.py"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -m integration"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+
+  - id: TEST-P0-FULL-GC-MEMORY-BUDGET
+    priority: P0
+    status: DONE_STRONG
+    track: test-infrastructure/performance
+    title: "Bound aggregate RSS when full-GC bootstrap chains run under xdist"
+    latest_evidence: docs/goal/evidence/2026-07-22-full-gc-aggregate-memory-budget.md
+    latest_update: "The two-chain default passes focused scheduling checks, a forced-rebuild five-GC matrix in 16m08s, and 4551 integration cases; observed aggregate RSS peaked at 12.99 GiB versus the old three-chain 18.2 GiB peak."
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL
+    rank: 71
+    exit_criteria:
+      - "The default five-GC resource lease cannot admit three multi-gigabyte full bootstrap chains simultaneously on a 12-core developer host."
+      - "Focused scheduler tests prove the memory-budget/admission decision, explicit override behavior, stale-lease cleanup, cache-warmer ordering, and per-chain worker allocation without running a compiler."
+      - "A current-source five-GC matrix retains every backend's stage2/stage3 no-libpython and identity checks, ends with a final pytest summary, and records elapsed time plus observed aggregate peak RSS below the task's documented safe cap."
+      - "The complete integration command remains within its 1800-second watchdog without increasing pytest worker count or weakening any marker."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_pcc_bootstrap_full.py -k 'parallel_slots or matrix_plan or active_gc or resource or run_order'"
+      - "gtimeout 1800s env -u LC_ALL PCC_BOOTSTRAP_FULL_REBUILD=1 uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -m integration"
+
+  - id: TEST-P0-PACKAGE-ABI-UTF8-SOURCE-READ
+    priority: P0
+    status: DONE_STRONG
+    track: test-infrastructure/reliability
+    title: "Make package ABI source-contract reads independent of worker locale"
+    latest_evidence: docs/goal/evidence/2026-07-22-package-abi-utf8-source-read.md
+    latest_update: "All repository-source reads use explicit UTF-8, the focused ABI contract passes 5 cases, and the complete non-integration suite passes 9403 cases under the measured watchdog."
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - C-P0-FAKE-DLFCN-RTLD-LAZY
+    rank: 69
+    exit_criteria:
+      - "All repository-source reads in the failing package ABI contract test specify UTF-8 explicitly."
+      - "The package ABI mode-label file passes without weakening host/pcc1 wheel-tag and capability parity assertions."
+      - "The complete non-integration suite has a final passing summary under the measured 1200-second watchdog."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_abi_mode_labels.py"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+
+  - id: C-P0-FAKE-DLFCN-RTLD-LAZY
+    priority: P0
+    status: DONE_STRONG
+    track: c-frontend/fake-libc
+    title: "Restore current-source pcc runtime archive builds by declaring RTLD_LAZY"
+    latest_evidence: docs/goal/evidence/2026-07-22-fake-dlfcn-rtld-lazy-runtime-oracle.md
+    latest_update: "The generic fake header declares RTLD_LAZY, the runtime-oracle key covers fake-libc inputs, py_http.c emits through pcc, and a cold four-archive build passes all 28 corpus comparisons."
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - PKG-P0-NETWORK-ACQUISITION-BACKENDS
+    rank: 69
+    exit_criteria:
+      - "pcc --emit-obj compiles py_http.c from the same fake-libc surface used by the runtime archive."
+      - "The cold immutable runtime-oracle fixture builds libpy_runtime_pcc.a and all parameterized corpus comparisons pass."
+      - "The fix is a generic fake dlfcn declaration with no package-name special case and no runtime or test bypass."
+    required_gates:
+      - "gtimeout 90s env -u LC_ALL uv run pytest -q -n0 -m integration 'tests/python/test_py_runtime_pcc_emit.py::test_pcc_emits_object_for_runtime_source[py_http.c]'"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q tests/python/test_runtime_oracle_diff.py"
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/c/test_c_libc_registry_extra.py tests/c/test_libc_extra.py"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+
+  - id: CLI-P0-PCC1-OWNER-DEFAULTS
+    priority: P0
+    status: TODO_READY
+    track: cli/self-backend
+    title: "Make bare pcc1 Python execution default to the self owner with no libpython"
+    latest_evidence: ""
+    latest_update: "python-libpython=off and ir-scaffold=on are already documented defaults, but an omitted Python backend still normalizes to llvm; the current README therefore needs explicit owner flags and the short pcc1 app.py experience is mode-incorrect."
+    open_boundary: "For Python inputs only, make pcc1 resolve an omitted backend to self, libpython mode to off, and IR scaffold to on. Preserve explicit --backend llvm as the oracle and explicit libpython auto/on as compatibility modes. Fail closed on unsupported self behavior with no implicit LLVM or libpython fallback."
+    milestone: M5
+    depends_on:
+      - PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL
+    rank: 80
+    exit_criteria:
+      - "build/bootstrap/pcc1 app.py and uv run pcc1 app.py resolve to backend=self, python-libpython=off, and ir-scaffold=on without flags, and diagnostics/profile output records all resolved modes."
+      - "An unsupported self-backend program fails with a stable mode-labeled diagnostic instead of executing through LLVM or libpython."
+      - "Explicit --backend llvm remains available as an oracle and explicit --python-libpython=auto/on remains a separately labeled compatibility mode."
+      - "C/project input defaults on the host pcc CLI are unchanged; this task does not silently switch the mature C compiler path."
+      - "The pinned NumPy L5 application compiles and runs from current pcc1 using only the source path and output option once its package environment is active."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_pcc1_owner_defaults.py tests/python/test_cli_contract.py"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_multi_file_bootstrap_shim.py tests/python/test_pcc1_python_smoke.py"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest -q -n0 -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py"
+
+  - id: PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT
+    priority: P0
+    status: TODO_READY
+    track: packages/environment
+    title: "Make pcc and pcc1 install into and import from one first-class package environment"
+    latest_evidence: ""
+    latest_update: "The current host default (~/.cache/pcc/site-packages), compiled pcc1 default (/tmp/pcc-site-packages), and import discovery do not form one reliable install/run environment; the explicit PCC_PACKAGE_SITE README flow exposed this gap."
+    open_boundary: "Implement the shared environment resolver specified by docs/design/pcc-package-environments.md, remove divergent host/pcc1 fallback destinations, and prove that a default install is immediately importable without PCC_PACKAGE_SITE or --target. Preserve both flags as explicit, diagnosed overrides."
+    milestone: M5
+    depends_on:
+      - PKG-P0-NETWORK-ACQUISITION-BACKENDS
+      - CLI-P0-PCC1-OWNER-DEFAULTS
+    rank: 85
+    exit_criteria:
+      - "Host pcc, compiled pcc1, frontend import discovery, and emitted applications consume one self-hostable environment-selection contract with no duplicate fallback path literals."
+      - "With no explicit target, an active VIRTUAL_ENV selects its private .pcc compatibility-tagged overlay; without one, installation uses a durable per-user data environment and never /tmp or a cache directory."
+      - "pcc env info and pcc1 env info report the selected root, selection reason, package-site precedence, Python semantic target, pcc-native ABI, target triple, and override provenance in human and JSON forms."
+      - "A local generic package and the real NumPy command gate both prove install followed by compile/run with no PCC_PACKAGE_SITE, no --target, no package-name special case, and no libpython runtime edge."
+      - "GC0..4 and LLVM/self execution choices do not change the environment compatibility tag."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_environment.py tests/python/test_package_import_path.py"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_multi_file_bootstrap_shim.py"
+      - "gtimeout 900s env -u LC_ALL PCC_RUN_PCC1_DEFAULT_ENV_NUMPY=1 uv run pytest -q -n0 -m integration tests/integration/test_pcc1_default_package_environment.py"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+
+  - id: PKG-P0-UV-PROJECT-ENVIRONMENT
+    priority: P0
+    status: TODO_READY
+    track: packages/environment/uv
+    title: "Make uv-installed pcc and pcc1 share a private pcc-native project overlay"
+    latest_evidence: ""
+    latest_update: "Local uv 0.10.2 sets VIRTUAL_ENV to the project .venv for uv run, providing a concrete environment ownership seam without placing pcc-native extensions in CPython site-packages."
+    open_boundary: "Use the active uv/virtual environment as the owner of a compatibility-tagged .venv/.pcc overlay. Prove uv run pcc, uv run pcc1, direct pcc1 under the same VIRTUAL_ENV, and emitted applications select it identically, including deterministic behavior after uv recreates the environment."
+    milestone: M5
+    depends_on:
+      - PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT
+    rank: 90
+    exit_criteria:
+      - "Installing the pcc wheel with uv exposes pcc and its shipped platform pcc1 while keeping their package environment identity identical."
+      - "uv run pcc1 -m pip install <generic-package> followed by uv run pcc1 app.py succeeds without package-path variables or target flags."
+      - "pcc-native files live only below .venv/.pcc and never pollute CPython site-packages; CPython-native artifacts are not relabeled or imported as pcc-native."
+      - "Environment inspection labels uv/VIRTUAL_ENV selection, and recreating .venv yields a clean missing-overlay state rather than silently selecting a stale global site."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_uv_environment.py"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 -m integration tests/integration/test_uv_pcc_project_environment.py"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_abi_mode_labels.py tests/python/test_package_install_import_claims.py"
+
+  - id: PKG-P1-UV-LOCKED-NATIVE-SYNC
+    priority: P1
+    status: TODO_READY
+    track: packages/environment/uv
+    title: "Project a uv lock into a deterministic pcc-native environment without a second resolver"
+    latest_evidence: ""
+    latest_update: "The design assigns project resolution and uv.lock ownership to uv, while pcc owns source selection validation, pcc-native builds, transactional overlay publication, and no-libpython runtime evidence."
+    open_boundary: "Implement a versioned uv.lock adapter and pcc sync --locked. Record lock and artifact provenance, honor the selected target Python/groups/extras/markers, fail closed when no acceptable source or pcc-native artifact exists, and make unchanged repeat sync network- and rebuild-free."
+    milestone: M5
+    depends_on:
+      - PKG-P0-UV-PROJECT-ENVIRONMENT
+    rank: 100
+    exit_criteria:
+      - "pcc sync --locked consumes but never modifies uv.lock and records its digest plus the selected dependency graph and artifact digests in the pcc environment manifest."
+      - "The adapter does not resolve versions independently; unsupported uv schema, target-Python mismatch, missing source artifacts, build isolation, and incompatible wheels fail with stable diagnostics."
+      - "Sync publishes transactionally, removes stale packages only from the private pcc overlay, and an unchanged second sync performs zero downloads and zero native builds."
+      - "A locked generic dependency graph and a locked NumPy project both compile and run from the uv-owned pcc overlay without libpython; broader package compatibility remains outside this task."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_uv_lock_sync.py"
+      - "gtimeout 900s env -u LC_ALL uv run pytest -q -n0 -m integration tests/integration/test_uv_locked_pcc_sync.py"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -m integration"
+
+  - id: PKG-P1-RUNTIME-PROFILE-ENVIRONMENT-INVARIANCE
+    priority: P1
+    status: TODO_READY
+    track: packages/runtime-profiles
+    title: "Reuse one package environment across GC, backend, scheduler, and accelerator execution profiles"
+    latest_evidence: ""
+    latest_update: "Package compatibility must be keyed by semantic Python, pcc-native ABI, and target platform rather than runtime policy; otherwise selectable GC, virtual-thread, and GPU work would multiply installation cost and fragment user environments."
+    open_boundary: "Specify capability-tagged optional artifacts and prove that runtime-policy changes reuse the same installed CPU package graph. Reject incompatible device or scheduler capabilities explicitly without choosing another package site or rebuilding unrelated packages. This task integrates package environments with existing GC, virtual-thread, and GPU tracks; it does not claim those tracks are otherwise complete."
+    milestone: M5
+    depends_on:
+      - PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT
+    rank: 110
+    exit_criteria:
+      - "GC0..4, LLVM/self, and virtual-thread/asyncio-compatible policy changes preserve one environment identity and identical installed-artifact digests when the target ABI is unchanged."
+      - "Optional Metal/GPU payloads are capability-tagged artifacts inside a distribution manifest rather than dimensions that duplicate the whole package environment."
+      - "Selecting an unavailable runtime capability fails with a stable mode-labeled diagnostic and never falls back to a different site, CPython ABI, LLVM owner, or CPU/GPU implementation silently."
+      - "A cache assertion proves runtime-profile switches trigger zero package acquisition and zero package rebuild work."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_runtime_profile_environment.py"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/python/gc/test_package_environment_gc0.py tests/python/gc/test_package_environment_gc1.py tests/python/gc/test_package_environment_gc2.py tests/python/gc/test_package_environment_gc3.py tests/python/gc/test_package_environment_gc4.py"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/vthread/test_package_environment_profile.py tests/kernel/test_package_gpu_capabilities.py"

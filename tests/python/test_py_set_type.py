@@ -115,6 +115,143 @@ def test_generator_expression_iterates_first_class_set_type(tmp_path) -> None:
     assert run.stdout == "3\n"
 
 
+def test_list_and_singleton_unpack_accept_first_class_set_type(tmp_path) -> None:
+    from pcc.py_frontend.pipeline import compile_python
+
+    source = tmp_path / "set_consumers.py"
+    executable = tmp_path / "set_consumers"
+    source.write_text(
+        "values = {3, 1, 2}\n"
+        "print(sorted(list(values)))\n"
+        "left = {'b'}\n"
+        "right = {'a'}\n"
+        "print(sorted(list(left | right)))\n"
+        "only = {'value'}\n"
+        "item, = only\n"
+        "print(item)\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(source),
+        str(executable),
+        backend="self",
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    run = subprocess.run(
+        [str(executable)], text=True, capture_output=True, timeout=30
+    )
+
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "[1, 2, 3]\n['a', 'b']\nvalue\n"
+
+
+def test_set_unpack_rejects_wrong_arity(tmp_path) -> None:
+    from pcc.py_frontend.pipeline import compile_python
+
+    source = tmp_path / "set_unpack_arity.py"
+    executable = tmp_path / "set_unpack_arity"
+    source.write_text(
+        "try:\n"
+        "    first, second = {'only'}\n"
+        "    print('accepted-short')\n"
+        "except ValueError:\n"
+        "    print('short')\n"
+        "try:\n"
+        "    first, = {'one', 'two'}\n"
+        "    print('accepted-long')\n"
+        "except ValueError:\n"
+        "    print('long')\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(source),
+        str(executable),
+        backend="self",
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    run = subprocess.run(
+        [str(executable)], text=True, capture_output=True, timeout=30
+    )
+
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "short\nlong\n"
+
+
+def test_dict_keys_view_union_with_set_is_set_operation(tmp_path) -> None:
+    from pcc.py_frontend.pipeline import compile_python
+
+    source = tmp_path / "dict_keys_set_union.py"
+    executable = tmp_path / "dict_keys_set_union"
+    source.write_text(
+        "alpha = 1\n"
+        "def public_names():\n"
+        "    names = globals().keys() | {'extra'}\n"
+        "    return names\n"
+        "result = public_names()\n"
+        "print('alpha' in result)\n"
+        "print('extra' in result)\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(source),
+        str(executable),
+        backend="self",
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    run = subprocess.run(
+        [str(executable)], text=True, capture_output=True, timeout=30
+    )
+
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "True\nTrue\n"
+
+
+def test_set_augassign_accepts_dynamic_set_and_preserves_identity(tmp_path) -> None:
+    from pcc.py_frontend.pipeline import compile_python
+
+    source = tmp_path / "set_augassign_dynamic.py"
+    executable = tmp_path / "set_augassign_dynamic"
+    source.write_text(
+        "def merge(values):\n"
+        "    result = set()\n"
+        "    alias = result\n"
+        "    for value in values:\n"
+        "        result |= value\n"
+        "    print(result is alias)\n"
+        "    return sorted(result)\n"
+        "print(merge([{'a'}, {'b'}]))\n"
+        "def reject(value):\n"
+        "    result = set()\n"
+        "    try:\n"
+        "        result |= value\n"
+        "    except TypeError:\n"
+        "        return 'type-error'\n"
+        "    return 'accepted'\n"
+        "print(reject(1))\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(source),
+        str(executable),
+        backend="self",
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    run = subprocess.run(
+        [str(executable)], text=True, capture_output=True, timeout=30
+    )
+
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "True\n['a', 'b']\ntype-error\n"
+
+
 def test_set_projection_has_no_syntax_side_table_workaround() -> None:
     from pathlib import Path
 

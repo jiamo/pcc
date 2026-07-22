@@ -114,6 +114,13 @@ def test_runtime_source_copies_exclude_repository_build_products():
     assert violations == []
 
 
+def test_runtime_oracle_cache_key_tracks_fake_libc_headers():
+    source = (ROOT / "tests/python/test_runtime_oracle_diff.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'REPO_ROOT / "utils" / "fake_libc_include"' in source
+
+
 def test_tests_do_not_delete_shared_runtime_archives_or_skip_under_xdist():
     forbidden = (
         "_wipe_repo_runtime_archive",

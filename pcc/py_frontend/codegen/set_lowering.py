@@ -49,6 +49,239 @@ _DYN_SET_METHOD_NATIVE = frozenset(
 
 
 class SetLoweringMixin:
+    def _emit_require_native_set_operands(
+        self,
+        lhs: ir.Value,
+        rhs: ir.Value,
+        span,
+    ) -> None:
+        """Branch to TypeError unless both dynamic objects are native sets."""
+        lhs_tag = self.builder.call(
+            self.runtime["py_obj_type_tag"],
+            [lhs],
+            name=self._fresh("set.binop.lhs.tag"),
+        )
+        rhs_tag = self.builder.call(
+            self.runtime["py_obj_type_tag"],
+            [rhs],
+            name=self._fresh("set.binop.rhs.tag"),
+        )
+        lhs_is_set = self.builder.icmp_signed(
+            "==", lhs_tag, ir.Constant(_I64, 8), name=self._fresh("set.binop.lhs.ok")
+        )
+        rhs_is_set = self.builder.icmp_signed(
+            "==", rhs_tag, ir.Constant(_I64, 8), name=self._fresh("set.binop.rhs.ok")
+        )
+        valid = self.builder.and_(
+            lhs_is_set,
+            rhs_is_set,
+            name=self._fresh("set.binop.operands.ok"),
+        )
+        fn = self.current_function
+        ok_bb = fn.append_basic_block(name=self._fresh("set.binop.ok"))
+        bad_bb = fn.append_basic_block(name=self._fresh("set.binop.bad"))
+        self.builder.cbranch(valid, ok_bb, bad_bb)
+        self.builder.position_at_end(bad_bb)
+        message = self._ptr_to_cstr(
+            self._cstr_global(
+                "set binary operator requires set operands",
+                ".set.binop.typeerror",
+            )
+        )
+        exc = self.builder.call(
+            self.runtime["py_exc_new"],
+            [ir.Constant(_I64, 3), message],
+            name=self._fresh("set.binop.exc"),
+        )
+        self.builder.call(self.runtime["py_raise"], [exc])
+        err_target = getattr(self, "_try_err_block", None) or self._ensure_fn_err_exit()
+        self.builder.branch(err_target)
+        self.builder.position_at_end(ok_bb)
+
+    def _emit_checked_set_binary_values(
+        self,
+        op: str,
+        lhs: ir.Value,
+        rhs: ir.Value,
+        span,
+    ) -> ir.Value:
+        self._emit_require_native_set_operands(lhs, rhs, span)
+        if op == "|":
+            return self._emit_set_union_values(lhs, rhs)
+        if op == "&":
+            return self.builder.call(
+                self.runtime["py_set_intersection"],
+                [lhs, rhs],
+                name=self._fresh("set.intersection"),
+            )
+        if op == "-":
+            return self.builder.call(
+                self.runtime["py_set_difference"],
+                [lhs, rhs],
+                name=self._fresh("set.difference"),
+            )
+        return self.builder.call(
+            self.runtime["py_set_symmetric_difference"],
+            [lhs, rhs],
+            name=self._fresh("set.symmetric_difference"),
+        )
+
+    def _emit_checked_set_inplace_values(
+        self,
+        op: str,
+        lhs: ir.Value,
+        rhs: ir.Value,
+        span,
+    ) -> ir.Value:
+        self._emit_require_native_set_operands(lhs, rhs, span)
+        if op == "|":
+            helper = "py_set_update"
+        elif op == "&":
+            helper = "py_set_intersection_update"
+        elif op == "-":
+            helper = "py_set_difference_update"
+        else:
+            helper = "py_set_symmetric_difference_update"
+        self.builder.call(self.runtime[helper], [lhs, rhs])
+        return self._gc_retain(lhs, name=self._fresh("set.inplace.retain"))
+
+    def _dict_keys_view_receiver(self, expr: Expr) -> Optional[Expr]:
+        """Return the mapping behind a statically known ``dict.keys()`` view.
+
+        The current runtime materialises ``dict.keys()`` as an insertion-
+        ordered list.  That is sufficient for iteration, but a Python keys
+        view also implements set-like binary operators.  Preserve that
+        distinction from the source expression instead of treating every
+        runtime list as set-like.
+        """
+        if not isinstance(expr, Call) or expr.args or expr.kwargs:
+            return None
+        if not isinstance(expr.func, Attr) or expr.func.name != "keys":
+            return None
+        receiver = expr.func.obj
+        if not isinstance(receiver.ty, DictType):
+            return None
+        return receiver
+
+    def _materialize_dict_keys_view_set(self, receiver: Expr) -> ir.Value:
+        mapping = self._emit_expr(receiver)
+        mapping_obj = marshal.marshal_to_object(
+            self.builder,
+            self.module,
+            self.runtime,
+            mapping,
+            receiver.ty,
+        )
+        keys = self.builder.call(
+            self.runtime["py_dict_keys"],
+            [mapping_obj],
+            name=self._fresh("dict.keys.set.keys"),
+        )
+        out = self.builder.call(
+            self.runtime["py_set_new"],
+            [],
+            name=self._fresh("dict.keys.set"),
+        )
+        length = self.builder.call(
+            self.runtime["py_list_len"],
+            [keys],
+            name=self._fresh("dict.keys.set.len"),
+        )
+        index = self._alloca_in_entry(_I64, name="dict.keys.set.index.addr")
+        self.builder.store(ir.Constant(_I64, 0), index)
+        fn = self.current_function
+        cond_bb = fn.append_basic_block(name=self._fresh("dict.keys.set.cond"))
+        body_bb = fn.append_basic_block(name=self._fresh("dict.keys.set.body"))
+        end_bb = fn.append_basic_block(name=self._fresh("dict.keys.set.end"))
+        self.builder.branch(cond_bb)
+        self.builder.position_at_end(cond_bb)
+        current = self.builder.load(index, name=self._fresh("dict.keys.set.index"))
+        keep_going = self.builder.icmp_signed(
+            "<",
+            current,
+            length,
+            name=self._fresh("dict.keys.set.keep"),
+        )
+        self.builder.cbranch(keep_going, body_bb, end_bb)
+        self.builder.position_at_end(body_bb)
+        item = self.builder.call(
+            self.runtime["py_list_get"],
+            [keys, current],
+            name=self._fresh("dict.keys.set.item"),
+        )
+        self.builder.call(self.runtime["py_set_add"], [out, item])
+        self._gc_release(item, self._release_context_label("dict.keys.set.item"))
+        next_index = self.builder.add(
+            current,
+            ir.Constant(_I64, 1),
+            name=self._fresh("dict.keys.set.next"),
+        )
+        self.builder.store(next_index, index)
+        self.builder.branch(cond_bb)
+        self.builder.position_at_end(end_bb)
+        self._gc_release(keys, self._release_context_label("dict.keys.set.keys"))
+        self._gc_release_if_owned(mapping_obj, receiver)
+        return out
+
+    def _maybe_emit_dict_keys_view_binop(self, expr) -> Optional[ir.Value]:
+        """Lower set operators involving a real ``dict.keys()`` view.
+
+        This is intentionally source-shape constrained: ordinary lists must
+        continue to reject ``list | set``.  Both operands are materialised as
+        native sets only when the other side is a statically known set or
+        another keys view.
+        """
+        if expr.op not in ("|", "&", "-", "^"):
+            return None
+        lhs_receiver = self._dict_keys_view_receiver(expr.lhs)
+        rhs_receiver = self._dict_keys_view_receiver(expr.rhs)
+        if lhs_receiver is None and rhs_receiver is None:
+            return None
+        if lhs_receiver is None and not isinstance(expr.lhs.ty, SetType):
+            return None
+        if rhs_receiver is None and not isinstance(expr.rhs.ty, SetType):
+            return None
+
+        lhs = (
+            self._materialize_dict_keys_view_set(lhs_receiver)
+            if lhs_receiver is not None
+            else self._emit_expr(expr.lhs)
+        )
+        rhs = (
+            self._materialize_dict_keys_view_set(rhs_receiver)
+            if rhs_receiver is not None
+            else self._emit_expr(expr.rhs)
+        )
+        if expr.op == "|":
+            result = self._emit_set_union_values(lhs, rhs)
+        elif expr.op == "&":
+            result = self.builder.call(
+                self.runtime["py_set_intersection"],
+                [lhs, rhs],
+                name=self._fresh("dict.keys.intersection"),
+            )
+        elif expr.op == "-":
+            result = self.builder.call(
+                self.runtime["py_set_difference"],
+                [lhs, rhs],
+                name=self._fresh("dict.keys.difference"),
+            )
+        else:
+            result = self.builder.call(
+                self.runtime["py_set_symmetric_difference"],
+                [lhs, rhs],
+                name=self._fresh("dict.keys.symmetric_difference"),
+            )
+        if lhs_receiver is not None:
+            self._gc_release(lhs, self._release_context_label("dict.keys.set.lhs"))
+        else:
+            self._gc_release_if_owned(lhs, expr.lhs)
+        if rhs_receiver is not None:
+            self._gc_release(rhs, self._release_context_label("dict.keys.set.rhs"))
+        else:
+            self._gc_release_if_owned(rhs, expr.rhs)
+        return result
+
     def _maybe_emit_set_method_via_dyn(
         self,
         expr: Call,

@@ -89,7 +89,7 @@
     "release": "25.5.0",
     "system": "Darwin"
   },
-  "generated_at": "2026-07-19T05:54:52.237680+00:00",
+  "generated_at": "2026-07-22T00:54:49.415424+00:00",
   "ir_shape": {
     "direct_aggregate_abi": true,
     "function_signature": "define double @user_value_array_c_like_hot({ { double, double }, { double, double } } %values, ptr %rounds) {",
@@ -111,15 +111,15 @@
       ],
       "label": "CPython-host",
       "links_libpython": "host-runtime",
-      "median_ns": 754878250,
+      "median_ns": 765276292,
       "samples_ns": [
-        748000208,
-        754878250,
-        761155667,
-        756710875,
-        748093042,
-        758258125,
-        753063917
+        778932541,
+        765276292,
+        758416666,
+        757885750,
+        767550083,
+        777502916,
+        758953833
       ]
     },
     "llvm_no_libpython": {
@@ -128,17 +128,17 @@
       ],
       "label": "LLVM/no-libpython",
       "links_libpython": false,
-      "median_ns": 59398584,
-      "ratio_vs_cpython": 0.07868631001091898,
-      "ratio_vs_native_c": 1.5799229037760127,
+      "median_ns": 59189958,
+      "ratio_vs_cpython": 0.0773445598913183,
+      "ratio_vs_native_c": 1.6076309698008793,
       "samples_ns": [
-        59056000,
-        59251958,
-        59831542,
-        59398584,
-        59691000,
-        58676250,
-        59680458
+        59673917,
+        59086375,
+        59732042,
+        59318500,
+        58808625,
+        58826417,
+        59189958
       ]
     },
     "native_c": {
@@ -147,15 +147,15 @@
       ],
       "label": "native-C/clang-O3",
       "links_libpython": false,
-      "median_ns": 37595875,
+      "median_ns": 36818125,
       "samples_ns": [
-        37759750,
-        37160667,
-        37595875,
-        38392084,
-        37730709,
-        37438209,
-        36888458
+        37371750,
+        36818125,
+        37337917,
+        36294834,
+        37239292,
+        36291542,
+        36655041
       ]
     },
     "self_no_libpython": {
@@ -164,24 +164,24 @@
       ],
       "label": "self/no-libpython",
       "links_libpython": false,
-      "median_ns": 283220083,
-      "ratio_vs_cpython": 0.3751864396675888,
-      "ratio_vs_native_c": 7.533275472375626,
+      "median_ns": 283337167,
+      "ratio_vs_cpython": 0.37024166299404976,
+      "ratio_vs_native_c": 7.695589251217981,
       "samples_ns": [
-        282534000,
-        283220083,
-        283215500,
-        282802208,
-        512851084,
-        283502125,
-        284394667
+        284169542,
+        284433042,
+        282779416,
+        281730084,
+        284228708,
+        281864500,
+        283337167
       ]
     }
   },
   "schema": "pcc.m3_c_like.value_array.v1",
   "source_identity": {
     "binding": "base commit plus exact content and emitted-IR hashes",
-    "frontend_ir_sha256": "a42d50acf682a1df8121cef54d702266b4393ea159a9508977f2b1f44f137c52",
+    "frontend_ir_sha256": "453a02be732247e4ac297d800cb7111efcad25deccef4f82b4716cc8f81298ac",
     "native_c_path": "benchmarks/c/value_array_c_like.c",
     "native_c_sha256": "e8d3272cd43918430e662790b01298d06667f175794bf4bda191d470e46c1945",
     "python_path": "benchmarks/python/scenarios/value_array_c_like.py",

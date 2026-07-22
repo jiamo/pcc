@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -16,11 +17,16 @@ import pytest
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 
 from pcc.package.install import install_package
-from pcc.package.metadata import current_platform_tag, inspect_artifact, pcc_native_wheel_tag
+from pcc.package.metadata import (
+    current_platform_tag,
+    inspect_artifact,
+    pcc_native_wheel_tag,
+)
 from pcc.package.wheel_repo import repository_report
 
-
 REPO = Path(__file__).resolve().parents[2]
+
+
 def _find_current_pcc1() -> Path | None:
     return find_current_pcc1(REPO)
 
@@ -31,8 +37,7 @@ def _write_demo_project(root: Path) -> Path:
     pkg.mkdir()
     (pkg / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
     (pkg / "core.py").write_text(
-        "def answer() -> int:\n"
-        "    return 42\n",
+        "def answer() -> int:\n" "    return 42\n",
         encoding="utf-8",
     )
     (root / "demo_pkg.pyx").write_text("cdef int value\n", encoding="utf-8")
@@ -41,8 +46,12 @@ def _write_demo_project(root: Path) -> Path:
         encoding="utf-8",
     )
     (root / "solver.f90").write_text("subroutine solver()\nend\n", encoding="utf-8")
-    (root / "blas_probe.c").write_text("int blas_probe(void) { return 0; }\n", encoding="utf-8")
-    (root / "lapack_probe.c").write_text("int lapack_probe(void) { return 0; }\n", encoding="utf-8")
+    (root / "blas_probe.c").write_text(
+        "int blas_probe(void) { return 0; }\n", encoding="utf-8"
+    )
+    (root / "lapack_probe.c").write_text(
+        "int lapack_probe(void) { return 0; }\n", encoding="utf-8"
+    )
     (root / "meson.build").write_text("project('demo_pkg', 'c')\n", encoding="utf-8")
     (root / "pyproject.toml").write_text(
         "[build-system]\n"
@@ -51,10 +60,12 @@ def _write_demo_project(root: Path) -> Path:
         encoding="utf-8",
     )
     (root / "compile_commands.json").write_text(
-        json.dumps([
-            {"file": str(root / "demo_pkg.c"), "command": "cc -c demo_pkg.c"},
-            {"file": str(root / "solver.f90"), "command": "gfortran -c solver.f90"},
-        ]),
+        json.dumps(
+            [
+                {"file": str(root / "demo_pkg.c"), "command": "cc -c demo_pkg.c"},
+                {"file": str(root / "solver.f90"), "command": "gfortran -c solver.f90"},
+            ]
+        ),
         encoding="utf-8",
     )
     return root
@@ -76,12 +87,12 @@ def _write_fake_vendored_meson(project: Path) -> None:
         "import sys\n"
         "builddir = Path(sys.argv[2])\n"
         "builddir.mkdir(parents=True, exist_ok=True)\n"
-        "(builddir / 'build.ninja').write_text(\"\"\"\n"
+        '(builddir / \'build.ninja\').write_text("""\n'
         "rule gen\n"
         "  command = /bin/sh -c \\\"mkdir -p demo_pkg && printf 'VALUE = 2\\\\n' > demo_pkg/__init__.py && printf 'BUILD_VALUE = 99\\\\n' > demo_pkg/generated.py\\\"\n"
         "build demo_pkg/generated.py: gen\n"
         "default demo_pkg/generated.py\n"
-        "\"\"\", encoding='utf-8')\n",
+        '""", encoding=\'utf-8\')\n',
         encoding="utf-8",
     )
 
@@ -100,8 +111,7 @@ def _write_demo_wheel(
         zf.writestr("demo_pkg/__init__.py", "VALUE = 1\n")
         zf.writestr(
             "demo_pkg/core.py",
-            "def answer() -> int:\n"
-            "    return 42\n",
+            "def answer() -> int:\n" "    return 42\n",
         )
         if native_libpython:
             zf.writestr("demo_pkg/bad.so", "/usr/local/lib/libpython3.13.dylib\n")
@@ -143,7 +153,8 @@ def _serve_directory(root: Path):
 def _write_simple_index(root: Path, wheel: Path) -> str:
     simple = root / "simple" / "demo-pkg"
     simple.mkdir(parents=True, exist_ok=True)
-    href = "/packages/" + wheel.name
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    href = "/packages/" + wheel.name + "#sha256=" + digest
     (simple / "index.html").write_text(
         f'<html><body><a href="{href}">{wheel.name}</a></body></html>\n',
         encoding="utf-8",
@@ -168,27 +179,66 @@ def test_artifact_metadata_covers_l9_l10_build_surfaces(tmp_path):
     assert meta["pcc_native_wheel_tag"] == pcc_native_wheel_tag()
 
 
+def test_source_install_prefers_distribution_package_and_scans_build_overlay(
+    tmp_path,
+):
+    project = tmp_path / "demo_pkg-0.1"
+    (project / "demo_pkg").mkdir(parents=True)
+    (project / "demo_pkg" / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (project / "benchmarks").mkdir()
+    (project / "benchmarks" / "__init__.py").write_text("\n", encoding="utf-8")
+    built = project / "build" / "pcc-package" / "meson-build" / "demo_pkg"
+    built.mkdir(parents=True)
+    (built / "_native.cpython-314-darwin.so").write_text(
+        "libpcc_runtime\n", encoding="utf-8"
+    )
+
+    result = install_package(
+        str(project),
+        target_dir=tmp_path / "site",
+        cache_dir=tmp_path / "cache",
+        abi="pcc-native",
+    )
+
+    assert result["ok"] is False
+    assert result["installed_path"] == str(tmp_path / "site" / "demo_pkg")
+    assert result["linkage"]["uses_cpython_extension_abi"] is True
+    assert not (tmp_path / "site" / "benchmarks").exists()
+
+
 def test_artifact_metadata_excludes_non_build_tree_surfaces(tmp_path):
     project = tmp_path / "demo_pkg-0.1"
     project.mkdir()
     (project / "demo_pkg").mkdir()
     (project / "demo_pkg" / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (project / "demo_pkg" / "_native.pyx").write_text("cdef int value\n", encoding="utf-8")
+    (project / "demo_pkg" / "_native.pyx").write_text(
+        "cdef int value\n", encoding="utf-8"
+    )
     (project / "doc" / "source").mkdir(parents=True)
-    (project / "doc" / "source" / "example.f90").write_text("subroutine demo()\nend\n", encoding="utf-8")
+    (project / "doc" / "source" / "example.f90").write_text(
+        "subroutine demo()\nend\n", encoding="utf-8"
+    )
     (project / "tests" / "examples").mkdir(parents=True)
-    (project / "tests" / "examples" / "checks.pyx").write_text("cdef int ignored\n", encoding="utf-8")
+    (project / "tests" / "examples" / "checks.pyx").write_text(
+        "cdef int ignored\n", encoding="utf-8"
+    )
     (project / "vendored-meson" / "meson" / "test cases" / "cython").mkdir(parents=True)
-    (project / "vendored-meson" / "meson" / "test cases" / "cython" / "storer.pyx").write_text(
+    (
+        project / "vendored-meson" / "meson" / "test cases" / "cython" / "storer.pyx"
+    ).write_text(
         "cdef int ignored\n",
         encoding="utf-8",
     )
-    (project / "vendored-meson" / "meson" / "test cases" / "cython" / "storer.c").write_text(
+    (
+        project / "vendored-meson" / "meson" / "test cases" / "cython" / "storer.c"
+    ).write_text(
         "/* Generated by Cython */\n",
         encoding="utf-8",
     )
     (project / ".github" / "workflows").mkdir(parents=True)
-    (project / ".github" / "workflows" / "linux_blas.yml").write_text("blas\n", encoding="utf-8")
+    (project / ".github" / "workflows" / "linux_blas.yml").write_text(
+        "blas\n", encoding="utf-8"
+    )
 
     meta = inspect_artifact("demo_pkg", project).as_dict()
     assert meta["cython_sources"] == ["demo_pkg/_native.pyx"]
@@ -210,8 +260,12 @@ def test_artifact_metadata_reads_meson_native_library_fallbacks(tmp_path):
         "        description: 'allow internal fallback routines')\n",
         encoding="utf-8",
     )
-    (project / "demo_pkg" / "blas_probe.c").write_text("int blas_probe(void) { return 0; }\n", encoding="utf-8")
-    (project / "demo_pkg" / "lapack_probe.c").write_text("int lapack_probe(void) { return 0; }\n", encoding="utf-8")
+    (project / "demo_pkg" / "blas_probe.c").write_text(
+        "int blas_probe(void) { return 0; }\n", encoding="utf-8"
+    )
+    (project / "demo_pkg" / "lapack_probe.c").write_text(
+        "int lapack_probe(void) { return 0; }\n", encoding="utf-8"
+    )
 
     meta = inspect_artifact("demo_pkg", project).as_dict()
     assert meta["native_library_fallbacks"] == ["blas", "lapack"]
@@ -238,11 +292,13 @@ def test_numpy_local_source_metadata_filters_non_build_surfaces():
         "tools/",
         "vendored-meson/",
     )
-    for key in ("cython_sources", "fortran_sources", "blas_indicators", "lapack_indicators"):
-        assert not any(
-            str(path).startswith(ignored_prefixes)
-            for path in meta[key]
-        )
+    for key in (
+        "cython_sources",
+        "fortran_sources",
+        "blas_indicators",
+        "lapack_indicators",
+    ):
+        assert not any(str(path).startswith(ignored_prefixes) for path in meta[key])
 
 
 def test_wheel_and_sdist_metadata(tmp_path):
@@ -311,7 +367,9 @@ def test_local_install_overlays_pcc_meson_build_payload(tmp_path):
     assert result["ok"] is True
     installed_pkg = tmp_path / "site" / "demo_pkg"
     assert (installed_pkg / "core.py").exists()
-    assert (installed_pkg / "generated.py").read_text(encoding="utf-8") == "BUILD_VALUE = 99\n"
+    assert (installed_pkg / "generated.py").read_text(
+        encoding="utf-8"
+    ) == "BUILD_VALUE = 99\n"
     assert (installed_pkg / "_native.so").exists()
     assert (installed_pkg / "__init__.py").read_text(encoding="utf-8") == "VALUE = 2\n"
     assert (tmp_path / "cache" / "demo_pkg" / "generated.py").exists()
@@ -336,7 +394,9 @@ def test_local_install_can_build_source_before_overlay(tmp_path):
         "meson_build",
     ]
     assert (tmp_path / "site" / "demo_pkg" / "generated.py").exists()
-    assert (tmp_path / "site" / "demo_pkg" / "__init__.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert (tmp_path / "site" / "demo_pkg" / "__init__.py").read_text(
+        encoding="utf-8"
+    ) == "VALUE = 2\n"
 
 
 def test_install_blocks_libpython_linked_artifact_in_pcc_native_mode(tmp_path):
@@ -425,7 +485,9 @@ def test_find_links_consumes_pcc_wheel_repository_manifest(tmp_path):
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
     _write_demo_wheel(wheelhouse / "demo_pkg-0.1-py3-none-any.whl")
-    native = _write_demo_wheel(wheelhouse / f"demo_pkg-0.1-{pcc_native_wheel_tag()}.whl")
+    native = _write_demo_wheel(
+        wheelhouse / f"demo_pkg-0.1-{pcc_native_wheel_tag()}.whl"
+    )
     report = repository_report(wheelhouse, write_manifest=True)
     assert report["ok"] is True
 
@@ -465,7 +527,9 @@ def test_find_links_repository_manifest_skips_libpython_artifact(tmp_path):
     assert result["no_libpython_runtime"] is True
 
 
-def test_find_links_prefers_highest_version_and_reports_unsupported_requirements(tmp_path):
+def test_find_links_prefers_highest_version_and_reports_unsupported_requirements(
+    tmp_path,
+):
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
     _write_demo_wheel(wheelhouse / "demo_pkg-0.2-py3-none-any.whl")
@@ -657,6 +721,7 @@ def test_pcc_pip_install_local_simple_index(tmp_path):
                 "pip",
                 "install",
                 "demo_pkg",
+                "--acquire=owned",
                 "--index-url",
                 index_url,
                 "--target",
@@ -674,10 +739,13 @@ def test_pcc_pip_install_local_simple_index(tmp_path):
     plan = json.loads(proc.stdout)
     assert plan["ok"] is True
     assert plan["index_urls"] == [index_url]
-    assert plan["installs"][0]["resolved_from"] == "index-url"
+    assert plan["acquisitions"][0]["artifact_origin"] == "simple-repository"
+    assert plan["installs"][0]["resolved_from"] == "direct"
     assert plan["installs"][0]["source_path"].endswith(wheel.name)
     assert (tmp_path / "site" / "demo_pkg" / "core.py").exists()
-    assert (tmp_path / "cache" / "downloads" / wheel.name).exists()
+    acquired = Path(plan["acquisitions"][0]["artifact_path"])
+    assert acquired.exists()
+    assert acquired.parent.name == plan["acquisitions"][0]["sha256"]
 
 
 def test_pcc_pip_dry_run_report_writes_install_plan(tmp_path):
@@ -752,7 +820,8 @@ def test_pcc_pip_install_find_links_installs_local_dependencies(tmp_path):
     )
     plan = json.loads(proc.stdout)
     assert plan["ok"] is True
-    assert plan["packages"] == ["helper-pkg", "demo_pkg"]
+    assert plan["packages"] == ["demo_pkg"]
+    assert plan["install_specs"] == ["helper-pkg", "demo_pkg"]
     assert (tmp_path / "site" / "helper_pkg" / "core.py").exists()
     assert (tmp_path / "site" / "demo_pkg" / "core.py").exists()
 
@@ -760,7 +829,9 @@ def test_pcc_pip_install_find_links_installs_local_dependencies(tmp_path):
 def test_pcc1_package_install_writes_manifest_without_host_python(tmp_path):
     pcc1 = _find_current_pcc1()
     if pcc1 is None:
-        skip_or_fail_no_current_pcc1("no current pcc1 binary with native package install shim")
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 binary with native package install shim"
+        )
     project = _write_demo_project(tmp_path / "demo_pkg-0.1")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
@@ -916,6 +987,7 @@ def test_pcc1_package_install_writes_manifest_without_host_python(tmp_path):
                 "pip",
                 "install",
                 "demo_pkg",
+                "--acquire=owned",
                 "--index-url",
                 index_url,
                 "--target",

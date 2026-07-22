@@ -311,6 +311,12 @@ Do not do that here.
   and terminate leftover `pytest`, `bootstrap.sh`, `pcc`, `pcc1`, `pcc2`, and
   `pcc3` children. A run without a final pytest summary is not green evidence,
   no matter how many progress dots were printed.
+- **A completed tool call is not ongoing work.** Once no shell/tool/agent job is
+  running, send a concrete progress update or end the turn within 60 seconds.
+  Do not remain silent in model-side analysis; if the next action is not ready,
+  report the exact completed state and yield. A multi-hour `Model interrupted
+  to submit` interval with no live child process is an agent stall, not task
+  progress, and must never be described as compilation or investigation time.
 - **Do not use the full five-GC bootstrap matrix as a diagnostic loop.** Any
   change under `pcc/` invalidates the content-addressed bootstrap source hash
   and can force five cold `pcc1 -> pcc2 -> pcc3` chains. Before launching the
@@ -337,9 +343,12 @@ Do not do that here.
   `scripts/bootstrap.sh`, `/tmp/<name>` probes, LLDB sessions, anything
   that forks a child process. The default is a small timeout you expect
   the command to finish well under; **only widen it when you can name a
-  specific reason** the run will legitimately take longer (e.g. "full
-  pytest suite is 6–8 min → use 600s", "stage1 self-host bootstrap is
-  ~4–5 min → use 360s"). "I'll just let it run" is not a reason.
+  specific reason** the run will legitimately take longer (e.g. "the current
+  9517-case non-integration suite reached only 93% at 900s on a cold
+  current-source run → use 1200s", "stage1 self-host bootstrap is ~4–5 min →
+  use 360s"). "I'll just let it run" is not a reason. Re-measure these
+  envelopes after build/cache changes; an old shorter estimate is not a reason
+  to repeat a gate that cannot produce a final summary.
   Without a timeout, a hung collection / codegen infinite loop / runaway
   probe silently burns the foreground turn and can leave zombie children
   pegging CPU for hours (this has happened — ~120 CPU-hours lost once).

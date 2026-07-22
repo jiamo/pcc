@@ -11,6 +11,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved for the closed-world self-host path as of 2026-05-13. The
 - [codegen-self-host-host-contract-trace-fields.md](codegen-self-host-host-contract-trace-fields.md) — **self-host codegen trace fields missing from host contract**
   - resolved (2026-05-23)
+- [numpy-2-4-6-set-codegen.md](numpy-2-4-6-set-codegen.md) — **NumPy exposes SetType coercion and tuple-unpack lowering failures**
+  - resolved locally (2026-07-21)
 - [pcc-bootstrap-stage2-layer1-codegen-timeout.md](pcc-bootstrap-stage2-layer1-codegen-timeout.md) — **pcc1 stage2 times out inside `codegen[pcc.py_frontend.codegen.layer1]`**
   - historical / superseded.
 - [pcc-py-codegen-float-dyn-closed-world.md](pcc-py-codegen-float-dyn-closed-world.md) — **`float(<dyn>)` and `_to_double` re-introduce libpython linkage in closed-world build**
@@ -26,6 +28,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved locally 2026-06-04
 - [self-backend-nested-valueclass-payload-equality.md](self-backend-nested-valueclass-payload-equality.md) — **self-backend nested valueclass payload equality**
   - resolved locally 2026-06-04
+- [self-backend-short-lived-emit-worker-fanout.md](self-backend-short-lived-emit-worker-fanout.md) — **self-backend short-lived emit worker fanout**
+  - The real `pcc1 -m pip install numpy` command gate entered application
 - [self-backend-sparse-ssa-cache-memory-explosion.md](self-backend-sparse-ssa-cache-memory-explosion.md) — **self-backend sparse SSA cache memory explosion**
   - resolved locally 2026-07-20
 - [self-backend-torture-phi-swap-and-minmax-zero-fold.md](self-backend-torture-phi-swap-and-minmax-zero-fold.md) — **self-backend torture cluster: phi parallel-copy swap + smin/smax-against-zero peephole**
@@ -358,6 +362,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - `tests/python/data_model/test_final_language_compiled_acceptance.py::test_t1_metaclass_type_enum_abcmeta_compiled`
 - [python-extern-c_ptr-funcname-libpython-wrap-leak.md](python-extern-c_ptr-funcname-libpython-wrap-leak.md) — **extern c_ptr arg for a Name leaks py_cpy_wrap_pcc_<N>arg into the no-libpython runtime archive**
   - `tests/py_corpus/phase4/re_match` fails at link time in the default pcc
+- [python-fake-libc-dlfcn-rtld-lazy-missing.md](python-fake-libc-dlfcn-rtld-lazy-missing.md) — **fake `dlfcn.h` omits `RTLD_LAZY` used by `py_http.c`**
+  - The current-source runtime-oracle fixture fails while building
 - [python-fake-libc-netdb-socket-addrinfo-missing.md](python-fake-libc-netdb-socket-addrinfo-missing.md) — **`fake_libc_include/netdb.h` and `sys/socket.h` lack `addrinfo` / `sockaddr` so pcc can't compile `py_http.c`**
   - `tests/python/test_py_runtime_pcc_emit.py::test_pcc_emits_object_for_runtime_source[py_http.c]`
 - [python-for-list-int-elem-boxed-slot-i64-store.md](python-for-list-int-elem-boxed-slot-i64-store.md) — **for v in [int list] stores i64 into a boxed (ptr) slot — link error / empty loop**
@@ -388,6 +394,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - The test compiles every `pcc/ir_passes/*.py` module under
 - [python-module-attr-write-native.md](python-module-attr-write-native.md) — **Native module attribute writes still require libpython**
   - `tests/test_python_module_imports_parity.py::test_module_attribute_write` is
+- [python-module-attrs-loses-extension-binding.md](python-module-attrs-loses-extension-binding.md) — **module attribute lookup loses an extension binding**
+  - resolved locally (2026-07-21)
 - [python-native-module-alias-module-global-attr-attribute-error.md](python-native-module-alias-module-global-attr-attribute-error.md) — **`mod_alias.module_global_attr` (e.g. `_mat.__all__`) failed with AttributeError because (a) Attr-RHS exports were dropped and (b) Attr lowering had no `module_global` branch**
   - `numpy/__init__.py:681 set(_mat.__all__)` failed at runtime with
 - [python-nested-if-import-from-skips-native-predeclare.md](python-nested-if-import-from-skips-native-predeclare.md) — **`from .sibling import name` nested inside top-level `if/try` skips native predeclare**
@@ -596,12 +604,18 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - `B-P0-PKG` gating feature (a) from the 2026-05-28 NEXT pivot note in
 - [nbody-shootout-fp-contract-and-vectorization.md](nbody-shootout-fp-contract-and-vectorization.md) — **Investigation Report: `nbody_shootout` Was Not "Just Missing Vectorization"**
   - `benchmarks/nbody_shootout.c` exposed a real optimization gap between `pcc` and
+- [numpy-2-5-capi-surface.md](numpy-2-5-capi-surface.md) — **NumPy 2.5 core exposes five missing generic C-API surfaces**
+  - The generic pcc-native Meson target replay compiles 134 of the 139 actions in
 - [numpy-first-import-libpython-fallback.md](numpy-first-import-libpython-fallback.md) — **Real NumPy first import still emits libpython fallback**
   - The active `B-P0-PKG` first-import tracer for the repository-local NumPy 2.4.4 package no longer matches the stale status/test expectatio...
 - [numpy-loader-probe-cext-reimport-load-once.md](numpy-loader-probe-cext-reimport-load-once.md) — **NumPy head-truth loader probe fails on cext re-import ("load once per process")**
   - `scripts/numpy_head_gate.py run` (README numpy step 2) exits non-zero with
+- [package-acquisition-target-python.md](package-acquisition-target-python.md) — **package acquisition ignores the pcc target Python language version**
+  - The default host acquisition backend resolves a bare package against the host
 - [package-campaign-generic-capability-profile.md](package-campaign-generic-capability-profile.md) — **package campaigns branch on a package-named profile**
   - Host and pcc1 campaign paths contained explicit `numpy-core-l6` comparisons
+- [package-host-pip-discovery.md](package-host-pip-discovery.md) — **host acquisition stops at a PATH-shadowing Python without pip**
+  - The host acquisition backend defaults to the first `python3` on PATH. Under
 - [package-manifest-schema-wheel-tag-source-of-truth.md](package-manifest-schema-wheel-tag-source-of-truth.md) — **host and pcc1 package manifests duplicate schema and wheel tags**
   - Host package metadata/install code and the no-libpython pcc1 CLI independently
 - [pcc-bootstrap-stage2-type-infer-runtime-corruption.md](pcc-bootstrap-stage2-type-infer-runtime-corruption.md) — **Investigation Report: Bootstrap Stage2 Type Inference Runtime Corruption**

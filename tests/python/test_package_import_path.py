@@ -2023,19 +2023,15 @@ def test_pcc1_pip_install_chain_no_host_ext_abi_smoke(tmp_path):
     assert proc.stdout.strip() == "43"
 
 
-def test_pip_install_unresolvable_bare_name_gets_acquire_hint(tmp_path):
-    """A bare name needing network acquisition fails with an actionable hint.
-
-    pcc's pip is a local installer by design (docs/design/pcc-package-model.md):
-    acquire is delegated to host tools. The failure must say so and give the
-    exact next command, not fail bare.
-    """
+def test_pip_install_offline_bare_name_fails_closed(tmp_path):
+    """Explicit offline mode never silently delegates or attempts a network."""
     from pcc.package.pip_shim import pip_install_plan
 
     plan = pip_install_plan(
         [
             "install",
             "definitely-not-a-pkg-xyz",
+            "--acquire=offline",
             "--target",
             str(tmp_path / "site"),
             "--cache-dir",
@@ -2043,10 +2039,9 @@ def test_pip_install_unresolvable_bare_name_gets_acquire_hint(tmp_path):
         ]
     )
     assert plan["ok"] is False
-    assert "does not download from PyPI" in str(plan["error"])
-    hint = str(plan["acquire_hint"])
-    assert "pip download definitely-not-a-pkg-xyz" in hint
-    assert "--find-links" in hint
+    assert plan["acquire_mode_requested"] == "offline"
+    assert plan["acquisitions"][0]["diagnostic"] == "PCC-PKG-ACQUIRE-OFFLINE"
+    assert "acquire_hint" not in plan
 
 
 def test_pip_install_pathlike_spec_failure_gets_no_acquire_hint(tmp_path):

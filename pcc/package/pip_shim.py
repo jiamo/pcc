@@ -1,9 +1,5 @@
-"""Safe pip-compatible front door for pcc package planning/install.
+"""Pip-compatible front door with explicit acquire/build/install boundaries."""
 
-The shim accepts the common `pip install ... --dry-run` form and reports the
-plan without invoking pip's installer.  Non-dry-run local installs are routed
-through pcc's package installer rather than upstream pip.
-"""
 from __future__ import annotations
 
 import argparse
@@ -11,8 +7,20 @@ import json
 import sys
 from pathlib import Path
 
+from .acquire import (
+    ACQUIRE_MODES,
+    acquire_requirement,
+    looks_like_local_spec,
+    target_python_version,
+)
 from .inspect import inspect_package
-from .install import install_package, local_resolver_diagnostics, resolve_local_install_order
+from .install import (
+    _default_cache_dir,
+    _resolve_spec_with_origin,
+    install_package,
+    local_resolver_diagnostics,
+    resolve_local_install_order,
+)
 
 
 def _parse_install_args(args: list[str]) -> dict[str, object]:
@@ -23,6 +31,8 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
     find_links: list[str] = []
     index_urls: list[str] = []
     no_index = False
+    acquire_mode = "auto"
+    target_python = None
     packages: list[str] = []
     report_path = None
     dry_run = "--dry-run" in args
@@ -33,6 +43,30 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
             pass
         elif arg == "--no-index":
             no_index = True
+        elif arg == "--acquire":
+            if i + 1 >= len(args):
+                return {
+                    "ok": False,
+                    "command": command,
+                    "error": "--acquire requires a value",
+                }
+            acquire_mode = args[i + 1]
+            i += 1
+        elif arg.startswith("--acquire="):
+            acquire_mode = arg.split("=", 1)[1]
+        elif arg in ("--python-version", "--target-python"):
+            if i + 1 >= len(args):
+                return {
+                    "ok": False,
+                    "command": command,
+                    "error": arg + " requires a value",
+                }
+            target_python = args[i + 1]
+            i += 1
+        elif arg.startswith("--python-version=") or arg.startswith(
+            "--target-python="
+        ):
+            target_python = arg.split("=", 1)[1]
         elif arg == "--report":
             dry_run = True
             if i + 1 < len(args) and not args[i + 1].startswith("-"):
@@ -43,38 +77,62 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
             report_path = arg.split("=", 1)[1]
         elif arg in ("--target", "--target-dir"):
             if i + 1 >= len(args):
-                return {"ok": False, "command": command, "error": arg + " requires a value"}
+                return {
+                    "ok": False,
+                    "command": command,
+                    "error": arg + " requires a value",
+                }
             target_dir = args[i + 1]
             i += 1
         elif arg == "--cache-dir":
             if i + 1 >= len(args):
-                return {"ok": False, "command": command, "error": "--cache-dir requires a value"}
+                return {
+                    "ok": False,
+                    "command": command,
+                    "error": "--cache-dir requires a value",
+                }
             cache_dir = args[i + 1]
             i += 1
         elif arg in ("--find-links", "-f"):
             if i + 1 >= len(args):
-                return {"ok": False, "command": command, "error": arg + " requires a value"}
+                return {
+                    "ok": False,
+                    "command": command,
+                    "error": arg + " requires a value",
+                }
             find_links.append(args[i + 1])
             i += 1
         elif arg.startswith("--find-links="):
             find_links.append(arg.split("=", 1)[1])
         elif arg in ("--index-url", "-i"):
             if i + 1 >= len(args):
-                return {"ok": False, "command": command, "error": arg + " requires a value"}
+                return {
+                    "ok": False,
+                    "command": command,
+                    "error": arg + " requires a value",
+                }
             index_urls.append(args[i + 1])
             i += 1
         elif arg.startswith("--index-url="):
             index_urls.append(arg.split("=", 1)[1])
         elif arg == "--extra-index-url":
             if i + 1 >= len(args):
-                return {"ok": False, "command": command, "error": "--extra-index-url requires a value"}
+                return {
+                    "ok": False,
+                    "command": command,
+                    "error": "--extra-index-url requires a value",
+                }
             index_urls.append(args[i + 1])
             i += 1
         elif arg.startswith("--extra-index-url="):
             index_urls.append(arg.split("=", 1)[1])
         elif arg == "--abi":
             if i + 1 >= len(args):
-                return {"ok": False, "command": command, "error": "--abi requires a value"}
+                return {
+                    "ok": False,
+                    "command": command,
+                    "error": "--abi requires a value",
+                }
             abi = args[i + 1]
             i += 1
         elif arg.startswith("--abi="):
@@ -84,6 +142,23 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
         else:
             packages.append(arg)
         i += 1
+    if acquire_mode not in ACQUIRE_MODES:
+        return {
+            "ok": False,
+            "command": command,
+            "error": "PCC-PKG-ACQUIRE-MODE-INVALID",
+        }
+    if no_index:
+        acquire_mode = "offline"
+    try:
+        target_python = target_python_version(target_python)
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "command": command,
+            "error": str(exc),
+            "diagnostic": "PCC-PKG-ACQUIRE-TARGET-PYTHON-INVALID",
+        }
     return {
         "ok": True,
         "command": command,
@@ -93,6 +168,8 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
         "find_links": find_links,
         "index_urls": [] if no_index else index_urls,
         "no_index": no_index,
+        "acquire_mode": acquire_mode,
+        "target_python": target_python,
         "report_path": report_path,
         "abi": abi,
         "packages": packages,
@@ -125,9 +202,17 @@ def pip_dry_run_plan(args: list[str]) -> dict[str, object]:
         abi=abi,
     )
     if command != "install":
-        return {"ok": False, "command": command, "error": "only install dry-run is supported"}
+        return {
+            "ok": False,
+            "command": command,
+            "error": "only install dry-run is supported",
+        }
     if not dry_run:
-        return {"ok": False, "command": command, "error": "pcc pip shim requires --dry-run"}
+        return {
+            "ok": False,
+            "command": command,
+            "error": "pcc pip shim requires --dry-run",
+        }
     if not packages:
         return {"ok": False, "command": command, "error": "no packages requested"}
     inspected = [inspect_package(pkg).as_dict() for pkg in packages]
@@ -139,6 +224,8 @@ def pip_dry_run_plan(args: list[str]) -> dict[str, object]:
         "find_links": find_links,
         "index_urls": index_urls,
         "no_index": bool(parsed["no_index"]),
+        "acquire_mode_requested": parsed["acquire_mode"],
+        "target_python": parsed["target_python"],
         "abi": abi,
         "report_path": parsed["report_path"],
         "resolver_diagnostics": resolver_diagnostics,
@@ -159,19 +246,75 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
     index_urls = list(parsed["index_urls"])  # type: ignore[arg-type]
     abi = str(parsed["abi"])
     packages = list(parsed["packages"])  # type: ignore[arg-type]
-    if find_links or index_urls:
-        packages = resolve_local_install_order(
-            packages,
-            cache_dir=cache_dir,  # type: ignore[arg-type]
-            find_links=find_links,
+    acquire_mode = str(parsed["acquire_mode"])
+    cache = (
+        Path(str(cache_dir)).expanduser().resolve()
+        if cache_dir is not None
+        else _default_cache_dir()
+    )
+    install_specs: list[str] = []
+    acquisitions: list[dict[str, object]] = []
+    for package in packages:
+        local_source, origin = _resolve_spec_with_origin(
+            package,
+            cache,
+            find_links,
+            index_urls=(),
+            abi=abi,
+        )
+        project_shadowed_by_online_acquire = (
+            origin == "projects" and acquire_mode != "offline"
+        )
+        if (
+            local_source is not None and not project_shadowed_by_online_acquire
+        ) or looks_like_local_spec(package):
+            install_specs.append(package)
+            continue
+        acquisition = acquire_requirement(
+            package,
+            mode=acquire_mode,
+            cache_dir=cache,
             index_urls=index_urls,
+            abi=abi,
+            target_python=str(parsed["target_python"]),
+        )
+        acquisitions.append(acquisition)
+        artifact_path = acquisition.get("artifact_path")
+        if acquisition.get("ok") and artifact_path:
+            install_specs.append(str(artifact_path))
+
+    failed_acquisitions = [item for item in acquisitions if not item.get("ok")]
+    if failed_acquisitions:
+        return {
+            "ok": False,
+            "command": command,
+            "dry_run": False,
+            "packages": packages,
+            "find_links": find_links,
+            "index_urls": index_urls,
+            "no_index": bool(parsed["no_index"]),
+            "abi": abi,
+            "acquire_mode_requested": acquire_mode,
+            "target_python": parsed["target_python"],
+            "acquisitions": acquisitions,
+            "installs": [],
+            "resolver_diagnostics": [],
+            "report_path": parsed["report_path"],
+            "error": failed_acquisitions[0].get("error"),
+        }
+    if find_links or install_specs != packages:
+        install_specs = resolve_local_install_order(
+            install_specs,
+            cache_dir=cache,
+            find_links=find_links,
+            index_urls=(),
             abi=abi,
         )
     resolver_diagnostics = local_resolver_diagnostics(
-        packages,
-        cache_dir=cache_dir,  # type: ignore[arg-type]
+        install_specs,
+        cache_dir=cache,
         find_links=find_links,
-        index_urls=index_urls,
+        index_urls=(),
         abi=abi,
     )
     if not packages:
@@ -182,72 +325,30 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
             target_dir=target_dir,  # type: ignore[arg-type]
             cache_dir=cache_dir,  # type: ignore[arg-type]
             find_links=find_links,
-            index_urls=index_urls,
+            index_urls=(),
             abi=abi,
             build_source=True,
         )
-        for pkg in packages
+        for pkg in install_specs
     ]
     plan: dict[str, object] = {
         "ok": all(item.get("ok") for item in installs),
         "command": command,
         "dry_run": False,
         "packages": packages,
+        "install_specs": install_specs,
         "find_links": find_links,
         "index_urls": index_urls,
         "no_index": bool(parsed["no_index"]),
         "abi": abi,
+        "acquire_mode_requested": acquire_mode,
+        "target_python": parsed["target_python"],
+        "acquisitions": acquisitions,
         "report_path": parsed["report_path"],
         "resolver_diagnostics": resolver_diagnostics,
         "installs": installs,
     }
-    hint = _acquire_delegation_hint(packages, installs)
-    if hint is not None:
-        plan["error"] = hint["error"]
-        plan["acquire_hint"] = hint["acquire_hint"]
     return plan
-
-
-def _acquire_delegation_hint(
-    packages: list[str], installs: list[dict[str, object]]
-) -> dict[str, str] | None:
-    """Explain a bare-name failure instead of leaving ``ok: false`` bare.
-
-    pcc's pip is a LOCAL installer by design (docs/design/pcc-package-model.md):
-    the acquire step — downloading from PyPI, resolving versions — is delegated
-    to host tools. A requested name that is neither an existing local path nor
-    resolvable through --find-links/cache therefore needs network acquisition,
-    which pcc deliberately does not perform. Say so, with the exact next step,
-    rather than failing silently.
-    """
-    unresolved = []
-    for pkg, item in zip(packages, installs):
-        if item.get("ok"):
-            continue
-        if item.get("source_path") or item.get("installed_path"):
-            continue  # resolved locally; failure is build/install, not acquire
-        spec = str(pkg)
-        if "/" in spec or spec.startswith(".") or spec.endswith((".whl", ".tar.gz")):
-            continue  # looks like a local path/artifact (possibly mistyped)
-        unresolved.append(spec)
-    if not unresolved:
-        return None
-    names = " ".join(unresolved)
-    return {
-        "error": (
-            "cannot resolve locally: "
-            + names
-            + " (pcc's pip is a local installer; it does not download from PyPI)"
-        ),
-        "acquire_hint": (
-            "acquire first with a host tool, then install locally: "
-            "python3 -m pip download "
-            + names
-            + " -d ./wheels && pcc -m pip install "
-            + names
-            + " --find-links ./wheels"
-        ),
-    }
 
 
 def _write_report_if_requested(plan: dict[str, object]) -> dict[str, object]:
@@ -277,10 +378,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument("install", nargs="?")
         parser.add_argument("packages", nargs="*")
         parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument("--python-version")
         parser.print_help()
         return 0
-    wants_plan = "--dry-run" in raw or "--report" in raw or any(
-        item.startswith("--report=") for item in raw
+    wants_plan = (
+        "--dry-run" in raw
+        or "--report" in raw
+        or any(item.startswith("--report=") for item in raw)
     )
     plan = pip_dry_run_plan(raw) if wants_plan else pip_install_plan(raw)
     plan = _write_report_if_requested(plan)

@@ -1,76 +1,118 @@
-# pcc package model: acquire / build / run 三层契约
+# pcc package model: acquire / build / run contract
 
-Status: ACTIVE design contract (2026-07-18). Governs `pcc -m pip`, the package
+Status: ACTIVE design contract (updated 2026-07-21). Governs `pcc -m pip`, the package
 executor, and the pcc-native extension ladder (`PKG-P1-NATIVE-EXTENSION-LADDER`).
 
-## 问题
+## Problem
 
-"支持 pip" 在讨论里混掉了三件完全不同的事,导致范围与声明反复混乱:
+Discussions of "pip support" often conflate three different capabilities,
+which makes both scope and claims ambiguous:
 
 ```text
-A 获取 acquire   从 PyPI 下载源码/wheel,解析依赖与版本(网络 + resolver + build isolation)
-B 构建 build     把源码/工件变成 pcc 能跑的产物(pcc-native ABI 对 pcc 的 C-API shim 编 C 扩展)
-C 运行 run       在 pcc1 的 no-libpython 运行时里 module-graph + dlopen 扩展 + 对象模型
+A acquire   Download source/wheels and resolve versions and dependencies
+            (network + resolver + build isolation).
+B build     Turn source/artifacts into pcc-runnable output (compile C
+            extensions against pcc's C-API shim for the pcc-native ABI).
+C run       Execute the module graph, dlopen extensions, and provide the object
+            model in pcc1's no-libpython runtime.
 ```
 
-## 契约
+## Contract
 
-**pcc 拥有 B 和 C;A 委托给宿主工具(pip/uv),永不自造。**
+**pcc owns B and C. A is an explicit, replaceable acquisition backend. The
+default `auto` mode selects `host`; first-class optional `owned` and strict
+`offline` modes are also available.**
 
-理由(与北极星逐条对齐):
+Rationale, aligned with the project north star:
 
-1. pcc 的论题是"拥有**执行**",不是"拥有包管理器"。B/C 是使命与差异化;A 是
-   CPython 生态已解决的问题,复制它零收益。
-2. 真 pip 的网络栈 + 依赖解析器 + build isolation 是动态/反射重的 Python 代码,
-   拉进 pcc1 的 no-libpython 闭世界必须开 CPython 桥——违背 no-libpython。
-3. 生态义务(AGENTS.md 义务 3)要求修**可复用机制**(install/import/ABI/buffer/
-   capsule/build-surface),不要求成为 PyPI 客户端。
+1. Build and run remain the execution-ownership path, but the command UX must
+   not force users to manually split `pip download` from `pcc install`.
+   Therefore `auto` may explicitly delegate only acquisition to host pip and
+   then immediately return to pcc's build/install/run path.
+2. `owned` does not embed pip or resolvelib in pcc1. pcc1 parses the Simple
+   Repository API, selects ABI-compatible artifacts, verifies repository-
+   published SHA-256 digests, and publishes them to a content-addressed
+   immutable cache. HTTPS/libcurl is C-level kernel transport; it owns no
+   package-selection semantics and requires no libpython.
+3. `owned` does not yet implement dependency backtracking or PEP 517 build
+   isolation. Those shapes must fail closed with stable diagnostics; it may
+   not silently borrow the host and still claim owned acquisition.
+4. The ecosystem obligation in AGENTS.md requires reusable mechanisms. No
+   backend may contain package-name special cases.
 
-因此 **pcc1 替换的是 Python 的执行环境,不是 Python 的包分发工具链。**
+Thus **pcc1 owns a narrow but real acquisition path without claiming to have
+reimplemented all of pip.**
 
-## `pcc -m pip` 的明确行为(三种入参)
+## Acquisition backend contract
 
-| 入参形态 | 行为 |
+| Mode | Selection/download owner | Host Python/pip | Current boundary |
+|---|---|---:|---|
+| `auto` (default) | Explicitly selects `host` and records requested/actual modes | Yes, acquire only | Best one-command UX; pcc still owns build/install/run |
+| `host` | Host pip `download --no-deps`; pcc verifies ABI and moves the artifact into immutable cache | Yes | Makes no owned-acquisition, dependency-resolution, or build-isolation claim |
+| `owned` | pcc1 Simple API selector + pcc runtime HTTPS transport | No | Bare names or `name==version` only; SHA-256 required; dependency/resolver/build-isolation shapes fail closed |
+| `offline` | Searches only paths, cache, and `--find-links` | No | A miss reports `PCC-PKG-ACQUIRE-OFFLINE` |
+
+Every acquisition report must separately record `acquire_mode_requested`, the
+actual `acquire_mode`, `host_assisted`, index, `artifact_origin`/URL, resolved
+version, SHA-256, whether the digest was verified, and the transport provider.
+This evidence is separate from install/import/runtime claims: a successful
+download does not prove that an artifact builds or imports.
+
+## Explicit `pcc -m pip` behavior
+
+| Input shape | Behavior |
 |---|---|
-| 本地源码树 / 本地 wheel / `--find-links <本地目录>` 可解析的名字 | 按 `--abi`(默认 `pcc-native`)构建 + 安装进 `--target` site |
-| `--dry-run` / `--report` | 只报告计划,不安装 |
-| 裸包名且本地不可解析(需要联网获取) | **明确失败**(`ok:false`, exit 2),并输出 `acquire_hint`:先用宿主工具下载(`python3 -m pip download <pkg> -d ./wheels`),再 `pcc -m pip install <pkg> --find-links ./wheels`。绝不假装支持、绝不静默空转 |
+| Local source tree, local wheel, or a name resolved by a local `--find-links` directory | Build for `--abi` (default `pcc-native`) and install into the `--target` site |
+| `--dry-run` / `--report` | Report the plan without installing |
+| Bare name not resolved locally | Execute `--acquire`: default `auto -> host`, pcc1's Simple API path for `owned`, or an explicit failure for `offline` |
 
-`--index-url` 只作为本地 resolver 的目录来源接受;任何真实网络获取都路由到
-acquire_hint 失败路径。
+`--index-url` and `--extra-index-url` are explicit acquisition-backend inputs.
+Online modes use `https://pypi.org/simple` when neither is supplied.
+`--no-index` forces offline acquisition and cannot be silently overridden by
+another mode.
 
-## ABI 面(不变,重申)
+## ABI boundary
 
-- `pcc-native`(默认):对 pcc 的窄 `Python.h`/C-API shim 构建,不链 libpython;
-  CPython-ABI 工件被 `PCC-PKG-004` 拒绝。
-- `cpython-compat` / `libpython`:显式兼容模式,链 libpython;是**独立声明**,
-  不得与 pcc-native 结论互相顶替(§0.10)。
+- `pcc-native` (default): build against pcc's narrow `Python.h`/C-API shim
+  without linking libpython. `PCC-PKG-004` rejects CPython-ABI artifacts.
+- `cpython-compat` / `libpython`: explicit compatibility modes that link
+  libpython. They are **separate claims** and cannot substitute for
+  pcc-native evidence (§0.10).
 
-## 端到端阶梯(把分散证据缝成一条)
+## End-to-end ladder
 
-现状零件齐但分散:install 能从本地源做 pcc-native 构建(`install.py` →
-`build_exec` meson 重放 + include 重定向);构建 gate
-(`scripts/numpy_package_artifact_gate.py`)是同一执行器的聚焦调用;L4/L5 从
-预制 site 证明 import + 数组运行。**缺一条单命令端到端证明:**
+The pieces exist but their evidence has historically been separate: install
+can build pcc-native artifacts from local source (`install.py` ->
+`build_exec` Meson replay + include redirection); the focused build gate
+(`scripts/numpy_package_artifact_gate.py`) uses the same executor; and L4/L5
+prove import plus array execution from a prepared site. The missing proof is
+one command spanning the whole path:
 
 ```text
-pcc -m pip install <本地真实源> --abi pcc-native --target <site>
-  -> site 含 pcc-native 扩展 + Python 模块
-  -> pcc1 --backend self --python-libpython=off 编 import <pkg> 程序
-  -> 运行,断言输出,otool 无 libpython
+pcc -m pip install <real-local-source> --abi pcc-native --target <site>
+  -> site contains pcc-native extensions and Python modules
+  -> pcc1 --backend self --python-libpython=off compiles an import program
+  -> run, assert output, and prove with otool that libpython is absent
 ```
 
-第一根阶梯用 NumPy(最接近);第二根用一个纯 Python 包或小 C 扩展证明机制
-通用。gate 形态沿用 L4/L5:`pytest.mark.integration` + 环境变量 opt-in,
-工具链/源缺失报 skip 不报成功。**禁止 `if package == "numpy"`。**
+The first rung uses NumPy because it is the nearest industrial target. A
+second rung uses a pure-Python package or a small C extension to prove that the
+mechanism is generic. Gates follow the L4/L5 form: `pytest.mark.integration`
+plus an environment-variable opt-in. Missing tools or sources produce a skip,
+never a false success. **`if package == "numpy"` is forbidden.**
 
-## 声明卫生(始终分开)
+## Claim hygiene
 
-`pcc-native import X 跑通` ≠ `pip install X`(本地)成功 ≠ `cpython-compat 装 X`
-≠ "支持 PyPI"。四者证据独立,永不合并。
+`pcc-native import X works` is not the same claim as `local pip install X
+works`, `cpython-compat installs X`, or `PyPI is supported`. Evidence for
+these four claims remains separate.
 
-## 非目标
+## Non-goals
 
-- 不实现 PyPI 网络客户端、TLS、上游依赖 resolver、build isolation。
-- 不追求"任意 PyPI wheel 直接可装可跑"。
-- 不为让某包过 gate 加包名特判。
+- Do not compile all of pip, an upstream backtracking resolver, or PEP 517
+  build isolation into pcc1.
+- `owned` does not yet accept extras, markers, range constraints, or artifacts
+  that require runtime dependencies/build isolation. These produce stable
+  diagnostics, not silent fallback.
+- Do not claim that arbitrary PyPI wheels install and run directly.
+- Do not add package-name special cases to pass a gate.

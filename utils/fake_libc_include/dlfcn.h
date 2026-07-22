@@ -4,6 +4,9 @@
 #include "_fake_defines.h"
 #include "_fake_typedefs.h"
 
+#ifndef RTLD_LAZY
+#define RTLD_LAZY 1
+#endif
 #ifndef RTLD_NOW
 #define RTLD_NOW 2
 #endif

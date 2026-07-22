@@ -270,7 +270,10 @@ _OUTER_PARALLELISM_ENV = "PCC_OUTER_PARALLELISM"
 _PY_FRONTEND_WORKER_TIMING_ENV = "PCC_PY_FRONTEND_WORKER_TIMING"
 _PY_FRONTEND_WORKER_ARG = "--pcc-python-multi-codegen-worker"
 _SELF_BACKEND_EMIT_WORKER_ARG = "--pcc-self-backend-emit-worker"
+_SELF_BACKEND_EMIT_BATCH_WORKER_ARG = "--pcc-self-backend-emit-batch-worker"
 _SELF_BACKEND_SPLIT_WORKER_ARG = "--pcc-self-backend-split-worker"
+_SELF_BACKEND_EMIT_BATCH_MANIFEST_V1 = "pcc.self_backend.emit_batch.v1"
+_SELF_BACKEND_DEFAULT_JOBS = 2
 _PY_FRONTEND_WORKER_MANIFEST_V1 = "pcc.py_frontend.codegen_worker.v1"
 _PY_FRONTEND_WORKER_MANIFEST_V2 = "pcc.py_frontend.codegen_worker.v2"
 _PY_FRONTEND_WORKER_MANIFEST_V3 = "pcc.py_frontend.codegen_worker.v3"
@@ -8419,6 +8422,91 @@ def run_self_backend_emit_worker(
         return 1
 
 
+def run_self_backend_emit_batch_worker(manifest_path: str) -> int:
+    """Emit several independent modules in one native stage process."""
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        if not lines or lines[0] != _SELF_BACKEND_EMIT_BATCH_MANIFEST_V1:
+            raise PyPipelineError("self backend emit batch has an invalid manifest")
+        payload = lines[1:]
+        if not payload or len(payload) % 4 != 0:
+            raise PyPipelineError("self backend emit batch has invalid item fields")
+        index = 0
+        while index < len(payload):
+            status = run_self_backend_emit_worker(
+                payload[index],
+                payload[index + 1],
+                payload[index + 2],
+                payload[index + 3],
+            )
+            if status != 0:
+                return status
+            index += 4
+        return 0
+    except Exception as exc:
+        sys.stderr.write("self backend emit batch worker failed: " + str(exc) + "\n")
+        return 1
+
+
+def _run_self_backend_emit_worker_pool(
+    worker_command_prefix: list[str],
+    worker_items: list[tuple[str, str, str]],
+    cc: str,
+    tmp_dir: str,
+    batch_label: str,
+    max_parallel: int,
+) -> int:
+    """Partition object jobs across persistent compiled-stage workers."""
+    if not worker_items:
+        return 0
+    max_parallel = max(1, min(int(max_parallel), len(worker_items)))
+    batches: list[list[tuple[str, str, str]]] = []
+    index = 0
+    while index < max_parallel:
+        batches.append([])
+        index += 1
+    for index, item in enumerate(worker_items):
+        batches[index % max_parallel].append(item)
+
+    commands: list[str] = []
+    for batch_index, batch in enumerate(batches):
+        manifest_path = str(
+            os.path.join(
+                tmp_dir,
+                "self_backend_emit_"
+                + batch_label
+                + "_"
+                + _small_int_decimal(batch_index)
+                + ".manifest",
+            )
+        )
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.write(_SELF_BACKEND_EMIT_BATCH_MANIFEST_V1 + "\n")
+            for result_path, obj_path, ir_path in batch:
+                for field in (ir_path, result_path, obj_path, cc):
+                    if "\n" in field or "\r" in field:
+                        raise PyPipelineError(
+                            "self backend emit batch field contains a newline"
+                        )
+                    f.write(field + "\n")
+        command_parts: list[str] = []
+        for prefix_part in worker_command_prefix:
+            command_parts.append(_shell_quote_arg(prefix_part))
+        command_parts.extend(
+            [
+                _shell_quote_arg(_SELF_BACKEND_EMIT_BATCH_WORKER_ARG),
+                _shell_quote_arg(manifest_path),
+            ]
+        )
+        commands.append(_join_strings(command_parts, " "))
+    _run_python_frontend_worker_commands(
+        commands,
+        max_parallel=len(commands),
+    )
+    return len(commands)
+
+
 def run_self_backend_split_worker(
     ir_path: str,
     result_path: str,
@@ -8580,61 +8668,65 @@ def _emit_self_objects_many_in_process(
         )
         _profile_end(profile, "link_self_native_object_cache_plan", cache_plan_t)
 
-        large_worker_commands: list[tuple[int, str]] = []
-        small_worker_commands: list[str] = []
+        large_worker_items: list[tuple[int, tuple[str, str, str]]] = []
+        small_worker_items: list[tuple[str, str, str]] = []
         for index, worker_item in enumerate(worker_items):
-            result_path, obj_path, ir_path = worker_item
             input_bytes = worker_input_bytes[index]
-            cache_path, cache_status = cache_plan[index]
+            _cache_path, cache_status = cache_plan[index]
             if cache_status == "hit":
                 continue
-            command_parts = []
-            for prefix_part in worker_command_prefix:
-                command_parts.append(_shell_quote_arg(prefix_part))
-            command_parts.extend(
-                [
-                    _shell_quote_arg(_SELF_BACKEND_EMIT_WORKER_ARG),
-                    _shell_quote_arg(ir_path),
-                    _shell_quote_arg(result_path),
-                    _shell_quote_arg(obj_path),
-                    _shell_quote_arg(cc),
-                ]
-            )
-            command = _join_strings(command_parts, " ")
             if input_bytes >= 1_000_000:
                 insert_at = 0
                 while (
-                    insert_at < len(large_worker_commands)
-                    and large_worker_commands[insert_at][0] >= input_bytes
+                    insert_at < len(large_worker_items)
+                    and large_worker_items[insert_at][0] >= input_bytes
                 ):
                     insert_at += 1
-                large_worker_commands.insert(insert_at, (input_bytes, command))
+                large_worker_items.insert(insert_at, (input_bytes, worker_item))
             else:
-                small_worker_commands.append(command)
+                small_worker_items.append(worker_item)
         configured_jobs = _self_backend_jobs(len(worker_items))
-        if large_worker_commands:
-            huge_commands: list[str] = []
-            medium_commands: list[str] = []
-            for input_bytes, command in large_worker_commands:
+        emit_pool_processes = 0
+        if large_worker_items:
+            huge_items: list[tuple[str, str, str]] = []
+            medium_items: list[tuple[str, str, str]] = []
+            for input_bytes, worker_item in large_worker_items:
                 if input_bytes >= 4_000_000:
-                    huge_commands.append(command)
+                    huge_items.append(worker_item)
                 else:
-                    medium_commands.append(command)
-            if huge_commands:
-                _run_python_frontend_worker_commands(
-                    huge_commands,
-                    max_parallel=min(2, configured_jobs, len(huge_commands)),
+                    medium_items.append(worker_item)
+            if huge_items:
+                emit_pool_processes += _run_self_backend_emit_worker_pool(
+                    worker_command_prefix,
+                    huge_items,
+                    cc,
+                    tmp_dir,
+                    "huge",
+                    min(2, configured_jobs, len(huge_items)),
                 )
-            if medium_commands:
-                _run_python_frontend_worker_commands(
-                    medium_commands,
-                    max_parallel=min(8, configured_jobs, len(medium_commands)),
+            if medium_items:
+                emit_pool_processes += _run_self_backend_emit_worker_pool(
+                    worker_command_prefix,
+                    medium_items,
+                    cc,
+                    tmp_dir,
+                    "medium",
+                    min(8, configured_jobs, len(medium_items)),
                 )
-        if small_worker_commands:
-            _run_python_frontend_worker_commands(
-                small_worker_commands,
-                max_parallel=min(12, configured_jobs, len(small_worker_commands)),
+        if small_worker_items:
+            emit_pool_processes += _run_self_backend_emit_worker_pool(
+                worker_command_prefix,
+                small_worker_items,
+                cc,
+                tmp_dir,
+                "small",
+                min(12, configured_jobs, len(small_worker_items)),
             )
+        _profile_counter(
+            profile,
+            "link_self_native_emit_pool_processes",
+            emit_pool_processes,
+        )
         native_object_cache_hits = 0
         native_object_cache_misses = 0
         native_object_cache_disabled = 0
@@ -8910,7 +9002,7 @@ def _self_backend_jobs(n_modules: int) -> int:
             jobs = 1
         return max(1, min(n_modules, jobs))
     cpu_count = _parallel_cpu_budget()
-    return max(1, min(n_modules, cpu_count))
+    return max(1, min(n_modules, cpu_count, _SELF_BACKEND_DEFAULT_JOBS))
 
 
 def _self_backend_skip_ll_temp() -> bool:

@@ -101,6 +101,20 @@ class TestStdlibExtra(unittest.TestCase):
         assert ret == 42
 
 
+class TestDlfcnExtra(unittest.TestCase):
+    def test_rtld_lazy_macro_is_available(self):
+        pcc = CEvaluator()
+        ret = pcc.evaluate(
+            '''
+            #include <dlfcn.h>
+
+            int main(){ return RTLD_LAZY; }
+            ''',
+            optimize=False,
+        )
+        assert ret == 1
+
+
 class TestCtypeExtra(unittest.TestCase):
     def test_isupper_islower(self):
         pcc = CEvaluator()

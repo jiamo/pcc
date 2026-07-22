@@ -18,6 +18,7 @@ from ..py_ast import (
     IntType,
     ListType,
     MemoryViewType,
+    SetType,
     StrType,
     TupleType,
     Type,
@@ -427,27 +428,24 @@ class BinaryOpLoweringMixin:
             self._emit_post_call_err_check(None)
             return td_res
 
-        if self._is_native_set_dyn(lhs_ty) and self._is_native_set_dyn(rhs_ty):
-            if op == "|":
-                return self._emit_set_union_values(lhs, rhs)
-            if op == "&":
-                return self.builder.call(
-                    self.runtime["py_set_intersection"],
-                    [lhs, rhs],
-                    name=self._fresh("set.intersection"),
-                )
-            if op == "-":
-                return self.builder.call(
-                    self.runtime["py_set_difference"],
-                    [lhs, rhs],
-                    name=self._fresh("set.difference"),
-                )
-            if op == "^":
-                return self.builder.call(
-                    self.runtime["py_set_symmetric_difference"],
-                    [lhs, rhs],
-                    name=self._fresh("set.symmetric_difference"),
-                )
+        if (
+            op in ("|", "&", "-", "^")
+            and (
+                isinstance(lhs_ty, SetType)
+                and isinstance(rhs_ty, (SetType, DynType))
+                or isinstance(rhs_ty, SetType)
+                and isinstance(lhs_ty, (SetType, DynType))
+            )
+        ):
+            lhs_obj = marshal.marshal_to_object(
+                self.builder, self.module, self.runtime, lhs, lhs_ty
+            )
+            rhs_obj = marshal.marshal_to_object(
+                self.builder, self.module, self.runtime, rhs, rhs_ty
+            )
+            return self._emit_checked_set_binary_values(
+                op, lhs_obj, rhs_obj, None
+            )
 
         # Generic DynType `-` / `*`, mirroring the `+` (py_obj_add) and `/`
         # (py_obj_truediv) paths above. Placed AFTER the native-set block so set

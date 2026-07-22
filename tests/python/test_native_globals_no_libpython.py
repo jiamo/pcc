@@ -78,6 +78,25 @@ print("after", "_is_loaded" in globals())
     assert out.splitlines() == ["before False", "after True"]
 
 
+def test_globals_local_does_not_release_module_namespace(tmp_path):
+    out = _run_pcc_program(
+        tmp_path,
+        """
+sentinel = 41
+
+def inspect_namespace():
+    namespace = globals()
+    return "sentinel" in namespace
+
+print(inspect_namespace())
+replacement = "allocate after globals local is released"
+print("sentinel" in globals())
+print(sentinel + 1)
+""",
+    )
+    assert out.splitlines() == ["True", "True", "42"]
+
+
 def test_bare_name_reads_dynamic_globals_subscript_store(tmp_path):
     out = _run_pcc_program(
         tmp_path,
