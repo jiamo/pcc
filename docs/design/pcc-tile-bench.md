@@ -9,7 +9,7 @@ Row: `P-P0-TILE-TVM-BENCH`. This document is the authoritative map for the tile
 benchmark harness and its hard claim boundary. It builds directly on the kernel
 IR pipeline documented in [`pcc-kernel-ir.md`](pcc-kernel-ir.md) (the
 `K-P0-*` cluster) and the research judgment in
-`tmp_research/deep-research-tvm.md` (do not integrate whole-TVM/whole-TileLang;
+`docs/refs_docs/deep-research/deep-research-tvm.md` (do not integrate whole-TVM/whole-TileLang;
 keep a TIRx-compatible middle tier and freeze tile semantics to plain TIR before
 any target codegen).
 

@@ -8,6 +8,12 @@ from .cli_contract import (
     IR_SCAFFOLD_CHOICES,
     PYTHON_LIBPYTHON_CHOICES,
 )
+from .package_environment import (
+    apply_locked_environment_resource_defaults,
+    environment_info_json,
+    environment_info_text,
+    package_site_roots,
+)
 
 _PASS_DISABLE_ENV = "PCC_DISABLE_PASSES"
 _LLVM_TEXT_PIPELINE_ENV = "PCC_LLVM_PIPELINE"
@@ -24,6 +30,7 @@ Any arguments after PATH (or after --) are passed to the compiled program.
 
 Options:
   -h, --help                Show this help message and exit.
+  env info [--json]         Inspect the selected pcc package environment.
   -m MODULE [ARGS...]       Run a host Python module through pcc's safe module shim.
   --python-libpython MODE   off (default), auto, or on for Python fallback linkage.
   --python-library          For .py inputs, emit a library module without @main.
@@ -125,7 +132,7 @@ def _inferred_package_site_roots(src_path: str):
     _append_unique_path(roots, src_dir)
     if os.path.basename(src_dir) in ("test", "tests"):
         _append_unique_path(roots, os.path.dirname(src_dir))
-    for root in _split_path_list(os.environ.get("PCC_PACKAGE_SITE", "")):
+    for root in package_site_roots():
         _append_unique_path(roots, root)
     return roots
 
@@ -436,8 +443,7 @@ def _parse_gpu_backend(value):
     except ValueError:
         expected = ", ".join(all_gpu_backend_names())
         raise ValueError(
-            "invalid gpu backend "
-            f"{value!r}; expected one of {expected}"
+            "invalid gpu backend " f"{value!r}; expected one of {expected}"
         )
 
 
@@ -455,12 +461,18 @@ def _self_backend_vectorize_requested() -> bool:
 
 def _effective_self_backend_opt_level(backend, opt_level: int) -> int:
     backend_name = (backend or os.environ.get("PCC_BACKEND", "") or "").strip().lower()
-    if backend_name == "self" and int(opt_level) > 0 and not _self_backend_vectorize_requested():
+    if (
+        backend_name == "self"
+        and int(opt_level) > 0
+        and not _self_backend_vectorize_requested()
+    ):
         return 0
     return int(opt_level)
 
 
-def _self_backend_opt_level_clamp_message(backend, requested_opt_level, effective_opt_level):
+def _self_backend_opt_level_clamp_message(
+    backend, requested_opt_level, effective_opt_level
+):
     backend_name = (backend or os.environ.get("PCC_BACKEND", "") or "").strip().lower()
     requested = int(requested_opt_level)
     effective = int(effective_opt_level)
@@ -481,7 +493,9 @@ def _self_backend_opt_level_clamp_message(backend, requested_opt_level, effectiv
     return None
 
 
-def _warn_if_self_backend_opt_level_clamped(backend, requested_opt_level, effective_opt_level):
+def _warn_if_self_backend_opt_level_clamped(
+    backend, requested_opt_level, effective_opt_level
+):
     message = _self_backend_opt_level_clamp_message(
         backend,
         requested_opt_level,
@@ -565,6 +579,20 @@ def _run_module_request(argv) -> int:
         return 1
     finally:
         sys.argv = old_argv
+    return 0
+
+
+def _run_environment_request(argv) -> int:
+    if len(argv) not in (2, 3) or argv[0] != "env" or argv[1] != "info":
+        _write_text("Error: expected `pcc env info [--json]`", err=True)
+        return 2
+    if len(argv) == 3 and argv[2] != "--json":
+        _write_text("Error: unknown env info option: " + str(argv[2]), err=True)
+        return 2
+    if len(argv) == 3:
+        _write_text(environment_info_json(), nl=False)
+    else:
+        _write_text(environment_info_text(), nl=False)
     return 0
 
 
@@ -852,9 +880,7 @@ def parse_cli_args(argv=None):
             continue
         if arg.startswith("--gpu-backend="):
             try:
-                gpu_backend = _parse_gpu_backend(
-                    _option_value(arg, "--gpu-backend=")
-                )
+                gpu_backend = _parse_gpu_backend(_option_value(arg, "--gpu-backend="))
             except ValueError as exc:
                 return None, 2, str(exc)
             i += 1
@@ -1456,8 +1482,14 @@ def execute_cli(
     return ret if isinstance(ret, int) else 0
 
 
-def cli_main(argv=None) -> int:
+def _cli_main_impl(argv=None) -> int:
     raw_argv = _normalized_sys_argv() if argv is None else _copy_seq(argv)
+    if raw_argv and raw_argv[0] == "env":
+        return _run_environment_request(raw_argv)
+    if raw_argv and raw_argv[0] == "sync":
+        from pcc.package.uv_lock_sync import main as sync_main
+
+        return sync_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "-m":
         return _run_module_request(raw_argv)
     if _argv_requests_help(argv):
@@ -1516,6 +1548,7 @@ def cli_main(argv=None) -> int:
         if not os.path.isfile(path):
             _write_text("Error: input file not found: " + path, err=True)
             return 1
+        apply_locked_environment_resource_defaults()
         _seed_package_site_for_python_entry(path)
         from pcc.py_frontend.pipeline import PyPipelineError, compile_python
         from pcc.compile_observability import (
@@ -1737,6 +1770,19 @@ def cli_main(argv=None) -> int:
         verbose=verbose,
         prog_args=prog_args,
     )
+
+
+def cli_main(argv=None) -> int:
+    """Run one CLI request without leaking temporary package build budgets."""
+    frontend_jobs = str(os.environ.get("PCC_PY_FRONTEND_JOBS") or "")
+    self_backend_jobs = str(os.environ.get("PCC_SELF_BACKEND_JOBS") or "")
+    try:
+        return _cli_main_impl(argv)
+    finally:
+        # Empty and absent have identical resource-selection semantics.  Direct
+        # assignment is also supported by the no-libpython environment shim.
+        os.environ["PCC_PY_FRONTEND_JOBS"] = frontend_jobs
+        os.environ["PCC_SELF_BACKEND_JOBS"] = self_backend_jobs
 
 
 def cli_main_sys_argv() -> int:

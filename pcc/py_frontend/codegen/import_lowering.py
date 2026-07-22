@@ -6,6 +6,7 @@ import os
 import sys
 from typing import Optional
 
+from pcc.package_environment import package_site_roots
 from pcc.llvm_capi.compat import ir
 
 from ..py_ast import (
@@ -436,16 +437,9 @@ class ImportLoweringMixin:
         return first_cp >= 0 and lower.find("-cp", first_cp + 3) >= 0
 
     def _resolve_pcc_native_extension_path(self, module_name: str) -> Optional[str]:
-        raw = str(os.environ.get("PCC_PACKAGE_SITE", "") or "").strip()
-        if not raw:
-            return None
         rel = module_name.replace(".", os.sep)
         suffixes = (".so", ".dylib", ".pyd", ".dll")
-        path_sep = ";"
-        if not sys.platform.startswith("win"):
-            path_sep = ":"
-        for site_root in raw.split(path_sep):
-            site_root = site_root.strip()
+        for site_root in package_site_roots():
             if not site_root:
                 continue
             base = os.path.join(site_root, rel)

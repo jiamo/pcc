@@ -106,7 +106,7 @@ def _compile_and_run(
         )
     pcc_bin = _pcc_binary()
     if pcc_bin is None:
-        pytest.skip("pcc CLI not on PATH")
+        pytest.fail("pcc CLI not on PATH")
     env = dict(os.environ)
     env.pop("LC_ALL", None)
     env["PCC_RUNTIME_DIR"] = str(runtime_dir)
@@ -325,11 +325,11 @@ def _ensure_runtime_archives(tmp_path_factory):
     """Build all oracle runtime archives once in an isolated directory."""
     make = shutil.which("make")
     if make is None:
-        pytest.skip("make not available")
+        pytest.fail("make not available")
 
     pcc_bin = _pcc_binary()
     if pcc_bin is None:
-        pytest.skip("pcc CLI not available")
+        pytest.fail("pcc CLI not available")
 
     del tmp_path_factory
     return _cached_runtime_dir(make, pcc_bin)
@@ -441,7 +441,7 @@ def test_corpus_cc_vs_pcc_py_equivalence(
     if program.stem in _KNOWN_PCC_C_DIVERGENCES:
         pytest.xfail(reason=_KNOWN_PCC_C_DIVERGENCES[program.stem])
     if not _runs_under_pcc_py(program.stem):
-        pytest.skip(
+        pytest.fail(
             f"{program.stem} does not exercise a pcc-py archive slot; "
             "only pcc-py-covered programs enforce archive selection."
         )

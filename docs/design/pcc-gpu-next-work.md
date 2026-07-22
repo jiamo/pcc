@@ -99,6 +99,7 @@ support claims.
 | Apache TVM | `~/pcc_refs/apache-tvm-full-depth1` | `cfb98e938c8d9525648c75fbebcb8944edb952fe` |
 | TileLang | `~/tilelang` | `ed00dfcd7f9c200e1150896b1be59c41ff3e8d9d` |
 | TileLang vendored TVM | `~/tilelang/3rdparty/tvm` | `1ecfcc2e1e1fb9f75db9ed760a97aa9687372905` |
+| TileLang current architecture reference | `~/pcc_refs/tilelang-full-depth1` | `dff136d4da552389b0a41f394edfa1a9fe47a590` |
 | ds4 / DwarfStar | `~/pcc_refs/antirez-ds4-depth1` | `80ebbc396aee40eedc1d829222f3362d10fa4c6c` |
 
 Do not copy these trees into `pcc/`. When using them for a task, record the
@@ -114,6 +115,15 @@ Reference-derived design rules:
   structure, Metal codegen shapes, swizzle/layout idioms, and simdgroup GEMM
   lowering. Import only the semantics pcc can represent in Kernel IR and
   validate; fail closed for the rest.
+- TVM `s_tir` schedule state/trace and MLIR Transform's payload/transform split
+  are references for PCC's replayable `KernelSchedule`. A schedule is a
+  content-addressed transformation of exact Kernel IR before freeze, not attrs
+  smuggled into semantic IR or an ambient provider callback.
+- Apple Metal pipeline capabilities are explicit cost-model inputs. Device
+  family, `threadExecutionWidth`, maximum threadgroup width, and static
+  threadgroup memory must be recorded before a target adapter selects a plan.
+  Metal binary archives are later content-addressed artifacts, never the sole
+  semantic representation.
 - ds4 is an external oracle and migration target. Use it to inventory real
   C/Metal/KV/SSD/distributed pressure, not as proof that pcc supports ds4.
 
@@ -151,6 +161,7 @@ The canonical route is:
 @pcc.gpu.kernel / TileLang-like source / ds4 adapter
   -> pcc Kernel IR
   -> validate_kernel()
+  -> optional checked KernelSchedule replay
   -> TIRx-compatible freeze
   -> target-specific finalize
   -> launch plan / package / runtime
@@ -159,6 +170,14 @@ The canonical route is:
 `pcc.gpu_kernel` has no direct AST-to-Metal path. Its finite scalar/indexed
 subset is imported as validated structured Kernel IR, and unsupported Python
 syntax fails closed before TIRx/Metal finalization.
+
+`KernelSchedule` is separate from semantic `KernelModule`. The first supported
+instruction binds a function's Metal thread count and is guarded by the exact
+input Kernel IR digest, canonical target, function selector, and expected old
+binding. Both `pcc-metal` and `tvm-tilelang` apply it through the same module
+before plain-TIR freeze and record its digest in artifact/owner manifests.
+Scheduling a frozen module or replaying a stale plan fails closed. This is not
+yet general tiling, layout scheduling, software pipelining, or autotuning.
 
 All TileLang and ds4 adapters must produce Kernel IR first. They must not call
 TileLang/TVM runtime objects or ds4 GPU APIs as semantic owners. A pinned,
@@ -315,6 +334,7 @@ The actionable rows are in `docs/goal/task-board.yaml`:
 - `GPU-P0-OWNER-BACKEND-CONTRACT`
 - `GPU-P0-PCC-METAL-OWNER-DRIVER`
 - `GPU-P0-TVM-TILELANG-OWNER-DRIVER`
+- `GPU-P1-OWNER-SCHEDULE-THREAD-BINDING`
 - `DIST-P0-LOCAL-COLLECTIVE-ORACLE-CODE`
 - `DS4-P0-INVENTORY-ORACLE`
 - `DS4-P1-CPU-COMPILE-SUBSET`

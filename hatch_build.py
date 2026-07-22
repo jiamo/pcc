@@ -19,17 +19,20 @@ Fall back to ``--backend llvm`` (uses clang) if self fails.
 Honours environment overrides:
 - PCC_BUILD_BACKEND={self|llvm}   override backend (default: self)
 - PCC_BUILD_TARGET=<make target>  override make target
+- PCC_BUILD_PCC1=<path>           bundle an already verified platform pcc1
+                                  instead of rebuilding it (release/CI reuse)
 - PCC_BUILD_SKIP=1                skip both runtime + binary build
                                   (dev iteration only)
 
-Archive failure is tolerated (lazy first-run in
-``pcc.py_frontend.pipeline`` rebuilds it). Binary failure raises —
-publishing sdist-only means the user's ``pip install`` must produce a
-working native ``pcc1`` helper. The Python ``pcc`` launcher exists, but
-published sdists should still prove the native bootstrap helper can be built.
+Archive and binary failures are both fatal for a wheel. A wheel-installed
+native ``pcc1`` must not depend on rebuilding runtime objects in the user's
+environment. The Python ``pcc`` launcher exists, but published sdists should
+still prove both native artifacts can be built.
 """
+
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -44,15 +47,18 @@ class CustomBuildHook(BuildHookInterface):
     PLUGIN_NAME = "custom"
 
     def initialize(self, version, build_data):
+        if version == "editable":
+            self.app.display_info(
+                "editable build: skipping release-only runtime archive and pcc1 build"
+            )
+            return
         if os.environ.get("PCC_BUILD_SKIP") == "1":
             self.app.display_info("PCC_BUILD_SKIP=1, skipping runtime + binary build")
             return
 
         root = Path(self.root)
         runtime_dir = root / "pcc" / "py_runtime"
-        target = os.environ.get(
-            "PCC_BUILD_TARGET", "libpy_runtime_pcc_py.a"
-        )
+        target = os.environ.get("PCC_BUILD_TARGET", "libpy_runtime_pcc_py.a")
         archive = runtime_dir / target
 
         if not runtime_dir.is_dir():
@@ -75,46 +81,91 @@ class CustomBuildHook(BuildHookInterface):
         self._discard_wrong_target_archives(runtime_dir)
 
         # ---- 1. runtime archive (soft-fail: lazy path can rebuild) ----
-        ok = self._run_make(runtime_dir, target, backend)
+        force_runtime_rebuild = self._runtime_archive_inputs_newer(root, archive)
+        ok = self._run_make(
+            runtime_dir,
+            target,
+            backend,
+            force=force_runtime_rebuild,
+        )
         if not ok and backend != "llvm":
             self.app.display_warning(
                 f"pcc runtime build with --backend={backend} failed; "
                 "retrying with --backend=llvm (clang will be invoked)"
             )
-            ok = self._run_make(runtime_dir, target, "llvm")
+            ok = self._run_make(
+                runtime_dir,
+                target,
+                "llvm",
+                force=force_runtime_rebuild,
+            )
         if ok and archive.is_file():
             self._write_archive_target_stamp(archive)
             rel = f"pcc/py_runtime/{target}"
             build_data.setdefault("force_include", {})[str(archive)] = rel
+            stamp = Path(str(archive) + ".target")
+            if not stamp.is_file():
+                raise RuntimeError(
+                    f"runtime archive target stamp was not created: {stamp}"
+                )
+            build_data.setdefault("force_include", {})[str(stamp)] = rel + ".target"
+            wheel_stamp = self._write_wheel_archive_stamp(archive)
+            build_data.setdefault("force_include", {})[str(wheel_stamp)] = (
+                rel + ".wheel"
+            )
             self.app.display_info(f"bundled runtime archive: {rel}")
         else:
-            self.app.display_warning(
-                "pcc runtime archive build failed; wheel will not bundle "
-                f"{target}. First run of `pcc` will rebuild it via the "
-                "lazy path in pcc.py_frontend.pipeline."
+            raise RuntimeError(
+                "pcc runtime archive build failed; refusing to publish a wheel "
+                f"without pcc/py_runtime/{target}"
             )
 
         # ---- 2. native pcc1 binary (hard-fail for published sdists) ----
-        out_binary = runtime_dir / "_native" / "pcc1"
-        bin_backend = backend
-        ok = self._run_pcc_self_compile(root, out_binary, bin_backend)
-        if not ok and bin_backend != "llvm":
-            self.app.display_warning(
-                f"pcc self-compile with --backend={bin_backend} failed; "
-                "retrying with --backend=llvm (clang will be invoked)"
-            )
-            ok = self._run_pcc_self_compile(root, out_binary, "llvm")
-        if not ok:
-            raise RuntimeError(
-                "pcc self-compile failed under both self and llvm backends. "
-                "The published wheel requires a native `pcc1` helper. Inspect the warnings "
-                "above, or set PCC_BUILD_SKIP=1 for a dev iteration only."
-            )
+        prebuilt = str(os.environ.get("PCC_BUILD_PCC1", "") or "").strip()
+        if prebuilt:
+            out_binary = Path(prebuilt).expanduser().resolve()
+            if not self._validate_prebuilt_pcc1(out_binary):
+                raise RuntimeError(
+                    f"PCC_BUILD_PCC1={out_binary} is not an executable pcc1 "
+                    "for this build host"
+                )
+            self.app.display_info(f"reusing verified native pcc1: {out_binary}")
+        else:
+            out_binary = runtime_dir / "_native" / "pcc1"
+            bin_backend = backend
+            ok = self._run_pcc_self_compile(root, out_binary, bin_backend)
+            if not ok and bin_backend != "llvm":
+                self.app.display_warning(
+                    f"pcc self-compile with --backend={bin_backend} failed; "
+                    "retrying with --backend=llvm (clang will be invoked)"
+                )
+                ok = self._run_pcc_self_compile(root, out_binary, "llvm")
+            if not ok:
+                raise RuntimeError(
+                    "pcc self-compile failed under both self and llvm backends. "
+                    "The published wheel requires a native `pcc1` helper. Inspect the warnings "
+                    "above, or set PCC_BUILD_SKIP=1 for a dev iteration only."
+                )
 
         build_data.setdefault("shared_scripts", {})[str(out_binary)] = "pcc1"
         build_data["pure_python"] = False
         build_data["infer_tag"] = True
         self.app.display_info("bundled native pcc1 binary at .data/scripts/pcc1")
+
+    def _validate_prebuilt_pcc1(self, path: Path) -> bool:
+        if not path.is_file() or not os.access(path, os.X_OK):
+            return False
+        try:
+            process = subprocess.run(
+                [str(path), "--help"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return process.returncode == 0 and "Usage: pcc" in process.stdout
 
     def _archive_target_id(self) -> str:
         """Mirror pipeline._runtime_archive_target_id (kept import-free:
@@ -189,8 +240,98 @@ class CustomBuildHook(BuildHookInterface):
         except OSError:
             pass
 
+    def _write_wheel_archive_stamp(self, archive: Path) -> Path:
+        digest = hashlib.sha256()
+        with archive.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        marker_root = Path(self.directory) / "pcc-runtime-wheel-markers"
+        marker_root.mkdir(parents=True, exist_ok=True)
+        marker = marker_root / (archive.name + ".wheel")
+        marker.write_text(
+            "pcc.runtime-wheel-artifact.v1\n"
+            + self._archive_target_id()
+            + "\nsha256:"
+            + digest.hexdigest()
+            + "\n",
+            encoding="utf-8",
+        )
+        return marker
+
+    def _runtime_archive_inputs_newer(self, root: Path, archive: Path) -> bool:
+        """Mirror the pipeline's pcc-emitted archive freshness contract."""
+        if not archive.is_file():
+            return True
+        archive_mtime = archive.stat().st_mtime
+        pcc_root = root / "pcc"
+        input_roots = [
+            pcc_root / "backend",
+            pcc_root / "codegen",
+            pcc_root / "evaluater",
+            pcc_root / "llvm_capi",
+            pcc_root / "parse",
+            pcc_root / "py_frontend",
+            pcc_root / "py_runtime",
+            pcc_root / "tools",
+            pcc_root / "__main__.py",
+            pcc_root / "api.py",
+            pcc_root / "cli_core.py",
+            pcc_root / "pcc.py",
+            pcc_root / "project.py",
+        ]
+        ignored_dirs = {
+            ".git",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+            "build_libpython",
+            "build_pcc",
+            "build_py",
+        }
+        pending = list(input_roots)
+        while pending:
+            current = pending.pop()
+            if current.is_file():
+                try:
+                    if current.stat().st_mtime > archive_mtime:
+                        return True
+                except OSError:
+                    return True
+                continue
+            if not current.is_dir():
+                continue
+            try:
+                entries = list(current.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.is_dir():
+                    if entry.name not in ignored_dirs and not entry.name.startswith(
+                        "."
+                    ):
+                        pending.append(entry)
+                    continue
+                if not (
+                    entry.suffix in (".py", ".c", ".h") or entry.name == "Makefile"
+                ):
+                    continue
+                try:
+                    if entry.stat().st_mtime > archive_mtime:
+                        return True
+                except OSError:
+                    return True
+        return False
+
     def _run_make(
-        self, runtime_dir: Path, target: str, backend: str,
+        self,
+        runtime_dir: Path,
+        target: str,
+        backend: str,
+        *,
+        force: bool = False,
     ) -> bool:
         """Invoke the runtime Makefile under a chosen backend.
 
@@ -205,7 +346,10 @@ class CustomBuildHook(BuildHookInterface):
         # in pcc/py_runtime/Makefile pick this up unchanged.
         env["PCC"] = f"{sys.executable} -m pcc --backend {backend}"
 
-        cmd = ["make", "-C", str(runtime_dir), target]
+        cmd = ["make"]
+        if force:
+            cmd.append("-B")
+        cmd.extend(["-C", str(runtime_dir), target])
         try:
             subprocess.run(
                 cmd,
@@ -217,14 +361,10 @@ class CustomBuildHook(BuildHookInterface):
             )
             return True
         except FileNotFoundError:
-            self.app.display_warning(
-                "make is not on PATH; cannot pre-build runtime"
-            )
+            self.app.display_warning("make is not on PATH; cannot pre-build runtime")
             return False
         except subprocess.TimeoutExpired:
-            self.app.display_warning(
-                "runtime build timed out after 10 minutes"
-            )
+            self.app.display_warning("runtime build timed out after 10 minutes")
             return False
         except subprocess.CalledProcessError as exc:
             tail = (exc.stderr or exc.stdout or "")[-2000:]
@@ -234,7 +374,10 @@ class CustomBuildHook(BuildHookInterface):
             return False
 
     def _run_pcc_self_compile(
-        self, root: Path, out_binary: Path, backend: str,
+        self,
+        root: Path,
+        out_binary: Path,
+        backend: str,
     ) -> bool:
         """Compile pcc/__main__.py into a native pcc binary.
 
@@ -259,12 +402,17 @@ class CustomBuildHook(BuildHookInterface):
         env.setdefault("PCC_RUNTIME_HIGH", "py")
 
         cmd = [
-            sys.executable, "-m", "pcc",
-            "--backend", backend,
-            "--python-libpython", "off",
+            sys.executable,
+            "-m",
+            "pcc",
+            "--backend",
+            backend,
+            "--python-libpython",
+            "off",
             "--ir-scaffold=on",
             str(main_py),
-            "-o", str(out_binary),
+            "-o",
+            str(out_binary),
         ]
         try:
             subprocess.run(
@@ -282,9 +430,7 @@ class CustomBuildHook(BuildHookInterface):
             )
             return False
         except subprocess.TimeoutExpired:
-            self.app.display_warning(
-                "pcc self-compile timed out after 10 minutes"
-            )
+            self.app.display_warning("pcc self-compile timed out after 10 minutes")
             return False
         except subprocess.CalledProcessError as exc:
             tail = (exc.stderr or exc.stdout or "")[-2000:]

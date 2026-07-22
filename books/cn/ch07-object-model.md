@@ -1,8 +1,8 @@
 # 第 7 章 对象模型
 
-运行时的一切都从"一个 Python 值在内存里长什么样"开始。pcc 的对象模型回答三件事:每个堆对象共享什么样的对象头(object header);类与实例如何布局、属性如何查找;以及最特殊的一条——同一套布局为什么要用 C 和 pcc-Python 各写一遍,并且必须逐字节一致。本章只讲对象的静态结构与属性协议:引用计数与所有权契约见第 9 章,异常协议见第 8 章,五个 GC 后端如何遍历和移动这些对象见第 10、11 章。读完本章,你应当能对照 [pcc/py_runtime/src/py_internal.h](../../pcc/py_runtime/src/py_internal.h) 画出 `PyClassObject` 的 120 字节,并解释为什么"对象明明有这个属性却报 AttributeError"的排查顺序是布局、屏障、错误检查——而不是先怀疑前端。
+运行时的一切都从"一个 Python 值在内存里长什么样"开始。pcc 的对象模型回答三件事:每个堆对象共享什么样的对象头(object header);类与实例如何布局、属性如何查找;以及最特殊的一条——同一套布局为什么要用 C 和 pcc-Python 各写一遍,并且必须逐字节一致。本章只讲对象的静态结构与属性协议:引用计数与所有权契约见第 9 章,异常协议见第 8 章,五个 GC 后端如何遍历和移动这些对象见第 10、11 章。读完本章,应当能对照 [pcc/py_runtime/src/py_internal.h](../../pcc/py_runtime/src/py_internal.h) 画出 `PyClassObject` 的 120 字节,并解释为什么"对象明明有这个属性却报 AttributeError"的排查顺序是布局、屏障、错误检查——而不是先怀疑前端。
 
-## 读者地图:对象先从"头部"看起
+## 本章导读:从对象头开始
 
 这一章细节很多,但入口很简单:所有堆对象先有同一类对象头,再由类型标签和具体布局决定后面的身体是什么。只要对象头、类型标签、slot 访问和 C/pcc-Python 镜像一致,后面的属性、方法和 GC 才有共同地基。
 
@@ -132,7 +132,7 @@ offset size 字段              语义
 
 逐字段的设计要点:
 
-**`bases` 与 `mro`。** `py_class_new()` 浅拷贝基类数组(`copy_class_array()`),然后用 `c3_linearize()` 做 PEP 3119 的 merge 算法:候选头是"不出现在任何其他序列尾部的头",取不出候选即 MRO 不一致,返回 -1,调用方以 TypeError 呈现。零基类且自身不是根类时,MRO 末尾追加惰性构造的 `object_root()`——一个 calloc 出来的、immortal 的、`type_tag_alloc = PY_TYPE_INSTANCE` 的极简类。注意这些数组持有的都是**借用引用**:类的生命周期与进程相当(代码生成把它存进全局),所以基类、方法、字段名都不参与引用计数。但"借用"不等于"GC 不可见"——这些槽仍然是对象图的边,移动型后端必须能改写它们,这正是 7.7 节第一个战争故事的主题。
+**`bases` 与 `mro`。** `py_class_new()` 浅拷贝基类数组(`copy_class_array()`),然后用 `c3_linearize()` 做 PEP 3119 的 merge 算法:候选头是"不出现在任何其他序列尾部的头",取不出候选即 MRO 不一致,返回 -1,调用方以 TypeError 呈现。零基类且自身不是根类时,MRO 末尾追加惰性构造的 `object_root()`——一个 calloc 出来的、immortal 的、`type_tag_alloc = PY_TYPE_INSTANCE` 的极简类。注意这些数组持有的都是**借用引用**:类的生命周期与进程相当(代码生成把它存进全局),所以基类、方法、字段名都不参与引用计数。但"借用"不等于"GC 不可见"——这些槽仍然是对象图的边,移动型后端必须能改写它们,这正是 7.7 节第一个案例研究的主题。
 
 **`methods` 与方法值的双重形态。** `PyClassMethod` 是 `{const char *name; PyObject *func}`,`func` 上的注释毫不掩饰:"borrowed — points at a user_* LLVM function"。方法表里存的多数不是堆上的函数对象,而是代码生成发射的裸函数指针 cast 成 `PyObject *`。调用辅助函数(`py_class.c` 的 `class_call_binary_method()` 等)先做头嗅探——指针能承载对象头且标签是 `PY_TYPE_FUNC` 才按 `PyFuncObject` 走 `py_func_call()`,否则直接 cast 回函数指针调用。这换来了零分配的静态方法表(模块 init 只做 realloc 追加),代价是运行时必须能可靠区分"堆对象"与"代码地址"——前述防御性指针判定在此不是诊断手段而是正确性依赖。`py_class_lookup()` 沿 MRO 线性扫每个类的方法表,字符串比较前先做指针相等短路(字段名/方法名通常是同一份 rodata 字面量);`__name__` 与 `__mro__` 在这里特判合成。
 
@@ -275,4 +275,4 @@ pcc 的对象模型由四个相互咬合的决定构成。16 字节对象头(`re
 2. **(审计)** `PY_TYPE_VALUEBOX = 200` 落在用户类标签空间内,而 `py_class.c` 的 `g_next_user_tag` 从 104 起单调递增且无避让。第 97 个领到标签的用户类会与之相撞。读 `py_obj_ops_compare.c`、`py_weakref.c`、`py_format.c` 中所有消费 `PY_TYPE_VALUEBOX` 的判断,描述相撞后的可观察症状;给出两种修复(分配器跳号 / 迁移 VALUEBOX 标签)并论证各自对镜像与已发射代码的代价。
 3. **(行为收敛证明)** C 的 `py_class_new()` 预填 `del_method`,端口的不预填。借助 `py_user_del_dispatch()` 的懒补逻辑,论证两者对任何用户程序不可区分;再构造一个(只能用运行时内部探针观察到的)差异点,说明为什么"可观察 ABI 等价"是比"逐语句等价"更合理的镜像标准。
 4. **(设计权衡)** `PY_CLASS_FLAG_SLOTS_ONLY` 复用了 `PY_FLAG_GC_TRACKED` 的 bit 0x2,安全前提是类对象从不进入 `py_gc_track()`。假设未来要让类对象参与循环收集(例如支持运行期类的卸载),列出这个 bit 复用会以什么症状暴露,并提出迁移方案(提示:`py_internal.h` 的 flags 空间还剩哪些位?端口里有多少处 `flags & 2` 需要同步?)。
-5. **(测量设计)** `py_class_lookup()` 是线性扫描,注释承诺"future phase can swap to a hashmap"。设计一个实验回答换哈希是否值得:你会测哪些真实负载(提示:自举 stage2 编译、[tests/python/](../../tests/python) 下的类密集用例)、统计什么分布(每类方法数、查找命中深度)、以及在什么阈值下结论成立。说明为什么微基准在这里会误导。
+5. **(测量设计)** `py_class_lookup()` 是线性扫描,注释承诺"future phase can swap to a hashmap"。设计一个实验回答换哈希是否值得:应测量哪些真实负载(提示:自举 stage2 编译、[tests/python/](../../tests/python) 下的类密集用例)、统计什么分布(每类方法数、查找命中深度)、以及在什么阈值下结论成立。说明为什么微基准在这里会误导。

@@ -1,4 +1,5 @@
 """Package inspection, install manifests, and dry-run shims for pcc planning."""
+
 from __future__ import annotations
 
 __all__ = [
@@ -15,6 +16,8 @@ __all__ = [
     "pip_dry_run_plan",
     "toolchain_report",
     "repository_report",
+    "project_uv_lock",
+    "sync_uv_lock",
 ]
 
 
@@ -55,6 +58,14 @@ def __getattr__(name: str):
         from .wheel_repo import repository_report
 
         return repository_report
+    if name == "project_uv_lock":
+        from .uv_lock_sync import project_uv_lock
+
+        return project_uv_lock
+    if name == "sync_uv_lock":
+        from .uv_lock_sync import sync_uv_lock
+
+        return sync_uv_lock
     if name == "linkage_report":
         from .linkage import linkage_report
 

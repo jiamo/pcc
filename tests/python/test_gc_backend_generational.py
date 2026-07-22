@@ -96,8 +96,7 @@ def test_gc_frame_index_accepts_raw_slot_pointer_keys(tmp_path):
     src = tmp_path / "frame_index_raw_pointer_probe.c"
     exe = tmp_path / "frame_index_raw_pointer_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_internal.h"
             #include <stdint.h>
 
@@ -126,8 +125,7 @@ def test_gc_frame_index_accepts_raw_slot_pointer_keys(tmp_path):
                 }
                 return 0;
             }
-            """
-        ).lstrip(),
+            """).lstrip(),
         encoding="utf-8",
     )
     build = subprocess.run(
@@ -155,8 +153,7 @@ def test_gc_open_addressed_indexes_preserve_probe_chains_after_delete(tmp_path):
     src = tmp_path / "gc_open_addressed_index_probe.c"
     exe = tmp_path / "gc_open_addressed_index_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_internal.h"
             #include <stdint.h>
 
@@ -290,8 +287,7 @@ def test_gc_open_addressed_indexes_preserve_probe_chains_after_delete(tmp_path):
                 pcc_gc_object_index_clear();
                 return 0;
             }
-            """
-        ).lstrip(),
+            """).lstrip(),
         encoding="utf-8",
     )
     build = subprocess.run(
@@ -364,9 +360,7 @@ def test_gc_frame_registry_hot_path_uses_frame_index_lookup():
     assert "stable = ptr_add(node, 64)" in py_enter_leave
     assert "free(load_ptr(indexed, 56))" not in py_enter_leave
     assert "free(indexed)" not in py_enter_leave
-    py_substrate = (RUNTIME_DIR / "py" / "py_substrate.py").read_text(
-        encoding="utf-8"
-    )
+    py_substrate = (RUNTIME_DIR / "py" / "py_substrate.py").read_text(encoding="utf-8")
     assert 'define_global_ptr_null("pcc_gc_frame_node_pool_heads")' in py_substrate
     assert 'define_global_ptr_null("pcc_gc_frame_node_pool_counts")' in py_substrate
     py_promote = py_src.split("def _promote_frame_roots", 1)[1].split(
@@ -402,7 +396,9 @@ def test_pcc_python_frame_and_scheduler_roots_share_slot_walkers_source():
     ):
         assert token in helper_body
 
-    scheduler_helper_end = py_src.index("def _gray_current_roots(", scheduler_helper_start)
+    scheduler_helper_end = py_src.index(
+        "def _gray_current_roots(", scheduler_helper_start
+    )
     scheduler_helper_body = py_src[scheduler_helper_start:scheduler_helper_end]
     assert 'global_load_ptr("pcc_gc_scheduler_root_head")' in scheduler_helper_body
     assert "_py_visit_mapped_root_slot(" in scheduler_helper_body
@@ -412,7 +408,9 @@ def test_pcc_python_frame_and_scheduler_roots_share_slot_walkers_source():
     )[0]
     assert "_py_visit_mapped_root_slots(" in gray_body
     assert "_py_visit_scheduler_root_slots(1, 1)" in gray_body
-    assert "_gray_mapped_roots(load_ptr(frame, 0), load_ptr(frame, 8), 1)" not in gray_body
+    assert (
+        "_gray_mapped_roots(load_ptr(frame, 0), load_ptr(frame, 8), 1)" not in gray_body
+    )
     assert "_resolve_root_slot_unlocked(slot, 0)" not in gray_body
 
     promote_body = py_src.split("def _promote_frame_roots", 1)[1].split(
@@ -428,7 +426,10 @@ def test_pcc_python_frame_and_scheduler_roots_share_slot_walkers_source():
     )[0]
     assert "_py_visit_mapped_root_slots(" in remap_body
     assert "_py_visit_scheduler_root_slots(3, 0)" in remap_body
-    assert "_rewrite_mapped_roots(load_ptr(frame, 0), load_ptr(frame, 8))" not in remap_body
+    assert (
+        "_rewrite_mapped_roots(load_ptr(frame, 0), load_ptr(frame, 8))"
+        not in remap_body
+    )
     assert "_resolve_root_slot_unlocked(slot, 0)" not in remap_body
 
 
@@ -437,8 +438,7 @@ def test_gc_lifo_frame_roots_skip_frame_index_but_remain_roots(tmp_path):
     src = tmp_path / "gc_lifo_frame_root_probe.c"
     exe = tmp_path / "gc_lifo_frame_root_probe.out"
     src.write_text(
-        textwrap.dedent(
-            r"""
+        textwrap.dedent(r"""
             #include "py_runtime.h"
             #include "py_internal.h"
 
@@ -461,9 +461,9 @@ def test_gc_lifo_frame_roots_skip_frame_index_but_remain_roots(tmp_path):
                 if (pcc_gc_frame_root_slot_count() != 0) return 15;
                 return 0;
             }
-            """
-        )
-    , encoding="utf-8")
+            """),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -627,7 +627,7 @@ def test_default_gc_implementations_share_object_node_index_source_of_truth():
     assert 'extern("py_gc_index_find"' in py_gc
 
 
-def test_generational_minor_refill_skips_global_young_scan():
+def test_generational_minor_refill_uses_intrusive_young_worklist():
     c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
     assert "(void)pcc_gc_step_generational_promotion(1024, 0);" in c_src
     assert "processed += pcc_gc_step_generational_promotion(budget, 1);" in c_src
@@ -637,6 +637,10 @@ def test_generational_minor_refill_skips_global_young_scan():
     assert "int promote_all_young" in c_step
     assert "if (promote_all_young)" in c_step
     assert "pcc_gc_backend3_drain_remembered_owners" in c_step
+    assert "while (pcc_gc_backend3_young_head != NULL" in c_step
+    assert "PccGcObjectNode *n = pcc_gc_backend3_young_head" in c_step
+    assert "pcc_gc_backend3_young_unlink(n)" in c_step
+    assert "pcc_gc_backend3_young_link_head(n)" in c_step
     assert "pcc_gc_backend3_remember_owner_unlocked(owner, owner_h)" in c_src
 
     py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
@@ -648,12 +652,100 @@ def test_generational_minor_refill_skips_global_young_scan():
     assert "promote_all_young: int" in py_step
     assert "if promote_all_young != 0:" in py_step
     assert "_backend3_drain_remembered_owners" in py_step
+    assert "node = _backend3_young_head()" in py_step
+    assert "_backend3_young_unlink(node)" in py_step
+    assert "_backend3_young_link_head(node)" in py_step
     assert "_backend3_remember_owner(owner, owner_flags)" in py_src
 
-    substrate_src = (RUNTIME_DIR / "py" / "py_substrate.py").read_text(
-        encoding="utf-8"
+    substrate_src = (RUNTIME_DIR / "py" / "py_substrate.py").read_text(encoding="utf-8")
+    assert (
+        'define_global_ptr_null("pcc_gc_backend3_remembered_owner_head")'
+        in substrate_src
     )
-    assert 'define_global_ptr_null("pcc_gc_backend3_remembered_owner_head")' in substrate_src
+    assert 'define_global_ptr_null("pcc_gc_backend3_young_head")' in substrate_src
+
+
+def _assert_generational_budgeted_young_worklist_advances_without_rescan(
+    tmp_path,
+    work_runtime: Path,
+    archive_name: str,
+    *,
+    extra_link_args: list[str] | None = None,
+):
+    src = tmp_path / "generational_young_worklist_probe.c"
+    exe = tmp_path / "generational_young_worklist_probe.out"
+    src.write_text(
+        textwrap.dedent("""
+            #include "py_runtime.h"
+            #include <stdio.h>
+
+            int main(void) {
+                const int count = 65536;
+                if (pcc_gc_set_backend(
+                        PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) != 0) {
+                    return 2;
+                }
+                for (int i = 0; i < count; i++) {
+                    PyObject *value = py_list_new(0);
+                    if (value == NULL) return 3;
+                }
+
+                int steps = 0;
+                while (steps <= count && pcc_gc_step(1) != 0) {
+                    steps++;
+                }
+                printf("%d\\n", steps);
+                printf("%lld\\n", (long long)pcc_gc_step(1));
+                return steps == count ? 0 : 4;
+            }
+            """).lstrip(),
+        encoding="utf-8",
+    )
+    link = [
+        _cc(),
+        "-std=c11",
+        f"-I{work_runtime / 'include'}",
+        f"-I{work_runtime / 'src'}",
+        str(src),
+        str(work_runtime / archive_name),
+    ]
+    if extra_link_args:
+        link.extend(extra_link_args)
+    link.extend(["-o", str(exe)])
+    build = subprocess.run(
+        link,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert build.returncode == 0, build.stderr
+    result = subprocess.run(
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == ["65536", "0"]
+
+
+def test_generational_budgeted_young_worklist_advances_without_rescan(tmp_path):
+    _assert_generational_budgeted_young_worklist_advances_without_rescan(
+        tmp_path,
+        _build_runtime(tmp_path),
+        "libpy_runtime.a",
+    )
+
+
+def test_generational_pcc_python_budgeted_young_worklist_advances_without_rescan(
+    tmp_path,
+):
+    _assert_generational_budgeted_young_worklist_advances_without_rescan(
+        tmp_path,
+        _build_pcc_py_runtime(tmp_path),
+        "libpy_runtime_pcc_py.a",
+        extra_link_args=["-pthread"],
+    )
 
 
 def test_c_runtime_core_container_promotion_reuses_owner_slot_walker_source():
@@ -726,31 +818,29 @@ def test_pcc_python_core_container_promotion_reuses_owner_slot_walker_source():
         "tag == 6:  # PY_TYPE_DICT",
         "tag == 8:  # PY_TYPE_SET",
         "_py_obj_visit_slot(",
-        "global_load_ptr(\"py_set_dummy\")",
+        'global_load_ptr("py_set_dummy")',
     ):
         assert token in helper_body
 
     trace_py = py_src.split("def _trace_referents(o)", 1)[1].split(
         "def _subtract_known_child_ref", 1
     )[0]
-    promote_py = py_src.split("def _trace_referents_for_promotion_mode", 1)[
-        1
-    ].split("def _trace_referents_for_promotion", 1)[0]
+    promote_py = py_src.split("def _trace_referents_for_promotion_mode", 1)[1].split(
+        "def _trace_referents_for_promotion", 1
+    )[0]
     remap_py = py_src.split("def _remap_referents(o)", 1)[1].split(
         "def _backend4_remap_and_retire", 1
     )[0]
     _assert_pcc_python_covered_slot_dispatch(py_src)
     assert (
-        "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE"
-        in trace_py
+        "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE" in trace_py
     )
     assert (
         "_py_obj_visit_covered_slots(o, 2, recurse) != 0:  # _PY_OBJ_VISIT_PROMOTE"
         in promote_py
     )
     assert (
-        "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE"
-        in remap_py
+        "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE" in remap_py
     )
     for token in (
         "tag == 5:  # PY_TYPE_LIST",
@@ -801,24 +891,22 @@ def test_pcc_python_fixed_owner_promotion_reuses_owner_slot_walker_source():
     trace_py = py_src.split("def _trace_referents(o)", 1)[1].split(
         "def _subtract_known_child_ref", 1
     )[0]
-    promote_py = py_src.split("def _trace_referents_for_promotion_mode", 1)[
-        1
-    ].split("def _trace_referents_for_promotion", 1)[0]
+    promote_py = py_src.split("def _trace_referents_for_promotion_mode", 1)[1].split(
+        "def _trace_referents_for_promotion", 1
+    )[0]
     remap_py = py_src.split("def _remap_referents(o)", 1)[1].split(
         "def _backend4_remap_and_retire", 1
     )[0]
     _assert_pcc_python_covered_slot_dispatch(py_src)
     assert (
-        "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE"
-        in trace_py
+        "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE" in trace_py
     )
     assert (
         "_py_obj_visit_covered_slots(o, 2, recurse) != 0:  # _PY_OBJ_VISIT_PROMOTE"
         in promote_py
     )
     assert (
-        "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE"
-        in remap_py
+        "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE" in remap_py
     )
     for token in (
         "tag == 9:  # PY_TYPE_FUNC",
@@ -861,24 +949,22 @@ def test_pcc_python_continuation_promotion_reuses_owner_slot_walker_source():
     trace_py = py_src.split("def _trace_referents(o)", 1)[1].split(
         "def _subtract_known_child_ref", 1
     )[0]
-    promote_py = py_src.split("def _trace_referents_for_promotion_mode", 1)[
-        1
-    ].split("def _trace_referents_for_promotion", 1)[0]
+    promote_py = py_src.split("def _trace_referents_for_promotion_mode", 1)[1].split(
+        "def _trace_referents_for_promotion", 1
+    )[0]
     remap_py = py_src.split("def _remap_referents(o)", 1)[1].split(
         "def _backend4_remap_and_retire", 1
     )[0]
     _assert_pcc_python_covered_slot_dispatch(py_src)
     assert (
-        "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE"
-        in trace_py
+        "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE" in trace_py
     )
     assert (
         "_py_obj_visit_covered_slots(o, 2, recurse) != 0:  # _PY_OBJ_VISIT_PROMOTE"
         in promote_py
     )
     assert (
-        "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE"
-        in remap_py
+        "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE" in remap_py
     )
     for body in (trace_py, promote_py, remap_py):
         assert "tag == 29:  # PY_TYPE_CONTINUATION" not in body
@@ -911,27 +997,28 @@ def test_pcc_python_instance_owner_promotion_reuses_owner_slot_walker_source():
     trace_py = py_src.split("def _trace_referents(o)", 1)[1].split(
         "def _subtract_known_child_ref", 1
     )[0]
-    promote_py = py_src.split("def _trace_referents_for_promotion_mode", 1)[
-        1
-    ].split("def _trace_referents_for_promotion", 1)[0]
+    promote_py = py_src.split("def _trace_referents_for_promotion_mode", 1)[1].split(
+        "def _trace_referents_for_promotion", 1
+    )[0]
     remap_py = py_src.split("def _remap_referents(o)", 1)[1].split(
         "def _backend4_remap_and_retire", 1
     )[0]
     _assert_pcc_python_covered_slot_dispatch(py_src)
     assert (
-        "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE"
-        in trace_py
+        "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE" in trace_py
     )
     assert (
         "_py_obj_visit_covered_slots(o, 2, recurse) != 0:  # _PY_OBJ_VISIT_PROMOTE"
         in promote_py
     )
     assert (
-        "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE"
-        in remap_py
+        "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE" in remap_py
     )
     for body in (trace_py, promote_py, remap_py):
-        assert "tag == 11 or tag >= 104:  # PY_TYPE_INSTANCE / user instance tags" not in body
+        assert (
+            "tag == 11 or tag >= 104:  # PY_TYPE_INSTANCE / user instance tags"
+            not in body
+        )
 
 
 def test_pcc_python_subtract_referents_reuses_slot_walkers_source():
@@ -944,7 +1031,10 @@ def test_pcc_python_subtract_referents_reuses_slot_walkers_source():
     assert "child = pcc_gc_load_ptr_extern(" in slot_adapter
     assert "ptr_add(slot_base, slot_offset)" in slot_adapter
     assert "_subtract_known_child_ref(child)" in slot_adapter
-    assert "_subtract_known_child_ref(load_ptr(slot_base, slot_offset))" not in slot_adapter
+    assert (
+        "_subtract_known_child_ref(load_ptr(slot_base, slot_offset))"
+        not in slot_adapter
+    )
 
     subtract_py = py_src.split("def _subtract_referent_refs(o)", 1)[1].split(
         "def _trace_referents_for_promotion_mode", 1
@@ -969,14 +1059,16 @@ def test_clear_referents_reuses_slot_contract_source():
 
     c_clear_slot_start = c_src.index("static void pcc_gc_clear_owned_slot(")
     c_clear_slot_body = c_src[
-        c_clear_slot_start:c_src.index("static void pcc_gc_clear_referents(", c_clear_slot_start)
+        c_clear_slot_start : c_src.index(
+            "static void pcc_gc_clear_referents(", c_clear_slot_start
+        )
     ]
     assert "role != PY_OBJ_SLOT_OWNED" in c_clear_slot_body
     assert "pcc_gc_clear_slot(slot)" in c_clear_slot_body
 
     c_clear_start = c_src.index("static void pcc_gc_clear_referents(")
     c_clear_body = c_src[
-        c_clear_start:c_src.index("/* PASS-1 of the two-phase sweep", c_clear_start)
+        c_clear_start : c_src.index("/* PASS-1 of the two-phase sweep", c_clear_start)
     ]
     assert "py_obj_visit_slots(o, pcc_gc_clear_owned_slot, NULL)" in c_clear_body
     assert "pcc_gc_clear_slot(&" not in c_clear_body
@@ -1015,8 +1107,7 @@ def _assert_backend_three_minor_refill_promotes_tls_exception_root(
     src = tmp_path / f"{archive_name}_minor_tls_exc_root_probe.c"
     exe = tmp_path / f"{archive_name}_minor_tls_exc_root_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdio.h>
@@ -1056,8 +1147,7 @@ def _assert_backend_three_minor_refill_promotes_tls_exception_root(
                 }
                 return 0;
             }
-            """
-        ).lstrip(),
+            """).lstrip(),
         encoding="utf-8",
     )
     link_cmd = [
@@ -1107,8 +1197,7 @@ def _assert_backend_three_non_list_slots_rewrite(
     src = tmp_path / f"{archive_name}_minor_non_list_slot_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_minor_non_list_slot_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -1260,9 +1349,9 @@ def _assert_backend_three_non_list_slots_rewrite(
                 printf("%d\\n", check_valuebox_field_slot());
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -1310,8 +1399,7 @@ def _assert_backend_three_frame_root_slot_rewrite(
     src = tmp_path / f"{archive_name}_minor_frame_root_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_minor_frame_root_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -1349,9 +1437,9 @@ def _assert_backend_three_frame_root_slot_rewrite(
                 pcc_gc_frame_leave(slots);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -1399,8 +1487,7 @@ def _assert_backend_three_borrowed_frame_root_rewrite_preserves_source_ref(
     src = tmp_path / f"{archive_name}_minor_borrowed_frame_root_probe.c"
     exe = tmp_path / f"{archive_name}_minor_borrowed_frame_root_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -1440,9 +1527,9 @@ def _assert_backend_three_borrowed_frame_root_rewrite_preserves_source_ref(
                 pcc_gc_release(child);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -1490,8 +1577,7 @@ def _assert_backend_three_suspended_generator_frame_slot_rewrite(
     src = tmp_path / f"{archive_name}_minor_gen_frame_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_minor_gen_frame_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -1550,9 +1636,9 @@ def _assert_backend_three_suspended_generator_frame_slot_rewrite(
                 pcc_gc_release(gen);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -1600,8 +1686,7 @@ def _assert_backend_three_continuation_stack_slot_rewrite(
     src = tmp_path / f"{archive_name}_minor_continuation_slot_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_minor_continuation_slot_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -1656,9 +1741,9 @@ def _assert_backend_three_continuation_stack_slot_rewrite(
                 pcc_gc_release(cont);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -1706,8 +1791,7 @@ def _assert_backend_three_generator_coroutine_state_slot_rewrite(
     src = tmp_path / f"{archive_name}_minor_gen_coro_state_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_minor_gen_coro_state_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -1817,9 +1901,9 @@ def _assert_backend_three_generator_coroutine_state_slot_rewrite(
                 printf("%d\\n", check_coroutine_result_slot());
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -1867,8 +1951,7 @@ def _assert_backend_three_task_state_slot_rewrite(
     src = tmp_path / f"{archive_name}_minor_task_state_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_minor_task_state_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -1937,9 +2020,9 @@ def _assert_backend_three_task_state_slot_rewrite(
                 pcc_gc_release(task);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -1987,8 +2070,7 @@ def _assert_backend_three_scheduler_root_slot_rewrite(
     src = tmp_path / f"{archive_name}_minor_scheduler_root_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_minor_scheduler_root_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -2028,9 +2110,9 @@ def _assert_backend_three_scheduler_root_slot_rewrite(
                 pcc_gc_release(child);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -2078,8 +2160,7 @@ def _assert_backend_three_scheduler_queue_entry_slot_rewrite(
     src = tmp_path / f"{archive_name}_minor_scheduler_queue_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_minor_scheduler_queue_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -2126,9 +2207,9 @@ def _assert_backend_three_scheduler_queue_entry_slot_rewrite(
                 pcc_gc_release(child);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -2176,8 +2257,7 @@ def _assert_backend_three_class_metadata_slots_rewrite(
     src = tmp_path / f"{archive_name}_minor_class_metadata_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_minor_class_metadata_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -2225,9 +2305,9 @@ def _assert_backend_three_class_metadata_slots_rewrite(
                 printf("%d\\n", forwarded_slot_matches(del_child, cls->del_method));
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -2275,8 +2355,7 @@ def _assert_backend_three_forwarded_minor_source_cleanup(
     src = tmp_path / f"{archive_name}_forwarded_minor_cleanup_probe.c"
     exe = tmp_path / f"{archive_name}_forwarded_minor_cleanup_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -2344,9 +2423,9 @@ def _assert_backend_three_forwarded_minor_source_cleanup(
                 pcc_gc_release((PyObject *)owner);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -2394,8 +2473,7 @@ def _assert_backend_three_cross_domain_remembered_slot_rewrite(
     src = tmp_path / f"{archive_name}_cross_domain_remembered_probe.c"
     exe = tmp_path / f"{archive_name}_cross_domain_remembered_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -2509,9 +2587,9 @@ def _assert_backend_three_cross_domain_remembered_slot_rewrite(
                 pcc_gc_release((PyObject *)owner);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link = [
         _cc(),
         "-std=c11",
@@ -2546,7 +2624,17 @@ def _assert_backend_three_cross_domain_remembered_slot_rewrite(
         env=env,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().splitlines() == ["1", "1", "1", "1", "1", "1", "1", "1", "1"]
+    assert result.stdout.strip().splitlines() == [
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+    ]
 
 
 def test_generational_backend_small_alloc_uses_minor_fast_path(tmp_path):
@@ -2616,8 +2704,7 @@ def test_generational_backend_c_runtime_uses_minor_bump_arena(tmp_path):
     src = tmp_path / "minor_arena_probe.c"
     exe = tmp_path / "minor_arena_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include <stdio.h>
 
@@ -2652,9 +2739,9 @@ def test_generational_backend_c_runtime_uses_minor_bump_arena(tmp_path):
                 }
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -2696,8 +2783,7 @@ def test_generational_backend_c_runtime_skips_graph_leaf_tracking(tmp_path):
     src = tmp_path / "gc3_graph_leaf_probe.c"
     exe = tmp_path / "gc3_graph_leaf_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include <stdio.h>
 
@@ -2717,9 +2803,9 @@ def test_generational_backend_c_runtime_skips_graph_leaf_tracking(tmp_path):
                 pcc_gc_release(container);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -2749,8 +2835,7 @@ def test_generational_backend_c_runtime_reuses_retained_empty_minor_blocks(
     src = tmp_path / "minor_arena_reuse_probe.c"
     exe = tmp_path / "minor_arena_reuse_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include <stdio.h>
 
@@ -2787,9 +2872,9 @@ def test_generational_backend_c_runtime_reuses_retained_empty_minor_blocks(
                 pcc_gc_release(c2);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -2832,8 +2917,7 @@ def test_generational_backend_c_runtime_frees_minor_object_by_index_when_flag_cl
     src = tmp_path / "minor_arena_flag_clobber_probe.c"
     exe = tmp_path / "minor_arena_flag_clobber_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include <stdio.h>
 
@@ -2864,9 +2948,9 @@ def test_generational_backend_c_runtime_frees_minor_object_by_index_when_flag_cl
                 puts("ok");
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -2896,8 +2980,7 @@ def test_generational_backend_c_runtime_retains_empty_minor_span_for_stale_relea
     src = tmp_path / "minor_arena_stale_release_probe.c"
     exe = tmp_path / "minor_arena_stale_release_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include <stdio.h>
 
@@ -2918,9 +3001,9 @@ def test_generational_backend_c_runtime_retains_empty_minor_span_for_stale_relea
                 puts("ok");
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -2948,8 +3031,7 @@ def test_tracing_backends_ignore_zero_flag_unknown_shell_on_release(tmp_path):
     src = tmp_path / "tracing_zero_flag_shell_probe.c"
     exe = tmp_path / "tracing_zero_flag_shell_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include <stdio.h>
             #include <stdlib.h>
@@ -2984,9 +3066,9 @@ def test_tracing_backends_ignore_zero_flag_unknown_shell_on_release(tmp_path):
                 puts("ok");
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -3063,9 +3145,9 @@ def test_generational_backend_pcc_python_runtime_uses_minor_bump_arena(
         ir_scaffold_mode=None,
     )
     result = _run_backend_three(exe)
-    assert result.returncode == 0, (
-        f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert result.stdout.strip().splitlines() == ["3", "4096", "8", "1", "8", "0"]
 
 
@@ -3098,9 +3180,9 @@ def test_generational_backend_pcc_python_runtime_skips_graph_leaf_tracking(
         ir_scaffold_mode=None,
     )
     result = _run_backend_three(exe)
-    assert result.returncode == 0, (
-        f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert result.stdout.strip().splitlines() == ["0", "1"]
 
 
@@ -3160,9 +3242,9 @@ def test_generational_backend_pcc_python_runtime_reuses_retained_empty_minor_blo
         timeout=30,
         env=env,
     )
-    assert result.returncode == 0, (
-        f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert result.stdout.strip().splitlines() == ["2", "2"]
 
 
@@ -3204,9 +3286,9 @@ def test_generational_backend_pcc_python_runtime_frees_minor_object_by_index_whe
         ir_scaffold_mode=None,
     )
     result = _run_backend_three(exe)
-    assert result.returncode == 0, (
-        f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert result.stdout.strip().splitlines() == [
         "3",
         "4096",
@@ -3248,9 +3330,9 @@ def test_generational_backend_pcc_python_runtime_retains_empty_minor_span_for_st
         ir_scaffold_mode=None,
     )
     result = _run_backend_three(exe)
-    assert result.returncode == 0, (
-        f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert result.stdout.strip().splitlines() == ["3", "ok"]
 
 
@@ -3262,8 +3344,7 @@ def test_generational_backend_pcc_python_runtime_threaded_minor_blocks(
     src = tmp_path / "pcc_py_minor_thread_blocks.c"
     exe = tmp_path / "pcc_py_minor_thread_blocks.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -3303,9 +3384,9 @@ def test_generational_backend_pcc_python_runtime_threaded_minor_blocks(
                 if (pcc_gc_set_backend(PCC_GC_KIND_REFCOUNT_CYCLE) != 0) return 6;
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -3375,9 +3456,9 @@ def test_generational_backend_pcc_python_runtime_class_instances_deallocate_from
         ir_scaffold_mode=None,
     )
     result = _run_backend_three(exe)
-    assert result.returncode == 0, (
-        f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert result.stdout.strip().splitlines() == ["backend 3", "ok"]
 
 
@@ -3413,9 +3494,9 @@ def test_generational_backend_pcc_python_runtime_string_constructor_preserves_mi
         ir_scaffold_mode=None,
     )
     result = _run_backend_three(exe)
-    assert result.returncode == 0, (
-        f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert result.stdout.strip().splitlines() == ["3", "128", "4096"]
 
 
@@ -3471,9 +3552,9 @@ def test_generational_backend_pcc_python_runtime_minor_refill_promotes_remembere
         ir_scaffold_mode=None,
     )
     result = _run_backend_three(exe)
-    assert result.returncode == 0, (
-        f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert result.stdout.strip().splitlines() == ["128", "512", "True", "256", "0"]
 
 
@@ -3496,8 +3577,7 @@ def test_generational_backend_minor_refill_promotes_remembered_young_child(
     src = tmp_path / "minor_refill_probe.c"
     exe = tmp_path / "minor_refill_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include <stdint.h>
             #include <stdio.h>
@@ -3558,9 +3638,9 @@ def test_generational_backend_minor_refill_promotes_remembered_young_child(
                 pcc_gc_release((PyObject *)owner);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -3603,8 +3683,7 @@ def test_generational_backend_minor_refill_oldifies_copy_for_remembered_child(
     src = tmp_path / "minor_oldify_copy_probe.c"
     exe = tmp_path / "minor_oldify_copy_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -3660,9 +3739,9 @@ def test_generational_backend_minor_refill_oldifies_copy_for_remembered_child(
                 pcc_gc_release((PyObject *)owner);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -3706,8 +3785,7 @@ def test_generational_backend_minor_refill_rewrites_remembered_list_slot_to_oldi
     src = tmp_path / "minor_oldify_slot_rewrite_probe.c"
     exe = tmp_path / "minor_oldify_slot_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -3758,9 +3836,9 @@ def test_generational_backend_minor_refill_rewrites_remembered_list_slot_to_oldi
                 pcc_gc_release((PyObject *)owner);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -3806,8 +3884,7 @@ def _assert_backend_three_young_owner_promotion_rewrites_list_referent(
     src = tmp_path / f"{archive_name}_young_owner_slot_rewrite_probe.c"
     exe = tmp_path / f"{archive_name}_young_owner_slot_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -3849,9 +3926,9 @@ def _assert_backend_three_young_owner_promotion_rewrites_list_referent(
                 pcc_gc_release(owner);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link_cmd = [
         _cc(),
         "-std=c11",
@@ -3899,8 +3976,7 @@ def _assert_backend_three_safepoint_does_not_promote_frame_roots(
     src = tmp_path / f"{archive_name}_safepoint_root_promotion_probe.c"
     exe = tmp_path / f"{archive_name}_safepoint_root_promotion_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -3934,9 +4010,9 @@ def _assert_backend_three_safepoint_does_not_promote_frame_roots(
                 pcc_gc_release(root);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link_cmd = [
         _cc(),
         "-std=c11",
@@ -4116,8 +4192,7 @@ def _assert_backend_three_forwarded_source_release_consumes_source_ref(
     src = tmp_path / "forwarded_source_release_probe.c"
     exe = tmp_path / "forwarded_source_release_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -4144,8 +4219,7 @@ def _assert_backend_three_forwarded_source_release_consumes_source_ref(
                 pcc_gc_release(target);
                 return 0;
             }
-            """
-        ).lstrip(),
+            """).lstrip(),
         encoding="utf-8",
     )
     build = subprocess.run(
@@ -4183,8 +4257,7 @@ def _assert_backend_three_oldified_tuple_retains_old_child(
     src = tmp_path / f"{archive_name}_oldified_tuple_child_ref_probe.c"
     exe = tmp_path / f"{archive_name}_oldified_tuple_child_ref_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -4236,9 +4309,9 @@ def _assert_backend_three_oldified_tuple_retains_old_child(
                 pcc_gc_store_root(&roots[0], 0);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link_cmd = [
         _cc(),
         "-std=c11",
@@ -4286,8 +4359,7 @@ def _assert_backend_three_minor_arena_tuple_cycle_promotes_in_place(
     src = tmp_path / f"{archive_name}_minor_tuple_cycle_promotion_probe.c"
     exe = tmp_path / f"{archive_name}_minor_tuple_cycle_promotion_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -4327,9 +4399,9 @@ def _assert_backend_three_minor_arena_tuple_cycle_promotes_in_place(
                 pcc_gc_store_root(&roots[0], 0);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link_cmd = [
         _cc(),
         "-std=c11",
@@ -4377,8 +4449,7 @@ def _assert_backend_three_string_loop_owned_root_cleanup(
     src = tmp_path / f"{archive_name}_string_loop_owned_root_cleanup_probe.c"
     exe = tmp_path / f"{archive_name}_string_loop_owned_root_cleanup_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -4440,9 +4511,9 @@ def _assert_backend_three_string_loop_owned_root_cleanup(
                 pcc_gc_release(parts);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     link_cmd = [
         _cc(),
         "-std=c11",
@@ -4521,8 +4592,7 @@ def test_generational_backend_pcc_python_runtime_minor_refill_oldifies_copy_for_
     src = tmp_path / "pcc_py_minor_oldify_copy_probe.c"
     exe = tmp_path / "pcc_py_minor_oldify_copy_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -4578,9 +4648,9 @@ def test_generational_backend_pcc_python_runtime_minor_refill_oldifies_copy_for_
                 pcc_gc_release((PyObject *)owner);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -4625,8 +4695,7 @@ def test_generational_backend_pcc_python_runtime_minor_refill_rewrites_remembere
     src = tmp_path / "pcc_py_minor_oldify_slot_rewrite_probe.c"
     exe = tmp_path / "pcc_py_minor_oldify_slot_rewrite_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -4677,9 +4746,9 @@ def test_generational_backend_pcc_python_runtime_minor_refill_rewrites_remembere
                 pcc_gc_release((PyObject *)owner);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),
@@ -4724,8 +4793,7 @@ def test_generational_backend_pcc_python_runtime_old_list_retains_appended_tuple
     src = tmp_path / "pcc_py_old_list_tuple_retention_probe.c"
     exe = tmp_path / "pcc_py_old_list_tuple_retention_probe.out"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             #include "py_runtime.h"
             #include "py_internal.h"
             #include <stdint.h>
@@ -4761,9 +4829,9 @@ def test_generational_backend_pcc_python_runtime_old_list_retains_appended_tuple
                 py_decref(table);
                 return 0;
             }
-            """
-        ).lstrip()
-    , encoding="utf-8")
+            """).lstrip(),
+        encoding="utf-8",
+    )
     build = subprocess.run(
         [
             _cc(),

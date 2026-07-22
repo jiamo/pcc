@@ -83,7 +83,7 @@ def test_checked_in_llvm_default_pass_registry_is_visible_in_repo():
     assert "argpromotion" in LLVM_DEFAULT_PROFILE_PASSES[3]
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_default_profile_pass_names_exposes_concrete_llvm_registry():
     names = default_profile_pass_names(2)
 
@@ -95,7 +95,7 @@ def test_default_profile_pass_names_exposes_concrete_llvm_registry():
     assert "instcombine" in unique_managed_pass_names(include_llvm=True)
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_external_llvm_pipeline_runs_and_records_concrete_passes(monkeypatch):
     llvm.initialize_native_target()
     llvm.initialize_native_asmprinter()
@@ -178,7 +178,7 @@ entry:
     llvm.parse_assembly(optimized).verify()
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_text_and_memory_llvm_pipeline_transports_are_equivalent(monkeypatch):
     ir_text = """
 define i32 @main() {

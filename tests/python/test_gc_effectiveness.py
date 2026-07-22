@@ -115,9 +115,10 @@ def test_non_cyclic_releases_correctly(tmp_path):
     assert result.stdout.strip() == "ok"
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/usr/bin/time"),
-    reason="needs /usr/bin/time -l for RSS measurement",
+@pytest.mark.pcc_gate(
+    unavailable=None
+    if os.path.exists("/usr/bin/time")
+    else "needs /usr/bin/time -l for RSS measurement"
 )
 def test_non_cyclic_rss_plateaus(tmp_path):
     """100k iterations of build + drop a 100-string list. Scope exit
@@ -591,9 +592,10 @@ def test_collect_preserves_root_reachable_subgraph(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/usr/bin/time"),
-    reason="needs /usr/bin/time -l for RSS measurement",
+@pytest.mark.pcc_gate(
+    unavailable=None
+    if os.path.exists("/usr/bin/time")
+    else "needs /usr/bin/time -l for RSS measurement"
 )
 def test_steady_state_cycle_workload_rss_plateaus(tmp_path):
     """100k iterations of "make 1 cycle, drop, optionally collect()".

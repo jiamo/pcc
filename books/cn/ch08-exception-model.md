@@ -1,8 +1,8 @@
 # 第 8 章 异常模型
 
-Python 的语义允许异常从几乎任何表达式涌出:下标越界、属性缺失、迭代器耗尽、用户 `__add__` 里的一次 `raise`。解释器里这件事由求值循环统一接住;编译成原生代码之后,"控制流如何从抛出点跨过任意多个原生栈帧到达匹配的 `except`"就成了必须显式回答的设计问题。pcc 的回答看起来是所有候选中最朴素的一个:`py_raise(exc)` 把异常存进一个线程局部槽位然后**正常返回**,每个可能抛异常的调用点之后由生成代码检查 `py_err_occurred()` 并分支到错误路径。没有展开器(unwinder),没有 Itanium ABI。本章解释这个选择的理由——代价、可移植性、self 后端可实现性——以及它的真实价格:把传播正确性变成分布在几十个低层化(lowering)文件里的插入义务,漏掉一处检查的症状不是崩溃,而是"compile succeeded with no output"。本章覆盖运行时五个 C 文件与五个 pcc-Python 镜像、前端的 `ExceptionLoweringMixin`,并以两次真实调查收尾。
+Python 的语义允许异常从几乎任何表达式涌出:下标越界、属性缺失、迭代器耗尽、用户 `__add__` 里的一次 `raise`。解释器里这件事由求值循环统一接住;编译成原生代码之后,"控制流如何从抛出点跨过任意多个原生栈帧到达匹配的 `except`"就成了必须显式回答的设计问题。pcc 的回答表观上是所有候选中最朴素的一个:`py_raise(exc)` 把异常存进一个线程局部槽位然后**正常返回**,每个可能抛异常的调用点之后由生成代码检查 `py_err_occurred()` 并分支到错误路径。没有展开器(unwinder),没有 Itanium ABI。本章解释这个选择的理由——代价、可移植性、self 后端可实现性——以及它的真实价格:把传播正确性变成分布在几十个低层化(lowering)文件里的插入义务,漏掉一处检查的症状不是崩溃,而是"compile succeeded with no output"。本章覆盖运行时五个 C 文件与五个 pcc-Python 镜像、前端的 `ExceptionLoweringMixin`,并以两次真实调查收尾。
 
-## 读者地图:异常不是"自动跳走"
+## 本章导读:异常传播是显式检查而非栈展开
 
 本章先记住一个模型:抛异常只是把错误对象放进线程局部槽,真正的跳转靠 generated code 在每次可能失败的调用后手动检查。少一次检查,异常就会变成沉默的错误或错位的返回。
 
@@ -47,6 +47,49 @@ self 后端义务        CFI/展开表/personality   无(异常边 = 普通分�
 ## 8.2 TLS 槽与 py_raise:模型的全部运行时状态
 
 整个异常模型的运行时状态只有一个字:[pcc/py_runtime/src/py_substrate.c](../../pcc/py_runtime/src/py_substrate.c) 里的 `static _Thread_local void *g_tls_current_exc`,经 `py_tls_exc_get()`/`py_tls_exc_set()` 两个裸访问器存取。槽位放在 substrate 而不是 `py_exc_tls.c` 自己,是镜像纪律的要求(见第 14 章):pcc-Python 端口 [pcc/py_runtime/py/py_exc_tls.py](../../pcc/py_runtime/py/py_exc_tls.py) 要整体替换 `py_exc_tls.o`,但它无法声明 C 的线程局部存储,于是存储留在"永远是 C 的底座"substrate 里,端口经 `pcc.extern.extern` 引用同一对访问器。逻辑可替换,状态不动。
+
+在 [pcc/py_runtime/src/py_exc_tls.c](../../pcc/py_runtime/src/py_exc_tls.c) 中,抛出与查询仅需几行 C 代码:
+
+```c
+// pcc/py_runtime/src/py_exc_tls.c
+void py_raise(PyObject *exc) {
+    PyObject *cur = py_resolve_current_exception();
+    if (cur != NULL && exc != NULL && cur != exc && py_type_of(exc) == PY_TYPE_EXC) {
+        PyExceptionObject *new_exc = (PyExceptionObject *)exc;
+        PyObject *existing_context = pcc_gc_load_ptr(exc, &new_exc->context);
+        if (existing_context == NULL) {
+            pcc_gc_store_ptr(exc, &new_exc->context, cur);
+        }
+    }
+    if (exc != NULL && !exc_owned) py_incref(exc);
+    if (cur != NULL) py_decref(cur);
+    py_tls_exc_set(exc);
+}
+
+int64_t py_err_occurred(void) {
+    return py_tls_exc_get() != NULL ? 1 : 0;
+}
+```
+
+而在前端代码生成侧,[pcc/py_frontend/codegen/exception_lowering.py](../../pcc/py_frontend/codegen/exception_lowering.py) 负责在每次函数调用后发射逻辑检查:
+
+```python
+# pcc/py_frontend/codegen/exception_lowering.py
+def _emit_post_call_err_check(self) -> None:
+    cur_fn = self.current_function
+    if cur_fn is not None and cur_fn.name in self._c_abi_export_symbols:
+        return
+    err_target = self._current_try_err_block()
+    if err_target is None:
+        err_target = self._ensure_fn_err_exit()
+    err_fn = self.runtime.get("py_err_occurred")
+    if err_fn is None:
+        err_ty = ir.FunctionType(_I64, [])
+        err_fn = ir.Function(self.module, err_ty, name="py_err_occurred")
+        err_fn.linkage = "external"
+        self.runtime["py_err_occurred"] = err_fn
+    is_err = self.builder.call(err_fn, [])
+```
 
 `py_exc_tls.c` 在这个槽上实现四个公开入口,合计 172 行:
 
@@ -113,7 +156,7 @@ self 后端义务        CFI/展开表/personality   无(异常边 = 普通分�
                                           → 外层 try.err 或 err.exit
 ```
 
-元组形式的 handler(`except (A, B):`)把多次 `py_exc_matches` 结果 or 起来;无类型的 `except:` 恒真。handler 入口的次序承载语义:先按需 retain 异常(handler 绑定了名字,或体内含裸 `raise`——`body_has_bare_raise()` 递归扫描判定),再 `py_clear_exception()` 清空 TLS,再把名字绑进 `e.addr` 槽。清空让 handler 体内的后续调用不被旧异常污染;retain 让绑定与重抛在 TLS 放手后仍有拥有引用可用。绑定名同时登记进 `_except_binding_names`,使后续 `saved = e` 的拷贝被 GC 根化——这条根缺失曾让追踪后端清扫掉异常的 message,根因在前端所有权低层化而非运行时,是第 10 章的战例(见 [docs/investigations/](../../docs/investigations) 的 gc-5backend-exception-referent-roots 调查)。`finally` 经 `_finally_stack` 在正常出口、无 handler 的错误路径、handler 出口三处展开;与 `return` 的交互(挂起 finally 的逐层发射)在第 9 章的返回路径里已经出现过。
+元组形式的 handler(`except (A, B):`)把多次 `py_exc_matches` 结果 or 起来;无类型的 `except:` 恒真。handler 入口的次序承载语义:先按需 retain 异常(handler 绑定了名字,或体内含裸 `raise`——`body_has_bare_raise()` 递归扫描判定),再 `py_clear_exception()` 清空 TLS,再把名字绑进 `e.addr` 槽。清空让 handler 体内的后续调用不被旧异常污染;retain 让绑定与重抛在 TLS 放手后仍有拥有引用可用。绑定名同时登记进 `_except_binding_names`,使后续 `saved = e` 的拷贝被 GC 根化——这条根缺失曾让追踪后端清扫掉异常的 message,根因在前端所有权低层化而非运行时,是第 10 章的案例研究(见 [docs/investigations/](../../docs/investigations) 的 gc-5backend-exception-referent-roots 调查)。`finally` 经 `_finally_stack` 在正常出口、无 handler 的错误路径、handler 出口三处展开;与 `return` 的交互(挂起 finally 的逐层发射)在第 9 章的返回路径里已经出现过。
 
 从源码推得的一处语义边界,如实记录:`py_raise` 的隐式 `__context__` 链接以"TLS 仍有挂起异常"为条件,而低层化代码在 handler 入口已清空 TLS——因此 handler 体内一次普通的 `raise NewError()` 不会自动携带刚捕获的旧异常作为 `__context__`;链接生效的是异常仍挂起时再次 raise 的路径(传播途中、运行时内部的二次抛出)。CPython 在 handler 体内也会链接。这是当前实现与 CPython 的一个已知差距,按开放问题记录。
 
@@ -149,7 +192,7 @@ self 后端义务        CFI/展开表/personality   无(异常边 = 普通分�
 
 ## 8.7 历史与教训
 
-### 战例一:链接干净、--help 正常、编译"成功"——静默失败的 pcc1(2026-04)
+### 案例研究一:链接干净、--help 正常、编译"成功"——静默失败的 pcc1(2026-04)
 
 来源:[docs/investigations/python-self-host-no-libpython-runtime-holes.md](../../docs/investigations/python-self-host-no-libpython-runtime-holes.md)(状态快照 2026-04-29;Issue 1 此后于 2026-05-01 关闭,基线在 [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json))。
 
@@ -161,7 +204,7 @@ self 后端义务        CFI/展开表/personality   无(异常边 = 普通分�
 
 **留下的不变式。** 其一,错误传播闸门:编译中抛异常必须 CLI 非零、stderr 有文本、不留产物——"status 0 且无产物"应当是不可能状态。其二,测试金字塔补层:stage1-as-compiler 冒烟(构建 pcc1 → 验链接 → 跑 --help → 编译最小文件并执行产物)成为强制闸门,今天固化在 `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py`(见第 15 章)。其三,方法论一条:对这类故障,第一动作是 lldb 断 `py_raise`,不是猜。
 
-### 战例二:emission-site err-check 审计——把分布式义务变成可枚举清单(2026-06-11)
+### 案例研究二:emission-site err-check 审计——把分布式义务变成可枚举清单(2026-06-11)
 
 来源:[docs/investigations/emission-site-err-check-audit.md](../../docs/investigations/emission-site-err-check-audit.md)。
 
@@ -185,4 +228,4 @@ pcc 的异常模型是一次方向明确的取舍:用每个调用点一次 TLS �
 2. **追踪一次低层化。** 对 `try: f() except (A, B) as e: g()`,按 `_emit_try()` 列出生成代码依次调用的运行时函数(从 `py_current_exception` 到 handler 出口),并指出:在哪个点 TLS 被清空?`e` 的引用在哪里 retain、哪里 release?为什么 `e` 要进 `_except_binding_names`?
 3. **构造故障。** 设运行时函数 `h()` 内部 `py_raise` 一个 `TypeError` 后返回 NULL,而它的发射位点漏插检查。沿 8.6 的故障链写出两种终局(4a 错位引爆 / 4b 静默成功)各自需要的后续代码形状,并解释为什么 `_ensure_fn_err_exit()` 选 0 当整型哨兵让 4b 成为可能。哨兵改成 -1 能根治吗?会破坏什么?
 4. **设计权衡论证。** 假设 self 后端日后支持了 CFI 元数据发射,是否应当迁回 Itanium 展开?分别从 `StopIteration` 频率、第 9 章 owned-local 清理在展开路径上的去向、Mach-O 与 ELF 的展开表差异、以及"漏检查"故障类在两种模型下的等价物(表项错误)四个角度论证。
-5. **改进审计。** 8.7 战例二的 8 行窗口启发式同时产出假阳性(检查在窗口外)与潜在假阴性。设计一个更好的静态审计:如何识别 maybe_end/propagate 等价路由?如何处理 `@c_abi_export` 抑制规则?它仍然证明不了什么(提示:可达性、运行时函数是否真能在该路径上 raise)?
+5. **改进审计。** 8.7 案例研究二的 8 行窗口启发式同时产出假阳性(检查在窗口外)与潜在假阴性。设计一个更好的静态审计:如何识别 maybe_end/propagate 等价路由?如何处理 `@c_abi_export` 抑制规则?它仍然证明不了什么(提示:可达性、运行时函数是否真能在该路径上 raise)?

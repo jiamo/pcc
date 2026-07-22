@@ -81,7 +81,10 @@ PyObject *py_file_open(PyObject *path, PyObject *mode) {
     py_file_unpin_current_vthread(vt);
     py_decref(path_owned);
     py_decref(mode_owned);
-    if (fp == NULL) return NULL;
+    if (fp == NULL) {
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "could not open file"));
+        return NULL;
+    }
 
     PyFileObject *out = (PyFileObject *)pcc_gc_alloc(
         (int64_t)sizeof(PyFileObject),

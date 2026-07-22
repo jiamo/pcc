@@ -48,6 +48,12 @@ from pcc.kernel_ir.metal_source_runtime import (
 REPO = Path(__file__).resolve().parents[2]
 
 
+pytestmark = [
+    pytest.mark.pcc_gate(probe="metal"),
+    pytest.mark.pcc_gate(probe="pcc1"),
+]
+
+
 def _level4_backend_record(
     backend: int,
     *,
@@ -1078,7 +1084,7 @@ def _build_real_metallib_tilelang_transpose_a_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang transpose_A GEMM metallib package did not produce "
@@ -1109,7 +1115,7 @@ def _build_real_metallib_tilelang_transpose_a_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1160,7 +1166,7 @@ def _build_real_metallib_tilelang_transpose_b_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang transpose_B GEMM metallib package did not produce "
@@ -1191,7 +1197,7 @@ def _build_real_metallib_tilelang_transpose_b_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1242,7 +1248,7 @@ def _build_real_metallib_tilelang_transpose_ab_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang transpose_AB GEMM metallib package did not produce "
@@ -1271,7 +1277,7 @@ def _build_real_metallib_tilelang_transpose_ab_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1322,7 +1328,7 @@ def _build_real_metallib_tilelang_splitk_atomic_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang split-K atomic GEMM metallib package did not produce "
@@ -1353,7 +1359,7 @@ def _build_real_metallib_tilelang_splitk_atomic_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1423,7 +1429,7 @@ def _build_real_metallib_tilelang_splitk_atomic_vectorized_c_artifacts(
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang split-K atomic T.vectorized C metallib package did not "
@@ -1472,7 +1478,7 @@ def _build_real_metallib_tilelang_splitk_atomic_vectorized_c_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1524,7 +1530,7 @@ def _build_real_metallib_tilelang_splitk_atomic_ceildiv_artifacts(tmp_path: Path
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang split-K atomic ceildiv GEMM metallib package did not "
@@ -1560,7 +1566,7 @@ def _build_real_metallib_tilelang_splitk_atomic_ceildiv_artifacts(tmp_path: Path
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1710,7 +1716,7 @@ def _build_real_metallib_tilelang_swizzled_padded_annotate_layout_artifacts(
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang swizzled padded annotate_layout metallib package did not "
@@ -1766,7 +1772,7 @@ def _build_real_metallib_tilelang_swizzled_padded_annotate_layout_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1819,7 +1825,7 @@ def _build_real_metallib_tilelang_enabled_swizzle_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang enabled use_swizzle metallib package did not produce "
@@ -1853,7 +1859,7 @@ def _build_real_metallib_tilelang_enabled_swizzle_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1904,7 +1910,7 @@ def _build_real_metallib_tilelang_nonzero_step_pipelined_artifacts(tmp_path: Pat
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang nonzero stepped T.Pipelined metallib package did not "
@@ -1941,7 +1947,7 @@ def _build_real_metallib_tilelang_nonzero_step_pipelined_artifacts(tmp_path: Pat
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2017,7 +2023,7 @@ def _build_real_metallib_tilelang_vectorized_a_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang T.vectorized A copy metallib package did not produce "
@@ -2057,7 +2063,7 @@ def _build_real_metallib_tilelang_vectorized_a_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2133,7 +2139,7 @@ def _build_real_metallib_tilelang_vectorized_b_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang T.vectorized B copy metallib package did not produce "
@@ -2173,7 +2179,7 @@ def _build_real_metallib_tilelang_vectorized_b_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2253,7 +2259,7 @@ def _build_real_metallib_tilelang_vectorized_c_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang T.vectorized C copy metallib package did not produce "
@@ -2293,7 +2299,7 @@ def _build_real_metallib_tilelang_vectorized_c_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2373,7 +2379,7 @@ def _build_real_metallib_tilelang_vectorized_abc_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang T.vectorized A/B/C copy metallib package did not produce "
@@ -2415,7 +2421,7 @@ def _build_real_metallib_tilelang_vectorized_abc_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2474,7 +2480,7 @@ def _build_real_metallib_tilelang_vectorized_annotations_artifacts(tmp_path: Pat
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang vectorized annotations metallib package did not produce "
@@ -2506,7 +2512,7 @@ def _build_real_metallib_tilelang_vectorized_annotations_artifacts(tmp_path: Pat
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2576,7 +2582,7 @@ def _build_real_metallib_tilelang_parallel_a_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang T.Parallel A copy metallib package did not produce "
@@ -2616,7 +2622,7 @@ def _build_real_metallib_tilelang_parallel_a_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2686,7 +2692,7 @@ def _build_real_metallib_tilelang_parallel_b_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang T.Parallel B copy metallib package did not produce "
@@ -2726,7 +2732,7 @@ def _build_real_metallib_tilelang_parallel_b_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2798,7 +2804,7 @@ def _build_real_metallib_tilelang_parallel_c_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang T.Parallel C copy metallib package did not produce "
@@ -2838,7 +2844,7 @@ def _build_real_metallib_tilelang_parallel_c_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2906,7 +2912,7 @@ def _build_real_metallib_tilelang_parallel_ab_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang T.Parallel A/B copy metallib package did not produce "
@@ -2946,7 +2952,7 @@ def _build_real_metallib_tilelang_parallel_ab_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -3014,7 +3020,7 @@ def _build_real_metallib_tilelang_parallel_abc_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang T.Parallel A/B/C copy metallib package did not produce "
@@ -3054,7 +3060,7 @@ def _build_real_metallib_tilelang_parallel_abc_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -3105,7 +3111,7 @@ def _build_real_metallib_tilelang_nonzero_step_serial_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang nonzero stepped T.serial metallib package did not produce "
@@ -3137,7 +3143,7 @@ def _build_real_metallib_tilelang_nonzero_step_serial_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != pcc1_metal.STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -8926,7 +8932,7 @@ def _run_lifetime_probe_backend(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout.splitlines() == [str(48 + backend), "0"]
     return _level5_lifetime_backend_record(backend, workload_id=workload_id)
 
@@ -8954,7 +8960,7 @@ def _run_metallib_lifetime_probe_backend(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout.splitlines() == [str(48 + backend), "0"]
     return _level5_metallib_lifetime_backend_record(
         backend,
@@ -12644,7 +12650,7 @@ def test_gpu_level6_five_gc_copy_owner_lifetime_real_or_skipped(tmp_path):
         )
         stdout = run.stdout.strip()
         if stdout == "903":
-            pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+            pytest.fail("MTLCreateSystemDefaultDevice returned nil")
         assert stdout.splitlines() == [str(48 + backend), "0"]
         backend_results.append(
             _level5_lifetime_backend_record(backend, workload_id=workload_id)

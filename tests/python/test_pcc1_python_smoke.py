@@ -64,13 +64,20 @@ def _pcc1_supports_pytest() -> bool:
 
 
 PCC1 = _find_pcc1()
-pytestmark = pytest.mark.skipif(
-    PCC1 is None,
-    reason=(
-        "No pcc1 binary found on disk; skipping self-host smoke. "
-        "Run scripts/bootstrap.sh to build one."
-    ),
-)
+pytestmark = pytest.mark.pcc_gate(probe="pcc1")
+
+@pytest.fixture(scope="module", autouse=True)
+def _smoke_pcc1_present():
+    global PCC1
+    if PCC1 is None:
+        PCC1 = _find_pcc1()
+    if PCC1 is None:
+        pytest.fail(
+            "no pcc1 binary found even after session auto-provisioning; "
+            "run scripts/bootstrap.sh --stage 1 and read its error output"
+        )
+    yield
+
 
 @pytest.fixture(scope="module", autouse=True)
 def _smoke_pcc_py_runtime(pcc_py_runtime_archive):
@@ -1074,7 +1081,7 @@ def test_pcc1_calls_positional_constructor_before_method_use(tmp_path):
 
 def test_pcc1_can_launch_pytest_for_test_directory(tmp_path):
     if not _pcc1_supports_pytest():
-        pytest.skip("pcc1 binary predates --pytest launcher support")
+        pytest.fail("pcc1 binary predates --pytest launcher support; auto-provisioning should have rebuilt it")
 
     test_dir = tmp_path / "tests"
     test_dir.mkdir()
@@ -1103,7 +1110,7 @@ def test_pcc1_can_launch_pytest_for_test_directory(tmp_path):
 @pytest.mark.integration
 def test_pcc1_pytest_marker_selection_matches_repo_gates(tmp_path):
     if not _pcc1_supports_pytest():
-        pytest.skip("pcc1 binary predates --pytest launcher support")
+        pytest.fail("pcc1 binary predates --pytest launcher support; auto-provisioning should have rebuilt it")
 
     default_dir = tmp_path / "default_tests"
     default_dir.mkdir()
@@ -1186,7 +1193,7 @@ def test_pcc1_pytest_marker_selection_matches_repo_gates(tmp_path):
 
 def test_pcc1_pytest_literal_skipif_matches_pytest_subset(tmp_path):
     if not _pcc1_supports_pytest():
-        pytest.skip("pcc1 binary predates --pytest launcher support")
+        pytest.fail("pcc1 binary predates --pytest launcher support; auto-provisioning should have rebuilt it")
 
     test_dir = tmp_path / "tests"
     test_dir.mkdir()

@@ -51,13 +51,7 @@ def _verify_isolated_runtime_archive(archive: Path) -> None:
 
 PCC1 = _find_pcc1()
 pytestmark = [
-    pytest.mark.skipif(
-        PCC1 is None,
-        reason=(
-            "No pcc1 binary found on disk; run "
-            "tests/python/test_pcc_bootstrap_full.py first."
-        ),
-    ),
+    pytest.mark.pcc_gate(probe="pcc1"),
     # The session-scoped fixture builds a complete threaded runtime archive.
     # Keep this file on one worker so the five backend parameters share that
     # build instead of compiling one archive per xdist worker.
@@ -349,6 +343,7 @@ def test_pcc1_c_runtime_threads_and_explicit_gc_collect_all_backends(
         _verify_isolated_runtime_archive(threaded_c_runtime_archive)
 
 
+@pytest.mark.pcc_gate(env="PCC_PCC1_THREADED_GC_STRESS_RUNS")
 def test_pcc1_c_runtime_threaded_explicit_gc_repeated_runs_stress(
     tmp_path: Path,
     threaded_c_runtime_archive: Path,
@@ -362,7 +357,7 @@ def test_pcc1_c_runtime_threaded_explicit_gc_repeated_runs_stress(
     """
     runs_raw = os.environ.get("PCC_PCC1_THREADED_GC_STRESS_RUNS", "").strip()
     if not runs_raw:
-        pytest.skip("set PCC_PCC1_THREADED_GC_STRESS_RUNS to enable this stress gate")
+        pytest.fail("PCC_PCC1_THREADED_GC_STRESS_RUNS must be set when this stress gate is selected")
     try:
         runs = int(runs_raw)
     except ValueError:

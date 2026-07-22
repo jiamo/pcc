@@ -2,7 +2,7 @@
 
 pcc's position on LLVM is written into the fourth of its seven obligations: LLVM is the oracle, not the owner. The second half of that obligation — how the self backend becomes a first-class execution root — belongs to Chapter 13. This chapter covers the first half: how pcc uses LLVM, and how, to avoid being locked into any one Python binding of LLVM, pcc rewrote an llvmlite-shaped IR builder and an LLVM-C binding inside the repository ([pcc/llvm_capi/](../../pcc/llvm_capi)), then used a parity-testing discipline to pin the old and new paths to the same semantics. The chapter answers three design questions that cannot be dodged: why llvmlite plays the oracle and llvm_capi plays the system under test; why text-level IR rewriting has been ratcheted down to a single `va_arg` exemption; and why the system-link path no longer hands IR text to the system compiler. Behind all three answers sits one principle: every piece of LLVM IR text may be parsed only by the LLVM that produced it.
 
-## Reader Map: LLVM Has Two Roles Here
+## Chapter Overview: LLVM Has Two Roles Here
 
 First separate two roles: LLVM can be a reliable reference, but it cannot remain pcc's owner forever. llvmlite serves as the oracle, the in-repository llvm_capi path is the system under test, and parity tests keep the two paths pinned to the same semantics.
 

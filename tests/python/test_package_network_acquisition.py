@@ -211,6 +211,39 @@ def test_owned_acquisition_fails_closed_on_build_isolation(tmp_path):
     assert result["hash_verified"] is True
 
 
+def test_auto_owned_acquisition_delegates_supported_source_build_to_pcc(tmp_path):
+    index = tmp_path / "index"
+    packages = index / "packages"
+    packages.mkdir(parents=True)
+    tree = tmp_path / "demo_pkg-1.2"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text(
+        "[build-system]\nrequires = ['setuptools']\n"
+        "build-backend = 'setuptools.build_meta'\n",
+        encoding="utf-8",
+    )
+    artifact = packages / "demo_pkg-1.2.tar.gz"
+    with tarfile.open(artifact, "w:gz") as tf:
+        tf.add(tree, arcname=tree.name)
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    _write_simple_index(index, artifact, digest=digest)
+
+    with _serve_directory(index) as base_url:
+        result = acquire_requirement(
+            "demo_pkg",
+            mode="auto",
+            cache_dir=tmp_path / "cache",
+            index_urls=[base_url + "/simple"],
+        )
+
+    assert result["ok"] is True, json.dumps(result, sort_keys=True)
+    assert result["acquire_mode_requested"] == "auto"
+    assert result["acquire_mode"] == "owned"
+    assert result["host_assisted"] is False
+    assert result["hash_verified"] is True
+    assert result["build_isolation"] == "delegated-to-pcc-native-builder"
+
+
 def test_host_acquisition_is_labeled_and_publishes_immutable_artifact(tmp_path):
     source = _write_wheel(tmp_path / "demo_pkg-1.2-py3-none-any.whl")
     fake_python = tmp_path / "fake-host-python"
@@ -323,69 +356,75 @@ def test_pip_install_owned_acquires_then_installs_generic_package(tmp_path):
     assert plan["acquisitions"][0]["acquire_mode"] == "owned"
     assert plan["acquisitions"][0]["hash_verified"] is True
     assert plan["installs"][0]["install_success"] is True
+    assert plan["installs"][0]["resolved_from"] == "index-url"
     assert (tmp_path / "site" / "demo_pkg" / "__init__.py").exists()
 
 
-def test_pip_install_auto_selects_labeled_host_acquisition(tmp_path, monkeypatch):
-    source = _write_wheel(tmp_path / "demo_pkg-1.2-py3-none-any.whl")
-    fake_python = tmp_path / "fake-host-python"
-    fake_python.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, shutil, sys\n"
-        "dest = sys.argv[sys.argv.index('--dest') + 1]\n"
-        "shutil.copy2(os.environ['PCC_TEST_ACQUIRE_ARTIFACT'], dest)\n",
-        encoding="utf-8",
-    )
-    fake_python.chmod(0o755)
-    monkeypatch.setenv("PCC_HOST_PYTHON", str(fake_python))
-    monkeypatch.setenv("PCC_TEST_ACQUIRE_ARTIFACT", str(source))
+def test_pip_install_auto_selects_owned_acquisition(tmp_path, monkeypatch):
+    index = tmp_path / "index"
+    packages = index / "packages"
+    packages.mkdir(parents=True)
+    source = _write_wheel(packages / "demo_pkg-1.2-py3-none-any.whl")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    _write_simple_index(index, source, digest=digest)
+    monkeypatch.setenv("PCC_HOST_PYTHON", "/definitely/not/available")
 
-    plan = pip_install_plan(
-        [
-            "install",
-            "demo_pkg",
-            "--cache-dir",
-            str(tmp_path / "cache"),
-            "--target",
-            str(tmp_path / "site"),
-        ]
-    )
+    with _serve_directory(index) as base_url:
+        plan = pip_install_plan(
+            [
+                "install",
+                "demo_pkg",
+                "--index-url",
+                base_url + "/simple",
+                "--cache-dir",
+                str(tmp_path / "cache"),
+                "--target",
+                str(tmp_path / "site"),
+            ]
+        )
 
     assert plan["ok"] is True, json.dumps(plan, sort_keys=True)
     assert plan["acquire_mode_requested"] == "auto"
-    assert plan["acquisitions"][0]["acquire_mode"] == "host"
-    assert plan["acquisitions"][0]["host_assisted"] is True
+    assert plan["acquisitions"][0]["acquire_mode"] == "owned"
+    assert plan["acquisitions"][0]["host_assisted"] is False
+    assert plan["acquisitions"][0]["hash_verified"] is True
     assert (tmp_path / "site" / "demo_pkg" / "__init__.py").exists()
 
 
 def test_online_bare_name_is_not_shadowed_by_repository_projects(tmp_path, monkeypatch):
-    source = _write_wheel(tmp_path / "numpy-1.2-py3-none-any.whl")
-    fake_python = tmp_path / "fake-host-python"
-    fake_python.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, shutil, sys\n"
-        "dest = sys.argv[sys.argv.index('--dest') + 1]\n"
-        "shutil.copy2(os.environ['PCC_TEST_ACQUIRE_ARTIFACT'], dest)\n",
+    index = tmp_path / "index"
+    packages = index / "packages"
+    packages.mkdir(parents=True)
+    source = _write_wheel(packages / "numpy-1.2-py3-none-any.whl")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    project = index / "simple" / "numpy"
+    project.mkdir(parents=True)
+    (project / "index.html").write_text(
+        f'<a href="/packages/{source.name}#sha256={digest}">numpy</a>\n',
         encoding="utf-8",
     )
-    fake_python.chmod(0o755)
-    monkeypatch.setenv("PCC_HOST_PYTHON", str(fake_python))
-    monkeypatch.setenv("PCC_TEST_ACQUIRE_ARTIFACT", str(source))
+    monkeypatch.setenv("PCC_HOST_PYTHON", "/definitely/not/available")
 
-    plan = pip_install_plan(
-        [
-            "install",
-            "numpy",
-            "--cache-dir",
-            str(tmp_path / "cache"),
-            "--target",
-            str(tmp_path / "site"),
-        ]
-    )
+    with _serve_directory(index) as base_url:
+        plan = pip_install_plan(
+            [
+                "install",
+                "numpy",
+                "--index-url",
+                base_url + "/simple",
+                "--cache-dir",
+                str(tmp_path / "cache"),
+                "--target",
+                str(tmp_path / "site"),
+            ]
+        )
 
     assert plan["ok"] is True, json.dumps(plan, sort_keys=True)
-    assert plan["acquisitions"][0]["artifact_origin"] == "host-pip"
-    assert plan["installs"][0]["resolved_from"] == "direct"
+    assert plan["acquisitions"][0]["artifact_origin"] == "simple-repository"
+    assert plan["installs"][0]["resolved_from"] == "index-url"
+    assert (
+        plan["installs"][0]["source_path"] == plan["acquisitions"][0]["artifact_path"]
+    )
 
 
 def test_acquisition_rejects_resolver_shapes_it_does_not_own(tmp_path):
@@ -475,13 +514,14 @@ def test_self_backend_transport_and_sha256_kernel_primitives(tmp_path):
 def _network_test_pcc1() -> Path:
     raw = os.environ.get("PCC_ACQUIRE_TEST_PCC1")
     if not raw:
-        pytest.skip("set PCC_ACQUIRE_TEST_PCC1 to a current pcc1 binary")
+        pytest.fail("PCC_ACQUIRE_TEST_PCC1 must be a current pcc1 binary when this gate is selected")
     path = Path(raw).expanduser().resolve()
     if not path.is_file():
         pytest.fail(f"PCC_ACQUIRE_TEST_PCC1 does not exist: {path}")
     return path
 
 
+@pytest.mark.pcc_gate(env="PCC_ACQUIRE_TEST_PCC1")
 def test_pcc1_owned_acquisition_uses_native_simple_api_and_hash(tmp_path):
     pcc1 = _network_test_pcc1()
     index = tmp_path / "index"
@@ -544,46 +584,46 @@ def test_pcc1_owned_acquisition_uses_native_simple_api_and_hash(tmp_path):
     assert (tmp_path / "site" / "demo_pkg" / "__init__.py").exists()
 
 
-def test_pcc1_auto_host_acquires_but_native_pcc1_installs(tmp_path):
+@pytest.mark.pcc_gate(env="PCC_ACQUIRE_TEST_PCC1")
+def test_pcc1_auto_owned_acquires_and_native_pcc1_installs(tmp_path):
     pcc1 = _network_test_pcc1()
-    wheel = _write_wheel(tmp_path / "demo_pkg-1.2-py3-none-any.whl")
-    fake_python = tmp_path / "fake-host-python"
-    fake_python.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, shutil, sys\n"
-        "dest = sys.argv[sys.argv.index('--dest') + 1]\n"
-        "shutil.copy2(os.environ['PCC_TEST_ACQUIRE_ARTIFACT'], dest)\n",
-        encoding="utf-8",
-    )
-    fake_python.chmod(0o755)
+    index = tmp_path / "index"
+    packages = index / "packages"
+    packages.mkdir(parents=True)
+    wheel = _write_wheel(packages / "demo_pkg-1.2-py3-none-any.whl")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    _write_simple_index(index, wheel, digest=digest)
     env = os.environ.copy()
-    env["PCC_HOST_PYTHON"] = str(fake_python)
-    env["PCC_TEST_ACQUIRE_ARTIFACT"] = str(wheel)
+    env["PCC_HOST_PYTHON"] = "/definitely/not/available"
 
-    proc = subprocess.run(
-        [
-            str(pcc1),
-            "-m",
-            "pip",
-            "install",
-            "demo_pkg",
-            "--cache-dir",
-            str(tmp_path / "cache"),
-            "--target",
-            str(tmp_path / "site"),
-        ],
-        check=False,
-        text=True,
-        capture_output=True,
-        timeout=60,
-        env=env,
-    )
+    with _serve_directory(index) as base_url:
+        proc = subprocess.run(
+            [
+                str(pcc1),
+                "-m",
+                "pip",
+                "install",
+                "demo_pkg",
+                "--index-url",
+                base_url + "/simple",
+                "--cache-dir",
+                str(tmp_path / "cache"),
+                "--target",
+                str(tmp_path / "site"),
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            env=env,
+        )
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     plan = json.loads(proc.stdout)
     acquisition = plan["acquisitions"][0]
     assert acquisition["acquire_mode_requested"] == "auto"
-    assert acquisition["acquire_mode"] == "host"
-    assert acquisition["host_assisted"] is True
+    assert acquisition["acquire_mode"] == "owned"
+    assert acquisition["host_assisted"] is False
+    assert acquisition["hash_verified"] is True
     assert plan["installs"][0]["install_success"] is True
     assert (tmp_path / "site" / "demo_pkg" / "__init__.py").exists()

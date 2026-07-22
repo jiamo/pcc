@@ -6,7 +6,7 @@ the partitioned, mostly-non-moving design, the CPU-owned correctness control
 plane, and the explicit claim boundary. Package: `pcc/gpu_gc/`. Tests:
 `tests/gpu_gc/`.
 
-Source of the design: `tmp_research/deep-research-gpu-gc.md`. The research
+Source of the design: `docs/refs_docs/deep-research/deep-research-gpu-gc.md`. The research
 survey concluded that modern "GPU-participating GC" is **not** a wholesale
 tracing collector on the GPU; it is a **partitioned, mostly-non-moving,
 concurrent collector with a CPU-owned control plane and GPU-assisted data-plane

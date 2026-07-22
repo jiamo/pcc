@@ -2,7 +2,7 @@
 
 类型推断(见第 5 章)结束后,pcc 的 Python 前端拿到的是一棵带类型标注的 AST;LLVM 后端与 self 后端(见第 12、13 章)接收的是 LLVM IR。把前者变成后者的层叫 Layer-1 codegen,它是整个 Python 路径里语义密度最高的一层:Python 的下标、迭代、异常、所有权、格式化,全部在这里被翻译成对运行时函数的调用序列与基本块结构。本章讲两件事。第一,这一层的物理组织:[pcc/py_frontend/codegen/layer1.py](../../pcc/py_frontend/codegen/layer1.py) 如何从一个两万行的单文件巨石拆成一个 56 行的 facade 加 86 个 mixin,以及拆分过程中"编译器必须能编译自己"这条约束如何反过来塑造了代码形态。第二,这一层的语义纪律:为什么每个可 raise 的运行时调用之后都必须插入 `py_err_occurred()` 检查,以及当同一个 Python 语义散布在多条低层化(lowering)路径上时,会发生什么——本章"历史与教训"里的双下标路径和六条除法路径,是这个失败模式最有教育意义的两次现场。
 
-## 读者地图:低层化是把语义接到运行时
+## 本章导读:低层化把语义连接到运行时
 
 读这一章时,不要把低层化理解成"语法树换一种格式"。它真正做的是把 Python 语义拆成 IR 控制流、runtime 调用、错误检查和引用清理,并且每一步都要保留 no-libpython 的边界。
 
@@ -37,7 +37,7 @@ class L1CodeGen(L1CodeGenEntrypointMixin, L1CodeGenMixinStack):
 
 pcc 选了 mixin,核心理由是**状态共享的成本**。Layer-1 低层化的所有操作共享一个巨大的可变上下文:`self.builder`(IR 构建器及其插入点)、`self.env`(局部变量槽表)、`self.runtime`(运行时函数声明表)、`self._try_err_block`(当前 try 的错误目标块)、`self.loop_stack`、生成器上下文栈、GC 根记录,等等。visitor 与 pass 管线都要求把这套状态打包穿针引线,或者退化成一个传给所有函数的 context 对象——后者就是换了名字的 `self`。mixin 让每个关注点(异常、下标、所有权)在自己的文件里以方法形式直接读写共享上下文,代价是继承链很长。
 
-这个代价在普通 Python 项目里只是审美问题,在 pcc 里却差点是致命问题:**pcc 的类型推断与低层化当时并不理解 mixin**。6.3 节会讲这次事故。这里先立一个本章反复出现的主题:Layer-1 的每一个架构决定都被"这段代码自己要被 pcc 编译"约束着,很多看起来奇怪的源码形态,其实是自托管约束留下的化石。
+这个代价在普通 Python 项目里只是审美问题,在 pcc 里却差点是致命问题:**pcc 的类型推断与低层化当时并不理解 mixin**。6.3 节会讲这次事故。这里先立一个本章反复出现的主题:Layer-1 的每一个架构决定都被"这段代码自己要被 pcc 编译"约束着,很多表观上奇怪的源码形态,其实是自托管约束留下的化石。
 
 ## 6.2 facade、栈与分发
 
@@ -105,7 +105,7 @@ if class_ident not in _BUILTIN_TYPE_TAGS:
 tag = _BUILTIN_TYPE_TAGS[class_ident]
 ```
 
-这个案例的教训被沉淀为仓库的写码惯例:在自举关键路径上,不要依赖"缺失返回 None"这类对装箱表示敏感的习语。host 测试全绿不构成证据——这颗哑弹只有 pcc1→pcc2 阶段能踩响。
+这个案例的教训被沉淀为仓库的写码惯例:在自举关键路径上,不要依赖"缺失返回 None"这类对装箱表示敏感的习语。host 测试全部通过不构成证据——这颗哑弹只有 pcc1→pcc2 阶段能踩响。
 
 ### 6.3.4 拆分原则
 
@@ -129,7 +129,7 @@ def _emit_post_call_err_check(self, span=None) -> None:
     `if (py_err_occurred()) goto err_target` ..."""
 ```
 
-错误目标有两级:当前 try 的 err 块(`_current_try_err_block()`),否则函数级错误出口 `_ensure_fn_err_exit()`——按返回类型发射哨兵值(指针返回 NULL、整数返回 0、`main` 特殊处理:打印未处理异常并返回 1)。`_emit_try` 把 try/except/else/finally 全部展开成基本块图:err 块里依次对每个 handler 调 `py_exc_matches` 测试,全不匹配则跳外层 err 目标;handler 绑定名(`except E as e`)需要 retain 并登记进 `_except_binding_names`,这个登记直接关系到 GC 帧根(见第 10 章的 exc-referent 战争故事)。
+错误目标有两级:当前 try 的 err 块(`_current_try_err_block()`),否则函数级错误出口 `_ensure_fn_err_exit()`——按返回类型发射哨兵值(指针返回 NULL、整数返回 0、`main` 特殊处理:打印未处理异常并返回 1)。`_emit_try` 把 try/except/else/finally 全部展开成基本块图:err 块里依次对每个 handler 调 `py_exc_matches` 测试,全不匹配则跳外层 err 目标;handler 绑定名(`except E as e`)需要 retain 并登记进 `_except_binding_names`,这个登记直接关系到 GC 帧根(见第 10 章的 exc-referent 案例研究)。
 
 两个细节展示了这套模型的成本意识。其一,带源位置的 err 检查会先经过一个记录异常帧(traceback 行)的中间块,`_ensure_post_call_frame_block` 按(函数、目标、位置)做键去重——否则每个调用点都长出一个独立帧块,IR 体积失控。其二,`_emit_post_call_err_check` 在 `@c_abi_export` 标记的运行时函数体内被**抑制**:这些函数可能在 TLS 已有挂起异常时被调用(比如 except 分发期间),一个不分场合的检查会把别人的异常误判成自己的;运行时函数沿用 C 运行时的显式 NULL 返回协议。
 
@@ -141,7 +141,7 @@ def _emit_post_call_err_check(self, span=None) -> None:
 
 但它不是唯一的路。`exact_int_lowering.py` 存在的理由是义务 7(见第 16 章):pcc 的 `int` 是任意精度**语义**类型,值投影(projection)是 i64 通道,对象投影是装箱大整数。当一个 int 表达式必须以精确对象形态参与运算——字面量超出 i64、`**` 运算、或环境标记表明变量已在对象车道——`_maybe_emit_exact_int_object()` 接管,在对象车道上用 `py_int_add` / `py_int_floordiv` 等运行时函数计算。而当这样的表达式是一个下标读取时,这条路径有**自己的**下标低层化:`_emit_subscript_load_object()`,内部同样按 List/Tuple/Dict/Dyn 分支、同样调 `py_dict_getitem` 加 err 检查。
 
-于是同一个源码形态 `d[k]`,按消费上下文走两个文件里的两个函数:`x = d[k]` 走 `_emit_subscript_load`,而 `print(d[k])` 这类对象上下文(`print_lowering.py` 先尝试 `_maybe_emit_exact_int_object`)走 `_emit_subscript_load_object`。在 IR 里二者可以凭调用结果的名字区分:前者是 `dict.getitem`/`list.getitem`,后者是 `dict.getitem.obj`/`list.getitem.obj`。这一对名字是调试这类问题时最廉价的判别工具,而这个双路径结构本身,是 6.6.1 战争故事的舞台。
+于是同一个源码形态 `d[k]`,按消费上下文走两个文件里的两个函数:`x = d[k]` 走 `_emit_subscript_load`,而 `print(d[k])` 这类对象上下文(`print_lowering.py` 先尝试 `_maybe_emit_exact_int_object`)走 `_emit_subscript_load_object`。在 IR 里二者可以凭调用结果的名字区分:前者是 `dict.getitem`/`list.getitem`,后者是 `dict.getitem.obj`/`list.getitem.obj`。这一对名字是调试这类问题时最廉价的判别工具,而这个双路径结构本身,是 6.6.1 案例研究的舞台。
 
 ### 6.4.3 for_loop_lowering:一个语义,N 个特化
 
@@ -191,7 +191,7 @@ def _emit_native_weakref_call(self, expr: Call) -> Optional[ir.Value]:
 
 先经 alias 表确认接收者真的是该模块(import 别名、from-import 都归一到这张表),再按 `"模块.成员"` 字符串分派到具体运行时调用;不认识的成员、不支持的参数形态一律返回 `None`。`native_modules.py` 是这群文件的总调度与杂项仓库,里面还有一类纯编译期折叠:`string.ascii_lowercase` 这类常量直接内联为字符串字面量,`codecs.BOM_*` 内联为 bytes——模块根本不需要在运行时存在。
 
-native 模块低层化与"生态支持必须通用"(义务 3)的关系需要说清楚:这里按**模块名**分派,看起来像特判,但它特判的是标准库语义的低层化目标(weakref 对应 `py_weakref_new`,gc 对应 `pcc_gc_*`),属于编译器对语言运行时的认识,而不是对某个第三方包的偏袒。禁止的是 `if package == "numpy"` 这种为通过闸门而做的包名分支;第 17 章的包机制走的是完全不同的通用路径。
+native 模块低层化与"生态支持必须通用"(义务 3)的关系需要说清楚:这里按**模块名**分派,表观上像特判,但它特判的是标准库语义的低层化目标(weakref 对应 `py_weakref_new`,gc 对应 `pcc_gc_*`),属于编译器对语言运行时的认识,而不是对某个第三方包的偏袒。禁止的是 `if package == "numpy"` 这种为通过闸门而做的包名分支;第 17 章的包机制走的是完全不同的通用路径。
 
 `native_weakref.py` 里 `weakref.ref` / `weakref.proxy` 的构造调用后各跟一条 `_emit_post_call_err_check`,注释写明:`py_weakref_new` 可能 raise(对值类载荷抛 TypeError),漏掉检查则挂起异常跳过外层 try/except。这两行就是 6.6.3 审计的第一批真阳性修复,native 模块群正是 err-check 义务最容易被遗忘的地带——每个文件几十个发射点,作者各异,时间跨度数月。
 

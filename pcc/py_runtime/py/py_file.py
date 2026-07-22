@@ -30,7 +30,6 @@ from pcc.unsafe import (
     store_ptr,
 )
 
-
 fclose = extern("fclose", (c_ptr,), c_int32)
 ferror = extern("ferror", (c_ptr,), c_int32)
 fflush = extern("fflush", (c_ptr,), c_int32)
@@ -148,6 +147,9 @@ def py_file_open(path, mode):
     py_decref(path_owned)
     py_decref(mode_owned)
     if ptr_is_null(fp):
+        # 14 == PY_EXC_OSERROR. Keep the C and pcc-Python runtime mirrors on
+        # the same NULL-plus-exception failure contract.
+        py_raise_owned(py_exc_new(14, cstr("could not open file")))
         return null()
 
     out = pcc_gc_alloc(40, 13, 0)

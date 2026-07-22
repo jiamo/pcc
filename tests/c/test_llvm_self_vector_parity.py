@@ -133,7 +133,7 @@ def _host_self_supported() -> str:
     triple = _host_triple()
     verdict = classify_self_backend_target_triple(triple)
     if not verdict.supported:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
     assert verdict.target_identity is not None
     return triple
 

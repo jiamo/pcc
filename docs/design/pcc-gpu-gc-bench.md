@@ -11,7 +11,7 @@ GPU/Metal collector.
 * Measures: the oracle in `pcc/gpu_gc/` (`substrate`, `cpu_collector`,
   `assist`, `metal_adapter`, `tiered`).
 * Design of the oracle it measures: `docs/design/pcc-gpu-gc.md`.
-* Research source: `tmp_research/deep-research-gpu-gc.md`.
+* Research source: `docs/refs_docs/deep-research/deep-research-gpu-gc.md`.
 
 This harness is deliberately separate from the existing long-running GC
 benchmarks (`tests/python/test_boc_benchmarks.py`, the gc-longrun harness): it

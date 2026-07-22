@@ -2,7 +2,7 @@
 
 A compiler book that ends with a chapter on method is not being polite. Most bugs in pcc are not parse errors; they are semantic errors that only become visible when expressions are combined, lowered to IR, and then exercised by real programs — and by then the crash site is usually several subsystems away from the cause. In a system like that, *how you test, how you investigate, and how you state results* is not engineering hygiene bolted onto the design; it is part of the design. The bootstrap fixed point and the five-GC matrix are product features, but they are also the two most important measuring instruments this repository owns. This chapter lays out the written method piece by piece: the gate system and its baseline files, the twelve techniques of the debugging playbook, the evidence-chain discipline of the investigation workflow, the mode-labeling rules of claim hygiene, and three documented incidents of false confidence in measurement. Everything here is grounded in real files: [AGENTS.md](../../AGENTS.md), [docs/debugging-playbook.md](../../docs/debugging-playbook.md), [docs/investigation-workflow.md](../../docs/investigation-workflow.md), [codex-goal-prompt.md](../../codex-goal-prompt.md), and the investigation records under [docs/investigations/](../../docs/investigations).
 
-## Reader Map: Method Protects Claims
+## Chapter Overview: Method Protects Claims
 
 This chapter is not extra process. It is the protection layer that lets the previous design claims hold. Every major pcc goal has a tempting local success that can be misread, so mode labels, minimized reproducers, real-project confirmation, and baseline gates keep the claims pinned down.
 
@@ -12,7 +12,7 @@ This chapter is not extra process. It is the protection layer that lets the prev
 
 ## 18.1 The Problem and the Design Space: Why Method Is Part of the Design
 
-Start with the actual working conditions of this repository. First, causal chains are long: a stage2 segfault can be rooted in a per-name cache that one frontend code path forgot to reset on the generator branch (Chapter 9, second war story); a flaky failure in Lua's sort can be rooted in an `^` expression that dropped its unsignedness metadata (Section 18.7). Second, the working tree is shared by multiple agents and humans; chat logs evaporate, and "what the previous person already ruled out" is precisely the most expensive information to lose. Third, claims about a system like this drift naturally: the same sentence "X is supported" can mean eight different things depending on whether it was observed under host pcc or pcc1, libpython or no-libpython, the LLVM backend or the self backend.
+Start with the actual working conditions of this repository. First, causal chains are long: a stage2 segfault can be rooted in a per-name cache that one frontend code path forgot to reset on the generator branch (Chapter 9, second case study); a flaky failure in Lua's sort can be rooted in an `^` expression that dropped its unsignedness metadata (Section 18.7). Second, the working tree is shared by multiple agents and humans; chat logs evaporate, and "what the previous person already ruled out" is precisely the most expensive information to lose. Third, claims about a system like this drift naturally: the same sentence "X is supported" can mean eight different things depending on whether it was observed under host pcc or pcc1, libpython or no-libpython, the LLVM backend or the self backend.
 
 The design space offers three kinds of answer. One: **rely on scale** — run the full test suite on every change. The full suite here takes minutes and the bootstrap gates take hundreds of seconds; making that the inner loop collapses iteration speed, and a green full suite still cannot answer "in which mode does this claim hold." Two: **rely on people** — senior maintainers' memory and review. With parallel agents and disposable sessions, memory is not a storage medium. Three: **reify the method into repository artifacts** — state goes into testable JSON baselines, history goes into structured investigation files, honesty goes into a citable claim-hygiene table, and procedure goes into mandatory sections of [AGENTS.md](../../AGENTS.md). pcc chose the third option, and chose it thoroughly: the comment block of [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) declares itself the authoritative state for Issue 1, and [AGENTS.md](../../AGENTS.md) states in so many words that these JSON files are the source of truth while historical tracker documents may lag.
 
@@ -40,7 +40,41 @@ tests/fallback_baseline.json         no-libpython fallback ratchet: multi-file
                                      against dynamic-idiom creep
 ```
 
-The corresponding tests are [tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py) and [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) / [tests/python/test_ir_py_fallback_baseline.py](../../tests/python/test_ir_py_fallback_baseline.py). The word *ratchet* deserves a pause: such a gate does not assert a fixed value, it asserts **monotonicity** — current fallback counts may not regress past the baseline. It turns "progress" itself into a regression-testable quantity; any change that lets the fallback surface creep back is caught mechanically, with no reliance on a reviewer remembering last month's numbers.
+The corresponding tests are [tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py) and [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) / [tests/python/test_ir_py_fallback_baseline.py](../../tests/python/test_ir_py_fallback_baseline.py):
+
+```python
+# tests/python/test_fallback_baseline.py
+def test_fallback_baseline_ratchet():
+    baseline = json.loads(pathlib.Path("tests/fallback_baseline.json").read_text())
+    current = count_fallback_routes()
+    assert current <= baseline["max_allowed_fallbacks"]
+```
+
+At the task board level, [scripts/goal_state.py](../../scripts/goal_state.py) enforces schema validation:
+
+```python
+# scripts/goal_state.py
+def validate_task_board(board_path: str = "docs/goal/task-board.yaml") -> int:
+    tasks = load_tasks(board_path)
+    for task in tasks:
+        validate_task_schema(task)
+    print(f"OK: {len(tasks)} tasks validated")
+    return 0
+```
+
+At the test infrastructure layer, [tests/conftest.py](../../tests/conftest.py) isolates environment and cache states via an autouse fixture:
+
+```python
+# tests/conftest.py
+@pytest.fixture(autouse=True)
+def _isolate_env_and_caches(tmp_path_factory):
+    old_env = os.environ.copy()
+    yield
+    os.environ.clear()
+    os.environ.update(old_env)
+```
+
+The word *ratchet* deserves a pause: such a gate does not assert a fixed value, it asserts **monotonicity** — current fallback counts may not regress past the baseline. It turns "progress" itself into a regression-testable quantity; any change that lets the fallback surface creep back is caught mechanically, with no reliance on a reviewer remembering last month's numbers.
 
 Above the gates sits a grading of claim strength. [codex-goal-prompt.md](../../codex-goal-prompt.md) §0.7 lists the full preconditions for `DONE_STRONG`: the implementation must be a generic mechanism rather than a hard-coded special case; there must be a focused regression plus a negative or boundary test; pcc1 claims need no-host evidence at the level of `PCC_HOST_PYTHON=/bin/false`; claims touching runtime/GC/rooting/object lifetime need *all-five-GC* bootstrap evidence — passing on backend #0 alone is not a strong claim; performance claims need an IR-shape gate plus a runtime benchmark. §0.9 then fixes the evidence format: commands written in full and reproducible; if a test was not run, write `not run` with a reason; **"should pass" is forbidden**. Any completion summary for a slice touching pcc1, the self backend, no-libpython, runtime/GC, or shared lowering must carry an explicit line of the form `bootstrap: passed|failed|not run` — omitting that line is itself a validation gap.
 
@@ -48,7 +82,7 @@ Above the gates sits a grading of claim strength. [codex-goal-prompt.md](../../c
 
 [docs/debugging-playbook.md](../../docs/debugging-playbook.md) is task-conditionally mandatory procedure: the moment you are debugging a failure, read it before guessing. The twelve techniques carry stable numbers (§1–§12) and are cited directly by [AGENTS.md](../../AGENTS.md) and by investigation files. Here they are one by one, each with its anchor in the repository.
 
-**§1 Make the failure deterministic first.** Do not start by reading all of `c_codegen.py`. Fix the random seed, replace filesystem/time inputs with constants, run with `-n0` so xdist cannot hide ordering or temp-file effects, isolate one test file. If the failure is random, removing the randomness *is* the first job. In the sort.lua war story of 18.7, the first effective move was `math.randomseed(15)`, not reading code.
+**§1 Make the failure deterministic first.** Do not start by reading all of `c_codegen.py`. Fix the random seed, replace filesystem/time inputs with constants, run with `-n0` so xdist cannot hide ordering or temp-file effects, isolate one test file. If the failure is random, removing the randomness *is* the first job. In the sort.lua case study of 18.7, the first effective move was `math.randomseed(15)`, not reading code.
 
 **§2 Use a same-source reference to separate "the program is odd" from "the compiler lowered it wrong."** The C side compares against the system C compiler; the Python side against CPython; `llvm_capi` against `llvmlite`; bootstrap stage divergence against the two JSON baselines. Same source, two toolchains, different behavior — only then does the bug belong to the compiler.
 
@@ -105,15 +139,15 @@ metadata exists        != runtime implementation complete
 microbenchmark win     != whole-program performance win
 ```
 
-Each line is a pair of propositions that are routinely conflated. Frontend code that runs under CPython hosting is not the same proposition as the compiled pcc1 binary running it (the execution boundary is entirely different — the second war story of 18.7 is a chapter-length testimony); an extension accepted in compat mode is not accepted by the pcc-native ABI; stage1 emitting itself through the self backend is not the same as the artifact reproducing itself for two more generations. §9.2 accordingly requires every claim to name its mode: pcc-native / cpython-compat / libpython / host-only diagnostic / pcc1 no-host / self-backed / LLVM-backed.
+Each line is a pair of propositions that are routinely conflated. Frontend code that runs under CPython hosting is not the same proposition as the compiled pcc1 binary running it (the execution boundary is entirely different — the second case study of 18.7 is a chapter-length testimony); an extension accepted in compat mode is not accepted by the pcc-native ABI; stage1 emitting itself through the self backend is not the same as the artifact reproducing itself for two more generations. §9.2 accordingly requires every claim to name its mode: pcc-native / cpython-compat / libpython / host-only diagnostic / pcc1 no-host / self-backed / LLVM-backed.
 
 Claim hygiene constrains more than wording; it constrains the shape of code and tests. Performance claims (§9.5) must carry, simultaneously: IR-shape evidence (e.g. no `pcc_gc_alloc` in the hot loop, no `py_cpy_*`, no `py_obj_call` in a typed loop), a runtime benchmark, a slow-path/guard correctness test, and a CPython baseline — a lone microbenchmark win claims nothing. Package claims ([AGENTS.md](../../AGENTS.md), Package/NumPy Claim Hygiene) make install and import two separate gates; a synthetic package or an array-core-only test does not constitute a NumPy support claim. And package-name special cases — `if package == "numpy"` — are banned outright: the generic mechanism (install/import/ABI/buffer/capsule) must be fixed and regression-tested. A special case can turn a gate green, but it quietly substitutes "supports a string named numpy" for "supports NumPy," which is precisely the forgery claim hygiene exists to stop. The end-state claim has its own standard in §19.2: "pcc1 can replace python" may be claimed only when no-host execution, the linkage scan, the deterministic pcc2/pcc3 compare, no silent LLVM fallback, the semantic differential, real-package evidence, five-GC mutual non-regression, and the full performance evidence set are present *at the same time*; with anything missing, write only partial progress and open blockers.
 
-What this table means in practice is demonstrated repeatedly by 18.6 and by the second war story of 18.7: nearly every recorded episode of false confidence is someone taking the left-hand side of one of those eight lines for the right-hand side.
+What this table means in practice is demonstrated repeatedly by 18.6 and by the second case study of 18.7: nearly every recorded episode of false confidence is someone taking the left-hand side of one of those eight lines for the right-hand side.
 
 ## 18.6 Regression and Measurement Discipline
 
-**Regression discipline.** When a long-green gate regresses, [AGENTS.md](../../AGENTS.md) requires a causality audit before any fix narrative, in a fixed order: (1) identify the first failing boundary in mode-labeled terms (`pcc0 -> pcc1` fallback, `pcc1 -> pcc2` runtime crash, `pcc2/pcc3` byte drift, …); (2) before changing more code, list the recently touched subsystems that could plausibly own that boundary — for codegen/runtime changes, your own recent change is the prime suspect until IR/source/debugger evidence rules it out; (3) separate stacked failures: if fixing the first boundary exposes a second crash, write them as two failures with two evidence chains, never collapse them into one guessed root cause; (4) never weaken runtime or GC semantics to localize a failure — disabling GC tracking, barriers, owned-local cleanup, or finalizers is a semantic change, not a diagnostic; (5) for ownership failures, verify the caller/callee reference contract before touching cleanup code; (6) host-side tests are not bootstrap proof — fixes touching frontend/runtime/bootstrap entry points need a focused regression plus the appropriate bootstrap gate; (7) debug instrumentation must be tagged, recorded in the investigation, and removed or promoted to a deliberate tested feature before finishing. Rule (3) has its best demonstration in the 18.4 case study; rule (4) was once enforced by the user personally, vetoing a proposal to disable tuple GC tracking (Chapter 9's ownership war story).
+**Regression discipline.** When a long-green gate regresses, [AGENTS.md](../../AGENTS.md) requires a causality audit before any fix narrative, in a fixed order: (1) identify the first failing boundary in mode-labeled terms (`pcc0 -> pcc1` fallback, `pcc1 -> pcc2` runtime crash, `pcc2/pcc3` byte drift, …); (2) before changing more code, list the recently touched subsystems that could plausibly own that boundary — for codegen/runtime changes, your own recent change is the prime suspect until IR/source/debugger evidence rules it out; (3) separate stacked failures: if fixing the first boundary exposes a second crash, write them as two failures with two evidence chains, never collapse them into one guessed root cause; (4) never weaken runtime or GC semantics to localize a failure — disabling GC tracking, barriers, owned-local cleanup, or finalizers is a semantic change, not a diagnostic; (5) for ownership failures, verify the caller/callee reference contract before touching cleanup code; (6) host-side tests are not bootstrap proof — fixes touching frontend/runtime/bootstrap entry points need a focused regression plus the appropriate bootstrap gate; (7) debug instrumentation must be tagged, recorded in the investigation, and removed or promoted to a deliberate tested feature before finishing. Rule (3) has its best demonstration in the 18.4 case study; rule (4) was once enforced by the user personally, vetoing a proposal to disable tuple GC tracking (Chapter 9's ownership case study).
 
 **Measurement discipline.** Gates and baselines are only meaningful while their preconditions hold; with a broken precondition, green is more dangerous than red. The repository carries three documented false-confidence incidents, each of which left behind an invariant:
 
@@ -127,7 +161,7 @@ The three incidents are isomorphic: the measurement action itself was correct; a
 
 ## 18.7 History and Lessons
 
-### War story one: sort.lua's flaky failure and the lost unsigned semantics
+### Case study one: sort.lua's flaky failure and the lost unsigned semantics
 
 (Source: [docs/investigations/lua-sort-random-pivot-signedness.md](../../docs/investigations/lua-sort-random-pivot-signedness.md).)
 
@@ -137,9 +171,9 @@ Each step of the investigation maps back onto the twelve techniques. Step one, d
 
 The wrong value 475 was itself evidence: it sits exactly 6 below the legal lower bound 481 — the signature of a signed remainder. Interpreted unsigned, the formula gives a legal pivot; interpreted as signed 32-bit, the remainder is -6. The root cause lands in [pcc/codegen/c_codegen.py](../../pcc/codegen/c_codegen.py): pcc lowers both signed and unsigned 32-bit integers to LLVM `i32`, carrying signedness in separate metadata (`_tag_unsigned` / `_is_unsigned_val`), and `^` returned `builder.xor(...)` without re-tagging the result as unsigned when the C result type was unsigned — bits all correct, semantics already lost, and the next `%` compiled to `srem`. After the fix, auditing the neighboring operators in the spirit of §10 caught a second genuine bug of the same family: unsigned prefix `++`/`--` expression results were also not re-tagged.
 
-The invariants left behind operate on two levels. Mechanism level: `^`, unsigned `>>`, integer compound-assignment results, and unsigned prefix increment/decrement all preserve the unsigned tag, with regressions in `tests/test_unsigned_loads.py` — all deliberately written in the "unsigned result immediately feeding `%` with a signed constant" shape (§11). The repository did not lack unsigned tests before; it lacked exactly that shape, which is why an entire bug class stayed invisible. Process level: the investigation's template — native reference first, derandomize, minimal integration harness, separate layout from semantics, reduce to pure C, inspect metadata propagation rather than arithmetic instructions — was distilled into the C Codegen Invariants section of [AGENTS.md](../../AGENTS.md) and into the playbook itself. A substantial fraction of the method documents' content was condensed out of war stories in precisely this way.
+The invariants left behind operate on two levels. Mechanism level: `^`, unsigned `>>`, integer compound-assignment results, and unsigned prefix increment/decrement all preserve the unsigned tag, with regressions in `tests/test_unsigned_loads.py` — all deliberately written in the "unsigned result immediately feeding `%` with a signed constant" shape (§11). The repository did not lack unsigned tests before; it lacked exactly that shape, which is why an entire bug class stayed invisible. Process level: the investigation's template — native reference first, derandomize, minimal integration harness, separate layout from semantics, reduce to pure C, inspect metadata propagation rather than arithmetic instructions — was distilled into the C Codegen Invariants section of [AGENTS.md](../../AGENTS.md) and into the playbook itself. A substantial fraction of the method documents' content was condensed out of case studies in precisely this way.
 
-### War story two: the runtime semantic holes exposed by the no-libpython self-host
+### Case study two: the runtime semantic holes exposed by the no-libpython self-host
 
 (Source: [docs/investigations/python-self-host-no-libpython-runtime-holes.md](../../docs/investigations/python-self-host-no-libpython-runtime-holes.md), reporting as of 2026-04-29.)
 

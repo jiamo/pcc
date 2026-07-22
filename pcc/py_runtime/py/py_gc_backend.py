@@ -713,6 +713,14 @@ def _set_trace_cursor(node) -> None:
     global_store_ptr("pcc_gc_trace_cursor", node)
 
 
+def _backend3_young_head():
+    return global_load_ptr("pcc_gc_backend3_young_head")
+
+
+def _set_backend3_young_head(node) -> None:
+    global_store_ptr("pcc_gc_backend3_young_head", node)
+
+
 def _gray_count() -> int:
     return load_i32(global_addr("pcc_gc_gray_count"), 0)
 
@@ -803,6 +811,22 @@ def _set_object_node_gc_refs(node, value: int) -> None:
     store_i64(node, 56, value)
 
 
+def _object_node_young_next(node):
+    return load_ptr(node, 64)
+
+
+def _set_object_node_young_next(node, nxt) -> None:
+    store_ptr(node, 64, nxt)
+
+
+def _object_node_young_prev(node):
+    return load_ptr(node, 72)
+
+
+def _set_object_node_young_prev(node, prev) -> None:
+    store_ptr(node, 72, prev)
+
+
 def _object_node_alloc():
     head = global_load_ptr("pcc_gc_object_node_free_head")
     if ptr_is_null(head) == 0:
@@ -812,7 +836,7 @@ def _object_node_alloc():
         if count > 0:
             store_i32(global_addr("pcc_gc_object_node_free_count"), 0, count - 1)
         return head
-    node = malloc(64)
+    node = malloc(80)
     return node
 
 
@@ -833,12 +857,56 @@ def _unlink_object_node(node) -> None:
     nxt = _object_node_next(node)
     if ptr_eq(_trace_cursor(), node) != 0:
         _set_trace_cursor(nxt)
+    _backend3_young_unlink(node)
     if ptr_is_null(prev) != 0:
         _set_object_head(nxt)
     else:
         _set_object_node_next(prev, nxt)
     if ptr_is_null(nxt) == 0:
         _set_object_node_prev(nxt, prev)
+
+
+def _backend3_young_link_head(node) -> None:
+    if ptr_is_null(node) != 0:
+        return
+    head = _backend3_young_head()
+    _set_object_node_young_prev(node, null())
+    _set_object_node_young_next(node, head)
+    if ptr_is_null(head) == 0:
+        _set_object_node_young_prev(head, node)
+    _set_backend3_young_head(node)
+
+
+def _backend3_young_unlink(node) -> None:
+    if ptr_is_null(node) != 0:
+        return
+    prev = _object_node_young_prev(node)
+    nxt = _object_node_young_next(node)
+    if ptr_is_null(prev) == 0:
+        _set_object_node_young_next(prev, nxt)
+    elif ptr_eq(_backend3_young_head(), node) != 0:
+        _set_backend3_young_head(nxt)
+    else:
+        _set_object_node_young_next(node, null())
+        _set_object_node_young_prev(node, null())
+        return
+    if ptr_is_null(nxt) == 0:
+        _set_object_node_young_prev(nxt, prev)
+    _set_object_node_young_next(node, null())
+    _set_object_node_young_prev(node, null())
+
+
+def _backend3_young_rebuild() -> None:
+    _set_backend3_young_head(null())
+    node = _object_head()
+    while ptr_is_null(node) == 0:
+        _set_object_node_young_next(node, null())
+        _set_object_node_young_prev(node, null())
+        if _object_node_is_active(node) != 0:
+            obj = load_ptr(node, 0)
+            if (load_i32(obj, 12) & 128) != 0:
+                _backend3_young_link_head(node)
+        node = _object_node_next(node)
 
 
 def _object_known_size(obj) -> int:
@@ -911,6 +979,7 @@ def _clear_object_list() -> None:
         node = nxt
     _set_object_head(null())
     _set_trace_cursor(null())
+    _set_backend3_young_head(null())
     _set_gray_count(0)
     pcc_gc_object_index_clear()
     _object_graph_unlock()
@@ -2438,6 +2507,8 @@ def _generational_oldify_copy(from_obj):
     store_ptr(node, 40, null())
     store_ptr(node, 48, null())
     _set_object_node_gc_refs(node, 0)
+    _set_object_node_young_next(node, null())
+    _set_object_node_young_prev(node, null())
     if ptr_is_null(old_head) == 0:
         _set_object_node_prev(old_head, node)
     _set_object_head(node)
@@ -2462,6 +2533,7 @@ def _generational_oldify_copy(from_obj):
         free(to_obj)
         return null()
 
+    _backend3_young_unlink(pcc_gc_object_index_find(from_obj))
     _mark_forwarded_source_inactive(from_obj)
     source_flags: int = load_i32(from_obj, 12)
     store_i32(from_obj, 12, (source_flags & ~128) | 256)
@@ -2483,10 +2555,12 @@ def _promote_young_if_known(o) -> None:
             return
         backend: int = _init_config()
         if backend == 3 and (load_i32(o, 12) & 4096) != 0:
+            _backend3_young_unlink(pcc_gc_object_index_find(o))
             promoted_flags: int = load_i32(o, 12)
             store_i32(o, 12, (promoted_flags & ~(128 | 512)) | 256)
             _trace_referents_for_promotion(o)
             return
+        _backend3_young_unlink(pcc_gc_object_index_find(o))
         store_i32(o, 12, (flags & ~128) | 256)
         if backend == 4:
             _backend4_zpage_note_owner_promoted(o)
@@ -3571,6 +3645,15 @@ def pcc_gc_set_backend(backend: int) -> int:
         store_i32(global_addr("pcc_gc_read_barrier_enabled"), 0, 0)
     store_i32(global_addr("pcc_gc_mark_active"), 0, 0)
     store_i32(global_addr("pcc_gc_cycle_requested"), 0, 1)
+    if backend == 3:
+        _backend3_young_rebuild()
+    else:
+        _set_backend3_young_head(null())
+        node = _object_head()
+        while ptr_is_null(node) == 0:
+            _set_object_node_young_next(node, null())
+            _set_object_node_young_prev(node, null())
+            node = _object_node_next(node)
     _set_gray_count(0)
     store_i32(global_addr("pcc_gc_debt_bytes"), 0, 0)
     store_i32(global_addr("pcc_gc_last_alloc_bytes"), 0, 0)
@@ -5495,24 +5578,29 @@ def _step_generational_promotion(
         remaining_budget - local_processed
     )
     if promote_all_young != 0:
-        node = _object_head()
-        while ptr_is_null(node) == 0 and local_processed < remaining_budget:
+        while (
+            ptr_is_null(_backend3_young_head()) == 0
+            and local_processed < remaining_budget
+        ):
+            node = _backend3_young_head()
+            _backend3_young_unlink(node)
             if _object_node_is_active(node) == 0:
-                node = _object_node_next(node)
                 continue
             o = load_ptr(node, 0)
             flags: int = load_i32(o, 12)
-            if (flags & 128) != 0:
-                if ptr_is_null(_forwarding_find(o)) == 0:
-                    node = _object_node_next(node)
-                    continue
-                _promote_young_if_known(o)
-                after_flags: int = load_i32(o, 12)
-                if (after_flags & 128) == 0 or ptr_is_null(_forwarding_find(o)) == 0:
-                    local_processed = local_processed + 1
-                    if (local_processed % 16) == 0:
-                        pcc_thread_safepoint()
-            node = _object_node_next(node)
+            if (flags & 128) == 0:
+                continue
+            if ptr_is_null(_forwarding_find(o)) == 0:
+                continue
+            _promote_young_if_known(o)
+            after_flags: int = load_i32(o, 12)
+            if (after_flags & 128) == 0 or ptr_is_null(_forwarding_find(o)) == 0:
+                local_processed = local_processed + 1
+                if (local_processed % 16) == 0:
+                    pcc_thread_safepoint()
+            else:
+                _backend3_young_link_head(node)
+                break
 
     if local_processed > 0:
         pcc_thread_safepoint()
@@ -5923,10 +6011,14 @@ def pcc_gc_note_object_allocated_sized(o, size: int) -> None:
         store_ptr(node, 40, null())
         store_ptr(node, 48, null())
         _set_object_node_gc_refs(node, 0)
+        _set_object_node_young_next(node, null())
+        _set_object_node_young_prev(node, null())
         if ptr_is_null(old_head) == 0:
             _set_object_node_prev(old_head, node)
         _set_object_head(node)
         pcc_gc_object_index_insert(o, node)
+        if backend == 3:
+            _backend3_young_link_head(node)
         live: int = load_i32(global_addr("pcc_gc_live_bytes"), 0)
         store_i32(global_addr("pcc_gc_live_bytes"), 0, live + size)
         if backend == 4:

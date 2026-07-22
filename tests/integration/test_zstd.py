@@ -58,7 +58,7 @@ def zstd_compiled_units_self():
     return compiled_units, base_dir
 
 
-@pytest.mark.skipif(not os.path.isdir(ZSTD_LIB_DIR), reason="zstd-1.5.6/lib not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(ZSTD_LIB_DIR) else "zstd-1.5.6/lib not found")
 @pytest.mark.integration
 def test_zstd_runtime_with_mcjit_depends_on(zstd_compiled_units):
     compiled_units, _base_dir = zstd_compiled_units
@@ -71,7 +71,7 @@ def test_zstd_runtime_with_mcjit_depends_on(zstd_compiled_units):
     assert result == 0
 
 
-@pytest.mark.skipif(not os.path.isdir(ZSTD_LIB_DIR), reason="zstd-1.5.6/lib not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(ZSTD_LIB_DIR) else "zstd-1.5.6/lib not found")
 @pytest.mark.integration
 def test_zstd_runtime_with_system_link_depends_on(zstd_compiled_units):
     compiled_units, base_dir = zstd_compiled_units
@@ -91,7 +91,7 @@ def test_zstd_runtime_with_system_link_depends_on(zstd_compiled_units):
     assert "OK" in result.stdout
 
 
-@pytest.mark.skipif(not os.path.isdir(ZSTD_LIB_DIR), reason="zstd-1.5.6/lib not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(ZSTD_LIB_DIR) else "zstd-1.5.6/lib not found")
 def test_zstd_runtime_with_self_backend_system_link_depends_on(zstd_compiled_units_self):
     compiled_units, base_dir = zstd_compiled_units_self
 
@@ -113,7 +113,7 @@ def test_zstd_runtime_with_self_backend_system_link_depends_on(zstd_compiled_uni
     assert "OK" in result.stdout
 
 
-@pytest.mark.skipif(not os.path.isdir(ZSTD_LIB_DIR), reason="zstd-1.5.6/lib not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(ZSTD_LIB_DIR) else "zstd-1.5.6/lib not found")
 def test_zstd_make_goal_dependency_collects_library_sources():
     units, base_dir = _zstd_units()
 

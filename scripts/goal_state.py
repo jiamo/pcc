@@ -468,17 +468,24 @@ def render_startup_markdown(
             ]
         )
 
+    unfinished_tasks = [
+        task for task in active_tasks if task.get("status") != "DONE_STRONG"
+    ]
+    done_strong = len(active_tasks) - len(unfinished_tasks)
     lines.extend(
         [
             "",
             "## Active task table",
+            "",
+            f"`DONE_STRONG` rows ({done_strong}) are omitted here to keep the",
+            "startup state compact; the full ledger is `docs/goal/task-board.yaml`.",
             "",
             "| Rank | ID | Status | Depends on | Evidence |",
             "|---:|---|---|---|---|",
         ]
     )
     for task in sorted(
-        active_tasks,
+        unfinished_tasks,
         key=lambda item: (item.get("rank", 0), item.get("id", "")),
     ):
         dependencies = ", ".join(task.get("depends_on", [])) or "-"

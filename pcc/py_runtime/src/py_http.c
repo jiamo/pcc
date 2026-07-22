@@ -29,7 +29,8 @@ enum {
     PCC_CURLOPT_URL = 10002,
     PCC_CURLOPT_WRITEFUNCTION = 20011,
     PCC_CURLOPT_USERAGENT = 10018,
-    PCC_CURLOPT_TIMEOUT = 13,
+    PCC_CURLOPT_LOW_SPEED_LIMIT = 19,
+    PCC_CURLOPT_LOW_SPEED_TIME = 20,
     PCC_CURLOPT_FAILONERROR = 45,
     PCC_CURLOPT_FOLLOWLOCATION = 52,
     PCC_CURLOPT_CONNECTTIMEOUT = 78,
@@ -92,7 +93,12 @@ static int download_with_system_libcurl(const char *url, const char *dest) {
     configured &= easy_setopt(curl, PCC_CURLOPT_FOLLOWLOCATION, 1L) == 0;
     configured &= easy_setopt(curl, PCC_CURLOPT_FAILONERROR, 1L) == 0;
     configured &= easy_setopt(curl, PCC_CURLOPT_CONNECTTIMEOUT, 20L) == 0;
-    configured &= easy_setopt(curl, PCC_CURLOPT_TIMEOUT, 60L) == 0;
+    /* No fixed total-transfer timeout: a 20MB sdist at modest bandwidth
+     * legitimately exceeds any wall-clock cap (a hard 60s cap made
+     * `pcc1 -m pip install numpy` fail exactly at the bandwidth cliff).
+     * Abort on STALL instead: under 1KiB/s for 30 consecutive seconds. */
+    configured &= easy_setopt(curl, PCC_CURLOPT_LOW_SPEED_LIMIT, 1024L) == 0;
+    configured &= easy_setopt(curl, PCC_CURLOPT_LOW_SPEED_TIME, 30L) == 0;
     configured &= easy_setopt(curl, PCC_CURLOPT_NOSIGNAL, 1L) == 0;
     PccCurlCode rc = configured ? easy_perform(curl) : -1;
     easy_cleanup(curl);

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).absolute().parents[1]
 TESTS = ROOT / "tests"
 THIS_FILE = Path(__file__).absolute()
@@ -43,8 +42,7 @@ _HEAVY_EXTERNAL_CORPUS_SUITES = (
 )
 
 _FULL_BOOTSTRAP_INTEGRATION_GATES = tuple(
-    f"tests/python/gc/test_pcc_bootstrap_full_gc{backend}.py"
-    for backend in range(5)
+    f"tests/python/gc/test_pcc_bootstrap_full_gc{backend}.py" for backend in range(5)
 )
 
 _RUNTIME_SOURCE_COPY_SUITES = (
@@ -133,9 +131,7 @@ def test_tests_do_not_delete_shared_runtime_archives_or_skip_under_xdist():
             if token in source:
                 violations.append(f"{path.relative_to(ROOT)}: {token}")
         if "PYTEST_XDIST_WORKER" in source and "pytest.skip(" in source:
-            violations.append(
-                f"{path.relative_to(ROOT)}: worker-specific pytest skip"
-            )
+            violations.append(f"{path.relative_to(ROOT)}: worker-specific pytest skip")
     assert violations == []
 
 
@@ -172,15 +168,28 @@ def test_tests_do_not_build_or_link_mutable_repository_c_runtime_archive():
 
 def test_default_xdist_keeps_bounded_workers_for_compiler_heavy_suite():
     config = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert '-n 6 --dist=loadgroup -m \'not integration\'' in config
+    assert "-n 6 --dist=loadgroup -m 'not integration'" in config
     conftest = (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
     assert "def pytest_xdist_auto_num_workers" not in conftest
-    assert 'os.environ.setdefault("PCC_OUTER_PARALLELISM", str(worker_count))' in conftest
+    assert (
+        'os.environ.setdefault("PCC_OUTER_PARALLELISM", str(worker_count))' in conftest
+    )
     assert "items[:] = warmup + remaining" in conftest
-    matrix = (
-        ROOT / "tests/python/test_gc_backend_under_env.py"
-    ).read_text(encoding="utf-8")
+    matrix = (ROOT / "tests/python/test_gc_backend_under_env.py").read_text(
+        encoding="utf-8"
+    )
     assert 'xdist_group(name=f"gc_meta_{gc_backend}")' in matrix
+
+
+def test_lock_owned_self_host_warmer_has_independent_inner_budget(monkeypatch):
+    from tests.python import test_self_host_oracle_diff as oracle
+
+    monkeypatch.setenv("PCC_OUTER_PARALLELISM", "6")
+    monkeypatch.delenv("PCC_PY_FRONTEND_JOBS", raising=False)
+    assert oracle._child_env()["PCC_PY_FRONTEND_JOBS"] == "4"
+
+    monkeypatch.setenv("PCC_PY_FRONTEND_JOBS", "3")
+    assert oracle._child_env()["PCC_PY_FRONTEND_JOBS"] == "3"
 
 
 def test_gc_meta_matrix_retains_required_modes_without_accidental_duplicates():
@@ -188,9 +197,10 @@ def test_gc_meta_matrix_retains_required_modes_without_accidental_duplicates():
 
     for target in matrix._FRONTEND_INDEPENDENT_TARGETS:
         assert matrix._self_frontend_target(target) is None
-    assert matrix._self_frontend_target(
-        matrix._CONCURRENT_COLLECTION_FILE
-    ) == matrix._CONCURRENT_COLLECTION_PCC_PYTHON_TARGET
+    assert (
+        matrix._self_frontend_target(matrix._CONCURRENT_COLLECTION_FILE)
+        == matrix._CONCURRENT_COLLECTION_PCC_PYTHON_TARGET
+    )
     assert len(matrix._self_frontend_target(matrix._GENERATIONAL_TARGETS)) < len(
         matrix._GENERATIONAL_TARGETS
     )
@@ -217,7 +227,12 @@ def test_stateless_gc_compile_suites_are_not_forced_onto_one_worker():
 def test_csmith_seeds_remain_independently_schedulable():
     source = (ROOT / "tests/c/test_csmith.py").read_text(encoding="utf-8")
     assert "xdist_group" not in source
-    assert '@pytest.mark.parametrize("seed", range(DEFAULT_SEEDS))' in source
+    # flat per-seed parametrize over the vetted corpus — one xdist item per
+    # seed, never grouped (corpus rationale lives in test_csmith.py)
+    assert (
+        '@pytest.mark.parametrize("seed", CSMITH_SEED_CORPUS[:DEFAULT_SEEDS])'
+        in source
+    )
 
 
 def test_heavy_external_c_corpora_are_in_the_integration_gate():
@@ -233,7 +248,7 @@ def test_heavy_external_c_corpora_are_in_the_integration_gate():
         "tests/c/test_gcc_torture_self.py",
     ):
         start = promotion.index(relative) - 80
-        assert '"-m", "integration"' in promotion[start:start + 160]
+        assert '"-m", "integration"' in promotion[start : start + 160]
 
 
 def test_full_three_stage_gc_bootstraps_are_in_the_integration_gate():
@@ -243,7 +258,8 @@ def test_full_three_stage_gc_bootstraps_are_in_the_integration_gate():
 
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     commands = [
-        line for line in agents.splitlines()
+        line
+        for line in agents.splitlines()
         if "test_pcc_bootstrap_full_gc" in line and "pytest" in line
     ]
     assert commands
@@ -258,7 +274,8 @@ def test_full_runtime_c_source_emit_gate_is_integration_only():
 
     board = (ROOT / "docs/goal/task-board.yaml").read_text(encoding="utf-8")
     commands = [
-        line for line in board.splitlines()
+        line
+        for line in board.splitlines()
         if "test_py_runtime_pcc_emit.py" in line and "pytest" in line
     ]
     assert commands
@@ -273,27 +290,29 @@ def test_gc_root_graph_fixture_is_not_rebuilt_by_every_xdist_worker():
 
 
 def test_fallback_closure_fixture_is_not_rebuilt_by_every_xdist_worker():
-    source = (
-        ROOT / "tests/python/test_fallback_baseline.py"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "tests/python/test_fallback_baseline.py").read_text(
+        encoding="utf-8"
+    )
     assert 'xdist_group(name="fallback_baseline")' in source
 
 
 def test_pcc1_threaded_runtime_fixture_is_not_rebuilt_by_every_xdist_worker():
-    source = (
-        ROOT / "tests/python/test_pcc1_threading_gc_runtime.py"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "tests/python/test_pcc1_threading_gc_runtime.py").read_text(
+        encoding="utf-8"
+    )
     assert 'xdist_group(name="pcc1_threaded_gc")' in source
 
 
 def test_self_host_oracle_stages_are_shared_across_xdist_workers():
-    source = (
-        ROOT / "tests/python/test_self_host_oracle_diff.py"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "tests/python/test_self_host_oracle_diff.py").read_text(
+        encoding="utf-8"
+    )
     cache = (ROOT / "tests/runtime_build_cache.py").read_text(encoding="utf-8")
     conftest = (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
     assert "cached_self_host_oracle_dir()" in source
     assert "self_host_source_key()" in source
+    assert "self_backend_object_cache_key()" in source
+    assert "PCC_PY_FRONTEND_IR_CACHE_IDENTITY" in source
     assert "PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY" in source
     assert "fcntl.flock" in source
     assert "os.replace(temporary, pcc1)" in source

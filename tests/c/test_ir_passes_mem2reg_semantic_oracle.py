@@ -63,7 +63,7 @@ def _execute_i32_unary(ir_text: str, values: tuple[int, ...]) -> tuple[int, ...]
 
 def test_mem2reg_matches_original_and_independent_llvm_opt_behavior():
     if not OPT_VERDICT.available:
-        pytest.skip(OPT_VERDICT.skip_reason())
+        pytest.fail(OPT_VERDICT.skip_reason())
     pcc_ir, changed = mem2reg_module(DIAMOND_IR)
     assert changed is True
     upstream = run_upstream_opt(DIAMOND_IR, "mem2reg")

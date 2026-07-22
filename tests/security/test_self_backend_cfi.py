@@ -47,9 +47,10 @@ _IS_AARCH64_DARWIN = (
     sys.platform == "darwin" and platform.machine() in ("arm64", "aarch64")
 )
 
-pytestmark = pytest.mark.skipif(
-    not _IS_AARCH64_DARWIN,
-    reason="self-backend AArch64 branch protection only applies on arm64 macOS",
+pytestmark = pytest.mark.pcc_gate(
+    unavailable=None
+    if _IS_AARCH64_DARWIN
+    else "self-backend AArch64 branch protection only applies on arm64 macOS"
 )
 
 # An indirect call through a function pointer exercises both edges: the callee
@@ -123,7 +124,7 @@ def test_self_backend_hardened_binary_assembles_and_runs(tmp_path):
     """
     cc = shutil.which("cc")
     if cc is None:
-        pytest.skip("no system cc available to assemble the self-backend asm")
+        pytest.fail("no system cc available to assemble the self-backend asm")
 
     asm = _emit_self_asm(_INDIRECT_CALL_C, tmp_path)
     asm_path = tmp_path / "cfi.s"

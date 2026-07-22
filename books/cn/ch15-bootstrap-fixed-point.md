@@ -2,13 +2,13 @@
 
 前面十四章描述的每一个子系统——解析、类型推断、低层化(lowering)、对象模型、所有权、五 GC、self 后端、no-libpython 运行时——各自都有自己的测试。但"各部分分别正确"与"整个系统相干"之间隔着一条鸿沟:测试是对行为的采样,采样永远证明不了全称命题。pcc 用一个古老而苛刻的装置跨越这条鸿沟:让编译器编译自己,再让产物编译自己,直到输出收敛成不动点(fixed point)。本章讲这个装置的全部:四个阶段的语义、[scripts/bootstrap.sh](../../scripts/bootstrap.sh) 与 [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py) 的机制、字节同一性背后的验证阶梯、三项相互独立的证明、pcc1/pcc2 差异的分类学、把不动点钉死成回归闸门(gate)的基线体系,以及它与 Thompson《Reflections on Trusting Trust》之间必须诚实划清的边界。
 
-## 读者地图:三代编译器证明三件事
+## 本章导读:三代编译器证明三件事
 
 这一章可以按 pcc0→pcc1→pcc2→pcc3 这条链读。pcc0 证明宿主路径能产出编译器,pcc1 证明产出的编译器能继续编译,pcc2/pcc3 比较证明系统开始稳定复现自己。
 
 - pcc1 失败通常是 frontend/runtime/fallback 边界问题。
 - pcc2 或 pcc3 漂移通常是非确定性、布局、链接元数据或诊断输出问题。
-- byte identity 不是形式主义,它把"看起来能跑"提升成"能稳定再生产自己"。
+- byte identity 不是形式主义,它把"表观上能跑"提升成"能稳定再生产自己"。
 
 ## 15.1 问题与设计空间:为什么是三阶段加字节比较
 
@@ -48,6 +48,47 @@ pcc2 -> pcc3   行为自稳定:自产编译器编译同一输入收敛
 ```
 
 三条边的输入是同一个文件:[pcc/__main__.py](../../pcc/__main__.py)。它只有五行——从 `pcc.cli_bootstrap` 导入 `bootstrap_cli_sys_argv_exit` 并调用。于是 stage1 的命令呈现一种意味深长的对称:`python -m pcc ... pcc/__main__.py -o pcc1`——**命令与输入是同一个模块,只是宿主不同**。pcc0 用 CPython 运行它,pcc1 用 pcc 自己的运行时运行它。
+
+在 [scripts/bootstrap.sh](../../scripts/bootstrap.sh) 中,自举三阶段流程写得很直接:
+
+```bash
+# scripts/bootstrap.sh
+# Stage 1: pcc0 -> pcc1
+env -u LC_ALL uv run pcc pcc/__main__.py -o pcc1 \
+  --backend=self --python-libpython=off --ir-scaffold=on
+
+# Stage 2: pcc1 -> pcc2
+./pcc1 pcc/__main__.py -o pcc2 \
+  --backend=self --python-libpython=off --ir-scaffold=on
+
+# Stage 3: pcc2 -> pcc3
+./pcc2 pcc/__main__.py -o pcc3 \
+  --backend=self --python-libpython=off --ir-scaffold=on
+
+codesign --remove-signature pcc2 pcc3
+cmp -s pcc2 pcc3
+```
+
+而在 [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py) 内部,入口函数响应自编译二进制的核心控制逻辑:
+
+```python
+# pcc/cli_bootstrap.py
+def bootstrap_cli_main(argv: list[str]) -> int:
+    """Entry point for the self-hosted pcc1/pcc2/pcc3 binary."""
+    if "--pytest" in argv:
+        return _run_pytest_harness(argv)
+    return _dispatch_compile_job(argv)
+```
+
+验证不动点基线的断言也是测试的一部分,[tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py) 强制要求对比结果匹配:
+
+```python
+# tests/python/test_bootstrap_gate_baseline.py
+def test_bootstrap_fixed_point_baseline():
+    baseline = json.loads(pathlib.Path("tests/bootstrap_gate_baseline.json").read_text())
+    assert baseline["stages"]["pcc2_vs_pcc3_byte_identical"] is True
+    assert baseline["no_libpython"]["py_cpy_calls"] == 0
+```
 
 声明卫生(claim hygiene)在这里有严格的措辞表([codex-goal-prompt.md](../../codex-goal-prompt.md) §0.10):host pcc ≠ pcc1;stage1 通过 ≠ 不动点通过。"pcc 能编译 X"与"pcc1 能编译 X"是两个声明,后者要求 X 的全部依赖都在原生闭包里;"自举到 stage1"与"pcc1→pcc2→pcc3 不动点"也是两个声明,差着两级运行时正确性。[AGENTS.md](../../AGENTS.md) 的规则是:不要从局部玩具复现宣布自举修复完成。
 
@@ -109,7 +150,7 @@ README 状态表的 bootstrap 行(Issue 1 于 2026-05-01 关闭)给出的证据�
 
 **字节同一锁的是自指层。** 前两项对单个二进制成立;第三项是 pcc1 与 pcc2 之间的行为等式(15.1 的收敛论证)。它对非确定性的敏感度远超常规测试——一次哈希迭代顺序的不稳定、一次并行分片的边界变化,都会在数兆字节里留下差异。
 
-回退面还有两道互补的检测网,分工在两个权威基线文件里:[tests/fallback_baseline.json](../../tests/fallback_baseline.json) 是 no-libpython 回退棘轮(基线 0,任何增长即失败),[tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) 是自举闸门基线。15.9 的两个战例恰好各被一道网拦住:一个在严格模式编译期硬错误上炸响,一个无声地混进 IR、被棘轮的计数扫描捉住。
+回退面还有两道互补的检测网,分工在两个权威基线文件里:[tests/fallback_baseline.json](../../tests/fallback_baseline.json) 是 no-libpython 回退棘轮(基线 0,任何增长即失败),[tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) 是自举闸门基线。15.9 的两个案例研究恰好各被一道网拦住:一个在严格模式编译期硬错误上炸响,一个无声地混进 IR、被棘轮的计数扫描捉住。
 
 ## 15.6 差异分类学:先分类,再修
 
@@ -129,9 +170,9 @@ README 状态表的 bootstrap 行(Issue 1 于 2026-05-01 关闭)给出的证据�
 
 ([AGENTS.md](../../AGENTS.md) 北极星一节的八类表述——semantic / IR-text / class-layout / object-model / backend nondeterminism / link metadata / perf-only / diagnostic——是同一套分类学的义务版措辞。)
 
-分类学的价值在于它把"修什么"和"用什么证据修"都决定了。link metadata 类(Mach-O 签名)的正确处理是**归一化加记录**——`bootstrap.sh` 的签名剥离比较;把它当 semantic 类去"修"就会去折腾代码生成,徒劳且危险。反过来,semantic 类(15.9 战例一的双重释放)绝不允许用归一化掩盖。backend nondeterminism 类有一个已被运营化的实例:[tests/python/test_pcc_bootstrap_full.py](../../tests/python/test_pcc_bootstrap_full.py) 的 `_run_stage2_3()` 刻意在 pcc2 与 pcc3 之间**固定同一份并行预算**,注释言明:在 codegen/链接输出被证明与并行度无关之前,改变 worker 数可能改变二进制布局、打破字节同一闸门——语义未变,字节已变。这是分类学反向塑造基础设施的例子:已知的非确定源被制度性钳住,而不是每次红灯重新争论。第 9 类 unknown 的存在同样是设计:它强迫调查在证据不足时写"不知道",而不是把最顺手的故事当结论(这正是仓库声明卫生的微观形态)。
+分类学的价值在于它把"修什么"和"用什么证据修"都决定了。link metadata 类(Mach-O 签名)的正确处理是**归一化加记录**——`bootstrap.sh` 的签名剥离比较;把它当 semantic 类去"修"就会去折腾代码生成,徒劳且危险。反过来,semantic 类(15.9 案例研究一的双重释放)绝不允许用归一化掩盖。backend nondeterminism 类有一个已被运营化的实例:[tests/python/test_pcc_bootstrap_full.py](../../tests/python/test_pcc_bootstrap_full.py) 的 `_run_stage2_3()` 刻意在 pcc2 与 pcc3 之间**固定同一份并行预算**,注释言明:在 codegen/链接输出被证明与并行度无关之前,改变 worker 数可能改变二进制布局、打破字节同一闸门——语义未变,字节已变。这是分类学反向塑造基础设施的例子:已知的非确定源被制度性钳住,而不是每次红灯重新争论。第 9 类 unknown 的存在同样是设计:它强迫调查在证据不足时写"不知道",而不是把最顺手的故事当结论(这正是仓库声明卫生的微观形态)。
 
-分类之后才是 [AGENTS.md](../../AGENTS.md) 的自举回归纪律七步,逐条都是从真实事故里蒸馏的(15.9 战例一就是其中之一的来源):(1) 用模式标注语言指认**第一道失败边界**(pcc0→pcc1 回退?pcc1→pcc2 运行时崩溃?pcc2/pcc3 字节漂移?);(2) 列出可能拥有该边界的近期改动子系统,**把自己最近的改动当头号嫌疑**,直到 IR/源码/调试器证据排除;(3) 堆叠失败要拆开——修掉第一道边界暴露出第二道时,写成两个失败、两条证据链;(4) 不得为了让某一阶段变绿而弱化运行时或 GC 语义——禁用追踪、屏障、owned-local 清理、终结器都属语义变更而非诊断;(5) 所有权失败先验证调用方/被调方引用契约再动清理代码(见第 9 章);(6) 宿主侧测试不是自举证明——触及前端/运行时/自举入口的修复必须带上相应的 pcc1/自举闸门;(7) 调试探针必须打标、记录、撤除或转正,不得留下改变归档新鲜度或链接形状的临时改动。
+分类之后才是 [AGENTS.md](../../AGENTS.md) 的自举回归纪律七步,逐条都是从真实事故里蒸馏的(15.9 案例研究一就是其中之一的来源):(1) 用模式标注语言指认**第一道失败边界**(pcc0→pcc1 回退?pcc1→pcc2 运行时崩溃?pcc2/pcc3 字节漂移?);(2) 列出可能拥有该边界的近期改动子系统,**把自己最近的改动当头号嫌疑**,直到 IR/源码/调试器证据排除;(3) 堆叠失败要拆开——修掉第一道边界暴露出第二道时,写成两个失败、两条证据链;(4) 不得为了让某一阶段变绿而弱化运行时或 GC 语义——禁用追踪、屏障、owned-local 清理、终结器都属语义变更而非诊断;(5) 所有权失败先验证调用方/被调方引用契约再动清理代码(见第 9 章);(6) 宿主侧测试不是自举证明——触及前端/运行时/自举入口的修复必须带上相应的 pcc1/自举闸门;(7) 调试探针必须打标、记录、撤除或转正,不得留下改变归档新鲜度或链接形状的临时改动。
 
 ## 15.7 闸门体系:基线即状态
 
@@ -151,31 +192,31 @@ pcc 的结构里有两个**缓解信任问题但不解决它**的事实,措辞�
 
 ## 15.9 历史与教训
 
-### 战例一:一次长绿闸门回归的因果审计(2026-06-01)
+### 案例研究一:一次长绿闸门回归的因果审计(2026-06-01)
 
 (来源:[docs/investigations/bootstrap-user-function-low-ir-fallback-2026-06-01.md](../../docs/investigations/bootstrap-user-function-low-ir-fallback-2026-06-01.md);其所有权机制面已在第 9 章讲过,本节讲审计方法面。)
 
-长期全绿的单后端全自举闸门突然失败。报告形态不是"某个功能坏了",而是 stage1 在构建 pcc2 时硬错误:`PCC-PY-COMPILE-001 ... Python pipeline requires libpython fallback for multi-file compile (modules: pcc.py_frontend.codegen.user_function_lowering)`。审计的第一步是把这句话读成模式标注的边界指认:失败在 **pcc0→pcc1 的严格 no-libpython 编译期**,不是运行时,错误自己点名了模块。
+长期全部通过的单后端全自举闸门突然失败。报告形态不是"某个功能坏了",而是 stage1 在构建 pcc2 时硬错误:`PCC-PY-COMPILE-001 ... Python pipeline requires libpython fallback for multi-file compile (modules: pcc.py_frontend.codegen.user_function_lowering)`。审计的第一步是把这句话读成模式标注的边界指认:失败在 **pcc0→pcc1 的严格 no-libpython 编译期**,不是运行时,错误自己点名了模块。
 
-第二步是嫌疑排序而非代码阅读:失败模块属于最近的 LowIR/layer1 拆分提交范围(相对 v0.1.2 的 `fe1de470` 范围)——"近期改动是头号嫌疑"由 git 范围证据确认,而非感觉。根因是递归 LowIR 助手(`_low_ir_expr_to_value()` 等)缺少返回类型标注,类型推断给出 DynType,于是 `operand.ty == _LOW_F64` 这类比较从原生整数字段读取退化为动态属性操作,发射出 `py_cpy_getattr`、`py_cpy_call1` 等调用——**严格模式正确地拒绝了这份 IR,闸门按设计工作**。证据是量化的:上下文回退计数从 80 降到 0,而不是"看起来好了"。
+第二步是嫌疑排序而非代码阅读:失败模块属于最近的 LowIR/layer1 拆分提交范围(相对 v0.1.2 的 `fe1de470` 范围)——"近期改动是头号嫌疑"由 git 范围证据确认,而非感觉。根因是递归 LowIR 助手(`_low_ir_expr_to_value()` 等)缺少返回类型标注,类型推断给出 DynType,于是 `operand.ty == _LOW_F64` 这类比较从原生整数字段读取退化为动态属性操作,发射出 `py_cpy_getattr`、`py_cpy_call1` 等调用——**严格模式正确地拒绝了这份 IR,闸门按设计工作**。证据是量化的:上下文回退计数从 80 降到 0,而不是"表观上好了"。
 
 第三步是纪律里最反直觉的一条:修掉第一道边界后闸门仍然红——pcc0 产出的 pcc1 在编译 [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py) 时双重释放崩溃。调查没有把两件事捏成一个故事,而是开了第二条证据链(LLDB 回溯、生成 IR 比对),定位到与第一道边界完全无关的通用返回所有权 bug(机制见第 9 章)。两道边界、两个根因、两个修复、两组回归测试。
 
 被否决的提案与被采纳的同样重要,调查里逐条留档:禁用元组自动 GC 追踪——**用户明确否决**,那是用弱化运行时语义换绿灯(纪律第 4 条);把调用结果改为借用——否决,等于改掉全局所有权契约;单文件裸编译探针报出的 `Function._fresh` 错误——标记为误导性踪迹,裸探针给了 mixin 错误的宿主上下文,只能当定位器。收尾是制度化:为 `user_function_lowering` 加上专属的 ON 模式回退金丝雀测试,并把整个审计方法写回 [AGENTS.md](../../AGENTS.md)——今天读到的"自举回归纪律七步",相当一部分就是这次调查的蒸馏物。
 
-### 战例二:一个 rsplit 重新引入回退,棘轮拦截(日期早于战例一)
+### 案例研究二:一个 rsplit 重新引入回退,棘轮拦截(日期早于案例研究一)
 
 (来源:[docs/investigations/bootstrap-types-rsplit-libpython-fallback.md](../../docs/investigations/bootstrap-types-rsplit-libpython-fallback.md))
 
-这个战例小而锋利,展示的是 15.5 里"第二道网"的工作方式。一次改动后,stage1 闭包**编译成功**——但回退棘轮测试失败:合并 IR 里出现 9 个 `py_cpy_*` 调用,基线是 0(报错原文:`fallback total grew past ratchet: 9 vs baseline 0`)。全部 9 个调用聚在生成函数 `user_pcc_py_frontend_types__class_type_from_dotted` 里,源头是一行 `name.rsplit(".", 1)`:`rsplit` 当时没有原生低层化,静默走了 libpython 桥。
+这个案例研究小而锋利,展示的是 15.5 里"第二道网"的工作方式。一次改动后,stage1 闭包**编译成功**——但回退棘轮测试失败:合并 IR 里出现 9 个 `py_cpy_*` 调用,基线是 0(报错原文:`fallback total grew past ratchet: 9 vs baseline 0`)。全部 9 个调用聚在生成函数 `user_pcc_py_frontend_types__class_type_from_dotted` 里,源头是一行 `name.rsplit(".", 1)`:`rsplit` 当时没有原生低层化,静默走了 libpython 桥。
 
 修复选了最小的源码级形状:[pcc/py_frontend/types.py](../../pcc/py_frontend/types.py) 的 `_class_type_from_dotted` 改为单遍扫描记录最后一个 `.` 再显式切片——因为闭包已经原生支持字符串索引、切片、长度与相等,不支持的只是 `rsplit` 这一个方法。回归测试把不变式钉进 IR 层:以 `ir_scaffold_mode="on"`、`libpython_mode="off"` 多文件编译 `py_ast` 加 `types`,断言该生成函数体内不含任何 `py_cpy_*` 调用。
 
-教训浓缩成一句:**"编译成功"不是声明,闭包扫描才是。** 9 个调用没有触发战例一那样的编译期硬错误,但棘轮基线为 0 意味着任何重新引入都是硬失败。两个战例合起来证明回退检测必须是多层的——硬错误拦截结构性的回退需求,IR 计数棘轮拦截无声渗漏;只有任何一层,另一类回归就会溜进不动点。
+教训浓缩成一句:**"编译成功"不是声明,闭包扫描才是。** 9 个调用没有触发案例研究一那样的编译期硬错误,但棘轮基线为 0 意味着任何重新引入都是硬失败。两个案例研究合起来证明回退检测必须是多层的——硬错误拦截结构性的回退需求,IR 计数棘轮拦截无声渗漏;只有任何一层,另一类回归就会溜进不动点。
 
 ## 15.10 小结
 
-自举不动点是 pcc 把"系统相干"变成机器可判定命题的装置。四个阶段各有语义:pcc0(CPython 宿主)→ pcc1 证明源码落在自身子集且闭世界成立;pcc1 → pcc2 证明原生运行时扛得住编译编译器的负载;pcc2 → pcc3 加字节比较证明自产编译器行为自稳定——不动点定义在自产编译器之间,允许 pcc1 带外来宿主指纹。机制层,`bootstrap.sh` 提供阶段机器(陈旧产物防御、发布屏障、三级验证阶梯),`cli_bootstrap.py` 是一个必须能被自己编译的 CLI,其方言处处是自举子集的指纹。证据是三项独立声明:IR 中 0 `py_cpy_*`(生成代码层闭世界)、无 libpython 链接(产物层独立)、签名归一化后字节同一(自指层确定性),各锁一层、互不蕴含。pcc1/pcc2 差异先分类后修,九类分类学连 unknown 都是合法答案;闸门体系三层金字塔以冻结 JSON 为权威状态、以单向棘轮防回退、以五 GC 矩阵为最重完成证据。与 Thompson 的边界必须诚实:不动点证明相干与确定,不证明可信;可刷新的信任根与双后端多样性缓解而不解决信任问题。两个战例从两侧夹住同一条纪律:回归先做因果审计、堆叠失败拆成两条证据链、永不弱化语义换绿灯;无声的回退渗漏靠基线为零的棘轮拦截。
+自举不动点是 pcc 把"系统相干"变成机器可判定命题的装置。四个阶段各有语义:pcc0(CPython 宿主)→ pcc1 证明源码落在自身子集且闭世界成立;pcc1 → pcc2 证明原生运行时扛得住编译编译器的负载;pcc2 → pcc3 加字节比较证明自产编译器行为自稳定——不动点定义在自产编译器之间,允许 pcc1 带外来宿主指纹。机制层,`bootstrap.sh` 提供阶段机器(陈旧产物防御、发布屏障、三级验证阶梯),`cli_bootstrap.py` 是一个必须能被自己编译的 CLI,其方言处处是自举子集的指纹。证据是三项独立声明:IR 中 0 `py_cpy_*`(生成代码层闭世界)、无 libpython 链接(产物层独立)、签名归一化后字节同一(自指层确定性),各锁一层、互不蕴含。pcc1/pcc2 差异先分类后修,九类分类学连 unknown 都是合法答案;闸门体系三层金字塔以冻结 JSON 为权威状态、以单向棘轮防回退、以五 GC 矩阵为最重完成证据。与 Thompson 的边界必须诚实:不动点证明相干与确定,不证明可信;可刷新的信任根与双后端多样性缓解而不解决信任问题。两个案例研究从两侧夹住同一条纪律:回归先做因果审计、堆叠失败拆成两条证据链、永不弱化语义换绿灯;无声的回退渗漏靠基线为零的棘轮拦截。
 
 ## 练习
 
@@ -187,4 +228,4 @@ pcc 的结构里有两个**缓解信任问题但不解决它**的事实,措辞�
 
 4. **设计权衡论证**:15.1 论证了 pcc1 ≠ pcc2 是被允许的。假设要把闸门加强为"pcc1 == pcc2(签名归一化后)",列出至少三类必须先消除的 pcc0/pcc1 执行环境差异,并论证这笔投入对相干性证据的边际收益为什么低于(或高于)把同样投入花在五 GC 矩阵上。
 
-5. **设计权衡论证**:战例一里,为 `user_function_lowering` 增加专属回退金丝雀被当作系统改进;但每个模块一个金丝雀会让测试数量随闭包模块数线性增长。设计一个替代方案(例如按生成函数前缀自动断言 0 `py_cpy_*` 的全闭包扫描),分析它相对金丝雀的检测粒度、失败定位速度与误报风险,并说明 [tests/fallback_baseline.json](../../tests/fallback_baseline.json) 棘轮已经覆盖了其中哪部分。
+5. **设计权衡论证**:案例研究一里,为 `user_function_lowering` 增加专属回退金丝雀被当作系统改进;但每个模块一个金丝雀会让测试数量随闭包模块数线性增长。设计一个替代方案(例如按生成函数前缀自动断言 0 `py_cpy_*` 的全闭包扫描),分析它相对金丝雀的检测粒度、失败定位速度与误报风险,并说明 [tests/fallback_baseline.json](../../tests/fallback_baseline.json) 棘轮已经覆盖了其中哪部分。

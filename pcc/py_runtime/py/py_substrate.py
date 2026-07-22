@@ -282,6 +282,7 @@ define_global_ptr_null("pcc_gc_continuation_root_head")
 define_global_ptr_null("pcc_gc_scheduler_root_head")
 define_global_ptr_null("pcc_gc_object_head")
 define_global_ptr_null("pcc_gc_trace_cursor")
+define_global_ptr_null("pcc_gc_backend3_young_head")
 define_global_ptr_null("pcc_gc_relocate_slot_pairs_ctx")
 
 

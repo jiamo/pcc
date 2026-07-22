@@ -129,6 +129,34 @@ def test_recursive_off_keeps_existing_libpython_path():
     assert "@.cpy.mod.keyword" in ir_text
 
 
+def test_plain_emit_only_does_not_auto_expand_stdlib_closure(tmp_path):
+    """A module IR probe stays single-file unless closure output is requested."""
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "probe.py"
+    out = tmp_path / "probe.ll"
+    profile: dict[str, object] = {}
+    src.write_text(
+        "import re\n\ndef matches(text: str) -> bool:\n"
+        "    return re.match('x', text) is not None\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(src),
+        str(out),
+        emit_llvm_only=True,
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+        profile=profile,
+    )
+
+    counters = profile["counters"]
+    assert counters["auto_files"] == 1
+    assert "multi_files" not in counters
+    assert "; ---- module:" not in out.read_text(encoding="utf-8")
+
+
 def test_no_libpython_auto_recursive_stdlib_scans_multi_file_closure(tmp_path):
     """Strict multi-file compile should notice stdlib imports in siblings."""
     from pcc.py_frontend.pipeline import compile_python
@@ -188,6 +216,108 @@ def test_recursive_stdlib_stops_at_function_bodies(tmp_path):
     assert "textwrap" in imports
     assert "pydoc" not in imports
     assert "email" not in imports
+
+
+def test_fast_import_discovery_matches_initialization_boundary(tmp_path):
+    from pcc.py_frontend import pipeline
+
+    src = tmp_path / "initialization_scope.py"
+    src.write_text(
+        textwrap.dedent('''
+            """
+            import random
+            """
+            from dataclasses import dataclass, field
+            if True: import base64
+
+            class C:
+                import textwrap
+
+                def method(self):
+                    import pydoc
+
+            def later():
+                import email
+            '''),
+        encoding="utf-8",
+    )
+    source = src.read_text(encoding="utf-8")
+
+    eager = pipeline._source_absolute_imports_for_discovery(
+        source,
+        include_function_bodies=False,
+    )
+    all_imports = pipeline._source_absolute_imports_for_discovery(
+        source,
+        include_function_bodies=True,
+    )
+
+    assert set(eager) == {"base64", "textwrap"}
+    assert set(all_imports) == {"base64", "textwrap", "pydoc", "email"}
+
+
+def test_recursive_stdlib_filters_scaffold_before_dependency_expansion():
+    from pcc.py_frontend import pipeline
+
+    source = _REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "stmt_misc_lowering.py"
+    _, modules = pipeline._prepare_multi_source_compile_closure(
+        [str(source)],
+        ["pcc.py_frontend.codegen.stmt_misc_lowering"],
+        recursive_stdlib=True,
+        ir_scaffold_mode="on",
+    )
+
+    assert "pcc.llvm_capi.ir" in modules
+    assert "pcc.llvm_capi.compat" not in modules
+    assert "pcc.llvm_capi.binding" not in modules
+    assert "ctypes" not in modules
+    assert "ctypes.util" not in modules
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def load():\n    import base64\n",
+        "def load():\n    from base64 import b64encode\n",
+        "if True: import base64\n",
+        "if True: from base64 import b64encode\n",
+        "from base64 import (\n    b64encode,\n)\n",
+    ],
+)
+def test_native_stdlib_discovery_does_not_invoke_full_parser(
+    tmp_path, monkeypatch, source
+):
+    """Import discovery is lexical metadata, not a second frontend parse."""
+    from pcc.parse import py_lift
+    from pcc.py_frontend import pipeline
+
+    src = tmp_path / "native_import.py"
+    src.write_text(source, encoding="utf-8")
+
+    def reject_parse(*_args, **_kwargs):
+        raise AssertionError("native stdlib discovery invoked the full parser")
+
+    monkeypatch.setattr(py_lift, "parse_and_lift", reject_parse)
+
+    assert pipeline._source_uses_native_stdlib(str(src))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "# import base64\n",
+        "text = 'import base64'\n",
+        'text = """\nimport base64\n"""\n',
+        "from .base64 import b64encode\n",
+    ],
+)
+def test_native_stdlib_discovery_ignores_non_import_text(tmp_path, source):
+    from pcc.py_frontend import pipeline
+
+    src = tmp_path / "not_an_absolute_import.py"
+    src.write_text(source, encoding="utf-8")
+
+    assert not pipeline._source_uses_native_stdlib(str(src))
 
 
 def test_recursive_stdlib_uses_compiled_export_after_native_lowering_declines(
@@ -291,8 +421,7 @@ def test_builtin_super_type_value_stays_native(tmp_path):
     src = tmp_path / "super_type_value.py"
     out = tmp_path / "super_type_value.ll"
     src.write_text(
-        "registry = {super: 'registered'}\n"
-        "print(registry[super])\n",
+        "registry = {super: 'registered'}\n" "print(registry[super])\n",
         encoding="utf-8",
     )
 
@@ -405,4 +534,8 @@ def test_c_extension_falls_back():
         recursive=True,
         libpython_mode="auto",
     )
-    assert "@.cpy.mod._socket" in ir_text  # falls back to dynamic
+    # Memory-transport pass sharding namespaces module-private symbols while
+    # preserving the dynamic import edge.  Assert both supported symbol shapes
+    # and, more importantly, the actual libpython fallback call.
+    assert re.search(r"@(?:__pcp\d+_)?\.cpy\.mod\._socket\b", ir_text)
+    assert re.search(r"\bcall ptr @py_cpy_import\(", ir_text)

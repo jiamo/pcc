@@ -29,6 +29,7 @@ from pcc.package_schema import (
     wheel_tag_fields,
     wheel_tags,
 )
+from pcc.package_environment import default_package_cache, default_package_site
 
 from .inspect import inspect_package
 from .linkage import linkage_report
@@ -48,17 +49,11 @@ def _repo_root() -> Path:
 
 
 def _default_site_dir() -> Path:
-    env = os.environ.get("PCC_PACKAGE_SITE")
-    if env:
-        return Path(env).expanduser().resolve()
-    return Path.home() / ".cache" / "pcc" / "site-packages"
+    return Path(default_package_site())
 
 
 def _default_cache_dir() -> Path:
-    env = os.environ.get("PCC_PACKAGE_CACHE")
-    if env:
-        return Path(env).expanduser().resolve()
-    return Path.home() / ".cache" / "pcc" / "package-cache"
+    return Path(default_package_cache())
 
 
 def _normalized_package_name(name: str) -> str:
@@ -777,7 +772,7 @@ def _copy_or_extract(
             artifact_dir = Path(tmp) / "artifact"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             with tarfile.open(source) as tf:
-                tf.extractall(artifact_dir)
+                tf.extractall(artifact_dir, filter="data")
             importable = _archive_importable_roots(artifact_dir)
             if importable:
                 return _copy_payloads_to_site(importable, site, metadata_name)
@@ -804,7 +799,7 @@ def _build_requirement_tool_wrappers(
     bin_dir = Path(temp_dir.name)
     script = (
         "#!/bin/sh\n"
-        "exec uv run --with " + repr(cython_requirement) + ' cython "$@"\n'
+        "exec uv run --no-project --with " + repr(cython_requirement) + ' cython "$@"\n'
     )
     for name in ("cython", "cython3"):
         tool = bin_dir / name
@@ -955,6 +950,7 @@ def install_package(
     abi: str = "pcc-native",
     use_cache: bool = True,
     build_source: bool = False,
+    resolved_from_override: str | None = None,
 ) -> dict[str, object]:
     cache = (
         Path(cache_dir).expanduser().resolve() if cache_dir else _default_cache_dir()
@@ -966,6 +962,8 @@ def install_package(
         index_urls=index_urls,
         abi=abi,
     )
+    if resolved_from_override is not None:
+        resolved_from = resolved_from_override
     if source is None:
         return {
             "ok": False,

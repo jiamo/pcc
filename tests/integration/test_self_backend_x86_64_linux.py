@@ -71,7 +71,7 @@ def test_docker_availability_requires_reachable_daemon(monkeypatch):
     _docker_available.cache_clear()
 
 
-@pytest.mark.skipif(not _docker_available(), reason="docker harness not available")
+@pytest.mark.pcc_gate(unavailable=None if _docker_available() else "docker harness not available")
 def test_linux_x86_64_docker_llvm_smoke_can_build_and_run():
     result = _run_linux_x86_64_harness(
         rf"""
@@ -92,7 +92,7 @@ cc -no-pie /tmp/self_backend_linux_smoke.o -o /tmp/self_backend_linux_smoke
     )
 
 
-@pytest.mark.skipif(not _docker_available(), reason="docker harness not available")
+@pytest.mark.pcc_gate(unavailable=None if _docker_available() else "docker harness not available")
 def test_linux_x86_64_docker_self_backend_smoke_can_build_and_run():
     result = _run_linux_x86_64_harness(
         rf"""
@@ -113,7 +113,7 @@ cc -no-pie /tmp/self_backend_linux_self_smoke.o -o /tmp/self_backend_linux_self_
     )
 
 
-@pytest.mark.skipif(not _docker_available(), reason="docker harness not available")
+@pytest.mark.pcc_gate(unavailable=None if _docker_available() else "docker harness not available")
 def test_linux_x86_64_docker_self_backend_smoke_supports_amd64_alias_triple():
     result = _run_linux_x86_64_harness(
         rf"""
@@ -134,7 +134,7 @@ cc -no-pie /tmp/self_backend_linux_unsupported_alias.o -o /tmp/self_backend_linu
     )
 
 
-@pytest.mark.skipif(not _docker_available(), reason="docker harness not available")
+@pytest.mark.pcc_gate(unavailable=None if _docker_available() else "docker harness not available")
 def test_linux_x86_64_docker_self_backend_direct_call_and_binop_smoke():
     result = _run_linux_x86_64_harness(
         rf"""
@@ -156,7 +156,7 @@ cc -no-pie /tmp/self_backend_linux_direct_call.o -o /tmp/self_backend_linux_dire
     )
 
 
-@pytest.mark.skipif(not _docker_available(), reason="docker harness not available")
+@pytest.mark.pcc_gate(unavailable=None if _docker_available() else "docker harness not available")
 def test_linux_x86_64_docker_llvm_c_testsuite_exact_match_bucket():
     assert CTESTSUITE_HARNESS.is_file(), f"missing harness: {CTESTSUITE_HARNESS}"
 
@@ -171,7 +171,7 @@ def test_linux_x86_64_docker_llvm_c_testsuite_exact_match_bucket():
     )
 
 
-@pytest.mark.skipif(not _docker_available(), reason="docker harness not available")
+@pytest.mark.pcc_gate(unavailable=None if _docker_available() else "docker harness not available")
 def test_linux_x86_64_docker_self_backend_c_testsuite_bucket_handles_partial_support_cleanly():
     assert CTESTSUITE_HARNESS.is_file(), f"missing harness: {CTESTSUITE_HARNESS}"
 
@@ -186,7 +186,7 @@ def test_linux_x86_64_docker_self_backend_c_testsuite_bucket_handles_partial_sup
     )
 
 
-@pytest.mark.skipif(not _docker_available(), reason="docker harness not available")
+@pytest.mark.pcc_gate(unavailable=None if _docker_available() else "docker harness not available")
 def test_linux_x86_64_docker_self_backend_strict_exact_bucket():
     assert CTESTSUITE_HARNESS.is_file(), f"missing harness: {CTESTSUITE_HARNESS}"
 

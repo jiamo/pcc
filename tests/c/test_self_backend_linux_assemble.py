@@ -118,7 +118,7 @@ entry:
 }
 
 
-@pytest.mark.skipif(_CLANG is None, reason="clang not on PATH")
+@pytest.mark.pcc_gate(unavailable=None if _CLANG is not None else "clang not on PATH")
 @pytest.mark.parametrize("name", sorted(_IR_SNIPPETS))
 def test_linux_emitted_asm_cross_assembles(tmp_path, name):
     asm_text = emit_x86_64_linux_asm(_IR_SNIPPETS[name].strip())

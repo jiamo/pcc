@@ -87,7 +87,7 @@ any speedup-vs-baseline number.
 
 ## Provenance
 
-The taxonomy is distilled from `tmp_research/deep-research-distribute.md`
+The taxonomy is distilled from `docs/refs_docs/deep-research/deep-research-distribute.md`
 (MLX's Apple-Silicon distributed reality: RING/TCP first, QUIC later,
 JACCL/Thunderbolt-RDMA requiring fully-connected topology + Recovery
 enablement; vLLM paged-KV block management as an upper-layer constraint). It

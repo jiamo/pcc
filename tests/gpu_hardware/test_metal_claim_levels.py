@@ -44,7 +44,10 @@ from pcc.kernel_ir.ir import (
     ScalarParam,
     ScalarType,
 )
-from pcc.kernel_ir.metal_finalize import emit_metal_simdgroup_gemm_source, emit_metal_source
+from pcc.kernel_ir.metal_finalize import (
+    emit_metal_simdgroup_gemm_source,
+    emit_metal_source,
+)
 from pcc.kernel_ir.metal_source_runtime import (
     STATUS_SKIPPED_WITH_REASON,
     STATUS_SOURCE_RUNTIME_INVOKED,
@@ -53,8 +56,8 @@ from pcc.kernel_ir.metal_source_runtime import (
     verify_metal_source_runtime_package_manifest,
     write_metal_source_runtime_package_manifest,
 )
+from pcc.kernel_ir.schedule import BindThreads, KernelSchedule
 from pcc.kernel_ir.tilelang_import import import_tilelang_source
-
 
 TILELANG_METAL_MATMUL = """
 import tilelang
@@ -186,8 +189,12 @@ def _matrix_copy_module() -> KernelModule:
     func = KernelFunc(
         name="copy_kernel",
         params=(
-            BufferParam("src", ScalarType.F32, rank=2, shape=(2, 2), scope=MemoryScope.GLOBAL),
-            BufferParam("dst", ScalarType.F32, rank=2, shape=(2, 2), scope=MemoryScope.GLOBAL),
+            BufferParam(
+                "src", ScalarType.F32, rank=2, shape=(2, 2), scope=MemoryScope.GLOBAL
+            ),
+            BufferParam(
+                "dst", ScalarType.F32, rank=2, shape=(2, 2), scope=MemoryScope.GLOBAL
+            ),
             ScalarParam("n", ScalarType.U32),
         ),
         body=(
@@ -218,7 +225,9 @@ def _tilelang_module(*, m: int = 5, n: int = 7, k: int = 3) -> KernelModule:
     )
 
 
-def _tilelang_vectorized_abc_copy_module(*, m: int = 5, n: int = 7, k: int = 16) -> KernelModule:
+def _tilelang_vectorized_abc_copy_module(
+    *, m: int = 5, n: int = 7, k: int = 16
+) -> KernelModule:
     return import_tilelang_source(
         TILELANG_VECTORIZED_ABC_COPY_MATMUL,
         outer_function="matmul_vectorized_abc_copy",
@@ -228,7 +237,9 @@ def _tilelang_vectorized_abc_copy_module(*, m: int = 5, n: int = 7, k: int = 16)
     )
 
 
-def _tilelang_vectorized_nonzero_serial_module(*, m: int = 5, n: int = 7, k: int = 24) -> KernelModule:
+def _tilelang_vectorized_nonzero_serial_module(
+    *, m: int = 5, n: int = 7, k: int = 24
+) -> KernelModule:
     source = TILELANG_VECTORIZED_ABC_COPY_MATMUL.replace(
         "for ko in T.serial(T.ceildiv(K, block_K)):",
         "for ko in T.serial(1, T.ceildiv(K, block_K)):",
@@ -331,7 +342,9 @@ def _simdgroup_gemm_module(
                 shape=(n, k) if transpose_b else (k, n),
                 scope=MemoryScope.GLOBAL,
             ),
-            BufferParam("C", ScalarType.F32, rank=2, shape=(m, n), scope=MemoryScope.GLOBAL),
+            BufferParam(
+                "C", ScalarType.F32, rank=2, shape=(m, n), scope=MemoryScope.GLOBAL
+            ),
         ),
         locals=(
             LocalBuffer(
@@ -459,7 +472,9 @@ def test_gpu_level4_copy_runtime_source_device_result_or_skip(tmp_path):
 
     src = ((1.0, 2.0), (3.0, 4.0))
     module = _matrix_copy_module()
-    cpu = CpuReferenceResult(entry="copy_kernel", outputs={"dst": src}, tiles_executed=1, k_tiles=1)
+    cpu = CpuReferenceResult(
+        entry="copy_kernel", outputs={"dst": src}, tiles_executed=1, k_tiles=1
+    )
     execution = get_gpu_backend_driver(GPU_BACKEND_PCC_METAL).execute(
         module,
         _matrix_copy_args(),
@@ -475,6 +490,47 @@ def test_gpu_level4_copy_runtime_source_device_result_or_skip(tmp_path):
     result = _assert_pcc_metal_owner(execution)
 
     evidence = classify_metal_source_runtime_package_result("copy", result)
+    checked = _assert_claim_level_4_or_skip(evidence)
+    if checked.device_result_proven:
+        assert checked.metallib_produced is False
+        _assert_device_result_manifest_round_trip(result, checked)
+
+
+def test_gpu_level4_scheduled_copy_runtime_source_device_result_or_skip(tmp_path):
+    if sys.platform != "darwin" and _strict_hardware():
+        raise AssertionError("strict Metal hardware gate requires Darwin")
+
+    src = ((1.0, 2.0), (3.0, 4.0))
+    module = _matrix_copy_module()
+    schedule = KernelSchedule.for_module(
+        module,
+        target="metal:0",
+        steps=(BindThreads("copy_kernel", expected_threads=16, threads=32),),
+    )
+    cpu = CpuReferenceResult(
+        entry="copy_kernel",
+        outputs={"dst": src},
+        tiles_executed=1,
+        k_tiles=1,
+    )
+    execution = get_gpu_backend_driver(GPU_BACKEND_PCC_METAL).execute(
+        module,
+        _matrix_copy_args(),
+        tmp_path,
+        target="metal:0",
+        pipeline=PCC_METAL_SCALAR_PIPELINE,
+        input_matrices={"src": src},
+        cpu_reference=cpu,
+        output_name="dst",
+        timeout=90.0,
+        launcher_links_libpython=True,
+        schedule=schedule,
+    )
+    result = _assert_pcc_metal_owner(execution)
+    assert execution.manifest.schedule_plan_sha256 == schedule.sha256
+    assert execution.manifest.artifact_hashes["schedule_plan"] == schedule.sha256
+
+    evidence = classify_metal_source_runtime_package_result("scheduled_copy", result)
     checked = _assert_claim_level_4_or_skip(evidence)
     if checked.device_result_proven:
         assert checked.metallib_produced is False
@@ -503,7 +559,9 @@ def test_gpu_level4_tilelang_gemm_runtime_source_device_result_or_skip(tmp_path)
     )
     result = _assert_pcc_metal_owner(execution)
 
-    evidence = classify_metal_source_runtime_package_result("tilelang_scalar_gemm", result)
+    evidence = classify_metal_source_runtime_package_result(
+        "tilelang_scalar_gemm", result
+    )
     checked = _assert_claim_level_4_or_skip(evidence)
     if checked.device_result_proven:
         assert checked.metallib_produced is False
@@ -604,7 +662,9 @@ def test_gpu_level4_tvm_tilelang_gemm_matches_pcc_metal_owner(tmp_path):
         assert _readback_matrix(provider_result) == _readback_matrix(pcc_result)
 
 
-def test_gpu_level4_tilelang_vectorized_abc_copy_runtime_source_device_result_or_skip(tmp_path):
+def test_gpu_level4_tilelang_vectorized_abc_copy_runtime_source_device_result_or_skip(
+    tmp_path,
+):
     if sys.platform != "darwin" and _strict_hardware():
         raise AssertionError("strict Metal hardware gate requires Darwin")
 
@@ -680,14 +740,18 @@ def test_gpu_level4_simdgroup_gemm_runtime_source_device_result_or_skip(tmp_path
         timeout=90.0,
     )
 
-    evidence = classify_metal_source_runtime_package_result("simdgroup_gemm_8x8", result)
+    evidence = classify_metal_source_runtime_package_result(
+        "simdgroup_gemm_8x8", result
+    )
     checked = _assert_claim_level_4_or_skip(evidence)
     if checked.device_result_proven:
         assert checked.metallib_produced is False
         _assert_device_result_manifest_round_trip(result, checked)
 
 
-def test_gpu_level4_simdgroup_gemm_32_splitk_transpose_edge_tail_device_result_or_skip(tmp_path):
+def test_gpu_level4_simdgroup_gemm_32_splitk_transpose_edge_tail_device_result_or_skip(
+    tmp_path,
+):
     if sys.platform != "darwin" and _strict_hardware():
         raise AssertionError("strict Metal hardware gate requires Darwin")
 

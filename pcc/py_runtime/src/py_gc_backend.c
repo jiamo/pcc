@@ -71,6 +71,8 @@ typedef struct PccGcObjectNode {
     struct PccGcObjectNode *prev;
     struct PccGcZPageNode *zpage_node;
     int64_t gc_refs;
+    struct PccGcObjectNode *young_next;
+    struct PccGcObjectNode *young_prev;
 } PccGcObjectNode;
 
 typedef struct PccGcFrameNode {
@@ -190,6 +192,11 @@ typedef struct {
 
 static PccGcObjectNode *pcc_gc_objects = NULL;
 static PccGcObjectNode *pcc_gc_trace_cursor = NULL;
+/* Backend #3 drains young objects in bounded pcc_gc_step() batches.  Keep a
+ * cursor between batches so a full promotion does not restart at the object
+ * list head after every budget-sized chunk.  Allocations publish pending work;
+ * object unlink advances the cursor under the existing graph lock. */
+static PccGcObjectNode *pcc_gc_backend3_young_head = NULL;
 static PccGcObjectNode *pcc_gc_object_node_free_list = NULL;
 static int64_t pcc_gc_object_node_free_count = 0;
 static int64_t pcc_gc_gray_count = 0;
@@ -529,11 +536,57 @@ static void pcc_gc_object_node_link_head(PccGcObjectNode *n) {
     pcc_gc_objects = n;
 }
 
+static void pcc_gc_backend3_young_link_head(PccGcObjectNode *n) {
+    if (n == NULL) return;
+    n->young_prev = NULL;
+    n->young_next = pcc_gc_backend3_young_head;
+    if (pcc_gc_backend3_young_head != NULL) {
+        pcc_gc_backend3_young_head->young_prev = n;
+    }
+    pcc_gc_backend3_young_head = n;
+}
+
+static void pcc_gc_backend3_young_unlink(PccGcObjectNode *n) {
+    if (n == NULL) return;
+    if (n->young_prev != NULL) {
+        n->young_prev->young_next = n->young_next;
+    } else if (pcc_gc_backend3_young_head == n) {
+        pcc_gc_backend3_young_head = n->young_next;
+    } else {
+        n->young_next = NULL;
+        n->young_prev = NULL;
+        return;
+    }
+    if (n->young_next != NULL) {
+        n->young_next->young_prev = n->young_prev;
+    }
+    n->young_next = NULL;
+    n->young_prev = NULL;
+}
+
+static void pcc_gc_backend3_young_rebuild_unlocked(void) {
+    pcc_gc_backend3_young_head = NULL;
+    for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
+        n->young_next = NULL;
+        n->young_prev = NULL;
+        if (
+            pcc_gc_object_node_is_active(n)
+            && (
+                py_header_flags_load(py_header(n->obj))
+                & PY_FLAG_GC_YOUNG
+            ) != 0
+        ) {
+            pcc_gc_backend3_young_link_head(n);
+        }
+    }
+}
+
 static void pcc_gc_object_node_unlink(PccGcObjectNode *n) {
     if (n == NULL) return;
     if (pcc_gc_trace_cursor == n) {
         pcc_gc_trace_cursor = n->next;
     }
+    pcc_gc_backend3_young_unlink(n);
     if (n->prev != NULL) {
         n->prev->next = n->next;
     } else if (pcc_gc_objects == n) {
@@ -5775,6 +5828,15 @@ int64_t pcc_gc_set_backend(int64_t backend) {
     pcc_gc_mark_active_store(0);
     pcc_gc_cycle_requested_store(1);
     pcc_gc_trace_cursor = NULL;
+    if (backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
+        pcc_gc_backend3_young_rebuild_unlocked();
+    } else {
+        pcc_gc_backend3_young_head = NULL;
+        for (PccGcObjectNode *n = pcc_gc_objects; n != NULL; n = n->next) {
+            n->young_next = NULL;
+            n->young_prev = NULL;
+        }
+    }
     pcc_gc_gray_count_store(0);
     __atomic_store_n(&pcc_gc_debt_bytes, 0, __ATOMIC_RELEASE);
     if (!pcc_gc_tracks_objects()) {
@@ -5783,6 +5845,7 @@ int64_t pcc_gc_set_backend(int64_t backend) {
             free(pcc_gc_objects);
             pcc_gc_objects = next;
         }
+        pcc_gc_backend3_young_head = NULL;
         pcc_gc_object_index_clear();
         __atomic_store_n(&pcc_gc_live_bytes, 0, __ATOMIC_RELEASE);
     }
@@ -6931,6 +6994,8 @@ static PyObject *pcc_gc_generational_oldify_copy(PyObject *from) {
     n->next = NULL;
     n->prev = NULL;
     n->zpage_node = NULL;
+    n->young_next = NULL;
+    n->young_prev = NULL;
     pcc_gc_object_node_link_head(n);
     if (pcc_gc_object_index_insert(to, n) < 0) {
         pcc_gc_object_node_unlink(n);
@@ -6950,6 +7015,8 @@ static PyObject *pcc_gc_generational_oldify_copy(PyObject *from) {
         return NULL;
     }
 
+    PccGcObjectNode *from_node = (PccGcObjectNode *)pcc_gc_object_index_find(from);
+    pcc_gc_backend3_young_unlink(from_node);
     pcc_gc_mark_forwarded_source_inactive(from);
     py_header_flags_update(from_h, PY_FLAG_GC_YOUNG, PY_FLAG_GC_OLD);
     return to;
@@ -6981,6 +7048,9 @@ static void pcc_gc_promote_young_object(PyObject *o) {
         }
         PCC_RT_TRIPWIRE((py_header_flags_load(h) & PY_FLAG_GC_OLD) == 0,
                         "pcc_gc_promote_young_object: promoting a YOUNG object already marked OLD (young->old generation invariant violated)");
+        pcc_gc_backend3_young_unlink(
+            (PccGcObjectNode *)pcc_gc_object_index_find(o)
+        );
         py_header_flags_update(h, PY_FLAG_GC_YOUNG, PY_FLAG_GC_OLD);
         if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
             pcc_gc_backend4_zpage_note_owner_promoted_unlocked(o);
@@ -8375,27 +8445,28 @@ static int64_t pcc_gc_step_generational_promotion(
     );
     processed += pcc_gc_backend3_drain_remembered_owners(budget - processed);
     if (promote_all_young) {
-        for (
-            PccGcObjectNode *n = pcc_gc_objects;
-            n != NULL && processed < budget;
-            n = n->next
-        ) {
+        while (pcc_gc_backend3_young_head != NULL && processed < budget) {
+            PccGcObjectNode *n = pcc_gc_backend3_young_head;
+            pcc_gc_backend3_young_unlink(n);
             if (!pcc_gc_object_node_is_active(n)) continue;
             PyObjectHeader *h = py_header(n->obj);
             int32_t flags = py_header_flags_load(h);
-            if ((flags & PY_FLAG_GC_YOUNG) != 0) {
-                if (pcc_gc_forwarding_find(n->obj) != NULL) continue;
-                pcc_gc_promote_young_object(n->obj);
-                int32_t after_flags = py_header_flags_load(h);
-                if (
-                    (after_flags & PY_FLAG_GC_YOUNG) == 0
-                    || pcc_gc_forwarding_find(n->obj) != NULL
-                ) {
-                    processed++;
-                    if ((processed % PCC_GC_SAFEPOINT_BATCH) == 0) {
-                        pcc_thread_safepoint();
-                    }
+            if ((flags & PY_FLAG_GC_YOUNG) == 0) continue;
+            if (pcc_gc_forwarding_find(n->obj) != NULL) continue;
+            pcc_gc_promote_young_object(n->obj);
+            int32_t after_flags = py_header_flags_load(h);
+            if (
+                (after_flags & PY_FLAG_GC_YOUNG) == 0
+                || pcc_gc_forwarding_find(n->obj) != NULL
+            ) {
+                processed++;
+                if ((processed % PCC_GC_SAFEPOINT_BATCH) == 0) {
+                    pcc_thread_safepoint();
                 }
+            } else {
+                /* A transient promotion failure must remain schedulable. */
+                pcc_gc_backend3_young_link_head(n);
+                break;
             }
         }
     }
@@ -8804,8 +8875,15 @@ void pcc_gc_note_object_allocated_sized(PyObject *o, int64_t size) {
     n->next = NULL;
     n->prev = NULL;
     n->zpage_node = NULL;
+    n->young_next = NULL;
+    n->young_prev = NULL;
     pcc_gc_object_node_link_head(n);
     (void)pcc_gc_object_index_insert(o, n);
+    if (
+        pcc_gc_selected_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+    ) {
+        pcc_gc_backend3_young_link_head(n);
+    }
     if (pcc_gc_selected_backend == PCC_GC_KIND_COLORED_RELOCATING) {
         n->zpage_node = pcc_gc_backend4_zpage_track_alloc_unlocked(o, n->size);
     }

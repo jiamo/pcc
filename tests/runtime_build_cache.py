@@ -18,6 +18,9 @@ import sys
 import tempfile
 from typing import Callable, ParamSpec, TypeVar
 
+from pcc.backend.self_backend_cache_identity import (
+    self_backend_emitter_source_identity,
+)
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -98,6 +101,13 @@ def self_host_source_key() -> str:
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=1)
+def self_backend_object_cache_key() -> str:
+    """Fingerprint only the implementation behind IR-shard object emission."""
+
+    return self_backend_emitter_source_identity(_REPO_ROOT)
+
+
 def cached_self_host_oracle_dir() -> Path:
     """Return a source-addressed directory for immutable pcc1/pcc2/pcc3."""
 
@@ -156,9 +166,7 @@ def _cached_c_runtime(*, threaded: bool) -> Path:
 
     variant = "c-threaded" if threaded else "c-default"
     key = _c_runtime_source_key() + "-" + variant
-    cache_root = (
-        Path.home() / ".cache" / "pcc" / "test-artifacts" / "runtime-builds"
-    )
+    cache_root = Path.home() / ".cache" / "pcc" / "test-artifacts" / "runtime-builds"
     cache_root.mkdir(parents=True, exist_ok=True)
     runtime = cache_root / key
     marker_name = ".pcc-c-runtime-complete"
@@ -180,9 +188,7 @@ def _cached_c_runtime(*, threaded: bool) -> Path:
                     return runtime
             if runtime.exists():
                 shutil.rmtree(runtime)
-            staging_root = Path(
-                tempfile.mkdtemp(prefix=key + ".", dir=str(cache_root))
-            )
+            staging_root = Path(tempfile.mkdtemp(prefix=key + ".", dir=str(cache_root)))
             work_runtime = staging_root / "py_runtime"
             shutil.copytree(
                 _RUNTIME_DIR,
@@ -276,7 +282,9 @@ def _pcc_runtime_source_key(pcc_bin: Path) -> str:
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
-            if any(part.startswith(".") or part == "__pycache__" for part in path.parts):
+            if any(
+                part.startswith(".") or part == "__pycache__" for part in path.parts
+            ):
                 continue
             if path.suffix not in {".c", ".h", ".py"} and path.name != "Makefile":
                 continue
@@ -291,9 +299,7 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
     pcc_bin = _REPO_ROOT / ".venv" / "bin" / "pcc"
     variant = "threaded-pcc-py" if threaded else "pcc-py"
     key = _pcc_runtime_source_key(pcc_bin) + "-" + variant
-    cache_root = (
-        Path.home() / ".cache" / "pcc" / "test-artifacts" / "runtime-builds"
-    )
+    cache_root = Path.home() / ".cache" / "pcc" / "test-artifacts" / "runtime-builds"
     cache_root.mkdir(parents=True, exist_ok=True)
     runtime = cache_root / key
     marker = runtime / (".pcc-" + variant + "-complete")
@@ -313,15 +319,13 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
                     return runtime
             if runtime.exists():
                 shutil.rmtree(runtime)
-            staging_root = Path(
-                tempfile.mkdtemp(prefix=key + ".", dir=str(cache_root))
-            )
+            staging_root = Path(tempfile.mkdtemp(prefix=key + ".", dir=str(cache_root)))
             work_runtime = staging_root / "py_runtime"
             shutil.copytree(
                 _RUNTIME_DIR,
                 work_runtime,
                 ignore=shutil.ignore_patterns(
-            "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
+                    "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
                 ),
             )
             command = [

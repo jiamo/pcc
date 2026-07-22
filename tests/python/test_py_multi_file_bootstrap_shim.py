@@ -1682,7 +1682,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
         def fake_worker_commands(commands, max_parallel=None):
             self.assertEqual(max_parallel, 2)
-            self.assertEqual(len(commands), 2)
+            self.assertEqual(len(commands), 3)
             for command in commands:
                 parts = command.split()
                 self.assertIn(pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG, parts)
@@ -1693,6 +1693,10 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 )
                 payload = manifest_lines[1:]
                 self.assertEqual(len(payload) % 4, 0)
+                self.assertLessEqual(
+                    len(payload) // 4,
+                    pipeline._SELF_BACKEND_EMIT_BATCH_MAX_ITEMS,
+                )
                 item = 0
                 while item < len(payload):
                     _ir_path = payload[item]
@@ -1707,8 +1711,11 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         def fake_run(cmd, **kwargs):
             return subprocess.CompletedProcess(cmd, 0)
 
-        with mock.patch.dict(os.environ, {"PCC_SELF_BACKEND_JOBS": "2"}), mock.patch.object(
-            pipeline, "_python_frontend_worker_executable", return_value="/tmp/pcc1"
+        with (
+            mock.patch.dict(os.environ, {"PCC_SELF_BACKEND_JOBS": "2"}),
+            mock.patch.object(
+                pipeline, "_python_frontend_worker_executable", return_value="/tmp/pcc1"
+            ),
         ):
             with mock.patch.object(
                 pipeline,
@@ -1731,25 +1738,22 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                                 side_effect=fake_run,
                             ):
                                 pairs = pipeline._emit_self_objects_many_in_process(
-                                    [ir_text] * 5,
+                                    [ir_text] * 10,
                                     self.td,
                                     "cc",
                                     split_large_modules=True,
                                     profile=None,
                                 )
 
-        self.assertEqual(len(pairs), 5)
+        self.assertEqual(len(pairs), 10)
         split_mock.assert_not_called()
         emit_mock.assert_not_called()
         worker_commands_mock.assert_called_once()
         collect_mock.assert_not_called()
         commands = worker_commands_mock.call_args.args[0]
-        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(commands), 3)
         self.assertTrue(
-            all(
-                pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG in cmd
-                for cmd in commands
-            )
+            all(pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG in cmd for cmd in commands)
         )
 
     def test_self_backend_emit_batch_worker_stops_on_first_failure(self):
@@ -1809,7 +1813,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 with mock.patch.object(
                     pipeline,
                     "_run_python_frontend_worker_commands",
-                    side_effect=AssertionError("cache hits must not launch emit workers"),
+                    side_effect=AssertionError(
+                        "cache hits must not launch emit workers"
+                    ),
                 ) as worker_commands_mock:
                     with mock.patch.object(pipeline.gc, "collect") as collect_mock:
                         pairs = pipeline._emit_self_objects_many_in_process(
@@ -1827,11 +1833,15 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_self_native_emitter_splits_large_ir_in_compiled_stage_worker(self):
         from pcc.py_frontend import pipeline
 
-        ir_text = (
-            'target triple = "arm64-apple-darwin23.6.0"\n'
-            "define i32 @first() {\nentry:\n  ret i32 1\n}\n"
-            "define i32 @second() {\nentry:\n  ret i32 2\n}\n"
-        )
+        ir_text = 'target triple = "arm64-apple-darwin23.6.0"\n'
+        for index in range(6):
+            ir_text += (
+                "define i32 @function_"
+                + str(index)
+                + "() {\nentry:\n  ret i32 "
+                + str(index)
+                + "\n}\n"
+            )
         command_batches = []
 
         def fake_worker_commands(commands, max_parallel=None):
@@ -1861,14 +1871,22 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             os.environ,
             {
                 "PCC_SELF_BACKEND_SPLIT_LARGE_MODULES": "1",
-                "PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES": "1",
-                "PCC_SELF_BACKEND_SPLIT_SHARD_BYTES": "1",
+                "PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES": "200",
+                "PCC_SELF_BACKEND_SPLIT_SHARD_BYTES": "80",
             },
         ):
-            with mock.patch.object(
-                pipeline,
-                "_python_frontend_worker_executable",
-                return_value="/tmp/pcc1",
+            with (
+                mock.patch.object(
+                    pipeline,
+                    "_python_frontend_worker_executable",
+                    return_value="/tmp/pcc1",
+                ),
+                mock.patch.object(pipeline, "_self_backend_jobs", return_value=2),
+                mock.patch.object(
+                    pipeline,
+                    "_SELF_BACKEND_EMIT_BATCH_MAX_ITEMS",
+                    1,
+                ),
             ):
                 with mock.patch.object(
                     pipeline,
@@ -1889,7 +1907,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                         )
 
         split_mock.assert_not_called()
-        self.assertEqual(len(pairs), 2)
+        self.assertGreaterEqual(len(pairs), 2)
         self.assertEqual(len(command_batches), 2)
         self.assertEqual(command_batches[0][1], 1)
         self.assertIn(pipeline._SELF_BACKEND_SPLIT_WORKER_ARG, command_batches[0][0][0])
@@ -1914,9 +1932,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             command_batches.append((commands, max_parallel))
             for command in commands:
                 parts = command.split()
-                worker_index = parts.index(
-                    pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG
-                )
+                worker_index = parts.index(pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG)
                 with open(parts[worker_index + 1], "r", encoding="utf-8") as f:
                     payload = f.read().splitlines()[1:]
                 item = 0
@@ -1965,7 +1981,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         split_mock.assert_called_once_with([ir_text])
         self.assertEqual(len(pairs), 2)
         self.assertEqual(len(command_batches), 1)
-        self.assertEqual(command_batches[0][1], 2)
+        self.assertEqual(command_batches[0][1], 1)
         self.assertTrue(
             all(
                 command.startswith("/usr/bin/python3 -m pcc ")
@@ -2004,23 +2020,24 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             observed_ir.append(ir_text)
             return ".text\n"
 
-        with mock.patch.object(
-            pipeline,
-            "_host_target_triple_for_self_backend",
-            return_value="arm64-apple-darwin23.6.0",
-        ), mock.patch.object(
-            pipeline,
-            "_emit_aarch64_darwin_asm_native",
-            side_effect=emit,
+        with (
+            mock.patch.object(
+                pipeline,
+                "_host_target_triple_for_self_backend",
+                return_value="arm64-apple-darwin23.6.0",
+            ),
+            mock.patch.object(
+                pipeline,
+                "_emit_aarch64_darwin_asm_native",
+                side_effect=emit,
+            ),
         ):
             status = pipeline.run_self_backend_emit_worker(ir_path, result_path)
 
         self.assertEqual(status, 0)
         self.assertEqual(len(observed_ir), 1)
         self.assertTrue(
-            observed_ir[0].startswith(
-                'target triple = "arm64-apple-darwin23.6.0"\n'
-            )
+            observed_ir[0].startswith('target triple = "arm64-apple-darwin23.6.0"\n')
         )
 
     def test_frontend_worker_empty_ir_fails_with_module_name(self):
@@ -2517,7 +2534,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         compile_mock.assert_called_once()
         self.assertEqual(compile_mock.call_args.kwargs["backend"], "self")
-        self.assertIsNone(compile_mock.call_args.kwargs["libpython_mode"])
+        self.assertEqual(compile_mock.call_args.kwargs["libpython_mode"], "off")
+        self.assertEqual(compile_mock.call_args.kwargs["ir_scaffold_mode"], "on")
 
     def test_bootstrap_cli_dispatches_self_backend_emit_batch_worker(self):
         from pcc import cli_bootstrap

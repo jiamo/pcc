@@ -2334,7 +2334,8 @@ def py_str_join(sep, lst):
     lst = pcc_gc_note_relocation_read(lst)
     if _type_of(sep) != 4:
         return null()
-    if _type_of(lst) != 5:
+    sequence_tag: int = _type_of(lst)
+    if sequence_tag != 5 and sequence_tag != 7:
         return null()
     length: int = load_i64(lst, 16)
     if length == 0:
@@ -2343,7 +2344,10 @@ def py_str_join(sep, lst):
     sep_len: int = load_i64(sep, 16)
     if sep_len < 0:
         return null()
-    items = load_ptr(lst, 32)
+    if sequence_tag == 5:
+        items = load_ptr(lst, 32)
+    else:
+        items = ptr_add(lst, 24)
     total: int = 0
     i: int = 0
     while i < length:
@@ -2373,7 +2377,10 @@ def py_str_join(sep, lst):
     # pre-allocation object or list-items pointers while copying the payload.
     sep = pcc_gc_note_relocation_read(sep)
     lst = pcc_gc_note_relocation_read(lst)
-    items = load_ptr(lst, 32)
+    if sequence_tag == 5:
+        items = load_ptr(lst, 32)
+    else:
+        items = ptr_add(lst, 24)
     out_data = ptr_add(out, 40)
     sep_data = ptr_add(sep, 40)
     off: int = 0

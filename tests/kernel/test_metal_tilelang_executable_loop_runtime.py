@@ -19,10 +19,13 @@ from tests.kernel.test_tilelang_executable_loop_bodies import (
 )
 
 
+pytestmark = pytest.mark.pcc_gate(probe="metal")
+
+
 @pytest.mark.parametrize("kind", ["parallel", "vectorized"])
 def test_executable_scheduled_loop_real_metal_readback(tmp_path, kind: str):
     if sys.platform != "darwin":
-        pytest.skip("TileLang executable-loop runtime requires Darwin Metal")
+        pytest.fail("TileLang executable-loop runtime requires Darwin Metal")
     if kind == "parallel":
         module = import_tilelang_source(
             TILELANG_PARALLEL_ADD,
@@ -67,7 +70,7 @@ def test_executable_scheduled_loop_real_metal_readback(tmp_path, kind: str):
     )
     data = result.to_dict()
     if result.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(data["reason"])
+        pytest.fail(data["reason"])
     assert result.status == STATUS_SOURCE_RUNTIME_PACKAGE_EXECUTED, data
     assert data["runtime_launch_executed"] is True
     assert data["invocation"]["fence_completed"] is True

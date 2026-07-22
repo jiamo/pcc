@@ -16,6 +16,14 @@ only, local, hardware-gated). What does **not** exist: whole-program GPU,
 `import tvm` / `import tilelang` runtime execution, and any real distributed
 runtime. Every section below repeats what it proves and what it does not.
 
+## Chapter Guide: GPU/Metal Thread is an Ownership Option, Not a Sixth Mission
+
+This chapter shows how pcc extends its native execution ownership thesis to GPU and accelerator hardware. Keep three boundaries in mind while reading:
+
+- Metal kernel IR and host/device split is the only real compilation path.
+- TVM, TIRx, and TileLang exist strictly as reference oracles or syntax subset parsers.
+- The GPU-GC and distributed subsystems are today CPU-only structural validation oracles.
+
 ## 19.1 Boundary and overview
 
 The GPU line has three parts, in decreasing maturity:
@@ -142,6 +150,13 @@ model GPU object / external-resource lifetime, but is **not wired into** those
 backends and is not a moving collector. Its `external_resource` seam is
 "production-shaped" but not connected to the C or pcc-Python runtime.
 
+```text
+[Host Python App] ──► kernel_ir.validate_kernel() ──► Metal Finalize (.metallib)
+                            │                               │
+                            ▼                               ▼
+                     CPU Oracle Check ◄───────────── Metal Hardware Execution
+```
+
 `pcc/dist/` is a **single-process, CPU, no-socket** metadata oracle: it models
 session/`DRef` identity, device mesh, deterministic collective semantics,
 sharding schedules, and KV-block bookkeeping. Every network mode reports
@@ -178,3 +193,14 @@ third time — the self backend treating LLVM as an oracle (Chapter 13), the val
 model treating Valhalla as a projection reference (Chapter 16). The cost is speed
 — it can only grow slice by slice; the payoff is that every slice is **its own**,
 auditable, claim-leveled execution, not a borrowed "support."
+
+## Summary
+
+1. **Strict Host/Device Isolation**: `validate_kernel()` rejects heap objects, dynamic dispatch, or exception handling on the device side.
+2. **Oracle Architectural Rule**: TVM and TileLang serve purely as verification oracles for IR shape and reference correctness, not runtime dependencies.
+3. **Hardware Gate Rigor**: Acceleration tests are explicitly gated by `PCC_GPU_HARDWARE_STRICT=1` and report `SKIPPED_WITH_REASON` when environment support is lacking.
+
+## Exercises
+
+1. Read [pcc/kernel_ir/tilelang_import.py](../../pcc/kernel_ir/tilelang_import.py) and analyze how `_parse_tilelang_ast` parses PrimFunc AST without importing `tilelang`.
+2. Write a `@gpu.kernel` function that attempts to instantiate a `PyObject`, and observe the exact diagnostic produced by `validate_kernel()`.

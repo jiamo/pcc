@@ -58,16 +58,22 @@ def _find_stage_binary(env_name: str, candidates: tuple[Path, ...]) -> Path | No
 
 PCC1 = _find_pcc1()
 PCC2 = _find_pcc2()
-pytestmark = pytest.mark.skipif(
-    PCC1 is None,
-    reason=(
-        "No pcc1 binary found on disk; run "
-        "tests/python/test_pcc_bootstrap_full.py first."
-    ),
+pytestmark = pytest.mark.pcc_gate(probe="pcc1")
+
+
+@pytest.mark.parametrize(
+    "stage_name,binary",
+    [
+        ("pcc1", PCC1),
+        pytest.param(
+            "pcc2",
+            PCC2,
+            marks=pytest.mark.pcc_gate(
+                unavailable=None if PCC2 is not None else "No pcc2 binary on disk"
+            ),
+        ),
+    ],
 )
-
-
-@pytest.mark.parametrize("stage_name,binary", [("pcc1", PCC1), ("pcc2", PCC2)])
 @pytest.mark.parametrize("gc_backend", ["0", "1", "2", "3", "4"])
 def test_bootstrap_stage_cli_starts_under_gc_backend(
     stage_name: str,
@@ -82,7 +88,7 @@ def test_bootstrap_stage_cli_starts_under_gc_backend(
     parse CLI options, print help, and shut down without finalizer/root issues.
     """
     if binary is None:
-        pytest.skip(f"No {stage_name} binary found on disk")
+        pytest.fail(f"No {stage_name} binary found on disk")
     env = {
         **os.environ,
         "PCC_GC_BACKEND": gc_backend,

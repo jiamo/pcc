@@ -33,6 +33,9 @@ from pcc.kernel_ir.tirx_adapter import lower_to_plain_tir
 DEFAULT_DS4_ROOT = Path("~/pcc_refs/antirez-ds4-depth1").expanduser()
 
 
+pytestmark = pytest.mark.pcc_gate(probe="metal")
+
+
 @pytest.fixture(scope="module")
 def ds4_copy_source() -> str:
     root = Path(os.environ.get("PCC_DS4_ROOT", str(DEFAULT_DS4_ROOT))).expanduser()
@@ -91,7 +94,7 @@ def test_ds4_f32_copy_cpu_oracle_is_exact_and_shape_checked():
 
 def test_ds4_f32_copy_real_metal_readback_matches_cpu_oracle(tmp_path: Path):
     if sys.platform != "darwin":
-        pytest.skip("ds4 primitive runtime-source Metal readback requires Darwin")
+        pytest.fail("ds4 primitive runtime-source Metal readback requires Darwin")
     matrix = (
         (-11.5, 0.0, 1.25, 42.0),
         (3.0, -7.75, 1024.5, -0.03125),
@@ -114,7 +117,7 @@ def test_ds4_f32_copy_real_metal_readback_matches_cpu_oracle(tmp_path: Path):
     result = execution.raw_result
     data = result.to_dict()
     if result.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(data["reason"])
+        pytest.fail(data["reason"])
 
     assert result.status == STATUS_SOURCE_RUNTIME_PACKAGE_EXECUTED, data
     assert execution.synchronized is True

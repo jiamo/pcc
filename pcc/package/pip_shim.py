@@ -63,9 +63,7 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
                 }
             target_python = args[i + 1]
             i += 1
-        elif arg.startswith("--python-version=") or arg.startswith(
-            "--target-python="
-        ):
+        elif arg.startswith("--python-version=") or arg.startswith("--target-python="):
             target_python = arg.split("=", 1)[1]
         elif arg == "--report":
             dry_run = True
@@ -253,6 +251,7 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
         else _default_cache_dir()
     )
     install_specs: list[str] = []
+    acquired_install_origins: dict[str, str] = {}
     acquisitions: list[dict[str, object]] = []
     for package in packages:
         local_source, origin = _resolve_spec_with_origin(
@@ -281,7 +280,9 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
         acquisitions.append(acquisition)
         artifact_path = acquisition.get("artifact_path")
         if acquisition.get("ok") and artifact_path:
-            install_specs.append(str(artifact_path))
+            artifact_text = str(artifact_path)
+            install_specs.append(artifact_text)
+            acquired_install_origins[str(Path(artifact_text).resolve())] = "index-url"
 
     failed_acquisitions = [item for item in acquisitions if not item.get("ok")]
     if failed_acquisitions:
@@ -319,18 +320,24 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
     )
     if not packages:
         return {"ok": False, "command": command, "error": "no packages requested"}
-    installs = [
-        install_package(
-            pkg,
-            target_dir=target_dir,  # type: ignore[arg-type]
-            cache_dir=cache_dir,  # type: ignore[arg-type]
-            find_links=find_links,
-            index_urls=(),
-            abi=abi,
-            build_source=True,
+    installs: list[dict[str, object]] = []
+    for pkg in install_specs:
+        origin_override = None
+        pkg_path = Path(pkg).expanduser()
+        if pkg_path.exists():
+            origin_override = acquired_install_origins.get(str(pkg_path.resolve()))
+        installs.append(
+            install_package(
+                pkg,
+                target_dir=target_dir,  # type: ignore[arg-type]
+                cache_dir=cache_dir,  # type: ignore[arg-type]
+                find_links=find_links,
+                index_urls=(),
+                abi=abi,
+                build_source=True,
+                resolved_from_override=origin_override,
+            )
         )
-        for pkg in install_specs
-    ]
     plan: dict[str, object] = {
         "ok": all(item.get("ok") for item in installs),
         "command": command,

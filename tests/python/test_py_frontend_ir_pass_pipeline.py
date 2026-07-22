@@ -20,6 +20,81 @@ def test_python_frontend_jobs_defaults_to_auto(monkeypatch):
     assert pipeline._python_frontend_jobs(111) == 10
 
 
+def test_profiled_gc_collect_records_current_process_reclamation(monkeypatch):
+    profile = {}
+    monkeypatch.setattr(pipeline.gc, "collect", lambda: 7)
+
+    assert pipeline._profiled_gc_collect(profile, "current_process") == 7
+    assert profile["counters"]["current_process_objects"] == 7
+    assert profile["counters"]["current_process_skipped"] == 0
+    assert profile["phase_totals_ms"]["current_process"] >= 0
+
+
+def test_profiled_gc_collect_skips_subprocess_reclamation_boundary(monkeypatch):
+    profile = {}
+
+    def unexpected_collect():
+        raise AssertionError("worker exit owns reclamation")
+
+    monkeypatch.setattr(pipeline.gc, "collect", unexpected_collect)
+
+    assert (
+        pipeline._profiled_gc_collect(
+            profile,
+            "worker_boundary",
+            allocations_owned_by_current_process=False,
+        )
+        == 0
+    )
+    assert profile["counters"]["worker_boundary_objects"] == 0
+    assert profile["counters"]["worker_boundary_skipped"] == 1
+    assert profile["phase_totals_ms"]["worker_boundary"] >= 0
+
+
+def test_python_frontend_package_graph_auto_budget_caps_retained_heap(monkeypatch):
+    monkeypatch.delenv("PCC_PY_FRONTEND_JOBS", raising=False)
+    monkeypatch.delenv("PCC_OUTER_PARALLELISM", raising=False)
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
+    monkeypatch.setattr(
+        pipeline,
+        "_package_site_package_root_for_src",
+        lambda path: "/site/demo" if path.startswith("/site/") else None,
+    )
+
+    assert pipeline._python_frontend_jobs_for_sources(["/repo/main.py"] * 111) == 10
+    assert (
+        pipeline._python_frontend_jobs_for_sources(
+            ["/repo/main.py"] * 110 + ["/site/demo/__init__.py"]
+        )
+        == 1
+    )
+
+
+def test_python_frontend_package_graph_explicit_jobs_remain_authoritative(monkeypatch):
+    monkeypatch.setenv("PCC_PY_FRONTEND_JOBS", "5")
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
+    monkeypatch.setattr(
+        pipeline,
+        "_package_site_package_root_for_src",
+        lambda _path: "/site/demo",
+    )
+
+    assert pipeline._python_frontend_jobs_for_sources(["/site/demo/mod.py"] * 111) == 5
+
+
+def test_python_frontend_package_graph_caps_outer_auto_budget(monkeypatch):
+    monkeypatch.delenv("PCC_PY_FRONTEND_JOBS", raising=False)
+    monkeypatch.setenv("PCC_OUTER_PARALLELISM", "6")
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
+    monkeypatch.setattr(
+        pipeline,
+        "_package_site_package_root_for_src",
+        lambda _path: "/site/demo",
+    )
+
+    assert pipeline._python_frontend_jobs_for_sources(["/site/demo/mod.py"] * 111) == 1
+
+
 def test_python_frontend_jobs_env_can_force_serial(monkeypatch):
     monkeypatch.setenv("PCC_PY_FRONTEND_JOBS", "0")
     monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
@@ -34,6 +109,59 @@ def test_self_backend_jobs_defaults_to_conservative_pool(monkeypatch):
 
     assert pipeline._self_backend_jobs(111) == 2
     assert pipeline._self_backend_jobs(1) == 1
+
+
+def test_self_backend_large_ir_defaults_bound_native_worker_memory(monkeypatch):
+    monkeypatch.delenv("PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES", raising=False)
+    monkeypatch.delenv("PCC_SELF_BACKEND_SPLIT_SHARD_BYTES", raising=False)
+
+    assert pipeline._self_backend_split_threshold_bytes() == 2_000_000
+    assert pipeline._self_backend_split_shard_bytes() == 1_000_000
+
+
+def test_self_backend_large_ir_memory_budget_remains_overridable(monkeypatch):
+    monkeypatch.setenv("PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES", "3000000")
+    monkeypatch.setenv("PCC_SELF_BACKEND_SPLIT_SHARD_BYTES", "1500000")
+
+    assert pipeline._self_backend_split_threshold_bytes() == 3_000_000
+    assert pipeline._self_backend_split_shard_bytes() == 1_500_000
+
+
+def test_compiled_self_backend_large_ir_defaults_to_one_worker(monkeypatch):
+    monkeypatch.delenv("PCC_SELF_BACKEND_JOBS", raising=False)
+    monkeypatch.delenv("PCC_OUTER_PARALLELISM", raising=False)
+    monkeypatch.delenv("PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES", raising=False)
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
+
+    assert (
+        pipeline._self_backend_jobs_for_ir_texts(
+            ["x" * 2_000_000, "small"], native_worker=True
+        )
+        == 1
+    )
+    assert (
+        pipeline._self_backend_jobs_for_ir_texts(
+            ["x" * 1_999_999, "small"], native_worker=True
+        )
+        == 2
+    )
+    assert (
+        pipeline._self_backend_jobs_for_ir_texts(
+            ["x" * 2_000_000, "small"], native_worker=False
+        )
+        == 2
+    )
+
+
+def test_compiled_self_backend_explicit_jobs_override_large_ir_cap(monkeypatch):
+    monkeypatch.setenv("PCC_SELF_BACKEND_JOBS", "2")
+
+    assert (
+        pipeline._self_backend_jobs_for_ir_texts(
+            ["x" * 2_000_000, "small"], native_worker=True
+        )
+        == 2
+    )
 
 
 def test_nested_parallelism_shares_cpu_budget_across_outer_workers(monkeypatch):
@@ -417,7 +545,7 @@ def test_python_ir_pass_memory_transport_keeps_llvm_default_on_large_modules(
 def test_python_ir_pass_memory_transport_matches_opt_default_o2(monkeypatch):
     opt = find_opt_binary()
     if opt is None:
-        pytest.skip("matching LLVM opt binary is not available")
+        pytest.fail("matching LLVM opt binary is not available")
     monkeypatch.setenv("PCC_PYTHON_IR_PASS_TRANSPORT", "memory")
 
     memory_out = ir_pass_pipeline.run_python_ir_pass_pipeline(
@@ -433,7 +561,7 @@ def test_python_ir_pass_memory_transport_matches_opt_default_o2(monkeypatch):
 def test_python_ir_pass_memory_transport_canonicalizes_default_os(monkeypatch):
     opt = find_opt_binary()
     if opt is None:
-        pytest.skip("matching LLVM opt binary is not available")
+        pytest.fail("matching LLVM opt binary is not available")
     monkeypatch.setenv("PCC_PYTHON_IR_PASS_TRANSPORT", "memory")
 
     memory_out = ir_pass_pipeline.run_python_ir_pass_pipeline(

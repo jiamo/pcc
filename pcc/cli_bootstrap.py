@@ -20,6 +20,14 @@ from .package_schema import (
     pcc_native_wheel_tag,
     wheel_tag_fields,
 )
+from .package_environment import (
+    apply_locked_environment_resource_defaults,
+    default_package_cache as _pcc_default_package_cache,
+    default_package_site as _pcc_default_package_site,
+    environment_info_json,
+    environment_info_text,
+    package_site_roots,
+)
 
 from .py_frontend.pipeline import compile_python as _compile_python
 from .py_frontend.pipeline import (
@@ -65,6 +73,48 @@ def _bootstrap_subprocess_run(args, *, check=False):
     return None
 
 
+def _native_bootstrap_executable() -> str:
+    argv0 = str(sys.argv[0] if len(sys.argv) > 0 else "" or "").strip()
+    base = os.path.basename(argv0).lower()
+    if not argv0 or not base.startswith("pcc") or argv0.endswith(".py"):
+        return ""
+    if os.path.isfile(argv0):
+        return os.path.abspath(argv0)
+    for root in _native_path_search_dirs():
+        candidate = os.path.join(root, argv0)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return ""
+
+
+def _restart_with_locked_environment_defaults(raw_argv, applied_defaults):
+    """Restart a native stage after publishing locked resource defaults.
+
+    The compiled bootstrap imports the frontend before ``bootstrap_cli_main``.
+    A fresh process is therefore required for locked-environment defaults to
+    be initial state rather than a late environment mutation. The restarted
+    child sees non-empty values, so the operation is bounded to one restart.
+    """
+    if len(applied_defaults) == 0:
+        return None
+    executable = _native_bootstrap_executable()
+    if not executable:
+        return None
+    command = [executable]
+    command.extend(raw_argv)
+    try:
+        _bootstrap_subprocess_run(command, check=True)
+        return 0
+    except subprocess.CalledProcessError as exc:
+        return exc.returncode
+    except Exception:
+        _write_text(
+            "Error: pcc1 locked-environment resource restart failed",
+            err=True,
+        )
+        return 1
+
+
 _HELP_TEXT = """Usage: pcc [OPTIONS] PATH
 
 Bootstrap-oriented Python entry for pcc self-hosting.
@@ -75,6 +125,7 @@ entrypoint.
 
 Options:
   -h, --help                Show this help message and exit.
+  env info [--json]         Inspect the selected pcc package environment.
   -m MODULE [ARGS...]       Compile and run a Python module through pcc1.
   --backend BACKEND         Native emission backend: llvm or self.
   --python-libpython MODE   off (default), auto, or on for Python fallback linkage.
@@ -169,7 +220,7 @@ def _inferred_package_site_roots(src_path: str):
     _append_unique_path(roots, src_dir)
     if os.path.basename(src_dir) == "test" or os.path.basename(src_dir) == "tests":
         _append_unique_path(roots, os.path.dirname(src_dir))
-    env_roots = _split_path_list(os.environ.get("PCC_PACKAGE_SITE", ""))
+    env_roots = package_site_roots()
     i = 0
     while i < len(env_roots):
         _append_unique_path(roots, env_roots[i])
@@ -6890,9 +6941,7 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
                 return 2
             target_python = raw[i + 1]
             i += 1
-        elif arg.startswith("--python-version=") or arg.startswith(
-            "--target-python="
-        ):
+        elif arg.startswith("--python-version=") or arg.startswith("--target-python="):
             target_python = arg.split("=", 1)[1]
         elif arg == "--index-url" or arg == "-i":
             if i + 1 >= len(raw):
@@ -6967,8 +7016,9 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
     effective_indexes = _copy_seq(index_urls)
     if not no_index and len(effective_indexes) == 0:
         effective_indexes.append("https://pypi.org/simple")
-    actual_acquire_mode = "host" if acquire_mode == "auto" else acquire_mode
+    actual_acquire_mode = "owned" if acquire_mode == "auto" else acquire_mode
     install_packages = []
+    acquired_install_origins = []
     acquisition_jsons = []
     acquisition_failed = False
     acquisition_error = ""
@@ -7013,7 +7063,12 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
             ]
         elif actual_acquire_mode == "owned":
             acquired = _native_acquire_owned_result(
-                spec, cache_dir, effective_indexes, abi, target_python
+                spec,
+                cache_dir,
+                effective_indexes,
+                abi,
+                target_python,
+                acquire_mode == "auto",
             )
         else:
             acquired = _native_acquire_host_result(
@@ -7031,6 +7086,7 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
         )
         if acquired[0] is not None and acquired[4] == "":
             install_packages.append(acquired[0])
+            acquired_install_origins.append([os.path.abspath(acquired[0]), "index-url"])
         else:
             acquisition_failed = True
             acquisition_error = acquired[4]
@@ -7081,6 +7137,17 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
         while k < len(packages):
             if k > 0:
                 installs += ", "
+            resolved_from_override = None
+            if os.path.exists(packages[k]):
+                package_path = os.path.abspath(packages[k])
+                origin_index = 0
+                while origin_index < len(acquired_install_origins):
+                    if acquired_install_origins[origin_index][0] == package_path:
+                        resolved_from_override = acquired_install_origins[origin_index][
+                            1
+                        ]
+                        break
+                    origin_index += 1
             install_json = _native_install_manifest_json(
                 packages[k],
                 target_dir,
@@ -7088,6 +7155,7 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
                 find_links,
                 abi,
                 [],
+                resolved_from_override,
             )
             if _native_find_from(install_json, '"ok": false', 0) >= 0:
                 all_ok = False
@@ -7594,9 +7662,7 @@ def _native_extract_href_links(text: str, page_url: str):
 
 def _native_find_index_artifact_result(spec: str, cache_dir, index_urls, abi: str):
     expected = _native_normalized_package_name(spec)
-    cache_root = (
-        cache_dir or os.environ.get("PCC_PACKAGE_CACHE") or "/tmp/pcc-package-cache"
-    )
+    cache_root = cache_dir or _pcc_default_package_cache()
     scratch = cache_root + "/index-pages"
     downloads = cache_root + "/downloads"
     best_url = None
@@ -7890,7 +7956,12 @@ def _native_owned_shape_diagnostic(path: str, cache_root: str) -> str:
 
 
 def _native_acquire_owned_result(
-    spec: str, cache_dir, index_urls, abi: str, target_python: str
+    spec: str,
+    cache_dir,
+    index_urls,
+    abi: str,
+    target_python: str,
+    allow_pcc_native_build: bool = False,
 ):
     requirement = _native_requirement_parts(spec)
     if requirement[0] is None:
@@ -7903,9 +7974,7 @@ def _native_acquire_owned_result(
         ]
     name = requirement[0]
     exact_version = requirement[1]
-    cache_root = (
-        cache_dir or os.environ.get("PCC_PACKAGE_CACHE") or "/tmp/pcc-package-cache"
-    )
+    cache_root = cache_dir or _pcc_default_package_cache()
     scratch = os.path.join(cache_root, ".owned-acquire-" + str(os.getpid()))
     try:
         _bootstrap_subprocess_run(["mkdir", "-p", scratch], check=True)
@@ -7930,9 +7999,7 @@ def _native_acquire_owned_result(
             while j < len(links):
                 published_url = links[j][0]
                 requires_python = links[j][2]
-                if not _native_requires_python_allows(
-                    requires_python, target_python
-                ):
+                if not _native_requires_python_allows(requires_python, target_python):
                     j += 1
                     continue
                 clean_url = _native_url_without_fragment(published_url)
@@ -7975,6 +8042,13 @@ def _native_acquire_owned_result(
     if published[0] is None:
         return [None, best_url, published[1], "", "PCC-PKG-ACQUIRE-HASH-MISMATCH"]
     diagnostic = _native_owned_shape_diagnostic(published[0], cache_root)
+    build_isolation = ""
+    if (
+        allow_pcc_native_build
+        and diagnostic == "PCC-PKG-ACQUIRE-BUILD-ISOLATION-UNSUPPORTED"
+    ):
+        diagnostic = ""
+        build_isolation = "delegated-to-pcc-native-builder"
     if diagnostic != "":
         return [
             published[0],
@@ -7989,6 +8063,7 @@ def _native_acquire_owned_result(
         published[1],
         _native_artifact_version_text(best_name),
         "",
+        build_isolation,
     ]
 
 
@@ -8006,9 +8081,7 @@ def _native_acquire_host_result(
         ]
     name = requirement[0]
     exact_version = requirement[1]
-    cache_root = (
-        cache_dir or os.environ.get("PCC_PACKAGE_CACHE") or "/tmp/pcc-package-cache"
-    )
+    cache_root = cache_dir or _pcc_default_package_cache()
     stage = os.path.join(cache_root, ".host-acquire-" + str(os.getpid()))
     configured_host_python = os.environ.get("PCC_HOST_PYTHON")
     host_pythons = []
@@ -8055,9 +8128,7 @@ def _native_acquire_host_result(
                 base += ["--extra-index-url", index_urls[j]]
                 j += 1
         command = (
-            base + ["--no-binary=:all:", spec]
-            if abi == "pcc-native"
-            else base + [spec]
+            base + ["--no-binary=:all:", spec] if abi == "pcc-native" else base + [spec]
         )
         try:
             names = os.listdir(stage)
@@ -8121,7 +8192,10 @@ def _native_acquisition_json(
     out += ', "artifact_url": ' + _json_str_or_null(
         None if result[1] == "" else result[1]
     )
-    out += ', "build_isolation": "not_attempted"'
+    build_isolation = "not_attempted"
+    if actual_mode == "owned" and len(result) > 5 and result[5] != "":
+        build_isolation = result[5]
+    out += ', "build_isolation": ' + _json_str(build_isolation)
     out += ', "dependency_resolution": "not_attempted"'
     out += ', "diagnostic": ' + _json_str_or_null(
         None if result[4] == "" else result[4]
@@ -8312,9 +8386,7 @@ def _native_resolve_install_order(
     ordered = []
     visiting = []
     done = []
-    scratch = (
-        cache_dir or os.environ.get("PCC_PACKAGE_CACHE") or "/tmp/pcc-package-cache"
-    )
+    scratch = cache_dir or _pcc_default_package_cache()
 
     def visit(pkg: str) -> None:
         if _native_package_list_contains(done, pkg) != 0:
@@ -9001,6 +9073,16 @@ def _native_build_install_source_json(name: str, source, abi: str) -> str:
         return (
             '{"actions": [], "ok": true, "reason": "not_source_tree", "skipped": true}'
         )
+    if (
+        os.path.isfile(os.path.join(source, "meson.build"))
+        and abi == "pcc-native"
+        and _native_has_installable_meson_payload(name, source)
+    ):
+        return (
+            '{"actions": [], "build_backend": "existing", '
+            '"host_assisted": false, "ok": true, '
+            '"reason": "existing_build_outputs", "skipped": true}'
+        )
     if os.path.isfile(os.path.join(source, "meson.build")) and abi == "pcc-native":
         return _native_host_eager_meson_build_json(name, source)
     if os.path.isfile(os.path.join(source, "meson.build")):
@@ -9032,6 +9114,33 @@ def _native_build_install_source_json(name: str, source, abi: str) -> str:
         False,
         False,
     )
+
+
+def _native_has_installable_meson_payload(name: str, source: str) -> bool:
+    """Return whether a matching importable Meson payload already exists."""
+    build_root = os.path.join(source, "build", "pcc-package", "meson-build")
+    if not os.path.isdir(build_root):
+        return False
+    try:
+        names = sorted(os.listdir(build_root))
+    except Exception:
+        names = []
+    normalized_name = _native_normalized_package_name(name)
+    i = 0
+    while i < len(names):
+        child_name = names[i]
+        child = os.path.join(build_root, child_name)
+        if (
+            os.path.isdir(child)
+            and _native_normalized_package_name(child_name) == normalized_name
+            and (
+                os.path.isfile(os.path.join(child, "__init__.py"))
+                or _native_has_direct_importable_payload(child)
+            )
+        ):
+            return True
+        i += 1
+    return False
 
 
 def _native_host_eager_meson_build_json(name: str, source: str) -> str:
@@ -9110,6 +9219,7 @@ def _native_install_manifest_json(
     find_links,
     abi: str,
     index_urls=None,
+    resolved_from_override=None,
 ) -> str:
     if index_urls is None:
         index_urls = []
@@ -9118,6 +9228,8 @@ def _native_install_manifest_json(
     )
     source = resolved[0]
     resolved_from = resolved[1]
+    if resolved_from_override is not None:
+        resolved_from = resolved_from_override
     if source is None and not os.path.exists(spec):
         # Nothing resolved locally (not a path, not in find-links/cache).
         # Mirror the host installer's not-found failure instead of
@@ -9136,12 +9248,8 @@ def _native_install_manifest_json(
         name = _native_package_basename(source if source is not None else spec)
     else:
         name = _native_normalized_package_name(spec)
-    target = (
-        target_dir or os.environ.get("PCC_PACKAGE_SITE") or "/tmp/pcc-site-packages"
-    )
-    cache_root = (
-        cache_dir or os.environ.get("PCC_PACKAGE_CACHE") or "/tmp/pcc-package-cache"
-    )
+    target = target_dir or _pcc_default_package_site()
+    cache_root = cache_dir or _pcc_default_package_cache()
     cache_record = os.path.abspath(os.path.join(cache_root, name))
     prepared_source = [source, None]
     try:
@@ -9887,6 +9995,18 @@ def _format_compile_error(exc, *, options, metadata):
     note = "exception_type=" + (
         str(original_exception_type) if original_exception_type else "Exception"
     )
+    mode_backend = metadata.get("backend", "") if metadata else ""
+    mode_libpython = metadata.get("python_libpython", "") if metadata else ""
+    mode_scaffold = metadata.get("ir_scaffold", "") if metadata else ""
+    if mode_backend or mode_libpython or mode_scaffold:
+        note += (
+            "; backend="
+            + str(mode_backend)
+            + "; python_libpython="
+            + str(mode_libpython)
+            + "; ir_scaffold="
+            + str(mode_scaffold)
+        )
     if options.explain_fallback:
         note += (
             "; fallback_explain=libpython fallback is controlled by "
@@ -9912,6 +10032,17 @@ def _format_compile_error(exc, *, options, metadata):
             "      }"
         )
     if options.diagnostic_format == "json" or options.diagnostic_format == "sarif":
+        metadata_json = "{}"
+        if mode_backend or mode_libpython or mode_scaffold:
+            metadata_json = (
+                '{"backend": '
+                + _observability_json_str(mode_backend)
+                + ', "python_libpython": '
+                + _observability_json_str(mode_libpython)
+                + ', "ir_scaffold": '
+                + _observability_json_str(mode_scaffold)
+                + "}"
+            )
         return (
             "{\n"
             '  "schema": "pcc.diagnostics.v1",\n'
@@ -9922,7 +10053,7 @@ def _format_compile_error(exc, *, options, metadata):
             '      "phase": ' + _observability_json_str(options.phase) + ",\n"
             '      "message": ' + _observability_json_str(message) + ",\n"
             '      "notes": [' + _observability_json_str(note) + "],\n"
-            '      "metadata": {}' + span_json + "\n"
+            '      "metadata": ' + metadata_json + span_json + "\n"
             "    }\n"
             "  ],\n"
             '  "has_errors": true\n'
@@ -9944,6 +10075,9 @@ def _write_profile_json(path: str, options, metadata) -> None:
     phase = options.phase
     emit_llvm = metadata.get("emit_llvm", False) if metadata else False
     output_path = metadata.get("output_path", None) if metadata else None
+    backend = metadata.get("backend", None) if metadata else None
+    python_libpython = metadata.get("python_libpython", None) if metadata else None
+    ir_scaffold = metadata.get("ir_scaffold", None) if metadata else None
     counters = metadata.get("counters", {}) if metadata else {}
     phase_totals = metadata.get("phase_totals_ms", {}) if metadata else {}
     events = metadata.get("events", []) if metadata else []
@@ -9964,6 +10098,17 @@ def _write_profile_json(path: str, options, metadata) -> None:
         f.write('    "phase": ' + _observability_json_str(phase) + ",\n")
         f.write('    "time_unit": "seconds",\n')
         f.write('    "emit_llvm": ' + ("true" if emit_llvm else "false"))
+        if backend is not None:
+            f.write(",\n")
+            f.write('    "backend": ' + _observability_json_str(backend))
+        if python_libpython is not None:
+            f.write(",\n")
+            f.write(
+                '    "python_libpython": ' + _observability_json_str(python_libpython)
+            )
+        if ir_scaffold is not None:
+            f.write(",\n")
+            f.write('    "ir_scaffold": ' + _observability_json_str(ir_scaffold))
         if output_path is not None:
             f.write(",\n")
             f.write('    "output_path": ' + _observability_json_str(output_path) + "\n")
@@ -10202,6 +10347,50 @@ def _parse_ir_scaffold(value):
     return lowered
 
 
+def _resolve_pcc1_python_modes(python_libpython, ir_scaffold, backend):
+    libpython_value = python_libpython
+    if libpython_value is None:
+        libpython_value = os.environ.get("PCC_PYTHON_LIBPYTHON", "")
+    if not str(libpython_value or "").strip():
+        libpython_value = "off"
+    resolved_libpython = _parse_python_libpython(libpython_value)
+
+    scaffold_value = ir_scaffold
+    if scaffold_value is None:
+        scaffold_value = os.environ.get("PCC_IR_SCAFFOLD", "")
+    if not str(scaffold_value or "").strip():
+        scaffold_value = "on"
+    resolved_scaffold = _parse_ir_scaffold(scaffold_value)
+    if resolved_scaffold == "auto":
+        resolved_scaffold = "on"
+
+    backend_value = backend
+    if backend_value is None:
+        backend_value = os.environ.get("PCC_BACKEND", "")
+    resolved_backend = str(backend_value or "").strip().lower()
+    if not resolved_backend:
+        resolved_backend = "self"
+    if resolved_backend not in BACKEND_CHOICES:
+        raise ValueError(
+            "invalid --backend "
+            + repr(backend_value)
+            + "; expected llvm, llvm_capi, or self"
+        )
+    return resolved_libpython, resolved_scaffold, resolved_backend
+
+
+def _bootstrap_compile_metadata(
+    *, emit_llvm, output_path, backend, python_libpython, ir_scaffold
+):
+    return {
+        "emit_llvm": bool(emit_llvm),
+        "output_path": output_path,
+        "backend": backend,
+        "python_libpython": python_libpython,
+        "ir_scaffold": ir_scaffold,
+    }
+
+
 def _should_consume_emit_llvm_value(argv, index, path):
     next_index = index + 1
     if next_index >= len(argv):
@@ -10400,11 +10589,23 @@ def parse_bootstrap_cli_args(argv=None):
     )
 
 
-def bootstrap_cli_main(argv=None) -> int:
+def _bootstrap_cli_main_impl(argv=None) -> int:
     if argv is None:
         raw_argv = _normalized_sys_argv()
     else:
         raw_argv = _copy_seq(argv)
+    if len(raw_argv) > 0 and raw_argv[0] == "env":
+        if len(raw_argv) not in (2, 3) or raw_argv[1] != "info":
+            _write_text("Error: expected `pcc1 env info [--json]`", err=True)
+            return 2
+        if len(raw_argv) == 3 and raw_argv[2] != "--json":
+            _write_text("Error: unknown env info option: " + str(raw_argv[2]), err=True)
+            return 2
+        if len(raw_argv) == 3:
+            _write_text(environment_info_json(), nl=False)
+        else:
+            _write_text(environment_info_text(), nl=False)
+        return 0
     if len(raw_argv) > 0 and raw_argv[0] == "--pcc-python-multi-codegen-worker":
         if len(raw_argv) != 2:
             _write_text(
@@ -10453,6 +10654,13 @@ def bootstrap_cli_main(argv=None) -> int:
         raw_argv
     )
     if module_is_request:
+        applied_defaults = apply_locked_environment_resource_defaults()
+        restarted = _restart_with_locked_environment_defaults(
+            raw_argv,
+            applied_defaults,
+        )
+        if restarted is not None:
+            return restarted
         return _run_python_module_from_pcc1_with_mode(module_argv, module_mode)
     if _should_delegate_to_host_cli(raw_argv):
         return _run_host_pcc_from_pcc1(raw_argv)
@@ -10491,6 +10699,16 @@ def bootstrap_cli_main(argv=None) -> int:
     backend = None if backend is None else (backend or "") + ""
 
     try:
+        python_libpython, ir_scaffold, backend = _resolve_pcc1_python_modes(
+            python_libpython,
+            ir_scaffold,
+            backend,
+        )
+    except ValueError as exc:
+        _write_text("Error: " + str(exc), err=True)
+        return 2
+
+    try:
         observability = ObservabilityOptions(
             diagnostic_format=diagnostic_format,
             profile_json=profile_json,
@@ -10514,6 +10732,13 @@ def bootstrap_cli_main(argv=None) -> int:
         _write_text("Error: input file not found: " + path, err=True)
         return 1
 
+    applied_defaults = apply_locked_environment_resource_defaults()
+    restarted = _restart_with_locked_environment_defaults(
+        raw_argv,
+        applied_defaults,
+    )
+    if restarted is not None:
+        return restarted
     _seed_package_site_for_python_entry(path)
 
     if output_path is None and emit_llvm is None:
@@ -10546,7 +10771,13 @@ def bootstrap_cli_main(argv=None) -> int:
                 path,
                 exe_path,
                 options=observability,
-                metadata={"emit_llvm": False, "output_path": exe_path},
+                metadata=_bootstrap_compile_metadata(
+                    emit_llvm=False,
+                    output_path=exe_path,
+                    backend=backend,
+                    python_libpython=python_libpython,
+                    ir_scaffold=ir_scaffold,
+                ),
                 verbose=verbose,
                 emit_llvm_only=False,
                 libpython_mode=python_libpython,
@@ -10578,7 +10809,13 @@ def bootstrap_cli_main(argv=None) -> int:
                 path,
                 exe_path,
                 options=observability,
-                metadata={"emit_llvm": False, "output_path": exe_path},
+                metadata=_bootstrap_compile_metadata(
+                    emit_llvm=False,
+                    output_path=exe_path,
+                    backend=backend,
+                    python_libpython=python_libpython,
+                    ir_scaffold=ir_scaffold,
+                ),
                 verbose=verbose,
                 emit_llvm_only=False,
                 libpython_mode=python_libpython,
@@ -10602,7 +10839,13 @@ def bootstrap_cli_main(argv=None) -> int:
             path,
             ll_out,
             options=observability,
-            metadata={"emit_llvm": True, "output_path": ll_out},
+            metadata=_bootstrap_compile_metadata(
+                emit_llvm=True,
+                output_path=ll_out,
+                backend=backend,
+                python_libpython=python_libpython,
+                ir_scaffold=ir_scaffold,
+            ),
             verbose=verbose,
             emit_llvm_only=True,
             libpython_mode=python_libpython,
@@ -10617,7 +10860,13 @@ def bootstrap_cli_main(argv=None) -> int:
             path,
             output_path,
             options=observability,
-            metadata={"emit_llvm": False, "output_path": output_path},
+            metadata=_bootstrap_compile_metadata(
+                emit_llvm=False,
+                output_path=output_path,
+                backend=backend,
+                python_libpython=python_libpython,
+                ir_scaffold=ir_scaffold,
+            ),
             verbose=verbose,
             emit_llvm_only=False,
             libpython_mode=python_libpython,
@@ -10628,6 +10877,20 @@ def bootstrap_cli_main(argv=None) -> int:
         if formatted_error is not None:
             return 1
     return 0
+
+
+def bootstrap_cli_main(argv=None) -> int:
+    """Run one bootstrap request without leaking temporary build budgets."""
+    frontend_jobs = str(os.environ.get("PCC_PY_FRONTEND_JOBS") or "")
+    self_backend_jobs = str(os.environ.get("PCC_SELF_BACKEND_JOBS") or "")
+    try:
+        return _bootstrap_cli_main_impl(argv)
+    finally:
+        # Native pcc1 restarts after the defaults are published, so the child
+        # still receives them in its initial environment.  Restoring here only
+        # affects a long-lived embedding process (including a pytest worker).
+        os.environ["PCC_PY_FRONTEND_JOBS"] = frontend_jobs
+        os.environ["PCC_SELF_BACKEND_JOBS"] = self_backend_jobs
 
 
 def bootstrap_cli_sys_argv_exit() -> None:

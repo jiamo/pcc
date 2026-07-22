@@ -1,10 +1,30 @@
 from __future__ import annotations
 
+import fcntl
 import os
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import pytest
+
+
+def repo_root() -> Path:
+    """Repo root by walking up to AGENTS.md.
+
+    ``Path(__file__).resolve().parents[N]`` is unreliable under pytest here:
+    tests/conftest.py monkeypatches ``Path.resolve`` to strip the
+    ``tests/{c,python}`` level for legacy tests, so fixed-index arithmetic
+    lands one directory too high. Walking up is immune to that shim.
+    """
+    cur = Path(__file__).resolve().parent
+    while cur != cur.parent:
+        if (cur / "AGENTS.md").exists():
+            return cur
+        cur = cur.parent
+    raise RuntimeError("AGENTS.md not found walking up from " + __file__)
 
 
 _FRESHNESS_SUFFIXES = {".py", ".c", ".h"}
@@ -116,7 +136,71 @@ def find_current_pcc1(repo: Path) -> Path | None:
     for candidate in candidates:
         if candidate.exists() and candidate.stat().st_mtime >= source_mtime:
             return candidate
+    # No fresh pcc1: provision one (find-or-build), then rescan once.
+    if _provision_stage1_pcc1(repo):
+        source_mtime = pcc1_freshness_cutoff(repo)
+        for candidate in current_pcc1_candidates(repo):
+            if candidate.exists() and candidate.stat().st_mtime >= source_mtime:
+                return candidate
     return None
+
+
+_PROVISION_ATTEMPTED = False
+
+
+def _provision_stage1_pcc1(repo: Path) -> bool:
+    """Build a fresh stage1 pcc1 instead of letting consumers skip.
+
+    Shares the lock/sentinel with tests/conftest.py's collection-time
+    provisioning so xdist workers and runtime callers never build twice.
+    Returns True when a rescan is worthwhile. Set PCC_NO_AUTO_PCC1=1 to opt
+    out (CI that stages its own binaries).
+    """
+    global _PROVISION_ATTEMPTED
+    if _PROVISION_ATTEMPTED or os.environ.get("PCC_NO_AUTO_PCC1", "").strip():
+        return False
+    _PROVISION_ATTEMPTED = True
+    lock_path = os.path.join(tempfile.gettempdir(), "pcc-pytest-pcc1-provision.lock")
+    with open(lock_path, "a+") as lockfile:
+        fcntl.flock(lockfile, fcntl.LOCK_EX)
+        try:
+            lockfile.seek(0)
+            stamp = lockfile.read().strip()
+            now = time.time()
+            if stamp:
+                try:
+                    if now - float(stamp) < 300:
+                        return True  # someone provisioned moments ago; rescan
+                except ValueError:
+                    pass
+            sys.stderr.write(
+                "[pcc1_gate] ensuring fresh stage1 pcc1 "
+                "(scripts/bootstrap.sh --stage 1; ~16s cached, minutes cold)\n"
+            )
+            env = os.environ.copy()
+            env.pop("LC_ALL", None)
+            proc = subprocess.run(
+                ["bash", str(repo / "scripts" / "bootstrap.sh"), "--stage", "1"],
+                capture_output=True,
+                text=True,
+                timeout=900,
+                cwd=str(repo),
+                env=env,
+            )
+            if proc.returncode != 0:
+                sys.stderr.write(
+                    "[pcc1_gate] pcc1 auto-build FAILED:\n"
+                    + proc.stdout[-2000:]
+                    + proc.stderr[-2000:]
+                    + "\n"
+                )
+                return False
+            lockfile.seek(0)
+            lockfile.truncate()
+            lockfile.write(str(now))
+            return True
+        finally:
+            fcntl.flock(lockfile, fcntl.LOCK_UN)
 
 
 def require_current_pcc1_enabled() -> bool:
@@ -124,9 +208,8 @@ def require_current_pcc1_enabled() -> bool:
 
 
 def skip_or_fail_no_current_pcc1(reason: str) -> None:
-    if require_current_pcc1_enabled():
-        pytest.fail(
-            reason
-            + "; PCC_REQUIRE_CURRENT_PCC1=1 makes pcc1 package parity a hard gate"
-        )
-    pytest.skip(reason)
+    pytest.fail(
+        reason
+        + "; auto-provisioning already tried scripts/bootstrap.sh --stage 1 — "
+        "read its error output (PCC_NO_AUTO_PCC1=1 disables the auto-build)"
+    )

@@ -72,9 +72,10 @@ def _compile_and_run_capture_rss(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/usr/bin/time"),
-    reason="needs /usr/bin/time -l for RSS measurement",
+@pytest.mark.pcc_gate(
+    unavailable=None
+    if os.path.exists("/usr/bin/time")
+    else "needs /usr/bin/time -l for RSS measurement"
 )
 def test_bug_110_str_in_local_list_does_not_leak(tmp_path):
     """Function builds a 100-string local list, returns None, gets

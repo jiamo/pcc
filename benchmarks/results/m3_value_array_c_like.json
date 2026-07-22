@@ -89,7 +89,7 @@
     "release": "25.5.0",
     "system": "Darwin"
   },
-  "generated_at": "2026-07-22T00:54:49.415424+00:00",
+  "generated_at": "2026-07-23T08:24:47.441037+00:00",
   "ir_shape": {
     "direct_aggregate_abi": true,
     "function_signature": "define double @user_value_array_c_like_hot({ { double, double }, { double, double } } %values, ptr %rounds) {",
@@ -111,15 +111,15 @@
       ],
       "label": "CPython-host",
       "links_libpython": "host-runtime",
-      "median_ns": 765276292,
+      "median_ns": 757227500,
       "samples_ns": [
-        778932541,
-        765276292,
-        758416666,
-        757885750,
-        767550083,
-        777502916,
-        758953833
+        757227500,
+        754303375,
+        758412542,
+        759284875,
+        753049791,
+        770345041,
+        754437375
       ]
     },
     "llvm_no_libpython": {
@@ -128,17 +128,17 @@
       ],
       "label": "LLVM/no-libpython",
       "links_libpython": false,
-      "median_ns": 59189958,
-      "ratio_vs_cpython": 0.0773445598913183,
-      "ratio_vs_native_c": 1.6076309698008793,
+      "median_ns": 58046167,
+      "ratio_vs_cpython": 0.0766561792856176,
+      "ratio_vs_native_c": 1.619053368889591,
       "samples_ns": [
-        59673917,
-        59086375,
-        59732042,
-        59318500,
-        58808625,
-        58826417,
-        59189958
+        58661750,
+        56258708,
+        57208916,
+        58046167,
+        58861958,
+        59153167,
+        57560250
       ]
     },
     "native_c": {
@@ -147,15 +147,15 @@
       ],
       "label": "native-C/clang-O3",
       "links_libpython": false,
-      "median_ns": 36818125,
+      "median_ns": 35851917,
       "samples_ns": [
-        37371750,
-        36818125,
-        37337917,
-        36294834,
-        37239292,
-        36291542,
-        36655041
+        35851917,
+        35936750,
+        35354750,
+        35011916,
+        36468375,
+        35423792,
+        36565083
       ]
     },
     "self_no_libpython": {
@@ -164,17 +164,17 @@
       ],
       "label": "self/no-libpython",
       "links_libpython": false,
-      "median_ns": 283337167,
-      "ratio_vs_cpython": 0.37024166299404976,
-      "ratio_vs_native_c": 7.695589251217981,
+      "median_ns": 281533542,
+      "ratio_vs_cpython": 0.3717951896886999,
+      "ratio_vs_native_c": 7.85267750117797,
       "samples_ns": [
-        284169542,
-        284433042,
-        282779416,
-        281730084,
-        284228708,
-        281864500,
-        283337167
+        281533542,
+        291811375,
+        281420125,
+        280970084,
+        279517667,
+        283636583,
+        283138583
       ]
     }
   },

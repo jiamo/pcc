@@ -58,7 +58,7 @@ appear verbatim throughout.
 | claim hygiene | Every capability claim states the mode that produced it and what it does not prove. |
 | mode-labeled | Annotated with host-pcc vs pcc1, libpython vs no-libpython, LLVM vs self backend, stage1 vs fixed point. |
 | investigation | A written, evidence-chained record under [docs/investigations/](../../docs/investigations), one bug per file, ending in a CONFIRMED/DENIED verdict. |
-| war story | The raw material of each chapter's History and Lessons section. |
+| case study | The raw material of each chapter's History and Lessons section. |
 | no-libpython | Not depending on the CPython runtime — which does not mean zero C in the binary. |
 | C kernel | The minimized bottom layer of the four-layer runtime model: platform/ABI, allocation, atomics, threads, dlopen, safepoints, GC primitives. |
 | C-API shim | The ABI surface extensions see; specified and generated, not CPython's libpython. |

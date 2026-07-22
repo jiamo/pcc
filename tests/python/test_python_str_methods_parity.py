@@ -13,6 +13,7 @@ Reference contract (from CPython):
     ``str.find`` / ``str.startswith`` / ``str.endswith`` / case
     conversions are the canonical surface
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -28,14 +29,19 @@ def _compile(monkeypatch, src: Path, exe: Path) -> None:
     from pcc.py_frontend.pipeline import compile_python
 
     compile_python(
-        str(src), str(exe),
-        ir_scaffold_mode="on", libpython_mode="off",
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
     )
 
 
 def _run(exe: Path, timeout: float = 30.0) -> str:
     result = subprocess.run(
-        [str(exe)], capture_output=True, text=True, timeout=timeout,
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
     )
     assert result.returncode == 0, (
         f"{exe.name} exited {result.returncode}\n"
@@ -47,24 +53,34 @@ def _run(exe: Path, timeout: float = 30.0) -> str:
 def test_str_split_join(tmp_path, monkeypatch):
     src = tmp_path / "str_split_join.py"
     exe = tmp_path / "str_split_join.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             parts = "a,b,c,d".split(",")
             print(parts[0], parts[1], parts[2], parts[3])
             print(",".join(parts))
             print("-".join(["x", "y", "z"]))
+            print("/".join(("tuple", "items")))
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
-    assert _run(exe).strip().splitlines() == ["a b c d", "a,b,c,d", "x-y-z"]
+    assert _run(exe).strip().splitlines() == [
+        "a b c d",
+        "a,b,c,d",
+        "x-y-z",
+        "tuple/items",
+    ]
 
 
 def test_str_replace(tmp_path, monkeypatch):
     src = tmp_path / "str_replace.py"
     exe = tmp_path / "str_replace.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             print("hello world".replace("world", "pcc"))
             print("aaa".replace("a", "b"))
@@ -72,7 +88,9 @@ def test_str_replace(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["hello pcc", "bbb", "X bar foo"]
 
@@ -80,7 +98,8 @@ def test_str_replace(tmp_path, monkeypatch):
 def test_str_strip(tmp_path, monkeypatch):
     src = tmp_path / "str_strip.py"
     exe = tmp_path / "str_strip.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             print("  spaces  ".strip())
             print("xxhelloxx".strip("x"))
@@ -89,7 +108,9 @@ def test_str_strip(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["spaces", "hello", "left", "right"]
 
@@ -97,7 +118,8 @@ def test_str_strip(tmp_path, monkeypatch):
 def test_str_find_startswith_endswith(tmp_path, monkeypatch):
     src = tmp_path / "str_find.py"
     exe = tmp_path / "str_find.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             print("hello world".find("world"))
             print("hello world".find("missing"))
@@ -108,17 +130,25 @@ def test_str_find_startswith_endswith(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
-        "6", "-1", "True", "False", "True", "False",
+        "6",
+        "-1",
+        "True",
+        "False",
+        "True",
+        "False",
     ]
 
 
 def test_str_case_conversion(tmp_path, monkeypatch):
     src = tmp_path / "str_case.py"
     exe = tmp_path / "str_case.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             print("Hello".upper())
             print("Hello".lower())
@@ -126,7 +156,9 @@ def test_str_case_conversion(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["HELLO", "hello", "Hello world"]
 
@@ -134,7 +166,8 @@ def test_str_case_conversion(tmp_path, monkeypatch):
 def test_str_slicing(tmp_path, monkeypatch):
     src = tmp_path / "str_slice.py"
     exe = tmp_path / "str_slice.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             s = "abcdef"
             print(s[0])
@@ -147,17 +180,26 @@ def test_str_slicing(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
-        "a", "f", "f", "bcd", "abc", "def", "ace",
+        "a",
+        "f",
+        "f",
+        "bcd",
+        "abc",
+        "def",
+        "ace",
     ]
 
 
 def test_str_concat_repeat(tmp_path, monkeypatch):
     src = tmp_path / "str_concat.py"
     exe = tmp_path / "str_concat.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             print("foo" + "bar")
             print("ab" * 3)
@@ -165,7 +207,9 @@ def test_str_concat_repeat(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).splitlines() == ["foobar", "ababab", ""]
 
@@ -173,7 +217,8 @@ def test_str_concat_repeat(tmp_path, monkeypatch):
 def test_str_in_operator(tmp_path, monkeypatch):
     src = tmp_path / "str_in.py"
     exe = tmp_path / "str_in.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             print("ell" in "hello")
             print("xyz" in "hello")
@@ -181,7 +226,9 @@ def test_str_in_operator(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["True", "False", "True"]
 
@@ -189,7 +236,8 @@ def test_str_in_operator(tmp_path, monkeypatch):
 def test_str_len(tmp_path, monkeypatch):
     src = tmp_path / "str_len.py"
     exe = tmp_path / "str_len.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             print(len(""))
             print(len("a"))
@@ -198,7 +246,9 @@ def test_str_len(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["0", "1", "5", "5"]
 
@@ -206,7 +256,8 @@ def test_str_len(tmp_path, monkeypatch):
 def test_str_fstring_basic(tmp_path, monkeypatch):
     src = tmp_path / "str_fstring.py"
     exe = tmp_path / "str_fstring.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             x = 42
             name = "pcc"
@@ -216,17 +267,22 @@ def test_str_fstring_basic(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == [
-        "x=42", "name=pcc", "42 + 42 = 84",
+        "x=42",
+        "name=pcc",
+        "42 + 42 = 84",
     ]
 
 
 def test_str_fstring_format_spec(tmp_path, monkeypatch):
     src = tmp_path / "str_fstring_spec.py"
     exe = tmp_path / "str_fstring_spec.out"
-    src.write_text(textwrap.dedent("""
+    src.write_text(
+        textwrap.dedent("""
         def main() -> None:
             x = 1234.5
             print(f"{x:.2f}")
@@ -237,14 +293,18 @@ def test_str_fstring_format_spec(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["1234.50", "1,234,567", "007"]
+
 
 def test_str_bytes_literal_nonascii(tmp_path, monkeypatch):
     src = tmp_path / "bytes_literal.py"
     exe = tmp_path / "bytes_literal.out"
-    src.write_text(textwrap.dedent(r"""
+    src.write_text(
+        textwrap.dedent(r"""
         def main() -> None:
             b = b"\xff\x00\x01"
             print(len(b))
@@ -258,6 +318,8 @@ def test_str_bytes_literal_nonascii(tmp_path, monkeypatch):
 
         if __name__ == "__main__":
             main()
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+        encoding="utf-8",
+    )
     _compile(monkeypatch, src, exe)
     assert _run(exe).strip().splitlines() == ["3", "255", "bcd", "1", "1", "255"]

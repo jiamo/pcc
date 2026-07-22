@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.pcc_gate(env="PCC_RUN_NUMPY_L4_INTEGRATION")]
 
 REPO = Path(__file__).resolve().parents[2]
 NUMPY_SITE = REPO / "build" / "head-truth" / "numpy-core" / "site"
@@ -38,12 +38,12 @@ def _pcc1_binary() -> Path:
 
 def _require_l4_gate_enabled() -> Path:
     if os.environ.get("PCC_RUN_NUMPY_L4_INTEGRATION") != "1":
-        pytest.skip("set PCC_RUN_NUMPY_L4_INTEGRATION=1 to run the real NumPy L4 pcc1 gate")
+        pytest.fail("set PCC_RUN_NUMPY_L4_INTEGRATION=1 to run the real NumPy L4 pcc1 gate")
     pcc1 = _pcc1_binary()
     if not pcc1.is_file():
-        pytest.skip(f"self-host pcc1 binary required: {pcc1} (set PCC1_BINARY or build via scripts/bootstrap.sh)")
+        pytest.fail(f"self-host pcc1 binary required: {pcc1} (set PCC1_BINARY or build via scripts/bootstrap.sh)")
     if not (NUMPY_SITE / "numpy" / "_core").is_dir():
-        pytest.skip(f"pcc-native NumPy core site required: {NUMPY_SITE} (run the M2-NUMPY predecessor gates)")
+        pytest.fail(f"pcc-native NumPy core site required: {NUMPY_SITE} (run the M2-NUMPY predecessor gates)")
     return pcc1
 
 

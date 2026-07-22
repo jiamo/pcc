@@ -2,7 +2,7 @@
 
 Nowhere is it easier for a Python compiler to deceive itself than on the package ecosystem. The phrase "supports NumPy" can name a dozen facts of wildly different strength: from "the install command did not error", through "a pure-Python subset can be imported", up to "the C extension initializes and runs correctly on pcc's own object model". pcc's answer to this front has two layers. One is mechanism — the generic install pipeline in [pcc/package/](../../pcc/package), the C-API shim in `py_capi_shim.c`, the extension loader in `py_extension_loader.c`, and CpyHandle boxing. The other is discipline — the pip-install gate and the import gate are two independent claims, each with its own evidence standard, and every fix must land in a reusable mechanism: no `if package == "numpy"` special cases, ever. This chapter covers both layers, because in this subsystem the discipline is not a footnote to the mechanism; it is the precondition for the mechanism staying true over time.
 
-## Reader Map: Package Compatibility Is a Gradient
+## Chapter Overview: Package Compatibility Is a Gradient
 
 First split "supports a package" into levels: it can install, parse metadata, import pure Python, load extensions, and expose the ABI needed through the C-API shim. Passing one level does not automatically prove compatibility with the whole package ecosystem.
 
@@ -77,11 +77,54 @@ One further detail decides the strength of the install evidence. `pcc1` is a com
 
 The import gate is likewise layered. For pure-Python packages, the import evidence is end-to-end: after installing, compile a main program containing `import demo_pkg` with `pcc1 --python-libpython=off --ir-scaffold=on`, run it, and assert on the output (`test_pcc1_pip_install_wheel_participates_in_import_site` asserts that `43` is printed). Where a **CPython-ABI** C extension is involved, the current honest evidence in no-libpython mode is, perversely enough, **rejection**: a real CPython extension wheel is stopped at the import boundary with `PCC-PKG-004` (Section 17.4) rather than silently generating thousands of `py_cpy_*` fallback calls.
 
-A **pcc-native** extension — built against pcc's own C-API shim — takes a different, and now working, path. As of 2026-07-16, pcc-native NumPy 2.4.4 (`_multiarray_umath` + `_umath_linalg`) genuinely imports inside a no-libpython pcc1 binary: `import numpy; print(np.__version__)` prints `2.4.4`, and `np.array([1, 2, 3]) + 1` produces `[2, 3, 4]`, with results identical under all five GC backends (gates: [tests/integration/test_numpy_l4_pcc1_gate.py](../../tests/integration/test_numpy_l4_pcc1_gate.py) and `test_numpy_l5_pcc1_gate.py`). The claim-hygiene point still holds: `PCC-PKG-004` rejects a **CPython-ABI** artifact, and a pcc-native artifact is a separate path; the milestone is deliberately narrow — import/version/array construction/scalar addition/element access/iteration/`==`/`repr`, with general ufuncs, reductions, dtypes, and broadcasting not yet covered. [docs/current-goal-state.md](../../docs/current-goal-state.md) records the per-slice status.
+At the frontend package scanning and linkage layer, [pcc/package/linkage.py](../../pcc/package/linkage.py) issues a rejection diagnostic for CPython-ABI extension artifacts:
+
+```python
+# pcc/package/linkage.py
+def _diagnostic_for_cpython_extension_abi(path: str) -> dict[str, object]:
+    return {
+        "code": "PCC-PKG-004",
+        "message": (
+            "native artifact name declares a CPython extension ABI; "
+            "pcc-native mode requires a pcc-native extension ABI or a source rebuild"
+        ),
+        "path": path,
+    }
+```
 
 ## 17.3 The Package Pipeline: Generic Machinery in [pcc/package/](../../pcc/package)
 
 ### 17.3.1 The pip Front Door
+
+On the C-API shim side, [pcc/py_runtime/src/py_capi_shim.c](../../pcc/py_runtime/src/py_capi_shim.c) implements the proxy for standard C-API functions:
+
+```c
+// pcc/py_runtime/src/py_capi_shim.c
+PyObject *py_capi_PyObject_CallObject(PyObject *callable, PyObject *args) {
+    if (callable == NULL) return NULL;
+    return py_call_callable(callable, args, NULL);
+}
+
+void *py_capi_PyCapsule_GetPointer(PyObject *capsule, const char *name) {
+    if (capsule == NULL || py_type_of(capsule) != PY_TYPE_CAPSULE) return NULL;
+    return py_capsule_pointer(capsule, name);
+}
+```
+
+In the native extension loader, [pcc/py_runtime/src/py_extension_loader.c](../../pcc/py_runtime/src/py_extension_loader.c) loads pcc-native `.so` binaries via `dlopen` and invokes `PyInit_<mod>`:
+
+```c
+// pcc/py_runtime/src/py_extension_loader.c
+PyObject *py_extension_load_native_so(const char *so_path, const char *mod_name) {
+    void *handle = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
+    if (handle == NULL) return NULL;
+    char init_name[256];
+    snprintf(init_name, sizeof(init_name), "PyInit_%s", mod_name);
+    PyInitFunc init_fn = (PyInitFunc)dlsym(handle, init_name);
+    if (init_fn == NULL) return NULL;
+    return init_fn();
+}
+```
 
 [pcc/package/pip_shim.py](../../pcc/package/pip_shim.py) is the front door for `pcc -m pip`, and its docstring sets the boundary first: it accepts the common `pip install ... --dry-run` shapes and reports a plan without invoking pip's installer; non-dry-run local installs go through pcc's own installer rather than upstream pip. `_parse_install_args` recognizes `--target`, `--cache-dir`, `--find-links`, `--index-url`, `--no-index`, `--report` — and one flag pip does not have: `--abi` (defaulting to `pcc-native`). The ABI mode starts flowing from the very first station on the command line, and the compatibility decisions, linkage scanning, and build redirection downstream all dispatch on it.
 

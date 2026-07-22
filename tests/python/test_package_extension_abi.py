@@ -5,13 +5,15 @@ import os
 import subprocess
 from pathlib import Path
 
+from pcc1_gate import repo_root
+
 import pytest
 
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 
 from pcc.capi_surface import capi_header_manifest, extension_abi_plan
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = repo_root()
 
 GENERIC_REFCNT_MACRO_SYMBOLS = [
     "Py_REFCNT",

@@ -62,7 +62,7 @@ def _i32(value: int) -> int:
 
 def test_inline_matches_original_and_independent_llvm_opt_behavior():
     if not OPT_VERDICT.available:
-        pytest.skip(OPT_VERDICT.skip_reason())
+        pytest.fail(OPT_VERDICT.skip_reason())
     pcc_ir, changed = inline_module(CALL_IR)
     assert changed is True
     upstream = run_upstream_opt(CALL_IR, "inline")

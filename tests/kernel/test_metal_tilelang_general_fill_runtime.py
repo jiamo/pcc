@@ -19,6 +19,9 @@ TILELANG_STATIC_FILL = """
 import tilelang
 import tilelang.language as T
 
+pytestmark = pytest.mark.pcc_gate(probe="metal")
+
+
 @tilelang.jit
 def fill_matrix(M, N, value=1.25, dtype=T.float32, threads=32):
     @T.prim_func
@@ -37,7 +40,7 @@ def test_tilelang_nonzero_fill_real_metal_readback(
     tmp_path, dtype: str, value: float, bytes_per_element: int
 ):
     if sys.platform != "darwin":
-        pytest.skip("TileLang general-fill runtime requires Darwin Metal")
+        pytest.fail("TileLang general-fill runtime requires Darwin Metal")
     module = import_tilelang_source(
         TILELANG_STATIC_FILL,
         outer_function="fill_matrix",
@@ -66,7 +69,7 @@ def test_tilelang_nonzero_fill_real_metal_readback(
     )
     data = result.to_dict()
     if result.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(data["reason"])
+        pytest.fail(data["reason"])
     assert result.status == STATUS_SOURCE_RUNTIME_PACKAGE_EXECUTED, data
     assert data["runtime_launch_executed"] is True
     assert data["invocation"]["fence_completed"] is True

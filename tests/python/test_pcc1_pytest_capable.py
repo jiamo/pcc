@@ -46,13 +46,7 @@ def _find_pcc1() -> Path | None:
 
 
 PCC1 = _find_pcc1()
-pytestmark = pytest.mark.skipif(
-    PCC1 is None,
-    reason=(
-        "No pcc1 binary on disk; skipping pcc1-pytest target tests. "
-        "Run scripts/bootstrap.sh to build one."
-    ),
-)
+pytestmark = pytest.mark.pcc_gate(probe="pcc1")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -118,7 +112,7 @@ def _links_libpython(path: Path) -> bool:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30.0)
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        pytest.skip(f"can't run {cmd[0]}; cannot verify libpython linkage")
+        pytest.fail(f"can't run {cmd[0]}; cannot verify libpython linkage")
     assert proc.returncode == 0, (
         f"{cmd[0]} failed while checking libpython linkage:\n"
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"

@@ -1,10 +1,10 @@
 # 第 4 章 C 语义低层化与符号性
 
-第 3 章把 C 源码送到了"AST 进入代码生成器"这条线;本章讲线的另一侧:[pcc/codegen/c_codegen.py](../../pcc/codegen/c_codegen.py) 如何把 C 表达式低层化(lowering)为 LLVM IR。仓库的 [AGENTS.md](../../AGENTS.md) 对这份约 1.1 万行的文件有一句定性——"大多数 C 侧 bug 落在这里",而其中最高产的一族 bug 只围绕一个事实:LLVM 的整数类型没有符号,C 的整数类型有。本章以符号性跟踪为主线,讲清三件事:为什么 `int` 与 `unsigned int` 同为 `i32` 而符号性要单独跟踪;C 标准的 usual arithmetic conversions 如何落在 `_usual_arithmetic_conversion` 等六个 helper 上;以及这个设计的经典失败模式——位形正确、签名标记丢失,下游悄悄选了 `sdiv`/`srem`/`ashr`/有符号比较。压轴的战争故事来自 Lua:一次"排序偶尔出错"的诡异失败,最终缩减成一行丢了无符号标记的 XOR。
+第 3 章把 C 源码送到了"AST 进入代码生成器"这条线;本章讲线的另一侧:[pcc/codegen/c_codegen.py](../../pcc/codegen/c_codegen.py) 如何把 C 表达式低层化(lowering)为 LLVM IR。仓库的 [AGENTS.md](../../AGENTS.md) 对这份约 1.1 万行的文件有一句定性——"大多数 C 侧 bug 落在这里",而其中最高产的一族 bug 只围绕一个事实:LLVM 的整数类型没有符号,C 的整数类型有。本章以符号性跟踪为主线,讲清三件事:为什么 `int` 与 `unsigned int` 同为 `i32` 而符号性要单独跟踪;C 标准的 usual arithmetic conversions 如何落在 `_usual_arithmetic_conversion` 等六个 helper 上;以及这个设计的经典失败模式——位形正确、签名标记丢失,下游悄悄选了 `sdiv`/`srem`/`ashr`/有符号比较。压轴的案例研究来自 Lua:一次"排序偶尔出错"的诡异失败,最终缩减成一行丢了无符号标记的 XOR。
 
-## 读者地图:LLVM 的整数没有"正负说明书"
+## 本章导读:LLVM 整数类型不携带符号信息
 
-这一章只要先记住一句话:位宽相同不代表语义相同。`int` 和 `unsigned int` 都可能降成 `i32`,但后续除法、取模、右移、比较要用 signed 还是 unsigned,取决于 pcc 自己保存的元数据。
+本章的核心结论是:位宽相同不代表语义相同。`int` 和 `unsigned int` 都可能降成 `i32`,但后续除法、取模、右移、比较要用 signed 还是 unsigned,取决于 pcc 自己保存的元数据。
 
 - 低层化的难点不是生成一条 LLVM 指令,而是让后面的指令还能知道这条值的 C 语义。
 - 符号性会在表达式链里丢失,所以测试不能只看单个操作的结果位。
@@ -152,7 +152,7 @@ C11 6.5.7 给移位开了特例:**不做 usual arithmetic conversions**,两侧�
 
 第三问对应的测试方法论是调试手册 §11 的"下游敏感回归测试":好的符号性测试不是断言一个常量,而是**让无符号生产者的结果立即流进一个符号敏感的消费者,且尽量让另一操作数是普通有符号常量**。[tests/c/test_unsigned_loads.py](../../tests/c/test_unsigned_loads.py) 整个文件就是这个形状的标本库:XOR 喂取余、复合赋值喂取余、前缀自增/自减喂取余、右移喂取余、三目喂取余。`% 960` 这个看似随意的常数是刻意的——960 是有符号字面量,若左侧标签丢失,usual arithmetic conversion 双签名分支会把整个运算拖回有符号世界。
 
-调试手册 §10 补上定位学的另一半:面对真实程序失败,先把**数据布局假设**与**表达式语义假设**拆开。布局假设(`sizeof`、`offsetof`、伪 libc 声明、结构体布局)用一个对照原生编译器的探针程序就能整族证伪,成本极低;证伪之后,剩下的嫌疑就集中在符号性、提升、比较、移位、除法这些表达式语义上。4.6.1 的战争故事会展示这个二分法在实战里如何砍掉一半搜索空间。两族在一处交汇:位域。`BitFieldRef` 同时携带布局信息(容器类型、位偏移、位宽)与符号性(`is_unsigned`),`_load_bitfield` 对无符号位域走掩码+截断/零扩展,对有符号位域走 `trunc` 到位宽再 `sext`——布局错一个比特或符号错一个判断,症状几乎相同,只有探针能分辨。
+调试手册 §10 补上定位学的另一半:面对真实程序失败,先把**数据布局假设**与**表达式语义假设**拆开。布局假设(`sizeof`、`offsetof`、伪 libc 声明、结构体布局)用一个对照原生编译器的探针程序就能整族证伪,成本极低;证伪之后,剩下的嫌疑就集中在符号性、提升、比较、移位、除法这些表达式语义上。4.6.1 的案例研究会展示这个二分法在实战里如何砍掉一半搜索空间。两族在一处交汇:位域。`BitFieldRef` 同时携带布局信息(容器类型、位偏移、位宽)与符号性(`is_unsigned`),`_load_bitfield` 对无符号位域走掩码+截断/零扩展,对有符号位域走 `trunc` 到位宽再 `sext`——布局错一个比特或符号错一个判断,症状几乎相同,只有探针能分辨。
 
 还有一处值得诚实标注的开放角落:`codegen_TernaryOp` 的合流规则。三目两臂先各自转换到 `pick_target_type` 选出的较宽类型,phi 节点的符号性取"任一入边无符号则无符号"(`any(self._is_unsigned_val(...))`)。同宽两臂下这与标准一致(无符号胜);但"较宽的有符号臂遇上较窄的无符号臂"时,标准要求结果为有符号(宽类型装得下),而 any() 规则会给 phi 错打无符号标签。`test_unsigned_ternary_result_stays_unsigned_for_modulo` 只覆盖了同宽情形;混宽情形目前没有回归测试。这是旁挂方案"近似规则散布在各合流点"的又一例——完整的格点规则在 `_usual_arithmetic_conversion` 里,而 phi 合流用了一个更粗的近似。练习 3 请读者把这个角落变成一个可运行的反例。
 
@@ -234,4 +234,4 @@ enum { MAXHSIZE = luaM_limitN(1 << MAXHBITS, Node) };
 2. **双向不变式。** `_integer_promotion` 对宽度小于 32 的整数固定传 `result_unsigned=False`。假设有人"修复"为保留源符号性(`unsigned char` 提升后仍无符号),[tests/c/test_unsigned_loads.py](../../tests/c/test_unsigned_loads.py) 中哪个测试会立即失败?写出该测试里比较运算两侧的提升后类型与比较指令,分别在正确实现与"修复"后实现下的版本。
 3. **开放角落实证。** 4.4 节指出 `codegen_TernaryOp` 的 phi 合流用 any() 近似符号性。构造一个最小 C 程序,让"较宽有符号臂 + 较窄无符号臂"的三目结果流入一个符号敏感的消费者,按 C 标准与按 any() 规则分别手推结果;说明为什么现有测试 `test_unsigned_ternary_result_stays_unsigned_for_modulo` 捕不到它,并按 §11 的形状为它写一个下游敏感回归测试(纸面即可)。
 4. **编译期孪生推演。** 不运行代码,分别按 `_eval_const_expr` 的 `ConstIntValue` 语义与"直接用 Python int"的朴素语义,手推 `((size_t)(~(size_t)0)) / sizeof(Node)`(设 `sizeof(Node) == 16`)的折叠值,以及它使 `luaM_limitN` 三目各选哪个分支;再解释 `c_int_div` 为什么不能写成 Python 的 `//`(给出一个两者结果不同的具体常量表达式)。
-5. **设计权衡论证。** 对比"旁挂元数据 + helper 纪律"(pcc)与"每个表达式值强制携带完整 C 类型"两种方案:各自在改造成本、漏标可检测性、与 llvmlite builder 的耦合度上的得失。然后设计一个机械检查来缩小 pcc 方案的弱点——例如一个 IR 后验 pass,扫描所有 `sdiv/srem/ashr/icmp_signed`,当其操作数携带 `_is_unsigned` 标签时报警——并论证它能抓住与抓不住 4.6 节两个战争故事中的哪一个,为什么。
+5. **设计权衡论证。** 对比"旁挂元数据 + helper 纪律"(pcc)与"每个表达式值强制携带完整 C 类型"两种方案:各自在改造成本、漏标可检测性、与 llvmlite builder 的耦合度上的得失。然后设计一个机械检查来缩小 pcc 方案的弱点——例如一个 IR 后验 pass,扫描所有 `sdiv/srem/ashr/icmp_signed`,当其操作数携带 `_is_unsigned` 标签时报警——并论证它能抓住与抓不住 4.6 节两个案例研究中的哪一个,为什么。

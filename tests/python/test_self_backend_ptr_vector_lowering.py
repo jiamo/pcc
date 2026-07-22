@@ -113,9 +113,10 @@ def test_ptr_vector_insert_extract_emits_self_backend_asm():
     assert "ldr x" in asm
 
 
-@pytest.mark.skipif(
-    platform.system() != "Darwin" or platform.machine() not in {"arm64", "aarch64"},
-    reason="AArch64 Darwin self-backend runtime smoke",
+@pytest.mark.pcc_gate(
+    unavailable=None
+    if platform.system() == "Darwin" and platform.machine() in {"arm64", "aarch64"}
+    else "AArch64 Darwin self-backend runtime smoke"
 )
 def test_ptr_vector_insert_extract_runs_on_aarch64_darwin(tmp_path: Path):
     asm = emit_self_asm(_PTR_VECTOR_IR)

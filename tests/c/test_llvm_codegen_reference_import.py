@@ -122,7 +122,7 @@ def test_llvm_codegen_ll_samples_convert_to_pcc_supported_assembly(
         )
         asm = tm.emit_assembly(mod)
     except RuntimeError as exc:
-        pytest.skip(f"LLVM target {triple!r} is unavailable: {exc}")
+        pytest.fail(f"LLVM target {triple!r} is unavailable: {exc}")
 
     assert expected_label in asm
     assert "ret" in asm

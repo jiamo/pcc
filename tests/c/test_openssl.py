@@ -32,7 +32,7 @@ def _openssl_make_goal_units():
     )
 
 
-@pytest.mark.skipif(not os.path.isdir(OPENSSL_DIR), reason="openssl-3.4.1 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(OPENSSL_DIR) else "openssl-3.4.1 not found")
 def test_openssl_make_goal_dependency_collects_library_sources():
     units, base_dir = _openssl_make_goal_units()
 
@@ -89,7 +89,7 @@ def openssl_compiled_units_self():
     return compiled_units, base_dir
 
 
-@pytest.mark.skipif(not os.path.isdir(OPENSSL_DIR), reason="openssl-3.4.1 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(OPENSSL_DIR) else "openssl-3.4.1 not found")
 def test_openssl_runtime_with_mcjit_depends_on(openssl_compiled_units):
     compiled_units, _base_dir = openssl_compiled_units
 
@@ -101,7 +101,7 @@ def test_openssl_runtime_with_mcjit_depends_on(openssl_compiled_units):
     assert result == 0
 
 
-@pytest.mark.skipif(not os.path.isdir(OPENSSL_DIR), reason="openssl-3.4.1 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(OPENSSL_DIR) else "openssl-3.4.1 not found")
 def test_openssl_runtime_with_system_link_depends_on(openssl_compiled_units):
     compiled_units, base_dir = openssl_compiled_units
 
@@ -120,7 +120,7 @@ def test_openssl_runtime_with_system_link_depends_on(openssl_compiled_units):
     assert "OK" in result.stdout
 
 
-@pytest.mark.skipif(not os.path.isdir(OPENSSL_DIR), reason="openssl-3.4.1 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(OPENSSL_DIR) else "openssl-3.4.1 not found")
 def test_openssl_runtime_with_self_backend_system_link_depends_on(openssl_compiled_units_self):
     compiled_units, base_dir = openssl_compiled_units_self
 

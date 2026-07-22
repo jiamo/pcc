@@ -2,7 +2,7 @@
 
 解释器执行 Python 时,引用计数由一个中心化的求值循环代管:每条字节码知道自己取走了什么、归还了什么。pcc 把 Python 编译成原生代码之后,这个中心消失了——每一次 incref、每一次 decref、每一次槽位覆写,都必须由前端在编译期逐条发射成 IR。发射依据不可能是运行期观察,只能是一份编译期可判定的契约:哪个表达式产生拥有引用(owned reference),哪个名字只是借用(borrowed reference),引用在函数边界上向哪个方向转移。本章讲这份契约的三层实现:运行时基元(`py_incref`/`py_decref`/`pcc_gc_store_ptr`)、前端的 owned-local 低层化(lowering)、以及函数返回路径上的被调方 retain 规则;并以两次真实的自举回归收尾。GC 算法本身——循环回收、追踪、分代、重定位——留给第 10、11 章;本章只讨论引用计数语义与所有权契约,以及它们为什么不允许为了过闸门(gate)而被弱化。
 
-## 读者地图:先问"这份引用归谁"
+## 本章导读:引用的所有权归属
 
 引用计数章节不用从 `incref`/`decref` 细节背起。先把每个值都看成一张借条:谁拿到 owned reference,谁就负责在合适的位置释放;borrowed reference 只是临时看一眼,不能当成自己拥有。
 
@@ -98,7 +98,7 @@ py_decref(old);
 
 - **重绑定**:[pcc/py_frontend/codegen/assignment_statement_lowering.py](../../pcc/py_frontend/codegen/assignment_statement_lowering.py) 的赋值路径先对旧值执行 `_emit_release_owned_local_if_flagged()`,再存新值、再置旗标。漏掉第一步就是每次循环迭代泄漏一个对象。
 - **作用域退出**:`_emit_owned_local_cleanup()` 在每个 `return` 之前释放所有带值旗标的 owned 局部,然后按注册的**逆序**(`_gc_rooted_local_order`)注销 GC 帧根。它接受 `skip_name` 参数——9.5 解释为什么。
-- **GC 根注册**:每个 owned 局部同时经 `_ensure_owned_local_gc_root()` 注册为帧根(`pcc_gc_frame_enter`/`pcc_gc_frame_leave`),让追踪式后端能看见栈上引用。根的机制属于第 10 章;本章只指出所有权与根注册在同一处低层化中耦合,这个耦合在 9.7 的第二个战例里会咬人。
+- **GC 根注册**:每个 owned 局部同时经 `_ensure_owned_local_gc_root()` 注册为帧根(`pcc_gc_frame_enter`/`pcc_gc_frame_leave`),让追踪式后端能看见栈上引用。根的机制属于第 10 章;本章只指出所有权与根注册在同一处低层化中耦合,这个耦合在 9.7 的第二个案例研究里会咬人。
 - **表达式临时的释放**:owned 不只属于具名局部。`a.b.c` 求值产生中间接收者临时、二元运算产生操作数临时,这些拥有的中间值用毕即应释放。统一入口是 `_gc_release_if_owned()`:它先经 `_raw_scaffold_object_rhs_is_owned()` 与 `_expr_returns_owned_object()` 双重确认来源表达式确实产生拥有引用、再排除 CPython 桥接标记值(`_cpy_values`),才发射 release。调用点散布在 `attr_load_lowering.py`、`expr_dispatch_lowering.py`、`exact_int_lowering.py`、`assignment_statement_lowering.py` 等十余处低层化位点。每次 release 都携带上下文标签(`_release_expr_label()` 编入函数名、表达式类型与源位置),调试构建里 `pcc_debug_check_release` 用它回答"是哪一行的哪一次 release 打穿了计数"。
 - **丢弃赋值**:`_ = expr` 由 `_maybe_emit_discard_assignment()` 特殊处理——求值、立即释放拥有结果、把 `_` 从 env 与各 hint 表中除名,不留下任何可悬垂的绑定。
 - **诚实的保守主义**:元组解包目标经 `_unpack_target_value_is_owned()` 判定,`DynType` 的解包结果**不**按拥有对象管理——动态解包位点可能携带指针形状的原生值(自举编译器里的 dataclass/AST 字符串字段),错按对象释放就是段错误。同理,带 C-ABI 导出的 raw-int-scaffold 模块(运行时端口自己)按"手工管理引用"处理,前端只追踪它能高置信识别的对象生成表达式(`_raw_scaffold_object_rhs_is_owned()`)。分类器宁可漏管(泄漏,可测量)不可错管(双重释放,崩溃)。
@@ -162,11 +162,11 @@ meth(o);                             /* 再调用 __del__ */
 
 ## 9.7 历史与教训
 
-### 战例一:借用返回打穿自举(2026-06-01)
+### 案例研究一:借用返回打穿自举(2026-06-01)
 
 (来源:[docs/investigations/bootstrap-user-function-low-ir-fallback-2026-06-01.md](../../docs/investigations/bootstrap-user-function-low-ir-fallback-2026-06-01.md))
 
-长期全绿的三阶段自举闸门(`--backend self --python-libpython=off`)突然双重失败。第一道边界是严格模式下的 libpython 回退,与所有权无关,修掉后暴露第二道:pcc0 产出的 pcc1 在编译 [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py) 生成 pcc2 时崩溃,LLDB 回溯落在生成代码 `user_pcc_py_frontend_type_infer__infer_expr` 经 `pcc_gc_release` → `py_decref` → `pcc_gc_free_object_memory` 的双重释放,现场紧挨 `replace(expr, ..., ty=ty)`。
+长期全部通过的三阶段自举闸门(`--backend self --python-libpython=off`)突然双重失败。第一道边界是严格模式下的 libpython 回退,与所有权无关,修掉后暴露第二道:pcc0 产出的 pcc1 在编译 [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py) 生成 pcc2 时崩溃,LLDB 回溯落在生成代码 `user_pcc_py_frontend_type_infer__infer_expr` 经 `pcc_gc_release` → `py_decref` → `pcc_gc_free_object_memory` 的双重释放,现场紧挨 `replace(expr, ..., ty=ty)`。
 
 错误假设排了一排。元组自动 GC 追踪被怀疑过——**用户明确否决**了禁用它的提案,因为那是用弱化运行时语义换闸门变绿,恰是仓库规则禁止的方向。`replace(...)` 的 dataclass 字段拷贝被怀疑过——源码检查否决:字段写入走 `pcc_gc_store_ptr`,平衡无误;`replace` 只是欠拥有的对象**变得可见**的地方,不是所有权丢失的地方。"把用户函数调用结果当借用"的方案也被否决——理由即 9.5 的方向性论证。
 
@@ -174,7 +174,7 @@ meth(o);                             /* 再调用 __del__ */
 
 留下的不变式有两层。机制层:被调方 retain 规则进入 `return_lowering.py` 并有专属回归测试。流程层:这次调查被写进 [AGENTS.md](../../AGENTS.md) 自举回归纪律——所有权失败先验证调用方/被调方契约再动清理代码,且永远不许靠调用方停止 release 来"修"。
 
-### 战例二:跨函数泄漏的 owned 旗标缓存
+### 案例研究二:跨函数泄漏的 owned 旗标缓存
 
 (来源:[docs/investigations/python-generator-owned-flag-cache-leaks-across-sibling-generators.md](../../docs/investigations/python-generator-owned-flag-cache-leaks-across-sibling-generators.md))
 
@@ -188,7 +188,7 @@ meth(o);                             /* 再调用 __del__ */
 
 ## 9.8 小结
 
-pcc 的引用计数与所有权是一份三层契约。运行时层提供基元:对象出生计数为 1;`py_incref`/`py_decref` 对 NULL、标记小整数、不朽单例统一免疫;死亡序列固定(弱引用失效 → GC 通知 → 摘除 → 延迟析构);`pcc_gc_store_ptr` 以"先 incref 新值、后 decref 旧值"的平衡写入垄断所有槽位覆写。前端层做判定:`_expr_returns_owned_object()` 静态分类拥有表达式,运行时 `i1` 旗标解决控制流汇合的不可判定,重绑定先释放、作用域退出统一清理,对动态与 raw-scaffold 位点保持"宁漏勿错"的保守。边界层是一句话契约:调用返回拥有引用,借用的返回在被调方 retain,owned 局部的返回是免计数的所有权转移。终结器一侧,`PY_FLAG_FINALIZED` 先置位后调用,保证 `__del__` 至多一次,复活由析构器的计数复查合法承认。两个战例共同指向同一条仓库纪律:所有权失败先审契约,不弱化语义换绿灯——这份纪律本身就是契约的一部分。
+pcc 的引用计数与所有权是一份三层契约。运行时层提供基元:对象出生计数为 1;`py_incref`/`py_decref` 对 NULL、标记小整数、不朽单例统一免疫;死亡序列固定(弱引用失效 → GC 通知 → 摘除 → 延迟析构);`pcc_gc_store_ptr` 以"先 incref 新值、后 decref 旧值"的平衡写入垄断所有槽位覆写。前端层做判定:`_expr_returns_owned_object()` 静态分类拥有表达式,运行时 `i1` 旗标解决控制流汇合的不可判定,重绑定先释放、作用域退出统一清理,对动态与 raw-scaffold 位点保持"宁漏勿错"的保守。边界层是一句话契约:调用返回拥有引用,借用的返回在被调方 retain,owned 局部的返回是免计数的所有权转移。终结器一侧,`PY_FLAG_FINALIZED` 先置位后调用,保证 `__del__` 至多一次,复活由析构器的计数复查合法承认。两个案例研究共同指向同一条仓库纪律:所有权失败先审契约,不弱化语义换绿灯——这份纪律本身就是契约的一部分。
 
 ## 练习
 

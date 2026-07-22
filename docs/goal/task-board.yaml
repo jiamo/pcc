@@ -1485,6 +1485,528 @@ tasks:
       - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/c/test_clang_compat.py tests/c/test_sizeof.py tests/c/test_struct.py tests/c/test_bitfields.py"
       - "focused source/parity guard proves the selected layout family has one shared size/alignment decision"
 
+  - id: BUG-P1-PY-LIST-TODO-RAISE-PLACEHOLDERS
+    priority: P1
+    status: TODO_READY
+    track: runtime/correctness
+    title: "py_list.c: six TODO(phase3) raise placeholders return garbage instead of raising MemoryError/IndexError"
+    latest_evidence: docs/goal/evidence/2026-07-23-bad-smell-audit-triage.md
+    open_boundary: "pcc/py_runtime/src/py_list.c has six '/* TODO(phase3): raise MemoryError|IndexError */' branches (lines ~230, 243, 536, 603, 625, 637) that fall through without py_raise, so allocation failure or empty-pop returns garbage/NULL-adjacent data. Fix must add py_raise + caller py_err_occurred coverage, mirror the pcc-Python port (py_list.py), wipe stale libpy_runtime archives, and pass focused list/GC gates plus a bootstrap gate appropriate to runtime semantics changes under all five PCC_GC_BACKEND values."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "rg -n 'TODO.*raise' pcc/py_runtime/src/py_list.c returns no matches"
+      - "focused regression: pop/index/alloc-failure paths raise under both C and port tiers"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py tests/python/test_fallback_baseline.py"
+  - id: AUD-P2-SELF-MODULE-SPECIAL-CASES-IN-CODEGEN
+    priority: P2
+    status: TODO_READY
+    track: repository hygiene
+    title: "Remove or generalize self-module special cases in codegen: class_gen field-table overrides and module-name-gated debug probes"
+    latest_evidence: docs/goal/evidence/2026-07-23-bad-smell-audit-triage.md
+    open_boundary: "Two semantic self-compile special cases in pcc/py_frontend/codegen/class_gen.py (~L2058 pcc.py_frontend.py_ast PY_AST_FIELD_NAME_OVERRIDES; ~L2065 layer1 L1CodeGen L1_CODEGEN_HOST_ATTRS injection) privilege pcc's own modules by name — replace with a generic mechanism (e.g. an explicit per-module export annotation) or prove why a name-keyed table is the honest design. Separately, PCC_DEBUG_BOOTSTRAP_TRACE probes are hardcoded to fire only for pcc.parse.py_lift across 8 codegen files although docs/debugging-playbook.md documents the env var as a general tool — either generalize the gate to any module or remove the dead sites. Any change here is bootstrap-critical: stage1..3 must be re-proven."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "rg -n 'module.name == \"pcc.' pcc/py_frontend/codegen/ returns no name-keyed semantic branches (documented debug hooks excepted only if generalized)"
+      - "full self-host bootstrap gate green for the touched backend set"
+  - id: AUD-P2-CLI-SHARED-HELPER-DUPLICATION
+    priority: P2
+    status: TODO_READY
+    track: repository hygiene
+    title: "Deduplicate cli_core.py / cli_bootstrap.py shared helpers via a closure-safe module"
+    latest_evidence: docs/goal/evidence/2026-07-23-bad-smell-audit-triage.md
+    open_boundary: "FNV-1a hashing (_fnv1a_update_u64/_fnv1a_update_bytes_u64), source iteration (_iter_py_sources_under), and run-cache path computation are copy-pasted between pcc/cli_core.py and pcc/cli_bootstrap.py (~11 duplicated defs each side). cli_bootstrap.py is inside the self-compiled stage1 closure, so naive extraction changes the bootstrap closure; the dedup must move helpers into a small pcc-Python-subset-safe shared module that both import, with evidence the stage1 closure and bootstrap hashes stay green. Do not dedup by importing cli_core into the bootstrap closure."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "rg -n '_fnv1a_update_u64' pcc/ shows a single definition"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LIBC-P1-IMPORT-RATCHET
+    priority: P1
+    status: DONE_WEAK
+    track: libc/ownership
+    title: "Freeze the pcc1 libc import surface as a shrink-only ratchet baseline"
+    latest_evidence: tests/libc_import_baseline.json
+    open_boundary: "Landed 2026-07-24: tests/libc_import_baseline.json records the exact 78 libSystem symbols the darwin-arm64 stage1 pcc1 imports (threads-off build), with pinned translation references (musl 1.2.5 sha256-verified, llvm-libc from the llvm 20.1.8 tree, apple-libc @ 71bbe350); tests/python/test_libc_import_baseline.py enforces subset-only (growth fails, shrinkage prompts deliberate tightening) behind probe=pcc1 auto-provisioning. Remaining: a linux-x86_64 twin baseline (docker gate) and a PCC_WITH_THREADS variant baseline."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 570s env -u LC_ALL uv run pytest -q -n0 tests/python/test_libc_import_baseline.py"
+  - id: LIBC-P1-PRIMITIVES
+    priority: P1
+    status: TODO_READY
+    track: libc/ownership
+    title: "Add syscall and atomic intrinsics plus a freestanding module discipline to pcc.unsafe"
+    latest_evidence: pcc/unsafe/__init__.py
+    open_boundary: "pcc.unsafe today has pointer/memory intrinsics but no raw-syscall intrinsic, no atomic load/store/CAS/fence intrinsics, and no freestanding (no-heap/no-exception/proven-unboxed) module discipline beyond _suppress_implicit_gc_roots. Add: linux syscall6-style intrinsic (self backend svc/syscall emission; macOS keeps libSystem externs — Darwin raw syscalls are unsupported platform policy, the Go/Rust precedent), atomic intrinsics mirroring the C runtime's __atomic_* usage, and a freestanding subset check for kernel-grade modules. Reference trees are read-only: ~/pcc_refs/musl-1.2.5, ~/pcc_refs/llvm-project-20.1.8-full-depth1/libc, ~/pcc_refs/apple-libc."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "intrinsic regressions on llvm and self backends; bootstrap gate green"
+  - id: LIBC-P2-MEM-STR
+    priority: P2
+    status: TODO_READY
+    track: libc/ownership
+    title: "Translate the mem/str family (11 imported symbols) from musl into pcc-Python"
+    latest_evidence: tests/libc_import_baseline.json
+    open_boundary: "memcpy/memmove/memset/memchr/bzero/strchr/strcmp/strlen/strncmp/strrchr/__memcpy_chk translated from ~/pcc_refs/musl-1.2.5/src/string (primary) with llvm-libc per-function tests as the secondary oracle, differential-tested against the host libc, then linked in place of the imports so the ratchet count drops. Performance parity for memcpy/memset depends on the PERF-P3-SIMD block-op stage; correctness lands first."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "differential oracle suite vs host libc; libc import ratchet count strictly drops; bootstrap gate green"
+  - id: LIBC-P2-ALLOCATOR
+    priority: P2
+    status: TODO_READY
+    track: libc/ownership
+    title: "Own allocation: a page-level allocator over mmap replacing the malloc family imports"
+    latest_evidence: tests/libc_import_baseline.json
+    open_boundary: "Replace malloc/calloc/realloc/free imports with a pcc-owned allocator (musl mallocng as the reference design; ~/pcc_refs/musl-1.2.5/src/malloc) over mmap (libSystem extern on macOS, syscall intrinsic on linux). Must serve the five GC backends without weakening any allocation-path invariant; longrun RSS/fragmentation benchmarks are the acceptance surface alongside correctness."
+    milestone: M5
+    depends_on:
+      - LIBC-P1-PRIMITIVES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "five-GC focused suites green; longrun benchmark deltas recorded; ratchet count drops; bootstrap gate green"
+  - id: LIBC-P2-STDIO-SUBSET
+    priority: P2
+    status: TODO_READY
+    track: libc/ownership
+    title: "Own the buffered-IO subset pcc actually uses (14 stdio imports)"
+    latest_evidence: tests/libc_import_baseline.json
+    open_boundary: "fopen/fclose/fread/fwrite/fflush/ferror/fgetc/fprintf/snprintf/vsnprintf/__stderrp/popen/pclose/remove: implement the subset pcc's runtime and CLI actually exercise (not a general FILE* emulation), musl as reference, formatting reuses the runtime's own py_format machinery where possible. popen/pclose sit on the process-spawn wrappers."
+    milestone: M5
+    depends_on:
+      - LIBC-P1-PRIMITIVES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "differential IO oracle suite; ratchet count drops; bootstrap gate green"
+  - id: LIBC-P2-THIN-WRAPPERS
+    priority: P2
+    status: TODO_READY
+    track: libc/ownership
+    title: "Own the thin wrapper families: fs/env, time, process spawn, sockets"
+    latest_evidence: tests/libc_import_baseline.json
+    open_boundary: "The ~32 remaining thin imports (access/stat/getcwd/realpath/mkdtemp/getenv/setenv/environ/uname/sysconf; clock_gettime/gettimeofday/time/nanosleep; posix_spawn family/system/waitpid/kill/getpid/exit/abort; socket/connect/send/recv/getaddrinfo/freeaddrinfo) become pcc-Python wrappers: libSystem externs on macOS (the supported platform boundary), raw syscalls on linux. getaddrinfo is the one non-thin member (resolver) — scope it to the numeric+/etc/hosts subset pcc needs, fail-closed beyond."
+    milestone: M5
+    depends_on:
+      - LIBC-P1-PRIMITIVES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "wrapper differential suite; ratchet count drops; bootstrap gate green"
+  - id: LIBC-P3-HARD-SINGLETONS
+    priority: P3
+    status: TODO_READY
+    track: libc/ownership
+    title: "Translate the numerically hard singletons: strtod and pow"
+    latest_evidence: tests/libc_import_baseline.json
+    open_boundary: "The only two numerically hard imports: strtod (correctly-rounded decimal-to-double; the runtime already owns shortest-repr float printing, this is its inverse) and pow (the single libm import). Translate from musl with llvm-libc's correctly-rounded implementations and tests as the stronger oracle; differential fuzz against the host on large corpora including subnormals, halfway cases, and hex floats."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "differential fuzz corpus green vs host libc and llvm-libc tests; ratchet count drops; bootstrap gate green"
+  - id: LIBC-P3-LINUX-ZERO-LIBC-TRACER
+    priority: P3
+    status: TODO_READY
+    track: libc/ownership
+    title: "Tracer bullet: a statically linked zero-libc pcc binary on x86_64 linux"
+    latest_evidence: tests/libc_import_baseline.json
+    open_boundary: "An asm _start shim plus the syscall intrinsic produce a static hello-world (write/exit) with ZERO undefined symbols on x86_64-linux (docker gate, same harness as the self-backend linux suites). Documents the structural casualty honestly: the static zero-libc track has no dlopen, so C extensions and the libcurl transport are excluded or statically linked on that track; macOS is out of scope by platform policy (libSystem stays)."
+    milestone: M5
+    depends_on:
+      - LIBC-P1-PRIMITIVES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "docker gate: static binary runs, nm -u empty, file reports statically linked"
+  - id: ARCH-P2-PIPELINE-DECOMPOSE
+    priority: P2
+    status: TODO_READY
+    track: architecture/hygiene
+    title: "Decompose pipeline.py (12,386 lines) into focused modules behind a thin facade"
+    latest_evidence: pcc/py_frontend/pipeline.py
+    open_boundary: "pipeline.py mixes CLI wiring, compile-state records, dependency-graph construction, AST lift driving, pass scheduling, LLVM/self backend driving, extension compilation, and host-subprocess escapes in one module. Split along those seams behind a thin facade with zero behavior change, following the landed layer1 facade precedent (AUD-P1-HOIST-LAYER1-SPLIT). Bootstrap-critical: the module is inside the stage1 closure, so every split slice carries bootstrap gates and the closure hash churn is expected."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "no public entrypoint changes; focused frontend gates plus gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: ARCH-P2-C-CODEGEN-DECOMPOSE
+    priority: P2
+    status: TODO_READY
+    track: architecture/hygiene
+    title: "Decompose c_codegen.py (11,711 lines) along expression/declaration/control-flow/layout seams"
+    latest_evidence: pcc/codegen/c_codegen.py
+    open_boundary: "Split the C lowering monolith behind a facade with zero behavior change, one seam per slice. The signedness metadata invariants (_tag_unsigned/_is_unsigned_val/_usual_arithmetic_conversion family) must stay in one place — signedness loss across module boundaries is the repository's classic C bug shape. Each slice runs the sensitive C gates (parser, lua onelua + runtime-match, lz4, sqlite, unsigned loads) before the next lands."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/c/test_c_parser.py tests/c/test_unsigned_loads.py tests/c/test_lz4.py"
+  - id: ARCH-P2-PCC1-PYTEST-EXTRACT
+    priority: P2
+    status: TODO_READY
+    track: architecture/hygiene
+    title: "Extract the embedded pcc1 pytest harness from cli_bootstrap.py into a closure-safe module"
+    latest_evidence: pcc/cli_bootstrap.py
+    open_boundary: "cli_bootstrap.py (10,901 lines) embeds the pcc1 --pytest launcher/harness (the _pcc1_pytest_* family). The harness is a deliberate self-host feature, not dead weight — the task is extraction into a separate module compiled inside the same stage1 closure, not deletion. Coordinate with AUD-P2-CLI-SHARED-HELPER-DUPLICATION so shared helpers land in one closure-safe home. Bootstrap gates required; the pcc1 --pytest launcher tests are the acceptance surface."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "pcc1 --pytest launcher suites green; gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: ARCH-P3-GC-DISPATCH-EVAL
+    priority: P3
+    status: TODO_READY
+    track: architecture/runtime
+    title: "Evaluate function-pointer dispatch vs the hot-path backend switch in py_gc_backend.c"
+    latest_evidence: pcc/py_runtime/src/py_gc_backend.c
+    open_boundary: "py_gc_backend.c consults the selected-backend global at 83 sites, including pcc_gc_step/pcc_gc_alloc/pcc_gc_store_ptr hot paths. Evaluate a per-backend function-pointer table against the switch WITH MEASUREMENTS (gc benchmarks + bootstrap stage timing); a predictable switch on a global can beat indirect calls, so this is an experiment first, refactor second. Five-GC production equality and the single slot-trace contract are non-negotiable; the C/pcc-Python mirror moves together. File-per-backend split is out of scope for this row."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "documented measurement verdict; if adopted: PCC_GC_BACKEND=0..4 focused suites green plus bootstrap gate"
+  - id: ARCH-P2-SELF-IR-PARSER-STRUCTURE
+    priority: P2
+    status: TODO_READY
+    track: architecture/self-backend
+    title: "Replace ad-hoc string splitting in self_backend_parse.py with a tokenizer and typed type parser"
+    latest_evidence: pcc/backend/self_backend_parse.py
+    open_boundary: "self_backend_parse.py (2,810 lines) parses LLVM IR text with regexes and comma splitting; nested aggregate types have already produced one production incident (the { i64, i64 } split, fixed by split_top_level). Introduce a small tokenizer plus a recursive typed type-parser for the supported IR subset so nesting is structural, not patched. BackendUnavailable stays fail-closed for unsupported shapes; the incident corpus becomes the regression suite; bootstrap gates required (strict self path consumes this parser)."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "self-backend suites green including nested-aggregate regression shapes; gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: ARCH-P2-PORT-ABI-AUTOGEN
+    priority: P2
+    status: TODO_READY
+    track: architecture/runtime
+    title: "Generate port-side struct offsets and type tags from the C headers instead of hand-writing them"
+    latest_evidence: tests/python/test_runtime_layout_contract.py
+    open_boundary: "tests/python/test_runtime_layout_contract.py (2026-07-23) LOCKS the C layouts the pcc-Python ports assume, but 140+ hand-written byte offsets remain in pcc/py_runtime/py/. Next step: generate a single port-side constants module (offsets, sizes, type tags) from the C headers at build time so the mirror has one source of truth, then migrate port readers off inline literals incrementally. Also covers the drift class where a C-side fix does not reach the port (the py_gc_track double-registration incident shape): extend port-vs-C parity gates as readers migrate."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "layout contract test green; migrated port modules pass their focused suites under PCC_GC_BACKEND=0..4; bootstrap gate green"
+  - id: ARCH-P3-LAYER1-STATE-PROTOCOL
+    priority: P3
+    status: TODO_READY
+    track: architecture/hygiene
+    title: "Give the 80+ layer1 mixins a typed shared-state protocol and a name-collision lint"
+    latest_evidence: pcc/py_frontend/codegen/layer1_mixins.py
+    open_boundary: "L1CodeGen composes 80+ mixins over one self namespace; cross-mixin state (current_function, runtime, error-block attributes) is implicit and MRO collisions are silent. This row is NOT a composition rewrite: declare the shared-state surface as a typed Protocol/base declaration, and add a source-level lint test that rejects same-name private helpers defined in more than one mixin. Zero behavior change; frontend gates plus bootstrap baseline."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "collision lint test in tests/; gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: ARCH-P3-TYPE-PREDICATE-INVENTORY
+    priority: P3
+    status: TODO_READY
+    track: architecture/hygiene
+    title: "Inventory string-based type predicates in type_infer.py and centralize if breadth confirms"
+    latest_evidence: pcc/py_frontend/type_infer.py
+    open_boundary: "An external audit claims dozens of string-matched type branches in type_infer.py (5,038 lines); a narrow-pattern probe found only 4, so the breadth is unproven. Inventory first: enumerate every string-based type test (str(type), .name comparisons, container-name tuples), classify which belong in shared typed predicates or a symbol table, and only then refactor. No refactor lands without the inventory; type inference is bootstrap-critical."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "inventory table committed as evidence; any landed refactor passes frontend suites plus bootstrap gate"
+  - id: PERF-P1-REGALLOC
+    priority: P1
+    status: TODO_READY
+    track: performance/self-backend
+    title: "Replace the one-stack-slot-per-SSA-value scheme with fast intra-function register allocation"
+    latest_evidence: pcc/backend/self_backend_aarch64_darwin_slots.py
+    open_boundary: "Today every SSA value round-trips through a stack slot (load_slot_to_reg/store_reg_to_slot in self_backend_aarch64_darwin_slots.py), which is the dominant instruction-level cost (-O0 shape). Implement block-local liveness plus linear-scan allocation with spill-to-slot fallback, reference shape llvm/lib/CodeGen/RegAllocFast.cpp (upstream-reference + oracle discipline, same as pcc/ir_passes). Oracle is behavioral (self-vs-llvm output parity + emit_self_asm assertions; pattern-only checks are banned). Bootstrap-critical; x86_64 mirror follows; measure value_array_c_like + stage2 wall time. Follow-on in the same track: save caller-saved registers only for values live across a call, and forward call results to their single use without a slot round-trip."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "self-vs-llvm runtime output parity on the existing self-backend suites; asm-level regressions via emit_self_asm"
+      - "before/after numbers recorded for value_array_c_like and bootstrap stage2 wall time"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P2-LDP-STP
+    priority: P2
+    status: TODO_READY
+    track: performance/self-backend
+    title: "Pair adjacent ldr/str into ldp/stp in the AArch64 self backend"
+    latest_evidence: pcc/backend/self_backend_target_passes.py
+    open_boundary: "Measured 2026-07-24: ldp/stp pairing is essentially absent outside the prologue. Translate the core of AArch64LoadStoreOptimizer.cpp as a registered target pass (self_backend_target_passes registry); prologue/epilogue and object-field access benefit most."
+    milestone: M5
+    depends_on:
+      - PERF-P1-REGALLOC
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "emit_self_asm shows ldp/stp pairing on a pinned regression shape; runtime parity preserved"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P2-MADD-FOLD
+    priority: P2
+    status: TODO_READY
+    track: performance/self-backend
+    title: "Fuse mul+add into madd/msub and fold address arithmetic into AArch64 addressing modes"
+    latest_evidence: pcc/backend/self_backend_aarch64_darwin_addr.py
+    open_boundary: "Measured 2026-07-24: zero madd/msub fusion and near-zero addressing-mode folding — every memory access computes its address with a separate add, and mul+add chains (tagged-int arithmetic, array indexing) emit two instructions. Translate MachineCombiner madd patterns and ISel addressing-mode folds ([base, index, lsl #n], [base, #imm] reuse) as registered target passes."
+    milestone: M5
+    depends_on:
+      - PERF-P1-REGALLOC
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "emit_self_asm shows madd fusion and folded addressing on pinned regression shapes; runtime parity preserved"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P2-COLD-PATHS
+    priority: P2
+    status: TODO_READY
+    track: performance/self-backend
+    title: "Lay out py_err_occurred error paths as cold blocks with fallthrough hot paths"
+    latest_evidence: pcc/backend/self_backend_aarch64_darwin_flow.py
+    open_boundary: "pcc-generated code checks py_err_occurred after every raising call, so branch layout is unusually high-leverage for this compiler: place error paths in a cold region, keep the hot path as fallthrough, and add tbz/tbnz and ccmp chains where they shorten the hot path (both unused today)."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "emit_self_asm shows cold-block layout on a pinned err-check shape; runtime parity preserved"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P3-SIMD
+    priority: P3
+    status: TODO_READY
+    track: performance/self-backend
+    title: "SIMD in two stages: q-register block copy/zero first, translated vectorizer passes second"
+    latest_evidence: pcc/ir_passes/slp_vectorizer.py
+    open_boundary: "Stage one: straight-line block copies/zeroing (struct and inline-array traffic) via q-register ldp/stp — cheap and immediately measurable. Stage two: assess the translated loop_vectorize/slp_vectorizer passes and connect them to NEON emission behind the explicit PCC_SELF_BACKEND_VECTORIZE policy; wide-SIMD hot paths belong to the kernel_ir/Metal route."
+    milestone: M5
+    depends_on:
+      - PERF-P2-LDP-STP
+      - PERF-P2-MADD-FOLD
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "stage-one block-op shapes pinned via emit_self_asm; runtime parity preserved"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P2-PASS-WIRE
+    priority: P2
+    status: TODO_READY
+    track: performance/compile-time
+    title: "Run the default pass tier on the self-backend path before emission"
+    latest_evidence: pcc/py_frontend/ir_pass_pipeline.py
+    open_boundary: "The translated pass library currently runs host-only behind PCC_PYTHON_IR_PASSES; --backend=self emission never benefits. Wire the default tier into the self path without growing the bootstrap closure (preserve the ir_pass_pipeline.py host-subprocess boundary); every enabled pass needs an opt differential oracle first (only ~6 of ~65 have one today, tests/c/test_ir_passes_*_semantic_oracle.py; a pass file existing does not prove upstream-matching behavior)."
+    milestone: M5
+    depends_on:
+      - PERF-P1-TIERING
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "self-backend output parity with passes on vs off on the existing self suites; stage2 wall-time within the tier budget"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P3-PASS-CLOSURE
+    priority: P3
+    status: TODO_READY
+    track: performance/compile-time
+    title: "Compile the pass library with pcc and run it inside pcc1 (closure admission)"
+    latest_evidence: docs/plans/all-pass-llvm-ir-1to1-master-plan.md
+    open_boundary: "Master-plan end state: the pass library joins the self-hosted closure so pcc1 optimizes with compiled passes (also removing the Python interpretation overhead behind the compile-time complaint). Requires the pass library to be libpython-free."
+    milestone: M5
+    depends_on:
+      - PERF-P2-PASS-WIRE
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "full self-host bootstrap green with the compiled pass tier active; stage timing recorded"
+  - id: PERF-P1-INT-READMIT
+    priority: P1
+    status: TODO_READY
+    track: performance/frontend
+    title: "Re-admit range-proven induction variables and bounded loops to the raw i64 lane"
+    latest_evidence: tests/python/test_py_typed_int_unboxed.py
+    open_boundary: "The 2026-06-17 typed-int overflow fix demoted general accumulator loops to the boxed/tagged ABI (correct, slower). Obligation 7 explicitly allows proven-in-range internal optimization: add value-range analysis for induction variables and bounded loops, and re-admit proven-non-overflowing shapes to raw i64. Acceptance surface: the test_py_typed_int_unboxed.py cases that now assert @py_int_add appears flip back to unboxed one by one, each with a proof obligation; unproven shapes stay boxed."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_typed_int_unboxed.py tests/python/test_native_typed_int_overflow.py tests/security/test_py_integer_safety.py"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P2-LOOKUP
+    priority: P2
+    status: TODO_READY
+    track: performance/runtime
+    title: "Replace py_class_lookup linear scan with hashed method tables or inline caches"
+    latest_evidence: pcc/py_runtime/src/py_class.c
+    open_boundary: "py_class_lookup() is a linear scan and its own comment promises a future hashmap. Stage2 compilation is class-dense, so the win is directly measurable. C and pcc-Python port stay mirrored; the PyClassObject layout contract (test_runtime_layout_contract.py) moves together with any layout change."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "focused lookup regression under both C and port tiers across PCC_GC_BACKEND=0..4; stage2 timing delta recorded"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py tests/python/test_runtime_layout_contract.py"
+  - id: PERF-P3-RC-ELISION
+    priority: P3
+    status: TODO_READY
+    track: performance/frontend
+    title: "Elide provably paired incref/decref for straight-line owned temporaries"
+    latest_evidence: pcc/py_frontend/codegen/ownership_lowering.py
+    open_boundary: "ownership_lowering already classifies owned/borrowed statically; a temporary that is born and dies within one basic block with no escaping use can skip its refcount pair. Elision touches counts only — slot tracing, root registration, and the store-barrier contract are untouched. Gate set is the full ownership/GC-root regression family plus bootstrap."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "ownership/GC-root regression families green across PCC_GC_BACKEND=0..4"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P1-FRAME-POOL
+    priority: P1
+    status: TODO_READY
+    track: performance/runtime
+    title: "Finish the frame-root entry-pool work: residual GC3/GC4 bookkeeping and backend-4 RSS pressure"
+    latest_evidence: docs/investigations/gc-frame-index-entry-pool-perf.md
+    open_boundary: "Investigation active and root-caused; entry-pool slices bootstrap-verified. Remaining: residual GC3/GC4 collector bookkeeping and backend #4 RSS pressure. The frame-index hash is REQUIRED (non-LIFO slot roots); never regress it to a list."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gc3/gc4 focused suites green; longrun RSS numbers recorded before/after"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P3-BUMP
+    priority: P3
+    status: TODO_READY
+    track: performance/runtime
+    title: "Bump allocation for the generational backend's young generation plus small-object pooling"
+    latest_evidence: benchmarks/run_gc_advantage_matrix.py
+    open_boundary: "Bump-pointer young-gen allocation for PCC_GC_BACKEND=3 (reusing the promotion machinery) plus small-object pools. No weakening of finalizer/weakref/resurrection/slot-trace contracts; longrun benchmarks are the anchor."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "PCC_GC_BACKEND=3 focused gc suites green; longrun benchmark deltas recorded"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PERF-P1-TIERING
+    priority: P1
+    status: TODO_READY
+    track: performance/compile-time
+    title: "Tier the translated LLVM pass pipeline: default O1 subset, per-pass time budget, telemetry baseline"
+    latest_evidence: docs/plans/all-pass-llvm-ir-1to1-master-plan.md
+    open_boundary: "Enabling all ~65 translated passes (pcc/ir_passes/) at once made compilation much slower (owner report 2026-07-24). Define a default tier selected FROM TELEMETRY (PCC_PYTHON_IR_PASS_TELEMETRY on a stage2 workload; candidates: mem2reg/sroa, instsimplify, early_cse, simplifycfg, dce/adce, licm); the rest becomes explicit -O2/-O3 opt-in. Add a per-pass wall-time budget breaker (over-budget = skip + telemetry, never a silent stall), enable the content-hash result cache by default, and gate huge functions to linear passes. Land a per-pass timing baseline under docs/performance/ so compile-time regressions go red. Over-budget passes get algorithmic treatment (worklists, sparse analyses, upstream-complexity bailouts), not permanent exclusion."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "telemetry table for the chosen workload committed under docs/performance/ with per-pass timings for default and full tiers"
+      - "default-tier bootstrap stage2 wall time within an agreed budget of the no-pass baseline; full tier explicit opt-in only"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: PKG-P2-REINSTALL-FASTPATH
+    priority: P2
+    status: TODO_READY
+    track: package/import
+    title: "pcc1 -m pip install re-run of an already-installed package must short-circuit instead of rebuilding"
+    latest_evidence: docs/investigations/pcc1-pip-numpy-owned-acquire-60s-timeout.md
+    open_boundary: "Measured 2026-07-24: re-running `pcc1 -m pip install numpy` into an env that already has the identical sha256-pinned install rebuilds everything (168s) instead of matching the installed pcc-package.json manifest (name, version, artifact sha256, abi tag) and returning ok immediately. Add the manifest-match fast path with an explicit report field (e.g. install_action: already-satisfied), keep --force/upgrade semantics rebuild-capable, and add a focused regression that a second install of the same artifact completes in seconds without invoking the native builder."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "focused regression: second identical install reports already-satisfied and does not run the extension build"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_install.py"
+  - id: TEST-P1-NO-SKIP-DOCTRINE-REMAINING-FAMILIES
+    priority: P1
+    status: DONE_WEAK
+    track: repository hygiene
+    title: "Finish converting designed skips to pcc_gate deselection: pcc1-freshness, Metal availability, and tool-verdict families"
+    latest_evidence: docs/goal/evidence/2026-07-24-no-skip-doctrine-full-conversion.md
+    open_boundary: "Policy (owner decision 2026-07-23): a test either runs and verifies or is not part of the run; pytest.skip is reserved for genuine mid-run environmental aborts. Landed: pcc_gate marker + collection deselection in tests/conftest.py (env=/dep=/probe=/unavailable=), csmith retry-then-fail (no oracle/pcc-timeout skips), and conversion of the two-Mac, CI-ratchet, stress, pinned-site, network, MLX, PCC_CURRENT_PCC1, and TSan gates (TSan probe runs 3x because macOS TSan startup crashes are ASLR-nondeterministic; any crash = unreliable toolchain = deselect). Auto-provisioning landed 2026-07-24: pcc_gate(probe="pcc1") in tests/conftest.py rebuilds stage1 via scripts/bootstrap.sh --stage 1 (flock + 300s sentinel, PCC_NO_AUTO_PCC1 opt-out, loud failure) — smoke and default-package-env converted; integration dir/tool gates and emit/intent converted the same day. All families converted 2026-07-24: gpu_hardware builder/launcher skips are failures behind probe=metal + probe=pcc1 module gates; Metal availability is a collection probe (device via MTLCreateSystemDefaultDevice + xcrun metal, cached); pcc1_gate.find_current_pcc1 is find-or-build (shared flock/sentinel with conftest provisioning) and skip_or_fail_no_current_pcc1 always fails; tests/c tool/dir verdicts, OPT/CC oracles, lua, llvm-registry, RSS /usr/bin/time, aarch64-only security pins, TSan, local ~/tilelang + pinned TVM provider + external ds4 references are pcc_gate collection gates. grep proves zero real pytest.skip/skipif sites under tests/. DONE_STRONG requires one full default run (expect 0 skipped) plus one full -m integration run with final summaries; neither full run was re-executed inside this slice."pcc1" and turn builder skips into fails), Metal availability (_unavailable helpers / MTLCreateSystemDefaultDevice sites across tests/gpu_hardware and tests/kernel), and tool-verdict skipifs (OPT/CC/project-dir UNAVAILABLE verdicts in tests/c). Landed since: bootstrap-baseline artifact gates, integration env/artifact/docker gates (numpy l4/l5, package e2e, pip-network, default-package-env, self-backend docker), dlpack_5gc consumer, csmith pinned certifiable corpus (5/11/18/21 deterministically exceed the native oracle budget and were replaced by vetted 20/22/23). Each needs a collection-time gate (marker or verdict kwarg) plus fail-on-bypass, without weakening any claim boundary."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 1200s env -u LC_ALL uv run pytest -q reports 0 skipped on a machine with fresh pcc1 and healthy toolchain; designed gates appear only as deselected"
+      - "rg -n 'pytest.skip' tests/ hits only genuine mid-run environmental-abort sites, each with a justifying comment"
+  - id: TEST-P2-REMOVE-LEGACY-PATH-SHIM
+    priority: P2
+    status: TODO_READY
+    track: repository hygiene
+    title: "Remove the tests/conftest.py global Path.resolve/os.path.dirname shim after migrating legacy path arithmetic"
+    latest_evidence: docs/investigations/tests-conftest-legacy-path-shim-false-repo-root.md
+    open_boundary: "tests/conftest.py monkeypatches pathlib.Path.resolve and os.path.dirname process-wide to keep pre-migration parents[1]/dirname(__file__) arithmetic working for direct children of tests/{c,python}. The 18 parents[2] victims are already migrated to the pcc1_gate.repo_root() AGENTS.md walk-up helper; ~91 legacy files still rely on the shim, and files added while the shim was active may use either convention, so each file needs classification (legacy-relies-on-shim vs correct-but-corrupted) before the shim is deleted. Removing the shim without that audit flips currently-green legacy tests to wrong-root behavior."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "rg -n 'Path.resolve = |os.path.dirname = ' tests/conftest.py returns no matches (shim deleted)"
+      - "rg -l 'parents\\[1\\]|dirname\\(__file__\\)' tests/c/*.py tests/python/*.py classified: every remaining use proven correct without the shim"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest -q (full default suite, final summary present, no new failures or new skips vs the pre-removal baseline)"
   - id: AUD-P2-DEAD-ROADMAP-MODULE-INVENTORY
     priority: P2
     status: CLAIM_RISK
@@ -2214,13 +2736,105 @@ tasks:
       - "gtimeout 1200s env -u LC_ALL uv run pytest"
       - "gtimeout 1800s env -u LC_ALL uv run pytest -m integration"
 
+  - id: TEST-P0-COLD-SELF-HOST-WARMUP-BUDGET
+    priority: P0
+    status: DONE_STRONG
+    track: test-infrastructure/performance
+    title: "Keep the cold self-host oracle warmer inside its per-stage timeout"
+    latest_evidence: docs/goal/evidence/2026-07-22-cold-self-host-warmup-budget.md
+    latest_update: "The lock-owned warmer now uses four frontend jobs independently of six-way outer pytest scheduling, preserves explicit overrides, completes an empty-cache pcc1/pcc2/pcc3 warmup in 727.55 seconds at a sampled 5.64 GiB peak, and the exact non-integration suite passes in 781.31 seconds."
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - TEST-P0-FULL-SUITE-BUILD-EFFICIENCY
+    rank: 991
+    exit_criteria:
+      - "The cold self-host oracle stage builder uses a tested fixed inner frontend budget independent of outer pytest worker count, while an explicit PCC_PY_FRONTEND_JOBS value still wins."
+      - "A cold pcc2/pcc3 warmup completes with final pytest summary inside the bounded stage and command watchdogs and publishes both immutable artifacts."
+      - "The exact six-worker non-integration suite completes with a final pytest summary and no surviving compiler or pytest children."
+    required_gates:
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/test_test_infrastructure_efficiency.py"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest -q -n0 tests/python/test_self_host_oracle_diff.py::test_000_self_host_oracle_stage_cache_warmup"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest"
+
+  - id: PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE
+    priority: P0
+    status: IN_PROGRESS
+    track: performance/self-host
+    title: "Eliminate repeated GC-invariant work from self-host compiler stages"
+    latest_evidence: ""
+    latest_update: "A compiler-identity/content-addressed frontend bundle cache reduced an isolated current-source pcc1-to-pcc2 stage from 373.914s and 5.319 GiB to 38.209s and 2.689 GiB while a separately keyed pcc2-to-pcc3 compilation preserved normalized fixed-point identity. The human tightened the remaining acceptance budget to 900 seconds: the five-GC forced matrix and both exact complete suites must finish inside that bound; timeout growth is not an optimization."
+    open_boundary: "Measure isolated pcc1-to-pcc2 phase costs and artifact identity, then remove or content-address reuse of repeated parse, discovery, type/export, IR-pass, and self-object work wherever the cache key proves it independent of GC runtime policy. Keep GC-specific runtime, ABI, link, fixed-point, and behavior gates distinct; do not reduce tests, loosen semantics, or increase timeouts as the optimization."
+    milestone: M5
+    depends_on:
+      - TEST-P0-COLD-SELF-HOST-WARMUP-BUDGET
+      - PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL
+      - TEST-P0-FULL-GC-MEMORY-BUDGET
+    rank: 99
+    exit_criteria:
+      - "A phase-level cold baseline identifies the dominant pcc1-to-pcc2 costs and records CPU time, wall time, peak RSS, module count, cache hits, and cache misses without relying on concurrent-suite timing."
+      - "A compiler-level content-addressed path avoids recomputing proven GC-invariant frontend or backend artifacts across equivalent invocations, with keys covering source, compiler/runtime ABI, target, backend, options, and every semantic input."
+      - "The dominant isolated stage or phase is at least 25% faster than its recorded cold baseline, with no increase above the documented 8 GiB single-chain RSS ceiling and no timeout increase."
+      - "The forced-rebuild five-GC fixed-point matrix, exact non-integration suite, and exact integration suite each complete inside 900 seconds with final pytest summaries; every backend and semantic gate remains present."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_frontend_ir_pass_pipeline.py -k 'cache or profile or deterministic'"
+      - "gtimeout 900s env -u LC_ALL uv run pytest -q -n0 tests/python/test_self_host_oracle_diff.py::test_000_self_host_oracle_stage_cache_warmup"
+      - "gtimeout 900s env -u LC_ALL PCC_BOOTSTRAP_FULL_REBUILD=1 uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc0.py tests/python/gc/test_pcc_bootstrap_full_gc1.py tests/python/gc/test_pcc_bootstrap_full_gc2.py tests/python/gc/test_pcc_bootstrap_full_gc3.py tests/python/gc/test_pcc_bootstrap_full_gc4.py"
+      - "gtimeout 900s env -u LC_ALL uv run pytest"
+      - "gtimeout 900s env -u LC_ALL uv run pytest -m integration"
+
+  - id: PERF-P1-COMPILER-DESIGN-REFERENCE-AUDIT
+    priority: P1
+    status: TODO_READY
+    track: performance/compiler-architecture
+    title: "Map proven compiler optimization designs onto PCC without weakening Python semantics"
+    latest_evidence: ""
+    latest_update: "The requested reference set is Cornell Virtual Workshop code optimization plus the primary designs of CPython, Go, HotSpot/JVM, GraalVM, and LLVM. The audit must classify techniques against PCC's measured frontend, self-backend, runtime, GC, package, value-model, and long-running-service boundaries rather than produce a generic optimization checklist."
+    open_boundary: "Produce a primary-source, profile-linked design matrix that identifies which techniques PCC already implements, which can land generically now, which require profiling evidence or the opt-in value model, and which conflict with Python semantics or self-host ownership. Convert the highest-value accepted techniques into finite task-board slices with correctness, fixed-point, memory, and performance gates."
+    milestone: M5
+    depends_on:
+      - PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE
+    rank: 101
+    exit_criteria:
+      - "The analysis covers Cornell's measurement, locality, loop, call, memory, vectorization, parallelism, and algorithm guidance and cites the original page or linked primary material for every nontrivial claim."
+      - "Separate sections compare PCC with CPython's specializing/tiered execution, Go's compiler and GC/runtime pipeline, HotSpot/JVM tiered JIT and profiling, GraalVM partial evaluation/speculation, and LLVM pass/analysis infrastructure."
+      - "Every recommended PCC technique names its semantic preconditions, invalidation/deoptimization or slow path, owner backend implications, expected profile counter, and a falsifiable benchmark gate; rejected techniques state the precise incompatibility."
+      - "The resulting roadmap prefers general mechanisms over package, GC, benchmark, module-count, or test-name special cases and does not relabel oracle/fallback paths as PCC ownership."
+    required_gates:
+      - "gtimeout 60s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate"
+
+  - id: GPU-P1-OWNER-SCHEDULE-THREAD-BINDING
+    priority: P1
+    status: DONE_STRONG
+    track: gpu/scheduling
+    title: "Separate replayable GPU thread scheduling from Kernel IR semantics"
+    latest_evidence: docs/goal/evidence/2026-07-22-gpu-owner-schedule-thread-binding.md
+    latest_update: "A versioned content-addressed KernelSchedule now applies checked BindThreads replay before TIRx freeze through both pcc-metal and tvm-tilelang. Stale/frozen/invalid plans fail closed, schedule digest and trace are recorded, the real pinned provider receives the scheduled frozen IR, and a strict Darwin pcc-metal scheduled copy reaches GPU_LEVEL_4_DEVICE_RESULT. General tiling, layouts, software pipelines, cost models, and autotuning are explicitly outside this completed slice."
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - GPU-P0-PCC-METAL-OWNER-DRIVER
+      - GPU-P0-TVM-TILELANG-OWNER-DRIVER
+    rank: 102
+    exit_criteria:
+      - "Kernel semantics and schedule decisions have separate versioned records; schedule application is deterministic, replayable, content-addressed, and rejects stale input digests, stale expected bindings, duplicate selectors, invalid Metal thread counts, target mismatch, and post-freeze application."
+      - "The pcc-metal and tvm-tilelang owner adapters apply the same schedule module before canonical TIRx freeze, produce the same scheduled frozen-IR digest, include the schedule digest in artifact identity and the owner manifest, and never fall back when a schedule is invalid."
+      - "An unscheduled invocation preserves the existing owner interface and artifact behavior, while a scheduled copy changes the compiled thread binding without changing CPU-oracle results."
+      - "A strict Darwin Metal gate reaches GPU_LEVEL_4_DEVICE_RESULT for the scheduled copy and records requested owner == actual owner == pcc-metal with fallback_used=false."
+    required_gates:
+      - "gtimeout 180s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_gpu_schedule.py tests/kernel/test_gpu_owner_backend.py"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/kernel/test_tvm_tilelang_owner_provider.py -k 'schedule or pinned_provider_compiles'"
+      - "gtimeout 300s env -u LC_ALL PCC_GPU_HARDWARE_STRICT=1 uv run pytest -q -n0 tests/gpu_hardware/test_metal_claim_levels.py -k 'scheduled_copy'"
+      - "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate"
+
   - id: PKG-P0-NETWORK-ACQUISITION-BACKENDS
     priority: P0
     status: DONE_STRONG
     track: packages/acquisition
     title: "Make pcc1 -m pip install requirements work through explicit host and owned acquisition backends"
     latest_evidence: docs/goal/evidence/2026-07-21-network-acquisition-backends-closure.md
-    latest_update: "Explicit auto/host/owned/offline acquisition, provenance and digest reporting, target-Python selection, owned Simple API HTTPS, the real pcc1 online NumPy five-GC command gate, complete bootstrap-shim regression, and goal-doc consistency are green."
+    latest_update: "Auto now selects the owned, hash-verified Simple Repository path and avoids host pip's redundant PEP 517 metadata build; explicit host remains labeled. Index-url provenance survives install, current pcc1 gates are green, and the default-environment NumPy path runs across GC0..4."
     open_boundary: ""
     milestone: M5
     depends_on:
@@ -2230,7 +2844,7 @@ tasks:
     rank: 75
     exit_criteria:
       - "pcc1 -m pip install accepts a bare requirement and records acquire_mode, index/artifact origin, sha256, resolved version, and host assistance separately from build/import/runtime claims."
-      - "The host backend performs bounded delegated download into an immutable cache and feeds the existing local installer; auto selection is explicit in diagnostics and never relabels host acquisition as owned."
+      - "The host backend performs bounded delegated download into an immutable cache as an explicit compatibility mode; default auto selection uses the owned Simple Repository path and records requested versus actual mode without relabeling provenance."
       - "The owned backend fetches and verifies an artifact through a standards-based Simple Repository endpoint with PCC_HOST_PYTHON and host pip unavailable, and fails closed with a stable diagnostic for unsupported dependency-resolution or build-isolation shapes."
       - "A generic synthetic package proves both acquisition backends without package-name special cases."
       - "The command-shaped NumPy gate acquires a source artifact, installs it, and passes the existing pcc1/self/no-libpython import plus basic array-add behavior; broader NumPy API compatibility remains outside this card."
@@ -2240,13 +2854,61 @@ tasks:
       - "gtimeout 900s env -u LC_ALL uv run pytest -q -n0 -m integration tests/integration/test_pcc1_pip_numpy_network.py"
       - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
 
+  - id: BUG-P0-NATIVE-FILE-OPEN-ERROR-CONTRACT
+    priority: P0
+    status: DONE_STRONG
+    track: python-runtime/files
+    title: "Raise through the runtime exception channel when native open fails"
+    latest_evidence: docs/goal/evidence/2026-07-22-native-file-open-error-contract.md
+    latest_update: "The C and pcc-Python file runtimes raise OSError on fopen failure, the with-binding root is NULL-initialized on the error edge, current pcc1 passes the original no-host package scenario, and focused plus complete suites are green."
+    open_boundary: ""
+    milestone: M5
+    depends_on: []
+    rank: 67
+    exit_criteria:
+      - "A missing path passed to native open returns NULL with an active OSError in both the C runtime and pcc-Python mirror, so compiled except OSError/Exception handlers execute."
+      - "A with-open binding registered as an entry GC root is object-or-NULL on every predecessor, including the open-error edge."
+      - "The original pcc1 package-install manifest test passes with PCC_HOST_PYTHON unavailable and emits the expected JSON rather than None."
+      - "Focused native-file and exception parity tests pass without weakening the package installer or bypassing native open lowering."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_python_exception_parity.py::test_return_from_failed_with_except_survives_outer_finally tests/python/test_native_file_open.py"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_install.py::test_pcc1_package_install_writes_manifest_without_host_python"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -m integration"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+
+  - id: BUG-P0-PCC1-EXISTING-MESON-OUTPUTS
+    priority: P0
+    status: DONE_STRONG
+    track: packages/build
+    title: "Install existing pcc-managed Meson outputs without requiring host Python"
+    latest_evidence: docs/goal/evidence/2026-07-22-existing-meson-output-install.md
+    latest_update: "Generic matching importable Meson outputs bypass host rebuilding without package special cases; current pcc1 passes every no-host install origin, the focused package/file group is green, and both complete suites pass."
+    open_boundary: ""
+    milestone: M5
+    depends_on:
+      - BUG-P0-NATIVE-FILE-OPEN-ERROR-CONTRACT
+    rank: 68
+    exit_criteria:
+      - "A source tree with a distribution-matching importable payload under build/pcc-package/meson-build installs that payload without invoking host Python."
+      - "A source tree without existing outputs still uses the bounded, explicitly host-assisted Meson build backend; the optimization cannot relabel an unbuilt source tree as built."
+      - "The original compiled-pcc1 package test passes with PCC_HOST_PYTHON=/usr/bin/false, including direct install, cache reinstall, and pip-shim install."
+      - "The behavior is package-generic and does not special-case demo_pkg, NumPy, or any other distribution."
+    required_gates:
+      - "gtimeout 120s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_install.py::test_native_pcc1_existing_meson_outputs_do_not_require_host_python"
+      - "gtimeout 300s env -u LC_ALL PCC_REQUIRE_CURRENT_PCC1=1 uv run pytest -q -n0 tests/python/test_package_install.py::test_pcc1_package_install_writes_manifest_without_host_python"
+      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/python/test_package_install.py tests/python/test_package_build_exec.py"
+      - "gtimeout 1200s env -u LC_ALL uv run pytest"
+      - "gtimeout 1800s env -u LC_ALL uv run pytest -m integration"
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -n0 tests/test_goal_state.py tests/test_goal_startup_docs.py"
+
   - id: PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL
     priority: P0
     status: DONE_STRONG
     track: performance/self-backend
     title: "Replace unbounded short-lived self-backend emit fanout with a resource-bounded efficient worker pool"
     latest_evidence: docs/goal/evidence/2026-07-22-self-backend-bounded-worker-pool.md
-    latest_update: "The two-worker default batch pool reuses compiled workers across objects; 165 focused cases, pcc1 NumPy L5 across GC0..4, 9403 non-integration cases, and 4551 integration cases pass with final summaries."
+    latest_update: "The pool recycles each process after at most four objects while retaining two-process concurrency. Focused deterministic/cache/failure tests, cold GC0, NumPy L5, the forced five-GC matrix, and both complete suites pass under bounded watchdogs."
     open_boundary: ""
     milestone: M5
     depends_on:
@@ -2261,7 +2923,7 @@ tasks:
       - "Focused tests prove worker batching, failure propagation, cache-hit behavior, and resource-bound selection without deleting or weakening existing compiler cases."
       - "A current-source pcc1 compiles and runs the pinned NumPy L5 surface under the no-libpython self backend, and the complete non-integration and integration suites have final summaries."
     required_gates:
-      - "gtimeout 600s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_frontend_ir_pass_pipeline.py tests/python/test_py_multi_file_bootstrap_shim.py"
+      - "gtimeout 900s env -u LC_ALL uv run pytest -q -n0 tests/python/test_py_frontend_ir_pass_pipeline.py tests/python/test_py_multi_file_bootstrap_shim.py"
       - "gtimeout 300s env -u LC_ALL PCC_RUN_NUMPY_L5_ARRAY_INTEGRATION=1 uv run pytest -q -n0 -m integration tests/integration/test_numpy_l5_pcc1_gate.py"
       - "gtimeout 1200s env -u LC_ALL uv run pytest"
       - "gtimeout 1800s env -u LC_ALL uv run pytest -m integration"
@@ -2273,7 +2935,7 @@ tasks:
     track: test-infrastructure/performance
     title: "Bound aggregate RSS when full-GC bootstrap chains run under xdist"
     latest_evidence: docs/goal/evidence/2026-07-22-full-gc-aggregate-memory-budget.md
-    latest_update: "The two-chain default passes focused scheduling checks, a forced-rebuild five-GC matrix in 16m08s, and 4551 integration cases; observed aggregate RSS peaked at 12.99 GiB versus the old three-chain 18.2 GiB peak."
+    latest_update: "A four-worker aggregate frontend budget gives two active chains two workers each and restores four for the last chain. The forced-rebuild five-GC matrix passes all backends in 1306.29s with a sampled 13.13 GiB peak, and the complete integration suite passes 4551 tests in 669.70s."
     open_boundary: ""
     milestone: M5
     depends_on:
@@ -2334,12 +2996,12 @@ tasks:
 
   - id: CLI-P0-PCC1-OWNER-DEFAULTS
     priority: P0
-    status: TODO_READY
+    status: DONE_STRONG
     track: cli/self-backend
     title: "Make bare pcc1 Python execution default to the self owner with no libpython"
-    latest_evidence: ""
-    latest_update: "python-libpython=off and ir-scaffold=on are already documented defaults, but an omitted Python backend still normalizes to llvm; the current README therefore needs explicit owner flags and the short pcc1 app.py experience is mode-incorrect."
-    open_boundary: "For Python inputs only, make pcc1 resolve an omitted backend to self, libpython mode to off, and IR scaffold to on. Preserve explicit --backend llvm as the oracle and explicit libpython auto/on as compatibility modes. Fail closed on unsupported self behavior with no implicit LLVM or libpython fallback."
+    latest_evidence: docs/goal/evidence/2026-07-22-pcc1-owner-defaults.md
+    latest_update: "Bare compiled-stage Python inputs resolve to self/off/on before cache or compilation; profiles and failures carry those labels, explicit compatibility modes remain available, focused compiled-stage/GC0 gates and both complete suites pass."
+    open_boundary: ""
     milestone: M5
     depends_on:
       - PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL
@@ -2357,12 +3019,12 @@ tasks:
 
   - id: PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT
     priority: P0
-    status: TODO_READY
+    status: DONE_STRONG
     track: packages/environment
     title: "Make pcc and pcc1 install into and import from one first-class package environment"
-    latest_evidence: ""
-    latest_update: "The current host default (~/.cache/pcc/site-packages), compiled pcc1 default (/tmp/pcc-site-packages), and import discovery do not form one reliable install/run environment; the explicit PCC_PACKAGE_SITE README flow exposed this gap."
-    open_boundary: "Implement the shared environment resolver specified by docs/design/pcc-package-environments.md, remove divergent host/pcc1 fallback destinations, and prove that a default install is immediately importable without PCC_PACKAGE_SITE or --target. Preserve both flags as explicit, diagnosed overrides."
+    latest_evidence: docs/goal/evidence/2026-07-22-first-class-package-environment.md
+    latest_update: "One self-hostable resolver now owns host/pcc1 install and import selection; VIRTUAL_ENV/private and durable user roots, env info, generic install/import, and bare owned-acquisition NumPy across GC0..4 are proven without PCC_PACKAGE_SITE or --target."
+    open_boundary: ""
     milestone: M5
     depends_on:
       - PKG-P0-NETWORK-ACQUISITION-BACKENDS
@@ -2382,12 +3044,12 @@ tasks:
 
   - id: PKG-P0-UV-PROJECT-ENVIRONMENT
     priority: P0
-    status: TODO_READY
+    status: DONE_STRONG
     track: packages/environment/uv
     title: "Make uv-installed pcc and pcc1 share a private pcc-native project overlay"
-    latest_evidence: ""
-    latest_update: "Local uv 0.10.2 sets VIRTUAL_ENV to the project .venv for uv run, providing a concrete environment ownership seam without placing pcc-native extensions in CPython site-packages."
-    open_boundary: "Use the active uv/virtual environment as the owner of a compatibility-tagged .venv/.pcc overlay. Prove uv run pcc, uv run pcc1, direct pcc1 under the same VIRTUAL_ENV, and emitted applications select it identically, including deterministic behavior after uv recreates the environment."
+    latest_evidence: "docs/goal/evidence/2026-07-22-uv-project-package-environment.md"
+    latest_update: "A real uv-built wheel now exposes pcc and native pcc1 with identical VIRTUAL_ENV-owned .venv/.pcc identity. Bare generic install plus compile/run succeeds without path or backend flags, installed runtime resources are target/freshness validated, CPython site-packages stays clean, and recreating .venv removes the overlay without selecting a stale global site."
+    open_boundary: ""
     milestone: M5
     depends_on:
       - PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT
@@ -2404,11 +3066,11 @@ tasks:
 
   - id: PKG-P1-UV-LOCKED-NATIVE-SYNC
     priority: P1
-    status: TODO_READY
+    status: IN_PROGRESS
     track: packages/environment/uv
     title: "Project a uv lock into a deterministic pcc-native environment without a second resolver"
     latest_evidence: ""
-    latest_update: "The design assigns project resolution and uv.lock ownership to uv, while pcc owns source selection validation, pcc-native builds, transactional overlay publication, and no-libpython runtime evidence."
+    latest_update: "Implementation started after the uv project environment reached DONE_STRONG. The active slice is mapping the frozen uv.lock schema into pcc's existing acquisition/install transaction boundary without adding a second version resolver."
     open_boundary: "Implement a versioned uv.lock adapter and pcc sync --locked. Record lock and artifact provenance, honor the selected target Python/groups/extras/markers, fail closed when no acceptable source or pcc-native artifact exists, and make unchanged repeat sync network- and rebuild-free."
     milestone: M5
     depends_on:

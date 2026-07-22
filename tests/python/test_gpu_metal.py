@@ -33,6 +33,9 @@ kernel void pcc_empty(
 PCC_GPU_VECTOR_ADD = """\
 from pcc import gpu
 
+pytestmark = pytest.mark.pcc_gate(probe="metal")
+
+
 @gpu.kernel
 def add(a: gpu.ptr_f32, b: gpu.ptr_f32, out: gpu.ptr_f32, n: gpu.u32):
     i = gpu.thread_id_x()
@@ -84,14 +87,14 @@ def test_find_metal_compiler_returns_path_or_none():
 
 def _require_usable_metal_toolchain(tmp_path):
     if find_metal_compiler() is None:
-        pytest.skip("Metal compiler unavailable")
+        pytest.fail("Metal compiler unavailable")
     try:
         compile_metal_source_to_air(
             MINIMAL_METAL_KERNEL,
             tmp_path / "metal_toolchain_probe.air",
         )
     except (MetalToolchainUnavailable, MetalCompileError) as exc:
-        pytest.skip(f"Metal compiler unavailable: {exc}")
+        pytest.fail(f"Metal compiler unavailable: {exc}")
 
 
 def test_compile_minimal_metal_kernel_when_toolchain_available(tmp_path):
@@ -100,7 +103,7 @@ def test_compile_minimal_metal_kernel_when_toolchain_available(tmp_path):
     try:
         compile_metal_source_to_air(MINIMAL_METAL_KERNEL, out)
     except (MetalToolchainUnavailable, MetalCompileError) as exc:
-        pytest.skip(f"Metal compiler unavailable: {exc}")
+        pytest.fail(f"Metal compiler unavailable: {exc}")
 
     assert out.is_file()
     assert out.stat().st_size > 0
@@ -202,7 +205,7 @@ def test_prepare_gpu_kernel_generates_metal_sidecar_artifacts(tmp_path):
             metallib_path=tmp_path / "kernel_host.metallib",
         )
     except (MetalToolchainUnavailable, MetalCompileError) as exc:
-        pytest.skip(f"Metal compiler unavailable: {exc}")
+        pytest.fail(f"Metal compiler unavailable: {exc}")
 
     assert "def main" in host_source
     assert len(artifacts) == 1
@@ -280,7 +283,7 @@ def test_pcc_metal_gpu_kernel_binary_launches_embedded_metallib(tmp_path):
     )
     combined = run_result.stdout + run_result.stderr
     if "pcc metal: no Metal device available" in combined:
-        pytest.skip("Metal runtime device unavailable")
+        pytest.fail("Metal runtime device unavailable")
 
     assert run_result.returncode == 0, combined
     assert "OK Metal add kernel via embedded metallib" in combined
@@ -289,7 +292,7 @@ def test_pcc_metal_gpu_kernel_binary_launches_embedded_metallib(tmp_path):
 
 def test_pcc_metal_gpu_kernel_launches_with_self_backend(tmp_path):
     if sys.platform != "darwin":
-        pytest.skip("self backend Metal launch is currently Darwin-only")
+        pytest.fail("self backend Metal launch is currently Darwin-only")
     _require_usable_metal_toolchain(tmp_path)
     src = tmp_path / "kernel_host.py"
     exe = tmp_path / "kernel_host_self"
@@ -326,7 +329,7 @@ def test_pcc_metal_gpu_kernel_launches_with_self_backend(tmp_path):
     )
     combined = run_result.stdout + run_result.stderr
     if "pcc metal: no Metal device available" in combined:
-        pytest.skip("Metal runtime device unavailable")
+        pytest.fail("Metal runtime device unavailable")
 
     assert run_result.returncode == 0, combined
     assert "OK Metal add kernel via embedded metallib" in combined

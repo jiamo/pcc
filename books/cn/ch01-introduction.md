@@ -2,7 +2,7 @@
 
 本书讲述 pcc——一个由 Python 写成、要把 Python 编译成原生代码、并最终用自己编译自己的编译器与运行时系统——的设计与实现。第 1 章不讲任何机制细节,只回答一个问题:这个系统为什么存在,以及它用什么纪律约束自己不变质。后面十七章的每一个设计决定,几乎都能回溯到本章的三个支点:论题(把 Python 的执行变成可拥有的)、七项义务(把论题变成可检验的守则)、声明卫生(把"做到了什么"与"没做到什么"分开说)。如果读者只读一章,应该读这一章;如果读者要质疑某个后续章节的设计,也应该先回到这一章检查它是否偏离了北极星。
 
-## 读者地图:先抓住"拥有执行"这句话
+## 本章导读:"拥有执行"的含义
 
 这一章是全书的契约。读的时候先不要把它当功能清单,而是把它当成后面每一章要证明的三件事:代码能不能离开 CPython 运行,语义有没有被偷偷削弱,声明有没有标清楚模式。
 
@@ -45,7 +45,20 @@ pcc2      -> pcc3    pcc2/pcc3 稳定 == 自托管不动点
 
 不动点不只是一次字节比较。`pcc2` 与 `pcc3` 字节同一,意味着 pcc 的 Python 语义、运行时、代码生成、对象模型、后端和诊断已经相干到足以复现自身——任何一层有不确定性,都会在两次自编译之间放大成差异。当前的权威状态冻结在 [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json)(2026-05-01 捕获,Issue 1 关闭证据):在 macOS arm64 上,LLVM 链与 self 后端链的全部三个阶段都不链接 `libpython`;严格路径(`--backend self --python-libpython=off --ir-scaffold=on`)下 `pcc2`/`pcc3` 发射的 IR 字节同一且含 0 个 `py_cpy_*` 调用,二进制在去除 Mach-O 签名后字节同一。注意这句声明的每个限定词都是刻意的——平台、后端、模式、比较方法——这正是 1.4 节要讲的声明卫生。自举的全部细节见第 15 章。
 
-**五 GC 对比运行时。** 运行时装载五个 GC 后端槽位,由环境变量 `PCC_GC_BACKEND` 在进程启动时选择,枚举定义在 [pcc/py_runtime/include/py_runtime.h](../../pcc/py_runtime/include/py_runtime.h) 中:`PCC_GC_KIND_REFCOUNT_CYCLE`(0)、`PCC_GC_KIND_INCREMENTAL_TRICOLOR`(1)、`PCC_GC_KIND_CONCURRENT_MARK_SWEEP`(2)、`PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR`(3)、`PCC_GC_KIND_COLORED_RELOCATING`(4)。每个后端镜像一个真实的参照实现——CPython、Lua 5.4、Go(greentea)、OCaml、ZGC——参照源码就放在树内 [docs/refs_docs/gc-research/](../../docs/refs_docs/gc-research) 下,移植与原文可以对照阅读。这是一个对比研究计划:同一套对象图契约上跑五种收集器,任何一个都不许靠弱化语义取胜。后端 #0 至今仍是默认与回滚参照(决策记录在 [docs/investigations/gc-backend-selection-matrix.md](../../docs/investigations/gc-backend-selection-matrix.md))。架构与逐后端的细节见第 10、11 章。
+**五 GC 对比运行时。** 运行时装载五个 GC 后端槽位,由环境变量 `PCC_GC_BACKEND` 在进程启动时选择,枚举定义在 [pcc/py_runtime/include/py_runtime.h](../../pcc/py_runtime/include/py_runtime.h) 中:
+
+```c
+// pcc/py_runtime/include/py_runtime.h
+enum {
+    PCC_GC_KIND_REFCOUNT_CYCLE = 0,
+    PCC_GC_KIND_INCREMENTAL_TRICOLOR = 1,
+    PCC_GC_KIND_CONCURRENT_MARK_SWEEP = 2,
+    PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR = 3,
+    PCC_GC_KIND_COLORED_RELOCATING = 4
+};
+```
+
+每个后端镜像一个真实的参照实现——CPython、Lua 5.4、Go(greentea)、OCaml、ZGC——参照源码就放在树内 [docs/refs_docs/gc-research/](../../docs/refs_docs/gc-research) 下,移植与原文可以对照阅读。这是一个对比研究计划:同一套对象图契约上跑五种收集器,任何一个都不许靠弱化语义取胜。后端 #0 至今仍是默认与回滚参照(决策记录在 [docs/investigations/gc-backend-selection-matrix.md](../../docs/investigations/gc-backend-selection-matrix.md))。架构与逐后端的细节见第 10、11 章。
 
 **可选值模型。** 值类(value class)是显式选择加入的、无身份的不可变载荷,服务热路径;普通类保留全部身份语义(`id`/`is`/弱引用/`__dict__`/可变性/子类化/终结器)。pcc 从 Java 的 Valhalla 项目借的是**投影(projection)模型**——语义类型与物理表示分离——而不是 Java 的定宽 `int` 回绕语义。见第 16 章。
 
@@ -59,7 +72,7 @@ pcc2      -> pcc3    pcc2/pcc3 稳定 == 自托管不动点
 
 1. **兼容性声明必须模式标注(mode-labeled)。** 一条声明必须说明它在哪个模式下成立:host pcc ≠ pcc1;cpython-compat ≠ pcc-native;libpython ≠ no-libpython;LLVM 后端 ≠ self 后端;stage1 ≠ pcc1→pcc2→pcc3 不动点。1.4 节展开。
 
-2. **性能必须被证明。** "接近 C"级别的声明需要 IR 形状证据、运行时基准,以及一条在假设失效时保持 Python 语义的慢路径。pcc 不声称任意动态 Python 能达到 C 速度——只对语义足够稳定、可被原生低层化(lowering)的部分作此声明。这条义务也要求如实记录违例:仓库中有一个**已确认的本义务违例**——typed-int ABI 路径里,显式标注 `int` 的未装箱 `+`/`*`/`<<` 可能在 i64 溢出时静默回绕;它的设计张力与候选修复见第 16 章。
+2. **性能必须被证明。** "接近 C"级别的声明需要 IR 形状证据、运行时基准,以及一条在假设失效时保持 Python 语义的慢路径。pcc 不声称任意动态 Python 能达到 C 速度——只对语义足够稳定、可被原生低层化(lowering)的部分作此声明。这条义务也要求如实记录违例:仓库曾有一个**已确认的本义务违例**——typed-int ABI 路径里,显式标注 `int` 的未装箱 `+`/`*`/`<<` 曾在 i64 溢出时静默回绕;从确认、裁定到修复(2026-06-17)的完整档案见第 16 章。
 
 3. **生态支持必须是通用机制。** NumPy、PyTorch、pandas、Arrow、SciPy 是集成目标,永远不是编译器特例。禁止 `if package == "numpy"`;要修的是可复用机制(安装/导入/ABI/buffer/capsule/构建表面),并为通用特性添加回归测试。见第 17 章与本章 1.8.2。
 
@@ -100,7 +113,22 @@ Exact Python semantics everywhere supported.
 
 声明卫生的执行机构不是文风审查,而是机器可检验的证据层级。仓库的权威次序是:**当前的聚焦测试、自举闸门与 JSON 基线 > 一切散文**。自举状态以 [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) 为准,由 [tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py) 强制;no-libpython 回退表面以 [tests/fallback_baseline.json](../../tests/fallback_baseline.json) 为准,构成一只只许收紧的棘轮;五个 GC 后端各有自己的完整三阶段自举闸门 `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py`。[docs/current-goal-state.md](../../docs/current-goal-state.md) 顶部的审计快照逐条记录证据,且完成度本身是分级的——大量条目标注为 `DONE_WEAK`(聚焦闸门加自举验证通过,但不声称覆盖完整边界),并显式列出"不声称"的内容:不声称完整逃逸边界覆盖、不声称完整 dataclasses 支持、不声称值模型完成。
 
-声明卫生有时表现为**故意保留一个失败**。严格 pcc-native 模式在遇到 CPython ABI 的扩展工件时,以 `PCC-PKG-004` 拒绝加载(聚焦闸门是 [tests/python/test_package_extension_abi.py](../../tests/python/test_package_extension_abi.py))。[README.md](../../README.md) 明说这个阻塞是有意的:它防止一个 CPython ABI 工件被误报成 pcc-native 的 NumPy 支持。一个为演示而设计的系统会把这条路悄悄打通;一个为可验证性而设计的系统把它做成显式错误码。
+声明卫生有时表现为**故意保留一个失败**。严格 pcc-native 模式在遇到 CPython ABI 的扩展工件时,以 `PCC-PKG-004` 拒绝加载(聚焦闸门是 [tests/python/test_package_extension_abi.py](../../tests/python/test_package_extension_abi.py)):
+
+```python
+# pcc/package/linkage.py
+def _diagnostic_for_cpython_extension_abi(path: str) -> dict[str, object]:
+    return {
+        "code": "PCC-PKG-004",
+        "message": (
+            "native artifact name declares a CPython extension ABI; "
+            "pcc-native mode requires a pcc-native extension ABI or a source rebuild"
+        ),
+        "path": path,
+    }
+```
+
+[README.md](../../README.md) 明说这个阻塞是有意的:它防止一个 CPython ABI 工件被误报成 pcc-native 的 NumPy 支持。一个为演示而设计的系统会把这条路悄悄打通;一个为可验证性而设计的系统把它做成显式错误码。
 
 ## 1.5 运行时分四层:把 C 收缩成内核
 
@@ -146,7 +174,7 @@ Linux 部署失败 -> self 后端    五 GC 矩阵   -> 运行时可信度
 性能未达    -> 值模型缺口      包 ABI 报告  -> 生态信任
 ```
 
-这个结构在 1.8.2 节的战争故事里能看得很具体:一次真实 NumPy 导入的失败,被拆解成一串通用机制缺口(警告模块、typing 标记、路径操作、正则子集……),每个缺口的修复都变成一条可复用的编译器能力,而不是一个 NumPy 补丁。从一个方向读,这是工业工作:用户想要的包离可导入更近了一步;从另一个方向读,这是研究产出:一张实测的地图,标出 no-libpython 的 Python 还缺哪些导入机制语义。两种读法谁也离不开谁——所以两个论题的连接点是同一条规则:**每条声明都必须说清它证明了什么、没证明什么。**
+这个结构在 1.8.2 节的案例研究里能看得很具体:一次真实 NumPy 导入的失败,被拆解成一串通用机制缺口(警告模块、typing 标记、路径操作、正则子集……),每个缺口的修复都变成一条可复用的编译器能力,而不是一个 NumPy 补丁。从一个方向读,这是工业工作:用户想要的包离可导入更近了一步;从另一个方向读,这是研究产出:一张实测的地图,标出 no-libpython 的 Python 还缺哪些导入机制语义。两种读法谁也离不开谁——所以两个论题的连接点是同一条规则:**每条声明都必须说清它证明了什么、没证明什么。**
 
 ## 1.8 历史与教训
 
@@ -156,13 +184,29 @@ Linux 部署失败 -> self 后端    五 GC 矩阵   -> 运行时可信度
 
 **症状。** 调查文件 [docs/investigations/python-valhalla-value-model-actual-state.md](../../docs/investigations/python-valhalla-value-model-actual-state.md)(更新日期 2026-05-19 至 2026-05-24)开篇记录:值模型的计划与状态报告声称受 Valhalla 启发的轨道已"实现到 V6"。
 
-**错误假设。** 把脚手架当成了实现。[pcc/value_model.py](../../pcc/value_model.py) 里确实存在名为 `ValuePayload`、`ValueBox`、`SpecializedArray`、`GenericSpecialization` 的宿主侧 dataclass——名字与计划中的 V1–V6 一一对应,看起来像完成了。
+**错误假设。** 把脚手架当成了实现。[pcc/value_model.py](../../pcc/value_model.py) 里确实存在名为 `ValuePayload`、`ValueBox`、`SpecializedArray`、`GenericSpecialization` 的宿主侧 dataclass——名字与计划中的 V1–V6 一一对应,表观上像完成了。
 
 **证据链。** 代码检视给出了相反的结论:真正接入类型推断与类低层化的只有 V0 切片([pcc/py_frontend/py_ast.py](../../pcc/py_frontend/py_ast.py) 定义 `ValueClassType`,[pcc/py_frontend/type_infer.py](../../pcc/py_frontend/type_infer.py) 识别 `@pcc.valueclass`);V1 没有直接的 LLVM 结构 ABI、没有证明热路径避免对象分配的 IR 形状闸门;V4 的 `pcc.array[Point]` 连续载荷运行时不存在;V5 的单态化与类型元组缓存不存在;V6 的热对象迁移与分配基准不存在。计划要求的 V1–V4 测试文件在调查开启前部分缺失。
 
 **真正根因。** 状态表面没有区分"元数据存在"与"运行时实现完成"——这正是后来 §0.10 表中 `metadata exists != runtime implementation complete` 那一行的出处。
 
-**修复与留下的不变式。** 修复不是删掉乐观的句子,而是把诚实做成 API:`value_model_status()` 此后报告 `implemented_through`(当时为 V1 标量载荷子集)、`scaffolding_through == "V6"`、`production_runtime is False`,并以 `not_implemented` 列表枚举缺失的运行时、代码生成、GC、特化与基准工作。状态本身变成了可断言的测试对象。这个故事还有一个递归的注脚:第一版为 V0 添加源形状诊断的补丁,自己就把 `pcc.py_frontend.type_infer` 的 no-libpython 回退计数从基线 846 推高到 951(棘轮上限 888),被 [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) 当场拦下——连"为了诚实而写的诊断代码"也要过同一道棘轮。修复(把诊断构造收敛到一个 `_raise_frontend_error` 辅助函数)把计数压回 851。教训:过度声明不是品德问题,是缺少装置的问题;装置到位后,它会被测试抓住,而不是被读者抓住。
+**修复与留下的不变式。** 修复不是删掉乐观的句子,而是把诚实做成 API:`value_model_status()` 此后报告 `implemented_through`(当时为 V1 标量载荷子集)、`scaffolding_through == "V6"`、`production_runtime is False`,并以 `not_implemented` 列表枚举缺失的运行时、代码生成、GC、特化与基准工作:
+
+```python
+# pcc/value_model.py
+def value_model_status() -> dict[str, object]:
+    return {
+        "implemented_through": (
+            "V1-direct-scalar-and-nested-payload-eq-checked-marshal-"
+            "v2-pointer-and-nested-dyn-boundary-partial"
+        ),
+        "scaffolding_through": "V6",
+        "production_runtime": False,
+        "marker": "@pcc.valueclass",
+    }
+```
+
+状态本身变成了可断言的测试对象。这个故事还有一个递归的注脚:第一版为 V0 添加源形状诊断的补丁,自己就把 `pcc.py_frontend.type_infer` 的 no-libpython 回退计数从基线 846 推高到 951(棘轮上限 888),被 [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) 当场拦下——连"为了诚实而写的诊断代码"也要过同一道棘轮。修复(把诊断构造收敛到一个 `_raise_frontend_error` 辅助函数)把计数压回 851。教训:过度声明不是品德问题,是缺少装置的问题;装置到位后,它会被测试抓住,而不是被读者抓住。
 
 ### 1.8.2 真实 NumPy 的首次导入:`if package == "numpy"` 禁令的来源(2026-05-27)
 
@@ -178,7 +222,7 @@ Linux 部署失败 -> self 后端    五 GC 矩阵   -> 运行时可信度
 
 ## 1.9 小结
 
-pcc 的论题是把 Python 的执行变成可拥有的:原生、可审计、可自托管、no-libpython。支撑论题的是五个分水岭——自举不动点、五 GC 对比运行时、可选值模型、作为第一类执行根的 self 后端、长跑效率——和把它们变成日常守则的七项义务。性能在这个系统里是已证语义的后果;诚实不是文档礼仪,而是用不等式表、JSON 基线、回退棘轮和闸门实现的体系结构构件。运行时按四层划分:C 内核保留并最小化,C 语义运行时收缩,pcc-Python 运行时增长,C-API shim 保留并规约化。与既有工具相比,pcc 押注的坐标轴是"没有 CPython 的 Python 执行",并为此接受其类型化前端今天仍是实验性子集的现实。两个战争故事展示了同一件事的两面:声明卫生被违反时如何被装置捕获,被遵守时如何把一次真实失败转化为一串可复用的能力。后续各章将把本章的每个名词展开成机制——并在各自的"历史与教训"里继续检验这套纪律。
+pcc 的论题是把 Python 的执行变成可拥有的:原生、可审计、可自托管、no-libpython。支撑论题的是五个分水岭——自举不动点、五 GC 对比运行时、可选值模型、作为第一类执行根的 self 后端、长跑效率——和把它们变成日常守则的七项义务。性能在这个系统里是已证语义的后果;诚实不是文档礼仪,而是用不等式表、JSON 基线、回退棘轮和闸门实现的体系结构构件。运行时按四层划分:C 内核保留并最小化,C 语义运行时收缩,pcc-Python 运行时增长,C-API shim 保留并规约化。与既有工具相比,pcc 押注的坐标轴是"没有 CPython 的 Python 执行",并为此接受其类型化前端今天仍是实验性子集的现实。两个案例研究展示了同一件事的两面:声明卫生被违反时如何被装置捕获,被遵守时如何把一次真实失败转化为一串可复用的能力。后续各章将把本章的每个名词展开成机制——并在各自的"历史与教训"里继续检验这套纪律。
 
 ## 练习
 

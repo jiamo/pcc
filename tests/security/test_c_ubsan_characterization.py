@@ -75,9 +75,10 @@ if repo_root not in sys.path:
 from pcc.evaluater.c_evaluator import CEvaluator
 
 _IS_AARCH64 = platform.machine().lower() in ("arm64", "aarch64")
-_aarch64_only = pytest.mark.skipif(
-    not _IS_AARCH64,
-    reason="arithmetic UB traps (SIGFPE) on x86_64; value pinned only on AArch64",
+_aarch64_only = pytest.mark.pcc_gate(
+    unavailable=None
+    if _IS_AARCH64
+    else "arithmetic UB traps (SIGFPE) on x86_64; value pinned only on AArch64"
 )
 
 

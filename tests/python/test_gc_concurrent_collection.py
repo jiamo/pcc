@@ -18,7 +18,7 @@ def _require_thread_sanitizer_runtime(tmp_path: Path, cc: str) -> None:
     if cc in _TSAN_UNAVAILABLE_BY_CC:
         reason = _TSAN_UNAVAILABLE_BY_CC[cc]
         if reason is not None:
-            pytest.skip(reason)
+            pytest.fail(reason)
         return
     probe = tmp_path / "tsan_availability.c"
     exe = tmp_path / "tsan_availability.out"
@@ -60,7 +60,7 @@ def _require_thread_sanitizer_runtime(tmp_path: Path, cc: str) -> None:
         if "sanitize" in stderr or "tsan" in stderr:
             reason = "ThreadSanitizer runtime is not available for this compiler"
             _TSAN_UNAVAILABLE_BY_CC[cc] = reason
-            pytest.skip(reason)
+            pytest.fail(reason)
         assert build.returncode == 0, build.stdout + build.stderr
     run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
     if run.returncode != 0:
@@ -69,7 +69,7 @@ def _require_thread_sanitizer_runtime(tmp_path: Path, cc: str) -> None:
             f"(exit {run.returncode})"
         )
         _TSAN_UNAVAILABLE_BY_CC[cc] = reason
-        pytest.skip(reason)
+        pytest.fail(reason)
     _TSAN_UNAVAILABLE_BY_CC[cc] = None
 
 
@@ -119,11 +119,12 @@ def _build_threaded_runtime(
     if build_runtime.returncode != 0 and tsan:
         stderr = build_runtime.stderr.lower()
         if "sanitize" in stderr or "tsan" in stderr:
-            pytest.skip("runtime cannot be built with ThreadSanitizer")
+            pytest.fail("runtime cannot be built with ThreadSanitizer")
     assert build_runtime.returncode == 0, build_runtime.stdout + build_runtime.stderr
     return work_runtime
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_pthread_stw_threadsanitizer_smoke_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)
@@ -172,6 +173,7 @@ def test_pthread_stw_threadsanitizer_smoke_or_skip(tmp_path):
     assert "data race" not in (run.stdout + run.stderr).lower()
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_cms_worker_threadsanitizer_stress_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)
@@ -417,6 +419,7 @@ def test_backend4_thread_medium_buffer_flushes_across_mutators(tmp_path):
     assert run.stdout.strip() == "backend4-thread-medium-flush-ok"
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_cms_collect_threadsanitizer_sweep_allocation_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)
@@ -561,6 +564,7 @@ def test_cms_collect_threadsanitizer_sweep_allocation_or_skip(tmp_path):
     assert int(lines[2]) > 0
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_generational_minor_threadsanitizer_alloc_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)
@@ -680,6 +684,7 @@ def test_generational_minor_threadsanitizer_alloc_or_skip(tmp_path):
     assert int(lines[3]) > 0
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_generational_scheduler_root_registry_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)
@@ -795,6 +800,7 @@ def test_generational_scheduler_root_registry_threadsanitizer_or_skip(tmp_path):
     assert "data race" not in combined.lower()
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_generational_scheduler_queue_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)
@@ -960,6 +966,7 @@ def test_generational_scheduler_queue_threadsanitizer_or_skip(tmp_path):
     assert "data race" not in combined.lower()
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_colored_relocating_forwarding_table_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)
@@ -1140,6 +1147,7 @@ def test_colored_relocating_forwarding_table_threadsanitizer_or_skip(tmp_path):
     assert "data race" not in combined.lower()
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_colored_relocating_step_allocation_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)
@@ -1280,6 +1288,7 @@ def test_colored_relocating_step_allocation_threadsanitizer_or_skip(tmp_path):
     assert "data race" not in combined.lower()
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_colored_relocating_free_hook_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)
@@ -1443,6 +1452,7 @@ def test_colored_relocating_free_hook_threadsanitizer_or_skip(tmp_path):
     assert "data race" not in combined.lower()
 
 
+@pytest.mark.pcc_gate(probe="tsan")
 def test_pcc_python_runtime_object_graph_threadsanitizer_or_skip(tmp_path):
     cc = os.environ.get("CC", "clang")
     _require_thread_sanitizer_runtime(tmp_path, cc)

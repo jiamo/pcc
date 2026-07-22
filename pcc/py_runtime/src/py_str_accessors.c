@@ -1786,17 +1786,24 @@ PyObject *py_str_join(PyObject *sep, PyObject *list) {
     if (sep == NULL || list == NULL) return NULL;
     sep = pcc_gc_note_relocation_read(sep);
     list = pcc_gc_note_relocation_read(list);
-    if (py_type_of(sep) != PY_TYPE_STR || py_type_of(list) != PY_TYPE_LIST) {
+    int32_t sequence_tag = py_type_of(list);
+    if (py_type_of(sep) != PY_TYPE_STR ||
+        (sequence_tag != PY_TYPE_LIST && sequence_tag != PY_TYPE_TUPLE)) {
         return NULL;
     }
     PyStrObject *sp = (PyStrObject *)sep;
-    PyListObject *l = (PyListObject *)list;
+    int64_t length = sequence_tag == PY_TYPE_LIST
+        ? ((PyListObject *)list)->length
+        : ((PyTupleObject *)list)->len;
 
-    if (l->length == 0) return py_str_new("", 0);
+    if (length == 0) return py_str_new("", 0);
 
     int64_t total = 0;
-    for (int64_t i = 0; i < l->length; i++) {
-        PyObject *e = pcc_gc_load_ptr(list, &l->items[i]);
+    for (int64_t i = 0; i < length; i++) {
+        PyObject **slot = sequence_tag == PY_TYPE_LIST
+            ? &((PyListObject *)list)->items[i]
+            : &((PyTupleObject *)list)->items[i];
+        PyObject *e = pcc_gc_load_ptr(list, slot);
         if (e == NULL || py_type_of(e) != PY_TYPE_STR) return NULL;
         if (i > 0) total += sp->byte_len;
         total += ((PyStrObject *)e)->byte_len;
@@ -1810,11 +1817,13 @@ PyObject *py_str_join(PyObject *sep, PyObject *list) {
     sep = pcc_gc_note_relocation_read(sep);
     list = pcc_gc_note_relocation_read(list);
     sp = (PyStrObject *)sep;
-    l = (PyListObject *)list;
 
     int64_t off = 0;
-    for (int64_t i = 0; i < l->length; i++) {
-        PyStrObject *e = (PyStrObject *)pcc_gc_load_ptr(list, &l->items[i]);
+    for (int64_t i = 0; i < length; i++) {
+        PyObject **slot = sequence_tag == PY_TYPE_LIST
+            ? &((PyListObject *)list)->items[i]
+            : &((PyTupleObject *)list)->items[i];
+        PyStrObject *e = (PyStrObject *)pcc_gc_load_ptr(list, slot);
         if (i > 0 && sp->byte_len > 0) {
             memcpy(out->data + off, sp->data, (size_t)sp->byte_len);
             off += sp->byte_len;

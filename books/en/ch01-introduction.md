@@ -2,7 +2,7 @@
 
 This book describes the design and implementation of pcc: a compiler and runtime system written in Python, built to compile Python to native code, and ultimately to compile itself. This first chapter deliberately contains no mechanism. It answers a single question: why does this system exist, and what discipline keeps it from quietly turning into something else? Nearly every design decision in the seventeen chapters that follow traces back to three anchors introduced here: the thesis (make Python execution ownable), the seven obligations (turn the thesis into checkable rules), and claim hygiene (always separate what has been proven from what has not). If you read only one chapter, read this one; if you want to challenge a design decision in a later chapter, come back here first and check whether it has drifted off the north star.
 
-## Reader Map: Start with "Owning Execution"
+## Chapter Overview: Start with "Owning Execution"
 
 This chapter is the contract for the rest of the book. Do not read it as a feature list; read it as three questions every later chapter must answer: can this code run without handing control back to CPython, has Python semantics been weakened, and is the mode of each claim labeled clearly?
 
@@ -46,7 +46,20 @@ pcc2      -> pcc3    stable pcc2/pcc3 == a self-hosted fixed point
 
 The fixed point is more than a byte compare. Byte-identical `pcc2` and `pcc3` is evidence that pcc's Python semantics, runtime, code generation, object model, backend, and diagnostics are coherent enough to reproduce themselves — nondeterminism in any layer amplifies into a visible difference between two self-compilations. The authoritative current state is frozen in [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) (captured 2026-05-01, the Issue 1 closure evidence): on macOS arm64, all three stages of both the LLVM chain and the self-backend chain link no `libpython`; on the strict path (`--backend self --python-libpython=off --ir-scaffold=on`), the IR emitted for `pcc2`/`pcc3` is byte-identical with zero `py_cpy_*` calls, and the binaries are byte-identical after Mach-O signature removal. Notice that every qualifier in that sentence — platform, backend, mode, comparison method — is deliberate; that is the claim hygiene of Section 1.4 at work. The full bootstrap story is Chapter 15.
 
-**The five-GC comparative runtime.** The runtime ships five GC backend slots, selected at process startup through the `PCC_GC_BACKEND` environment variable. The enum lives in [pcc/py_runtime/include/py_runtime.h](../../pcc/py_runtime/include/py_runtime.h): `PCC_GC_KIND_REFCOUNT_CYCLE` (0), `PCC_GC_KIND_INCREMENTAL_TRICOLOR` (1), `PCC_GC_KIND_CONCURRENT_MARK_SWEEP` (2), `PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR` (3), and `PCC_GC_KIND_COLORED_RELOCATING` (4). Each backend mirrors a real reference implementation — CPython, Lua 5.4, Go (greentea), OCaml, ZGC — and the reference sources are kept in tree under [docs/refs_docs/gc-research/](../../docs/refs_docs/gc-research) so the port can be read next to the original. This is a comparative research program: five collectors running over one object-graph contract, and none of them is allowed to win by weakening semantics. Backend #0 remains the default and rollback reference (the decision is recorded in [docs/investigations/gc-backend-selection-matrix.md](../../docs/investigations/gc-backend-selection-matrix.md)). The architecture and the per-backend treatments are Chapters 10 and 11.
+**The five-GC comparative runtime.** The runtime ships five GC backend slots, selected at process startup through the `PCC_GC_BACKEND` environment variable. The enum lives in [pcc/py_runtime/include/py_runtime.h](../../pcc/py_runtime/include/py_runtime.h):
+
+```c
+// pcc/py_runtime/include/py_runtime.h
+enum {
+    PCC_GC_KIND_REFCOUNT_CYCLE = 0,
+    PCC_GC_KIND_INCREMENTAL_TRICOLOR = 1,
+    PCC_GC_KIND_CONCURRENT_MARK_SWEEP = 2,
+    PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR = 3,
+    PCC_GC_KIND_COLORED_RELOCATING = 4
+};
+```
+
+Each backend mirrors a real reference implementation — CPython, Lua 5.4, Go (greentea), OCaml, ZGC — and the reference sources are kept in tree under [docs/refs_docs/gc-research/](../../docs/refs_docs/gc-research) so the port can be read next to the original. This is a comparative research program: five collectors running over one object-graph contract, and none of them is allowed to win by weakening semantics. Backend #0 remains the default and rollback reference (the decision is recorded in [docs/investigations/gc-backend-selection-matrix.md](../../docs/investigations/gc-backend-selection-matrix.md)). The architecture and the per-backend treatments are Chapters 10 and 11.
 
 **The opt-in value model.** Value classes are explicitly opted-in, identity-free immutable payloads for hot paths; ordinary classes keep their full identity semantics (`id`/`is`/weakref/`__dict__`/mutation/subclassing/finalizers). What pcc borrows from Java's Project Valhalla is the **projection** model — separating semantic type from physical representation — and emphatically not Java's fixed-width wrapping `int`. See Chapter 16.
 
@@ -60,7 +73,7 @@ The thesis lands through seven obligations. Each is operationalized by a track a
 
 1. **Compatibility claims must be mode-labeled.** A claim must say which mode produced it: host pcc ≠ pcc1; cpython-compat ≠ pcc-native; libpython ≠ no-libpython; LLVM backend ≠ self backend; stage1 ≠ the pcc1→pcc2→pcc3 fixed point. Section 1.4 expands on this.
 
-2. **Performance must be proven.** A "C-like" claim requires IR-shape evidence, a runtime benchmark, and a slow path that preserves Python semantics when the assumptions fail. pcc does not claim that arbitrary dynamic Python reaches C speed — only the parts whose semantics are stable enough to lower natively. The obligation also demands recording violations honestly: the repository carries one **confirmed violation of this obligation** — typed-int ABI paths for unboxed `+`/`*`/`<<` over explicitly annotated `int` can silently wrap on i64 overflow. Its design tension and candidate fixes are treated in Chapter 16.
+2. **Performance must be proven.** A "C-like" claim requires IR-shape evidence, a runtime benchmark, and a slow path that preserves Python semantics when the assumptions fail. pcc does not claim that arbitrary dynamic Python reaches C speed — only the parts whose semantics are stable enough to lower natively. The obligation also demands recording violations honestly: the repository once carried one **confirmed violation of this obligation** — typed-int ABI paths for unboxed `+`/`*`/`<<` over explicitly annotated `int` silently wrapped on i64 overflow. The complete dossier, from confirmation through ruling to the fix (2026-06-17), is treated in Chapter 16.
 
 3. **Ecosystem support must be generic.** NumPy, PyTorch, pandas, Arrow, and SciPy are integration targets, never compiler special cases. No `if package == "numpy"`; fix the reusable mechanism (install/import/ABI/buffer/capsule/build surface) and add a regression test for the generic feature. See Chapter 17 and Section 1.8.2.
 
@@ -101,7 +114,22 @@ Exact Python semantics everywhere supported.
 
 The enforcement body for claim hygiene is not editorial review; it is a machine-checkable evidence hierarchy. The authority order in the repository is: **current focused tests, bootstrap gates, and JSON baselines outrank all prose.** Bootstrap status is owned by [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) and enforced by [tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py); the no-libpython fallback surface is owned by [tests/fallback_baseline.json](../../tests/fallback_baseline.json), which forms a ratchet that is only allowed to tighten; each of the five GC backends has its own full three-stage bootstrap gate in `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py`. The audit snapshot at the top of [docs/current-goal-state.md](../../docs/current-goal-state.md) records evidence row by row, and completion itself is graded — many entries carry the label `DONE_WEAK` (focused gates plus bootstrap verification passed, without claiming the full boundary), with an explicit list of what is *not* being claimed: not complete escape-boundary coverage, not complete dataclasses support, not a finished value model.
 
-Sometimes claim hygiene takes the form of **deliberately keeping a failure**. Strict pcc-native mode rejects CPython-ABI extension artifacts with the error code `PCC-PKG-004` (the focused gate is [tests/python/test_package_extension_abi.py](../../tests/python/test_package_extension_abi.py)). [README.md](../../README.md) says outright that this blocker is intentional: it prevents a CPython ABI artifact from being misreported as pcc-native NumPy support. A system designed for demos would quietly open that path; a system designed for verifiability turns it into an explicit error code.
+Sometimes claim hygiene takes the form of **deliberately keeping a failure**. Strict pcc-native mode rejects CPython-ABI extension artifacts with the error code `PCC-PKG-004` (the focused gate is [tests/python/test_package_extension_abi.py](../../tests/python/test_package_extension_abi.py)):
+
+```python
+# pcc/package/linkage.py
+def _diagnostic_for_cpython_extension_abi(path: str) -> dict[str, object]:
+    return {
+        "code": "PCC-PKG-004",
+        "message": (
+            "native artifact name declares a CPython extension ABI; "
+            "pcc-native mode requires a pcc-native extension ABI or a source rebuild"
+        ),
+        "path": path,
+    }
+```
+
+[README.md](../../README.md) says outright that this blocker is intentional: it prevents a CPython ABI artifact from being misreported as pcc-native NumPy support. A system designed for demos would quietly open that path; a system designed for verifiability turns it into an explicit error code.
 
 ## 1.5 The Runtime in Four Layers: Shrinking C to a Kernel
 
@@ -166,7 +194,23 @@ Every chapter of this book ends with real investigations from [docs/investigatio
 
 **Real root cause.** The status surface did not distinguish "metadata exists" from "runtime implementation complete" — which is precisely the line `metadata exists != runtime implementation complete` in the §0.10 table; this incident is where it comes from.
 
-**Fix and the invariant left behind.** The fix was not to delete the optimistic sentences but to make honesty an API: `value_model_status()` now reports `implemented_through` (at the time, the V1 scalar-payload subset), `scaffolding_through == "V6"`, `production_runtime is False`, and a `not_implemented` list enumerating the missing runtime, codegen, GC, specialization, and benchmark work. Status itself became a testable assertion target. The story has a recursive footnote: the first patch adding V0 source-shape diagnostics itself pushed the no-libpython fallback count for `pcc.py_frontend.type_infer` from the baseline 846 up to 951 (ratchet cap 888) and was caught on the spot by [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) — even code written *in the service of honesty* must pass the same ratchet. The repair (routing diagnostic construction through one `_raise_frontend_error` helper) brought the count back to 851. The lesson: overclaiming is not a character flaw, it is a missing-instrumentation problem; once the instrumentation exists, the overclaim is caught by a test instead of by a reader.
+**Fix and the invariant left behind.** The fix was not to delete the optimistic sentences but to make honesty an API: `value_model_status()` now reports `implemented_through` (at the time, the V1 scalar-payload subset), `scaffolding_through == "V6"`, `production_runtime is False`, and a `not_implemented` list enumerating the missing runtime, codegen, GC, specialization, and benchmark work:
+
+```python
+# pcc/value_model.py
+def value_model_status() -> dict[str, object]:
+    return {
+        "implemented_through": (
+            "V1-direct-scalar-and-nested-payload-eq-checked-marshal-"
+            "v2-pointer-and-nested-dyn-boundary-partial"
+        ),
+        "scaffolding_through": "V6",
+        "production_runtime": False,
+        "marker": "@pcc.valueclass",
+    }
+```
+
+Status itself became a testable assertion target. The story has a recursive footnote: the first patch adding V0 source-shape diagnostics itself pushed the no-libpython fallback count for `pcc.py_frontend.type_infer` from the baseline 846 up to 951 (ratchet cap 888) and was caught on the spot by [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) — even code written *in the service of honesty* must pass the same ratchet. The repair (routing diagnostic construction through one `_raise_frontend_error` helper) brought the count back to 851. The lesson: overclaiming is not a character flaw, it is a missing-instrumentation problem; once the instrumentation exists, the overclaim is caught by a test instead of by a reader.
 
 ### 1.8.2 Real NumPy's First Import: Where the `if package == "numpy"` Ban Comes From (2026-05-27)
 
@@ -182,7 +226,7 @@ Every chapter of this book ends with real investigations from [docs/investigatio
 
 ## 1.9 Summary
 
-pcc's thesis is to make Python execution ownable: native, auditable, self-hostable, no-libpython. The thesis stands on five dividing lines — the bootstrap fixed point, the five-GC comparative runtime, the opt-in value model, the self backend as a first-class execution root, and long-running efficiency — and on seven obligations that turn them into daily rules. Performance, in this system, is a consequence of proven semantics; honesty is not documentation etiquette but an architectural component implemented with inequality tables, JSON baselines, fallback ratchets, and gates. The runtime divides into four layers: the C kernel is kept and minimized, the C semantic runtime shrinks, the pcc-Python runtime grows, and the C-API shim is kept and specified. Against existing tools, pcc bets on the axis of "Python execution without CPython," and accepts the present reality that its typed frontend remains an experimental subset. The two war stories show the same thing from both sides: what the instrumentation does when claim hygiene is violated, and what the discipline produces when it is obeyed — a real failure converted into a chain of reusable capabilities. The chapters that follow expand every noun in this chapter into mechanism, and keep testing this discipline in their own History and Lessons sections.
+pcc's thesis is to make Python execution ownable: native, auditable, self-hostable, no-libpython. The thesis stands on five dividing lines — the bootstrap fixed point, the five-GC comparative runtime, the opt-in value model, the self backend as a first-class execution root, and long-running efficiency — and on seven obligations that turn them into daily rules. Performance, in this system, is a consequence of proven semantics; honesty is not documentation etiquette but an architectural component implemented with inequality tables, JSON baselines, fallback ratchets, and gates. The runtime divides into four layers: the C kernel is kept and minimized, the C semantic runtime shrinks, the pcc-Python runtime grows, and the C-API shim is kept and specified. Against existing tools, pcc bets on the axis of "Python execution without CPython," and accepts the present reality that its typed frontend remains an experimental subset. The two case studies show the same thing from both sides: what the instrumentation does when claim hygiene is violated, and what the discipline produces when it is obeyed — a real failure converted into a chain of reusable capabilities. The chapters that follow expand every noun in this chapter into mechanism, and keep testing this discipline in their own History and Lessons sections.
 
 ## Exercises
 

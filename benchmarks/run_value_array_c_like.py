@@ -200,7 +200,12 @@ def mode_result(
 
 
 def build_manifest(runs: int, warmups: int, timeout: int) -> dict[str, Any]:
-    pcc_prefix = [sys.executable, "-m", "pcc"]
+    # Benchmark the public host compiler entrypoint.  ``python -m pcc`` is the
+    # bootstrap-stage CLI compiled into pcc1/pcc2/pcc3; it intentionally emits
+    # a different scaffold boundary and is not an alias for the installed
+    # ``pcc`` command.  Running the launcher as a module keeps the subprocess
+    # tied to this interpreter/environment without depending on PATH.
+    pcc_prefix = [sys.executable, "-m", "pcc.cli_launcher"]
     cc = shutil.which(os.environ.get("CC", "clang"))
     if cc is None:
         raise RuntimeError("C compiler not found")
@@ -217,7 +222,14 @@ def build_manifest(runs: int, warmups: int, timeout: int) -> dict[str, Any]:
         c_exe = tmp / "value_array_c_like_c"
         common = ["--python-libpython=off", "--ir-scaffold=on"]
         run_checked(
-            [*pcc_prefix, *common, f"--emit-llvm={ir_path}", str(PY_SOURCE)],
+            [
+                *pcc_prefix,
+                "--backend",
+                "llvm",
+                *common,
+                f"--emit-llvm={ir_path}",
+                str(PY_SOURCE),
+            ],
             timeout=60,
         )
         for backend, output in (("llvm", llvm_exe), ("self", self_exe)):

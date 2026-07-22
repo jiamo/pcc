@@ -2,7 +2,7 @@
 
 Python's semantics allow an exception to surface from almost any expression: an out-of-range subscript, a missing attribute, an exhausted iterator, a `raise` inside a user `__add__`. In an interpreter this is absorbed uniformly by the evaluation loop; once Python is compiled to native code, "how does control flow travel from the raise site, across an arbitrary number of native stack frames, to the matching `except`" becomes a design question that must be answered explicitly. pcc's answer looks like the plainest candidate on the table: `py_raise(exc)` stores the exception into a thread-local slot and **returns normally**, and after every call that may raise, generated code checks `py_err_occurred()` and branches to the error path. No unwinder, no Itanium ABI. This chapter explains the reasons behind that choice — the cost model, portability, implementability in the self backend — and its real price: propagation correctness becomes an insertion obligation scattered across dozens of lowering files, and the symptom of one missing check is not a crash but "compile succeeded with no output." The chapter covers the runtime's five C files and their five pcc-Python mirrors, the frontend's `ExceptionLoweringMixin`, and closes with two real investigations.
 
-## Reader Map: Exceptions Do Not Jump Automatically
+## Chapter Overview: Exceptions Do Not Jump Automatically
 
 The model to keep in mind is this: raising an exception stores an error object in a thread-local slot, and generated code performs the actual branch by checking after each call that may fail. Miss one check, and an exception can turn into a silent wrong return.
 
@@ -52,6 +52,49 @@ The last row is this chapter's undercurrent. Checked-call converts propagation c
 ## 8.2 The TLS Slot and py_raise: The Model's Entire Runtime State
 
 The exception model's entire runtime state is a single word: `static _Thread_local void *g_tls_current_exc` in [pcc/py_runtime/src/py_substrate.c](../../pcc/py_runtime/src/py_substrate.c), accessed through the two bare accessors `py_tls_exc_get()`/`py_tls_exc_set()`. The slot lives in the substrate rather than in `py_exc_tls.c` itself because the mirroring discipline demands it (see Chapter 14): the pcc-Python port [pcc/py_runtime/py/py_exc_tls.py](../../pcc/py_runtime/py/py_exc_tls.py) is meant to replace `py_exc_tls.o` wholesale, but it cannot declare C thread-local storage, so the storage stays in the substrate — the part that is "always C" — and the port reaches the same pair of accessors through `pcc.extern.extern`. Logic is replaceable; state does not move.
+
+In [pcc/py_runtime/src/py_exc_tls.c](../../pcc/py_runtime/src/py_exc_tls.c), raising and querying take only a few lines of C:
+
+```c
+// pcc/py_runtime/src/py_exc_tls.c
+void py_raise(PyObject *exc) {
+    PyObject *cur = py_resolve_current_exception();
+    if (cur != NULL && exc != NULL && cur != exc && py_type_of(exc) == PY_TYPE_EXC) {
+        PyExceptionObject *new_exc = (PyExceptionObject *)exc;
+        PyObject *existing_context = pcc_gc_load_ptr(exc, &new_exc->context);
+        if (existing_context == NULL) {
+            pcc_gc_store_ptr(exc, &new_exc->context, cur);
+        }
+    }
+    if (exc != NULL && !exc_owned) py_incref(exc);
+    if (cur != NULL) py_decref(cur);
+    py_tls_exc_set(exc);
+}
+
+int64_t py_err_occurred(void) {
+    return py_tls_exc_get() != NULL ? 1 : 0;
+}
+```
+
+On the frontend codegen side, [pcc/py_frontend/codegen/exception_lowering.py](../../pcc/py_frontend/codegen/exception_lowering.py) emits the post-call error check:
+
+```python
+# pcc/py_frontend/codegen/exception_lowering.py
+def _emit_post_call_err_check(self) -> None:
+    cur_fn = self.current_function
+    if cur_fn is not None and cur_fn.name in self._c_abi_export_symbols:
+        return
+    err_target = self._current_try_err_block()
+    if err_target is None:
+        err_target = self._ensure_fn_err_exit()
+    err_fn = self.runtime.get("py_err_occurred")
+    if err_fn is None:
+        err_ty = ir.FunctionType(_I64, [])
+        err_fn = ir.Function(self.module, err_ty, name="py_err_occurred")
+        err_fn.linkage = "external"
+        self.runtime["py_err_occurred"] = err_fn
+    is_err = self.builder.call(err_fn, [])
+```
 
 On top of this slot, `py_exc_tls.c` implements four public entry points, 172 lines in total:
 
@@ -118,7 +161,7 @@ The runtime supplies only the operators; assembling Python's `raise`/`try` seman
                                              → enclosing try.err or err.exit
 ```
 
-A tuple handler (`except (A, B):`) ors together multiple `py_exc_matches` results; an untyped `except:` is always true. The order of operations at handler entry carries the semantics: first retain the exception if needed (the handler binds a name, or its body contains a bare `raise` — decided by the recursive scan `body_has_bare_raise()`), then `py_clear_exception()` to clear the TLS, then bind the name into the `e.addr` slot. Clearing keeps subsequent calls inside the handler body from being polluted by the old exception; retaining keeps an owned reference available for the binding and for re-raise after the TLS has let go. The bound name is also registered into `_except_binding_names`, so that a later copy like `saved = e` gets GC-rooted — a missing root here once let a tracing backend sweep the exception's message, with the root cause in frontend ownership lowering rather than in the runtime; that is a Chapter 10 war story (see the gc-5backend-exception-referent-roots investigation under [docs/investigations/](../../docs/investigations)). `finally` is unwound through `_finally_stack` at three places — the normal exit, the no-handler error path, and the handler exit; its interaction with `return` (emitting pending finally blocks level by level) already appeared on Chapter 9's return path.
+A tuple handler (`except (A, B):`) ors together multiple `py_exc_matches` results; an untyped `except:` is always true. The order of operations at handler entry carries the semantics: first retain the exception if needed (the handler binds a name, or its body contains a bare `raise` — decided by the recursive scan `body_has_bare_raise()`), then `py_clear_exception()` to clear the TLS, then bind the name into the `e.addr` slot. Clearing keeps subsequent calls inside the handler body from being polluted by the old exception; retaining keeps an owned reference available for the binding and for re-raise after the TLS has let go. The bound name is also registered into `_except_binding_names`, so that a later copy like `saved = e` gets GC-rooted — a missing root here once let a tracing backend sweep the exception's message, with the root cause in frontend ownership lowering rather than in the runtime; that is a Chapter 10 case study (see the gc-5backend-exception-referent-roots investigation under [docs/investigations/](../../docs/investigations)). `finally` is unwound through `_finally_stack` at three places — the normal exit, the no-handler error path, and the handler exit; its interaction with `return` (emitting pending finally blocks level by level) already appeared on Chapter 9's return path.
 
 One semantic boundary, derived from the source and recorded as is: `py_raise`'s implicit `__context__` chaining is conditioned on "the TLS still holds a pending exception," but the lowering clears the TLS at handler entry — so an ordinary `raise NewError()` inside a handler body does not automatically carry the just-caught exception as its `__context__`; the chaining takes effect on the path where a second raise happens while an exception is still pending (mid-propagation, runtime-internal secondary raises). CPython chains inside handler bodies too. This is a known gap against CPython, recorded as an open problem.
 
@@ -160,7 +203,7 @@ The systematic response has three layers, landing in different chapters: at the 
 
 ## 8.7 History and Lessons
 
-### War story one: clean link, working --help, "successful" compile — the silently failing pcc1 (2026-04)
+### Case study one: clean link, working --help, "successful" compile — the silently failing pcc1 (2026-04)
 
 Source: [docs/investigations/python-self-host-no-libpython-runtime-holes.md](../../docs/investigations/python-self-host-no-libpython-runtime-holes.md) (status snapshot 2026-04-29; Issue 1 subsequently closed 2026-05-01, baseline in [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json)).
 
@@ -172,7 +215,7 @@ Source: [docs/investigations/python-self-host-no-libpython-runtime-holes.md](../
 
 **Invariants left behind.** First, an error-propagation gate: an exception raised during compilation must produce a nonzero CLI exit, text on stderr, and no artifact left behind — "status 0 with no artifact" should be an impossible state. Second, a new layer in the test pyramid: a stage1-as-compiler smoke test (build pcc1 → verify the link → run --help → compile a minimal file and execute the artifact) became a mandatory gate, today hardened into `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py` (see Chapter 15). Third, one line of methodology: for this failure class, the first action is lldb on `py_raise`, not guessing.
 
-### War story two: the emission-site err-check audit — turning a distributed obligation into an enumerable list (2026-06-11)
+### Case study two: the emission-site err-check audit — turning a distributed obligation into an enumerable list (2026-06-11)
 
 Source: [docs/investigations/emission-site-err-check-audit.md](../../docs/investigations/emission-site-err-check-audit.md).
 
@@ -196,4 +239,4 @@ The price is equally clear: propagation correctness = an insertion obligation di
 2. **Trace one lowering.** For `try: f() except (A, B) as e: g()`, list — per `_emit_try()` — the runtime functions the generated code calls in order (from `py_current_exception` to handler exit), and identify: at which point is the TLS cleared? Where is `e`'s reference retained, and where released? Why must `e` be registered in `_except_binding_names`?
 3. **Construct the failure.** Suppose runtime function `h()` does a `py_raise` of a `TypeError` and returns NULL, and its emission site is missing the check. Following 8.6's failure chain, write out the follow-on code shapes each of the two endings requires (4a misplaced detonation / 4b silent success), and explain why `_ensure_fn_err_exit()` choosing 0 as the integer sentinel is what makes 4b possible. Would changing the sentinel to -1 cure it? What would it break?
 4. **Argue a design tradeoff.** Suppose the self backend one day supports CFI metadata emission — should pcc migrate back to Itanium unwinding? Argue from four angles: `StopIteration` frequency; where Chapter 9's owned-local cleanup goes on the unwind path; the unwind-table differences between Mach-O and ELF; and what the "missing check" failure class corresponds to in the other model (a wrong table entry).
-5. **Improve the audit.** The 8-line-window heuristic of 8.7's second war story produces both false positives (the check is outside the window) and potential false negatives. Design a better static audit: how would you recognize the maybe_end/propagate equivalent routing? How would you handle the `@c_abi_export` suppression rule? What can it still not prove (hint: reachability, and whether the runtime function can actually raise on that path)?
+5. **Improve the audit.** The 8-line-window heuristic of 8.7's second case study produces both false positives (the check is outside the window) and potential false negatives. Design a better static audit: how would you recognize the maybe_end/propagate equivalent routing? How would you handle the `@c_abi_export` suppression rule? What can it still not prove (hint: reachability, and whether the runtime function can actually raise on that path)?

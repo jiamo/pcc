@@ -2,7 +2,7 @@
 
 Every subsystem described in the previous fourteen chapters — parsing, type inference, lowering, the object model, ownership, the five GCs, the self backend, the no-libpython runtime — carries its own tests. But there is a gulf between "each part is individually correct" and "the whole system is coherent": a test is a sample of behavior, and no amount of sampling proves a universally quantified claim. pcc crosses that gulf with an old and unforgiving device: make the compiler compile itself, make the product compile itself again, and keep going until the output converges to a fixed point. This chapter covers the whole device: the semantics of the four stages; the machinery in [scripts/bootstrap.sh](../../scripts/bootstrap.sh) and [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py); the verification ladder behind byte identity; the three mutually independent proofs; the taxonomy of pcc1/pcc2 differences; the baseline system that nails the fixed point down as a regression gate; and the boundary — which must be drawn honestly — between all of this and Thompson's *Reflections on Trusting Trust*.
 
-## Reader Map: Three Compiler Generations Prove Three Things
+## Chapter Overview: Three Compiler Generations Prove Three Things
 
 Read this chapter along the pcc0→pcc1→pcc2→pcc3 chain. pcc0 proves the host path can produce a compiler; pcc1 proves that produced compiler can keep compiling; the pcc2/pcc3 comparison proves the system has begun to reproduce itself stably.
 
@@ -53,6 +53,47 @@ pcc2 -> pcc3   behavioral self-stability: a self-produced compiler
 ```
 
 All three edges take the same input file: [pcc/__main__.py](../../pcc/__main__.py). It is five lines long — it imports `bootstrap_cli_sys_argv_exit` from `pcc.cli_bootstrap` and calls it. The stage1 command therefore exhibits a telling symmetry: `python -m pcc ... pcc/__main__.py -o pcc1` — **the command and the input are the same module; only the host differs.** pcc0 runs it on CPython; pcc1 runs it on pcc's own runtime.
+
+In [scripts/bootstrap.sh](../../scripts/bootstrap.sh), the three-stage bootstrap pipeline is written directly:
+
+```bash
+# scripts/bootstrap.sh
+# Stage 1: pcc0 -> pcc1
+env -u LC_ALL uv run pcc pcc/__main__.py -o pcc1 \
+  --backend=self --python-libpython=off --ir-scaffold=on
+
+# Stage 2: pcc1 -> pcc2
+./pcc1 pcc/__main__.py -o pcc2 \
+  --backend=self --python-libpython=off --ir-scaffold=on
+
+# Stage 3: pcc2 -> pcc3
+./pcc2 pcc/__main__.py -o pcc3 \
+  --backend=self --python-libpython=off --ir-scaffold=on
+
+codesign --remove-signature pcc2 pcc3
+cmp -s pcc2 pcc3
+```
+
+Inside [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py), the entry point responds to the self-compiled binary's control logic:
+
+```python
+# pcc/cli_bootstrap.py
+def bootstrap_cli_main(argv: list[str]) -> int:
+    """Entry point for the self-hosted pcc1/pcc2/pcc3 binary."""
+    if "--pytest" in argv:
+        return _run_pytest_harness(argv)
+    return _dispatch_compile_job(argv)
+```
+
+The assertions enforcing the baseline are also part of the tests, with [tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py) requiring the results to match:
+
+```python
+# tests/python/test_bootstrap_gate_baseline.py
+def test_bootstrap_fixed_point_baseline():
+    baseline = json.loads(pathlib.Path("tests/bootstrap_gate_baseline.json").read_text())
+    assert baseline["stages"]["pcc2_vs_pcc3_byte_identical"] is True
+    assert baseline["no_libpython"]["py_cpy_calls"] == 0
+```
 
 Claim hygiene has a strict phrasing table here ([codex-goal-prompt.md](../../codex-goal-prompt.md) §0.10): host pcc ≠ pcc1; stage1 passing ≠ the fixed point passing. "pcc can compile X" and "pcc1 can compile X" are two different claims — the latter requires every dependency of X to live inside the native closure. "Bootstrapped to stage1" and "the pcc1→pcc2→pcc3 fixed point" are likewise two different claims, separated by two levels of runtime correctness. The rule in [AGENTS.md](../../AGENTS.md): never declare a bootstrap fix complete from a local toy reproducer.
 
@@ -122,7 +163,7 @@ The bootstrap row of the README status table (Issue 1 closed 2026-05-01) gives i
 
 **Byte identity locks the self-referential layer.** The first two items hold for a single binary; the third is the behavioral equality between pcc1 and pcc2 (the convergence argument of 15.1). Its sensitivity to nondeterminism far exceeds ordinary tests — one unstable hash iteration order, one shifted boundary in a parallel shard, and the difference shows up somewhere in megabytes of output.
 
-The fallback surface has two further, complementary detection nets, with the division of labor recorded in two authoritative baseline files: [tests/fallback_baseline.json](../../tests/fallback_baseline.json) is the no-libpython fallback ratchet (baseline zero; any growth is a failure), and [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) is the bootstrap gate baseline. The two war stories in 15.9 were each caught by a different net: one detonated as a strict-mode compile-time hard error; the other slipped silently into the IR and was caught by the ratchet's count scan.
+The fallback surface has two further, complementary detection nets, with the division of labor recorded in two authoritative baseline files: [tests/fallback_baseline.json](../../tests/fallback_baseline.json) is the no-libpython fallback ratchet (baseline zero; any growth is a failure), and [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) is the bootstrap gate baseline. The two case studies in 15.9 were each caught by a different net: one detonated as a strict-mode compile-time hard error; the other slipped silently into the IR and was caught by the ratchet's count scan.
 
 ## 15.6 A Taxonomy of Differences: Classify First, Then Fix
 
@@ -146,9 +187,9 @@ When the fixed-point gate goes red, the first action is not to fix — it is to 
 
 (The eight-class wording in the north-star section of [AGENTS.md](../../AGENTS.md) — semantic / IR-text / class-layout / object-model / backend nondeterminism / link metadata / perf-only / diagnostic — is the obligations-level phrasing of the same taxonomy.)
 
-The value of the taxonomy is that it decides both "what to fix" and "with what evidence." The correct handling of the link-metadata class (Mach-O signatures) is **normalize and record** — the signature-stripped comparison in `bootstrap.sh`; treating it as semantic and "fixing" it would mean fiddling with code generation, futile and dangerous. Conversely, the semantic class (the double free in war story one, 15.9) must never be hidden by normalization. The backend-nondeterminism class has one instance that has already been operationalized: `_run_stage2_3()` in [tests/python/test_pcc_bootstrap_full.py](../../tests/python/test_pcc_bootstrap_full.py) deliberately pins **the same parallel budget** for pcc2 and pcc3, with a comment stating that until codegen/link output is proven independent of parallelism, changing the worker count can change binary layout and break the byte-identity gate — semantics unchanged, bytes changed. This is the taxonomy reshaping infrastructure in reverse: a known nondeterminism source is institutionally clamped, instead of being relitigated at every red light. The existence of class 9, unknown, is equally a design decision: it forces an investigation to write "we don't know" when evidence is insufficient, instead of promoting the most convenient story to a conclusion — the micro-form of the repository's claim hygiene.
+The value of the taxonomy is that it decides both "what to fix" and "with what evidence." The correct handling of the link-metadata class (Mach-O signatures) is **normalize and record** — the signature-stripped comparison in `bootstrap.sh`; treating it as semantic and "fixing" it would mean fiddling with code generation, futile and dangerous. Conversely, the semantic class (the double free in case study one, 15.9) must never be hidden by normalization. The backend-nondeterminism class has one instance that has already been operationalized: `_run_stage2_3()` in [tests/python/test_pcc_bootstrap_full.py](../../tests/python/test_pcc_bootstrap_full.py) deliberately pins **the same parallel budget** for pcc2 and pcc3, with a comment stating that until codegen/link output is proven independent of parallelism, changing the worker count can change binary layout and break the byte-identity gate — semantics unchanged, bytes changed. This is the taxonomy reshaping infrastructure in reverse: a known nondeterminism source is institutionally clamped, instead of being relitigated at every red light. The existence of class 9, unknown, is equally a design decision: it forces an investigation to write "we don't know" when evidence is insufficient, instead of promoting the most convenient story to a conclusion — the micro-form of the repository's claim hygiene.
 
-Only after classification comes the seven-step bootstrap regression discipline of [AGENTS.md](../../AGENTS.md), each step distilled from a real incident (war story one in 15.9 is the source of several): (1) identify the **first failing boundary** in mode-labeled language (a pcc0→pcc1 fallback? a pcc1→pcc2 runtime crash? pcc2/pcc3 byte drift?); (2) list the recently touched subsystems that could own that boundary, and treat **your own most recent change as the prime suspect** until IR/source/debugger evidence rules it out; (3) separate stacked failures — when fixing the first boundary exposes a second crash, write them as two failures with two evidence chains; (4) never weaken runtime or GC semantics to turn a stage green — disabling tracking, barriers, owned-local cleanup, or finalizers is a semantic change, not a diagnostic; (5) for ownership failures, verify the caller/callee reference contract before touching cleanup code (Chapter 9); (6) host-side tests are not bootstrap proof — a fix touching the frontend, runtime, or bootstrap entry points must come with the corresponding pcc1/bootstrap gate; (7) debug probes must be tagged, recorded, and removed or promoted — never left behind as ad-hoc changes that alter archive staleness or link shape.
+Only after classification comes the seven-step bootstrap regression discipline of [AGENTS.md](../../AGENTS.md), each step distilled from a real incident (case study one in 15.9 is the source of several): (1) identify the **first failing boundary** in mode-labeled language (a pcc0→pcc1 fallback? a pcc1→pcc2 runtime crash? pcc2/pcc3 byte drift?); (2) list the recently touched subsystems that could own that boundary, and treat **your own most recent change as the prime suspect** until IR/source/debugger evidence rules it out; (3) separate stacked failures — when fixing the first boundary exposes a second crash, write them as two failures with two evidence chains; (4) never weaken runtime or GC semantics to turn a stage green — disabling tracking, barriers, owned-local cleanup, or finalizers is a semantic change, not a diagnostic; (5) for ownership failures, verify the caller/callee reference contract before touching cleanup code (Chapter 9); (6) host-side tests are not bootstrap proof — a fix touching the frontend, runtime, or bootstrap entry points must come with the corresponding pcc1/bootstrap gate; (7) debug probes must be tagged, recorded, and removed or promoted — never left behind as ad-hoc changes that alter archive staleness or link shape.
 
 ## 15.7 The Gate System: Baselines as State
 
@@ -168,7 +209,7 @@ Two facts in pcc's structure **mitigate the trust problem without solving it**, 
 
 ## 15.9 History and Lessons
 
-### War story one: a causality audit of a long-green gate regression (2026-06-01)
+### Case study one: a causality audit of a long-green gate regression (2026-06-01)
 
 (Source: [docs/investigations/bootstrap-user-function-low-ir-fallback-2026-06-01.md](../../docs/investigations/bootstrap-user-function-low-ir-fallback-2026-06-01.md); the ownership-mechanics side was covered in Chapter 9 — this section covers the audit-method side.)
 
@@ -180,7 +221,7 @@ The third step is the most counterintuitive item in the discipline: after the fi
 
 The rejected proposals matter as much as the accepted ones, and the investigation archives them item by item: disabling automatic GC tracking of tuples — **explicitly rejected by the user**, since that trades weakened runtime semantics for a green light (discipline item 4); changing call results to borrowed — rejected, since it rewrites the global ownership contract; the `Function._fresh` error reported by a bare single-file compile probe — flagged as a misleading trace, because the bare probe handed the mixin the wrong host context, and such probes are locators only. The closure was institutional: a dedicated ON-mode fallback canary test was added for `user_function_lowering`, and the entire audit method was written back into [AGENTS.md](../../AGENTS.md) — a substantial part of the "seven-step bootstrap regression discipline" you read today is the distillate of this one investigation.
 
-### War story two: an rsplit reintroduces fallback; the ratchet intercepts (predates war story one)
+### Case study two: an rsplit reintroduces fallback; the ratchet intercepts (predates case study one)
 
 (Source: [docs/investigations/bootstrap-types-rsplit-libpython-fallback.md](../../docs/investigations/bootstrap-types-rsplit-libpython-fallback.md))
 
@@ -192,7 +233,7 @@ The lesson compresses to one sentence: **"it compiled" is not a claim; the closu
 
 ## 15.10 Summary
 
-The bootstrap fixed point is pcc's device for turning "the system is coherent" into a machine-decidable proposition. The four stages each carry their own semantics: pcc0 (the CPython host) → pcc1 proves the source lies within its own subset and the closed world holds; pcc1 → pcc2 proves the native runtime survives the load of compiling a compiler; pcc2 → pcc3 plus the byte compare proves a self-produced compiler is behaviorally self-stable — the fixed point is defined between self-produced compilers, and pcc1 is allowed to carry the foreign host's fingerprints. At the mechanism layer, `bootstrap.sh` supplies the stage machine (stale-artifact defense, the publish barrier, the three-rung verification ladder), while `cli_bootstrap.py` is a CLI that must be compilable by itself, its dialect everywhere bearing the fingerprints of the bootstrap subset. The evidence is three independent claims: zero `py_cpy_*` in the IR (closed world at the generated-code layer), no libpython linkage (independence at the artifact layer), and byte identity after signature normalization (determinism at the self-referential layer) — each locks one layer, and none implies another. pcc1/pcc2 differences are classified before they are fixed, under a nine-class taxonomy in which even *unknown* is a legitimate answer; the gate system is a three-tier pyramid with frozen JSON as authoritative state, one-way ratchets against regression, and the five-GC matrix as the heaviest completion evidence. The boundary with Thompson must stay honest: the fixed point proves coherence and determinism, not trust; the refreshable trust root and the two-backend diversity mitigate the trust problem without solving it. The two war stories squeeze the same discipline from both sides: regressions get a causality audit first, stacked failures split into two evidence chains, and semantics are never weakened for a green light; silent fallback seepage is intercepted by a ratchet whose baseline is zero.
+The bootstrap fixed point is pcc's device for turning "the system is coherent" into a machine-decidable proposition. The four stages each carry their own semantics: pcc0 (the CPython host) → pcc1 proves the source lies within its own subset and the closed world holds; pcc1 → pcc2 proves the native runtime survives the load of compiling a compiler; pcc2 → pcc3 plus the byte compare proves a self-produced compiler is behaviorally self-stable — the fixed point is defined between self-produced compilers, and pcc1 is allowed to carry the foreign host's fingerprints. At the mechanism layer, `bootstrap.sh` supplies the stage machine (stale-artifact defense, the publish barrier, the three-rung verification ladder), while `cli_bootstrap.py` is a CLI that must be compilable by itself, its dialect everywhere bearing the fingerprints of the bootstrap subset. The evidence is three independent claims: zero `py_cpy_*` in the IR (closed world at the generated-code layer), no libpython linkage (independence at the artifact layer), and byte identity after signature normalization (determinism at the self-referential layer) — each locks one layer, and none implies another. pcc1/pcc2 differences are classified before they are fixed, under a nine-class taxonomy in which even *unknown* is a legitimate answer; the gate system is a three-tier pyramid with frozen JSON as authoritative state, one-way ratchets against regression, and the five-GC matrix as the heaviest completion evidence. The boundary with Thompson must stay honest: the fixed point proves coherence and determinism, not trust; the refreshable trust root and the two-backend diversity mitigate the trust problem without solving it. The two case studies squeeze the same discipline from both sides: regressions get a causality audit first, stacked failures split into two evidence chains, and semantics are never weakened for a green light; silent fallback seepage is intercepted by a ratchet whose baseline is zero.
 
 ## Exercises
 
@@ -204,4 +245,4 @@ The bootstrap fixed point is pcc's device for turning "the system is coherent" i
 
 4. **Argue a design tradeoff**: 15.1 argued that pcc1 ≠ pcc2 is permitted. Suppose the gate were strengthened to "pcc1 == pcc2 (after signature normalization)." List at least three classes of pcc0/pcc1 execution-environment differences that would have to be eliminated first, and argue why the marginal coherence-evidence return on that investment is lower (or higher) than spending the same effort on the five-GC matrix.
 
-5. **Argue a design tradeoff**: in war story one, adding a dedicated fallback canary for `user_function_lowering` was treated as a systemic improvement; but one canary per module makes the test count grow linearly with the number of closure modules. Design an alternative (for example, a whole-closure scan that automatically asserts zero `py_cpy_*` per generated-function prefix), analyze its detection granularity, failure-localization speed, and false-positive risk relative to per-module canaries, and state which part of this the [tests/fallback_baseline.json](../../tests/fallback_baseline.json) ratchet already covers.
+5. **Argue a design tradeoff**: in case study one, adding a dedicated fallback canary for `user_function_lowering` was treated as a systemic improvement; but one canary per module makes the test count grow linearly with the number of closure modules. Design an alternative (for example, a whole-closure scan that automatically asserts zero `py_cpy_*` per generated-function prefix), analyze its detection granularity, failure-localization speed, and false-positive risk relative to per-module canaries, and state which part of this the [tests/fallback_baseline.json](../../tests/fallback_baseline.json) ratchet already covers.

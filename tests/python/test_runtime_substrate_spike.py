@@ -31,7 +31,7 @@ def _pcc_binary() -> str:
         return str(candidate)
     found = shutil.which("pcc")
     if found is None:
-        pytest.skip("pcc CLI not on PATH")
+        pytest.fail("pcc CLI not on PATH")
     return found
 
 
@@ -235,7 +235,7 @@ def test_pcc_python_archive_has_no_libpython_object():
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     result = subprocess.run(
         ["ar", "t", str(archive)],
@@ -539,7 +539,7 @@ def test_libpython_pcc_python_archive_staleness_tracks_libpython_bridge(tmp_path
 def test_pcc_python_runtime_objects_do_not_depend_on_module_main_globals():
     build_dir = PY_RUNTIME_DIR / "build_py"
     if not build_dir.exists():
-        pytest.skip(f"runtime build dir missing: {build_dir}")
+        pytest.fail(f"runtime build dir missing: {build_dir}")
 
     offenders: list[str] = []
     for module in _active_python_runtime_modules():
@@ -556,7 +556,7 @@ def test_pcc_python_runtime_objects_do_not_depend_on_module_main_globals():
 def test_pcc_python_runtime_library_ir_has_no_program_main():
     build_dir = PY_RUNTIME_DIR / "build_py"
     if not build_dir.exists():
-        pytest.skip(f"runtime build dir missing: {build_dir}")
+        pytest.fail(f"runtime build dir missing: {build_dir}")
 
     offenders: list[str] = []
     for module in _active_python_runtime_modules():
@@ -641,7 +641,7 @@ def test_python_library_copied_runtime_source_suppresses_implicit_frame_roots(
 def test_pcc_python_libpython_archive_adds_only_bridge_object():
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py_libpython.a"
     if not archive.exists():
-        pytest.skip(f"runtime archive missing: {archive}")
+        pytest.fail(f"runtime archive missing: {archive}")
 
     result = subprocess.run(
         ["ar", "t", str(archive)],
@@ -696,7 +696,7 @@ def test_pcc_python_archive_uses_python_py_substrate_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_substrate.o"],
@@ -730,7 +730,7 @@ def test_pcc_python_archive_uses_python_py_process_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_process.o"],
@@ -761,7 +761,7 @@ def test_pcc_python_archive_uses_python_py_coroutine_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_coroutine.o"],
@@ -791,7 +791,7 @@ def test_pcc_python_archive_uses_python_py_func_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_func.o"],
@@ -822,7 +822,7 @@ def test_pcc_python_archive_uses_python_py_re_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_re.o"],
@@ -852,7 +852,7 @@ def test_pcc_python_archive_uses_python_py_dunder_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_dunder.o"],
@@ -883,7 +883,7 @@ def test_pcc_python_archive_uses_python_py_file_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_file.o"],
@@ -914,7 +914,7 @@ def test_pcc_python_archive_uses_python_py_os_substrate_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_os_substrate.o"],
@@ -945,7 +945,7 @@ def test_pcc_python_archive_uses_python_py_process_substrate_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_process_substrate.o"],
@@ -976,7 +976,7 @@ def test_pcc_python_archive_uses_python_py_int_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     subprocess.run(
         ["ar", "x", str(archive), "py_int.o"],
@@ -1005,7 +1005,7 @@ def test_pcc_python_runtime_bigint_divmod_matches_python(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     harness = tmp_path / "bigint_divmod_harness.c"
     harness.write_text(
@@ -1096,7 +1096,7 @@ def test_pcc_python_traceback_archive_formats_exception(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     harness = tmp_path / "traceback_harness.c"
     harness.write_text(
@@ -1151,7 +1151,7 @@ def test_pcc_python_relocate_copy_rejects_oversized_copy(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     harness = tmp_path / "relocate_copy_size_harness.c"
     harness.write_text(
@@ -1215,7 +1215,7 @@ def test_pcc_python_relocate_copy_consumes_relocation_entry(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     harness = tmp_path / "relocate_copy_single_forward_harness.c"
     harness.write_text(
@@ -1288,7 +1288,7 @@ def test_pcc_python_relocating_step_copies_simple_object(tmp_path):
     # (AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT).
     verdict = probe_artifact_dependency(archive, kind="runtime-archive")
     if not verdict.available:
-        pytest.skip(verdict.skip_reason())
+        pytest.fail(verdict.skip_reason())
 
     harness = tmp_path / "relocating_step_harness.c"
     harness.write_text(
@@ -1486,7 +1486,7 @@ def test_runtime_mirror_probe_and_backend0_latch_source_parity():
 
 def test_py_tuple_port_spike_runs_correctly(tmp_path):
     if not SPIKE_SRC.exists():
-        pytest.skip(f"spike source missing: {SPIKE_SRC}")
+        pytest.fail(f"spike source missing: {SPIKE_SRC}")
     out = tmp_path / "py_tuple_spike"
     env = dict(os.environ)
     env.pop("LC_ALL", None)
@@ -1521,7 +1521,7 @@ def test_py_tuple_port_spike_runs_correctly(tmp_path):
 def test_py_tuple_port_spike_under_pcc_runtime_cc(tmp_path):
     """Same as above but with the pcc-emitted runtime archive."""
     if not SPIKE_SRC.exists():
-        pytest.skip(f"spike source missing: {SPIKE_SRC}")
+        pytest.fail(f"spike source missing: {SPIKE_SRC}")
     out = tmp_path / "py_tuple_spike_pcc"
     env = dict(os.environ)
     env.pop("LC_ALL", None)

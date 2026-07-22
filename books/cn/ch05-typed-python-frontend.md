@@ -2,9 +2,9 @@
 
 pcc 的 Python 路径从一个文本文件开始,到一棵每个表达式都带类型标注的 AST 结束——低层化(lowering)成 LLVM IR 是第 6 章的事。本章讲这条前端链路的四级:手写词法与递归下降解析([pcc/parse/py_lex.py](../../pcc/parse/py_lex.py)、`py_parse.py`)、向冻结 AST 的提升([pcc/parse/py_lift.py](../../pcc/parse/py_lift.py) → [pcc/py_frontend/py_ast.py](../../pcc/py_frontend/py_ast.py))、流水线装配与模式裁决([pcc/py_frontend/pipeline.py](../../pcc/py_frontend/pipeline.py))、注解驱动的类型推断([pcc/py_frontend/type_infer.py](../../pcc/py_frontend/type_infer.py))。但机制只是一半;另一半是三个必须先想清楚的设计裁决:为什么 pcc 做的是 typed-subset 编译器而不是全 Python JIT;为什么不支持的习语默认大声失败(fail loudly)而不是静默回退(fallback);以及 `--ir-scaffold` 这个三态旗标到底在裁决什么。这三个问题的答案互相锁定,共同决定了前端每一层的形态。
 
-## 读者地图:先看清"受控的 Python 子集"
+## 本章导读:受控的 Python 子集
 
-这一章的关键不是 Python 语法有多全,而是前端怎样把一段 Python 程序变成编译器能信任的结构。你可以按四步读:词法/语法得到 AST,提升层改写成更适合编译的形状,类型推断标出对象和值,最后把不支持的动态行为明确挡在门外。
+这一章的关键不是 Python 语法有多全,而是前端怎样把一段 Python 程序变成编译器能信任的结构。请按四步读:词法/语法得到 AST,提升层改写成更适合编译的形状,类型推断标出对象和值,最后把不支持的动态行为明确挡在门外。
 
 - 类型化 Python 前端服务自举,所以它宁可拒绝不清楚的代码,也不靠 CPython 偷跑。
 - `ir-scaffold` 是严格路线的一部分:它让缺口暴露为编译期失败,而不是运行时 fallback。
@@ -36,7 +36,7 @@ pcc 没有选这条路,因为 pcc 的论题不是加速,是**拥有执行**(见�
 
 前端目录里藏着一段谱系。[pcc/py_frontend/parser.py](../../pcc/py_frontend/parser.py) 是第一代解析器:用 CPython 标准库 `ast` 模块做骨干,把 `ast.AST` 节点提升成 pcc 的 AST。它实现快、覆盖全,但有一个致命属性:它本身依赖 libpython。当 pcc 开始编译自己的流水线时,这条 `import ast` 边把 libpython 拖回了 stage1 闭包。`pipeline.py` 中 `compile_python` 的注释记录了裁决:`pcc.parse.py_parse` + `pcc.parse.py_lift` 是自举安全(bootstrap-safe)的解析路径,"之前的 CPython-ast 逃生门在编译后的流水线里保留了一条 libpython import 边,所以自托管路径不再发射它"。`parser.py` 自己的注释则宣判了未来:一旦原生解析器成为硬默认,这个文件可以整体删除。今天它残存的价值是给若干源码形状分析测试当宿主侧工具。
 
-这段谱系给本章定下基调:下面要讲的每一个文件——词法器、解析器、提升器——都既是 pcc 的前端,又是 pcc1 必须能编译、编译出来还必须能正确运行的**输入**。很多看起来过度防御的源码形态,都是这个双重身份留下的化石。
+这段谱系给本章定下基调:下面要讲的每一个文件——词法器、解析器、提升器——都既是 pcc 的前端,又是 pcc1 必须能编译、编译出来还必须能正确运行的**输入**。很多表观上过度防御的源码形态,都是这个双重身份留下的化石。
 
 ## 5.2 解析:py_lex 与 py_parse
 
@@ -104,7 +104,7 @@ py_ast.Module
 | `name := expr` | `_walrus(target, expr)` 调用 |
 | f-string | `format(x, spec)` 与字符串拼接的组合 |
 
-这个编码的好处与 5.3.1 一脉相承:冻结契约不必为每个语法糖扩节点。坏处是一种特有的失败模式——**哨兵泄漏**:如果某个哨兵在低层化阶段没有被改写(因为构造它的形态不在改写器预期内),它会作为普通名字查找活到运行时,变成一个莫名其妙的 `NameError: name '_yield' is not defined`。错误从编译期搬到了运行期,且报错点离根因隔了两个阶段。5.7.1 的战争故事就是这个失败模式的现场,它给哨兵编码立下了不变式:哨兵只允许在低层化器保证改写的形态里被构造。
+这个编码的好处与 5.3.1 一脉相承:冻结契约不必为每个语法糖扩节点。坏处是一种特有的失败模式——**哨兵泄漏**:如果某个哨兵在低层化阶段没有被改写(因为构造它的形态不在改写器预期内),它会作为普通名字查找活到运行时,变成一个莫名其妙的 `NameError: name '_yield' is not defined`。错误从编译期搬到了运行期,且报错点离根因隔了两个阶段。5.7.1 的案例研究就是这个失败模式的现场,它给哨兵编码立下了不变式:哨兵只允许在低层化器保证改写的形态里被构造。
 
 ### 5.3.3 防御性提升:自举输入的化石层
 
@@ -175,7 +175,7 @@ cpython_fallback         无原生提供者;除非显式允许,否则触发硬�
 
 推断的输出直接决定第 6 章低层化的分层。接口契约 [docs/plans/python-frontend-interfaces.md](../../docs/plans/python-frontend-interfaces.md) 第 7 节定义了三个执行层级:L1(全原生操作数,直接 LLVM 操作)、L2(原生与 PyObject* 混合,边界编组)、L3(全动态,一切经运行时分发),并给 codegen 立下规则:"证明不了所有操作数是原生的,降到 L2;什么都证明不了,降到 L3。**决不猜测——发射运行时调用。**"需要诚实说明的是,今天的目录树与这份 v0.1 计划有漂移:不存在名为 `layer2.py`/`layer3.py` 的文件,类型化层级整体落在 `L1CodeGen` 里,而"动态层级"以 DynType 驱动的运行时分发与(在允许时的)`py_cpy_*` 路径存续。层级是语义事实,不再是文件边界。
 
-这就解释了 `DynType` 的传染性为什么是前端最重要的性能与正确性变量:一个表达式一旦是 `DynType`,它的每个消费点都失去原生低层化资格,在 no-libpython 下还可能直接把编译推进 5.4.1 的硬失败。类型信息是一条供应链——5.7.2 的战争故事会展示链条断在哪一环时,运行时与 codegen 的既有支持如何整体作废。
+这就解释了 `DynType` 的传染性为什么是前端最重要的性能与正确性变量:一个表达式一旦是 `DynType`,它的每个消费点都失去原生低层化资格,在 no-libpython 下还可能直接把编译推进 5.4.1 的硬失败。类型信息是一条供应链——5.7.2 的案例研究会展示链条断在哪一环时,运行时与 codegen 的既有支持如何整体作废。
 
 类类型是这条供应链的大宗货物。`_prepopulate_module_scope()` 先把模块顶层的类与函数注册进全局作用域;类定义经 `_class_fields_from_def()`(字段 schema)、`_class_bases_from_def()`(基类)、`_class_properties_from_def()`(`@property` 声明,见 5.7.2)装配成 `ClassType`;属性访问 `obj.attr` 沿 `_class_mro_list()` 的 MRO 走 `_lookup_class_field()` → `_lookup_class_property()`。多文件场景下,`external_exports` 让跨模块的 `from .sibling import C` 在推断期拿到完整 schema;`derived_class_map` 处理 mixin 形态——当基类在闭包里有唯一派生类时,以派生类为 `self` 类型推断基类方法,这个机制的来历与代价由第 6 章的拆分史详述。`contextual_host_params` 与 `l1_codegen_host_type()` 是同一问题的另一面:为接收 `L1CodeGen` 宿主对象的辅助函数提供一个合成类型,让 `host.builder` 不至于立刻塌缩成 `DynType`——这是类型推断为"编译自己"做的定向加强。
 

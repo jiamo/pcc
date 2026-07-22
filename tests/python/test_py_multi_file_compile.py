@@ -174,9 +174,15 @@ class MultiFileCompileTests(unittest.TestCase):
         )
 
         ir_text = open(out_ll, "r", encoding="utf-8").read()
-        self.assertIn("@.pcc.module.init.pkg_lib = internal global i32 0", ir_text)
+        init_guard = re.search(
+            r"@(?P<symbol>(?:__pcp\d+_)?\.pcc\.module\.init\.pkg_lib) "
+            r"= (?:internal )?global i32 0\b",
+            ir_text,
+        )
+        self.assertIsNotNone(init_guard)
         self.assertIn("%mod.init.seen", ir_text)
-        self.assertIn("store i32 1, ptr @.pcc.module.init.pkg_lib", ir_text)
+        symbol = re.escape(init_guard.group("symbol"))
+        self.assertRegex(ir_text, rf"store i32 1, ptr @{symbol}\b")
 
     def test_cross_module_function_call(self):
         files = {
@@ -1475,13 +1481,10 @@ class MultiFileCompileTests(unittest.TestCase):
                 "Codes = Literal['x', 'y']\n"
             )
         with open(facade, "w", encoding="utf-8") as fh:
-            fh.write(
-                "from .provider import AnyShape as AnyShape, Codes as Codes\n"
-            )
+            fh.write("from .provider import AnyShape as AnyShape, Codes as Codes\n")
         with open(entry, "w", encoding="utf-8") as fh:
             fh.write(
-                "from .facade import AnyShape, Codes\n\n"
-                "print('typing reexport')\n"
+                "from .facade import AnyShape, Codes\n\n" "print('typing reexport')\n"
             )
 
         exe = os.path.join(td, "typing_reexport")

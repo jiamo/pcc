@@ -47,14 +47,14 @@ def _strict_hardware() -> bool:
 def _unavailable(reason: str) -> None:
     if _strict_hardware():
         pytest.fail(reason)
-    pytest.skip(reason)
+    pytest.fail(reason)
 
 
 def _mlx_or_skip():
     try:
         import mlx.core as mx
     except ImportError as exc:
-        _unavailable(f"MLX is not installed: {exc}")
+        pytest.fail(f"mlx gate selected but the MLX import failed: {exc}")
     if sys.platform != "darwin":
         _unavailable("MLX kDLMetal round-trip requires Darwin")
     if not mx.metal.is_available():
@@ -86,6 +86,8 @@ def _matrix_plan():
     return plan_metal_launch(_matrix_module(), args)
 
 
+@pytest.mark.pcc_gate(dep="mlx")
+@pytest.mark.pcc_gate(probe="metal")
 def test_owned_metal_tensor_roundtrips_through_mlx_dlpack(tmp_path):
     mx = _mlx_or_skip()
     runtime = build_metal_native_buffer_runtime_artifacts(

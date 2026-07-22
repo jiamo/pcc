@@ -1,8 +1,8 @@
 # 第 14 章 no-libpython:把运行时收缩成内核
 
-no-libpython 是 pcc 论题里最容易被误读的一个词。它不是"二进制里没有 C",更不是"运行时被消灭了";它的精确含义只有一句:**编译产物不依赖 CPython 运行时**。本章讲 pcc 为兑现这句话而搭建的全部机构:运行时的四层模型(C 内核保留并最小化、C 语义运行时收缩、pcc-Python 运行时增长、C-API shim 保留并规约);让 pcc-Python 能写底层代码的两扇门([pcc/extern/](../../pcc/extern) 与 [pcc/unsafe/](../../pcc/unsafe));C 与 pcc-Python 双实现的镜像纪律,以及一个多数人会答错的构建事实——默认链接的是 pcc-Python 端口,不是 C 源;最后是把"还差多少"做成单向闸门(gate)的回退棘轮([tests/fallback_baseline.json](../../tests/fallback_baseline.json))。三个战争故事都来自 2026 年 5 月的真实调查:cc 模式给出的假信心、float repr 的四条路径、以及支撑这条战线的 idiom-diff 工作法。自举不动点本身——pcc1→pcc2→pcc3——留给第 15 章;本章只回答"无 libpython 的运行时从哪里来,边界守在哪里"。
+no-libpython 是 pcc 论题里最容易被误读的一个词。它不是"二进制里没有 C",更不是"运行时被消灭了";它的精确含义只有一句:**编译产物不依赖 CPython 运行时**。本章讲 pcc 为兑现这句话而搭建的全部机构:运行时的四层模型(C 内核保留并最小化、C 语义运行时收缩、pcc-Python 运行时增长、C-API shim 保留并规约);让 pcc-Python 能写底层代码的两扇门([pcc/extern/](../../pcc/extern) 与 [pcc/unsafe/](../../pcc/unsafe));C 与 pcc-Python 双实现的镜像纪律,以及一个多数人会答错的构建事实——默认链接的是 pcc-Python 端口,不是 C 源;最后是把"还差多少"做成单向闸门(gate)的回退棘轮([tests/fallback_baseline.json](../../tests/fallback_baseline.json))。三个案例研究都来自 2026 年 5 月的真实调查:cc 模式给出的假信心、float repr 的四条路径、以及支撑这条战线的 idiom-diff 工作法。自举不动点本身——pcc1→pcc2→pcc3——留给第 15 章;本章只回答"无 libpython 的运行时从哪里来,边界守在哪里"。
 
-## 读者地图:no-libpython 不是"没有 C"
+## 本章导读:no-libpython 的准确含义
 
 这一章先拆掉一个误会:no-libpython 的目标是摆脱 CPython runtime,不是把所有底层 C 内核清零。pcc 仍然需要小而稳定的 C-level kernel 来处理平台、ABI、分配、线程和 GC 原语;要收缩的是手写 C 语义层。
 
@@ -104,7 +104,7 @@ libpy_runtime_pcc_py_libpython.a   上者加 CPython 桥(兼容回退用)
 
 选择哪个归档,由 [pcc/py_frontend/pipeline.py](../../pcc/py_frontend/pipeline.py) 的两个函数决定,而它们的默认值就是本节标题:`_runtime_cc_mode()` 读 `PCC_RUNTIME_CC`,默认返回 `"pcc"`;`_runtime_high_mode()` 读 `PCC_RUNTIME_HIGH`,默认返回 `"py"`。两个默认叠加,`_ensure_runtime()` 选中 `libpy_runtime_pcc_py.a`。docstring 直说:默认就是自举安全路径,`PCC_RUNTIME_CC=cc` 是**显式要求 host-cc oracle 归档**时才设的。
 
-这个事实给镜像纪律装上了牙齿。[AGENTS.md](../../AGENTS.md) 的规则是"Mirror C and pcc-Python runtimes"——多数 GC/运行时代码在 `src/` 有 C 文件、在 `py/` 有端口,两者必须同步。现在可以把它说成构建语言:**对 PY_MODULES 名单内的文件,改 C 源对默认模式是无效操作**。C 版只活在 cc/oracle 归档里;默认模式的二进制链接的是端口的代码。反方向同理,只改端口则 oracle 归档失真。14.6 的第一个战争故事就是这条纪律被违反的完整记录。
+这个事实给镜像纪律装上了牙齿。[AGENTS.md](../../AGENTS.md) 的规则是"Mirror C and pcc-Python runtimes"——多数 GC/运行时代码在 `src/` 有 C 文件、在 `py/` 有端口,两者必须同步。现在可以把它说成构建语言:**对 PY_MODULES 名单内的文件,改 C 源对默认模式是无效操作**。C 版只活在 cc/oracle 归档里;默认模式的二进制链接的是端口的代码。反方向同理,只改端口则 oracle 归档失真。14.6 的第一个案例研究就是这条纪律被违反的完整记录。
 
 那哪些 C 可以**不**镜像?Makefile 的 `OBJ_PY_CC_HELPERS` 列表给出答案:`py_format.o`、`py_capi_shim.o`、`py_extension_loader.o`、`pcc_threads.o`、`py_gc_index_table.o`、`py_os_native.o`、`py_re_engine.o`、`py_cpy_handle.o` 等二十来个对象,以 host cc 编译后**直接进入端口归档**。它们是 C-only 辅助:单一 C 实现、没有端口镜像、两种归档共享同一份语义。仓库的取舍规则:当一个新的 no-libpython 运行时辅助函数让端口去重写会很笨拙(需要 C 库函数循环、平台边界、或与 shim 共生)时,加一个 C-only 文件,而不是 C+端口双写。这不是镜像纪律的漏洞,是它的补集——镜像的成本只花在"语义真的要迁移"的文件上;14.6 的 float repr 故事会展示一次教科书式的运用。
 
@@ -138,7 +138,7 @@ no-libpython 战线上最危险的工作方式是"凭感觉找下一个洞"。20
 
 **症状。** 上述 9 个切片全部回归测试绿、自举闸门绿。随后一个默认模式探针调用 `bin(5)`,链接失败:`undefined _py_builtin_bin`。
 
-**错误假设。** "回归测试 + 自举全绿 = 切片在目标模式下成立。"两个闸门各有一个此前没人说破的盲区。
+**错误假设。** "回归测试 + 自举全部通过 = 切片在目标模式下成立。"两个闸门各有一个此前没人说破的盲区。
 
 **证据链。** 逐项核对发现,9 个切片里 4 个只在 cc 模式生效:bin/hex/oct(新符号加在 `py_dunder.c`,端口 `py_dunder.py` 没有)、str 的 title/swapcase/casefold(`py_str_accessors.c` 新符号,端口缺失)、`set ^`(`py_set.c` 的 `py_set_symmetric_difference`,端口缺失)、sorted 处理 dict/可迭代(`py_obj_ops_compare.c` 的 `py_obj_sorted` 改了,端口还是旧的整数下标版本——这个最阴险:默认模式不是链接失败,而是**静默保留旧的错误行为**)。这四个文件全在 `PY_MODULES` 名单里;而所有回归测试都钉了 `PCC_RUNTIME_CC=cc`,只验证了 oracle 归档。自举为什么也绿?因为 pcc 自己的代码不调用 bin、不用 set 对称差——**闸门通过只证明闸门覆盖的路径,不证明特性存在**。
 
@@ -160,7 +160,7 @@ no-libpython 战线上最危险的工作方式是"凭感觉找下一个洞"。20
 
 ## 14.7 小结
 
-no-libpython 是一个边界声明,不是一个清零声明:产物不依赖 CPython 运行时,而 C 以"内核"的身份合法存续。本章的机构围绕三个守边动作展开。**分层**:四层模型给每层一个动词(KEEP-minimize / SHRINK / GROW / KEEP-spec),C 内核以知识边界而非代码量定义,`py_cpy_*` 桥被隔离在 `py_libpython.c` 的 `#ifdef` 后面,两个指针命名空间永不混叠。**迁移**:`pcc.extern` 与 `pcc.unsafe` 让 pcc-Python 写底层,`c_abi_export` 让端口在链接期顶替 C 符号;Makefile 的 `PY_MODULES` 把 55 个端口编进默认归档——默认链接端口而非 C 源,这个构建事实是镜像纪律的牙齿,也是两个战争故事共同的根。**锁定**:回退棘轮把"还差多少"做成 5% 噪声上限、单向、桥/非桥分账的闸门,`_recapture_log` 留下从 27853 到 0 的编年史;`--explain-fallback` 保证每次回退要么被解释、要么被禁止。三个故事的公约数是测量纪律:闸门只证明它覆盖的模式,绿不等于真——先问"跑在哪个模式上",再决定相信什么。pcc1→pcc2→pcc3 如何用这套运行时闭合不动点,见第 15 章。
+no-libpython 是一个边界声明,不是一个清零声明:产物不依赖 CPython 运行时,而 C 以"内核"的身份合法存续。本章的机构围绕三个守边动作展开。**分层**:四层模型给每层一个动词(KEEP-minimize / SHRINK / GROW / KEEP-spec),C 内核以知识边界而非代码量定义,`py_cpy_*` 桥被隔离在 `py_libpython.c` 的 `#ifdef` 后面,两个指针命名空间永不混叠。**迁移**:`pcc.extern` 与 `pcc.unsafe` 让 pcc-Python 写底层,`c_abi_export` 让端口在链接期顶替 C 符号;Makefile 的 `PY_MODULES` 把 55 个端口编进默认归档——默认链接端口而非 C 源,这个构建事实是镜像纪律的牙齿,也是两个案例研究共同的根。**锁定**:回退棘轮把"还差多少"做成 5% 噪声上限、单向、桥/非桥分账的闸门,`_recapture_log` 留下从 27853 到 0 的编年史;`--explain-fallback` 保证每次回退要么被解释、要么被禁止。三个故事的公约数是测量纪律:闸门只证明它覆盖的模式,绿不等于真——先问"跑在哪个模式上",再决定相信什么。pcc1→pcc2→pcc3 如何用这套运行时闭合不动点,见第 15 章。
 
 ## 练习
 
@@ -172,4 +172,4 @@ no-libpython 是一个边界声明,不是一个清零声明:产物不依赖 CPyt
 
 4. **设计权衡。** [pcc/extern/__init__.py](../../pcc/extern/__init__.py) 自述了 `c_str` 返回位的缺口:`getenv` 拿回裸 `i8*`,无人包装成 `PyStrObject`。给出两个修复方向——(a) 加一个运行时辅助函数(C-only?端口镜像?)在调用后包装;(b) 让代码生成在 `c_str` 返回位自动插入包装调用——并从 14.4 的归档结构与 14.2 的层边界论证各自的归属与风险:新符号会进哪些归档?哪个方向更接近 14.6.1 提到的"新符号自举风险"?
 
-5. **战争故事推演。** 假设你要给 `py_set.c` 新增 `py_set_symmetric_difference` 并让前端低层化 `a ^ b` 调用它。按本章与 14.6 的教训,列出让它在**默认模式**下真实生效的完整步骤清单(运行时 C、端口、`runtime_abi` 声明、回归测试的模式选择、自举闸门),并标出哪一步被省略时,会精确复现 14.6.2 的四种假信心形态中的哪一种(链接失败 vs 静默旧行为)。
+5. **案例研究推演。** 假设你要给 `py_set.c` 新增 `py_set_symmetric_difference` 并让前端低层化 `a ^ b` 调用它。按本章与 14.6 的教训,列出让它在**默认模式**下真实生效的完整步骤清单(运行时 C、端口、`runtime_abi` 声明、回归测试的模式选择、自举闸门),并标出哪一步被省略时,会精确复现 14.6.2 的四种假信心形态中的哪一种(链接失败 vs 静默旧行为)。

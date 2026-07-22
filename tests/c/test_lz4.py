@@ -58,7 +58,7 @@ def lz4_compiled_units_self():
     return compiled_units, base_dir
 
 
-@pytest.mark.skipif(not os.path.isdir(LZ4_LIB_DIR), reason="lz4-1.10.0/lib not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(LZ4_LIB_DIR) else "lz4-1.10.0/lib not found")
 def test_lz4_make_goal_dependency_collects_library_sources():
     units, base_dir = _lz4_units()
 
@@ -74,7 +74,7 @@ def test_lz4_make_goal_dependency_collects_library_sources():
     assert "examples/simple_buffer.c" not in names
 
 
-@pytest.mark.skipif(not os.path.isdir(LZ4_LIB_DIR), reason="lz4-1.10.0/lib not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(LZ4_LIB_DIR) else "lz4-1.10.0/lib not found")
 def test_lz4_runtime_with_mcjit_depends_on(lz4_compiled_units):
     compiled_units, _base_dir = lz4_compiled_units
 
@@ -86,7 +86,7 @@ def test_lz4_runtime_with_mcjit_depends_on(lz4_compiled_units):
     assert result == 0
 
 
-@pytest.mark.skipif(not os.path.isdir(LZ4_LIB_DIR), reason="lz4-1.10.0/lib not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(LZ4_LIB_DIR) else "lz4-1.10.0/lib not found")
 def test_lz4_runtime_with_system_link_depends_on(lz4_compiled_units):
     compiled_units, base_dir = lz4_compiled_units
 
@@ -106,7 +106,7 @@ def test_lz4_runtime_with_system_link_depends_on(lz4_compiled_units):
     assert "OK" in result.stdout
 
 
-@pytest.mark.skipif(not os.path.isdir(LZ4_LIB_DIR), reason="lz4-1.10.0/lib not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(LZ4_LIB_DIR) else "lz4-1.10.0/lib not found")
 def test_lz4_runtime_with_self_backend_system_link_depends_on(lz4_compiled_units_self):
     compiled_units, base_dir = lz4_compiled_units_self
 

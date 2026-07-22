@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.pcc_gate(env="PCC_RUN_NUMPY_L5_ARRAY_INTEGRATION")]
 
 REPO = Path(__file__).resolve().parents[2]
 NUMPY_SITE = REPO / "build" / "head-truth" / "numpy-core" / "site"
@@ -41,12 +41,12 @@ def _pcc1_binary() -> Path:
 
 def _require_gate_enabled() -> Path:
     if os.environ.get("PCC_RUN_NUMPY_L5_ARRAY_INTEGRATION") != "1":
-        pytest.skip("set PCC_RUN_NUMPY_L5_ARRAY_INTEGRATION=1 to run the real NumPy L5 array gate")
+        pytest.fail("set PCC_RUN_NUMPY_L5_ARRAY_INTEGRATION=1 to run the real NumPy L5 array gate")
     pcc1 = _pcc1_binary()
     if not pcc1.is_file():
-        pytest.skip(f"self-host pcc1 binary required: {pcc1}")
+        pytest.fail(f"self-host pcc1 binary required: {pcc1}")
     if not (NUMPY_SITE / "numpy" / "_core").is_dir():
-        pytest.skip(f"pcc-native NumPy core site required: {NUMPY_SITE}")
+        pytest.fail(f"pcc-native NumPy core site required: {NUMPY_SITE}")
     return pcc1
 
 

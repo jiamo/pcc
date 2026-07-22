@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.pcc_gate(env="PCC_RUN_NUMPY_L5_INTEGRATION")]
 
 REPO = Path(__file__).resolve().parents[2]
 NUMPY_ROOT = REPO / "projects" / "numpy-2.4.4"
@@ -16,7 +16,7 @@ NUMPY_ROOT = REPO / "projects" / "numpy-2.4.4"
 
 def _require_numpy_l5_gate_enabled() -> None:
     if os.environ.get("PCC_RUN_NUMPY_L5_INTEGRATION") != "1":
-        pytest.skip("set PCC_RUN_NUMPY_L5_INTEGRATION=1 to run the real NumPy L5 package gate")
+        pytest.fail("set PCC_RUN_NUMPY_L5_INTEGRATION=1 to run the real NumPy L5 package gate")
     if not NUMPY_ROOT.exists():
         pytest.fail(f"real NumPy source tree is required: {NUMPY_ROOT}")
 

@@ -20,23 +20,26 @@ C run       Execute the module graph, dlopen extensions, and provide the object
 ## Contract
 
 **pcc owns B and C. A is an explicit, replaceable acquisition backend. The
-default `auto` mode selects `host`; first-class optional `owned` and strict
+default `auto` mode selects `owned`; explicit `host` compatibility and strict
 `offline` modes are also available.**
 
 Rationale, aligned with the project north star:
 
 1. Build and run remain the execution-ownership path, but the command UX must
    not force users to manually split `pip download` from `pcc install`.
-   Therefore `auto` may explicitly delegate only acquisition to host pip and
-   then immediately return to pcc's build/install/run path.
+   Therefore `auto` uses pcc1's narrow Simple Repository path and then
+   immediately continues into pcc's build/install/run path. This also avoids
+   pip invoking a package's PEP 517 backend merely to obtain sdist metadata.
 2. `owned` does not embed pip or resolvelib in pcc1. pcc1 parses the Simple
    Repository API, selects ABI-compatible artifacts, verifies repository-
    published SHA-256 digests, and publishes them to a content-addressed
    immutable cache. HTTPS/libcurl is C-level kernel transport; it owns no
    package-selection semantics and requires no libpython.
-3. `owned` does not yet implement dependency backtracking or PEP 517 build
-   isolation. Those shapes must fail closed with stable diagnostics; it may
-   not silently borrow the host and still claim owned acquisition.
+3. `owned` does not implement dependency backtracking or PEP 517 build
+   isolation. Explicit owned mode fails closed on those shapes. In coordinated
+   `auto` mode, a verified source artifact may be handed to pcc's supported
+   native source builder; that is labeled as build delegation and still fails
+   closed when the pcc builder cannot satisfy the source contract.
 4. The ecosystem obligation in AGENTS.md requires reusable mechanisms. No
    backend may contain package-name special cases.
 
@@ -47,7 +50,7 @@ reimplemented all of pip.**
 
 | Mode | Selection/download owner | Host Python/pip | Current boundary |
 |---|---|---:|---|
-| `auto` (default) | Explicitly selects `host` and records requested/actual modes | Yes, acquire only | Best one-command UX; pcc still owns build/install/run |
+| `auto` (default) | pcc1 Simple API selector + pcc runtime HTTPS transport, then the supported pcc-native source builder | No for acquisition | Best one-command UX; records owned acquisition and any native-build delegation separately |
 | `host` | Host pip `download --no-deps`; pcc verifies ABI and moves the artifact into immutable cache | Yes | Makes no owned-acquisition, dependency-resolution, or build-isolation claim |
 | `owned` | pcc1 Simple API selector + pcc runtime HTTPS transport | No | Bare names or `name==version` only; SHA-256 required; dependency/resolver/build-isolation shapes fail closed |
 | `offline` | Searches only paths, cache, and `--find-links` | No | A miss reports `PCC-PKG-ACQUIRE-OFFLINE` |
@@ -64,7 +67,7 @@ download does not prove that an artifact builds or imports.
 |---|---|
 | Local source tree, local wheel, or a name resolved by a local `--find-links` directory | Build for `--abi` (default `pcc-native`) and install into the `--target` site |
 | `--dry-run` / `--report` | Report the plan without installing |
-| Bare name not resolved locally | Execute `--acquire`: default `auto -> host`, pcc1's Simple API path for `owned`, or an explicit failure for `offline` |
+| Bare name not resolved locally | Execute `--acquire`: default `auto -> owned`, explicit host pip compatibility for `host`, or an explicit failure for `offline` |
 
 `--index-url` and `--extra-index-url` are explicit acquisition-backend inputs.
 Online modes use `https://pypi.org/simple` when neither is supplied.

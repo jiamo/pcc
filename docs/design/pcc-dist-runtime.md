@@ -3,7 +3,7 @@
 Status: local oracle, explicit localhost TCP-ring/collective owners, and an
 explicit authenticated-but-unencrypted remote admission path landed. No
 multi-Mac execution proof exists yet.
-Source: converted from `tmp_research/deep-research-distribute.md` (TVM Disco
+Source: converted from `docs/refs_docs/deep-research/deep-research-distribute.md` (TVM Disco
 `Session`/`DRef`/device-mesh boundaries; Apple-Silicon transport reality;
 vLLM paged-KV block management).
 Goal rows: `D-P0-DIST-SESSION`, `D-P0-DIST-TRANSPORT`, `D-P0-DIST-COLLECTIVE`,

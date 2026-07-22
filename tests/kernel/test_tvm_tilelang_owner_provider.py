@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from pcc.kernel_ir.gpu_owner_backend import TvmTilelangGpuBackendDriver
 from pcc.kernel_ir.ir import (
     BufferParam,
     KernelFunc,
@@ -16,10 +17,12 @@ from pcc.kernel_ir.ir import (
     ScalarParam,
     ScalarType,
 )
+from pcc.kernel_ir.schedule import BindThreads, KernelSchedule
 from pcc.kernel_ir.tirx_adapter import lower_to_plain_tir
 from pcc.kernel_ir.tvm_tilelang_owner import (
     TVM_TILELANG_ORDERED_PASSES,
     TVM_TILELANG_PIPELINE,
+    TVM_TILELANG_PROVIDER_IDENTITY,
     TvmTilelangProviderError,
     compile_with_tvm_tilelang_provider,
     load_tvm_tilelang_provider_config,
@@ -96,9 +99,21 @@ def _gemm_module() -> KernelModule:
                 ),
                 body=(
                     KernelOp("fill", ("C_local",), {"value": 0}),
-                    KernelOp("copy", ("A", "A_shared"), {"pipeline_extent": 1, "num_stages": 0}),
-                    KernelOp("copy", ("B", "B_shared"), {"pipeline_extent": 1, "num_stages": 0}),
-                    KernelOp("gemm", ("A_shared", "B_shared", "C_local"), {"pipeline_extent": 1, "num_stages": 0}),
+                    KernelOp(
+                        "copy",
+                        ("A", "A_shared"),
+                        {"pipeline_extent": 1, "num_stages": 0},
+                    ),
+                    KernelOp(
+                        "copy",
+                        ("B", "B_shared"),
+                        {"pipeline_extent": 1, "num_stages": 0},
+                    ),
+                    KernelOp(
+                        "gemm",
+                        ("A_shared", "B_shared", "C_local"),
+                        {"pipeline_extent": 1, "num_stages": 0},
+                    ),
                     KernelOp("copy", ("C_local", "C")),
                 ),
                 grid=(1, 1),
@@ -106,6 +121,22 @@ def _gemm_module() -> KernelModule:
             ),
         ),
     )
+
+
+def _provider_unavailable_reason() -> str | None:
+    try:
+        config = load_tvm_tilelang_provider_config()
+    except Exception as exc:  # config itself unreadable -> not installed
+        return f"pinned local TVM/TileLang provider is not installed: {exc}"
+    required = (
+        Path(config.root),
+        Path(config.python),
+        Path(config.site_packages),
+        Path(config.provider_script),
+    )
+    if not all(path.exists() for path in required):
+        return "pinned local TVM/TileLang provider is not installed"
+    return None
 
 
 def _config_or_skip():
@@ -117,7 +148,7 @@ def _config_or_skip():
         Path(config.provider_script),
     )
     if not all(path.exists() for path in required):
-        pytest.skip("pinned local TVM/TileLang provider is not installed")
+        pytest.fail("pinned local TVM/TileLang provider is not installed")
     return config
 
 
@@ -125,6 +156,7 @@ def _config_or_skip():
     ("module_factory", "semantic_kind"),
     ((_copy_module, "copy"), (_gemm_module, "gemm")),
 )
+@pytest.mark.pcc_gate(unavailable=_provider_unavailable_reason())
 def test_pinned_provider_compiles_canonical_plain_tir_without_fallback(
     tmp_path,
     module_factory,
@@ -148,7 +180,10 @@ def test_pinned_provider_compiles_canonical_plain_tir_without_fallback(
     assert len(result.metal_source_sha256) == 64
     assert Path(result.request_path).is_file()
     assert Path(result.response_path).is_file()
-    assert Path(result.provider_source_path).read_text(encoding="utf-8") == result.provider_metal_source
+    assert (
+        Path(result.provider_source_path).read_text(encoding="utf-8")
+        == result.provider_metal_source
+    )
     assert Path(result.source_path).read_text(encoding="utf-8") == result.metal_source
     assert set(result.artifact_hashes()) >= {
         "canonical_frozen_ir",
@@ -179,6 +214,7 @@ def test_provider_unavailable_fails_closed_without_pcc_metal_fallback(tmp_path):
         )
 
 
+@pytest.mark.pcc_gate(unavailable=_provider_unavailable_reason())
 def test_provider_incompatible_pin_fails_closed(tmp_path):
     config = _config_or_skip()
     pin = dict(config.pin)
@@ -194,6 +230,7 @@ def test_provider_incompatible_pin_fails_closed(tmp_path):
         )
 
 
+@pytest.mark.pcc_gate(unavailable=_provider_unavailable_reason())
 def test_provider_isolates_ambient_python_and_plugin_configuration(
     tmp_path,
     monkeypatch,
@@ -213,6 +250,7 @@ def test_provider_isolates_ambient_python_and_plugin_configuration(
     )
 
 
+@pytest.mark.pcc_gate(unavailable=_provider_unavailable_reason())
 def test_provider_rejects_unsupported_semantics_without_fallback(tmp_path):
     module = _copy_module()
     func = module.funcs[0]
@@ -231,3 +269,27 @@ def test_provider_rejects_unsupported_semantics_without_fallback(tmp_path):
             tmp_path,
             config=_config_or_skip(),
         )
+
+
+@pytest.mark.pcc_gate(unavailable=_provider_unavailable_reason())
+def test_owner_schedule_reaches_pinned_provider_as_scheduled_frozen_ir(tmp_path):
+    module = _copy_module()
+    schedule = KernelSchedule.for_module(
+        module,
+        target="metal:0",
+        steps=(BindThreads("copy_kernel", expected_threads=16, threads=32),),
+    )
+    artifacts = TvmTilelangGpuBackendDriver(provider_config=_config_or_skip()).compile(
+        module,
+        "metal:0",
+        TVM_TILELANG_PIPELINE,
+        tmp_path,
+        schedule=schedule,
+    )
+
+    assert artifacts.frozen_module.funcs[0]["threads"] == 32
+    assert artifacts.schedule_plan_sha256 == schedule.sha256
+    assert artifacts.provider_result.canonical_frozen_ir_sha256 == (
+        artifacts.provider_result.artifact_hashes()["canonical_frozen_ir"]
+    )
+    assert artifacts.provider_result.provider_identity == TVM_TILELANG_PROVIDER_IDENTITY

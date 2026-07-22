@@ -40,7 +40,7 @@ def _have_libpython() -> bool:
     return probe.returncode == 0 and bool(probe.stdout.strip())
 
 
-@pytest.mark.skipif(not _have_libpython(), reason="cpython-compat requires libpython headers/lib")
+@pytest.mark.pcc_gate(unavailable=None if _have_libpython() else "cpython-compat requires libpython headers/lib")
 def test_cpython_compat_imports_stdlib_c_extension(tmp_path):
     from pcc.py_frontend.pipeline import compile_python
 

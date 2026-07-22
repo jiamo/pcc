@@ -315,7 +315,7 @@ else:
 # ────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.skipif(not os.path.isdir(NGINX_DIR), reason="nginx-1.28.3 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(NGINX_DIR) else "nginx-1.28.3 not found")
 def test_nginx_make_goal_collects_source_files():
     """Verify make goal discovers nginx source files (not pcre/zlib)."""
     units, base_dir = _nginx_units()
@@ -339,7 +339,7 @@ def test_nginx_make_goal_collects_source_files():
     assert "src/core/ngx_regex.c" in names
 
 
-@pytest.mark.skipif(not os.path.isdir(NGINX_DIR), reason="nginx-1.28.3 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(NGINX_DIR) else "nginx-1.28.3 not found")
 @pytest.mark.parametrize("fname", NGINX_SOURCE_FILES, ids=NGINX_SOURCE_FILES)
 def test_nginx_source_compile(fname):
     """Test nginx .c file: preprocess → parse → codegen → LLVM verify."""
@@ -350,7 +350,7 @@ def test_nginx_source_compile(fname):
         pytest.xfail(f"Stage '{stage}': {result}")
 
 
-@pytest.mark.skipif(not os.path.isdir(NGINX_DIR), reason="nginx-1.28.3 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(NGINX_DIR) else "nginx-1.28.3 not found")
 @pytest.mark.integration
 def test_nginx_native_build():
     """Build nginx with native compiler as a baseline."""
@@ -365,7 +365,7 @@ def test_nginx_native_build():
     assert "nginx/1.28.3" in (result.stdout + result.stderr)
 
 
-@pytest.mark.skipif(not os.path.isdir(NGINX_DIR), reason="nginx-1.28.3 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(NGINX_DIR) else "nginx-1.28.3 not found")
 @pytest.mark.integration
 def test_nginx_full_system_link():
     """Compile all nginx sources with pcc, link with system cc, verify binary."""

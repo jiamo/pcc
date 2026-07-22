@@ -1,11 +1,13 @@
 # First-class pcc package environments
 
-## Status and problem
+## Status and original problem
 
-This document defines the target package-environment contract. It does not
-claim that the contract is implemented yet.
+The first-class environment-selection contract is implemented for host pcc,
+compiled pcc1, default install, and frontend import discovery. The locked uv
+sync and cross-profile artifact-manifest slices remain separate task-board
+work; this document continues to define their shared boundary.
 
-The current implementation has two incompatible implicit destinations:
+Before this implementation, pcc had two incompatible implicit destinations:
 
 - the host installer defaults to `~/.cache/pcc/site-packages`;
 - the compiled `pcc1 -m pip` installer defaults to

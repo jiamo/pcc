@@ -1,6 +1,6 @@
 # Preface
 
-## Reader Map: Read the Book in Three Layers
+## How to Read This Book: Three Layers
 
 On a first pass, do not try to memorize every file name. Read the book in three layers: first, why pcc exists; second, how the C frontend, Python frontend, runtime, and backends form an execution chain; third, what evidence keeps each claim from overreaching.
 
@@ -65,13 +65,13 @@ standing to discuss design.
 Every chapter follows one structure: first **the problem and the design
 space** (why the subsystem exists, what the alternatives were, why they were
 rejected); then **the mechanism**, grounded in real source files and function
-names; then **History and Lessons** — war stories drawn from the two hundred
+names; then **History and Lessons** — case studies drawn from the two hundred
 odd investigation records under [docs/investigations/](../../docs/investigations): symptom, wrong
 hypothesis, evidence chain, root cause, and the invariant left behind.
 Exercises close each chapter, ranging from "verify this claim in the source"
 to "argue a design trade-off."
 
-The war stories are first-class content, not garnish. A system's real design
+The case studies are first-class content, not garnish. A system's real design
 constraints often become visible only after they have been violated — after
 they turned the bootstrap red or crashed a collector. [docs/investigations/](../../docs/investigations)
 is this system's fossil record; the book cites those files by name and date so
@@ -93,7 +93,7 @@ Nine parts, eighteen chapters. Three paths:
 
 ## Version and conventions
 
-The book corresponds to the pcc repository as of June 2026 (after 0.1.3, with
+The book corresponds to the pcc repository as of June 2026 (after 0.1.5, with
 all five GC bootstrap gates green on the mainline). The code will keep
 evolving, so source references always use **file path plus identifier name**
 (e.g. `pcc_gc_store_ptr()` in [pcc/py_runtime/src/py_gc_backend.c](../../pcc/py_runtime/src/py_gc_backend.c)), never

@@ -76,7 +76,7 @@
 | claim hygiene | 声明卫生 | 每条声明标注其证明范围 |
 | mode-labeled | 模式标注的 | |
 | investigation | 调查 | [docs/investigations/](../../docs/investigations) 下的文档 |
-| war story | 战争故事 | 本书"历史与教训"小节的素材 |
+| case study | 案例研究 | 本书"历史与教训"小节的体例,取材 docs/investigations |
 | reproducer | 重现程序 | 最小化的失败用例 |
 | regression | 回归 | |
 | no-libpython | no-libpython | 不译;不依赖 CPython 运行时 |

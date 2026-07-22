@@ -12,6 +12,12 @@ def _kill_process_group(proc: subprocess.Popen[str], sig: int) -> None:
         os.killpg(proc.pid, sig)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # A signal handler can reap the group leader before the outer cleanup
+        # path repeats killpg().  Treat EPERM as benign only after the owned
+        # parent is observably gone; a live process must still surface it.
+        if proc.poll() is None:
+            raise
 
 
 def _finish_after_process_group_kill(

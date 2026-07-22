@@ -1,7 +1,7 @@
 # 《pcc 的设计与实现》/ The Design and Implementation of pcc — 全书蓝图
 
 十部十九章 + 前言 + 附录。每章蓝图含:主题边界、必读素材、必须回答的设计问题、
-必讲的战争故事来源。写作 agent 不得越出本章边界(相邻章节会覆盖)。
+必讲的案例研究来源。写作 agent 不得越出本章边界(相邻章节会覆盖)。
 
 跨章引用写法:「见第 N 章」/ "see Chapter N",不要复述他章内容。
 
@@ -19,7 +19,7 @@
   `docs/current-goal-state.md` 顶部审计快照。
 - 设计问题:为什么"加速器"不是目标?为什么 honesty(mode-labeled claims)是架构的一部分?
   与 PyPy/Cython/Nuitka/mypyc 的定位差异(基于事实,不贬低)。
-- 战争故事:claim hygiene 的来源——为什么仓库规则禁止 `if package == "numpy"`。
+- 案例研究:claim hygiene 的来源——为什么仓库规则禁止 `if package == "numpy"`。
 
 ### 第 2 章 体系结构总览 (Architecture Overview)
 文件:`ch02-architecture.md`
@@ -41,7 +41,7 @@
   `pcc/evaluater/c_evaluator.py` 流水线(preprocess/parse/IR/optimize/execute)、
   `pcc/project.py` 源收集与 `--sources-from-make` 的原理及限制。
 - 素材:上列文件 + `AGENTS.md` Common Pitfalls 里 stale parser cache、目录探针误编译。
-- 战争故事:从 `docs/investigations/INDEX.md` 选 C 侧条目(struct/union tag 重用、
+- 案例研究:从 `docs/investigations/INDEX.md` 选 C 侧条目(struct/union tag 重用、
   static/incomplete array、casted function-pointer globals 类)。
 
 ### 第 4 章 C 语义降低与符号性 (C Semantic Lowering and Signedness)
@@ -53,7 +53,7 @@
   sdiv/srem/ashr/signed compare);常量折叠是语义子系统;数据布局 bug vs 表达式语义 bug。
 - 素材:`pcc/codegen/c_codegen.py`(读上述 helper 与调用点)、`AGENTS.md` 符号性一节、
   `docs/debugging-playbook.md` §10/§12、`tests/c/test_unsigned_loads.py`。
-- 战争故事:Lua/libc-heavy 程序暴露符号性丢失的真实案例(查 INDEX)。
+- 案例研究:Lua/libc-heavy 程序暴露符号性丢失的真实案例(查 INDEX)。
 
 ## 第 III 部 Python 前端 (Part III: The Python Frontend)
 
@@ -73,7 +73,7 @@
   for_loop/comprehension、format/fstring);`native_*.py` 原生模块降低;
   生成代码必须在可 raise 调用后插 `py_err_occurred()` 检查的降低义务。
 - 素材:`pcc/py_frontend/codegen/` 目录、`AGENTS.md` layer1 split 段。
-- 战争故事:双下标路径(subscript_lowering vs exact_int_lowering 改一半 = 半失效)、
+- 案例研究:双下标路径(subscript_lowering vs exact_int_lowering 改一半 = 半失效)、
   六条除法降低路径——同一语义散布多路径的维护代价(查 INDEX 对应调查)。
 
 ## 第 IV 部 运行时 (Part IV: The Runtime)
@@ -87,7 +87,7 @@
   "object has no attribute X 但类明明定义了 X"的三因检查顺序。
 - 素材:`pcc/py_runtime/include/py_runtime.h`、`src/py_internal.h`、`src/py_class.c`、
   `src/py_obj.c`、`py/py_class.py`、`AGENTS.md` 对象头/布局节。
-- 战争故事:布局漂移类 bug(INDEX 检索 layout/class);dataclass default-None setattr
+- 案例研究:布局漂移类 bug(INDEX 检索 layout/class);dataclass default-None setattr
   clobber 邻槽问题。
 
 ### 第 8 章 异常模型 (The Exception Model)
@@ -98,7 +98,7 @@
   `py_exc_tls.c`、`py_exc_traceback.c`);失败模式"compile succeeded with no output"。
 - 素材:上列 C 文件 + `py/py_exc_*.py` 镜像、`exception_lowering.py`、
   `docs/investigations/python-self-host-no-libpython-runtime-holes.md`。
-- 战争故事:漏 err-check 的 emission-site 审计(INDEX: emission-site-err-check-audit)。
+- 案例研究:漏 err-check 的 emission-site 审计(INDEX: emission-site-err-check-audit)。
 
 ### 第 9 章 引用计数与所有权 (Reference Counting and Ownership)
 文件:`ch09-refcount-ownership.md`
@@ -109,7 +109,7 @@
   防复活再入;为什么"禁止为了过 gate 而弱化所有权/清理"。
 - 素材:`pcc/py_frontend/codegen/ownership*_lowering.py`(以实际文件名为准,rg 查)、
   `src/py_obj.c`、`src/py_obj_dealloc.c`、`AGENTS.md` 自举回归纪律第 5 条。
-- 战争故事:bootstrap 所有权回归案例(INDEX: ownership / owned-local / return)。
+- 案例研究:bootstrap 所有权回归案例(INDEX: ownership / owned-local / return)。
 
 ## 第 V 部 垃圾收集:五后端实验室 (Part V: GC — the Five-Backend Laboratory)
 
@@ -124,7 +124,7 @@
 - 素材:`pcc/py_runtime/src/py_gc_backend.c`、`src/py_obj_gc.c`、`include/py_runtime.h`、
   `py/py_gc_backend.py`、`AGENTS.md` 5-GC equality、
   `docs/investigations/gc-5backend-*`(对象生命周期契约、异常 referent roots 等)。
-- 战争故事:exc-referent 根缺失的根因在前端 ownership lowering 而非运行时
+- 案例研究:exc-referent 根缺失的根因在前端 ownership lowering 而非运行时
   (gc-5backend-exception-referent-roots);frame-root 哈希退化案例。
 
 ### 第 11 章 五个后端:从引用计数到重定位 (The Five Backends: from Refcounting to Relocation)
@@ -141,7 +141,7 @@
 - 素材:`src/py_gc_backend.c`、`docs/refs_docs/gc-research/<lang>/`、
   `docs/investigations/gc-backend{1,2,3,4}-*`、`gc-backend-selection-matrix.md`、
   `bootstrap-five-gc-*`。
-- 战争故事:每个后端至少一个(从对应 investigation 取)。
+- 案例研究:每个后端至少一个(从对应 investigation 取)。
 
 ## 第 VI 部 后端与链接 (Part VI: Backends and Linking)
 
@@ -152,7 +152,7 @@
   重写只剩 va_arg 一个豁免;`postprocess_ir_text()` 与属性剥离
   (nuw/nneg/range()/initializes()/dead_on_unwind);system-link 路径直接发 native object。
 - 素材:`pcc/llvm_capi/`、`AGENTS.md` IR Fix Policy、上述测试。
-- 战争故事:capi/llvmlite 不一致案例(INDEX 检索 llvm_capi / parity)。
+- 案例研究:capi/llvmlite 不一致案例(INDEX 检索 llvm_capi / parity)。
 
 ### 第 13 章 self 后端:没有 LLVM 的原生发射 (The Self Backend: Native Emission without LLVM)
 文件:`ch13-self-backend.md`
@@ -162,7 +162,7 @@
   目标 pass、Mach-O 产物;"第一类执行根"义务——`--backend=self` 后禁止静默回退 LLVM;
   `_link_with_self_backend` 不得把 `pcc.backend.*` 拉回 stage1 闭包(subprocess 边界)。
 - 素材:`pcc/backend/` 文件群、`AGENTS.md` S-track 义务与 subprocess 边界节。
-- 战争故事:self 后端 bootstrap 相关调查(INDEX 检索 self-backend / backend)。
+- 案例研究:self 后端 bootstrap 相关调查(INDEX 检索 self-backend / backend)。
 
 ## 第 VII 部 自举与 no-libpython (Part VII: Self-Hosting)
 
@@ -177,7 +177,7 @@
 - 素材:`AGENTS.md` Runtime layering、`pcc/py_runtime/py/` 目录、`pcc/extern/`、
   `pcc/unsafe/`、`pcc/py_runtime/` 的 Makefile/构建脚本(rg 查 PY_MODULES)、
   fallback 基线测试。
-- 战争故事:PCC_RUNTIME_CC=cc 测出假信心(C 修复在 PY_MODULES 文件里默认模式不生效);
+- 案例研究:PCC_RUNTIME_CC=cc 测出假信心(C 修复在 PY_MODULES 文件里默认模式不生效);
   float repr 多路径;no-libpython idiom slices 工作法。
 
 ### 第 15 章 自举:pcc1→pcc2→pcc3 不动点 (Bootstrap: the pcc1→pcc2→pcc3 Fixed Point)
@@ -190,7 +190,7 @@
   (`tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py`);自举回归纪律(七步);
   Thompson "Trusting Trust" 的关联与边界。
 - 素材:上列脚本/测试/基线、`AGENTS.md` Bootstrap 全节、README Status 表。
-- 战争故事:一次真实 bootstrap 回归的因果审计(INDEX 检索 bootstrap-)。
+- 案例研究:一次真实 bootstrap 回归的因果审计(INDEX 检索 bootstrap-)。
 
 ## 第 VIII 部 值模型与生态 (Part VIII: The Value Model and the Ecosystem)
 
@@ -216,7 +216,7 @@
   CpyHandle(tag 32)装箱外来 cpy 引用的机制;`PCC_HOST_PYTHON=/bin/false` 证据法。
 - 素材:上列文件、`AGENTS.md` Package/NumPy Claim Hygiene、`codex-goal-prompt.md` §0.10、
   INDEX 检索 package / numpy / capi / extension。
-- 战争故事:stale capi header 给出假"gap 0"的测量教训。
+- 案例研究:stale capi header 给出假"gap 0"的测量教训。
 
 ## 第 IX 部 工程方法 (Part IX: Engineering Method)
 
@@ -247,7 +247,7 @@
   `AGENTS.md`"加速器执行是所有权论题的延伸"段。
 - 设计问题:为什么"oracle,不是 owner"必须写进架构(与 self 后端对 LLVM、值模型对 Valhalla 同律)?
   为什么"有 TVM/tilelang 支持"是要防的 overclaim?
-- 战争故事:import 上游帮你跑通 kernel ≠ 执行所有权;claim level 阶梯为何存在。
+- 案例研究:import 上游帮你跑通 kernel ≠ 执行所有权;claim level 阶梯为何存在。
 
 ---
 

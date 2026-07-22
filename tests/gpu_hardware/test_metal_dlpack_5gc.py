@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tests.gpu_hardware.test_metal_dlpack_pcc1 import (
     run_pcc1_dlpack_capsule_gate,
 )
+
+
+pytestmark = pytest.mark.pcc_gate(env="PCC_CURRENT_PCC1")
 
 
 def test_pcc1_dlpack_real_metal_device_lifetime_under_gc0_through_gc4(

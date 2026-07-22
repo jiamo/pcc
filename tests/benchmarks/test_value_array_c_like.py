@@ -41,6 +41,7 @@ def test_value_array_c_like_manifest_is_exactly_source_and_ir_bound(tmp_path):
         emit_llvm_only=True,
         libpython_mode="off",
         ir_scaffold_mode="on",
+        backend="llvm",
     )
     assert identity["frontend_ir_sha256"] == _sha256(emitted)
 

@@ -29,6 +29,14 @@ from pcc.kernel_ir.metal_metallib_runtime import (
 )
 from pcc.kernel_ir.tilelang_import import import_tilelang_source
 
+_TILELANG_LOCAL_REASON = (
+    None
+    if (Path.home() / "tilelang" / "benchmark").is_dir()
+    else "local ~/tilelang benchmark checkout not present"
+)
+
+
+
 
 TILELANG_METAL_MATMUL = """
 import tilelang
@@ -217,7 +225,7 @@ def _tilelang_local_metal_benchmark_module(
         Path.home() / "tilelang" / "benchmark" / "matmul_metal" / "benchmark_matmul_metal.py"
     )
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang Metal benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang Metal benchmark reference not found: {benchmark_path}")
     return import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),
         outer_function="matmul_simdgroup",
@@ -242,7 +250,7 @@ def _tilelang_local_matmul_nonroller_module(
 ) -> KernelModule:
     benchmark_path = Path.home() / "tilelang" / "benchmark" / "matmul" / "benchmark_matmul.py"
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang benchmark reference not found: {benchmark_path}")
     return import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),
         outer_function="matmul",
@@ -272,7 +280,7 @@ def _tilelang_local_matmul_static_roller_module(
 ) -> KernelModule:
     benchmark_path = Path.home() / "tilelang" / "benchmark" / "matmul" / "benchmark_matmul.py"
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang benchmark reference not found: {benchmark_path}")
     return import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),
         outer_function="matmul",
@@ -576,6 +584,7 @@ def test_metallib_runtime_package_executes_imported_tilelang_gemm_or_records_too
     assert package["runtime_launch_executed"] is False
 
 
+@pytest.mark.pcc_gate(unavailable=_TILELANG_LOCAL_REASON)
 def test_metallib_runtime_package_executes_local_tilelang_metal_benchmark_or_records_toolchain_skip(
     tmp_path,
 ):
@@ -625,6 +634,7 @@ def test_metallib_runtime_package_executes_local_tilelang_metal_benchmark_or_rec
     assert package["runtime_launch_executed"] is False
 
 
+@pytest.mark.pcc_gate(unavailable=_TILELANG_LOCAL_REASON)
 def test_metallib_runtime_package_executes_local_tilelang_matmul_nonroller_or_records_toolchain_skip(
     tmp_path,
 ):
@@ -675,6 +685,7 @@ def test_metallib_runtime_package_executes_local_tilelang_matmul_nonroller_or_re
     assert package["runtime_launch_executed"] is False
 
 
+@pytest.mark.pcc_gate(unavailable=_TILELANG_LOCAL_REASON)
 def test_metallib_runtime_package_executes_local_tilelang_matmul_static_roller_or_records_toolchain_skip(
     tmp_path,
 ):

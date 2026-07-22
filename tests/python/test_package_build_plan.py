@@ -5,6 +5,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from pcc1_gate import repo_root
+
 import pytest
 
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
@@ -15,7 +17,7 @@ from pcc.package.build_plan import (
     load_meson_introspection_commands,
 )
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = repo_root()
 
 
 def _find_current_pcc1() -> Path | None:

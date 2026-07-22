@@ -5,10 +5,12 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from pcc1_gate import repo_root
+
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = repo_root()
 
 
 def test_dynamic_receiver_truediv_compiles_dunder_self_backend(tmp_path):

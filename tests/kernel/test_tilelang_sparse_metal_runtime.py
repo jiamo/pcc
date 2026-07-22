@@ -22,6 +22,9 @@ from pcc.kernel_ir.tilelang_import import import_tilelang_source
 TILELANG_FIXED_SPARSE_GEMM = """
 import tilelang.language as T
 
+pytestmark = pytest.mark.pcc_gate(probe="metal")
+
+
 def matmul_sp(M, N, K, in_dtype, accum_dtype, e_dtype, e_factor,
               block_M, block_N, block_K, num_stages, thread_num,
               policy, enable_rasterization):
@@ -177,7 +180,7 @@ def test_sparse_gemm_sp_metal_fails_closed_for_transpose():
 
 def test_fixed_sparse_gemm_sp_real_metal_readback(tmp_path):
     if sys.platform != "darwin":
-        pytest.skip("fixed TileLang sparse GEMM runtime requires Darwin Metal")
+        pytest.fail("fixed TileLang sparse GEMM runtime requires Darwin Metal")
     module = fixed_sparse_module()
     a_sparse, metadata, b, _ = fixed_sparse_inputs()
     args = PccPackedArgs(launch_device="metal:0")
@@ -199,7 +202,7 @@ def test_fixed_sparse_gemm_sp_real_metal_readback(tmp_path):
     )
     data = result.to_dict()
     if result.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(data["reason"])
+        pytest.fail(data["reason"])
     assert result.status == STATUS_SOURCE_RUNTIME_PACKAGE_EXECUTED, data
     assert data["runtime_launch_executed"] is True
     assert data["invocation"]["fence_completed"] is True

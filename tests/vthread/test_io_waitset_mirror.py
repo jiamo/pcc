@@ -274,7 +274,7 @@ def _oracle_poll_dataset(script):
 def test_c_io_waitset_poll_matches_oracle_dataset(tmp_path):
     cc = _c_compiler()
     if cc is None:
-        pytest.skip("no C compiler available")
+        pytest.fail("no C compiler available")
 
     root = _repo_root()
     src_dir = root / "pcc" / "py_runtime" / "src"
@@ -469,7 +469,7 @@ def test_c_io_waitset_semantics_and_capability(tmp_path):
     (on kqueue platforms) the real kevent(2) backend over live pipe fds."""
     cc = _c_compiler()
     if cc is None:
-        pytest.skip("no C compiler available")
+        pytest.fail("no C compiler available")
 
     root = _repo_root()
     src_dir = root / "pcc" / "py_runtime" / "src"

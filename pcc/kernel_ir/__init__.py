@@ -33,6 +33,16 @@ from pcc.kernel_ir.ir import (
     dump_kernel,
     validate_kernel,
 )
+from pcc.kernel_ir.schedule import (
+    KERNEL_SCHEDULE_SCHEMA,
+    METAL_MAX_THREADS_PER_THREADGROUP,
+    AppliedKernelSchedule,
+    BindThreads,
+    KernelSchedule,
+    KernelScheduleError,
+    apply_kernel_schedule,
+    kernel_ir_sha256,
+)
 from pcc.kernel_ir.target_split import (
     DeviceTarget,
     HostBackend,

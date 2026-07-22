@@ -5,6 +5,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from pcc1_gate import repo_root
+
 import pytest
 
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
@@ -17,7 +19,7 @@ from pcc.package.campaign import (
     select_test_files,
 )
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = repo_root()
 
 
 def _find_current_pcc1() -> Path | None:

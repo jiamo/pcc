@@ -2,7 +2,7 @@
 
 第 12 章里 LLVM 是 pcc 的发射引擎;本章它退为参照物。[pcc/backend/](../../pcc/backend) 下的 self 后端是一个不调用 LLVM 库的原生汇编发射器:读入 LLVM IR 文本,直接写出 AArch64 Darwin(及一个 x86_64 Linux 子集)汇编。它存在的理由写在七义务的第 4 条——self 后端必须成为第一类执行根,LLVM 是 oracle 而不是所有者。本章讲清三件事:为什么自举(bootstrap)不动点逼出了这个后端;一个刻意不做寄存器分配的"asm 优先"发射器如何切层(目标无关的解析/布局/栈槽层,目标特定的发射族,文本窥孔层);以及两条边界义务——`--backend=self` 之后禁止静默回退(fallback)LLVM,`_link_with_self_backend` 不得把 `pcc.backend.*` 拉回 stage1 闭包。后端的输入从哪来(Python 前端低层化,见第 6 章)与自举闸门(gate)本身(见第 15 章)不在本章。
 
-## 读者地图:self 后端先看边界,再看指令
+## 本章导读:self 后端的边界与指令面
 
 这一章不要从汇编细节开始。先抓住 self 后端的边界:它读 LLVM IR 文本,自己做指令选择和 ABI 发射,但仍把汇编/链接交给系统工具;它可以拒绝不支持的形状,但不能在 `--backend=self` 后静默绕回 LLVM。
 
@@ -30,7 +30,7 @@
 
 [pcc/backend/](../../pcc/backend) 的切层原则写在 `self_backend_parse.py` 的模块文档里:文本 LLVM IR 的处理逻辑归目标无关层所有,"解析结果应当被今天的 AArch64 Darwin 与以后的 x86_64 Linux 复用,而不是每个目标重新实现一遍 IR 文本处理"。`self_backend.py` 本身只剩一个十几行的兼容门面(老的单文件后端曾住在这里)。
 
-**解析层**(`self_backend_parse.py`)是一组按行匹配的正则:`_ALLOCA_RE`、`_STORE_RE`、`_BINOP_RE`、`_ICMP_RE`、`_CALL_RE`、`_GEP_RE`、`_PHI_RE`……`parse_self_backend_module()` 产出 `ParsedModule`(triple、全局、函数),函数体由 `_parse_blocks()` 切成带标签的基本块,每行经 `_parse_instruction()` 归一化为 `ParsedInstr(kind, data)` 元组,终结子单独走 `_parse_terminator()`。两个细节值得点名,因为 13.7 的战争故事会回到它们:其一,`split_top_level()` 是唯一合法的逗号切分器——它跟踪花括号/方括号/尖括号/圆括号/引号深度,保证 `{ i64, i64 }` 这样的聚合类型不会被字段逗号撕开;其二,常量表达式(`getelementptr` 常量、`inttoptr` 常量、嵌套 cast)被 `decode_value_token()` 归一化成 `gepconst:base:offset`、`gep0:base`、`inttoptrconst:N` 这样的前缀小语言,发射层据此免于再碰原始文本。无法归一的形状照例抛 `BackendUnavailable`;`check_simple_symbol_name()` 把符号面限制在简单 C 标识符。
+**解析层**(`self_backend_parse.py`)是一组按行匹配的正则:`_ALLOCA_RE`、`_STORE_RE`、`_BINOP_RE`、`_ICMP_RE`、`_CALL_RE`、`_GEP_RE`、`_PHI_RE`……`parse_self_backend_module()` 产出 `ParsedModule`(triple、全局、函数),函数体由 `_parse_blocks()` 切成带标签的基本块,每行经 `_parse_instruction()` 归一化为 `ParsedInstr(kind, data)` 元组,终结子单独走 `_parse_terminator()`。两个细节值得点名,因为 13.7 的案例研究会回到它们:其一,`split_top_level()` 是唯一合法的逗号切分器——它跟踪花括号/方括号/尖括号/圆括号/引号深度,保证 `{ i64, i64 }` 这样的聚合类型不会被字段逗号撕开;其二,常量表达式(`getelementptr` 常量、`inttoptr` 常量、嵌套 cast)被 `decode_value_token()` 归一化成 `gepconst:base:offset`、`gep0:base`、`inttoptrconst:N` 这样的前缀小语言,发射层据此免于再碰原始文本。无法归一的形状照例抛 `BackendUnavailable`;`check_simple_symbol_name()` 把符号面限制在简单 C 标识符。
 
 **数据模型**(`self_backend_ir.py`)围绕 `TypeDesc` 展开:一个 frozen dataclass 同时承担类型描述与布局代数——`slot_size`(内存中的存储尺寸,含结构体字段对齐折叠)、`value_slot_size` / `value_align`(SSA 值槽位用的最小 4 字节版本)、`field_offset()`、`aggregate_member_info()`(沿索引链算出成员类型与字节偏移,供 `extractvalue`/`insertvalue`/GEP 共用)。`ParsedFunction` 携带发射所需的全部账本:`value_types`、`value_slots`、`alloca_slots`、`block_map`、`hidden_sret_slot`、`frame_size`。
 
@@ -166,7 +166,7 @@ self 后端回答的问题是:不动点的最后一环——原生发射——�
 3. **拒绝**:不支持的形状抛 `BackendUnavailable`,从类型 token 到 icmp 条件码无一例外。这不是未完成的歉意,是 S-P0-A 闸门的实现材料:静默猜测与静默回退是同一种谎言的两个面。
 4. **边界**:工件经系统 `cc` 汇编链接、Darwin 上签名校验读回后才算发布;`--backend=self` 后没有任何通往 `_link_with_clang()` 的代码路径;pcc1 经 subprocess 调用宿主解释器运行后端,使 `pcc.backend.*` 不进 stage1 闭包——一个方向明确的过渡形态。
 
-三个战争故事各钉一条边界上的不变式:发布语义属于后端的正确性面;文本解析的切分政策只能有一条,而推动子集扩张的是值模型的 ABI 义务;自托管链上的崩溃署名不可信,第一失败边界必须用模式标注的语言确立。
+三个案例研究各钉一条边界上的不变式:发布语义属于后端的正确性面;文本解析的切分政策只能有一条,而推动子集扩张的是值模型的 ABI 义务;自托管链上的崩溃署名不可信,第一失败边界必须用模式标注的语言确立。
 
 ## 练习
 

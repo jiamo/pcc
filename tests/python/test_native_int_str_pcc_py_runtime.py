@@ -5,10 +5,12 @@ import sys
 import textwrap
 from pathlib import Path
 
+from pcc1_gate import repo_root
+
 from tests.python.process_timeout import run_process_group_timeout
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = repo_root()
 
 
 def test_tagged_int_str_uses_pcc_python_runtime(

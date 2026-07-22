@@ -156,7 +156,7 @@ def sqlite_pcc_object(tmp_path_factory):
     return obj_path
 
 
-@pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(SQLITE_DIR) else "sqlite-amalgamation-3490100 not found")
 @pytest.mark.integration
 def test_sqlite_prepare_select_literal_regression(tmp_path, sqlite_pcc_object):
     result = _run_sqlite_prepare_probe(tmp_path, sqlite_pcc_object, "select 1;")
@@ -166,7 +166,7 @@ def test_sqlite_prepare_select_literal_regression(tmp_path, sqlite_pcc_object):
     ), f"sqlite prepare(select 1) failed:\n{result.stdout}\n{result.stderr}"
 
 
-@pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(SQLITE_DIR) else "sqlite-amalgamation-3490100 not found")
 @pytest.mark.integration
 def test_sqlite_prepare_string_literal_regression(tmp_path, sqlite_pcc_object):
     result = _run_sqlite_prepare_probe(tmp_path, sqlite_pcc_object, "select 'x';")
@@ -176,7 +176,7 @@ def test_sqlite_prepare_string_literal_regression(tmp_path, sqlite_pcc_object):
     ), f"sqlite prepare(select 'x') failed:\n{result.stdout}\n{result.stderr}"
 
 
-@pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(SQLITE_DIR) else "sqlite-amalgamation-3490100 not found")
 @pytest.mark.integration
 def test_sqlite_prepare_create_table_regression(tmp_path, sqlite_pcc_object):
     result = _run_sqlite_prepare_probe(
@@ -190,7 +190,7 @@ def test_sqlite_prepare_create_table_regression(tmp_path, sqlite_pcc_object):
     ), f"sqlite prepare(create table) failed:\n{result.stdout}\n{result.stderr}"
 
 
-@pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(SQLITE_DIR) else "sqlite-amalgamation-3490100 not found")
 @pytest.mark.integration
 def test_sqlite_runtime_with_mcjit_depends_on(tmp_path, sqlite_compiled_units):
     compiled_units, _base_dir = sqlite_compiled_units
@@ -207,7 +207,7 @@ def test_sqlite_runtime_with_mcjit_depends_on(tmp_path, sqlite_compiled_units):
     _assert_sqlite_db_contents(db_path)
 
 
-@pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(SQLITE_DIR) else "sqlite-amalgamation-3490100 not found")
 @pytest.mark.integration
 def test_sqlite_runtime_with_system_link_depends_on(tmp_path, sqlite_compiled_units):
     compiled_units, base_dir = sqlite_compiled_units
@@ -235,7 +235,7 @@ def test_sqlite_runtime_with_system_link_depends_on(tmp_path, sqlite_compiled_un
     _assert_sqlite_db_contents(db_path)
 
 
-@pytest.mark.skipif(not os.path.isdir(SQLITE_DIR), reason="sqlite-amalgamation-3490100 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(SQLITE_DIR) else "sqlite-amalgamation-3490100 not found")
 def test_sqlite_depends_on_collects_amalgamation_and_main():
     units, base_dir = _sqlite_units()
 

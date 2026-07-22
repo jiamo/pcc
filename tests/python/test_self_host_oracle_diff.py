@@ -14,10 +14,10 @@ import pytest
 from pcc.macho_normalize import normalize_macho_metadata
 from tests.runtime_build_cache import (
     cached_self_host_oracle_dir,
+    self_backend_object_cache_key,
     self_host_object_cache_dir,
     self_host_source_key,
 )
-
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 NO_HOST_PYTHON = shutil.which("false") or "/usr/bin/false"
@@ -4001,167 +4001,176 @@ CASES: tuple[tuple[str, str], ...] = (
     ),
 )
 
-FIXPOINT_SMOKE_CASES = frozenset({
-    "ternary_inline",
-    "lambda_add",
-    "kwargs_defaults",
-    "list_comprehension",
-    "nested_def_capture",
-    "closure_cell_rebind",
-    "fstring_format_spec",
-    "bitwise_int_ops",
-    "bitwise_negative_shift_errors",
-    "fstring_debug_and_conversions",
-    "fstring_attr_call_mix",
-    "fstring_dynamic_format_spec",
-    "fstring_custom_format",
-    "string_concat_runtime",
-    "fstring_ascii_conversion_non_ascii",
-    "generator_fstring_join",
-    "tuple_generator_expression",
-    "walrus_expression",
-    "list_slice_mutation",
-    "generator_next",
-    "getattr_default_and_if_args_or_kwargs",
-    "generator_yield_from",
-    "generator_inner_for",
-    "custom_getattribute",
-    "custom_getattribute_getattr_fallback",
-    "custom_getattribute_valueerror_propagates",
-    "metaclass_literal_class_attrs",
-    "metaclass_method_binding",
-    "metaclass_property_binding",
-    "metaclass_property_readonly_errors",
-    "metaclass_property_readonly_precedence",
-    "metaclass_custom_descriptor_set_delete",
-    "metaclass_data_descriptor_precedence",
-    "metaclass_runtime_class_object_property_precedence",
-    "metaclass_runtime_class_object_data_descriptor_precedence",
-    "metaclass_runtime_class_object_property_setter_deleter_precedence",
-    "metaclass_prepare_namespace",
-    "metaclass_prepare_namespace_body_override",
-    "metaclass_prepare_namespace_body_extends",
-    "metaclass_prepare_namespace_method_and_body",
-    "metaclass_prepare_namespace_non_mapping_typeerror",
-    "metaclass_prepare_custom_namespace_setitem_order",
-    "metaclass_prepare_custom_namespace_getitem_new",
-    "metaclass_prepare_custom_namespace_class_body_lookup",
-    "metaclass_prepare_custom_namespace_constructor_args",
-    "metaclass_prepare_custom_namespace_factory_return",
-    "metaclass_prepare_custom_namespace_alias_constructor",
-    "metaclass_prepare_custom_namespace_factory_local_return",
-    "metaclass_prepare_custom_namespace_generic_mapping_factory",
-    "metaclass_prepare_custom_namespace_delete_name",
-    "metaclass_keyword_arguments_prepare_new",
-    "metaclass_call_controls_instantiation",
-    "metaclass_call_delegates_type_call",
-    "metaclass_dynamic_value_binding",
-    "metaclass_dynamic_value_exception_propagates",
-    "metaclass_dynamic_value_function_return",
-    "metaclass_dynamic_value_function_arg_return",
-    "metaclass_dynamic_value_conditional_return",
-    "metaclass_dynamic_value_conditional_expr",
-    "metaclass_dynamic_value_bool_or_expr",
-    "metaclass_dynamic_value_bool_and_expr",
-    "metaclass_dynamic_value_bool_or_falsey_left_expr",
-    "metaclass_dynamic_value_bool_or_alias_fallback",
-    "metaclass_dynamic_value_bool_and_or_falsey_chain",
-    "metaclass_prepare_namespace_non_string_key_typeerror",
-    "metaclass_inherited_from_base",
-    "metaclass_conflict_between_bases_typeerror",
-    "metaclass_compatible_bases_choose_most_derived",
-    "dynamic_type_constructor_class_attrs",
-    "dynamic_type_constructor_namespace_var",
-    "dynamic_type_constructor_namespace_alias",
-    "dynamic_type_constructor_namespace_mutation_before_call",
-    "dynamic_type_constructor_runtime_namespace_dict",
-    "dynamic_type_constructor_namespace_mapping_typeerror",
-    "dynamic_type_constructor_namespace_function_method",
-    "dynamic_type_constructor_namespace_descriptor",
-    "dynamic_type_constructor_namespace_staticmethod",
-    "dynamic_type_constructor_namespace_classmethod",
-    "dynamic_type_constructor_namespace_data_descriptor",
-    "dynamic_type_constructor_namespace_property",
-    "dynamic_type_constructor_namespace_property_readonly_errors",
-    "property_decorator_get_set_delete",
-    "descriptor_get",
-    "data_descriptor_priority",
-    "user_instance_subscript_setitem_getitem",
-    "descriptor_delete",
-    "zero_arg_super_method",
-    "zero_arg_super_classmethod",
-    "zero_arg_super_nested_method_with_receiver",
-    "zero_arg_super_nested_class_receiver",
-    "zero_arg_super_escaping_nested_class_receiver",
-    "zero_arg_super_escaping_nested_method_receiver",
-    "dunder_class_cell_method",
-    "dunder_class_cell_nested_method",
-    "dunder_class_cell_escaping_nested_method",
-    "dunder_class_local_shadow_escaping_nested_method",
-    "dunder_class_cell_staticmethod",
-    "zero_arg_super_staticmethod_error",
-    "class_body_dunder_class_nameerror",
-    "argumented_super_method",
-    "argumented_super_classmethod",
-    "argumented_super_invalid_receiver_typeerror",
-    "argumented_super_staticmethod_explicit_receiver",
-    "argumented_super_class_receiver_subtype",
-    "argumented_super_class_alias_receiver_subtype",
-    "argumented_super_local_class_alias_receiver_subtype",
-    "argumented_super_missing_method_attributeerror",
-    "inherited_classmethod_cls_class_attr",
-    "class_attr_mutation_visible_to_classmethod",
-    "inherited_classmethod_cls_attr_store",
-    "class_attr_delete_visible_to_classmethod",
-    "class_attr_descriptor_get_owner",
-    "class_attr_staticmethod_classmethod_wrapper_access",
-    "class_attr_instance_method_unbound_value",
-    "instance_method_bound_name_self",
-    "dynamic_class_attr_function_instance_bound",
-    "class_attr_method_replacement_runtime_lookup",
-    "class_attr_method_replacement_delete_fallback",
-    "class_attr_method_replacement_untaken_branch_fallback",
-    "class_attr_method_replacement_taken_branch_lookup",
-    "class_attr_method_replacement_loop_untaken_delete_preserves_replacement",
-    "class_attr_method_replacement_loop_taken_delete_fallback",
-    "class_attr_method_replacement_try_except_untaken_delete_preserves_replacement",
-    "class_attr_method_replacement_try_except_taken_delete_fallback",
-    "class_attr_method_replacement_finally_delete_fallback",
-    "class_attr_method_replacement_finally_store_after_delete",
-    "class_attr_method_replacement_loop_break_delete_fallback",
-    "class_attr_method_replacement_loop_continue_skips_delete",
-    "class_attr_descriptor_replacement_runtime_lookup",
-    "class_attr_descriptor_replacement_delete_fallback",
-    "class_attr_function_descriptor_identity",
-    "class_attr_classmethod_bound_name_identity",
-    "class_attr_classmethod_bound_self",
-    "try_except",
-    "bool_short_circuit",
-    "short_circuit_value_semantics",
-    "short_circuit_custom_bool",
-    "short_circuit_bool_exception",
-    "short_circuit_len_truthiness",
-    "short_circuit_len_exception",
-    "short_circuit_len_negative",
-    "float_arith",
-})
+FIXPOINT_SMOKE_CASES = frozenset(
+    {
+        "ternary_inline",
+        "lambda_add",
+        "kwargs_defaults",
+        "list_comprehension",
+        "nested_def_capture",
+        "closure_cell_rebind",
+        "fstring_format_spec",
+        "bitwise_int_ops",
+        "bitwise_negative_shift_errors",
+        "fstring_debug_and_conversions",
+        "fstring_attr_call_mix",
+        "fstring_dynamic_format_spec",
+        "fstring_custom_format",
+        "string_concat_runtime",
+        "fstring_ascii_conversion_non_ascii",
+        "generator_fstring_join",
+        "tuple_generator_expression",
+        "walrus_expression",
+        "list_slice_mutation",
+        "generator_next",
+        "getattr_default_and_if_args_or_kwargs",
+        "generator_yield_from",
+        "generator_inner_for",
+        "custom_getattribute",
+        "custom_getattribute_getattr_fallback",
+        "custom_getattribute_valueerror_propagates",
+        "metaclass_literal_class_attrs",
+        "metaclass_method_binding",
+        "metaclass_property_binding",
+        "metaclass_property_readonly_errors",
+        "metaclass_property_readonly_precedence",
+        "metaclass_custom_descriptor_set_delete",
+        "metaclass_data_descriptor_precedence",
+        "metaclass_runtime_class_object_property_precedence",
+        "metaclass_runtime_class_object_data_descriptor_precedence",
+        "metaclass_runtime_class_object_property_setter_deleter_precedence",
+        "metaclass_prepare_namespace",
+        "metaclass_prepare_namespace_body_override",
+        "metaclass_prepare_namespace_body_extends",
+        "metaclass_prepare_namespace_method_and_body",
+        "metaclass_prepare_namespace_non_mapping_typeerror",
+        "metaclass_prepare_custom_namespace_setitem_order",
+        "metaclass_prepare_custom_namespace_getitem_new",
+        "metaclass_prepare_custom_namespace_class_body_lookup",
+        "metaclass_prepare_custom_namespace_constructor_args",
+        "metaclass_prepare_custom_namespace_factory_return",
+        "metaclass_prepare_custom_namespace_alias_constructor",
+        "metaclass_prepare_custom_namespace_factory_local_return",
+        "metaclass_prepare_custom_namespace_generic_mapping_factory",
+        "metaclass_prepare_custom_namespace_delete_name",
+        "metaclass_keyword_arguments_prepare_new",
+        "metaclass_call_controls_instantiation",
+        "metaclass_call_delegates_type_call",
+        "metaclass_dynamic_value_binding",
+        "metaclass_dynamic_value_exception_propagates",
+        "metaclass_dynamic_value_function_return",
+        "metaclass_dynamic_value_function_arg_return",
+        "metaclass_dynamic_value_conditional_return",
+        "metaclass_dynamic_value_conditional_expr",
+        "metaclass_dynamic_value_bool_or_expr",
+        "metaclass_dynamic_value_bool_and_expr",
+        "metaclass_dynamic_value_bool_or_falsey_left_expr",
+        "metaclass_dynamic_value_bool_or_alias_fallback",
+        "metaclass_dynamic_value_bool_and_or_falsey_chain",
+        "metaclass_prepare_namespace_non_string_key_typeerror",
+        "metaclass_inherited_from_base",
+        "metaclass_conflict_between_bases_typeerror",
+        "metaclass_compatible_bases_choose_most_derived",
+        "dynamic_type_constructor_class_attrs",
+        "dynamic_type_constructor_namespace_var",
+        "dynamic_type_constructor_namespace_alias",
+        "dynamic_type_constructor_namespace_mutation_before_call",
+        "dynamic_type_constructor_runtime_namespace_dict",
+        "dynamic_type_constructor_namespace_mapping_typeerror",
+        "dynamic_type_constructor_namespace_function_method",
+        "dynamic_type_constructor_namespace_descriptor",
+        "dynamic_type_constructor_namespace_staticmethod",
+        "dynamic_type_constructor_namespace_classmethod",
+        "dynamic_type_constructor_namespace_data_descriptor",
+        "dynamic_type_constructor_namespace_property",
+        "dynamic_type_constructor_namespace_property_readonly_errors",
+        "property_decorator_get_set_delete",
+        "descriptor_get",
+        "data_descriptor_priority",
+        "user_instance_subscript_setitem_getitem",
+        "descriptor_delete",
+        "zero_arg_super_method",
+        "zero_arg_super_classmethod",
+        "zero_arg_super_nested_method_with_receiver",
+        "zero_arg_super_nested_class_receiver",
+        "zero_arg_super_escaping_nested_class_receiver",
+        "zero_arg_super_escaping_nested_method_receiver",
+        "dunder_class_cell_method",
+        "dunder_class_cell_nested_method",
+        "dunder_class_cell_escaping_nested_method",
+        "dunder_class_local_shadow_escaping_nested_method",
+        "dunder_class_cell_staticmethod",
+        "zero_arg_super_staticmethod_error",
+        "class_body_dunder_class_nameerror",
+        "argumented_super_method",
+        "argumented_super_classmethod",
+        "argumented_super_invalid_receiver_typeerror",
+        "argumented_super_staticmethod_explicit_receiver",
+        "argumented_super_class_receiver_subtype",
+        "argumented_super_class_alias_receiver_subtype",
+        "argumented_super_local_class_alias_receiver_subtype",
+        "argumented_super_missing_method_attributeerror",
+        "inherited_classmethod_cls_class_attr",
+        "class_attr_mutation_visible_to_classmethod",
+        "inherited_classmethod_cls_attr_store",
+        "class_attr_delete_visible_to_classmethod",
+        "class_attr_descriptor_get_owner",
+        "class_attr_staticmethod_classmethod_wrapper_access",
+        "class_attr_instance_method_unbound_value",
+        "instance_method_bound_name_self",
+        "dynamic_class_attr_function_instance_bound",
+        "class_attr_method_replacement_runtime_lookup",
+        "class_attr_method_replacement_delete_fallback",
+        "class_attr_method_replacement_untaken_branch_fallback",
+        "class_attr_method_replacement_taken_branch_lookup",
+        "class_attr_method_replacement_loop_untaken_delete_preserves_replacement",
+        "class_attr_method_replacement_loop_taken_delete_fallback",
+        "class_attr_method_replacement_try_except_untaken_delete_preserves_replacement",
+        "class_attr_method_replacement_try_except_taken_delete_fallback",
+        "class_attr_method_replacement_finally_delete_fallback",
+        "class_attr_method_replacement_finally_store_after_delete",
+        "class_attr_method_replacement_loop_break_delete_fallback",
+        "class_attr_method_replacement_loop_continue_skips_delete",
+        "class_attr_descriptor_replacement_runtime_lookup",
+        "class_attr_descriptor_replacement_delete_fallback",
+        "class_attr_function_descriptor_identity",
+        "class_attr_classmethod_bound_name_identity",
+        "class_attr_classmethod_bound_self",
+        "try_except",
+        "bool_short_circuit",
+        "short_circuit_value_semantics",
+        "short_circuit_custom_bool",
+        "short_circuit_bool_exception",
+        "short_circuit_len_truthiness",
+        "short_circuit_len_exception",
+        "short_circuit_len_negative",
+        "float_arith",
+    }
+)
 
 FIXPOINT_CASES = tuple(
     (name, source) for name, source in CASES if name in FIXPOINT_SMOKE_CASES
 )
 
 _SELF_HOST_BUILD_TIMEOUT_SECONDS = 600
+_SELF_HOST_STAGE_FRONTEND_JOBS = "4"
 
 
 def _child_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("LC_ALL", None)
+    # A stage build is serialized by _self_host_artifact_lock, so it owns a
+    # bounded inner budget rather than inheriting xdist's outer-width divisor.
+    # Two workers miss the cold 600-second stage deadline on the reference Mac;
+    # four remain below the repository memory ceiling and finish in time.
+    env.setdefault("PCC_PY_FRONTEND_JOBS", _SELF_HOST_STAGE_FRONTEND_JOBS)
     env.setdefault("PCC_SELF_BACKEND_OBJECT_CACHE", "1")
     env.setdefault(
         "PCC_SELF_BACKEND_OBJECT_CACHE_DIR",
         str(self_host_object_cache_dir()),
     )
-    env["PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY"] = self_host_source_key()
+    env["PCC_PY_FRONTEND_IR_CACHE_IDENTITY"] = self_host_source_key()
+    env["PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY"] = self_backend_object_cache_key()
     return env
 
 
@@ -4197,7 +4206,7 @@ def _self_host_artifact_lock(path: Path):
 @pytest.fixture(scope="session")
 def pcc1_self_host_binary(tmp_path_factory, worker_id):
     if not _supported_self_host():
-        pytest.skip("self backend oracle supports macOS arm64 and Linux x86_64")
+        pytest.fail("self backend oracle supports macOS arm64 and Linux x86_64")
     explicit_pcc1 = os.environ.get("PCC1_BINARY")
     if explicit_pcc1:
         pcc1 = Path(explicit_pcc1).resolve()
@@ -4325,10 +4334,14 @@ def test_000_self_host_oracle_stage_cache_warmup(
 
 
 def _links_libpython(binary: Path) -> bool:
-    cmd = ["otool", "-L", str(binary)] if sys.platform == "darwin" else [
-        "ldd",
-        str(binary),
-    ]
+    cmd = (
+        ["otool", "-L", str(binary)]
+        if sys.platform == "darwin"
+        else [
+            "ldd",
+            str(binary),
+        ]
+    )
     result = subprocess.run(
         cmd,
         cwd=str(REPO_ROOT),
@@ -4456,8 +4469,7 @@ def test_pcc2_hoists_nested_closure_across_try_handler(
 ):
     src = tmp_path / "nested_closure_try.py"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             def locate(mod_name: str):
                 def candidates(root: str) -> list[str]:
                     return [root + mod_name]
@@ -4469,8 +4481,7 @@ def test_pcc2_hoists_nested_closure_across_try_handler(
                 return origin
 
             print(locate("x"))
-            """
-        ).lstrip(),
+            """).lstrip(),
         encoding="utf-8",
     )
     result = _compile_and_run(
@@ -4488,8 +4499,7 @@ def test_pcc1_bare_reraise_preserves_active_exception(
 ):
     src = tmp_path / "bare_reraise.py"
     src.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             def main() -> None:
                 try:
                     try:
@@ -4513,8 +4523,7 @@ def test_pcc1_bare_reraise_preserves_active_exception(
 
             if __name__ == "__main__":
                 main()
-            """
-        ).lstrip(),
+            """).lstrip(),
         encoding="utf-8",
     )
 
@@ -6977,10 +6986,12 @@ def test_pcc2_pcc3_fixpoint_and_no_libpython(
     assert not _links_libpython(pcc3_self_host_binary)
 
     pcc2 = _signature_stripped_copy(
-        pcc2_self_host_binary, tmp_path / "pcc2.nosig",
+        pcc2_self_host_binary,
+        tmp_path / "pcc2.nosig",
     )
     pcc3 = _signature_stripped_copy(
-        pcc3_self_host_binary, tmp_path / "pcc3.nosig",
+        pcc3_self_host_binary,
+        tmp_path / "pcc3.nosig",
     )
     assert pcc2.read_bytes() == pcc3.read_bytes()
 

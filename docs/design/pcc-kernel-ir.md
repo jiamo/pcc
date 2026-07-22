@@ -26,7 +26,7 @@ This document is the authoritative map for the `K-P0-*` cluster. The broader
 GPU / GPU-GC / distributed / ds4 roadmap and claim-level policy lives in
 `docs/design/pcc-gpu-next-work.md`. Together they let the next agent extend the
 pipeline without re-reading the TVM/TileLang research report
-(`tmp_research/deep-research-tvm.md`) or the local reference trees.
+(`docs/refs_docs/deep-research/deep-research-tvm.md`) or the local reference trees.
 
 ## 1. Why a kernel-only IR at all
 

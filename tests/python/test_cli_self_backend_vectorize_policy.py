@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from pcc1_gate import repo_root as _repo_root
+
 from pcc import cli_core
 
 
@@ -56,7 +58,7 @@ def test_self_backend_clamp_warning_is_suppressed_when_not_clamped(monkeypatch, 
 
 
 def test_self_backend_clamp_warning_reaches_c_cli(tmp_path):
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = _repo_root()
     source = tmp_path / "main.c"
     output = tmp_path / "main.ll"
     source.write_text("int main(void) { return 0; }\n", encoding="utf-8")

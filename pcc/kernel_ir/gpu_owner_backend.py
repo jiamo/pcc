@@ -26,6 +26,11 @@ from pcc.kernel_ir.metal_source_runtime import (
     STATUS_SKIPPED_WITH_REASON,
     run_metal_source_runtime_package,
 )
+from pcc.kernel_ir.schedule import (
+    KernelSchedule,
+    KernelScheduleError,
+    apply_kernel_schedule,
+)
 from pcc.kernel_ir.tirx_adapter import (
     PLAIN_TIR_FREEZE_MARKER,
     PlainTirModule,
@@ -39,7 +44,6 @@ from pcc.kernel_ir.tvm_tilelang_owner import (
     TvmTilelangProviderError,
     compile_with_tvm_tilelang_provider,
 )
-
 
 GPU_BACKEND_PCC_METAL = "pcc-metal"
 GPU_BACKEND_TVM_TILELANG = "tvm-tilelang"
@@ -73,6 +77,8 @@ class PccMetalValidation:
     target: str
     frozen_module: PlainTirModule
     canonical_frozen_ir_sha256: str
+    schedule_plan_sha256: str | None = None
+    schedule_trace: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,6 +93,8 @@ class PccMetalCompileArtifacts:
     metal_source_sha256: str
     artifact_id: str
     source_path: str
+    schedule_plan_sha256: str | None = None
+    schedule_trace: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,8 @@ class TvmTilelangValidation:
     target: str
     frozen_module: PlainTirModule
     canonical_frozen_ir_sha256: str
+    schedule_plan_sha256: str | None = None
+    schedule_trace: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +115,8 @@ class TvmTilelangCompileArtifacts:
     frozen_module: PlainTirModule
     provider_result: TvmTilelangCompileResult
     artifact_id: str
+    schedule_plan_sha256: str | None = None
+    schedule_trace: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +157,8 @@ class GpuOwnerManifest:
     claim_level: str
     gate_result: str
     whole_program_gpu: bool = False
+    schedule_plan_sha256: str | None = None
+    schedule_trace: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if self.requested_gpu_backend != self.actual_gpu_backend:
@@ -162,6 +176,15 @@ class GpuOwnerManifest:
             )
         if self.whole_program_gpu:
             raise GpuBackendError("Kernel IR execution cannot claim whole-program GPU")
+        if self.schedule_plan_sha256 is not None and (
+            len(self.schedule_plan_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in self.schedule_plan_sha256)
+        ):
+            raise GpuBackendError("GPU owner manifest has an invalid schedule digest")
+        if bool(self.schedule_plan_sha256) != bool(self.schedule_trace):
+            raise GpuBackendError(
+                "GPU owner manifest must record schedule digest and trace together"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -174,12 +197,12 @@ class GpuOwnerManifest:
             "provider_identity": self.provider_identity,
             "canonical_frozen_ir_sha256": self.canonical_frozen_ir_sha256,
             "pass_pipeline_identity": self.pass_pipeline_identity,
+            "schedule_plan_sha256": self.schedule_plan_sha256,
+            "schedule_trace": [dict(record) for record in self.schedule_trace],
             "artifact_hashes": dict(sorted(self.artifact_hashes.items())),
             "fallback_used": self.fallback_used,
             "launcher_links_libpython": self.launcher_links_libpython,
-            "provider_process_links_libpython": (
-                self.provider_process_links_libpython
-            ),
+            "provider_process_links_libpython": (self.provider_process_links_libpython),
             "claim_level": self.claim_level,
             "gate_result": self.gate_result,
             "whole_program_gpu": self.whole_program_gpu,
@@ -208,7 +231,13 @@ class GpuBackendDriver(Protocol):
 
     def capabilities(self, target: str) -> GpuBackendCapabilities: ...
 
-    def validate(self, module: KernelModule | PlainTirModule, target: str) -> Any: ...
+    def validate(
+        self,
+        module: KernelModule | PlainTirModule,
+        target: str,
+        *,
+        schedule: KernelSchedule | None = None,
+    ) -> Any: ...
 
     def compile(
         self,
@@ -216,6 +245,8 @@ class GpuBackendDriver(Protocol):
         target: str,
         pipeline: str,
         artifact_dir: str | Path,
+        *,
+        schedule: KernelSchedule | None = None,
     ) -> Any: ...
 
     def package(
@@ -253,6 +284,35 @@ def _canonical_frozen_ir(plain: PlainTirModule) -> bytes:
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _freeze_with_schedule(
+    module: KernelModule | PlainTirModule,
+    *,
+    target: str,
+    schedule: KernelSchedule | None,
+    backend: str,
+) -> tuple[PlainTirModule, str | None, tuple[Mapping[str, Any], ...]]:
+    if isinstance(module, PlainTirModule):
+        if schedule is not None:
+            raise GpuBackendError(
+                f"{backend} cannot apply a KernelSchedule after plain-TIR freeze; "
+                "no fallback"
+            )
+        return module, None, ()
+    if schedule is None:
+        return lower_to_plain_tir(module, target="metal"), None, ()
+    try:
+        applied = apply_kernel_schedule(module, schedule, target=target)
+    except KernelScheduleError as exc:
+        raise GpuBackendError(
+            f"{backend} schedule rejected: {exc}; no fallback"
+        ) from exc
+    return (
+        lower_to_plain_tir(applied.module, target="metal"),
+        applied.schedule_sha256,
+        applied.trace,
+    )
 
 
 def _result_data(result: Any) -> dict[str, Any]:
@@ -384,9 +444,7 @@ class PccMetalGpuBackendDriver:
             source_emitters
             or {
                 PCC_METAL_SCALAR_PIPELINE: emit_metal_source,
-                PCC_METAL_SIMDGROUP_GEMM_PIPELINE: (
-                    emit_metal_simdgroup_gemm_source
-                ),
+                PCC_METAL_SIMDGROUP_GEMM_PIPELINE: (emit_metal_simdgroup_gemm_source),
             }
         )
 
@@ -404,26 +462,33 @@ class PccMetalGpuBackendDriver:
         self,
         module: KernelModule | PlainTirModule,
         target: str,
+        *,
+        schedule: KernelSchedule | None = None,
     ) -> PccMetalValidation:
         capabilities = self.capabilities(target)
         if not capabilities.supported:
             raise GpuBackendError(
                 f"{self.backend_id} does not support target {target!r}; no fallback"
             )
+        plain, schedule_digest, schedule_trace = _freeze_with_schedule(
+            module,
+            target=capabilities.target,
+            schedule=schedule,
+            backend=self.backend_id,
+        )
         if isinstance(module, PlainTirModule):
-            plain = module
             if plain.target != "metal" or plain.marker != PLAIN_TIR_FREEZE_MARKER:
                 raise GpuBackendError(
                     "pcc-metal requires canonical Metal plain-TIR freeze input"
                 )
-        else:
-            plain = lower_to_plain_tir(module, target="metal")
         digest = _sha256_bytes(_canonical_frozen_ir(plain))
         return PccMetalValidation(
             backend=self.backend_id,
             target=capabilities.target,
             frozen_module=plain,
             canonical_frozen_ir_sha256=digest,
+            schedule_plan_sha256=schedule_digest,
+            schedule_trace=schedule_trace,
         )
 
     def compile(
@@ -432,8 +497,10 @@ class PccMetalGpuBackendDriver:
         target: str,
         pipeline: str,
         artifact_dir: str | Path,
+        *,
+        schedule: KernelSchedule | None = None,
     ) -> PccMetalCompileArtifacts:
-        validation = self.validate(module, target)
+        validation = self.validate(module, target, schedule=schedule)
         emitter = self._source_emitters.get(pipeline)
         if emitter is None:
             raise GpuBackendError(
@@ -443,17 +510,18 @@ class PccMetalGpuBackendDriver:
         if not isinstance(source, str) or not source.strip():
             raise GpuBackendError("pcc-metal source emitter produced no Metal source")
         source_digest = _sha256_bytes(source.encode("utf-8"))
-        artifact_id = _sha256_bytes(
-            (
-                PCC_METAL_DRIVER_IDENTITY
-                + "\0"
-                + validation.canonical_frozen_ir_sha256
-                + "\0"
-                + pipeline
-                + "\0"
-                + source_digest
-            ).encode("utf-8")
+        artifact_identity = (
+            PCC_METAL_DRIVER_IDENTITY
+            + "\0"
+            + validation.canonical_frozen_ir_sha256
+            + "\0"
+            + pipeline
+            + "\0"
+            + source_digest
         )
+        if validation.schedule_plan_sha256 is not None:
+            artifact_identity += "\0" + validation.schedule_plan_sha256
+        artifact_id = _sha256_bytes(artifact_identity.encode("utf-8"))
         out_dir = Path(artifact_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         source_path = out_dir / (
@@ -471,6 +539,8 @@ class PccMetalGpuBackendDriver:
             metal_source_sha256=source_digest,
             artifact_id=artifact_id,
             source_path=str(source_path),
+            schedule_plan_sha256=validation.schedule_plan_sha256,
+            schedule_trace=validation.schedule_trace,
         )
 
     def package(
@@ -562,8 +632,15 @@ class PccMetalGpuBackendDriver:
         entry: str | None = None,
         timeout: float = 30.0,
         launcher_links_libpython: bool,
+        schedule: KernelSchedule | None = None,
     ) -> GpuOwnerExecutionResult:
-        compiled = self.compile(module, target, pipeline, Path(artifact_dir) / "compile")
+        compiled = self.compile(
+            module,
+            target,
+            pipeline,
+            Path(artifact_dir) / "compile",
+            schedule=schedule,
+        )
         package = self.package(
             compiled,
             packed_args,
@@ -612,6 +689,8 @@ class PccMetalGpuBackendDriver:
             "canonical_frozen_ir": compiled.canonical_frozen_ir_sha256,
             "metal_source": compiled.metal_source_sha256,
         }
+        if compiled.schedule_plan_sha256 is not None:
+            artifact_hashes["schedule_plan"] = compiled.schedule_plan_sha256
         try:
             from pcc.kernel_ir.metal_source_runtime import (
                 metal_source_runtime_package_manifest_dict,
@@ -643,6 +722,8 @@ class PccMetalGpuBackendDriver:
             claim_level=evidence.level.name,
             gate_result=evidence.status,
             whole_program_gpu=False,
+            schedule_plan_sha256=compiled.schedule_plan_sha256,
+            schedule_trace=compiled.schedule_trace,
         )
 
 
@@ -678,26 +759,33 @@ class TvmTilelangGpuBackendDriver:
         self,
         module: KernelModule | PlainTirModule,
         target: str,
+        *,
+        schedule: KernelSchedule | None = None,
     ) -> TvmTilelangValidation:
         capabilities = self.capabilities(target)
         if not capabilities.supported:
             raise GpuBackendError(
                 f"{self.backend_id} does not support target {target!r}; no fallback"
             )
+        plain, schedule_digest, schedule_trace = _freeze_with_schedule(
+            module,
+            target=capabilities.target,
+            schedule=schedule,
+            backend=self.backend_id,
+        )
         if isinstance(module, PlainTirModule):
-            plain = module
             if plain.target != "metal" or plain.marker != PLAIN_TIR_FREEZE_MARKER:
                 raise GpuBackendError(
                     "tvm-tilelang requires canonical Metal plain-TIR freeze input"
                 )
-        else:
-            plain = lower_to_plain_tir(module, target="metal")
         digest = _sha256_bytes(_canonical_frozen_ir(plain))
         return TvmTilelangValidation(
             backend=self.backend_id,
             target=capabilities.target,
             frozen_module=plain,
             canonical_frozen_ir_sha256=digest,
+            schedule_plan_sha256=schedule_digest,
+            schedule_trace=schedule_trace,
         )
 
     def compile(
@@ -706,8 +794,10 @@ class TvmTilelangGpuBackendDriver:
         target: str,
         pipeline: str,
         artifact_dir: str | Path,
+        *,
+        schedule: KernelSchedule | None = None,
     ) -> TvmTilelangCompileArtifacts:
-        validation = self.validate(module, target)
+        validation = self.validate(module, target, schedule=schedule)
         try:
             result = self._provider_compiler(
                 validation.frozen_module,
@@ -723,19 +813,20 @@ class TvmTilelangGpuBackendDriver:
             )
         if result.canonical_frozen_ir_sha256 != validation.canonical_frozen_ir_sha256:
             raise GpuBackendError("TVM/TileLang provider changed canonical frozen IR")
-        artifact_id = _sha256_bytes(
-            (
-                result.provider_identity
-                + "\0"
-                + result.canonical_frozen_ir_sha256
-                + "\0"
-                + result.pipeline
-                + "\0"
-                + result.provider_metal_source_sha256
-                + "\0"
-                + result.metal_source_sha256
-            ).encode("utf-8")
+        artifact_identity = (
+            result.provider_identity
+            + "\0"
+            + result.canonical_frozen_ir_sha256
+            + "\0"
+            + result.pipeline
+            + "\0"
+            + result.provider_metal_source_sha256
+            + "\0"
+            + result.metal_source_sha256
         )
+        if validation.schedule_plan_sha256 is not None:
+            artifact_identity += "\0" + validation.schedule_plan_sha256
+        artifact_id = _sha256_bytes(artifact_identity.encode("utf-8"))
         return TvmTilelangCompileArtifacts(
             backend=self.backend_id,
             target=validation.target,
@@ -743,6 +834,8 @@ class TvmTilelangGpuBackendDriver:
             frozen_module=validation.frozen_module,
             provider_result=result,
             artifact_id=artifact_id,
+            schedule_plan_sha256=validation.schedule_plan_sha256,
+            schedule_trace=validation.schedule_trace,
         )
 
     def package(
@@ -807,9 +900,7 @@ class TvmTilelangGpuBackendDriver:
         if not isinstance(invocation, dict) or not invocation.get("fence_completed"):
             raise GpuBackendError("tvm-tilelang launch did not complete its fence")
         if not data.get("runtime_launch_executed"):
-            raise GpuBackendError(
-                "tvm-tilelang result did not execute a device launch"
-            )
+            raise GpuBackendError("tvm-tilelang result did not execute a device launch")
         return True
 
     def destroy(self, result: Any) -> bool:
@@ -836,8 +927,15 @@ class TvmTilelangGpuBackendDriver:
         entry: str | None = None,
         timeout: float = 30.0,
         launcher_links_libpython: bool,
+        schedule: KernelSchedule | None = None,
     ) -> GpuOwnerExecutionResult:
-        compiled = self.compile(module, target, pipeline, Path(artifact_dir) / "compile")
+        compiled = self.compile(
+            module,
+            target,
+            pipeline,
+            Path(artifact_dir) / "compile",
+            schedule=schedule,
+        )
         package = self.package(
             compiled,
             packed_args,
@@ -884,6 +982,8 @@ class TvmTilelangGpuBackendDriver:
         )
         provider = compiled.provider_result
         artifact_hashes = provider.artifact_hashes()
+        if compiled.schedule_plan_sha256 is not None:
+            artifact_hashes["schedule_plan"] = compiled.schedule_plan_sha256
         try:
             from pcc.kernel_ir.metal_source_runtime import (
                 metal_source_runtime_package_manifest_dict,
@@ -915,6 +1015,8 @@ class TvmTilelangGpuBackendDriver:
             claim_level=evidence.level.name,
             gate_result=evidence.status,
             whole_program_gpu=False,
+            schedule_plan_sha256=compiled.schedule_plan_sha256,
+            schedule_trace=compiled.schedule_trace,
         )
 
 

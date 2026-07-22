@@ -45,6 +45,11 @@ class NativeFilesLoweringMixin:
             [path_obj, mode_obj],
             name=self._fresh("file.open"),
         )
+        # ``py_file_open`` reports an OSError through the runtime exception
+        # channel and returns NULL.  Both plain ``open()`` and ``with open()``
+        # share this helper, so branch to the active handler before either
+        # caller can treat the failure sentinel as a file object.
+        self._emit_post_call_err_check(getattr(expr, "span", None))
         if not hasattr(self, "_native_file_values"):
             self._native_file_values = set()
         self._native_file_values.add(result)
@@ -210,7 +215,11 @@ class NativeFilesLoweringMixin:
 
         slot = self.env.get(as_expr.ident)
         if slot is None:
-            alloca = self._alloca_in_entry(_CSTR, name=f"{as_expr.ident}.addr")
+            alloca = self._alloca_in_entry(
+                _CSTR,
+                name=f"{as_expr.ident}.addr",
+                init_null=True,
+            )
             self.env[as_expr.ident] = (alloca, _CSTR, DynType(name="dyn"))
             slot = self.env[as_expr.ident]
 

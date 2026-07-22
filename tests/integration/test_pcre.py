@@ -109,7 +109,7 @@ def _compile_pcre_file(fname):
 PCRE_LIB_FILES = PCRE_CORE_FILES
 
 
-@pytest.mark.skipif(not os.path.isdir(pcre_dir), reason="pcre-8.45 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(pcre_dir) else "pcre-8.45 not found")
 @pytest.mark.parametrize("fname", PCRE_CORE_FILES, ids=PCRE_CORE_FILES)
 def test_pcre_source_compile(fname):
     """Test PCRE .c file: preprocess → parse → codegen → LLVM verify."""
@@ -190,7 +190,7 @@ def pcre_compiled_units_self():
     return compiled_units
 
 
-@pytest.mark.skipif(not os.path.isdir(pcre_dir), reason="pcre-8.45 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(pcre_dir) else "pcre-8.45 not found")
 def test_pcre_native_runtime(native_pcre_bin):
     """Run test_pcre_main with natively compiled pcre (baseline)."""
     stage, bin_path = native_pcre_bin
@@ -202,7 +202,7 @@ def test_pcre_native_runtime(native_pcre_bin):
     assert "53/53 tests passed" in r.stdout
 
 
-@pytest.mark.skipif(not os.path.isdir(pcre_dir), reason="pcre-8.45 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(pcre_dir) else "pcre-8.45 not found")
 @pytest.mark.integration
 def test_pcre_pcc_runtime_with_system_link(pcre_compiled_units):
     result = CEvaluator().run_compiled_translation_units_with_system_cc(
@@ -219,7 +219,7 @@ def test_pcre_pcc_runtime_with_system_link(pcre_compiled_units):
     assert "53/53 tests passed" in result.stdout
 
 
-@pytest.mark.skipif(not os.path.isdir(pcre_dir), reason="pcre-8.45 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(pcre_dir) else "pcre-8.45 not found")
 def test_pcre_self_backend_runtime_with_system_link(pcre_compiled_units_self):
     result = CEvaluator(
         backend="self",
@@ -238,7 +238,7 @@ def test_pcre_self_backend_runtime_with_system_link(pcre_compiled_units_self):
     assert "53/53 tests passed" in result.stdout
 
 
-@pytest.mark.skipif(not os.path.isdir(pcre_dir), reason="pcre-8.45 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(pcre_dir) else "pcre-8.45 not found")
 @pytest.mark.integration
 def test_pcre_pcc_runtime_with_mcjit(pcre_compiled_units):
     result = CEvaluator().evaluate_compiled_translation_units(

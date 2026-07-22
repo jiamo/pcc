@@ -84,6 +84,12 @@ _TILELANG_PCC1_MATMUL_SOURCE = """
 import tilelang
 import tilelang.language as T
 
+pytestmark = [
+    pytest.mark.pcc_gate(probe="metal"),
+    pytest.mark.pcc_gate(probe="pcc1"),
+]
+
+
 @tilelang.jit
 def matmul_simdgroup(M, N, K, block_M=64, block_N=64, block_K=32, dtype=T.float16, accum_dtype=T.float32):
     @T.prim_func
@@ -695,7 +701,7 @@ def _find_current_pcc1(repo: Path) -> Path | None:
 def _cc() -> str:
     cc = shutil.which("cc")
     if cc is None:
-        pytest.skip("cc is required for the pcc1 Metal runtime C-shim gate")
+        pytest.fail("cc is required for the pcc1 Metal runtime C-shim gate")
     return cc
 
 
@@ -707,7 +713,7 @@ def _links_libpython(path: Path) -> bool:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        pytest.skip(f"can't run {cmd[0]}; cannot verify libpython linkage")
+        pytest.fail(f"can't run {cmd[0]}; cannot verify libpython linkage")
     assert proc.returncode == 0, (
         f"{cmd[0]} failed for {path}:\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
@@ -723,7 +729,7 @@ def _build_fake_runtime_source_bridge(tmp_path: Path) -> Path:
         bridge = tmp_path / "fake_metal_bridge.so"
         bridge_cmd = [_cc(), "-shared", "-fPIC", "-o", str(bridge)]
     else:
-        pytest.skip("dlfcn-based pcc1 Metal runtime C-shim gate is Darwin/Linux only")
+        pytest.fail("dlfcn-based pcc1 Metal runtime C-shim gate is Darwin/Linux only")
 
     bridge_source = tmp_path / "fake_metal_bridge.c"
     bridge_source.write_text(
@@ -920,7 +926,7 @@ def _build_real_runtime_source_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -936,7 +942,7 @@ def _build_real_runtime_source_copy_artifacts(tmp_path: Path):
         validate_bridge_library=True,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -959,7 +965,7 @@ def _build_real_metallib_copy_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(f"metallib package did not produce metallib: {package.to_dict()}")
     if not package.bridge_library_load_validated:
@@ -976,7 +982,7 @@ def _build_real_metallib_copy_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -999,7 +1005,7 @@ def _build_real_metallib_tilelang_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             f"TileLang GEMM metallib package did not produce metallib: {package.to_dict()}"
@@ -1020,7 +1026,7 @@ def _build_real_metallib_tilelang_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1044,7 +1050,7 @@ def _build_real_metallib_tilelang_local_metal_benchmark_artifacts(tmp_path: Path
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "Local TileLang Metal benchmark GEMM metallib package did not produce "
@@ -1075,7 +1081,7 @@ def _build_real_metallib_tilelang_local_metal_benchmark_artifacts(tmp_path: Path
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1104,7 +1110,7 @@ def _build_real_metallib_tilelang_local_matmul_nonroller_artifacts(tmp_path: Pat
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "Local TileLang matmul non-roller metallib package did not produce "
@@ -1135,7 +1141,7 @@ def _build_real_metallib_tilelang_local_matmul_nonroller_artifacts(tmp_path: Pat
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1164,7 +1170,7 @@ def _build_real_metallib_tilelang_local_matmul_static_roller_artifacts(tmp_path:
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "Local TileLang matmul static roller-config metallib package did not "
@@ -1200,7 +1206,7 @@ def _build_real_metallib_tilelang_local_matmul_static_roller_artifacts(tmp_path:
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1231,7 +1237,7 @@ def _tilelang_local_metal_benchmark_module() -> KernelModule:
         Path.home() / "tilelang" / "benchmark" / "matmul_metal" / "benchmark_matmul_metal.py"
     )
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang Metal benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang Metal benchmark reference not found: {benchmark_path}")
     return import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),
         outer_function="matmul_simdgroup",
@@ -1251,7 +1257,7 @@ def _tilelang_local_metal_benchmark_module() -> KernelModule:
 def _tilelang_local_matmul_nonroller_module() -> KernelModule:
     benchmark_path = Path.home() / "tilelang" / "benchmark" / "matmul" / "benchmark_matmul.py"
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang benchmark reference not found: {benchmark_path}")
     return import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),
         outer_function="matmul",
@@ -1276,7 +1282,7 @@ def _tilelang_local_matmul_nonroller_module() -> KernelModule:
 def _tilelang_local_matmul_static_roller_module() -> KernelModule:
     benchmark_path = Path.home() / "tilelang" / "benchmark" / "matmul" / "benchmark_matmul.py"
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang benchmark reference not found: {benchmark_path}")
     return import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),
         outer_function="matmul",
@@ -1419,7 +1425,7 @@ def _build_real_metallib_tilelang_output_staging_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang output-staged GEMM metallib package did not produce "
@@ -1448,7 +1454,7 @@ def _build_real_metallib_tilelang_output_staging_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1477,7 +1483,7 @@ def _build_real_metallib_tilelang_output_staging_f16_transpose_b_artifacts(tmp_p
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang output-staged f16 transpose_B GEMM metallib package did not produce "
@@ -1512,7 +1518,7 @@ def _build_real_metallib_tilelang_output_staging_f16_transpose_b_artifacts(tmp_p
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1544,7 +1550,7 @@ def _build_real_metallib_tilelang_output_staging_f16_transpose_b_policy_alias_ar
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang output-staged f16 transpose_B GemmWarpPolicy alias "
@@ -1600,7 +1606,7 @@ def _build_real_metallib_tilelang_output_staging_f16_transpose_b_policy_alias_ar
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1633,7 +1639,7 @@ def _build_real_runtime_source_tilelang_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1650,7 +1656,7 @@ def _build_real_runtime_source_tilelang_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -1920,7 +1926,7 @@ def _build_real_runtime_source_tilelang_vectorized_nonzero_serial_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -1937,7 +1943,7 @@ def _build_real_runtime_source_tilelang_vectorized_nonzero_serial_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -2220,7 +2226,7 @@ def _build_real_runtime_source_tilelang_vectorized_annotations_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2237,7 +2243,7 @@ def _build_real_runtime_source_tilelang_vectorized_annotations_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -2369,7 +2375,7 @@ def _build_real_runtime_source_tilelang_splitk_atomic_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2386,7 +2392,7 @@ def _build_real_runtime_source_tilelang_splitk_atomic_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -2421,7 +2427,7 @@ def _build_real_runtime_source_tilelang_splitk_atomic_ceildiv_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2438,7 +2444,7 @@ def _build_real_runtime_source_tilelang_splitk_atomic_ceildiv_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -2466,7 +2472,7 @@ def _build_real_metallib_tilelang_splitk_floor_plus_one_ceildiv_artifacts(
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "TileLang split-K floor-plus-one ceildiv metallib package did not "
@@ -2514,7 +2520,7 @@ def _build_real_metallib_tilelang_splitk_floor_plus_one_ceildiv_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2639,7 +2645,7 @@ def _build_real_runtime_source_tilelang_transpose_ab_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2656,7 +2662,7 @@ def _build_real_runtime_source_tilelang_transpose_ab_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -2722,7 +2728,7 @@ def _build_real_runtime_source_tilelang_swizzled_padded_annotate_layout_artifact
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2739,7 +2745,7 @@ def _build_real_runtime_source_tilelang_swizzled_padded_annotate_layout_artifact
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -2804,7 +2810,7 @@ def _build_real_runtime_source_tilelang_enabled_swizzle_artifacts(tmp_path: Path
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2821,7 +2827,7 @@ def _build_real_runtime_source_tilelang_enabled_swizzle_artifacts(tmp_path: Path
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -2876,7 +2882,7 @@ def _build_real_runtime_source_tilelang_nonzero_start_pipelined_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2893,7 +2899,7 @@ def _build_real_runtime_source_tilelang_nonzero_start_pipelined_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -2956,7 +2962,7 @@ def _build_real_runtime_source_tilelang_step_serial_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -2973,7 +2979,7 @@ def _build_real_runtime_source_tilelang_step_serial_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -3016,7 +3022,7 @@ def _build_real_runtime_source_tilelang_step_pipelined_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -3033,7 +3039,7 @@ def _build_real_runtime_source_tilelang_step_pipelined_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -3096,7 +3102,7 @@ def _build_real_runtime_source_tilelang_nonzero_step_pipelined_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -3113,7 +3119,7 @@ def _build_real_runtime_source_tilelang_nonzero_step_pipelined_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -3156,7 +3162,7 @@ def _build_real_runtime_source_tilelang_nonzero_step_serial_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -3173,7 +3179,7 @@ def _build_real_runtime_source_tilelang_nonzero_step_serial_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -4478,7 +4484,7 @@ def _build_real_runtime_source_simdgroup_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -4495,7 +4501,7 @@ def _build_real_runtime_source_simdgroup_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -4523,7 +4529,7 @@ def _build_real_metallib_simdgroup_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             f"simdgroup metallib package did not produce metallib: {package.to_dict()}"
@@ -4548,7 +4554,7 @@ def _build_real_metallib_simdgroup_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -4576,7 +4582,7 @@ def _build_real_metallib_simdgroup_two_n_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "two-N simdgroup metallib package did not produce metallib: "
@@ -4616,7 +4622,7 @@ def _build_real_metallib_simdgroup_two_n_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -4644,7 +4650,7 @@ def _build_real_metallib_simdgroup_two_m_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "two-M simdgroup metallib package did not produce metallib: "
@@ -4684,7 +4690,7 @@ def _build_real_metallib_simdgroup_two_m_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -4712,7 +4718,7 @@ def _build_real_metallib_simdgroup_four_2d_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "four-2D simdgroup metallib package did not produce metallib: "
@@ -4753,7 +4759,7 @@ def _build_real_metallib_simdgroup_four_2d_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -4783,7 +4789,7 @@ def _build_real_metallib_simdgroup_four_2d_edge_tail_gemm_artifacts(
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "four-2D edge/tail simdgroup metallib package did not produce "
@@ -4861,7 +4867,7 @@ def _build_real_metallib_simdgroup_four_2d_edge_tail_gemm_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -4891,7 +4897,7 @@ def _build_real_metallib_simdgroup_four_2d_transpose_ab_gemm_artifacts(
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "four-2D transpose_AB simdgroup metallib package did not produce "
@@ -4948,7 +4954,7 @@ def _build_real_metallib_simdgroup_four_2d_transpose_ab_gemm_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -4979,7 +4985,7 @@ def _build_real_metallib_simdgroup_four_2d_transpose_ab_edge_tail_gemm_artifacts
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "four-2D transpose_AB edge/tail simdgroup metallib package did not "
@@ -5088,7 +5094,7 @@ def _build_real_metallib_simdgroup_four_2d_transpose_ab_edge_tail_gemm_artifacts
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -5118,7 +5124,7 @@ def _build_real_metallib_simdgroup_four_2d_splitk_atomic_gemm_artifacts(
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "four-2D split-K atomic simdgroup metallib package did not produce "
@@ -5203,7 +5209,7 @@ def _build_real_metallib_simdgroup_four_2d_splitk_atomic_gemm_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -5234,7 +5240,7 @@ def _build_real_metallib_simdgroup_four_2d_splitk_atomic_edge_tail_gemm_artifact
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "four-2D split-K atomic edge/tail simdgroup metallib package did "
@@ -5331,7 +5337,7 @@ def _build_real_metallib_simdgroup_four_2d_splitk_atomic_edge_tail_gemm_artifact
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -5362,7 +5368,7 @@ def _build_real_metallib_simdgroup_four_2d_transpose_ab_splitk_atomic_edge_tail_
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "four-2D transpose_AB split-K atomic edge/tail simdgroup metallib "
@@ -5513,7 +5519,7 @@ def _build_real_metallib_simdgroup_four_2d_transpose_ab_splitk_atomic_edge_tail_
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -5544,7 +5550,7 @@ def _build_real_metallib_simdgroup_eight_n_transpose_ab_splitk_atomic_edge_tail_
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "eight-N transpose_AB split-K atomic edge/tail simdgroup metallib "
@@ -5647,7 +5653,7 @@ def _build_real_metallib_simdgroup_eight_n_transpose_ab_splitk_atomic_edge_tail_
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -5678,7 +5684,7 @@ def _build_real_metallib_simdgroup_sixteen_transpose_ab_splitk_atomic_edge_tail_
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "sixteen transpose_AB split-K atomic edge/tail simdgroup metallib "
@@ -5805,7 +5811,7 @@ def _build_real_metallib_simdgroup_sixteen_transpose_ab_splitk_atomic_edge_tail_
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -5838,7 +5844,7 @@ def _build_real_metallib_simdgroup_thirty_two_transpose_ab_splitk_atomic_edge_ta
         timeout=90.0,
     )
     if package.finalize.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(package.finalize.reason)
+        pytest.fail(package.finalize.reason)
     if not package.finalize.metallib_produced:
         pytest.fail(
             "thirty-two transpose_AB split-K atomic edge/tail simdgroup "
@@ -5965,7 +5971,7 @@ def _build_real_metallib_simdgroup_thirty_two_transpose_ab_splitk_atomic_edge_ta
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6005,7 +6011,7 @@ def _build_real_runtime_source_simdgroup_two_n_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6022,7 +6028,7 @@ def _build_real_runtime_source_simdgroup_two_n_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6060,7 +6066,7 @@ def _build_real_runtime_source_simdgroup_two_m_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6077,7 +6083,7 @@ def _build_real_runtime_source_simdgroup_two_m_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6116,7 +6122,7 @@ def _build_real_runtime_source_simdgroup_four_2d_gemm_artifacts(tmp_path: Path):
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6133,7 +6139,7 @@ def _build_real_runtime_source_simdgroup_four_2d_gemm_artifacts(tmp_path: Path):
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6178,7 +6184,7 @@ def _build_real_runtime_source_simdgroup_four_2d_transpose_ab_gemm_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6195,7 +6201,7 @@ def _build_real_runtime_source_simdgroup_four_2d_transpose_ab_gemm_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6254,7 +6260,7 @@ def _build_real_runtime_source_simdgroup_four_2d_edge_tail_gemm_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6271,7 +6277,7 @@ def _build_real_runtime_source_simdgroup_four_2d_edge_tail_gemm_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6331,7 +6337,7 @@ def _build_real_runtime_source_simdgroup_four_2d_transpose_ab_edge_tail_gemm_art
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6348,7 +6354,7 @@ def _build_real_runtime_source_simdgroup_four_2d_transpose_ab_edge_tail_gemm_art
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6409,7 +6415,7 @@ def _build_real_runtime_source_simdgroup_four_2d_splitk_atomic_gemm_artifacts(
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6426,7 +6432,7 @@ def _build_real_runtime_source_simdgroup_four_2d_splitk_atomic_gemm_artifacts(
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6494,7 +6500,7 @@ def _build_real_runtime_source_simdgroup_four_2d_splitk_atomic_edge_tail_gemm_ar
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6512,7 +6518,7 @@ def _build_real_runtime_source_simdgroup_four_2d_splitk_atomic_edge_tail_gemm_ar
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6581,7 +6587,7 @@ def _build_real_runtime_source_simdgroup_four_2d_transpose_ab_splitk_atomic_edge
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6599,7 +6605,7 @@ def _build_real_runtime_source_simdgroup_four_2d_transpose_ab_splitk_atomic_edge
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6670,7 +6676,7 @@ def _build_real_runtime_source_simdgroup_eight_n_transpose_ab_splitk_atomic_edge
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6688,7 +6694,7 @@ def _build_real_runtime_source_simdgroup_eight_n_transpose_ab_splitk_atomic_edge
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6759,7 +6765,7 @@ def _build_real_runtime_source_simdgroup_sixteen_transpose_ab_splitk_atomic_edge
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6777,7 +6783,7 @@ def _build_real_runtime_source_simdgroup_sixteen_transpose_ab_splitk_atomic_edge
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -6850,7 +6856,7 @@ def _build_real_runtime_source_simdgroup_thirty_two_transpose_ab_splitk_atomic_e
         validate_symbols=True,
     )
     if native_runtime.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(native_runtime.reason)
+        pytest.fail(native_runtime.reason)
     if native_runtime.status != STATUS_NATIVE_BUFFER_RUNTIME_LOAD_VALIDATED:
         pytest.fail(
             f"native buffer runtime was not load-validated: {native_runtime.to_dict()}"
@@ -6868,7 +6874,7 @@ def _build_real_runtime_source_simdgroup_thirty_two_transpose_ab_splitk_atomic_e
         timeout=90.0,
     )
     if source_bridge.status == STATUS_SKIPPED_WITH_REASON:
-        pytest.skip(source_bridge.reason)
+        pytest.fail(source_bridge.reason)
     if source_bridge.status != STATUS_SOURCE_RUNTIME_BRIDGE_LOAD_VALIDATED:
         pytest.fail(
             f"source runtime bridge was not load-validated: {source_bridge.to_dict()}"
@@ -7009,7 +7015,7 @@ def test_level5_pcc1_compiled_program_calls_runtime_c_shim_fake_bridge(tmp_path)
                 "no fresh current pcc1 binary for GPU Level-5 C-shim gate; "
                 "set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip("no fresh current pcc1 binary for GPU Level-5 C-shim gate")
+        pytest.fail("no fresh current pcc1 binary for GPU Level-5 C-shim gate")
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
 
     bridge = _build_fake_runtime_source_bridge(tmp_path)
@@ -7189,7 +7195,7 @@ def test_level5_pcc1_compiled_program_runs_real_runtime_source_copy(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 real runtime-source gate; "
                 "set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip("no fresh current pcc1 binary for GPU Level-5 real runtime-source gate")
+        pytest.fail("no fresh current pcc1 binary for GPU Level-5 real runtime-source gate")
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
 
     package, native_runtime, source_bridge, metal_source = (
@@ -7401,7 +7407,7 @@ def test_level5_pcc1_compiled_program_runs_real_runtime_source_copy(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     if provider_result is None:
@@ -7468,7 +7474,7 @@ def test_level5_pcc1_compiled_program_runs_real_metallib_copy(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 real metallib gate; "
                 "set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip("no fresh current pcc1 binary for GPU Level-5 real metallib gate")
+        pytest.fail("no fresh current pcc1 binary for GPU Level-5 real metallib gate")
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
 
     package, native_runtime = _build_real_metallib_copy_artifacts(tmp_path)
@@ -7655,7 +7661,7 @@ def test_level5_pcc1_compiled_program_runs_real_metallib_copy(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -7693,7 +7699,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_gemm_metallib(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 TileLang GEMM "
                 "metallib gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang GEMM metallib gate"
         )
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
@@ -7906,7 +7912,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_gemm_metallib(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -7946,7 +7952,7 @@ def test_level5_pcc1_compiled_program_runs_local_tilelang_metal_benchmark_metall
                 "no fresh current pcc1 binary for GPU Level-5 local TileLang "
                 "Metal benchmark metallib gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 local TileLang "
             "Metal benchmark metallib gate"
         )
@@ -7983,7 +7989,7 @@ def test_level5_pcc1_compiled_program_runs_local_tilelang_matmul_nonroller_metal
                 "no fresh current pcc1 binary for GPU Level-5 local TileLang "
                 "matmul non-roller metallib gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 local TileLang "
             "matmul non-roller metallib gate"
         )
@@ -8022,7 +8028,7 @@ def test_level5_pcc1_compiled_program_runs_local_tilelang_matmul_static_roller_m
                 "matmul static roller-config metallib gate; set PCC_CURRENT_PCC1 "
                 "or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 local TileLang "
             "matmul static roller-config metallib gate"
         )
@@ -8058,7 +8064,7 @@ def test_level5_pcc1_compiled_program_runs_imported_tilelang_gemm(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 TileLang GEMM gate; "
                 "set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip("no fresh current pcc1 binary for GPU Level-5 TileLang GEMM gate")
+        pytest.fail("no fresh current pcc1 binary for GPU Level-5 TileLang GEMM gate")
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
 
     package, native_runtime, source_bridge, metal_source = (
@@ -8284,7 +8290,7 @@ def test_level5_pcc1_compiled_program_runs_imported_tilelang_gemm(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     owner_result = {
@@ -8329,7 +8335,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_vectorized_nonzero_serial(
                 "no fresh current pcc1 binary for GPU Level-5 TileLang vectorized "
                 "nonzero-serial gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang vectorized "
             "nonzero-serial gate"
         )
@@ -8541,7 +8547,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_vectorized_nonzero_serial(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -8790,7 +8796,7 @@ def _run_pcc1_three_buffer_runtime_source_probe(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -9084,7 +9090,7 @@ def _run_pcc1_three_buffer_metallib_probe(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -9125,7 +9131,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_vectorized_annotations(
                 "no fresh current pcc1 binary for GPU Level-5 TileLang vectorized "
                 "annotations gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang vectorized "
             "annotations gate"
         )
@@ -9164,7 +9170,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_splitk_atomic(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 TileLang split-K "
                 "atomic gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang split-K atomic gate"
         )
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
@@ -9385,7 +9391,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_splitk_atomic(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -9424,7 +9430,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_splitk_atomic_ceildiv_tail(
                 "no fresh current pcc1 binary for GPU Level-5 TileLang split-K "
                 "atomic ceildiv-tail gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang split-K atomic "
             "ceildiv-tail gate"
         )
@@ -9657,7 +9663,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_splitk_atomic_ceildiv_tail(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -9696,7 +9702,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_splitk_floor_plus_one_ceildi
                 "no fresh current pcc1 binary for GPU Level-5 TileLang split-K "
                 "floor-plus-one ceildiv metallib gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang split-K "
             "floor-plus-one ceildiv metallib gate"
         )
@@ -9736,7 +9742,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_output_staged_gemm_metallib(
                 "no fresh current pcc1 binary for GPU Level-5 TileLang "
                 "output-staged GEMM metallib gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang "
             "output-staged GEMM metallib gate"
         )
@@ -9773,7 +9779,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_output_staged_f16_transpose_
                 "no fresh current pcc1 binary for GPU Level-5 TileLang "
                 "output-staged f16 transpose_B GEMM metallib gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang "
             "output-staged f16 transpose_B GEMM metallib gate"
         )
@@ -9811,7 +9817,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_gemmwarp_policy_alias_metall
                 "no fresh current pcc1 binary for GPU Level-5 TileLang "
                 "GemmWarpPolicy alias metallib gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang "
             "GemmWarpPolicy alias metallib gate"
         )
@@ -9849,7 +9855,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_transpose_ab(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 TileLang "
                 "transpose_A+transpose_B gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang "
             "transpose_A+transpose_B gate"
         )
@@ -10067,7 +10073,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_transpose_ab(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -10106,7 +10112,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_swizzled_padded_annotate_lay
                 "no fresh current pcc1 binary for GPU Level-5 TileLang swizzled "
                 "padded annotate_layout gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang swizzled padded "
             "annotate_layout gate"
         )
@@ -10326,7 +10332,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_swizzled_padded_annotate_lay
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -10363,7 +10369,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_enabled_swizzle(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 TileLang enabled "
                 "use_swizzle gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang enabled "
             "use_swizzle gate"
         )
@@ -10581,7 +10587,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_enabled_swizzle(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -10620,7 +10626,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_nonzero_start_pipelined(
                 "no fresh current pcc1 binary for GPU Level-5 TileLang nonzero-start "
                 "Pipelined gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang nonzero-start "
             "Pipelined gate"
         )
@@ -10832,7 +10838,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_nonzero_start_pipelined(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -10871,7 +10877,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_step_serial(
                 "no fresh current pcc1 binary for GPU Level-5 TileLang stepped "
                 "T.serial gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang stepped "
             "T.serial gate"
         )
@@ -11081,7 +11087,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_step_serial(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -11120,7 +11126,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_step_pipelined(
                 "no fresh current pcc1 binary for GPU Level-5 TileLang stepped "
                 "T.Pipelined gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang stepped "
             "T.Pipelined gate"
         )
@@ -11330,7 +11336,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_step_pipelined(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -11369,7 +11375,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_nonzero_step_pipelined(
                 "no fresh current pcc1 binary for GPU Level-5 TileLang nonzero "
                 "stepped T.Pipelined gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang nonzero "
             "stepped T.Pipelined gate"
         )
@@ -11581,7 +11587,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_nonzero_step_pipelined(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -11620,7 +11626,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_nonzero_step_serial(
                 "no fresh current pcc1 binary for GPU Level-5 TileLang nonzero "
                 "stepped T.serial gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 TileLang nonzero "
             "stepped T.serial gate"
         )
@@ -11830,7 +11836,7 @@ def test_level5_pcc1_compiled_program_runs_tilelang_nonzero_step_serial(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -11867,7 +11873,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_gemm(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 simdgroup GEMM gate; "
                 "set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip("no fresh current pcc1 binary for GPU Level-5 simdgroup GEMM gate")
+        pytest.fail("no fresh current pcc1 binary for GPU Level-5 simdgroup GEMM gate")
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
 
     package, native_runtime, source_bridge, metal_source, a, b, expected = (
@@ -12074,7 +12080,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_gemm(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -12111,7 +12117,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_gemm_metallib(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 simdgroup GEMM "
                 "metallib gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 simdgroup GEMM metallib gate"
         )
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
@@ -12319,7 +12325,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_gemm_metallib(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -12357,7 +12363,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_two_n_gemm(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 two-N simdgroup "
                 "GEMM gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 two-N simdgroup GEMM gate"
         )
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
@@ -12566,7 +12572,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_two_n_gemm(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -12603,7 +12609,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_two_m_gemm(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 two-M simdgroup "
                 "GEMM gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 two-M simdgroup GEMM gate"
         )
     assert not _links_libpython(pcc1), f"pcc1 links libpython: {pcc1}"
@@ -12812,7 +12818,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_two_m_gemm(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -12849,7 +12855,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_gemm(tmp_path):
                 "no fresh current pcc1 binary for GPU Level-5 four-2D simdgroup "
                 "GEMM gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 four-2D simdgroup "
             "GEMM gate"
         )
@@ -13059,7 +13065,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_gemm(tmp_path):
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -13098,7 +13104,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_transpose_ab_gemm(
                 "no fresh current pcc1 binary for GPU Level-5 four-2D transpose "
                 "simdgroup GEMM gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 four-2D transpose "
             "simdgroup GEMM gate"
         )
@@ -13310,7 +13316,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_transpose_ab_gemm(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -13349,7 +13355,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_edge_tail_gemm(
                 "no fresh current pcc1 binary for GPU Level-5 four-2D edge-tail "
                 "simdgroup GEMM gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 four-2D edge-tail "
             "simdgroup GEMM gate"
         )
@@ -13569,7 +13575,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_edge_tail_gemm(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -13609,7 +13615,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_transpose_ab_edge_t
                 "transpose edge-tail simdgroup GEMM gate; set PCC_CURRENT_PCC1 "
                 "or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 four-2D transpose "
             "edge-tail simdgroup GEMM gate"
         )
@@ -13829,7 +13835,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_transpose_ab_edge_t
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -13868,7 +13874,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_splitk_atomic_gemm(
                 "no fresh current pcc1 binary for GPU Level-5 four-2D split-K "
                 "atomic simdgroup GEMM gate; set PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 four-2D split-K "
             "atomic simdgroup GEMM gate"
         )
@@ -14100,7 +14106,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_splitk_atomic_gemm(
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -14140,7 +14146,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_splitk_atomic_edge_
                 "atomic edge-tail simdgroup GEMM gate; set PCC_CURRENT_PCC1 or "
                 "rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 four-2D split-K "
             "atomic edge-tail simdgroup GEMM gate"
         )
@@ -14374,7 +14380,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_splitk_atomic_edge_
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -14414,7 +14420,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_transpose_ab_splitk
                 "transpose split-K atomic edge-tail simdgroup GEMM gate; set "
                 "PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 four-2D transpose "
             "split-K atomic edge-tail simdgroup GEMM gate"
         )
@@ -14654,7 +14660,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_four_2d_transpose_ab_splitk
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -14694,7 +14700,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_eight_n_transpose_ab_splitk
                 "transpose split-K atomic edge-tail simdgroup GEMM gate; set "
                 "PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 eight-simdgroup "
             "transpose split-K atomic edge-tail simdgroup GEMM gate"
         )
@@ -14934,7 +14940,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_eight_n_transpose_ab_splitk
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -14974,7 +14980,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_sixteen_transpose_ab_splitk
                 "transpose split-K atomic edge-tail simdgroup GEMM gate; set "
                 "PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 sixteen-simdgroup "
             "transpose split-K atomic edge-tail simdgroup GEMM gate"
         )
@@ -15214,7 +15220,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_sixteen_transpose_ab_splitk
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(
@@ -15254,7 +15260,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_thirty_two_transpose_ab_spl
                 "transpose split-K atomic edge-tail simdgroup GEMM gate; set "
                 "PCC_CURRENT_PCC1 or rebuild pcc1"
             )
-        pytest.skip(
+        pytest.fail(
             "no fresh current pcc1 binary for GPU Level-5 thirty-two-simdgroup "
             "transpose split-K atomic edge-tail simdgroup GEMM gate"
         )
@@ -15494,7 +15500,7 @@ def test_level5_pcc1_compiled_program_runs_simdgroup_thirty_two_transpose_ab_spl
     )
     stdout = run.stdout.strip()
     if stdout == "903":
-        pytest.skip("MTLCreateSystemDefaultDevice returned nil")
+        pytest.fail("MTLCreateSystemDefaultDevice returned nil")
     assert stdout == "0"
 
     evidence = classify_pcc1_native_gpu_result(

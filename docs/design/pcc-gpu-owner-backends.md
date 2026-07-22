@@ -87,8 +87,8 @@ operations and ownership rules may not:
 
 ```text
 capabilities(target) -> declared feature set
-validate(frozen_module, target) -> accepted or fail-closed diagnostic
-compile(frozen_module, target, pipeline) -> content-addressed artifacts
+validate(kernel_or_frozen_module, target, schedule=None) -> accepted or fail-closed diagnostic
+compile(kernel_or_frozen_module, target, pipeline, schedule=None) -> content-addressed artifacts
 package(artifacts, launch_plan) -> provider-neutral package record
 launch(package, PccPackedArgs, stream) -> PccFenceToken/result
 synchronize(fence) -> completed device result
@@ -99,6 +99,14 @@ The driver accepts no `PyObject` device arguments.  `PccBufferHandle`,
 `PccPackedArgs`, and `PccFenceToken` remain the cross-backend ABI.  A provider
 may borrow native handles for a launch; ownership transfer requires an explicit
 adapter record and must preserve one-shot/deferred-release rules.
+
+An optional `KernelSchedule` is accepted only with semantic Kernel IR and is
+applied through the shared PCC schedule module before plain-TIR freeze. A
+schedule binds to the exact input Kernel IR digest, target, selector, and
+expected old state. It cannot be applied to already frozen IR, and a rejection
+never retries without the schedule or through another owner. The schedule
+digest and replay trace are owner-neutral provenance; the produced device
+source and runtime remain owned by the selected backend.
 
 Every result manifest records at least:
 
@@ -112,6 +120,7 @@ target_triple/device
 provider version and build identity
 canonical frozen-IR hash
 ordered pass-pipeline identity
+schedule plan hash when scheduled
 artifact hashes
 fallback_used=false
 launcher links_libpython
@@ -202,4 +211,3 @@ slice permits the Level-5/Level-6 claims for `gpu-owner=tvm-tilelang`.
   contract.
 - It does not make the provider part of `backend=self`; host and device owners
   remain independently labeled.
-

@@ -2,7 +2,7 @@
 
 ## Status
 
-resolved
+active again: bounded concurrency retained compiler heap across an unbounded batch
 
 ## Problem Description
 
@@ -68,3 +68,30 @@ The complete integration run also measured a distinct outer scheduling peak:
 three full-GC bootstrap chains combined to 18.2 GiB RSS after the cache warmer.
 That is not per-object fanout and is tracked separately in
 `TEST-P0-FULL-GC-MEMORY-BUDGET`.
+
+## Cold-cache invalidation of the first pool design
+
+A later current-source GC0 gate forced native object-cache misses. Capping the
+pool at two processes did not cap memory: each long-lived compiled pcc1 worker
+processed an unbounded share of the object list and grew to about 10 GiB;
+aggregate related RSS reached 22.8 GiB before a deliberate interrupt. Running
+eight shorter workers had previously reached 25.3 GiB, so concurrency-only
+tuning merely moved retained compiler heap between processes.
+
+The revised design keeps two-process concurrency but recycles a process after
+at most four objects. For 151 misses this requires about 38 process starts,
+still far fewer than the old one-process-per-object protocol, while giving
+compiler state a hard OS reclamation boundary. The cold fixed-point gate must
+prove the resulting peak before this investigation can return to resolved.
+
+## Full-GC aggregate frontend concurrency
+
+A later complete integration run exposed a separate composition failure: the
+two-chain GC lease still assigned four frontend workers to each concurrently
+active pcc2-to-pcc3 chain.  Aggregate descendant RSS reached 16.61 GiB and the
+run was deliberately terminated at the safety boundary.  The scheduler now
+shares one four-worker frontend budget across active GC chains (four for one,
+two each for two), while retaining the explicit per-chain override and
+restoring four workers for the last chain.  Focused scheduling tests pass, and
+the forced-rebuild five-GC matrix passes all five backends in 1306.29 seconds
+with a sampled 13.13 GiB peak.  Complete-suite validation remains open.

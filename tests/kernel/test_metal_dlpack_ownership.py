@@ -390,9 +390,12 @@ def test_dlpack_imports_foreign_dlmanagedtensor_and_defers_foreign_deleter(tmp_p
     new = ctypes.pythonapi.PyCapsule_New
     new.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
     new.restype = ctypes.py_object
+    # PyCapsule_New stores the name POINTER without copying; the bytes object
+    # must outlive the capsule or PyCapsule_IsValid reads freed memory.
+    capsule_name = DLPACK_CAPSULE_NAME.encode()
     capsule = new(
         ctypes.c_void_p(ctypes.addressof(managed)),
-        DLPACK_CAPSULE_NAME.encode(),
+        capsule_name,
         None,
     )
 

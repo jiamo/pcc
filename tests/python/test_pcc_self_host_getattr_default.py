@@ -33,11 +33,16 @@ import pytest
 
 REPO = Path(__file__).absolute().parents[2]
 PCC1 = REPO / "pcc1"
+pytestmark = pytest.mark.pcc_gate(
+    unavailable=None
+    if PCC1.exists() and os.access(PCC1, os.X_OK)
+    else f"repo-root pcc1 artifact not present at {PCC1} (manual build target)"
+)
 
 
 def _require_pcc1():
     if not PCC1.exists() or not os.access(PCC1, os.X_OK):
-        pytest.skip(
+        pytest.fail(
             f"pcc1 binary not available at {PCC1}; build via "
             f"`uv run pcc --backend self --python-libpython=off --ir-scaffold=on "
             f"pcc/__main__.py -o pcc1`"

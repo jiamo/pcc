@@ -6,13 +6,15 @@ import subprocess
 import zipfile
 from pathlib import Path
 
+from pcc1_gate import repo_root
+
 import pytest
 
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 
 from pcc.package.linkage import linkage_report, scan_artifact, scan_link_command
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = repo_root()
 
 
 def _find_current_pcc1() -> Path | None:

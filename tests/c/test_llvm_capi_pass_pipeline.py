@@ -37,7 +37,7 @@ def test_llvm_capi_memory_pass_pipeline_promotes_stack_slot():
     pcc_bind.parse_assembly(out).verify()
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_llvm_capi_memory_pipeline_matches_opt_text_pipeline_for_basic_ir():
     pipeline = "mem2reg,instcombine,simplifycfg"
     opt_path = find_opt_binary()

@@ -54,7 +54,7 @@ def _execute_i32_unary(ir_text: str, values: tuple[int, ...]) -> tuple[int, ...]
 
 def test_instsimplify_matches_original_and_independent_llvm_opt_behavior():
     if not OPT_VERDICT.available:
-        pytest.skip(OPT_VERDICT.skip_reason())
+        pytest.fail(OPT_VERDICT.skip_reason())
     pcc_ir, changed = simplify_module_text(SIMPLIFY_IR)
     assert changed is True
     upstream = run_upstream_opt(SIMPLIFY_IR, "instsimplify")

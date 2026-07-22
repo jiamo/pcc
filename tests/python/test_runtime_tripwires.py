@@ -182,3 +182,20 @@ def test_armed_tripwire_fault_injection_aborts_with_runtime_log(
     assert result.returncode != 0
     assert "TRIPWIRE" in result.stderr
     assert "owned foreign reference has no release hook" in result.stderr
+
+
+def test_owned_acquire_download_has_no_fixed_transfer_timeout():
+    """`pcc1 -m pip install numpy` must not fail on slow-but-alive downloads.
+
+    A hard CURLOPT_TIMEOUT once capped every transfer at 60s, which failed the
+    README numpy flow exactly at the bandwidth cliff (20MB sdist at ~0.4MB/s).
+    The libcurl path must abort on STALL (low-speed options), never on a fixed
+    total-transfer wall clock.
+    """
+    source = (RUNTIME_DIR / "src" / "py_http.c").read_text(encoding="utf-8")
+    assert "PCC_CURLOPT_LOW_SPEED_LIMIT" in source
+    assert "PCC_CURLOPT_LOW_SPEED_TIME" in source
+    assert "PCC_CURLOPT_TIMEOUT" not in source, (
+        "a fixed total-transfer timeout regressed into the owned-acquire "
+        "libcurl path; use low-speed (stall) abort instead"
+    )

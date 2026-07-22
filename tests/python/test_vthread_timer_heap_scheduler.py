@@ -333,13 +333,13 @@ def _run_probe(
     ]
 
 
-@pytest.mark.skipif(not _have_cc(), reason="no C compiler available")
+@pytest.mark.pcc_gate(unavailable=None if _have_cc() else "no C compiler available")
 def test_timer_heap_scheduler_ordering_c_runtime(tmp_path):
     work_runtime, archive, extra_link_args = _build_runtime(tmp_path)
     _run_probe(tmp_path, work_runtime, archive, extra_link_args=extra_link_args)
 
 
-@pytest.mark.skipif(not _have_cc(), reason="no C compiler available")
+@pytest.mark.pcc_gate(unavailable=None if _have_cc() else "no C compiler available")
 def test_timer_heap_scheduler_ordering_pcc_python_runtime(tmp_path):
     work_runtime, archive, extra_link_args = _build_runtime(
         tmp_path, pcc_python=True

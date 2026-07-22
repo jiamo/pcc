@@ -29,7 +29,7 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
 - [self-backend-nested-valueclass-payload-equality.md](self-backend-nested-valueclass-payload-equality.md) — **self-backend nested valueclass payload equality**
   - resolved locally 2026-06-04
 - [self-backend-short-lived-emit-worker-fanout.md](self-backend-short-lived-emit-worker-fanout.md) — **self-backend short-lived emit worker fanout**
-  - The real `pcc1 -m pip install numpy` command gate entered application
+  - active again: bounded concurrency retained compiler heap across an unbounded batch
 - [self-backend-sparse-ssa-cache-memory-explosion.md](self-backend-sparse-ssa-cache-memory-explosion.md) — **self-backend sparse SSA cache memory explosion**
   - resolved locally 2026-07-20
 - [self-backend-torture-phi-swap-and-minmax-zero-fold.md](self-backend-torture-phi-swap-and-minmax-zero-fold.md) — **self-backend torture cluster: phi parallel-copy swap + smin/smax-against-zero peephole**
@@ -45,12 +45,18 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - While validating the generic array-core `--reduce mean` slice through a freshly
 - [pcc1-dynamic-class-descriptor-fixed-layout-state.md](pcc1-dynamic-class-descriptor-fixed-layout-state.md) — **pcc1 dynamic class descriptor fixed-layout state**
   - Resolved locally 2026-07-17. A current-source pcc1 compiled a runtime class
+- [pcc1-existing-meson-output-requires-host.md](pcc1-existing-meson-output-requires-host.md) — **existing pcc1 Meson output incorrectly requires host Python**
+  - After the native file-open exception contract was repaired, the original
 - [pcc1-linkage-scanner-fabricates-libpython-edge.md](pcc1-linkage-scanner-fabricates-libpython-edge.md) — **pcc1-run linkage scanner fabricates a false "libpython]" edge on a clean artifact**
   - `tests/python/test_package_build_exec.py::test_pcc1_build_exec_builds_reusable_numpy_capi_provider_without_host_python`
 - [pcc1-module-level-set-var-degrades-to-dyn.md](pcc1-module-level-set-var-degrades-to-dyn.md) — **pcc1: module-level `set` variable degrades to `dyn`, breaks `set` operators**
   - CONFIRMED and FIXED (2026-07-16). Full self-host bootstrap (stage1→stage2→stage3,
 - [pcc1-native-json-string-escapes.md](pcc1-native-json-string-escapes.md) — **pcc1 native JSON string escapes**
   - resolved locally 2026-06-05.
+- [pcc1-package-graph-frontend-worker-memory-budget.md](pcc1-package-graph-frontend-worker-memory-budget.md) — **pcc1 package-graph frontend worker memory budget**
+  - Resolved locally on 2026-07-22. After a clean locked NumPy install, the
+- [pcc1-pip-numpy-owned-acquire-60s-timeout.md](pcc1-pip-numpy-owned-acquire-60s-timeout.md) — **`pcc1 -m pip install numpy` owned acquisition fails with PCC-PKG-ACQUIRE-DOWNLOAD-FAILED (hard 60s libcurl timeout)**
+  - Verifying the README "NumPy on pcc1" flow: step 2
 - [pcc1-pproxy-concurrency-leak-blocking-2026-06-21.md](pcc1-pproxy-concurrency-leak-blocking-2026-06-21.md) — **pcc1 `-m pproxy` live-proxy concurrency hang, exception-churn memory leak, blocking-IO serialization, and `-vv`**
   - IN PROGRESS — 4 fixes landed + verified; #5/#6 remain diagnosed but not fixed.
 - [pcc1-pproxy-gc4-live-proxy-readuntil-empty.md](pcc1-pproxy-gc4-live-proxy-readuntil-empty.md) — **pcc1 pproxy GC4 live proxy readuntil returns empty**
@@ -71,6 +77,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - Backend 0..4 real-pthread explicit `gc.collect()` are covered by a pcc1 hard
 - [pcc1-tuple-unpack-self-host-str-counter-corruption.md](pcc1-tuple-unpack-self-host-str-counter-corruption.md) — **pcc1 self-host miscompile: tuple-unpack corrupts codegen `_str_counter`**
   - **FIXED** (2026-07-03). This investigation now covers two adjacent pcc1
+- [pcc1-wheel-installed-runtime-resource-location.md](pcc1-wheel-installed-runtime-resource-location.md) — **wheel-installed pcc1 loses its runtime resource root**
+  - A native `pcc1` copied into a uv-managed virtual environment could report the
 
 ## bootstrap
 
@@ -600,6 +608,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - After `pcc` gained `--cpp-arg` and make-derived preprocessor flag inference,
 - [malloc-history-uaf-localization.md](malloc-history-uaf-localization.md) — **Using `MallocStackLogging` + `malloc_history` to localize a UAF**
   - When pcc1 self-host crashes with `nanov2_guard_corruption_detected` deep
+- [native-file-open-null-without-exception.md](native-file-open-null-without-exception.md) — **native file open returns NULL without an exception**
+  - The complete non-integration suite failed
 - [native-re-compiled-pattern-object.md](native-re-compiled-pattern-object.md) — **native re.compile pattern OBJECT (replace literal-alias rewriting; numpy `.cpy.attr.compile`~71)**
   - `B-P0-PKG` gating feature (a) from the 2026-05-28 NEXT pivot note in
 - [nbody-shootout-fp-contract-and-vectorization.md](nbody-shootout-fp-contract-and-vectorization.md) — **Investigation Report: `nbody_shootout` Was Not "Just Missing Vectorization"**
@@ -610,16 +620,22 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - The active `B-P0-PKG` first-import tracer for the repository-local NumPy 2.4.4 package no longer matches the stale status/test expectatio...
 - [numpy-loader-probe-cext-reimport-load-once.md](numpy-loader-probe-cext-reimport-load-once.md) — **NumPy head-truth loader probe fails on cext re-import ("load once per process")**
   - `scripts/numpy_head_gate.py run` (README numpy step 2) exits non-zero with
+- [package-acquisition-install-provenance.md](package-acquisition-install-provenance.md) — **acquired package install loses index provenance**
+  - The compiled pcc1 owned-acquisition path correctly recorded its Simple API URL,
 - [package-acquisition-target-python.md](package-acquisition-target-python.md) — **package acquisition ignores the pcc target Python language version**
   - The default host acquisition backend resolves a bare package against the host
 - [package-campaign-generic-capability-profile.md](package-campaign-generic-capability-profile.md) — **package campaigns branch on a package-named profile**
   - Host and pcc1 campaign paths contained explicit `numpy-core-l6` comparisons
+- [package-cython-wrapper-uv-project-discovery.md](package-cython-wrapper-uv-project-discovery.md) — **Package Cython wrapper accidentally builds the source project**
+  - The default-environment NumPy gate used owned acquisition, then entered pcc's
 - [package-host-pip-discovery.md](package-host-pip-discovery.md) — **host acquisition stops at a PATH-shadowing Python without pip**
   - The host acquisition backend defaults to the first `python3` on PATH. Under
 - [package-manifest-schema-wheel-tag-source-of-truth.md](package-manifest-schema-wheel-tag-source-of-truth.md) — **host and pcc1 package manifests duplicate schema and wheel tags**
   - Host package metadata/install code and the no-libpython pcc1 CLI independently
 - [pcc-bootstrap-stage2-type-infer-runtime-corruption.md](pcc-bootstrap-stage2-type-infer-runtime-corruption.md) — **Investigation Report: Bootstrap Stage2 Type Inference Runtime Corruption**
   - historical — fixes from this investigation have landed (Function.__init__
+- [pcc-compiler-design-reference-audit.md](pcc-compiler-design-reference-audit.md) — **compiler-design references for faster, exact, maintainable PCC**
+  - PCC must become materially faster without reducing Python semantics, removing
 - [pcc-py-set-signed-perturb-bootstrap-timeout.md](pcc-py-set-signed-perturb-bootstrap-timeout.md) — **pcc-py set lookup signed perturb bootstrap timeout**
   - fixed in the current working tree.
 - [pcc-py-type-infer-property-return-type.md](pcc-py-type-infer-property-return-type.md) — **`@property` return type does not propagate in pcc's type inference**
@@ -654,6 +670,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved 2026-05-30 for the common cases: `print(*items)` (#62, No.1),
 - [str-print-format-no-repr-fallback-no-libpython.md](str-print-format-no-repr-fallback-no-libpython.md) — **str()/print()/format() of an instance does not fall back to __repr__ (no-libpython)**
   - Under strict no-libpython, `print(obj)` / `str(obj)` / `f"{obj}"` / `"x" + str(obj)`
+- [tests-conftest-legacy-path-shim-false-repo-root.md](tests-conftest-legacy-path-shim-false-repo-root.md) — **tests/conftest.py legacy path shim silently corrupts `Path(__file__).resolve()` repo-root arithmetic in 18 test files**
+  - resolved (this slice: victims migrated to `repo_root()` walk-up; global shim
 - [threaded-gc-safepoint-production-blocker.md](threaded-gc-safepoint-production-blocker.md) — **threaded GC safepoint production blocker**
   - `pcc_stop_the_world()` is cooperative: the collector can only stop other live
 - [threading-list-index-native-dispatch.md](threading-list-index-native-dispatch.md) — **list-indexed threading receivers miss native dispatch**
@@ -672,6 +690,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - Second of the four blocked-numpy-module root causes (sibling:
 - [unbound-class-method-call-wrong-fallback.md](unbound-class-method-call-wrong-fallback.md) — **`KnownClass.method(self)` with a CPython-backed base hit the any-class name-scan fallback (bogus arg-count error)**
   - Third of the four blocked-numpy-module root causes (siblings:
+- [uv-locked-local-source-build-contamination.md](uv-locked-local-source-build-contamination.md) — **uv locked local source build contamination**
+  - Resolved locally on 2026-07-22 for the locked-sync path. A real uv-generated
 - [valuebox-call-return-ownership-regression.md](valuebox-call-return-ownership-regression.md) — **Nested-function default-cache ownership regression**
   - Resolved in the working tree (2026-07-16). The filename is retained because
 - [valuebox-nested-valueclass-dynamic-equality-hash.md](valuebox-nested-valueclass-dynamic-equality-hash.md) — **nested ValueBox dynamic equality and hash**
@@ -734,5 +754,7 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved (2026-06-18)
 - [virtual-threads-runtime-prerequisites.md](virtual-threads-runtime-prerequisites.md) — **Loom-shaped virtual threads for pcc**
   - pcc currently has a synchronous no-suspension coroutine thunk and pthread-based
+- [wheel-pcc-runtime-archive-freshness.md](wheel-pcc-runtime-archive-freshness.md) — **wheel runtime archive loses target and freshness evidence**
+  - After wheel-installed `pcc1` found the packaged runtime directory, application
 - [zero-division-silent-no-libpython-six-paths.md](zero-division-silent-no-libpython-six-paths.md) — **division/modulo by zero silently yields 0/inf/NULL instead of ZeroDivisionError (no-libpython, six lowering paths)**
   - Under strict no-libpython (`--backend self --python-libpython=off`), division and

@@ -12,11 +12,13 @@ import threading
 import zipfile
 from pathlib import Path
 
+from pcc1_gate import repo_root
+
 import pytest
 
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 
-from pcc.package.install import install_package
+from pcc.package.install import _build_requirement_tool_wrappers, install_package
 from pcc.package.metadata import (
     current_platform_tag,
     inspect_artifact,
@@ -24,7 +26,7 @@ from pcc.package.metadata import (
 )
 from pcc.package.wheel_repo import repository_report
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = repo_root()
 
 
 def _find_current_pcc1() -> Path | None:
@@ -276,7 +278,7 @@ def test_artifact_metadata_reads_meson_native_library_fallbacks(tmp_path):
 def test_numpy_local_source_metadata_filters_non_build_surfaces():
     numpy_root = REPO / "projects" / "numpy-2.4.4"
     if not numpy_root.exists():
-        pytest.skip("local NumPy source tree is not present")
+        pytest.fail("local NumPy source tree is not present")
 
     meta = inspect_artifact("", numpy_root).as_dict()
     assert "numpy/random/_common.pyx" in meta["cython_sources"]
@@ -397,6 +399,17 @@ def test_local_install_can_build_source_before_overlay(tmp_path):
     assert (tmp_path / "site" / "demo_pkg" / "__init__.py").read_text(
         encoding="utf-8"
     ) == "VALUE = 2\n"
+
+
+def test_cython_tool_wrapper_does_not_discover_the_package_project():
+    wrappers = _build_requirement_tool_wrappers(("Cython>=3.0.6",))
+    assert wrappers is not None
+    try:
+        script = (Path(wrappers.name) / "cython").read_text(encoding="utf-8")
+    finally:
+        wrappers.cleanup()
+
+    assert "uv run --no-project --with 'Cython>=3.0.6' cython" in script
 
 
 def test_install_blocks_libpython_linked_artifact_in_pcc_native_mode(tmp_path):
@@ -740,7 +753,10 @@ def test_pcc_pip_install_local_simple_index(tmp_path):
     assert plan["ok"] is True
     assert plan["index_urls"] == [index_url]
     assert plan["acquisitions"][0]["artifact_origin"] == "simple-repository"
-    assert plan["installs"][0]["resolved_from"] == "direct"
+    assert plan["installs"][0]["resolved_from"] == "index-url"
+    assert (
+        plan["installs"][0]["source_path"] == plan["acquisitions"][0]["artifact_path"]
+    )
     assert plan["installs"][0]["source_path"].endswith(wheel.name)
     assert (tmp_path / "site" / "demo_pkg" / "core.py").exists()
     acquired = Path(plan["acquisitions"][0]["artifact_path"])
@@ -824,6 +840,29 @@ def test_pcc_pip_install_find_links_installs_local_dependencies(tmp_path):
     assert plan["install_specs"] == ["helper-pkg", "demo_pkg"]
     assert (tmp_path / "site" / "helper_pkg" / "core.py").exists()
     assert (tmp_path / "site" / "demo_pkg" / "core.py").exists()
+
+
+def test_native_pcc1_existing_meson_outputs_do_not_require_host_python(
+    tmp_path, monkeypatch
+):
+    from pcc.cli_bootstrap import _native_build_install_source_json
+
+    project = _write_demo_project(tmp_path / "demo_pkg-0.1")
+    _write_demo_meson_build_overlay(project)
+    monkeypatch.setenv("PCC_HOST_PYTHON", "/usr/bin/false")
+
+    report = json.loads(
+        _native_build_install_source_json("demo_pkg", str(project), "pcc-native")
+    )
+
+    assert report == {
+        "actions": [],
+        "build_backend": "existing",
+        "host_assisted": False,
+        "ok": True,
+        "reason": "existing_build_outputs",
+        "skipped": True,
+    }
 
 
 def test_pcc1_package_install_writes_manifest_without_host_python(tmp_path):

@@ -196,7 +196,7 @@ def _links_libpython(exe) -> bool:
     if not exe.exists():
         return False
     if not INSPECTOR_VERDICT.available:
-        pytest.skip(INSPECTOR_VERDICT.skip_reason())
+        pytest.fail(INSPECTOR_VERDICT.skip_reason())
     if _INSPECTOR_NAME == "otool":
         tool = [INSPECTOR_VERDICT.resolved_path, "-L", str(exe)]
     else:

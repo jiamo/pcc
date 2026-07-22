@@ -29,6 +29,7 @@ import tempfile
 import time
 from typing import Optional
 
+from ..package_environment import package_site_roots
 from ..backend.self_backend_aarch64_darwin import (
     emit_aarch64_darwin_asm as _emit_aarch64_darwin_asm_native,
 )
@@ -39,6 +40,14 @@ from ..backend.self_backend_target_match import (
     is_aarch64_darwin_triple as _is_aarch64_darwin_triple_native,
 )
 from .export_meta import encode_type
+from .compile_cache import (
+    acquire_python_frontend_ir_cache,
+    load_python_frontend_ir_cache,
+    plan_python_frontend_ir_cache,
+    publish_python_frontend_ir_cache,
+    release_python_frontend_ir_cache,
+    wait_python_frontend_ir_cache,
+)
 from .codegen.host_contract import (
     L1_CODEGEN_HOST_ATTRS,
     L1_CODEGEN_HOST_CLASS,
@@ -120,6 +129,44 @@ def _bootstrap_append_pcc_dir_ancestors(
         cur = parent
 
 
+def _bootstrap_append_install_prefix_candidates(
+    paths: list[str],
+    prefix: Optional[str],
+) -> None:
+    """Add ``pcc`` package directories beneath an installed Python prefix.
+
+    A native ``pcc1`` wheel script has no trustworthy source ``__file__``.
+    Its stable anchors are the active virtual environment and its own
+    ``<prefix>/bin/pcc1`` location.  Inspect the conventional site-packages
+    layouts beneath those prefixes so the installed runtime resources are
+    found without a repository path or a user-supplied environment variable.
+    """
+    if prefix is None:
+        return
+    prefix = str(prefix or "").strip()
+    if not prefix:
+        return
+    prefix = os.path.abspath(prefix)
+    direct_roots = [
+        os.path.join(prefix, "Lib", "site-packages"),
+        os.path.join(prefix, "lib", "site-packages"),
+        os.path.join(prefix, "lib64", "site-packages"),
+    ]
+    for site_root in direct_roots:
+        _bootstrap_append_pcc_dir_candidate(paths, os.path.join(site_root, "pcc"))
+    for lib_name in ("lib", "lib64"):
+        lib_root = os.path.join(prefix, lib_name)
+        if not os.path.isdir(lib_root):
+            continue
+        try:
+            names = sorted(os.listdir(lib_root))
+        except OSError:
+            names = []
+        for name in names:
+            site_root = os.path.join(lib_root, name, "site-packages")
+            _bootstrap_append_pcc_dir_candidate(paths, os.path.join(site_root, "pcc"))
+
+
 def _pcc_dir_has_source_files(path: str) -> bool:
     return (
         os.path.isfile(os.path.join(path, "__init__.py"))
@@ -140,14 +187,23 @@ def _resolve_pcc_dir_from_environment() -> str:
     _bootstrap_append_pcc_dir_candidate(
         candidates, os.environ.get("PCC_PY_STDLIB_ROOT")
     )
+    _bootstrap_append_install_prefix_candidates(
+        candidates, os.environ.get("VIRTUAL_ENV")
+    )
     _bootstrap_append_pcc_dir_candidate(candidates, raw_pcc_dir)
     _bootstrap_append_pcc_dir_candidate(candidates, raw_pipeline_dir)
     try:
         if len(sys.argv) > 0:
+            argv_prefix = os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[0])))
+            _bootstrap_append_install_prefix_candidates(candidates, argv_prefix)
             _bootstrap_append_pcc_dir_ancestors(candidates, sys.argv[0])
     except Exception:
         pass
     try:
+        executable_prefix = os.path.dirname(
+            os.path.dirname(os.path.abspath(sys.executable))
+        )
+        _bootstrap_append_install_prefix_candidates(candidates, executable_prefix)
         _bootstrap_append_pcc_dir_ancestors(candidates, sys.executable)
     except Exception:
         pass
@@ -274,6 +330,7 @@ _SELF_BACKEND_EMIT_BATCH_WORKER_ARG = "--pcc-self-backend-emit-batch-worker"
 _SELF_BACKEND_SPLIT_WORKER_ARG = "--pcc-self-backend-split-worker"
 _SELF_BACKEND_EMIT_BATCH_MANIFEST_V1 = "pcc.self_backend.emit_batch.v1"
 _SELF_BACKEND_DEFAULT_JOBS = 2
+_SELF_BACKEND_EMIT_BATCH_MAX_ITEMS = 4
 _PY_FRONTEND_WORKER_MANIFEST_V1 = "pcc.py_frontend.codegen_worker.v1"
 _PY_FRONTEND_WORKER_MANIFEST_V2 = "pcc.py_frontend.codegen_worker.v2"
 _PY_FRONTEND_WORKER_MANIFEST_V3 = "pcc.py_frontend.codegen_worker.v3"
@@ -587,6 +644,26 @@ def _profile_counter(profile, name: str, value) -> None:
         counters[name] = value
 
 
+def _profiled_gc_collect(
+    profile,
+    name: str,
+    *,
+    allocations_owned_by_current_process: bool = True,
+) -> int:
+    started = _profile_begin(profile)
+    collected = 0
+    if allocations_owned_by_current_process:
+        collected = int(gc.collect())
+    _profile_end(profile, name, started)
+    _profile_counter(profile, name + "_objects", collected)
+    _profile_counter(
+        profile,
+        name + "_skipped",
+        0 if allocations_owned_by_current_process else 1,
+    )
+    return collected
+
+
 def _normalize_gpu_backend_name(value: Optional[str]) -> str:
     if value is None:
         return _DEFAULT_GPU_BACKEND
@@ -705,7 +782,9 @@ _SELF_BACKEND_HOST_MANY_CODE = (
     "    try:\n"
     "        import pcc.backend.self_backend_dispatch as _dispatch_module\n"
     "        backend_dir = os.path.dirname(os.path.abspath(_dispatch_module.__file__))\n"
-    "        backend_files = sorted(glob.glob(os.path.join(backend_dir, 'self_backend*.py')))\n"
+    "        backend_files = [path for path in "
+    "sorted(glob.glob(os.path.join(backend_dir, 'self_backend*.py'))) "
+    "if os.path.basename(path) != 'self_backend_cache_identity.py']\n"
     "    except Exception:\n"
     "        backend_files = []\n"
     "    for path in backend_files:\n"
@@ -1171,30 +1250,7 @@ def _resolve_module_src(root_dir: str, dotted_name: str) -> Optional[str]:
 
 
 def _package_site_roots() -> list[str]:
-    roots: list[str] = []
-    raw = str(os.environ.get("PCC_PACKAGE_SITE", "") or "").strip()
-    if raw:
-        path_sep = ";"
-        if not sys.platform.startswith("win"):
-            path_sep = ":"
-        start = 0
-        i = 0
-        while i <= len(raw):
-            if i == len(raw) or raw[i] == path_sep:
-                item = raw[start:i].strip()
-                start = i + 1
-            else:
-                i += 1
-                continue
-            if item:
-                roots.append(str(os.path.abspath(item)))
-            i += 1
-    home = str(os.environ.get("HOME", "") or "")
-    default_root = ""
-    if home:
-        default_root = str(os.path.abspath(home + "/.cache/pcc/site-packages"))
-    if os.path.isdir(default_root):
-        roots.append(default_root)
+    roots = package_site_roots()
     out: list[str] = []
     seen: set[str] = set()
     for root in roots:
@@ -1447,7 +1503,11 @@ def _top_level_import_targets(
     return targets
 
 
-def _source_module_scope_lines(source: str) -> list[tuple[str, bool]]:
+def _source_module_scope_lines(
+    source: str,
+    *,
+    include_class_bodies: bool = False,
+) -> list[tuple[str, bool]]:
     """Classify source lines as module-scope, including control-flow suites.
 
     Package initialization commonly nests imports under a module-level
@@ -1482,11 +1542,9 @@ def _source_module_scope_lines(source: str) -> list[tuple[str, bool]]:
             blocked_paren_depth = 0
 
         code = stripped.split("#", 1)[0].rstrip()
-        opens_local_scope = (
-            code.startswith("def ")
-            or code.startswith("async def ")
-            or code.startswith("class ")
-        )
+        opens_local_scope = code.startswith("def ") or code.startswith("async def ")
+        if not include_class_bodies and code.startswith("class "):
+            opens_local_scope = True
         if opens_local_scope:
             blocked_indent = indent
             blocked_paren_depth = code.count("(") - code.count(")")
@@ -2038,6 +2096,53 @@ def _filter_ir_scaffold_closure(
     return out_srcs, out_mods
 
 
+def _prepare_multi_source_compile_closure(
+    src_paths: list[str],
+    module_names: list[str],
+    *,
+    recursive_stdlib: bool,
+    ir_scaffold_mode: str,
+    profile: Optional[dict] = None,
+) -> tuple[list[str], list[str]]:
+    """Build the admitted multi-file closure in dependency-pass order.
+
+    Compile-time scaffold modules must be removed before recursive stdlib
+    discovery.  Otherwise a rejected provider can leak its own host-only
+    dependencies into the final no-libpython closure.
+    """
+    t = _profile_begin(profile)
+    src_paths, module_names = _collect_multi_source_relative_closure(
+        src_paths,
+        module_names,
+        recursive_stdlib=False,
+    )
+    _profile_end(profile, "collect_multi_source_relative_closure", t)
+
+    t = _profile_begin(profile)
+    src_paths, module_names = _filter_ir_scaffold_closure(
+        src_paths,
+        module_names,
+        ir_scaffold_mode=ir_scaffold_mode,
+    )
+    _profile_end(profile, "filter_ir_scaffold_closure", t)
+
+    if recursive_stdlib:
+        t = _profile_begin(profile)
+        seen = {
+            mod_name: src_path for src_path, mod_name in zip(src_paths, module_names)
+        }
+        _expand_recursive_stdlib(src_paths, module_names, seen)
+        # Recursive providers can themselves name installed pcc-native object
+        # ports; admit those only after the provider closure is final.
+        _expand_native_extension_module_object_ports(
+            src_paths,
+            module_names,
+            seen,
+        )
+        _profile_end(profile, "expand_recursive_stdlib", t)
+    return src_paths, module_names
+
+
 def _host_find_spec_origin(mod_name: str) -> str:
     py_cmd = str(os.environ.get("PCC_HOST_PYTHON", "") or "python3").strip()
     probe = (
@@ -2205,6 +2310,23 @@ def _pcc_package_dir_candidates() -> list[str]:
     return out
 
 
+def _locate_native_stdlib_module_source(mod_name: str) -> Optional[str]:
+    """Resolve only pcc-owned stdlib providers, without a host probe."""
+    rel = mod_name.replace(".", os.sep)
+    for pcc_package_dir in _pcc_package_dir_candidates():
+        for dirname in ("py_stdlib", "stdlib"):
+            root = os.path.join(pcc_package_dir, dirname)
+            for pcc_port in (
+                os.path.join(root, f"{rel}.py"),
+                os.path.join(root, rel, "__init__.py"),
+                # Legacy flat dotted filename form.
+                os.path.join(root, f"{mod_name}.py"),
+            ):
+                if os.path.isfile(pcc_port):
+                    return pcc_port
+    return None
+
+
 def _locate_stdlib_module_source(mod_name: str) -> Optional[str]:
     """Resolve ``mod_name`` to a ``.py`` source path for the recursive
     stdlib walker (Issue 11.C.1).
@@ -2219,28 +2341,9 @@ def _locate_stdlib_module_source(mod_name: str) -> Optional[str]:
     Returns ``None`` for built-ins, C extensions, or modules that
     can't be located.
     """
-
-    def _port_candidates(root: str) -> list[str]:
-        rel = mod_name.replace(".", os.sep)
-        return [
-            os.path.join(root, f"{rel}.py"),
-            os.path.join(root, rel, "__init__.py"),
-            # Legacy flat dotted filename form.
-            os.path.join(root, f"{mod_name}.py"),
-        ]
-
-    for pcc_package_dir in _pcc_package_dir_candidates():
-        pcc_py_stdlib_dir = os.path.join(pcc_package_dir, "py_stdlib")
-        for pcc_port in _port_candidates(pcc_py_stdlib_dir):
-            if os.path.isfile(pcc_port):
-                return pcc_port
-        pcc_stdlib_dir = os.path.join(
-            pcc_package_dir,
-            "stdlib",
-        )
-        for pcc_port in _port_candidates(pcc_stdlib_dir):
-            if os.path.isfile(pcc_port):
-                return pcc_port
+    pcc_port = _locate_native_stdlib_module_source(mod_name)
+    if pcc_port is not None:
+        return pcc_port
     try:
         origin = _host_find_spec_origin(mod_name)
     except Exception:
@@ -2436,14 +2539,17 @@ def _classify_python_import(
 def _source_uses_native_stdlib(src_path: str) -> bool:
     # A package can call a small factory during module initialization whose
     # body imports a pcc-owned stdlib port (simplejson's OrderedDict chooser is
-    # one real shape).  Scan function bodies for the bounded decision to turn
-    # on recursive stdlib closure; the closure itself still admits lazy
-    # imports only when their provider is owned under pcc/py_stdlib.
-    for mod_name in _stdlib_absolute_imports_in(
-        src_path,
-        include_function_bodies=True,
-    ):
-        if _classify_python_import(mod_name) == "native_stdlib":
+    # one real shape).  This is dependency discovery, so do not run the full
+    # parser a second time for every module before the content cache can be
+    # queried.  The bootstrap-safe import scanner preserves statement
+    # boundaries while masking strings and comments.
+    try:
+        with open(src_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except OSError:
+        return False
+    for mod_name in _source_absolute_imports_for_discovery(source):
+        if _locate_native_stdlib_module_source(mod_name) is not None:
             return True
     return False
 
@@ -2453,6 +2559,142 @@ def _sources_use_native_stdlib(src_paths: list[str]) -> bool:
         if _source_uses_native_stdlib(src_path):
             return True
     return False
+
+
+def _source_after_unescaped_delimiter(
+    source: str,
+    delimiter: str,
+) -> tuple[bool, str]:
+    """Return text after the next unescaped delimiter, if present."""
+    remaining = source
+    while delimiter in remaining:
+        before, _separator, after = remaining.partition(delimiter)
+        trailing_slashes = len(before) - len(before.rstrip("\\"))
+        if trailing_slashes % 2 == 0:
+            return True, after
+        remaining = after
+    return False, ""
+
+
+def _source_import_discovery_line(
+    raw_line: str,
+    continued_quote: str,
+) -> tuple[str, str]:
+    """Mask literals/comments in one line without codepoint indexing."""
+    out: list[str] = []
+    remaining = raw_line
+    if continued_quote:
+        found, remaining = _source_after_unescaped_delimiter(
+            remaining,
+            continued_quote,
+        )
+        if not found:
+            return "", continued_quote
+        out.append(" ")
+        continued_quote = ""
+
+    while remaining:
+        marker = ""
+        marker_pos = -1
+        for candidate in ("#", "'", '"'):
+            candidate_pos = remaining.find(candidate)
+            if candidate_pos >= 0 and (marker_pos < 0 or candidate_pos < marker_pos):
+                marker = candidate
+                marker_pos = candidate_pos
+        if marker_pos < 0:
+            out.append(remaining)
+            break
+        out.append(remaining[:marker_pos])
+        if marker == "#":
+            break
+
+        after_marker = remaining[marker_pos:]
+        delimiter = marker
+        triple_delimiter = marker + marker + marker
+        if after_marker.startswith(triple_delimiter):
+            delimiter = triple_delimiter
+        after_open = after_marker[len(delimiter) :]
+        found, remaining = _source_after_unescaped_delimiter(
+            after_open,
+            delimiter,
+        )
+        out.append(" ")
+        if not found:
+            continued_quote = delimiter
+            break
+    return "".join(out), continued_quote
+
+
+def _source_import_discovery_text(source: str) -> str:
+    """Mask strings/comments while preserving source layout.
+
+    Import closure discovery needs lexical import statements, not a typed AST.
+    Keeping newlines and indentation lets the caller distinguish module/class
+    initialization from deferred function bodies.
+    """
+    out: list[str] = []
+    continued_quote = ""
+    for raw_line in source.splitlines():
+        masked_line, continued_quote = _source_import_discovery_line(
+            raw_line,
+            continued_quote,
+        )
+        out.append(masked_line)
+        out.append("\n")
+    return "".join(out)
+
+
+def _source_absolute_imports_for_discovery(
+    source: str,
+    *,
+    include_function_bodies: bool = True,
+) -> list[str]:
+    """Return absolute import module names without constructing an AST.
+
+    Class bodies remain part of module initialization.  Function bodies are
+    included only for the narrower pcc-owned-provider decision.
+    """
+    masked_source = _source_import_discovery_text(source)
+    if include_function_bodies:
+        lines = [(line, True) for line in masked_source.splitlines()]
+    else:
+        lines = _source_module_scope_lines(
+            masked_source,
+            include_class_bodies=True,
+        )
+    scan_parts: list[str] = []
+    for raw_line, active in lines:
+        if active:
+            # Both tokens delimit simple statements in valid Python source.
+            # Splitting them also covers ``if cond: import mod`` without
+            # admitting deferred ``def f(): import mod`` lines, which were
+            # marked inactive above.
+            scan_parts.append(raw_line.replace(":", "\n").replace(";", "\n"))
+        scan_parts.append("\n")
+    scan_source = "".join(scan_parts)
+    out: list[str] = []
+    seen: set[str] = set()
+    for mod_name in _iter_source_import_specs(scan_source, top_level_only=False):
+        if mod_name and not mod_name.startswith(".") and mod_name not in seen:
+            seen.add(mod_name)
+            out.append(mod_name)
+    for mod_name, imported_names in _iter_source_import_from_specs(
+        scan_source,
+        top_level_only=False,
+    ):
+        compile_only = _COMPILE_TIME_ONLY_IMPORT_FROMS.get(mod_name)
+        if compile_only is not None and imported_names:
+            compile_only_only = True
+            for imported_name in imported_names:
+                if imported_name not in compile_only:
+                    compile_only_only = False
+                    break
+            if compile_only_only:
+                continue
+        if mod_name and not mod_name.startswith(".") and mod_name not in seen:
+            seen.add(mod_name)
+            out.append(mod_name)
+    return out
 
 
 def _source_pcc_native_extension_paths(src_path: str) -> list[str]:
@@ -2769,12 +3011,20 @@ def _expand_recursive_stdlib(
         cur_src = seen.get(cur_mod)
         if cur_src is None:
             continue
-        import_names = _stdlib_absolute_imports_in(cur_src)
+        try:
+            with open(cur_src, "r", encoding="utf-8") as f:
+                source = f.read()
+        except OSError:
+            continue
+        import_names = _source_absolute_imports_for_discovery(
+            source,
+            include_function_bodies=False,
+        )
         # Include lazy imports only for first-class pcc-owned stdlib providers.
         # This covers module-init factories without admitting arbitrary host
         # stdlib/optional dependency trees into the no-libpython closure.
-        for lazy_name in _stdlib_absolute_imports_in(
-            cur_src,
+        for lazy_name in _source_absolute_imports_for_discovery(
+            source,
             include_function_bodies=True,
         ):
             if lazy_name in import_names:
@@ -5554,36 +5804,31 @@ def build_closed_world_context(
         def is_typing_metadata_expr(expr):
             if _closed_world_is_node(expr, _Name):
                 return (
-                    _py_ast_field_value(expr, "ident", "")
-                    in typing_metadata_bindings
+                    _py_ast_field_value(expr, "ident", "") in typing_metadata_bindings
                 )
             if _closed_world_is_node(expr, _Attr):
                 obj = _py_ast_field_value(expr, "obj", None)
                 return (
                     _closed_world_is_node(obj, _Name)
-                    and _py_ast_field_value(obj, "ident", "")
-                    in typing_module_aliases
-                    and _py_ast_field_value(expr, "name", "")
-                    in typing_metadata_exports
+                    and _py_ast_field_value(obj, "ident", "") in typing_module_aliases
+                    and _py_ast_field_value(expr, "name", "") in typing_metadata_exports
                 )
             if _closed_world_is_node(expr, _Subscript):
-                return is_typing_metadata_expr(
-                    _py_ast_field_value(expr, "obj", None)
-                )
+                return is_typing_metadata_expr(_py_ast_field_value(expr, "obj", None))
             if _closed_world_is_node(expr, _Call):
-                return is_typing_metadata_expr(
-                    _py_ast_field_value(expr, "func", None)
+                return is_typing_metadata_expr(_py_ast_field_value(expr, "func", None))
+            if (
+                _closed_world_is_node(expr, _BinOp)
+                and _py_ast_field_value(
+                    expr,
+                    "op",
+                    "",
                 )
-            if _closed_world_is_node(expr, _BinOp) and _py_ast_field_value(
-                expr,
-                "op",
-                "",
-            ) == "|":
+                == "|"
+            ):
                 return is_typing_metadata_expr(
                     _py_ast_field_value(expr, "lhs", None)
-                ) or is_typing_metadata_expr(
-                    _py_ast_field_value(expr, "rhs", None)
-                )
+                ) or is_typing_metadata_expr(_py_ast_field_value(expr, "rhs", None))
             if _closed_world_is_node(expr, _TupleExpr):
                 for elem in _py_ast_field_value(expr, "elems", ()):
                     if is_typing_metadata_expr(elem):
@@ -5707,10 +5952,9 @@ def build_closed_world_context(
                 value = _py_ast_field_value(stmt, "value", None)
                 annotation = _py_ast_field_value(stmt, "annotation", None)
                 annotation_name = _py_ast_field_value(annotation, "name", "")
-                if (
-                    typing_metadata_bindings.get(annotation_name) == "TypeAlias"
-                    or is_typing_metadata_expr(value)
-                ):
+                if typing_metadata_bindings.get(
+                    annotation_name
+                ) == "TypeAlias" or is_typing_metadata_expr(value):
                     exports[target_name] = {
                         "kind": "typing_metadata",
                         "owning_module": mod_name,
@@ -6345,6 +6589,8 @@ def _runtime_archive_stale(archive: str) -> bool:
         return True
     if not _runtime_archive_target_matches(archive):
         return True
+    if _runtime_archive_wheel_stamp_matches(archive):
+        return False
     archive_mtime = os.path.getmtime(archive)
     archive_base = str(os.path.basename(archive))
     if _runtime_archive_compiler_sources_newer_than(archive_base, archive_mtime):
@@ -6358,9 +6604,7 @@ def _runtime_archive_stale(archive: str) -> bool:
         "libpy_runtime_pcc_py_libpython.a",
     )
     replaced_c_modules = (
-        _runtime_pcc_python_replaced_c_modules()
-        if archive_uses_pcc_python
-        else set()
+        _runtime_pcc_python_replaced_c_modules() if archive_uses_pcc_python else set()
     )
     header = os.path.join(_PY_RUNTIME_DIR, "include", "py_runtime.h")
     if os.path.isfile(header) and os.path.getmtime(header) > archive_mtime:
@@ -6535,6 +6779,24 @@ def _runtime_archive_target_matches(archive: str) -> bool:
         return False
 
 
+def _runtime_archive_wheel_stamp_matches(archive: str) -> bool:
+    marker = str(archive) + ".wheel"
+    if not os.path.isfile(marker):
+        return False
+    try:
+        with open(marker, "r", encoding="utf-8") as stream:
+            lines = stream.read().splitlines()
+    except OSError:
+        return False
+    return (
+        len(lines) >= 3
+        and lines[0] == "pcc.runtime-wheel-artifact.v1"
+        and lines[1] == _runtime_archive_target_id()
+        and lines[2].startswith("sha256:")
+        and len(lines[2]) == 71
+    )
+
+
 def _runtime_archive_target_id() -> str:
     import platform
 
@@ -6626,9 +6888,7 @@ def _ensure_runtime(
     clang invocation can surface a concrete missing-file/link error
     instead of silently omitting the runtime archive.
     """
-    explicit_archive = str(
-        os.environ.get(_PY_RUNTIME_ARCHIVE_ENV, "") or ""
-    ).strip()
+    explicit_archive = str(os.environ.get(_PY_RUNTIME_ARCHIVE_ENV, "") or "").strip()
     if explicit_archive:
         explicit_archive = os.path.abspath(explicit_archive)
         if not os.path.isfile(explicit_archive):
@@ -6639,9 +6899,7 @@ def _ensure_runtime(
         return explicit_archive
 
     runtime_dir = str(os.environ.get(_PY_RUNTIME_DIR_ENV, "") or "").strip()
-    runtime_dir = (
-        os.path.abspath(runtime_dir) if runtime_dir else _PY_RUNTIME_DIR
-    )
+    runtime_dir = os.path.abspath(runtime_dir) if runtime_dir else _PY_RUNTIME_DIR
     if not os.path.isdir(runtime_dir):
         raise PyPipelineError("explicit runtime directory not found: " + runtime_dir)
 
@@ -8457,17 +8715,19 @@ def _run_self_backend_emit_worker_pool(
     batch_label: str,
     max_parallel: int,
 ) -> int:
-    """Partition object jobs across persistent compiled-stage workers."""
+    """Run bounded batches in a concurrency-limited compiled-stage pool."""
     if not worker_items:
         return 0
     max_parallel = max(1, min(int(max_parallel), len(worker_items)))
     batches: list[list[tuple[str, str, str]]] = []
-    index = 0
-    while index < max_parallel:
-        batches.append([])
-        index += 1
-    for index, item in enumerate(worker_items):
-        batches[index % max_parallel].append(item)
+    batch: list[tuple[str, str, str]] = []
+    for item in worker_items:
+        batch.append(item)
+        if len(batch) >= _SELF_BACKEND_EMIT_BATCH_MAX_ITEMS:
+            batches.append(batch)
+            batch = []
+    if batch:
+        batches.append(batch)
 
     commands: list[str] = []
     for batch_index, batch in enumerate(batches):
@@ -8502,7 +8762,7 @@ def _run_self_backend_emit_worker_pool(
         commands.append(_join_strings(command_parts, " "))
     _run_python_frontend_worker_commands(
         commands,
-        max_parallel=len(commands),
+        max_parallel=min(max_parallel, len(commands)),
     )
     return len(commands)
 
@@ -8570,10 +8830,18 @@ def _emit_self_objects_many_in_process(
     else:
         worker_command_prefix = []
     t = _profile_begin(profile)
-    parent_emitted_objects = not worker_command_prefix
     if worker_command_prefix:
         split_threshold = _self_backend_split_threshold_bytes()
         split_shard_bytes = _self_backend_split_shard_bytes()
+        split_jobs = _self_backend_jobs_for_ir_texts(
+            inputs,
+            native_worker=bool(native_worker),
+        )
+        _profile_counter(
+            profile,
+            "link_self_native_split_jobs",
+            split_jobs,
+        )
         planned_inputs: list[tuple[str, str, int]] = []
         split_worker_commands: list[str] = []
         split_module_count = 0
@@ -8610,16 +8878,26 @@ def _emit_self_objects_many_in_process(
                 planned_inputs.append((ir_path, "", input_bytes))
 
         if split_worker_commands:
+            _profiled_gc_collect(
+                profile,
+                "link_self_native_pre_split_collect",
+                allocations_owned_by_current_process=False,
+            )
             split_t = _profile_begin(profile)
             _run_python_frontend_worker_commands(
                 split_worker_commands,
                 max_parallel=min(
                     2,
-                    _self_backend_jobs(len(split_worker_commands)),
+                    split_jobs,
                     len(split_worker_commands),
                 ),
             )
             _profile_end(profile, "link_self_native_split_workers", split_t)
+            _profiled_gc_collect(
+                profile,
+                "link_self_native_post_split_collect",
+                allocations_owned_by_current_process=False,
+            )
 
         worker_inputs: list[tuple[str, int]] = []
         split_shard_count = 0
@@ -8647,6 +8925,32 @@ def _emit_self_objects_many_in_process(
                 split_shard_count += 1
         _profile_counter(profile, "link_self_native_split_modules", split_module_count)
         _profile_counter(profile, "link_self_native_split_shards", split_shard_count)
+
+        # A native worker parsing one unsplit multi-megabyte module can retain
+        # several GiB, so the split phase is deliberately serialized when an
+        # oversized input is present.  Do not carry that phase-local limit into
+        # object emission: after splitting, the bounded shards have a different
+        # memory profile and can use the normal self-backend worker budget.
+        emit_jobs = _self_backend_jobs_for_input_sizes(
+            [input_bytes for _input_path, input_bytes in worker_inputs],
+            native_worker=bool(native_worker),
+        )
+        _profile_counter(
+            profile,
+            "link_self_native_configured_jobs",
+            emit_jobs,
+        )
+        _profile_counter(profile, "link_self_native_emit_jobs", emit_jobs)
+        _profile_counter(
+            profile,
+            "link_self_native_large_ir_job_cap",
+            (
+                1
+                if split_jobs < _self_backend_jobs(len(inputs))
+                or emit_jobs < _self_backend_jobs(len(worker_inputs))
+                else 0
+            ),
+        )
 
         worker_items: list[tuple[str, str, str]] = []
         worker_input_bytes: list[int] = []
@@ -8685,7 +8989,6 @@ def _emit_self_objects_many_in_process(
                 large_worker_items.insert(insert_at, (input_bytes, worker_item))
             else:
                 small_worker_items.append(worker_item)
-        configured_jobs = _self_backend_jobs(len(worker_items))
         emit_pool_processes = 0
         if large_worker_items:
             huge_items: list[tuple[str, str, str]] = []
@@ -8702,7 +9005,7 @@ def _emit_self_objects_many_in_process(
                     cc,
                     tmp_dir,
                     "huge",
-                    min(2, configured_jobs, len(huge_items)),
+                    min(2, emit_jobs, len(huge_items)),
                 )
             if medium_items:
                 emit_pool_processes += _run_self_backend_emit_worker_pool(
@@ -8711,7 +9014,7 @@ def _emit_self_objects_many_in_process(
                     cc,
                     tmp_dir,
                     "medium",
-                    min(8, configured_jobs, len(medium_items)),
+                    min(8, emit_jobs, len(medium_items)),
                 )
         if small_worker_items:
             emit_pool_processes += _run_self_backend_emit_worker_pool(
@@ -8720,7 +9023,7 @@ def _emit_self_objects_many_in_process(
                 cc,
                 tmp_dir,
                 "small",
-                min(12, configured_jobs, len(small_worker_items)),
+                min(12, emit_jobs, len(small_worker_items)),
             )
         _profile_counter(
             profile,
@@ -8806,14 +9109,10 @@ def _emit_self_objects_many_in_process(
             # Source-mode stage1 emits hundreds of shards in this process.
             if object_index % 4 == 3:
                 gc.collect()
-    collect_t = _profile_begin(profile)
-    if parent_emitted_objects:
-        gc.collect()
-    _profile_end(profile, "link_self_emit_objects_collect", collect_t)
-    _profile_counter(
+    _profiled_gc_collect(
         profile,
-        "link_self_emit_objects_collect_skipped",
-        0 if parent_emitted_objects else 1,
+        "link_self_emit_objects_collect",
+        allocations_owned_by_current_process=not bool(worker_command_prefix),
     )
     _profile_end(profile, "link_self_emit_objects_native", t)
     _profile_counter(profile, "link_self_native_object_count", len(pairs))
@@ -9005,6 +9304,32 @@ def _self_backend_jobs(n_modules: int) -> int:
     return max(1, min(n_modules, cpu_count, _SELF_BACKEND_DEFAULT_JOBS))
 
 
+def _self_backend_jobs_for_ir_texts(ir_texts, *, native_worker: bool) -> int:
+    return _self_backend_jobs_for_input_sizes(
+        [len(str(ir_text)) for ir_text in ir_texts],
+        native_worker=native_worker,
+    )
+
+
+def _self_backend_jobs_for_input_sizes(input_sizes, *, native_worker: bool) -> int:
+    jobs = _self_backend_jobs(len(input_sizes))
+    if jobs <= 1 or not native_worker:
+        return jobs
+    raw = str(os.environ.get(_SELF_BACKEND_JOBS_ENV, "") or "").strip()
+    if raw:
+        return jobs
+    threshold = _self_backend_split_threshold_bytes()
+    for input_bytes in input_sizes:
+        if int(input_bytes) >= threshold:
+            # A compiled self-backend worker currently needs several GiB to
+            # parse a multi-megabyte LLVM module. Two such workers can exceed
+            # the repository's 16 GiB process-group budget even after the
+            # module is later sharded. Keep small-module graphs parallel, but
+            # serialize native large-module splitting/emission by default.
+            return 1
+    return jobs
+
+
 def _self_backend_skip_ll_temp() -> bool:
     raw = str(os.environ.get(_SELF_BACKEND_SKIP_LL_TEMP_ENV, "") or "")
     normalized = raw.strip().lower()
@@ -9037,14 +9362,14 @@ def _self_backend_split_int_env(name: str, default: int) -> int:
 def _self_backend_split_threshold_bytes() -> int:
     return _self_backend_split_int_env(
         _SELF_BACKEND_SPLIT_THRESHOLD_BYTES_ENV,
-        4_000_000,
+        2_000_000,
     )
 
 
 def _self_backend_split_shard_bytes() -> int:
     return _self_backend_split_int_env(
         _SELF_BACKEND_SPLIT_SHARD_BYTES_ENV,
-        2_000_000,
+        1_000_000,
     )
 
 
@@ -10151,6 +10476,13 @@ def compile_python(
         not effective_recursive_stdlib
         and libpython_mode == "off"
         and not python_library
+        # A plain emit-only request is a per-module IR diagnostic.  Expanding
+        # its stdlib imports changes that request into a multi-module compile,
+        # multiplying parse/type/codegen work and changing when the
+        # no-libpython gate runs.  Executable builds and package entrypoints
+        # still close their runtime graph automatically; callers that want a
+        # standalone closure dump can request recursive_stdlib explicitly.
+        and should_auto_close
         and _sources_use_native_stdlib(auto_srcs)
     ):
         effective_recursive_stdlib = True
@@ -10486,6 +10818,35 @@ def _python_frontend_jobs(job_count_hint: int) -> int:
     return jobs
 
 
+def _python_frontend_package_site_workload(src_paths) -> bool:
+    for src_path in src_paths:
+        if _package_site_package_root_for_src(str(src_path)) is not None:
+            return True
+    return False
+
+
+def _python_frontend_jobs_for_sources(src_paths) -> int:
+    jobs = _python_frontend_jobs(len(src_paths))
+    if jobs <= 1:
+        return jobs
+    raw = str(os.environ.get(_PY_FRONTEND_JOBS_ENV, "") or "").strip().lower()
+    if raw and raw not in ("auto", "on", "true", "yes"):
+        return jobs
+    # A pcc-native package graph can mix generated package modules, native
+    # extension object ports, and host-located stdlib sources. Ten isolated
+    # native frontend workers are useful for the compiler bootstrap, but this
+    # package shape retained enough allocator state to push one NumPy compile
+    # beyond 18 GiB RSS. Even two quiet compiled-stage workers retain enough
+    # allocator state to cross the 16 GiB process-group budget; verbose worker
+    # timing merely masks that behavior. Keep bootstrap's auto=10 policy and
+    # serialize package-graph frontend workers until the compiled allocator can
+    # prove a lower retained-heap bound. An explicit numeric override remains
+    # authoritative.
+    if _python_frontend_package_site_workload(src_paths):
+        return 1
+    return jobs
+
+
 def _python_frontend_worker_timing_enabled() -> bool:
     raw = str(os.environ.get(_PY_FRONTEND_WORKER_TIMING_ENV, "") or "")
     return raw.strip().lower() in ("1", "true", "yes", "on")
@@ -10784,8 +11145,7 @@ def _read_python_frontend_worker_ir(ir_path: str, module_name: str) -> str:
         ir_text = f.read()
     if len(ir_text) == 0:
         raise PyPipelineError(
-            "frontend codegen worker produced empty LLVM IR for module "
-            + module_name
+            "frontend codegen worker produced empty LLVM IR for module " + module_name
         )
     return ir_text
 
@@ -11207,6 +11567,11 @@ def _build_python_frontend_shared_exports_parallel(
         worker_i += 1
 
     _run_python_frontend_worker_commands(commands, max_parallel=max_parallel)
+    _profiled_gc_collect(
+        profile,
+        "multi_frontend_export_worker_collect",
+        allocations_owned_by_current_process=False,
+    )
 
     native_exports = {}
     reexport_edges = []
@@ -11264,6 +11629,106 @@ def _build_python_frontend_shared_exports_parallel(
 
 
 def _compile_python_multi_codegen_parallel(
+    src_paths,
+    module_names,
+    *,
+    jobs: int,
+    entry_module: str,
+    sibling_inits,
+    libpython_mode: str,
+    ir_scaffold_mode: str,
+    verbose: bool,
+    profile: Optional[dict] = None,
+) -> Optional[tuple[list[tuple[str, str]], bool, bool, int, list[str]]]:
+    """Run parallel frontend codegen with a pre-pass content cache."""
+    if jobs < 1 or not _can_spawn_python_frontend_worker():
+        return _compile_python_multi_codegen_parallel_uncached(
+            src_paths,
+            module_names,
+            jobs=jobs,
+            entry_module=entry_module,
+            sibling_inits=sibling_inits,
+            libpython_mode=libpython_mode,
+            ir_scaffold_mode=ir_scaffold_mode,
+            verbose=verbose,
+            profile=profile,
+        )
+    worker_prefix = _python_frontend_worker_command_prefix()
+    if not worker_prefix:
+        return _compile_python_multi_codegen_parallel_uncached(
+            src_paths,
+            module_names,
+            jobs=jobs,
+            entry_module=entry_module,
+            sibling_inits=sibling_inits,
+            libpython_mode=libpython_mode,
+            ir_scaffold_mode=ir_scaffold_mode,
+            verbose=verbose,
+            profile=profile,
+        )
+
+    cache_t = _profile_begin(profile)
+    cache_plan = plan_python_frontend_ir_cache(
+        src_paths,
+        module_names,
+        compiler_executable=str(worker_prefix[0]),
+        host_python=_host_python_command(),
+        entry_module=entry_module,
+        sibling_inits=sibling_inits,
+        libpython_mode=libpython_mode,
+        ir_scaffold_mode=ir_scaffold_mode,
+    )
+    cached_result = load_python_frontend_ir_cache(cache_plan, module_names)
+    _profile_end(profile, "multi_frontend_ir_cache_lookup", cache_t)
+    if cached_result is not None:
+        _profile_counter(profile, "multi_frontend_ir_cache_hits", 1)
+        _profile_counter(profile, "multi_frontend_ir_cache_misses", 0)
+        return cached_result
+
+    cache_owner = acquire_python_frontend_ir_cache(cache_plan)
+    if cache_plan is not None and not cache_owner:
+        wait_t = _profile_begin(profile)
+        cached_result = wait_python_frontend_ir_cache(cache_plan, module_names)
+        _profile_end(profile, "multi_frontend_ir_cache_wait", wait_t)
+        if cached_result is not None:
+            _profile_counter(profile, "multi_frontend_ir_cache_hits", 1)
+            _profile_counter(profile, "multi_frontend_ir_cache_misses", 0)
+            return cached_result
+
+    _profile_counter(profile, "multi_frontend_ir_cache_hits", 0)
+    _profile_counter(
+        profile,
+        "multi_frontend_ir_cache_misses",
+        1 if cache_plan is not None else 0,
+    )
+    try:
+        result = _compile_python_multi_codegen_parallel_uncached(
+            src_paths,
+            module_names,
+            jobs=jobs,
+            entry_module=entry_module,
+            sibling_inits=sibling_inits,
+            libpython_mode=libpython_mode,
+            ir_scaffold_mode=ir_scaffold_mode,
+            verbose=verbose,
+            profile=profile,
+        )
+        if cache_owner and result is not None:
+            publish_t = _profile_begin(profile)
+            published = publish_python_frontend_ir_cache(cache_plan, result)
+            _profile_end(profile, "multi_frontend_ir_cache_publish", publish_t)
+            _profile_counter(
+                profile,
+                "multi_frontend_ir_cache_publish_ok",
+                1 if published else 0,
+            )
+        return result
+    finally:
+        if cache_owner:
+            release_python_frontend_ir_cache(cache_plan)
+
+
+def _compile_python_multi_codegen_parallel_uncached(
     src_paths,
     module_names,
     *,
@@ -11357,6 +11822,11 @@ def _compile_python_multi_codegen_parallel(
             t = _profile_begin(profile)
             _run_python_frontend_worker_commands(commands, max_parallel=jobs)
             _profile_end(profile, "multi_frontend_codegen_worker_commands", t)
+            _profiled_gc_collect(
+                profile,
+                "multi_frontend_codegen_worker_collect",
+                allocations_owned_by_current_process=False,
+            )
         except subprocess.CalledProcessError as exc:
             raise PyPipelineError("parallel frontend codegen worker failed") from exc
 
@@ -11539,20 +12009,13 @@ def compile_python_multi(
     if len(module_names) != len(src_paths):
         raise PyPipelineError("module_names length must match src_paths length")
 
-    t = _profile_begin(profile)
-    src_paths, module_names = _collect_multi_source_relative_closure(
+    src_paths, module_names = _prepare_multi_source_compile_closure(
         src_paths,
         list(module_names),
         recursive_stdlib=recursive_stdlib,
-    )
-    _profile_end(profile, "collect_multi_source_relative_closure", t)
-    t = _profile_begin(profile)
-    src_paths, module_names = _filter_ir_scaffold_closure(
-        src_paths,
-        list(module_names),
         ir_scaffold_mode=ir_scaffold_mode,
+        profile=profile,
     )
-    _profile_end(profile, "filter_ir_scaffold_closure", t)
     t = _profile_begin(profile)
     _validate_package_site_no_libpython_abi(
         src_paths,
@@ -11599,8 +12062,18 @@ def compile_python_multi(
 
     total_ir_bytes_before_passes = 0
     parallel_codegen_result = None
-    frontend_jobs = _python_frontend_jobs(len(src_paths))
+    frontend_jobs = _python_frontend_jobs_for_sources(src_paths)
     _profile_counter(profile, "multi_frontend_jobs", frontend_jobs)
+    _profile_counter(
+        profile,
+        "multi_frontend_package_site_capped",
+        (
+            1
+            if frontend_jobs < _python_frontend_jobs(len(src_paths))
+            and _python_frontend_package_site_workload(src_paths)
+            else 0
+        ),
+    )
     if native_backend == "self" or emit_only_self_backend:
         t = _profile_begin(profile)
         parallel_codegen_result = _compile_python_multi_codegen_parallel(

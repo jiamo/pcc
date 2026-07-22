@@ -33,7 +33,7 @@ from tests.integration.pcc_native_e2e import (
     run_package_e2e,
 )
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.pcc_gate(env="PCC_RUN_PACKAGE_E2E_INTEGRATION")]
 
 REPO = Path(__file__).resolve().parents[2]
 WHEEL_FIXTURE_DIR = REPO / "tests" / "fixtures" / "packages"
@@ -47,16 +47,16 @@ SIMPLEJSON_SOURCE = REPO / "build" / "m1-site" / "simplejson-4.1.1"
 
 def _require_gate() -> Path:
     if os.environ.get("PCC_RUN_PACKAGE_E2E_INTEGRATION") != "1":
-        pytest.skip(
+        pytest.fail(
             "set PCC_RUN_PACKAGE_E2E_INTEGRATION=1 to run the pcc-native package E2E gate"
         )
     pcc1 = pcc1_binary()
     if not pcc1.is_file():
-        pytest.skip(
+        pytest.fail(
             f"self-host pcc1 binary required: {pcc1} (set PCC1_BINARY or build via scripts/bootstrap.sh --stage 1)"
         )
     if not WHEEL_FIXTURE.is_file():
-        pytest.skip(f"pure-Python wheel fixture required: {WHEEL_FIXTURE}")
+        pytest.fail(f"pure-Python wheel fixture required: {WHEEL_FIXTURE}")
     return pcc1
 
 
@@ -82,7 +82,7 @@ def test_numpy_package_e2e_reuses_same_skeleton_no_libpython(tmp_path):
     """
     pcc1 = _require_gate()
     if not (NUMPY_SITE / "numpy" / "_core").is_dir():
-        pytest.skip(
+        pytest.fail(
             f"pcc-native NumPy core site required: {NUMPY_SITE} "
             "(run: uv run python scripts/numpy_head_gate.py run --skip-loader)"
         )
@@ -115,7 +115,7 @@ def test_simplejson_c_extension_builds_from_cold_source_through_generic_e2e(
     """
     pcc1 = _require_gate()
     if not (SIMPLEJSON_SOURCE / "simplejson" / "_speedups.c").is_file():
-        pytest.skip(
+        pytest.fail(
             f"simplejson 4.1.1 source prerequisite required: {SIMPLEJSON_SOURCE}"
         )
     source = tmp_path / "simplejson-4.1.1-source"

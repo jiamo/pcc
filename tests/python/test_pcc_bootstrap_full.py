@@ -26,9 +26,13 @@ import functools
 import hashlib
 import json
 import os
+import signal
 import subprocess
 
 from pcc.dependency_verdict import probe_platform_capability
+from pcc.backend.self_backend_cache_identity import (
+    self_backend_emitter_source_identity,
+)
 import shutil
 import sys
 import time
@@ -44,7 +48,10 @@ from tests.python.test_bootstrap_gate_baseline import (
     _is_macos_arm64,
     _links_libpython,
 )
-from tests.python.process_timeout import run_process_group_timeout
+from tests.python.process_timeout import (
+    _kill_process_group,
+    run_process_group_timeout,
+)
 
 _BOOTSTRAP_SH = _REPO_ROOT / "scripts" / "bootstrap.sh"
 _SHARED_STAGE1_DIR = _REPO_ROOT / "build" / "bootstrap-pytest-shared-stage1"
@@ -67,6 +74,8 @@ _GC_BOOTSTRAP_WEIGHT = {"0": 60, "4": 50, "3": 40, "1": 30, "2": 30}
 # the 12-core development gate, so the unattended default admits at most two.
 # PCC_BOOTSTRAP_FULL_MAX_ACTIVE_GC remains the explicit operator override.
 _GC_BOOTSTRAP_MAX_ACTIVE_BACKENDS = 2
+_GC_BOOTSTRAP_MAX_FRONTEND_JOBS = 4
+_GC_BOOTSTRAP_MAX_SELF_BACKEND_JOBS = 2
 _GC_BOOTSTRAP_PARALLEL_MIN_JOBS = 6
 # A clean stage currently takes about 10-11 minutes on the 12-core macOS gate
 # host.  This repository is also exercised by multiple concurrent goal loops;
@@ -161,6 +170,11 @@ def _bootstrap_source_sha256() -> str:
         digest.update(relative)
         digest.update(bytes.fromhex(_sha256_path(path)))
     return digest.hexdigest()
+
+
+@functools.lru_cache(maxsize=1)
+def _bootstrap_self_backend_object_identity() -> str:
+    return self_backend_emitter_source_identity(_REPO_ROOT)
 
 
 def _prepare_bootstrap_profile_dir(gc_backend: str) -> Path:
@@ -470,6 +484,19 @@ def _record_shared_stage1_rebuilt_for_this_run() -> None:
         _SHARED_STAGE1_REBUILD_STAMP.write_text(run_id, encoding="utf-8")
 
 
+def _configure_bootstrap_compiler_caches(env: dict[str, str]) -> None:
+    """Give every bootstrap stage the same content-addressed cache namespace."""
+    env.setdefault("PCC_SELF_BACKEND_OBJECT_CACHE", "1")
+    env.setdefault(
+        "PCC_SELF_BACKEND_OBJECT_CACHE_DIR",
+        str(_BOOTSTRAP_OBJECT_CACHE_DIR),
+    )
+    env["PCC_PY_FRONTEND_IR_CACHE_IDENTITY"] = _bootstrap_source_sha256()
+    env["PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY"] = (
+        _bootstrap_self_backend_object_identity()
+    )
+
+
 def _shared_pcc1_needs_rebuild(pcc1: Path) -> bool:
     if not _shared_pcc1_is_fresh(pcc1):
         return True
@@ -520,6 +547,7 @@ def _build_shared_stage1(runtime_archive: Path) -> Path:
             env = os.environ.copy()
             env.pop("LC_ALL", None)
             env["PCC_RUNTIME_ARCHIVE"] = str(runtime_archive)
+            _configure_bootstrap_compiler_caches(env)
             result = run_process_group_timeout(
                 cmd, timeout=_BOOTSTRAP_STAGE_TIMEOUT_S, env=env
             )
@@ -544,7 +572,7 @@ def shared_stage1_pcc1(pcc_py_runtime_archive) -> Path:
     # archive, so make the host-built archive an explicit fixture dependency
     # instead of relying on pytest's ordering of independent test arguments.
     if not _is_macos_arm64():
-        pytest.skip(
+        pytest.fail(
             "Full self-backend bootstrap is currently verified on macOS arm64 only"
         )
     return _build_shared_stage1(pcc_py_runtime_archive)
@@ -558,6 +586,25 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def test_process_group_cleanup_ignores_eperm_only_after_parent_exit(monkeypatch):
+    class FakeProcess:
+        pid = 123
+
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        def poll(self):
+            return self.returncode
+
+    def deny(_pid, _sig):
+        raise PermissionError("already reaped")
+
+    monkeypatch.setattr(os, "killpg", deny)
+    _kill_process_group(FakeProcess(-signal.SIGTERM), signal.SIGTERM)
+    with pytest.raises(PermissionError, match="already reaped"):
+        _kill_process_group(FakeProcess(None), signal.SIGTERM)
+
+
 def test_process_group_timeout_reaps_bootstrap_children(tmp_path):
     # POSIX capability classified separately from the guard's behavior; the
     # child-group termination assertions stay hard on supported systems
@@ -568,7 +615,7 @@ def test_process_group_timeout_reaps_bootstrap_children(tmp_path):
         detail="process-group timeout is a POSIX bootstrap harness guard",
     )
     if not posix_verdict.available:
-        pytest.skip(posix_verdict.skip_reason())
+        pytest.fail(posix_verdict.skip_reason())
 
     child_pid_path = tmp_path / "child.pid"
     child_script = tmp_path / "child.py"
@@ -624,7 +671,7 @@ def test_process_group_interrupt_reaps_bootstrap_children(tmp_path):
         detail="process-group interrupt handling is a POSIX bootstrap guard",
     )
     if not posix_verdict.available:
-        pytest.skip(posix_verdict.skip_reason())
+        pytest.fail(posix_verdict.skip_reason())
 
     child_pid_path = tmp_path / "interrupt-child.pid"
     child_script = tmp_path / "interrupt_child.py"
@@ -911,7 +958,13 @@ def _bootstrap_active_gc_lease(gc_backend: str, parallel_slots: int):
                         waiting_path.unlink()
                     active_path.write_text(str(pid), encoding="utf-8")
                     acquired = True
-                    granted_slots = effective_limit
+                    done_count = sum(
+                        1
+                        for candidate in _GC_BACKENDS
+                        if (run_dir / f"done-gc{candidate}").is_file()
+                    )
+                    remaining_slots = max(1, parallel_slots - done_count)
+                    granted_slots = min(effective_limit, remaining_slots)
                     break
             time.sleep(0.2)
         yield granted_slots
@@ -1037,6 +1090,7 @@ def _bootstrap_matrix_plan(
             self_jobs = cpu
         else:
             self_jobs = cpu // workers
+        self_jobs = min(self_jobs, _GC_BOOTSTRAP_MAX_SELF_BACKEND_JOBS)
     else:
         self_jobs = int(self_backend_jobs)
     self_jobs = _clamp_int(self_jobs, minimum=1, maximum=cpu)
@@ -1106,9 +1160,20 @@ def _bootstrap_gc_backend_plan(
             # The self-host closure is large enough that native frontend workers
             # are memory-bound rather than CPU-bound.  Ten concurrent workers on
             # a 12-core host caused macOS to SIGKILL pcc1 while compiling pcc2.
-            # Keep the unattended gate within a conservative memory budget;
-            # PCC_BOOTSTRAP_FULL_FRONTEND_JOBS remains an explicit override.
-            frontend_jobs = min(4, cpu)
+            # Keep one aggregate frontend-worker budget across concurrently
+            # admitted GC chains.  Two pcc2->pcc3 parents already retain
+            # several GiB each, so assigning four more multi-hundred-MiB
+            # frontend workers to *each* chain can exceed the machine budget.
+            # PCC_BOOTSTRAP_FULL_FRONTEND_JOBS remains an explicit per-chain
+            # override for operators who have measured additional headroom.
+            if active_slots_override is None:
+                frontend_slots = _bootstrap_gc_active_limit(active_slots)
+            else:
+                frontend_slots = active_slots
+            frontend_jobs = max(
+                1,
+                min(_GC_BOOTSTRAP_MAX_FRONTEND_JOBS, cpu) // frontend_slots,
+            )
     frontend_jobs = _clamp_int(
         int(frontend_jobs),
         minimum=1,
@@ -1119,10 +1184,11 @@ def _bootstrap_gc_backend_plan(
         env_self_jobs = _env_int("PCC_BOOTSTRAP_FULL_SELF_BACKEND_JOBS")
         if env_self_jobs is not None:
             self_backend_jobs = env_self_jobs
-        elif active_slots <= 1:
-            self_backend_jobs = cpu
         else:
-            self_backend_jobs = max(slot_cpu_count, _bootstrap_parallel_min_jobs(cpu))
+            self_backend_jobs = min(
+                max(slot_cpu_count, _bootstrap_parallel_min_jobs(cpu)),
+                _GC_BOOTSTRAP_MAX_SELF_BACKEND_JOBS,
+            )
     self_backend_jobs = _clamp_int(int(self_backend_jobs), minimum=1, maximum=cpu)
 
     return BootstrapMatrixPlan(
@@ -1183,12 +1249,7 @@ def _run_bootstrap_stage(
     env["PCC_BOOTSTRAP_PROFILE_DIR"] = str(profile_dir)
     env["PCC_BOOTSTRAP_PY_FRONTEND_JOBS"] = str(frontend_jobs)
     env["PCC_SELF_BACKEND_JOBS"] = str(self_backend_jobs)
-    env.setdefault("PCC_SELF_BACKEND_OBJECT_CACHE", "1")
-    env.setdefault(
-        "PCC_SELF_BACKEND_OBJECT_CACHE_DIR",
-        str(_BOOTSTRAP_OBJECT_CACHE_DIR),
-    )
-    env["PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY"] = _bootstrap_source_sha256()
+    _configure_bootstrap_compiler_caches(env)
     start = time.monotonic()
     process = run_process_group_timeout(
         cmd, timeout=_BOOTSTRAP_STAGE_TIMEOUT_S, env=env
@@ -1364,7 +1425,7 @@ def test_bootstrap_matrix_plan_uses_bounded_parallelism_on_12_cpu_host():
     assert plan.backends == ("0", "4", "3", "1", "2")
     assert plan.max_workers == 2
     assert plan.frontend_jobs == 6
-    assert plan.self_backend_jobs == 6
+    assert plan.self_backend_jobs == 2
     assert plan.max_workers * plan.frontend_jobs <= 12
     assert plan.max_workers * plan.self_backend_jobs <= 12
 
@@ -1375,7 +1436,7 @@ def test_bootstrap_matrix_plan_single_backend_keeps_full_local_parallelism():
     assert plan.backends == ("4",)
     assert plan.max_workers == 1
     assert plan.frontend_jobs == 10
-    assert plan.self_backend_jobs == 12
+    assert plan.self_backend_jobs == 2
 
 
 def test_bootstrap_matrix_plan_clamps_overrides_to_backend_and_cpu_limits():
@@ -1445,11 +1506,11 @@ def test_bootstrap_gc_backend_plan_partitions_worker_budget_for_parallel_files(
     gc4 = _bootstrap_gc_backend_plan("4", cpu_count=12, parallel_slots=5)
 
     assert gc0.cpu_ids == (0, 1, 2)
-    assert gc0.frontend_jobs == 4
-    assert gc0.self_backend_jobs == 6
+    assert gc0.frontend_jobs == 2
+    assert gc0.self_backend_jobs == 2
     assert gc4.cpu_ids == (10, 11)
-    assert gc4.frontend_jobs == 4
-    assert gc4.self_backend_jobs == 6
+    assert gc4.frontend_jobs == 2
+    assert gc4.self_backend_jobs == 2
 
 
 def test_bootstrap_active_gc_limit_defaults_to_two_heavy_chains(monkeypatch):
@@ -1480,12 +1541,12 @@ def test_bootstrap_gc_backend_plan_expands_for_not_yet_started_gc_after_done(
     _mark_bootstrap_gc_done("3")
     only_gc4_left = _bootstrap_gc_backend_plan("4", cpu_count=12, parallel_slots=5)
 
-    assert initial.frontend_jobs == 4
-    assert initial.self_backend_jobs == 6
-    assert after_one_done.frontend_jobs == 4
-    assert after_one_done.self_backend_jobs == 6
+    assert initial.frontend_jobs == 2
+    assert initial.self_backend_jobs == 2
+    assert after_one_done.frontend_jobs == 2
+    assert after_one_done.self_backend_jobs == 2
     assert only_gc4_left.frontend_jobs == 4
-    assert only_gc4_left.self_backend_jobs == 12
+    assert only_gc4_left.self_backend_jobs == 2
 
 
 def test_bootstrap_gc_backend_plan_respects_active_lease_slots(monkeypatch):
@@ -1499,8 +1560,8 @@ def test_bootstrap_gc_backend_plan_respects_active_lease_slots(monkeypatch):
     )
 
     assert plan.cpu_ids == (0, 1, 2, 3, 4, 5)
-    assert plan.frontend_jobs == 4
-    assert plan.self_backend_jobs == 6
+    assert plan.frontend_jobs == 2
+    assert plan.self_backend_jobs == 2
 
 
 def test_bootstrap_gc_backend_plan_single_file_keeps_memory_safe_frontend_parallelism(
@@ -1512,7 +1573,39 @@ def test_bootstrap_gc_backend_plan_single_file_keeps_memory_safe_frontend_parall
 
     assert plan.cpu_ids == tuple(range(12))
     assert plan.frontend_jobs == 4
-    assert plan.self_backend_jobs == 12
+    assert plan.self_backend_jobs == 2
+
+
+def test_bootstrap_gc_backend_plan_keeps_explicit_self_job_override(monkeypatch):
+    _use_unique_bootstrap_resource_run(monkeypatch, "self-jobs-override")
+    monkeypatch.setenv("PCC_BOOTSTRAP_FULL_SELF_BACKEND_JOBS", "5")
+
+    plan = _bootstrap_gc_backend_plan("0", cpu_count=12, parallel_slots=1)
+
+    assert plan.self_backend_jobs == 5
+
+
+def test_bootstrap_gc_backend_plan_keeps_explicit_frontend_job_override(monkeypatch):
+    _use_unique_bootstrap_resource_run(monkeypatch, "frontend-jobs-override")
+    monkeypatch.setenv("PCC_BOOTSTRAP_FULL_FRONTEND_JOBS", "5")
+
+    plan = _bootstrap_gc_backend_plan(
+        "0",
+        cpu_count=12,
+        parallel_slots=5,
+        active_slots_override=2,
+    )
+
+    assert plan.frontend_jobs == 5
+
+
+def test_bootstrap_active_gc_lease_grants_full_budget_to_last_chain(monkeypatch):
+    _use_unique_bootstrap_resource_run(monkeypatch, "last-chain")
+    for backend in ("0", "1", "2", "3"):
+        _mark_bootstrap_gc_done(backend)
+
+    with _bootstrap_active_gc_lease("4", 5) as active_slots:
+        assert active_slots == 1
 
 
 def test_bootstrap_gc_object_cache_warmup_serializes_until_gc0_terminal(
@@ -1531,6 +1624,29 @@ def test_bootstrap_gc_object_cache_warmup_is_disabled_with_cache(monkeypatch, tm
     monkeypatch.setenv("PCC_SELF_BACKEND_OBJECT_CACHE", "off")
 
     assert _bootstrap_effective_active_limit_locked(tmp_path, 5, 3) == 3
+
+
+def test_bootstrap_stage1_and_later_stages_share_content_cache_namespace(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_bootstrap_source_sha256",
+        lambda: "source-content-id",
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_bootstrap_self_backend_object_identity",
+        lambda: "emitter-content-id",
+    )
+    env: dict[str, str] = {}
+
+    _configure_bootstrap_compiler_caches(env)
+
+    assert env["PCC_SELF_BACKEND_OBJECT_CACHE"] == "1"
+    assert env["PCC_SELF_BACKEND_OBJECT_CACHE_DIR"] == str(_BOOTSTRAP_OBJECT_CACHE_DIR)
+    assert env["PCC_PY_FRONTEND_IR_CACHE_IDENTITY"] == "source-content-id"
+    assert env["PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY"] == "emitter-content-id"
 
 
 def test_seed_shared_stage1_atomically_replaces_existing_executable(tmp_path):

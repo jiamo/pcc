@@ -2,7 +2,7 @@
 
 A runtime that ships five garbage-collection backends owes the reader a defense: five collectors means five times the correctness surface, and the characteristic GC bug is irreproducible memory corruption. This chapter explains why pcc accepts that cost, and what architecture keeps the cost contained — one collector-selection ABI, one set of object-graph slot rules, one root-registration interface, one write/read barrier pair, and a "production equality rule" that pins all five backends to the same Python semantics. The internals of each backend (tricolor pacing, concurrent marking, generational promotion, colored relocation) belong to Chapter 11; this chapter covers only the skeleton the backends share, and why that skeleton must never grow a second copy.
 
-## Reader Map: Reduce GC to Four Questions First
+## Chapter Overview: Reduce GC to Four Questions First
 
 Do not start this topic from algorithm names such as "tricolor," "generational," or "relocating." That drops the reader straight into backend internals. Any GC can first be reduced to four questions:
 
@@ -190,7 +190,7 @@ The whole point of the five-GC architecture is to **compare collection algorithm
 4. **The barrier pair**: `pcc_gc_store_ptr` with its all-backend balanced store plus per-backend write barriers (#1 shading, #2 buffered shading, #3 remembered set, #4 store buffer); `pcc_gc_load_ptr` as the self-healing read barrier for #3/#4.
 5. **The equality rule**: identical semantics across all five is a hard requirement; no backend may win by weakening finalizers, weakrefs, resurrection, suspended frames, scheduler queues, or extension references; `DONE_STRONG` requires all five green.
 
-The three war stories each pin one invariant: a data structure must be faithful to the true shape of its access pattern (non-LIFO forbids a stack); root registration is a frontend obligation whose absence #0 will mask; and on a shared path, both bugs and fixes multiply. The next chapter opens the five backends one by one and watches five algorithms walk on this one skeleton.
+The three case studies each pin one invariant: a data structure must be faithful to the true shape of its access pattern (non-LIFO forbids a stack); root registration is a frontend obligation whose absence #0 will mask; and on a shared path, both bugs and fixes multiply. The next chapter opens the five backends one by one and watches five algorithms walk on this one skeleton.
 
 ## Exercises
 

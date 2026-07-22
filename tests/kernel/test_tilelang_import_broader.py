@@ -15,6 +15,14 @@ from pcc.kernel_ir.ir import KernelFunc, KernelModule, KernelOp
 from pcc.kernel_ir.tilelang_import import TileLangImportError, import_tilelang_source
 from pcc.kernel_ir.tirx_adapter import lower_to_plain_tir
 
+_TILELANG_LOCAL_REASON = (
+    None
+    if (Path.home() / "tilelang" / "benchmark").is_dir()
+    else "local ~/tilelang benchmark checkout not present"
+)
+
+
+
 
 TILELANG_SPLITK_GEMM_VARIANT = """
 import tilelang
@@ -1247,10 +1255,11 @@ def test_output_staged_f16_transpose_b_gemm_casts_accumulator_to_half_output():
     assert "C_shared" not in source
 
 
+@pytest.mark.pcc_gate(unavailable=_TILELANG_LOCAL_REASON)
 def test_local_tilelang_matmul_benchmark_source_imports_freezes_and_emits_scalar_metal():
     benchmark_path = Path.home() / "tilelang" / "benchmark" / "matmul" / "benchmark_matmul.py"
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang benchmark reference not found: {benchmark_path}")
 
     module = import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),
@@ -1299,10 +1308,11 @@ def test_local_tilelang_matmul_benchmark_source_imports_freezes_and_emits_scalar
     assert "C[(row * 7u) + col] = (half)acc;" in source
 
 
+@pytest.mark.pcc_gate(unavailable=_TILELANG_LOCAL_REASON)
 def test_local_tilelang_matmul_benchmark_nonroller_config_imports_freezes_and_emits_scalar_metal():
     benchmark_path = Path.home() / "tilelang" / "benchmark" / "matmul" / "benchmark_matmul.py"
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang benchmark reference not found: {benchmark_path}")
 
     module = import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),
@@ -1352,12 +1362,13 @@ def test_local_tilelang_matmul_benchmark_nonroller_config_imports_freezes_and_em
     assert "C[(row * 7u) + col] = (half)acc;" in source
 
 
+@pytest.mark.pcc_gate(unavailable=_TILELANG_LOCAL_REASON)
 def test_local_tilelang_metal_matmul_benchmark_source_imports_freezes_and_emits_scalar_metal():
     benchmark_path = (
         Path.home() / "tilelang" / "benchmark" / "matmul_metal" / "benchmark_matmul_metal.py"
     )
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang Metal benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang Metal benchmark reference not found: {benchmark_path}")
 
     module = import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),
@@ -1399,10 +1410,11 @@ def test_local_tilelang_metal_matmul_benchmark_source_imports_freezes_and_emits_
     assert "C[(row * 7u) + col] = (float)acc;" in source
 
 
+@pytest.mark.pcc_gate(unavailable=_TILELANG_LOCAL_REASON)
 def test_local_tilelang_fp8_matmul_benchmark_reaches_dtype_boundary_without_runtime_import():
     benchmark_path = Path.home() / "tilelang" / "benchmark" / "matmul_fp8" / "benchmark_matmul.py"
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang fp8 benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang fp8 benchmark reference not found: {benchmark_path}")
 
     with pytest.raises(TileLangImportError, match="unsupported TileLang dtype 'float8_e4m3fn'"):
         import_tilelang_source(
@@ -1428,10 +1440,11 @@ def test_local_tilelang_fp8_matmul_benchmark_reaches_dtype_boundary_without_runt
         )
 
 
+@pytest.mark.pcc_gate(unavailable=_TILELANG_LOCAL_REASON)
 def test_local_tilelang_sparse_matmul_benchmark_imports_tirx_cpu_oracle_and_metal_fail_closed():
     benchmark_path = Path.home() / "tilelang" / "benchmark" / "matmul" / "benchmark_matmul_sp.py"
     if not benchmark_path.exists():
-        pytest.skip(f"local TileLang sparse matmul benchmark reference not found: {benchmark_path}")
+        pytest.fail(f"local TileLang sparse matmul benchmark reference not found: {benchmark_path}")
 
     module = import_tilelang_source(
         benchmark_path.read_text(encoding="utf-8"),

@@ -5,7 +5,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+from pcc1_gate import repo_root
+
+REPO = repo_root()
 if not (REPO / "utils" / "fake_libc_include" / "Python.h").exists():
     REPO = REPO / "pcc"
 

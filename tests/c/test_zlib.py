@@ -55,7 +55,7 @@ def zlib_compiled_units_self():
     return compiled_units, base_dir
 
 
-@pytest.mark.skipif(not os.path.isdir(ZLIB_DIR), reason="zlib-1.3.1 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(ZLIB_DIR) else "zlib-1.3.1 not found")
 def test_zlib_make_goal_dependency_collects_library_sources():
     units, base_dir = _zlib_units()
 
@@ -70,7 +70,7 @@ def test_zlib_make_goal_dependency_collects_library_sources():
     assert "minigzip.c" not in names
 
 
-@pytest.mark.skipif(not os.path.isdir(ZLIB_DIR), reason="zlib-1.3.1 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(ZLIB_DIR) else "zlib-1.3.1 not found")
 def test_zlib_runtime_with_mcjit_depends_on(zlib_compiled_units):
     compiled_units, _base_dir = zlib_compiled_units
 
@@ -82,7 +82,7 @@ def test_zlib_runtime_with_mcjit_depends_on(zlib_compiled_units):
     assert result == 0
 
 
-@pytest.mark.skipif(not os.path.isdir(ZLIB_DIR), reason="zlib-1.3.1 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(ZLIB_DIR) else "zlib-1.3.1 not found")
 def test_zlib_runtime_with_system_link_depends_on(zlib_compiled_units):
     compiled_units, base_dir = zlib_compiled_units
 
@@ -100,7 +100,7 @@ def test_zlib_runtime_with_system_link_depends_on(zlib_compiled_units):
     assert "OK" in result.stdout
 
 
-@pytest.mark.skipif(not os.path.isdir(ZLIB_DIR), reason="zlib-1.3.1 not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(ZLIB_DIR) else "zlib-1.3.1 not found")
 def test_zlib_runtime_with_self_backend_system_link_depends_on(
     zlib_compiled_units_self,
     monkeypatch,

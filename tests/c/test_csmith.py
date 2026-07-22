@@ -58,6 +58,16 @@ if CSMITH_BIN:
             break
 
 DEFAULT_SEEDS = int(os.environ.get("PCC_CSMITH_SEEDS", "20"))
+
+# Deterministic certifiable corpus. Seeds 5, 11, 18 generate programs whose
+# native-oracle run exceeds the timeout budget on every run (rc=124 twice in a
+# row, not load-transient), so they can certify nothing and are replaced (after per-seed vetting; 21 also
+# exceeds the budget) to keep 20 programs. If the installed csmith version changes, a
+# newly-slow seed fails loudly; re-vet the corpus then.
+CSMITH_SEED_CORPUS = (
+    0, 1, 2, 3, 4, 6, 7, 8, 9, 10,
+    12, 13, 14, 15, 16, 17, 19, 20, 22, 23,
+)
 DEFAULT_TIMEOUT = 30
 
 # Csmith flags that produce programs pcc can handle:
@@ -212,16 +222,24 @@ elif CSMITH_INCLUDE is None:
     )
 
 
-@pytest.mark.skipif(_skip_reason is not None, reason=_skip_reason or "")
-@pytest.mark.parametrize("seed", range(DEFAULT_SEEDS))
+@pytest.mark.pcc_gate(unavailable=_skip_reason)
+@pytest.mark.parametrize("seed", CSMITH_SEED_CORPUS[:DEFAULT_SEEDS])
 def test_csmith_seed(seed):
     r = _run_seed(seed)
 
-    if r.native_returncode != 0:
-        pytest.skip(f"native compile/run failed (rc={r.native_returncode})")
+    transient = r.native_returncode != 0 or (
+        r.pcc_returncode != 0
+        and ("timeout" in r.pcc_stderr.lower() or "timed out" in r.pcc_stderr.lower())
+    )
+    if transient:
+        # host load can time out either side; one fresh retry, then hard verdicts
+        r = _run_seed(seed)
 
-    if r.pcc_returncode != 0 and ("timeout" in r.pcc_stderr.lower() or "timed out" in r.pcc_stderr.lower()):
-        pytest.skip(f"csmith seed {r.seed}: pcc execution timed out")
+    if r.native_returncode != 0:
+        pytest.fail(
+            f"csmith seed {r.seed}: native oracle failed twice "
+            f"(rc={r.native_returncode}); the host toolchain/load is broken"
+        )
 
     assert r.pcc_returncode == 0, (
         f"csmith seed {r.seed}: pcc failed (rc={r.pcc_returncode})\n"
@@ -235,10 +253,9 @@ def test_csmith_seed(seed):
     )
 
 
+@pytest.mark.pcc_gate(unavailable=_skip_reason)
 def test_csmith_tool_identity_recorded_when_present(record_property):
     """Seed identity lives in each test id; tool identity is recorded here."""
-    if _skip_reason is not None:
-        pytest.skip(_skip_reason)
     version = subprocess.run(
         [CSMITH_BIN, "--version"], text=True, capture_output=True, timeout=30
     )

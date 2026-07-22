@@ -15,10 +15,22 @@ RUNTIME_MAKEFILE = ROOT / "pcc" / "py_runtime" / "Makefile"
 RUNTIME_INCLUDE = ROOT / "pcc" / "py_runtime" / "include"
 
 
+_CC_REASON = None if shutil.which("cc") else "cc is required for the Metal runtime C FFI shim test"
+_PLATFORM_REASON = (
+    None
+    if sys.platform in ("darwin", "linux")
+    else "dlfcn-based Metal runtime C FFI shim is only tested on Darwin/Linux"
+)
+pytestmark = [
+    pytest.mark.pcc_gate(unavailable=_CC_REASON),
+    pytest.mark.pcc_gate(unavailable=_PLATFORM_REASON),
+]
+
+
 def _cc() -> str:
     cc = shutil.which("cc")
     if cc is None:
-        pytest.skip("cc is required for the Metal runtime C FFI shim test")
+        pytest.fail("cc is required for the Metal runtime C FFI shim test")
     return cc
 
 
@@ -36,7 +48,7 @@ def _fake_bridge_path(tmp_path: Path) -> tuple[Path, list[str], list[str]]:
         bridge_cmd = [_cc(), "-shared", "-fPIC", "-o", str(bridge)]
         driver_extra = ["-ldl"]
     else:
-        pytest.skip("dlfcn-based Metal runtime C FFI shim is only tested on Darwin/Linux")
+        pytest.fail("dlfcn-based Metal runtime C FFI shim is only tested on Darwin/Linux")
     return bridge, bridge_cmd, driver_extra
 
 

@@ -457,15 +457,15 @@ def _real_vllm_metal_install_command(
 def _write_real_cpython_extension_wheel(tmp_path: Path) -> Path:
     cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
     if cc is None:
-        pytest.skip("C compiler required for real CPython extension wheel tracer")
+        pytest.fail("C compiler required for real CPython extension wheel tracer")
     include = sysconfig.get_paths().get("include")
     if not include or not Path(include).is_dir():
-        pytest.skip(
+        pytest.fail(
             "Python include directory required for real CPython extension wheel tracer"
         )
     ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
     if not ext_suffix:
-        pytest.skip(
+        pytest.fail(
             "Python EXT_SUFFIX required for real CPython extension wheel tracer"
         )
 

@@ -1,5 +1,20 @@
 # Network package acquisition backends and NumPy command gate
 
+## Provenance repair (2026-07-22)
+
+The evidence below proved acquisition-mode, URL, hash, target-Python, and host
+assistance fields, but a later full package gate found that the downstream
+install manifest relabeled an owned index acquisition as
+`resolved_from: direct` after receiving its immutable local cache path.  The
+install boundary was repaired by carrying the acquisition origin alongside
+the immutable artifact path.  Host and owned acquisition now retain
+`resolved_from: index-url` while `source_path` remains the verified cache
+artifact.  The combined package/file group passed 77 tests with 3 skips, the
+original current-pcc1 no-host install scenario passed in 6.65 seconds, the
+complete integration suite passed 4551 tests with 12 skips in 669.70 seconds,
+and the complete non-integration suite passed 9503 tests with 28 skips in
+970.63 seconds.
+
 Task: `PKG-P0-NETWORK-ACQUISITION-BACKENDS`
 
 Date: 2026-07-21
@@ -9,7 +24,10 @@ Date: 2026-07-21
 `pcc1 -m pip install <requirement>` now accepts a bounded bare requirement and
 routes acquisition through explicit `auto`, `host`, `owned`, or `offline`
 modes. The report separates acquisition provenance from pcc-native build and
-runtime claims. The command-shaped NumPy gate proves that an ordinary
+runtime claims. `auto` now selects the owned, hash-verified Simple Repository
+path; explicit `host` remains a labeled compatibility mode. This avoids host
+pip's PEP 517 metadata build before pcc performs its own native source build.
+The command-shaped NumPy gate proves that an ordinary
 `pcc1 -m pip install numpy` invocation can acquire a compatible source
 artifact, build/install the required pcc-native NumPy extensions, compile a
 self-backend no-libpython application, and run basic array addition under all
@@ -17,10 +35,11 @@ five GC backends.
 
 This does not claim a general dependency resolver, PEP 517 build isolation, or
 complete NumPy API compatibility. `auto` currently selects the explicitly
-labeled host-assisted backend when a usable host pip is available. The owned
-backend implements the standards-based Simple Repository API download and
-hash verification path for the deliberately strict single-requirement subset;
-unsupported resolution and isolation shapes fail closed.
+labeled owned backend. The owned backend implements the standards-based Simple
+Repository API download and hash verification path for the deliberately strict
+single-requirement subset; explicit owned mode rejects build-isolation shapes,
+while auto may delegate a supported source tree to pcc's native builder and
+still fails closed if that builder cannot satisfy it.
 
 ## Implemented boundaries
 
@@ -28,9 +47,10 @@ unsupported resolution and isolation shapes fail closed.
   reports acquisition mode, records index and artifact origin, verifies
   SHA-256, stores immutable cached artifacts, and distinguishes the requested
   target Python from the host interpreter used for acquisition.
-- Host acquisition delegates only the acquire step to a bounded host pip
-  subprocess. It discovers a host interpreter that actually has pip instead
-  of assuming the repository virtualenv does.
+- Host acquisition remains an explicit compatibility mode. It delegates only
+  the acquire step to a bounded host pip subprocess and discovers a host
+  interpreter that actually has pip instead of assuming the repository
+  virtualenv does.
 - Owned acquisition fetches and parses PEP 503/691 Simple Repository data,
   follows the selected source link over the runtime's native HTTPS path, and
   verifies the advertised digest without a host Python/pip subprocess.
@@ -64,8 +84,9 @@ unsupported resolution and isolation shapes fail closed.
   `tests/python/test_package_network_acquisition.py` — **16 passed in 6.14s**.
 - Package import/install/ABI regression batch — **41 passed, 1 warning in
   3.79s**.
-- Command-shaped online NumPy integration with the current-source pcc1 —
-  **1 passed in 221.34s**. The same emitted application ran NumPy 2.4.x array
+- Command-shaped default-environment NumPy integration with the current pcc1 —
+  **2 passed in 213.02s** after removing an accidental uv project build. The
+  same emitted application ran NumPy 2.4.x array
   addition under GC0, GC1, GC2, GC3, and GC4 with host Python and package-site
   discovery disabled at runtime; linkage checks rejected libpython/Python.
 - Focused set/module-namespace/relative-extension regressions — **18 passed in

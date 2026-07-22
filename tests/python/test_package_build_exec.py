@@ -7,6 +7,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+from pcc1_gate import repo_root
+
 import pytest
 
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
@@ -18,7 +20,7 @@ from pcc.package.build_exec import (
 from pcc.package.metadata import current_platform_tag
 from pcc.package_schema import pcc_native_extension_suffix
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = repo_root()
 
 
 def _find_current_pcc1() -> Path | None:
@@ -635,16 +637,16 @@ def test_execute_build_actions_builds_reusable_numpy_capi_provider_with_include_
     tmp_path,
 ):
     if shutil.which("cc") is None:
-        pytest.skip("C compiler is required for native provider build smoke")
+        pytest.fail("C compiler is required for native provider build smoke")
     provider_dir = Path("utils/pcc_numpy_capi_provider").resolve()
     provider_source = provider_dir / "pccnpapi.c"
     fake_include = Path("utils/fake_libc_include").resolve()
     runtime_include = Path("pcc/py_runtime/include").resolve()
     runtime_lib = Path("pcc/py_runtime").resolve()
     if not provider_source.exists():
-        pytest.skip("reusable NumPy C-API provider source is not present")
+        pytest.fail("reusable NumPy C-API provider source is not present")
     if not (runtime_lib / "libpy_runtime.a").exists():
-        pytest.skip("pcc runtime archive is required for native provider link smoke")
+        pytest.fail("pcc runtime archive is required for native provider link smoke")
     project = tmp_path / "pccnpapi-src"
     shutil.copytree(provider_dir, project)
 
@@ -1065,16 +1067,16 @@ def test_pcc1_build_exec_builds_reusable_numpy_capi_provider_without_host_python
         )
     cc_path = shutil.which("cc")
     if cc_path is None:
-        pytest.skip("C compiler is required for native provider build smoke")
+        pytest.fail("C compiler is required for native provider build smoke")
     provider_dir = Path("utils/pcc_numpy_capi_provider").resolve()
     provider_source = provider_dir / "pccnpapi.c"
     fake_include = Path("utils/fake_libc_include").resolve()
     runtime_include = Path("pcc/py_runtime/include").resolve()
     runtime_lib = Path("pcc/py_runtime").resolve()
     if not provider_source.exists():
-        pytest.skip("reusable NumPy C-API provider source is not present")
+        pytest.fail("reusable NumPy C-API provider source is not present")
     if not (runtime_lib / "libpy_runtime.a").exists():
-        pytest.skip("pcc runtime archive is required for native provider link smoke")
+        pytest.fail("pcc runtime archive is required for native provider link smoke")
     project = tmp_path / "pccnpapi-src"
     shutil.copytree(provider_dir, project)
     env = os.environ.copy()

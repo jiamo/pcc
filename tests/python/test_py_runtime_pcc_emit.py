@@ -43,14 +43,23 @@ _DEFAULT_EMIT_TIMEOUT = 120
 # This repository-scale self-compilation gate emits every runtime C source.
 # Keep it out of the default unit suite; the integration run owns its cost.
 # Within that gate, serialize compiler subprocesses to bound peak memory.
+_PCC_BIN = shutil.which("pcc")
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.xdist_group(name="pcc_runtime_emit"),
+    pytest.mark.pcc_gate(
+        unavailable=None if _PCC_BIN else "pcc CLI (cli_core) not on PATH"
+    ),
 ]
 
 
 def _runtime_sources() -> list[Path]:
-    return sorted(RUNTIME_SRC.glob("*.c"))
+    # CC-only C-kernel platform helpers (SDK-header / ABI structs; see
+    # Makefile PCC_CC_ONLY_SRCS) are statically inapplicable, not skips.
+    return sorted(
+        p for p in RUNTIME_SRC.glob("*.c")
+        if p.name not in _CC_ONLY_KERNEL_SOURCES
+    )
 
 
 @pytest.mark.parametrize(
@@ -59,14 +68,7 @@ def _runtime_sources() -> list[Path]:
     ids=lambda p: p.name,
 )
 def test_pcc_emits_object_for_runtime_source(tmp_path, src):
-    pcc_bin = shutil.which("pcc")
-    if not pcc_bin:
-        pytest.skip("pcc CLI (cli_core) not on PATH")
-    if src.name in _CC_ONLY_KERNEL_SOURCES:
-        pytest.skip(
-            f"{src.name} is a CC-only C-kernel platform helper "
-            "(SDK-header / ABI struct; see Makefile PCC_CC_ONLY_SRCS)"
-        )
+    pcc_bin = _PCC_BIN
     obj_path = tmp_path / (src.stem + ".o")
     cmd = [
         pcc_bin,

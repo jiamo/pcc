@@ -244,7 +244,7 @@ def _oracle_dataset(n: int, ncancel: int, steps):
 
 def test_c_timer_heap_matches_oracle_dataset(tmp_path):
     if not CC_VERDICT.available:
-        pytest.skip(CC_VERDICT.skip_reason())
+        pytest.fail(CC_VERDICT.skip_reason())
     cc = CC_VERDICT.resolved_path
 
     root = _repo_root()
@@ -334,7 +334,7 @@ def test_c_timer_heap_matches_oracle_dataset(tmp_path):
 
 def test_c_timer_heap_scripted_semantics(tmp_path):
     if not CC_VERDICT.available:
-        pytest.skip(CC_VERDICT.skip_reason())
+        pytest.fail(CC_VERDICT.skip_reason())
     cc = CC_VERDICT.resolved_path
 
     root = _repo_root()

@@ -20,111 +20,66 @@ Historical startup ledger:
 ## Active milestone
 
 - Milestone: `M5`
-- Tasks in milestone: `92`
+- Tasks in milestone: `133`
 - `BLOCKED`: `2`
 - `CLAIM_RISK`: `1`
-- `DONE_STRONG`: `84`
-- `TODO_READY`: `5`
-- Next dependency-ready task: `CLI-P0-PCC1-OWNER-DEFAULTS`
-- Next title: Make bare pcc1 Python execution default to the self owner with no libpython
-- Next open boundary: For Python inputs only, make pcc1 resolve an omitted backend to self, libpython mode to off, and IR scaffold to on. Preserve explicit --backend llvm as the oracle and explicit libpython auto/on as compatibility modes. Fail closed on unsupported self behavior with no implicit LLVM or libpython fallback.
+- `DONE_STRONG`: `91`
+- `DONE_WEAK`: `2`
+- `IN_PROGRESS`: `2`
+- `TODO_READY`: `35`
+- Next dependency-ready task: `PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE`
+- Next title: Eliminate repeated GC-invariant work from self-host compiler stages
+- Next open boundary: Measure isolated pcc1-to-pcc2 phase costs and artifact identity, then remove or content-address reuse of repeated parse, discovery, type/export, IR-pass, and self-object work wherever the cache key proves it independent of GC runtime policy. Keep GC-specific runtime, ABI, link, fixed-point, and behavior gates distinct; do not reduce tests, loosen semantics, or increase timeouts as the optimization.
 
 ## Active task table
 
+`DONE_STRONG` rows (91) are omitted here to keep the
+startup state compact; the full ledger is `docs/goal/task-board.yaml`.
+
 | Rank | ID | Status | Depends on | Evidence |
 |---:|---|---|---|---|
-| 69 | `C-P0-FAKE-DLFCN-RTLD-LAZY` | `DONE_STRONG` | PKG-P0-NETWORK-ACQUISITION-BACKENDS | docs/goal/evidence/2026-07-22-fake-dlfcn-rtld-lazy-runtime-oracle.md |
-| 69 | `TEST-P0-PACKAGE-ABI-UTF8-SOURCE-READ` | `DONE_STRONG` | C-P0-FAKE-DLFCN-RTLD-LAZY | docs/goal/evidence/2026-07-22-package-abi-utf8-source-read.md |
-| 70 | `PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL` | `DONE_STRONG` | TEST-P0-FULL-SUITE-BUILD-EFFICIENCY, PKG-P0-NETWORK-ACQUISITION-BACKENDS, C-P0-FAKE-DLFCN-RTLD-LAZY, TEST-P0-PACKAGE-ABI-UTF8-SOURCE-READ | docs/goal/evidence/2026-07-22-self-backend-bounded-worker-pool.md |
-| 71 | `TEST-P0-FULL-GC-MEMORY-BUDGET` | `DONE_STRONG` | PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL | docs/goal/evidence/2026-07-22-full-gc-aggregate-memory-budget.md |
-| 75 | `PKG-P0-NETWORK-ACQUISITION-BACKENDS` | `DONE_STRONG` | PKG-P0-INSTALL-IMPORT-SEPARATION, PKG-P0-ABI-MODE-LABELS, M2-NUMPY-L5 | docs/goal/evidence/2026-07-21-network-acquisition-backends-closure.md |
-| 80 | `CLI-P0-PCC1-OWNER-DEFAULTS` | `TODO_READY` | PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL | - |
-| 85 | `PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT` | `TODO_READY` | PKG-P0-NETWORK-ACQUISITION-BACKENDS, CLI-P0-PCC1-OWNER-DEFAULTS | - |
-| 90 | `GPU-P0-OWNER-BACKEND-CONTRACT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-16-gpu-owner-backend-contract.md |
-| 90 | `PKG-P0-UV-PROJECT-ENVIRONMENT` | `TODO_READY` | PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT | - |
-| 100 | `GPU-P0-PCC-METAL-OWNER-DRIVER` | `DONE_STRONG` | GPU-P0-OWNER-BACKEND-CONTRACT | docs/goal/evidence/2026-07-17-pcc-metal-owner-driver.md |
-| 100 | `PKG-P1-UV-LOCKED-NATIVE-SYNC` | `TODO_READY` | PKG-P0-UV-PROJECT-ENVIRONMENT | - |
-| 110 | `GPU-P0-TVM-TILELANG-OWNER-DRIVER` | `DONE_STRONG` | GPU-P0-PCC-METAL-OWNER-DRIVER | docs/goal/evidence/2026-07-17-tvm-tilelang-owner-driver.md |
+| 99 | `PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE` | `IN_PROGRESS` | TEST-P0-COLD-SELF-HOST-WARMUP-BUDGET, PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL, TEST-P0-FULL-GC-MEMORY-BUDGET | - |
+| 100 | `PKG-P1-UV-LOCKED-NATIVE-SYNC` | `IN_PROGRESS` | PKG-P0-UV-PROJECT-ENVIRONMENT | - |
+| 101 | `PERF-P1-COMPILER-DESIGN-REFERENCE-AUDIT` | `TODO_READY` | PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE | - |
 | 110 | `PKG-P1-RUNTIME-PROFILE-ENVIRONMENT-INVARIANCE` | `TODO_READY` | PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT | - |
-| 990 | `TEST-P0-FULL-SUITE-BUILD-EFFICIENCY` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-20-full-suite-build-efficiency-closure.md |
-| 1000 | `AUD-P0-CLAUDE-LOW-RISK-FIXES` | `DONE_STRONG` | - | docs/current-goal-state.md |
-| 1000 | `AUD-P0-GC-BARRIER-WRITE-AUDIT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-gc-barrier-peripheral-runtime-closure.md |
-| 1000 | `AUD-P0-GC-SLOT-VISITOR` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-gc-slot-visitor-current-source-closure.md |
-| 1000 | `AUD-P0-RUNTIME-ASSERTS` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-runtime-tripwire-closure.md |
-| 1000 | `AUD-P1-BOOTSTRAP-SUBPROCESS-TIMEOUTS` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-bootstrap-subprocess-timeout-closure.md |
-| 1000 | `AUD-P1-C-CODEGEN-SOURCE-OF-TRUTH` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-c-libc-core-registry-source-closure.md |
-| 1000 | `AUD-P1-C-IR-POSTPROCESS-POLICY` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-c-ir-branch-protection-attribute-closure.md |
-| 1000 | `AUD-P1-CLI-ENTRYPOINT-SOURCE-OF-TRUTH` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-cli-entrypoint-contract-closure.md |
-| 1000 | `AUD-P1-DIAGNOSTICSPAN-ADOPTION` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-diagnostic-span-codegen-adoption-closure.md |
-| 1000 | `AUD-P1-GC-INDEX-TABLE-SOURCE-OF-TRUTH` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-gc-index-source-of-truth-closure.md |
-| 1000 | `AUD-P1-HOIST-LAYER1-SPLIT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-hoist-layer1-split-closure.md |
-| 1000 | `AUD-P1-NUMPY-CAPI-PROVIDER-SPLIT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-07-numpy-capi-provider-split.md |
-| 1000 | `AUD-P1-PCC1-DYNAMIC-CLASS-DESCRIPTOR-REGRESSION` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-pcc1-dynamic-class-descriptor-fixed-layout.md |
-| 1000 | `AUD-P1-PY-FRONTEND-LOWERING-CONSOLIDATION` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-python-floordiv-lowering-owner.md |
-| 1000 | `AUD-P1-RUNTIME-CLASS-LAYOUT-MIRROR` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-runtime-pyclass-layout-mirror.md |
-| 1000 | `AUD-P1-RUNTIME-MIRROR-PARITY` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-runtime-set-dict-perturb-parity.md |
-| 1000 | `AUD-P1-XFAIL-ORACLE-CLAIM-AUDIT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-lua-xfail-claim-hygiene.md |
-| 1000 | `AUD-P2-BUILTIN-EXC-TAG-DEDUP` | `DONE_STRONG` | - | docs/current-goal-state.md |
+| 1000 | `ARCH-P2-C-CODEGEN-DECOMPOSE` | `TODO_READY` | - | pcc/codegen/c_codegen.py |
+| 1000 | `ARCH-P2-PCC1-PYTEST-EXTRACT` | `TODO_READY` | - | pcc/cli_bootstrap.py |
+| 1000 | `ARCH-P2-PIPELINE-DECOMPOSE` | `TODO_READY` | - | pcc/py_frontend/pipeline.py |
+| 1000 | `ARCH-P2-PORT-ABI-AUTOGEN` | `TODO_READY` | - | tests/python/test_runtime_layout_contract.py |
+| 1000 | `ARCH-P2-SELF-IR-PARSER-STRUCTURE` | `TODO_READY` | - | pcc/backend/self_backend_parse.py |
+| 1000 | `ARCH-P3-GC-DISPATCH-EVAL` | `TODO_READY` | - | pcc/py_runtime/src/py_gc_backend.c |
+| 1000 | `ARCH-P3-LAYER1-STATE-PROTOCOL` | `TODO_READY` | - | pcc/py_frontend/codegen/layer1_mixins.py |
+| 1000 | `ARCH-P3-TYPE-PREDICATE-INVENTORY` | `TODO_READY` | - | pcc/py_frontend/type_infer.py |
+| 1000 | `AUD-P2-CLI-SHARED-HELPER-DUPLICATION` | `TODO_READY` | - | docs/goal/evidence/2026-07-23-bad-smell-audit-triage.md |
 | 1000 | `AUD-P2-DEAD-ROADMAP-MODULE-INVENTORY` | `CLAIM_RISK` | - | docs/goal/evidence/2026-07-09-claude-structural-audit-triage.md |
-| 1000 | `BUG-P1-PCC1-LINKAGE-SCANNER-FALSE-LIBPYTHON-EDGE` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-18-bootstrap-critical-runtime-frontend-closure.md |
-| 1000 | `DIST-P0-LOCAL-COLLECTIVE-ORACLE-CODE` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-dist-local-oracle-closure.md |
-| 1000 | `DIST-P0-TCP-TRANSPORT-OWNER` | `DONE_STRONG` | DIST-P0-LOCAL-COLLECTIVE-ORACLE-CODE | docs/goal/evidence/2026-07-17-dist-tcp-owner-closure.md |
-| 1000 | `DIST-P0-TRANSPORT-COLLECTIVE-OWNER` | `DONE_STRONG` | DIST-P0-TCP-TRANSPORT-OWNER | docs/goal/evidence/2026-07-17-dist-transport-collective-owner-closure.md |
+| 1000 | `AUD-P2-SELF-MODULE-SPECIAL-CASES-IN-CODEGEN` | `TODO_READY` | - | docs/goal/evidence/2026-07-23-bad-smell-audit-triage.md |
+| 1000 | `BUG-P1-PY-LIST-TODO-RAISE-PLACEHOLDERS` | `TODO_READY` | - | docs/goal/evidence/2026-07-23-bad-smell-audit-triage.md |
 | 1000 | `DIST-P1-MULTI-MAC-TRANSPORT-E2E` | `BLOCKED` | DIST-P0-TRANSPORT-COLLECTIVE-OWNER | docs/goal/evidence/2026-07-17-dist-multi-mac-owner-blocked.md |
 | 1000 | `DIST-P1-THROUGHPUT-SCALING` | `BLOCKED` | DIST-P0-TRANSPORT-COLLECTIVE-OWNER, DIST-P1-MULTI-MAC-TRANSPORT-E2E | docs/design/pcc-dist-runtime.md |
-| 1000 | `DIST-P1-TRAINING-INFERENCE-EXECUTION` | `DONE_STRONG` | DIST-P0-TRANSPORT-COLLECTIVE-OWNER | docs/goal/evidence/2026-07-17-dist-tensor-kv-execution.md |
-| 1000 | `DS4-P0-INVENTORY-ORACLE` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-ds4-golden-values-capture.md |
-| 1000 | `DS4-P1-CPU-COMPILE-SUBSET` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-ds4-cpu-compile-subset.md |
-| 1000 | `DS4-P2-GPU-API-MAPPING` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-ds4-gpu-api-mapping.md |
-| 1000 | `DS4-P3-PRIMITIVE-ORACLE` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-ds4-first-copy-primitive.md |
-| 1000 | `GPU-P0-CANONICAL-KERNEL-IR-PATH` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-gpu-canonical-kernel-ir-closure.md |
-| 1000 | `GPU-P0-DLPACK-5GC-DEVICE-LIFETIME` | `DONE_STRONG` | GPU-P0-DLPACK-PCC1-CAPSULE, GPU-P0-METAL-5GC-LIFETIME-REAL | docs/goal/evidence/2026-07-17-metal-dlpack-five-gc-device-lifetime.md |
-| 1000 | `GPU-P0-DLPACK-EXTERNAL-CAPSULE-INTEROP` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-metal-dlmanagedtensor-interop-closure.md |
-| 1000 | `GPU-P0-DLPACK-FRAMEWORK-MPS-ROUNDTRIP` | `DONE_STRONG` | GPU-P0-DLPACK-EXTERNAL-CAPSULE-INTEROP, GPU-P0-HARDWARE-LEVEL-GATES | docs/goal/evidence/2026-07-17-metal-mlx-dlpack-roundtrip-closure.md |
-| 1000 | `GPU-P0-DLPACK-PCC1-CAPSULE` | `DONE_STRONG` | GPU-P0-DLPACK-EXTERNAL-CAPSULE-INTEROP, GPU-P0-METAL-PCC1-LAUNCH-REAL | docs/goal/evidence/2026-07-17-metal-dlpack-pcc1-capsule-closure.md |
-| 1000 | `GPU-P0-DLPACK-TENSOR-OWNERSHIP` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-metal-dlpack-tensor-ownership-closure.md |
-| 1000 | `GPU-P0-GC-EXTERNAL-RESOURCE-SEAM` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-gpu-gc-runtime-external-resource-closure.md |
-| 1000 | `GPU-P0-HARDWARE-LEVEL-GATES` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-gpu-level4-gate-closure.md |
-| 1000 | `GPU-P0-METAL-5GC-LIFETIME-REAL` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-metal-five-gc-lifetime-closure.md |
-| 1000 | `GPU-P0-METAL-PCC1-LAUNCH-REAL` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-metal-pcc1-launch-closure.md |
-| 1000 | `GPU-P0-METAL-RUNTIME-SOURCE-PACKAGE` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-metal-runtime-source-package-closure.md |
-| 1000 | `GPU-P0-METALLIB-OFFLINE-CHAIN` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-metal-metallib-offline-chain-closure.md |
-| 1000 | `GPU-P0-SIMDGROUP-TENSORCORE-GEMM` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-metal-simdgroup-lowering-closure.md |
-| 1000 | `GPU-P0-TILELANG-GEMM-RUNTIME-ORACLE` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-tilelang-gemm-runtime-oracle-closure.md |
-| 1000 | `GPU-P0-TILELANG-NATIVE-NAMING-BOUNDARY` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-08-gpu-tilelang-native-naming-boundary.md |
-| 1000 | `GPU-P0-TVM-TIRX-HOST-DEVICE-SPLIT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-tirx-metal-host-device-split-closure.md |
-| 1000 | `GPU-P1-BROADER-TILELANG-TIRX-PASSES` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-tilelang-broader-phase1-closure.md |
-| 1000 | `GPU-P1-TILELANG-EXECUTABLE-LOOP-BODIES` | `DONE_STRONG` | GPU-P1-BROADER-TILELANG-TIRX-PASSES | docs/goal/evidence/2026-07-17-tilelang-executable-loop-bodies.md |
-| 1000 | `GPU-P1-TILELANG-GENERAL-FILL` | `DONE_STRONG` | GPU-P1-BROADER-TILELANG-TIRX-PASSES | docs/goal/evidence/2026-07-17-tilelang-general-fill.md |
-| 1000 | `GPU-P1-TILELANG-SPARSE-METAL-FIRST` | `DONE_STRONG` | GPU-P1-BROADER-TILELANG-TIRX-PASSES | docs/goal/evidence/2026-07-17-tilelang-sparse-metal-first.md |
-| 1000 | `GPU-P2-TILELANG-ADVANCED-LAYOUT-LOWERING` | `DONE_STRONG` | GPU-P1-BROADER-TILELANG-TIRX-PASSES | docs/goal/evidence/2026-07-17-tilelang-wgmma-layout-classification.md |
-| 1000 | `GPU-P2-TILELANG-DYNAMIC-SHAPE-CONTRACT` | `DONE_STRONG` | GPU-P1-BROADER-TILELANG-TIRX-PASSES | docs/goal/evidence/2026-07-17-tilelang-dynamic-shape-contract.md |
-| 1000 | `PKG-P0-ABI-MODE-LABELS` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-08-pkg-abi-mode-labels.md |
-| 1000 | `PKG-P0-INSTALL-IMPORT-SEPARATION` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-08-pkg-install-import-separation.md |
-| 1000 | `PKG-P0-PCC1-COMPAT-RUNNER` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-pcc1-cpython-compat-runner-closure.md |
-| 1000 | `PKG-P1-NATIVE-EXTENSION-LADDER` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-18-native-extension-ladder-done-strong.md |
-| 1001 | `AUD-P1-C-SIGNEDNESS-SOURCE-OF-TRUTH` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-c-integer-conversion-owner.md |
-| 1001 | `AUD-P1-IR-PASS-ORACLE-STRENGTH` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-lower-expect-semantic-oracle.md |
-| 1001 | `AUD-P1-PCC1-BARE-RERAISE-ACTIVE-EXCEPTION` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-pcc1-bare-reraise-active-exception.md |
-| 1002 | `AUD-P1-C-ABI-LAYOUT-SOURCE-OF-TRUTH` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-c-scalar-pointer-layout-owner.md |
-| 1002 | `AUD-P1-DEPENDENCY-GUARD-CLAIM-AUDIT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-opt-dependency-verdict.md |
-| 1002 | `AUD-P1-PY-SUBSCRIPT-LOWERING-CONSOLIDATION` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-exact-container-getitem-lowering-owner.md |
-| 1003 | `AUD-P1-PLATFORM-GUARD-CLAIM-AUDIT` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-self-backend-platform-verdict.md |
-| 1003 | `AUD-P1-PY-COMPARISON-LOWERING-CONSOLIDATION` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-runtime-object-comparison-owner.md |
-| 1003 | `AUD-P2-PY-LIST-SUBSCRIPT-STORE-INDEXERROR` | `DONE_STRONG` | AUD-P1-PY-SUBSCRIPT-LOWERING-CONSOLIDATION | docs/goal/evidence/2026-07-18-bootstrap-critical-runtime-frontend-closure.md |
-| 1004 | `AUD-P1-PY-DYNTYPE-OP-LOWERING-CONSOLIDATION` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-dyntype-tagged-binop-owner.md |
-| 1010 | `AUD-P1-NATIVE-OS-MAKEDIRS` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-17-native-os-makedirs.md |
-| 1020 | `AUD-P1-SELFHOST-MISCOMPILE-ROOT-FIXES` | `DONE_STRONG` | - | docs/goal/evidence/2026-07-18-selfhost-miscompile-root-fixes.md |
-| 1101 | `AUD-P2-IR-PASS-INSTSIMPLIFY-SEMANTIC-ORACLE` | `DONE_STRONG` | AUD-P1-IR-PASS-ORACLE-STRENGTH | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
-| 1102 | `AUD-P2-IR-PASS-LOOP-ROTATE-SEMANTIC-ORACLE` | `DONE_STRONG` | AUD-P1-IR-PASS-ORACLE-STRENGTH | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
-| 1103 | `AUD-P2-IR-PASS-MEM2REG-SEMANTIC-ORACLE` | `DONE_STRONG` | AUD-P1-IR-PASS-ORACLE-STRENGTH | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
-| 1104 | `AUD-P2-IR-PASS-INLINE-SEMANTIC-ORACLE` | `DONE_STRONG` | AUD-P1-IR-PASS-ORACLE-STRENGTH | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
-| 1201 | `AUD-P2-DEPENDENCY-SYSTEM-CC-VERDICT` | `DONE_STRONG` | AUD-P1-DEPENDENCY-GUARD-CLAIM-AUDIT | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
-| 1202 | `AUD-P2-DEPENDENCY-RUNTIME-ARCHIVE-VERDICT` | `DONE_STRONG` | AUD-P1-DEPENDENCY-GUARD-CLAIM-AUDIT | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
-| 1203 | `AUD-P2-DEPENDENCY-CSMITH-VERDICT` | `DONE_STRONG` | AUD-P1-DEPENDENCY-GUARD-CLAIM-AUDIT | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
-| 1301 | `AUD-P2-PLATFORM-BOOTSTRAP-BASELINE-VERDICT` | `DONE_STRONG` | AUD-P1-PLATFORM-GUARD-CLAIM-AUDIT | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
-| 1302 | `AUD-P2-PLATFORM-BINARY-INSPECTION-VERDICT` | `DONE_STRONG` | AUD-P1-PLATFORM-GUARD-CLAIM-AUDIT | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
-| 1303 | `AUD-P2-PLATFORM-POSIX-RUNTIME-VERDICT` | `DONE_STRONG` | AUD-P1-PLATFORM-GUARD-CLAIM-AUDIT | docs/goal/evidence/2026-07-18-ir-pass-semantic-oracles-and-dependency-verdicts.md |
+| 1000 | `LIBC-P1-IMPORT-RATCHET` | `DONE_WEAK` | - | tests/libc_import_baseline.json |
+| 1000 | `LIBC-P1-PRIMITIVES` | `TODO_READY` | - | pcc/unsafe/__init__.py |
+| 1000 | `LIBC-P2-ALLOCATOR` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
+| 1000 | `LIBC-P2-MEM-STR` | `TODO_READY` | - | tests/libc_import_baseline.json |
+| 1000 | `LIBC-P2-STDIO-SUBSET` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
+| 1000 | `LIBC-P2-THIN-WRAPPERS` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
+| 1000 | `LIBC-P3-HARD-SINGLETONS` | `TODO_READY` | - | tests/libc_import_baseline.json |
+| 1000 | `LIBC-P3-LINUX-ZERO-LIBC-TRACER` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
+| 1000 | `PERF-P1-FRAME-POOL` | `TODO_READY` | - | docs/investigations/gc-frame-index-entry-pool-perf.md |
+| 1000 | `PERF-P1-INT-READMIT` | `TODO_READY` | - | tests/python/test_py_typed_int_unboxed.py |
+| 1000 | `PERF-P1-REGALLOC` | `TODO_READY` | - | pcc/backend/self_backend_aarch64_darwin_slots.py |
+| 1000 | `PERF-P1-TIERING` | `TODO_READY` | - | docs/plans/all-pass-llvm-ir-1to1-master-plan.md |
+| 1000 | `PERF-P2-COLD-PATHS` | `TODO_READY` | - | pcc/backend/self_backend_aarch64_darwin_flow.py |
+| 1000 | `PERF-P2-LDP-STP` | `TODO_READY` | PERF-P1-REGALLOC | pcc/backend/self_backend_target_passes.py |
+| 1000 | `PERF-P2-LOOKUP` | `TODO_READY` | - | pcc/py_runtime/src/py_class.c |
+| 1000 | `PERF-P2-MADD-FOLD` | `TODO_READY` | PERF-P1-REGALLOC | pcc/backend/self_backend_aarch64_darwin_addr.py |
+| 1000 | `PERF-P2-PASS-WIRE` | `TODO_READY` | PERF-P1-TIERING | pcc/py_frontend/ir_pass_pipeline.py |
+| 1000 | `PERF-P3-BUMP` | `TODO_READY` | - | benchmarks/run_gc_advantage_matrix.py |
+| 1000 | `PERF-P3-PASS-CLOSURE` | `TODO_READY` | PERF-P2-PASS-WIRE | docs/plans/all-pass-llvm-ir-1to1-master-plan.md |
+| 1000 | `PERF-P3-RC-ELISION` | `TODO_READY` | - | pcc/py_frontend/codegen/ownership_lowering.py |
+| 1000 | `PERF-P3-SIMD` | `TODO_READY` | PERF-P2-LDP-STP, PERF-P2-MADD-FOLD | pcc/ir_passes/slp_vectorizer.py |
+| 1000 | `PKG-P2-REINSTALL-FASTPATH` | `TODO_READY` | - | docs/investigations/pcc1-pip-numpy-owned-acquire-60s-timeout.md |
+| 1000 | `TEST-P1-NO-SKIP-DOCTRINE-REMAINING-FAMILIES` | `DONE_WEAK` | - | docs/goal/evidence/2026-07-24-no-skip-doctrine-full-conversion.md |
+| 1000 | `TEST-P2-REMOVE-LEGACY-PATH-SHIM` | `TODO_READY` | - | docs/investigations/tests-conftest-legacy-path-shim-false-repo-root.md |
 
 ## Checked truth manifest
 

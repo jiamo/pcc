@@ -4,6 +4,14 @@
 
 先把诚实的范围立在最前,因为这条线最容易被一句"我们支持 TVM/TileLang"骗过去:今天真实存在的是**一条 Metal 内核 IR 路径 + 小固定形状内核的真机执行**(仅 macOS/Metal、本机、硬件门控);**不存在**整程序 GPU、`import tvm` / `import tilelang` 的运行时执行、以及真正的分布式运行时。本章每一节都会重复标注它证明了什么、没证明什么。
 
+## 本章导读: GPU/Metal 线程是拥有权选件而非第六使命
+
+本章展示 pcc 如何将"原生可拥有执行"的北极星延伸至 GPU 与加速器硬件。阅读时请记住三个边界:
+
+- Metal 内核 IR 与 host/device 分裂是唯一真正的编译路径。
+- TVM、TIRx 与 TileLang 仅仅作为对比 oracle 或语法子集解析器存在。
+- GPU-GC 与分布式子系统今天仍是纯 CPU 上的结构验证 oracle。
+
 ## 19.1 边界与总览
 
 GPU 线由三块组成,成熟度递减:
@@ -75,6 +83,13 @@ Kernel IR -> validate_kernel() -> TIRx 兼容 freeze -> Metal 定案 -> 启动�
 
 `pcc/gpu_gc/`(`__version__ = "0.0.1-oracle"`)是**CPU-only 研究 oracle**:它借用五个生产 GC 后端(第 10–11 章)的词汇建模 GPU 对象/外部资源生命周期,但**没有接入**那五个后端,也不是一个会搬动的收集器。它的 `external_resource` 缝是"production-shaped"但未接 C 或 pcc-Python 运行时。
 
+```text
+[Host Python App] ──► kernel_ir.validate_kernel() ──► Metal Finalize (.metallib)
+                            │                               │
+                            ▼                               ▼
+                     CPU Oracle 对照 ◄────────────── Metal Hardware Execution
+```
+
 `pcc/dist/` 是**本机单进程、CPU、无 socket** 的元数据 oracle:建模 session/`DRef` 身份、device mesh、确定性 collective 语义、sharding schedule、KV-block 记账。每种网络模式都报 `SKIPPED_WITH_REASON`——不是多进程、不是 localhost-TCP、不是多机执行。
 
 ## 19.7 声明边界(把话说死)
@@ -94,3 +109,14 @@ env -u LC_ALL uv run pytest tests/gpu_gc -q -n0        # GPU-GC 元数据/生命
 ## 历史与教训
 
 这条线的教训不是某个 bug,而是**为什么"oracle,不是 owner"必须写进架构**。一个 GPU 编译器最容易的自欺是:import 了 TVM/TileLang、让上游帮你跑通一个 kernel,然后宣称"支持 TVM/TileLang"——而其实你只是它们的调用者,一点执行所有权都没拿到。pcc 的选择是把 TVM/TIRx/TileLang 全部降为参照:它们定义"正确的形状长什么样",pcc 自己拥有从内核 IR 到 Metal 的每一步。这和第 13 章 self 后端把 LLVM 当 oracle、第 16 章值模型把 Valhalla 当投影参照,是同一条设计纪律的三次出现。代价是慢——只能一小片一小片地长;收益是每一片都是**自己的**、可审计、可 claim-level 标定的执行,而不是一句借来的"支持"。
+
+## 小结
+
+1. **Host/Device 严格分离**: `validate_kernel()` 拒绝在设备端出现任何堆对象、动态分派或异常处理。
+2. **Oracle 架构法则**: TVM 与 TileLang 仅仅是验证 IR 形状与参照正确性的 oracle,不构成运行时依赖。
+3. **硬件闸门严谨性**: 所有硬件加速测试均由 `PCC_GPU_HARDWARE_STRICT=1` 显式门控,无环境时严格上报 `SKIPPED_WITH_REASON`。
+
+## 练习
+
+1. 阅读 [pcc/kernel_ir/tilelang_import.py](../../pcc/kernel_ir/tilelang_import.py),分析 `_parse_tilelang_ast` 如何在不 import `tilelang` 的前提下解析 PrimFunc AST。
+2. 尝试编写一个包含 `PyObject` 创建的 `@gpu.kernel` 函数,观察 `validate_kernel()` 抛出的具体的错误诊断。

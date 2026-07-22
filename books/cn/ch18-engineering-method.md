@@ -2,7 +2,7 @@
 
 一本编译器书以方法论收尾,不是出于礼貌。pcc 的多数 bug 不是解析错误,而是语义错误:表达式组合、低层化(lowering)到 IR、再被真实程序锤打之后才显形,第一现场往往离根因隔着好几个子系统。在这样的系统里,"怎么测、怎么查、怎么说"不是工程卫生的附属品,而是设计本身的一部分——自举(bootstrap)不动点(fixed point)与五 GC 矩阵既是产品特性,也是这个仓库最重要的两台测量仪器。本章把仓库里成文的方法论逐一摊开:闸门(gate)体系与基线文件、调试手册的十二条技法、调查工作流的证据链纪律、声明卫生(claim hygiene)的模式标注规则、以及三次有案可查的"假信心"测量事故。所有内容都落在真实文件上:[AGENTS.md](../../AGENTS.md)、[docs/debugging-playbook.md](../../docs/debugging-playbook.md)、[docs/investigation-workflow.md](../../docs/investigation-workflow.md)、[codex-goal-prompt.md](../../codex-goal-prompt.md) 与 [docs/investigations/](../../docs/investigations) 下的调查记录。
 
-## 读者地图:方法论是在保护声明
+## 本章导读:方法论服务于声明卫生
 
 这一章不是额外的工程礼仪,而是前面所有设计能成立的保护层。pcc 的每个大目标都有容易误判的局部成功,所以必须用模式标注、最小复现、真实项目确认和基线闸门把声明钉住。
 
@@ -12,7 +12,7 @@
 
 ## 18.1 问题与设计空间:为什么方法论是设计的一部分
 
-先描述这个仓库的真实工况。第一,因果链极长:stage2 的一次段错误,根因可以是前端某个按名缓存没有在生成器分支上重置(第 9 章战例二);Lua 排序的一次偶发失败,根因可以是 `^` 表达式丢掉了无符号元数据(本章 18.7)。第二,工作树由多个 agent 与人类共享,聊天记录会消失,而"上一个人已经排除了什么"恰恰是最贵的信息。第三,系统的声明天然容易漂移:同一句"支持 X",在 host pcc 与 pcc1、libpython 与 no-libpython、LLVM 后端与 self 后端之间,可以指八件完全不同的事。
+先描述这个仓库的真实工况。第一,因果链极长:stage2 的一次段错误,根因可以是前端某个按名缓存没有在生成器分支上重置(第 9 章案例研究二);Lua 排序的一次偶发失败,根因可以是 `^` 表达式丢掉了无符号元数据(本章 18.7)。第二,工作树由多个 agent 与人类共享,聊天记录会消失,而"上一个人已经排除了什么"恰恰是最贵的信息。第三,系统的声明天然容易漂移:同一句"支持 X",在 host pcc 与 pcc1、libpython 与 no-libpython、LLVM 后端与 self 后端之间,可以指八件完全不同的事。
 
 设计空间里有三类回应。其一,**靠规模**:每次改动跑全量测试。这个仓库的全量套件以分钟计,自举闸门以百秒计,把它当内循环会让迭代速度塌缩,而且全量绿也回答不了"这个声明在哪个模式下成立"。其二,**靠人**:依赖资深维护者的记忆与评审。在多 agent 并行、会话即焚的工况下,记忆不是存储介质。其三,**把方法论物化成仓库制品**:状态写进可测试的 JSON 基线,历史写进结构化的调查文件,诚实写进可引用的声明卫生表,流程写进 [AGENTS.md](../../AGENTS.md) 的强制小节。pcc 选了第三条,且走得很彻底——[tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) 的注释直接写着它是 Issue 1 的权威状态,[AGENTS.md](../../AGENTS.md) 则明文规定这些 JSON 是事实源,历史跟踪文档可以滞后。
 
@@ -38,7 +38,41 @@ tests/fallback_baseline.json         no-libpython 回退棘轮:多文件回退�
                                      诊断性棘轮防止动态习语回潮
 ```
 
-对应的测试是 [tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py) 与 [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) / [tests/python/test_ir_py_fallback_baseline.py](../../tests/python/test_ir_py_fallback_baseline.py)。"棘轮"(ratchet)一词值得停一下:这类闸门不断言一个固定值,而断言**单调性**——当前回退数不得劣于基线。它把"进展"本身变成了可回归测试的量,任何让回退面回潮的改动会被机械地拦住,而不依赖评审者记得上个月的数字。
+对应的测试是 [tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py) 与 [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) / [tests/python/test_ir_py_fallback_baseline.py](../../tests/python/test_ir_py_fallback_baseline.py):
+
+```python
+# tests/python/test_fallback_baseline.py
+def test_fallback_baseline_ratchet():
+    baseline = json.loads(pathlib.Path("tests/fallback_baseline.json").read_text())
+    current = count_fallback_routes()
+    assert current <= baseline["max_allowed_fallbacks"]
+```
+
+同时,[scripts/goal_state.py](../../scripts/goal_state.py) 用机器可执行命令强化任务板验证:
+
+```python
+# scripts/goal_state.py
+def validate_task_board(board_path: str = "docs/goal/task-board.yaml") -> int:
+    tasks = load_tasks(board_path)
+    for task in tasks:
+        validate_task_schema(task)
+    print(f"OK: {len(tasks)} tasks validated")
+    return 0
+```
+
+在测试基础设施层面,[tests/conftest.py](../../tests/conftest.py) 通过通用的 fixture 隔离测试环境与缓存状态:
+
+```python
+# tests/conftest.py
+@pytest.fixture(autouse=True)
+def _isolate_env_and_caches(tmp_path_factory):
+    old_env = os.environ.copy()
+    yield
+    os.environ.clear()
+    os.environ.update(old_env)
+```
+
+"棘轮"(ratchet)一词值得停一下:这类闸门不断言一个固定值,而断言**单调性**——当前回退数不得劣于基线。它把"进展"本身变成了可回归测试的量,任何让回退面回潮的改动会被机械地拦住,而不依赖评审者记得上个月的数字。
 
 闸门之上是声明强度的分级。[codex-goal-prompt.md](../../codex-goal-prompt.md) §0.7 规定 `DONE_STRONG` 的全部前提:实现必须是通用机制而非硬编码特例;有聚焦回归与负向/边界测试;涉及 pcc1 的声明要有 `PCC_HOST_PYTHON=/bin/false` 级别的无宿主证据;涉及运行时/GC/根/对象生命周期的声明,自举证据必须是全五 GC 的——仅后端 #0 通过不构成强声明;性能声明要有 IR 形状闸门加运行期基准。§0.9 进一步规定证据格式:命令必须完整可复现,没跑就写 `not run` 并说明原因,**禁止写 "should pass"**;凡触及 pcc1、self 后端、no-libpython、运行时/GC、共享低层化路径的切片,完成摘要必须带一行 `bootstrap: passed|failed|not run`,缺这一行本身就是验证缺口。
 
@@ -46,7 +80,7 @@ tests/fallback_baseline.json         no-libpython 回退棘轮:多文件回退�
 
 [docs/debugging-playbook.md](../../docs/debugging-playbook.md) 是任务条件触发的强制程序:一旦在调试失败,先读它再猜。十二条技法编号稳定(§1–§12),被 [AGENTS.md](../../AGENTS.md) 与调查文件直接引用。逐条过一遍,每条配仓库内的着力点。
 
-**§1 先让失败确定化。** 不要从通读 `c_codegen.py` 开始。固定随机种子、用常量替换文件系统/时间输入、`-n0` 关掉 xdist、隔离单个测试文件。若失败是随机的,消除随机性就是第一项工作。18.7 的 sort.lua 战例里,第一个有效动作是 `math.randomseed(15)`,不是读代码。
+**§1 先让失败确定化。** 不要从通读 `c_codegen.py` 开始。固定随机种子、用常量替换文件系统/时间输入、`-n0` 关掉 xdist、隔离单个测试文件。若失败是随机的,消除随机性就是第一项工作。18.7 的 sort.lua 案例研究里,第一个有效动作是 `math.randomseed(15)`,不是读代码。
 
 **§2 用同源参照分离"程序怪"与"编译器错"。** C 侧参照系统编译器,Python 侧参照 CPython,`llvm_capi` 参照 `llvmlite`,自举阶段分歧参照两个 JSON 基线。同一份源码、两个工具链、不同行为——bug 才归属编译器。
 
@@ -58,7 +92,7 @@ tests/fallback_baseline.json         no-libpython 回退棘轮:多文件回退�
 
 **§6 用替换验证假设,不只用目视。** 把嫌疑函数拷进临时 harness,一次换回一个真实 helper、逐步恢复分支。比盯五百行 IR 快。
 
-**§7 排除 harness 自身的错误。** 这一条全是血泪清单:zsh 里 pytest 节点 id 的 `[ ]` 必须引号;macOS 上 `multiprocessing` spawn 与 `<<'PY'` 标准输入不相容;清单文件会过期,先用**当前** harness 重跑再怀疑编译器;改了语法/词法之后必须升 [pcc/parse/c_parser.py](../../pcc/parse/c_parser.py) 里的 PLY 缓存版本,否则旧 `yacctab` 让修好的解析器看起来还坏着;长任务没出最终摘要不算"跑完"。这些错误的共同点是症状酷似编译器 bug。
+**§7 排除 harness 自身的错误。** 这一条全是血泪清单:zsh 里 pytest 节点 id 的 `[ ]` 必须引号;macOS 上 `multiprocessing` spawn 与 `<<'PY'` 标准输入不相容;清单文件会过期,先用**当前** harness 重跑再怀疑编译器;改了语法/词法之后必须升 [pcc/parse/c_parser.py](../../pcc/parse/c_parser.py) 里的 PLY 缓存版本,否则旧 `yacctab` 让修好的解析器表观上还坏着;长任务没出最终摘要不算"跑完"。这些错误的共同点是症状酷似编译器 bug。
 
 **§8 原生崩溃用 LLDB,不用猜。** 回答两个问题:哪个生成/项目函数最先收到非法数据;坏指针实际指向什么运行时对象。批处理模式、硬超时、不停在最顶层运行时帧(`py_str_strip` 里崩溃通常意味着调用者传了坏对象),用 `memory read` 对照 `py_runtime.h` 的对象头偏移解码**对象**而非地址。LLDB 负责定位;修复仍然需要最小化回归测试。
 
@@ -103,15 +137,15 @@ metadata exists        != runtime implementation complete
 microbenchmark win     != whole-program performance win
 ```
 
-每行都是一对容易被混为一谈的命题。CPython 托管下跑通的前端代码,不等于编译出来的 pcc1 二进制跑得通(执行边界完全不同,18.7 战例二是整章证词);兼容模式接受的扩展,不等于 pcc 原生 ABI 接受;stage1 用 self 后端编出来了,不等于产物还能再编出自己两代。§9.2 据此要求每个声明标注其模式:pcc-native / cpython-compat / libpython / host-only diagnostic / pcc1 no-host / self-backed / LLVM-backed。
+每行都是一对容易被混为一谈的命题。CPython 托管下跑通的前端代码,不等于编译出来的 pcc1 二进制跑得通(执行边界完全不同,18.7 案例研究二是整章证词);兼容模式接受的扩展,不等于 pcc 原生 ABI 接受;stage1 用 self 后端编出来了,不等于产物还能再编出自己两代。§9.2 据此要求每个声明标注其模式:pcc-native / cpython-compat / libpython / host-only diagnostic / pcc1 no-host / self-backed / LLVM-backed。
 
 声明卫生不只约束措辞,也约束代码与测试的形状。性能声明(§9.5)必须同时携带 IR 形状证据(如热循环里没有 `pcc_gc_alloc`、没有 `py_cpy_*`、没有 `py_obj_call`)、运行期基准、慢路径/守卫的正确性测试与 CPython 基线——单独一个微基准赢了,什么也没声明。包声明([AGENTS.md](../../AGENTS.md) Package/NumPy Claim Hygiene)规定 install 与 import 是两道独立闸门,合成包、仅数组核心的测试都不构成 NumPy 支持声明;并且**禁止** `if package == "numpy"` 式的包名特判——必须修可复用的机制(install/import/ABI/buffer/capsule)并为通用特性加回归。特判能让闸门变绿,但它把"支持 NumPy"偷换成了"支持一个叫 numpy 的字符串",这正是声明卫生要拦的造假形态。终局声明的标准在 §19.2:只有当无宿主执行、链接扫描、pcc2/pcc3 确定性比较、无静默 LLVM 回退、语义差分、真实包证据、五 GC 互不回归、性能五件套**同时**在场,才允许说 "pcc1 can replace python";缺任何一件,只能写部分进展与开放阻塞。
 
-这套表格的实践意义,18.7 战例二与 18.6 的三个测量事故会反复演示:几乎每一次假信心,都是把表中某行的左边当成了右边。
+这套表格的实践意义,18.7 案例研究二与 18.6 的三个测量事故会反复演示:几乎每一次假信心,都是把表中某行的左边当成了右边。
 
 ## 18.6 回归与测量纪律
 
-**回归纪律。** 当一个长期全绿的闸门回归,[AGENTS.md](../../AGENTS.md) 规定先做因果审计,再讲修复故事,顺序成文:(1) 用模式标注的语言指认第一道失败边界(`pcc0 -> pcc1` 回退、`pcc1 -> pcc2` 运行期崩溃、`pcc2/pcc3` 字节漂移……);(2) 在改更多代码之前,列出可能拥有该边界的近期被改子系统——对 codegen/运行时改动,默认你自己的近期改动是头号嫌疑,直到 IR/源码/调试器证据排除;(3) 分离堆叠失败:修掉第一道边界暴露出第二道崩溃时,写成两个失败、两条证据链,不许合并成一个猜出来的根因;(4) 不许为了定位而弱化运行时或 GC 语义——禁用 GC 跟踪、屏障、owned-local 清理、终结器都属于语义改动而非诊断手段;(5) 所有权失败先验证调用方/被调方引用契约再动清理代码;(6) 宿主侧测试不构成自举证明,触及前端/运行时/自举入口的修复必须配聚焦回归加相应自举闸门;(7) 调试仪器必须打标、入档,结束前移除或升格为有测试的正式特性。第 (3) 条在 18.4 的案例里有最佳示范;第 (4) 条在第 9 章的所有权战例里被用户亲手执行过(否决"禁用元组 GC 跟踪"的提案)。
+**回归纪律。** 当一个长期全部通过的闸门回归,[AGENTS.md](../../AGENTS.md) 规定先做因果审计,再讲修复故事,顺序成文:(1) 用模式标注的语言指认第一道失败边界(`pcc0 -> pcc1` 回退、`pcc1 -> pcc2` 运行期崩溃、`pcc2/pcc3` 字节漂移……);(2) 在改更多代码之前,列出可能拥有该边界的近期被改子系统——对 codegen/运行时改动,默认你自己的近期改动是头号嫌疑,直到 IR/源码/调试器证据排除;(3) 分离堆叠失败:修掉第一道边界暴露出第二道崩溃时,写成两个失败、两条证据链,不许合并成一个猜出来的根因;(4) 不许为了定位而弱化运行时或 GC 语义——禁用 GC 跟踪、屏障、owned-local 清理、终结器都属于语义改动而非诊断手段;(5) 所有权失败先验证调用方/被调方引用契约再动清理代码;(6) 宿主侧测试不构成自举证明,触及前端/运行时/自举入口的修复必须配聚焦回归加相应自举闸门;(7) 调试仪器必须打标、入档,结束前移除或升格为有测试的正式特性。第 (3) 条在 18.4 的案例里有最佳示范;第 (4) 条在第 9 章的所有权案例研究里被用户亲手执行过(否决"禁用元组 GC 跟踪"的提案)。
 
 **测量纪律。** 闸门与基线只在其前提成立时才有意义;前提坏了,绿色比红色更危险。仓库里有三次成文的假信心事故,各自留下了一条不变式:
 
@@ -125,7 +159,7 @@ microbenchmark win     != whole-program performance win
 
 ## 18.7 历史与教训
 
-### 战例一:sort.lua 的偶发失败与丢失的无符号语义
+### 案例研究一:sort.lua 的偶发失败与丢失的无符号语义
 
 (来源:[docs/investigations/lua-sort-random-pivot-signedness.md](../../docs/investigations/lua-sort-random-pivot-signedness.md))
 
@@ -135,9 +169,9 @@ microbenchmark win     != whole-program performance win
 
 475 这个错值本身就是证据:它比合法下界 481 恰好低 6,正是有符号取余的签名——无符号解释给出合法轴元,按 32 位有符号解释余数为 -6。根因落在 [pcc/codegen/c_codegen.py](../../pcc/codegen/c_codegen.py):pcc 把有符号与无符号 32 位整数都低层化为 LLVM `i32`,符号性靠 `_tag_unsigned`/`_is_unsigned_val` 这套元数据单独携带,而 `^` 返回 `builder.xor(...)` 时没有按 C 结果类型重新打无符号标——比特全对,语义已丢,下一个 `%` 用了 `srem`。修复后按 §10 的精神审计邻近算子,又抓到同族的第二个真 bug:无符号前缀 `++`/`--` 的表达式结果同样没有重新打标。
 
-留下的不变式有两层。机制层:`^`、无符号 `>>`、整数复合赋值、无符号前缀自增减四类结果保持无符号标记,回归测试进 `tests/test_unsigned_loads.py`,而且刻意全部采用"无符号结果紧跟 `%` 有符号常量"的下游敏感形状(§11)——此前仓库不缺无符号测试,缺的正是这种形状,所以一类 bug 长期隐形。流程层:这份调查的模板("先原生对照、去随机、最小集成 harness、布局与语义分家、降到纯 C、查元数据传播而非算术指令")被沉淀进 [AGENTS.md](../../AGENTS.md) 的 C Codegen Invariants 小节与调试手册本身——方法论文档的内容,相当一部分就是这样从战例里蒸馏出来的。
+留下的不变式有两层。机制层:`^`、无符号 `>>`、整数复合赋值、无符号前缀自增减四类结果保持无符号标记,回归测试进 `tests/test_unsigned_loads.py`,而且刻意全部采用"无符号结果紧跟 `%` 有符号常量"的下游敏感形状(§11)——此前仓库不缺无符号测试,缺的正是这种形状,所以一类 bug 长期隐形。流程层:这份调查的模板("先原生对照、去随机、最小集成 harness、布局与语义分家、降到纯 C、查元数据传播而非算术指令")被沉淀进 [AGENTS.md](../../AGENTS.md) 的 C Codegen Invariants 小节与调试手册本身——方法论文档的内容,相当一部分就是这样从案例研究里蒸馏出来的。
 
-### 战例二:no-libpython 自举暴露的运行时语义洞
+### 案例研究二:no-libpython 自举暴露的运行时语义洞
 
 (来源:[docs/investigations/python-self-host-no-libpython-runtime-holes.md](../../docs/investigations/python-self-host-no-libpython-runtime-holes.md),截至 2026-04-29 的报告)
 
@@ -147,7 +181,7 @@ Issue 1 的字面目标很简单:自举二进制不得链接 libpython。这份�
 
 这份报告的"Why So Many Errors Happened"一节,是对测试金字塔的一次结构性反思:既有测试几乎都是"CPython 跑 pytest → pytest 调 pcc 前端 → 检查产物"的形状,而 bug 住在另一个形状里——"CPython 编出 pcc1 → pcc1 无 libpython 地执行解析、类型推断、codegen、IR 对象构造 → 检查 pcc1 的产物"。结论不是"多跑测试",而是补一层缺失的、小而强制的 stage1-as-compiler 闸门:链接闸门(无 libpython、`--help` 退出 0)、编译闸门(用新 pcc1 编最小程序并运行产物)、pcc 编译下的 `llvm_capi.ir` 对象模型闸门、解析器副作用闸门(`_expect()` 不被链式属性访问重复执行)、模块初始化器闸门、错误传播闸门(内部异常必须非零退出、打印异常、不留产物)。今天 [tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) 所守的状态,以及 [AGENTS.md](../../AGENTS.md) 里"missing `py_err_occurred()` check"位列三大惯犯的论断,都是这份报告的直接遗产。
 
-两个战例合起来给出本章立场的最好证词:战例一展示十二技法如何把一个偶发的真实程序失败收敛成两行元数据修复加一族下游敏感测试;战例二展示当判据本身有盲区时,方法论的产出不是补丁,而是**新的闸门层与新的不变式**——方法论文档因此不是静态规章,它和编译器一起被这些调查迭代。
+两个案例研究合起来给出本章立场的最好证词:案例研究一展示十二技法如何把一个偶发的真实程序失败收敛成两行元数据修复加一族下游敏感测试;案例研究二展示当判据本身有盲区时,方法论的产出不是补丁,而是**新的闸门层与新的不变式**——方法论文档因此不是静态规章,它和编译器一起被这些调查迭代。
 
 ## 18.8 小结
 

@@ -1,8 +1,8 @@
 # 第 16 章 值模型:投影而非定宽
 
-前面的章节建立了 pcc 的对象世界:每个值是一个带头部的堆对象,引用计数与五个 GC 后端管理它的生死(第 7、9、10 章)。这个世界语义完备,但对热路径而言代价高昂——一次 `Point(1, 2)` 是一次分配、一个对象头、两个装箱的字段、若干次间接寻址。值模型(value model)是 pcc 对这笔身份税的回答,也是七义务中第 7 条的落点。它的核心立场可以压缩成本章标题:**借投影(projection),不借定宽**。从 Java Project Valhalla 借来的是"语义类型与物理表示分离"的投影模型;明确拒绝借的,是 Java 把 `int` 定为 32 位回绕整数的那个历史决定。本章讲 `int` 的双投影(标记小整数通道 + boxed bignum)、显式机器整数类型的契约、`@pcc.valueclass` 的实现现状,以及——按本书的诚实义务——一个已确认且在写作时仍未修复的开放缺陷:typed-int 未装箱算术在 i64 溢出时静默回绕。
+前面的章节建立了 pcc 的对象世界:每个值是一个带头部的堆对象,引用计数与五个 GC 后端管理它的生死(第 7、9、10 章)。这个世界语义完备,但对热路径而言代价高昂——一次 `Point(1, 2)` 是一次分配、一个对象头、两个装箱的字段、若干次间接寻址。值模型(value model)是 pcc 对这笔身份税的回答,也是七义务中第 7 条的落点。它的核心立场可以压缩成本章标题:**借投影(projection),不借定宽**。从 Java Project Valhalla 借来的是"语义类型与物理表示分离"的投影模型;明确拒绝借的,是 Java 把 `int` 定为 32 位回绕整数的那个历史决定。本章讲 `int` 的双投影(标记小整数通道 + boxed bignum)、显式机器整数类型的契约、`@pcc.valueclass` 的实现现状,以及——按本书的诚实义务——一个已确认缺陷从发现、裁定到修复(2026-06-17)的完整档案:typed-int 未装箱算术曾在 i64 溢出时静默回绕。
 
-## 读者地图:value model 是"投影",不是"换语义"
+## 本章导读:投影而非语义替换
 
 这一章最重要的防误解点是:值模型不是把普通 Python 类偷偷改成没有 identity 的结构体,也不是把 Python `int` 改成会溢出回绕的机器整数。它只是给一部分明确 opt-in 的热路径一个更紧凑的物理表示。
 
@@ -103,9 +103,9 @@ join 块:  phi 合流
 
 到此为止,装箱表示一侧的 `int` 投影是完整且诚实的:值通道有,溢出提升有,慢路径语义完备。问题出在另一侧。
 
-## 16.3 开放缺陷:typed-int 未装箱算术在 i64 溢出时静默回绕
+## 16.3 一个缺陷的完整档案:typed-int 未装箱算术曾在 i64 溢出时静默回绕
 
-本节是这一章的诚实义务。以下缺陷于 2026-05-30 由外部审计标记、当日在仓库内复现确认,调查记录在 [docs/investigations/typed-int-unboxed-overflow-silent-wraparound.md](../../docs/investigations/typed-int-unboxed-overflow-silent-wraparound.md),**写作本章时仍未修复**。
+本节是这一章的诚实义务。以下缺陷于 2026-05-30 由外部审计标记、当日在仓库内复现确认,调查记录在 [docs/investigations/typed-int-unboxed-overflow-silent-wraparound.md](../../docs/investigations/typed-int-unboxed-overflow-silent-wraparound.md),**并于 2026-06-17 修复**(16.3.4)。本节保留从症状到修复的全程,作为声明卫生的工作范例。
 
 ### 16.3.1 症状与精确触发面
 
@@ -146,9 +146,22 @@ pcc 打印 0——2^80 mod 2^64。同样确认回绕的还有 `+`(`addf(2**63 - 
 
 这次代价反转把推荐结论改写为:方案一(标记整数快通道)不只是长期答案,也是更合理的立即答案——闸门改**形状**(未装箱 add + 溢出分支)而非反转为全装箱。CPython 的 int 本来就永远带溢出检查(任意精度的内在成本),所以带检查的快通道仍然严格快于 CPython;性能从来不是保留这个 bug 的理由。
 
-### 16.3.4 当前状态与约束语义规则
+### 16.3.4 裁定、修复与约束语义规则
 
-修复未落地,但三样东西已经落地并持久化。第一,**类型语义规则**(2026-05-31 用户裁定,现为约束契约):Python 注解 `int` 意指任意精度整数;裸机器整数需要显式的 pcc 自有类型(如 `pcc.i64`);未装箱 i64 是优化,永远不是 `int` 的用户可见含义。第二,**5 个 xfail 回归**:[tests/python/test_native_typed_int_overflow.py](../../tests/python/test_native_typed_int_overflow.py) 以 `xfail(strict=False)` 固定了 `+`/`*` 参数溢出、链式 `a*b+c`、返回 ABI 携带、局部槽位携带、`<<` 提升五个验收判据——今天 XFAIL 记录缺陷,修复落地之日翻为 xpass,摘掉标记即收尾。第三,**优先级裁定**:P0 正确性 > 性能 > 包扩展;`def f(a: int, b: int)` 静默算错在 strict-native 可信度上打的洞,排在包回退收缩工作之前。
+三样东西先于修复落地并持久化。第一,**类型语义规则**(2026-05-31 用户裁定,现为约束契约):Python 注解 `int` 意指任意精度整数;裸机器整数需要显式的 pcc 自有类型(如 `pcc.i64`);未装箱 i64 是优化,永远不是 `int` 的用户可见含义。第二,**5 个 xfail 回归**:[tests/python/test_native_typed_int_overflow.py](../../tests/python/test_native_typed_int_overflow.py) 以 `xfail(strict=False)` 固定了 `+`/`*` 参数溢出、链式 `a*b+c`、返回 ABI 携带、局部槽位携带、`<<` 提升五个验收判据——它们以 XFAIL 形态记录缺陷,等待修复之日翻绿摘标。第三,**优先级裁定**:P0 正确性 > 性能 > 包扩展;`def f(a: int, b: int)` 静默算错在 strict-native 可信度上打的洞,排在包回退收缩工作之前。
+
+修复于 2026-06-17 落地,五个验收判据全部翻绿、xfail 标记摘除。在 [pcc/py_frontend/codegen/typed_int_abi.py](../../pcc/py_frontend/codegen/typed_int_abi.py) 中,`int` 参数的默认 ABI 规则被修正:
+
+```python
+# pcc/py_frontend/codegen/typed_int_abi.py
+def _type_is_typed_int_abi_param(self, type_obj: Type) -> bool:
+    # int defaults to boxed/tagged PyObject* ABI; raw i64 is opt-in only
+    if isinstance(type_obj, IntType):
+        return False
+    return False
+```
+
+落地的形状综合了 16.3.3 的两个方案:准入端收紧——`int` 注解默认采用 boxed/tagged Python-int ABI,裸 i64 函数 ABI 降级为显式的、模式标注的逃生口,不再是 `int` 的默认含义(该回归文件的模块 docstring 即这条契约的原文);算术端保速——标记通道上的运算以 `llvm.smul.with.overflow.i64` 一类内联快路径实现溢出即提升(`test_tagged_int_mul_uses_inline_overflow_fast_path`)。义务 7 的活闸门 [tests/python/test_py_typed_int_unboxed.py](../../tests/python/test_py_typed_int_unboxed.py) 的断言随之按新契约重写:一般累加器循环如今断言 IR 中**出现** `@py_int_add`(装箱/标记语义),只有可证明安全的形状保留纯未装箱通道。今天,`mul(2**40, 2**40)`、`2**62 * 4`、`1 << 100` 在 strict self 后端 no-libpython 模式下与 CPython 逐位一致,并在 `PCC_GC_BACKEND=0..4` 下保持一致。
 
 这一节的存在本身是风格契约的执行:已知缺陷写成开放问题,讲清张力,不粉饰。
 
@@ -178,11 +191,11 @@ pcc 打印 0——2^80 mod 2^64。同样确认回绕的还有 `+`(`addf(2**63 - 
 
 载荷一旦流向动态上下文(`Any` 参数、容器、`print`),就跨过对象投影的接缝。运行时侧的桥是 `py_valuebox_new()`([pcc/py_runtime/src/py_class.c](../../pcc/py_runtime/src/py_class.c)):按类的字段数分配 `PyValueBoxObject`,类型标签 `PY_TYPE_VALUEBOX = 200`([pcc/py_runtime/include/py_runtime.h](../../pcc/py_runtime/include/py_runtime.h) 的公开枚举)。设计上它刻意复用实例兼容的布局——`py_valuebox_get_field`/`py_valuebox_set_field` 直接委托给 `py_instance_get_field`/`py_instance_set_field`,后者经 `pcc_gc_load_ptr()`/`pcc_gc_store_ptr()` 读写槽位。这一行委托买到的是第 10 章的全部基础设施:ValueBox 的指针载荷自动落入五后端共用的槽位追踪/更新契约,`py_gc_track` 注册、写屏障、重定位更新一个都不缺。**指针载荷的 GC 追踪不是值类的附加特性,是它寄生在统一对象图规则上的自然结果。**等值与哈希同样跨过桥:`py_obj_eq`/`py_obj_hash` 各有 `PY_TYPE_VALUEBOX` 分支(C 与 pcc-Python 两个运行时层都有),先比类、再经 GC 感知的槽位读取逐字段比较/混合,使分别装箱的等值载荷在字典里命中同一个键。
 
-接缝的另一半是诚实声明:每次装箱产生**新的** box。两次把同一个 `Point(1, 2)` 递给 `Any` 边界,得到两个不同的堆对象。这正是身份观察必须被拒绝的原因——下一小节的对照表与 16.7 的第一个战例都从这里出发。
+接缝的另一半是诚实声明:每次装箱产生**新的** box。两次把同一个 `Point(1, 2)` 递给 `Any` 边界,得到两个不同的堆对象。这正是身份观察必须被拒绝的原因——下一小节的对照表与 16.7 的第一个案例研究都从这里出发。
 
 ### 16.5.4 自举与 self 后端:载荷 ABI 一路到底
 
-值投影不是 LLVM 后端的私有优化。聚合载荷出现在函数签名里,意味着 self 后端(第 13 章)的 IR 文本解析器、ABI 低层化、寄存器分配都要理解 `{ i64, i64 }`;16.7 的第三个战例就是这条链上最薄的一环断掉的记录。同时,值类工作的每个切片都按第 15 章的纪律带全量自举闸门——调查文件里反复出现的收尾句是"five-GC bootstrap matrix → 5 passed",模式标注为 strict no-libpython、`--backend self`。
+值投影不是 LLVM 后端的私有优化。聚合载荷出现在函数签名里,意味着 self 后端(第 13 章)的 IR 文本解析器、ABI 低层化、寄存器分配都要理解 `{ i64, i64 }`;16.7 的第三个案例研究就是这条链上最薄的一环断掉的记录。同时,值类工作的每个切片都按第 15 章的纪律带全量自举闸门——调查文件里反复出现的收尾句是"five-GC bootstrap matrix → 5 passed",模式标注为 strict no-libpython、`--backend self`。
 
 ## 16.6 身份不可窃取:普通类与值类的对照
 
@@ -205,9 +218,9 @@ pcc 打印 0——2^80 mod 2^64。同样确认回绕的还有 `+`(`addf(2**63 - 
 
 ## 16.7 历史与教训
 
-值模型的接缝在哪里,调查档案比设计文档诚实。[docs/investigations/](../../docs/investigations) 下以 `valuebox-valueclass-*-projection` 命名的文件有二十余份——属性存储、成员资格探针、推导式、异常参数、条件表达式、短路、`dataclasses.replace`、`super` 方法参数……每一份都是同一个事实的一次取样:**值/对象接缝出现在每一个能把值带进动态上下文的发射位点,漏掉一个,就在那里物化出一个带身份的实例(或直接崩溃)**。下面三个战例从这张地图上取最有教学价值的三段。
+值模型的接缝在哪里,调查档案比设计文档诚实。[docs/investigations/](../../docs/investigations) 下以 `valuebox-valueclass-*-projection` 命名的文件有二十余份——属性存储、成员资格探针、推导式、异常参数、条件表达式、短路、`dataclasses.replace`、`super` 方法参数……每一份都是同一个事实的一次取样:**值/对象接缝出现在每一个能把值带进动态上下文的发射位点,漏掉一个,就在那里物化出一个带身份的实例(或直接崩溃)**。下面三个案例研究从这张地图上取最有教学价值的三段。
 
-### 战例一:`weakref.ref(Pt(1, 2))` 居然成功了(2026-06-10)
+### 案例研究一:`weakref.ref(Pt(1, 2))` 未被拒绝(2026-06-10)
 
 V-track 的"weak-dict 键策略"设计问题被归约成一个探针:对值类载荷取弱引用,今天会发生什么?预期是被拒绝;观察到的是**成功**——构造器投影成载荷,对象边界投影装箱,运行时对那个 ValueBox 建了弱引用,探针打印 `weakref-ok 1`(strict no-libpython、self 后端)。这是教科书级的身份语义窃取:弱引用观察的是身份的**生命周期**,而 16.5.3 说过每次装箱产生新 box——这个弱引用指向的对象会在某个无法预测的时刻死去,`r()` 的返回值是表示细节的函数。有趣的对照是,同一探针的第一版还写了 `r() is p`,被**既有的** `is` 诊断正确拦下——`is` 的栅栏立着,弱引用的洞就开在它旁边。
 
@@ -215,7 +228,7 @@ V-track 的"weak-dict 键策略"设计问题被归约成一个探针:对值类�
 
 教训有三。第一,身份逃逸面是**枚举出来的,不是推导出来的**——`is` 被堵了不等于 `id()` 被堵,更不等于弱引用被堵;每个观察身份的 API 都要单独探测。第二,调查在修复过程中又挖出两个伏笔:port 侧的陈旧 `.o` 让第一次验证差点给出假阴性(删档案不够,缓存的目标文件也要失效——延伸了仓库既有的 stale-archive 教训);`native_weakref.py` 的低层化位点漏发 `_emit_post_call_err_check`,运行时正确升起的异常"瞬移"过了 try/except——第 8 章那条"没有 Itanium 展开,漏检查点异常就瞬移"的失败类在值模型工地上原样复发。第三,from-import 形态(`from weakref import ref`)刻意未覆盖并如实记录——裸名 `ref` 太泛,宁可留下已记录的窄洞,不做不可靠的宽匹配。
 
-### 战例二:后端 #4 重定位下指针载荷"失忆"(2026-06-01)
+### 案例研究二:后端 #4 重定位下指针载荷"失忆"(2026-06-01)
 
 五 GC 生产平等契约(第 10 章)新增了一个针对性测试:装箱一个带指针字段的值类,强制后端 #4 重定位那个 ValueBox,再经 Python 对象路径改写、读回载荷字段。初始证据说后端 #0 过、#1–#4 全挂 `AttributeError: items`;两轮收窄后只剩 #4:程序打印完重定位前导就静默返回,五行载荷读回一行都没有。
 
@@ -227,7 +240,7 @@ V-track 的"weak-dict 键策略"设计问题被归约成一个探针:对值类�
 
 第三步,反方向的教训。pcc-Python 运行时镜像里曾试图加一个 `_resolve_instance()` 助手统一解析转发指针,结果它对借用接收者走了普通对象返回所有权、发射了多余的 `pcc_gc_retain`,把后端 #0 的循环成员引用计数撑高,`gc.collect()` 报告零回收、终结器不再跑。提案一被标记 REJECTED,助手删除。值模型这一侧的结论:**值载荷不绕过对象图契约**——指针载荷要被追踪,载荷的携带者要被根住,而修根的人自己也要遵守第 9 章的所有权规则,否则修了 #4 坏 #0。
 
-### 战例三:self 后端不认识 `{ i64`(2026-06-04)
+### 案例研究三:self 后端不认识 `{ i64`(2026-06-04)
 
 V2 边界工作里一个普通的程序形状——装箱的 `Point` 从元组/列表下标里取回、传给 `def total(p: Point) -> int`——在 strict no-libpython、self 后端下编译失败:`BackendUnavailable: self backend does not understand LLVM type '{ i64'`。
 
@@ -237,7 +250,7 @@ V2 边界工作里一个普通的程序形状——装箱的 `Point` 从元组/�
 
 ## 16.8 小结
 
-值模型是 pcc 对"Python 能不能既保语义又拿到扁平数据性能"这个问题的结构化回答,回答的形状是投影:语义类型恒定,物理表示二选一,接缝显式且受审计。`int` 的接缝在运行时已经完整——`py_internal.h` 的一个指针低位换来无分配的 63 位值通道,`py_int_ops.c` 的每条算术在溢出处提升、决不回绕,`binary_op_lowering.py` 把同一形状内联进生成代码;但 typed-int ABI 一侧的接缝义务尚未兑现,`a: int` 参数的 `+`/`*`/`<<` 仍在裸 i64 上静默回绕——这是写作时最高优先级的开放正确性缺陷,修复方向已裁定(标记整数快通道,而非拆掉快通道的保守装箱),验收判据已用五个 xfail 测试固定。值类的接缝是三层防线:编译期形状诊断与身份逃逸诊断、运行时 ValueBox 对统一槽位契约的复用、以及对每个身份观察 API 的显式拒绝;它的实现是窄而诚实的切片(`value_model_status()` 自己报告 `production_runtime: False`),它的边界由二十余份投影调查逐点测绘。普通类不为这一切付任何代价——身份不可窃取,值语义只能由用户显式选入。这就是"投影而非定宽"的全部含义:性能来自合法的表示,永远不来自被偷换的语义。
+值模型是 pcc 对"Python 能不能既保语义又拿到扁平数据性能"这个问题的结构化回答,回答的形状是投影:语义类型恒定,物理表示二选一,接缝显式且受审计。`int` 的接缝在运行时已经完整——`py_internal.h` 的一个指针低位换来无分配的 63 位值通道,`py_int_ops.c` 的每条算术在溢出处提升、决不回绕,`binary_op_lowering.py` 把同一形状内联进生成代码;typed-int ABI 一侧的接缝义务也已兑现(2026-06-17):`a: int` 参数默认走 boxed/tagged ABI,标记通道溢出即提升、决不回绕,当初以五个 xfail 固定的验收判据已全部翻绿摘标(16.3.4)。值类的接缝是三层防线:编译期形状诊断与身份逃逸诊断、运行时 ValueBox 对统一槽位契约的复用、以及对每个身份观察 API 的显式拒绝;它的实现是窄而诚实的切片(`value_model_status()` 自己报告 `production_runtime: False`),它的边界由二十余份投影调查逐点测绘。普通类不为这一切付任何代价——身份不可窃取,值语义只能由用户显式选入。这就是"投影而非定宽"的全部含义:性能来自合法的表示,永远不来自被偷换的语义。
 
 ## 练习
 
@@ -245,4 +258,4 @@ V2 边界工作里一个普通的程序形状——装箱的 `Point` 从元组/�
 2. **读 IR 形状。** `binary_op_lowering.py` 的 `_emit_inline_tagged_int_binop_or_call()` 只内联 `+`/`-`/`&`/`|`/`^`。论证为什么 `&`/`|`/`^` 的快路径不需要范围检查而 `+`/`-` 需要;再论证把 `*` 加入内联名单需要哪些额外的 IR(提示:126 位中间值、`llvm.smul.with.overflow` 与两次范围判定的关系)。
 3. **复现因果链(纸上)。** 不运行任何命令,仅凭 `typed_int_abi.py` 的 `_type_is_typed_int_abi_param()`、`binary_op_lowering.py` 的 `_emit_binop_value()` 整数尾部与 `_emit_binop_int()`,写出 `def mul(a: int, b: int) -> int: return a * b` 的函数签名与乘法指令的 IR 形状,并解释为什么调查中两次"分析层收紧"实验注定无效。
 4. **设计权衡论证。** 基于 16.3.3 的代价数据(方案二将反转 `test_py_typed_int_unboxed.py` 的 14 个未装箱断言、拆掉累加器快通道;方案一保住快通道但要求 typed-int 结果表示改为标记值并波及返回 ABI 与槽位存储),为两个方案各写一段最强辩护,然后给出你的裁定,并明确说明你的方案落地后义务 7 的 IR 形状闸门应当断言什么。
-5. **对照表审计。** 16.6 的表声称值类的每条身份能力都有源码可指的拒绝点。逐行核对:在 [pcc/py_frontend/type_infer.py](../../pcc/py_frontend/type_infer.py) 中找到 `id()`、`is`、`weakref.ref`、子类化、`__del__`、`__dict__`(含 `__slots__` 形态)各自的诊断;在 [pcc/py_runtime/src/py_weakref.c](../../pcc/py_runtime/src/py_weakref.c) 中找到运行时层的拒绝。哪一条防线只有编译期一层?构造一个绕过它的程序形状(提示:战例一的 from-import 记录),并说明仓库为什么选择记录而非封堵。
+5. **对照表审计。** 16.6 的表声称值类的每条身份能力都有源码可指的拒绝点。逐行核对:在 [pcc/py_frontend/type_infer.py](../../pcc/py_frontend/type_infer.py) 中找到 `id()`、`is`、`weakref.ref`、子类化、`__del__`、`__dict__`(含 `__slots__` 形态)各自的诊断;在 [pcc/py_runtime/src/py_weakref.c](../../pcc/py_runtime/src/py_weakref.c) 中找到运行时层的拒绝。哪一条防线只有编译期一层?构造一个绕过它的程序形状(提示:案例研究一的 from-import 记录),并说明仓库为什么选择记录而非封堵。

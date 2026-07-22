@@ -2,7 +2,7 @@
 
 pcc 的 C 前端是仓库中最成熟的子系统:它编译并运行过 Lua、SQLite、PostgreSQL `libpq`、zlib、lz4、zstd、PCRE、OpenSSL 这一级别的真实项目。本章讲它如何把一份(或一个目录的)C 源码变成可解析的翻译单元(translation unit,TU),再送进求值器流水线。具体来说:解析器从 PLY 到原生 LR 驱动的双轨结构、两条预处理路径、[utils/fake_libc_include/](../../utils/fake_libc_include) 这套"只有声明没有实现"的伪 libc、[pcc/evaluater/c_evaluator.py](../../pcc/evaluater/c_evaluator.py) 的 preprocess→parse→IR→optimize→execute 流水线,以及 [pcc/project.py](../../pcc/project.py) 的源收集与 `--sources-from-make`。表达式如何低层化(lowering)为 LLVM IR、符号性如何跟踪,是第 4 章的内容;本章止步于"AST 进了代码生成器"这条线。
 
-## 读者地图:把 C 前端看成四道关
+## 本章导读:C 前端的四个阶段
 
 本章不用从 C 语法细节读起。先抓住四道关:预处理把宿主头文件问题收窄,fake libc 提供可控声明,解析器把 token 变成 AST,求值器把 AST 接到 LLVM 与真实项目测试上。
 
@@ -106,7 +106,7 @@ cc -E -P -nostdinc -isystem utils/fake_libc_include  -I <用户目录>...  <大�
 
 ## 3.4 伪 libc:声明即接口
 
-[utils/fake_libc_include/](../../utils/fake_libc_include) 沿用 pycparser 的 fake-libc 思路并大幅扩展,现有 83 个条目(含 `sys/`、`arpa/`、`netinet/`、`linux/`、`openssl/`、`numpy/` 子目录)。其设计可以一句话概括:**编译期只需要声明和布局,实现属于链接期。**
+[utils/fake_libc_include/](../../utils/fake_libc_include) 沿用 pycparser 的 fake-libc 思路并大幅扩展,现有 83 个条目(含 `sys/`、`arpa/`、`netinet/`、`linux/`、`openssl/`、`numpy/` 子目录)。其设计原则可以概括为:**编译期只需要声明和布局,实现属于链接期。**
 
 结构上一切收敛到两个根文件。多数头只有两行:
 
@@ -220,7 +220,7 @@ SQLite 集成报告的标题就是结论:它**不是一个 bug**。`(sqlite3_sys
 
 ## 3.8 小结
 
-C 前端的每一层都是同一个判断的不同投影:**复用成熟件起步,但把"可被 pcc 自己编译、可被审计"作为演化方向**。解析器从 pycparser/PLY 出发,冻结表 + 原生驱动 + 手写词法逐步替换运行时魔法,行为等价由 parity 闸门钉住;预处理借系统 `cc -E` 之力,用 `-nostdinc` + 伪 libc + 大表兼容宏把宿主世界挡在边界外,文本整形被明确圈定在这一层;伪 libc 用"声明即接口"换得跨机器可重复的解析输入,代价是一份必须与宿主 ABI 对齐的 typedef 断言清单;求值器用三层缓存(编译器指纹废止、`.so` 复用、进程内 JIT)摊销冷启动,用四条执行出口覆盖从交互求值到 self 后端的谱系;源收集对 make 做干跑考古,并诚实声明边界——构建系统没说出口的旗标,谁也恢复不了。而 3.7 的三个故事反复验证同一条经验:真实项目的失败极少是它看起来的那个问题,缩减到带真实类型的最小复现、读 IR 而不是猜,才是这套前端长出今天形状的方式。
+C 前端的每一层都是同一个判断的不同投影:**复用成熟件起步,但把"可被 pcc 自己编译、可被审计"作为演化方向**。解析器从 pycparser/PLY 出发,冻结表 + 原生驱动 + 手写词法逐步替换运行时魔法,行为等价由 parity 闸门钉住;预处理借系统 `cc -E` 之力,用 `-nostdinc` + 伪 libc + 大表兼容宏把宿主世界挡在边界外,文本整形被明确圈定在这一层;伪 libc 用"声明即接口"换得跨机器可重复的解析输入,代价是一份必须与宿主 ABI 对齐的 typedef 断言清单;求值器用三层缓存(编译器指纹废止、`.so` 复用、进程内 JIT)摊销冷启动,用四条执行出口覆盖从交互求值到 self 后端的谱系;源收集对 make 做干跑考古,并诚实声明边界——构建系统没说出口的旗标,谁也恢复不了。而 3.7 的三个故事反复验证同一条经验:真实项目的失败极少是它表观上的那个问题,缩减到带真实类型的最小复现、读 IR 而不是猜,才是这套前端长出今天形状的方式。
 
 ## 练习
 
@@ -228,4 +228,4 @@ C 前端的每一层都是同一个判断的不同投影:**复用成熟件起步
 2. **缓存考古。** 对照 `_DEFAULT_PLY_YACCTAB` 的手工版本号与 [pcc/parse/c_parsetab.py](../../pcc/parse/c_parsetab.py) 的 `GRAMMAR_SHA256` 机制,各写出一种它们能/不能捕获的陈旧场景;再看 `_compiler_cache_fingerprint()`,说明编译产物缓存为什么不需要任何手工版本号(提示:`_COMPILE_CACHE_VERSION` 仍然存在,它防的是哪类变化?)。
 3. **伪 libc 失配实验(纸面)。** `_fake_typedefs.h` 断言 `mode_t` 为 `unsigned short`,内置预处理器 `TYPE_PREAMBLE` 断言 `unsigned int`。构造一个最小 C 程序,使它在两条预处理路径下产生不同的 `sizeof` 行为;再论证:什么样的真实 libc 调用会把这个失配变成运行时错误?
 4. **设计权衡。** 内置预处理器为实现 `#if` 求值专门写了 `_CppExprParser`,而不是调用 `eval()`。除了自举审计的禁令,再给出至少两个独立于自举的理由(提示:C 语义 vs Python 语义;攻击面)。反方向论证一次:如果 pcc 永远不自举,`eval()` 方案是否就是正确的工程选择?
-5. **战争故事重演。** 仅凭 3.7.2 的信息,写出你在拿到"PCRE 在 `pcre_compile` 挂起"这个报告后的前四个动作,并为每个动作标注它要证伪的假设。然后对照报告原文 [docs/investigations/pcre-op-lengths-incomplete-array-binding.md](../../docs/investigations/pcre-op-lengths-incomplete-array-binding.md) 的实际顺序,找出你的方案中最昂贵的多余步骤。
+5. **案例研究重演。** 仅凭 3.7.2 的信息,写出你在拿到"PCRE 在 `pcre_compile` 挂起"这个报告后的前四个动作,并为每个动作标注它要证伪的假设。然后对照报告原文 [docs/investigations/pcre-op-lengths-incomplete-array-binding.md](../../docs/investigations/pcre-op-lengths-incomplete-array-binding.md) 的实际顺序,找出你的方案中最昂贵的多余步骤。

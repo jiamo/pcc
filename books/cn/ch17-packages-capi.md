@@ -2,7 +2,7 @@
 
 一个 Python 编译器最容易在包生态上自欺。"支持 NumPy"这四个字可以指十几种强度完全不同的事实:从"安装命令没报错",到"纯 Python 子集能 import",再到"C 扩展在 pcc 自己的对象模型上初始化并正确运行"。pcc 对这条战线的回答有两层:一层是机制——[pcc/package/](../../pcc/package) 的通用安装管道、`py_capi_shim.c` 的 C-API shim、`py_extension_loader.c` 的扩展加载器、CpyHandle 装箱;另一层是纪律——pip install 闸与 import 闸是两个独立声明,各自有证据标准,且任何修复都必须落在可复用机制上,禁止 `if package == "numpy"` 式特判。本章两层都讲,因为在这个子系统里,纪律不是机制的注脚,而是机制能否长期成立的前提。
 
-## 读者地图:包兼容是梯度,不是开关
+## 本章导读:包兼容是梯度而非开关
 
 这一章先把"支持某个包"拆成多级问题:能安装,能解析 metadata,能 import 纯 Python,能加载扩展,能通过 C-API shim 暴露需要的 ABI。任何一级通过,都不能自动宣称全包生态兼容。
 
@@ -72,11 +72,54 @@ install 闸还有一个细节决定证据强度:`pcc1` 是编译出来的原生�
 
 import 闸同样分层。纯 Python 包的 import 证据是端到端的:安装后用 `pcc1 --python-libpython=off --ir-scaffold=on` 编译一个 `import demo_pkg` 的主程序、运行、断言输出(`test_pcc1_pip_install_wheel_participates_in_import_site` 断言打印 `43`)。涉及 **CPython-ABI** C 扩展时,no-libpython 模式的当前诚实证据是**拒绝**:真实 CPython 扩展 wheel 在 import 边界被 `PCC-PKG-004` 挡下(17.4 节),而不是默默生成成千上万个 `py_cpy_*` 回退调用。
 
-而针对 pcc 自己的 C-API shim 编译的 **pcc-native** 扩展走的是另一条、且已经打通的路:2026-07-16 起,pcc-native 的 NumPy 2.4.4(`_multiarray_umath` + `_umath_linalg`)能在无 libpython 的 pcc1 二进制里真正 import——`import numpy; print(np.__version__)` 打印 `2.4.4`、`np.array([1, 2, 3]) + 1` 得 `[2, 3, 4]`,并在 GC0..4 五个后端下结果一致(gate:[tests/integration/test_numpy_l4_pcc1_gate.py](../../tests/integration/test_numpy_l4_pcc1_gate.py) 与 `test_numpy_l5_pcc1_gate.py`)。要点仍是声明卫生:被 `PCC-PKG-004` 拒绝的始终是 **CPython-ABI** 工件,pcc-native 工件与其是两条独立的路;且这条里程碑刻意窄——覆盖 import/版本/数组构造/标量加法/元素访问/迭代/`==`/`repr`,通用 ufunc、归约、dtype、广播尚未覆盖。[docs/current-goal-state.md](../../docs/current-goal-state.md) 记录逐 slice 的当前状态。
+而在前端包扫描与链接层,[pcc/package/linkage.py](../../pcc/package/linkage.py) 对 CPython ABI 扩展工件给出拒绝诊断:
+
+```python
+# pcc/package/linkage.py
+def _diagnostic_for_cpython_extension_abi(path: str) -> dict[str, object]:
+    return {
+        "code": "PCC-PKG-004",
+        "message": (
+            "native artifact name declares a CPython extension ABI; "
+            "pcc-native mode requires a pcc-native extension ABI or a source rebuild"
+        ),
+        "path": path,
+    }
+```
 
 ## 17.3 包管道:[pcc/package/](../../pcc/package) 的通用机制
 
 ### 17.3.1 pip 前门
+
+在 C-API shim 侧,[pcc/py_runtime/src/py_capi_shim.c](../../pcc/py_runtime/src/py_capi_shim.c) 实现了标准的 C-API 函数代理:
+
+```c
+// pcc/py_runtime/src/py_capi_shim.c
+PyObject *py_capi_PyObject_CallObject(PyObject *callable, PyObject *args) {
+    if (callable == NULL) return NULL;
+    return py_call_callable(callable, args, NULL);
+}
+
+void *py_capi_PyCapsule_GetPointer(PyObject *capsule, const char *name) {
+    if (capsule == NULL || py_type_of(capsule) != PY_TYPE_CAPSULE) return NULL;
+    return py_capsule_pointer(capsule, name);
+}
+```
+
+在原生扩展加载器中,[pcc/py_runtime/src/py_extension_loader.c](../../pcc/py_runtime/src/py_extension_loader.c) 负责通过 `dlopen` 加载 pcc-native `.so` 并唤醒 `PyInit_<mod>`:
+
+```c
+// pcc/py_runtime/src/py_extension_loader.c
+PyObject *py_extension_load_native_so(const char *so_path, const char *mod_name) {
+    void *handle = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
+    if (handle == NULL) return NULL;
+    char init_name[256];
+    snprintf(init_name, sizeof(init_name), "PyInit_%s", mod_name);
+    PyInitFunc init_fn = (PyInitFunc)dlsym(handle, init_name);
+    if (init_fn == NULL) return NULL;
+    return init_fn();
+}
+```
 
 [pcc/package/pip_shim.py](../../pcc/package/pip_shim.py) 是 `pcc -m pip` 的前门,文档字符串先把边界说清:接受常见的 `pip install ... --dry-run` 形态并报告计划而不调用 pip 的安装器;非 dry-run 的本地安装走 pcc 自己的安装器而非上游 pip。`_parse_install_args` 识别 `--target`、`--cache-dir`、`--find-links`、`--index-url`、`--no-index`、`--report`,以及一个 pip 没有的旗标:`--abi`(默认 `pcc-native`)——ABI 模式从命令行第一站就开始流动,后面的兼容判断、链接扫描、构建重定向全部按它分派。
 

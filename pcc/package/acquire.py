@@ -4,12 +4,14 @@ Acquisition stops at an immutable local artifact.  Building and installing the
 artifact remain pcc operations.  The two online backends deliberately expose
 different provenance:
 
-``host``
-    asks a host Python's pip to select and download one artifact, without
-    dependencies;
 ``owned``
     implements the PEP 503/691 HTML link-selection path in pcc and uses only a
     byte transport beneath it.  It requires a repository-provided SHA-256.
+``host``
+    is an explicit compatibility mode that asks a host Python's pip to select
+    and download one artifact, without dependencies.  ``auto`` prefers the
+    owned path so acquiring an sdist cannot trigger pip's PEP 517 metadata
+    build before pcc performs its own native build.
 
 Neither backend claims dependency resolution or PEP 517 build isolation.
 """
@@ -65,7 +67,9 @@ class _SimpleLinks(HTMLParser):
 
 def target_python_version(value: str | None = None) -> str:
     """Return the explicit Python language version used for package choice."""
-    selected = value or os.environ.get("PCC_PACKAGE_TARGET_PYTHON") or DEFAULT_TARGET_PYTHON
+    selected = (
+        value or os.environ.get("PCC_PACKAGE_TARGET_PYTHON") or DEFAULT_TARGET_PYTHON
+    )
     selected = selected.strip()
     if re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", selected) is None:
         raise ValueError(
@@ -162,7 +166,7 @@ def selected_acquire_mode(requested: str) -> str:
         raise ValueError(
             "PCC-PKG-ACQUIRE-MODE-INVALID: expected auto, host, owned, or offline"
         )
-    return "host" if requested == "auto" else requested
+    return "owned" if requested == "auto" else requested
 
 
 def _artifact_version(filename: str) -> str:
@@ -550,11 +554,20 @@ def _owned_acquire(
     unsupported = owned_shape_diagnostic(published)
     if unsupported is not None:
         diagnostic, dependencies = unsupported
-        report["ok"] = False
-        report["diagnostic"] = diagnostic
-        report["error"] = diagnostic
-        if dependencies:
-            report["dependencies"] = dependencies
+        if (
+            requested_mode == "auto"
+            and diagnostic == "PCC-PKG-ACQUIRE-BUILD-ISOLATION-UNSUPPORTED"
+        ):
+            # Acquisition only selected and verified the immutable source.
+            # The pcc-native installer owns the subsequent supported-source
+            # build and will fail closed if it cannot satisfy that contract.
+            report["build_isolation"] = "delegated-to-pcc-native-builder"
+        else:
+            report["ok"] = False
+            report["diagnostic"] = diagnostic
+            report["error"] = diagnostic
+            if dependencies:
+                report["dependencies"] = dependencies
     return report
 
 

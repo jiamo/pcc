@@ -266,7 +266,7 @@ def test_lua_oracles_have_no_dynamic_xfails():
     assert 'reason="testes/ not found"' in source
 
 
-@pytest.mark.skipif(_CC_MISSING, reason="system cc is required for the Lua C oracle")
+@pytest.mark.pcc_gate(unavailable=None if not _CC_MISSING else "system cc is required for the Lua C oracle")
 @pytest.mark.parametrize("fname", LUA_C_FILES_FILTERED, ids=LUA_C_FILES_FILTERED)
 def test_lua_source_compile(fname):
     """Test Lua .c file: preprocess → parse → codegen → LLVM verify."""
@@ -744,7 +744,7 @@ def _normalize_runtime_stdout(stdout, bin_path):
 def pcc_lua_bin():
     """Compile onelua.c via pcc once per session."""
     if _CC_MISSING:
-        pytest.skip("system cc is required to link the pcc-built Lua oracle")
+        pytest.fail("system cc is required to link the pcc-built Lua oracle")
     return _compile_onelua()
 
 
@@ -752,7 +752,7 @@ def pcc_lua_bin():
 def native_lua_bin():
     """Compile onelua.c via cc once per session."""
     if _CC_MISSING:
-        pytest.skip("system cc is required for the native Lua oracle")
+        pytest.fail("system cc is required for the native Lua oracle")
     return _compile_native_onelua()
 
 
@@ -760,7 +760,7 @@ def native_lua_bin():
 def self_lua_bin():
     """Compile onelua.c via the self backend once per session."""
     if _CC_MISSING:
-        pytest.skip("system cc is required to link the self-backend Lua oracle")
+        pytest.fail("system cc is required to link the self-backend Lua oracle")
     return _compile_self_backend_onelua()
 
 
@@ -768,7 +768,7 @@ def self_lua_bin():
 def self_lua_separate_tus_bin():
     """Compile Lua via self backend using make-derived separate translation units."""
     if _CC_MISSING or _MAKE_MISSING:
-        pytest.skip("system cc and make are required for separate-TU Lua")
+        pytest.fail("system cc and make are required for separate-TU Lua")
     return _compile_self_backend_lua_separate_tus()
 
 
@@ -776,7 +776,7 @@ def self_lua_separate_tus_bin():
 def makefile_lua_bin():
     """Build Lua via Makefile once per session."""
     if _CC_MISSING or _MAKE_MISSING:
-        pytest.skip("system cc and make are required for the Makefile Lua oracle")
+        pytest.fail("system cc and make are required for the Makefile Lua oracle")
     return _compile_makefile_lua()
 
 
@@ -784,14 +784,11 @@ def makefile_lua_bin():
 def lua_runtime_tests_dir():
     """Prepare an isolated copy of the Lua tests with loadable C modules."""
     if _CC_MISSING:
-        pytest.skip("system cc is required to build Lua test modules")
+        pytest.fail("system cc is required to build Lua test modules")
     return _prepare_runtime_tests_dir()
 
 
-@pytest.mark.skipif(
-    not os.path.isfile(os.path.join(lua_src_dir, "onelua.c")),
-    reason="onelua.c not found",
-)
+@pytest.mark.pcc_gate(unavailable=None if os.path.isfile(os.path.join(lua_src_dir, "onelua.c")) else "onelua.c not found")
 def test_onelua_compile_and_link(pcc_lua_bin):
     """Compile onelua.c (single TU) → .o → linked binary."""
     stage, result = pcc_lua_bin
@@ -799,7 +796,7 @@ def test_onelua_compile_and_link(pcc_lua_bin):
     assert os.path.isfile(result), f"Binary not found: {result}"
 
 
-@pytest.mark.skipif(not os.path.isdir(lua_tests_dir), reason="testes/ not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(lua_tests_dir) else "testes/ not found")
 @pytest.mark.parametrize("test_file", LUA_TEST_FILES, ids=LUA_TEST_FILES)
 def test_pcc_runtime_matches_makefile(
     test_file, pcc_lua_bin, makefile_lua_bin, lua_runtime_tests_dir
@@ -826,7 +823,7 @@ def test_pcc_runtime_matches_makefile(
     ) == _normalize_runtime_stderr(make_r.stderr, make_bin)
 
 
-@pytest.mark.skipif(not os.path.isdir(lua_tests_dir), reason="testes/ not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(lua_tests_dir) else "testes/ not found")
 @pytest.mark.parametrize("test_file", LUA_TEST_FILES, ids=LUA_TEST_FILES)
 def test_pcc_runtime_matches_native(
     test_file, pcc_lua_bin, native_lua_bin, lua_runtime_tests_dir
@@ -853,7 +850,7 @@ def test_pcc_runtime_matches_native(
     ) == _normalize_runtime_stderr(native_r.stderr, native_bin)
 
 
-@pytest.mark.skipif(not os.path.isdir(lua_tests_dir), reason="testes/ not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(lua_tests_dir) else "testes/ not found")
 @pytest.mark.parametrize(
     "test_file",
     SELF_BACKEND_SMOKE_TEST_FILES,
@@ -884,11 +881,8 @@ def test_self_backend_runtime_matches_native_smoke(
     ) == _normalize_runtime_stderr(native_r.stderr, native_bin)
 
 
-@pytest.mark.skipif(
-    not os.path.isfile(os.path.join(lua_src_dir, "makefile")),
-    reason="makefile not found",
-)
-@pytest.mark.skipif(not os.path.isdir(lua_tests_dir), reason="testes/ not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isfile(os.path.join(lua_src_dir, "makefile")) else "makefile not found")
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(lua_tests_dir) else "testes/ not found")
 @pytest.mark.parametrize("test_file", LUA_TEST_FILES, ids=LUA_TEST_FILES)
 def test_makefile_lua_test_suite(test_file, makefile_lua_bin, lua_runtime_tests_dir):
     """Run full Lua test suite with Makefile-built binary."""
@@ -902,10 +896,7 @@ def test_makefile_lua_test_suite(test_file, makefile_lua_bin, lua_runtime_tests_
     assert r.returncode == 0, f"exit={r.returncode}: {r.stderr[:200]}"
 
 
-@pytest.mark.skipif(
-    not os.path.isfile(os.path.join(lua_tests_dir, "all.lua")),
-    reason="all.lua not found",
-)
+@pytest.mark.pcc_gate(unavailable=None if os.path.isfile(os.path.join(lua_tests_dir, "all.lua")) else "all.lua not found")
 def test_makefile_lua_all(makefile_lua_bin, lua_runtime_tests_dir):
     """Run all.lua — the official Lua test suite entry point."""
     make_stage, make_bin = makefile_lua_bin
@@ -927,10 +918,7 @@ def test_makefile_lua_all(makefile_lua_bin, lua_runtime_tests_dir):
     assert r.returncode == 0, f"all.lua failed (rc={r.returncode}):\n{r.stderr[-500:]}"
 
 
-@pytest.mark.skipif(
-    not os.path.isfile(os.path.join(lua_tests_dir, "all.lua")),
-    reason="all.lua not found",
-)
+@pytest.mark.pcc_gate(unavailable=None if os.path.isfile(os.path.join(lua_tests_dir, "all.lua")) else "all.lua not found")
 def test_self_backend_lua_all_smoke(self_lua_bin, native_lua_bin, lua_runtime_tests_dir):
     """Run all.lua through the self backend's current curated Lua closure path."""
     self_stage, self_bin = self_lua_bin
@@ -963,10 +951,7 @@ def test_self_backend_lua_all_smoke(self_lua_bin, native_lua_bin, lua_runtime_te
     assert "final OK !!!" in self_r.stdout
 
 
-@pytest.mark.skipif(
-    not os.path.isfile(os.path.join(lua_tests_dir, "all.lua")),
-    reason="all.lua not found",
-)
+@pytest.mark.pcc_gate(unavailable=None if os.path.isfile(os.path.join(lua_tests_dir, "all.lua")) else "all.lua not found")
 def test_self_backend_separate_tus_lua_all_smoke(self_lua_separate_tus_bin, lua_runtime_tests_dir):
     """Run all.lua through the self backend's separate-TU Lua build path."""
     self_stage, self_bin = self_lua_separate_tus_bin

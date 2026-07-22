@@ -1,14 +1,13 @@
 # Self-backend bounded worker-pool closure
 
-## Claim
+## Superseded claim and reopened boundary
 
-Direct self-backend emission now defaults to a conservative two-process pool
-and reuses each compiled worker across a batch of IR/object jobs. Explicit
-`PCC_SELF_BACKEND_JOBS` and bootstrap-specific throughput settings remain
-authoritative. This proves bounded process starts, deterministic publication,
-failure propagation, cache behavior, current-source pcc1 NumPy L5 execution,
-and complete-suite compatibility; it does not claim a like-for-like wall-time
-speedup for every workload.
+The original evidence proved two-process concurrency and fewer starts, but a
+later cold-source GC0 run invalidated the unlimited worker-lifetime claim. Two
+persistent compiled emitters each accumulated about 10 GiB and related RSS
+reached 22.8 GiB before a deliberate interrupt. The replacement recycles a
+compiled emitter after at most four objects, retaining two-process concurrency
+while giving compiler heap an OS reclamation boundary.
 
 ## Change
 
@@ -29,6 +28,14 @@ speedup for every workload.
 - complete non-integration suite: 9403 passed, 114 skipped, 1 warning in
   706.50s (11m46s).
 - complete integration suite: 4551 passed, 12 skipped in 1316.67s (21m56s).
+- current-source cold GC0 fixed point with recycling: 1 passed in 532.73s,
+  sampled peak 8.93 GiB;
+- forced-rebuild current-source five-GC matrix: 5 passed in 1306.29s, sampled
+  aggregate peak 13.13 GiB after the outer frontend budget repair;
+- final complete integration suite: 4551 passed, 12 skipped in 669.70s;
+- final complete non-integration suite: 9503 passed, 28 skipped, 1 warning in
+  970.63s, with a transient sampled 15.21 GiB peak that fell to 4.17 GiB when
+  the heavy pcc1 child exited.
 
 The original direct NumPy path launched 114 short-lived compiler processes in
 batches of twelve. The new default launches at most two batch workers and
@@ -40,3 +47,7 @@ GC0 warmed the cache, the bootstrap lease admitted three full GC chains at
 once and combined RSS peaked at 18.2 GiB. That is tracked independently as
 `TEST-P0-FULL-GC-MEMORY-BUDGET`; it does not reopen the direct emitter-pool
 claim closed here.
+
+The four-object process lifetime, deterministic publication/cache/failure
+tests, cold fixed point, NumPy L5 gate, forced matrix, and both complete suites
+are now green. No compiler case or marker was removed or weakened.

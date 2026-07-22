@@ -29,6 +29,12 @@ from pcc.kernel_ir.metal_package import build_metal_kernel_package
 REPO = Path(__file__).resolve().parents[2]
 
 
+pytestmark = [
+    pytest.mark.pcc_gate(env="PCC_CURRENT_PCC1"),
+    pytest.mark.pcc_gate(probe="metal"),
+]
+
+
 def _strict_hardware() -> bool:
     return os.environ.get("PCC_GPU_HARDWARE_STRICT") == "1"
 
@@ -36,13 +42,13 @@ def _strict_hardware() -> bool:
 def _unavailable(reason: str) -> None:
     if _strict_hardware():
         pytest.fail(reason)
-    pytest.skip(reason)
+    pytest.fail(reason)
 
 
 def _current_pcc1() -> Path:
     raw = os.environ.get("PCC_CURRENT_PCC1", "").strip()
     if not raw:
-        _unavailable("PCC_CURRENT_PCC1 is required for the pcc1 DLPack gate")
+        pytest.fail("PCC_CURRENT_PCC1 must be set when the pcc1 DLPack gate is selected")
     path = Path(raw)
     if not path.is_absolute():
         path = REPO / path

@@ -2,7 +2,7 @@
 
 Chapter 1 stated pcc's thesis and its seven obligations; this chapter supplies the spatial map: which layer of the repository each of those commitments lives in, and whose hands a source file passes through on its way from the command line to an executable. pcc is a cohabitation of "two compilers and one runtime" — the mature C frontend, the experimental typed-Python frontend, and a native runtime with five GC backends — sharing a CLI, project collection, backend selection, and caching infrastructure while each owning a complete pipeline. This chapter looks only at the skeleton: one diagram per pipeline, and for every component an answer to "why does it sit here, and where is its boundary," with the details deferred to later chapters (parsing and the evaluator in Chapter 3, C semantic lowering in Chapter 4, the three tiers of the Python frontend in Chapters 5 and 6, the runtime and GC in Chapters 7 through 11, the backends in Chapters 12 and 13, the bootstrap in Chapter 15). When you finish this chapter you should be able to place any file in the repository onto this map and say which segment of which pipeline it belongs to.
 
-## Reader Map: Treat the Repository as a Pipeline
+## Chapter Overview: Treat the Repository as a Pipeline
 
 This chapter is easy to get lost in because many directories appear at once. Read it as the path from source text to a runnable artifact: entry points collect inputs, frontends establish semantics, lowering produces IR, backends emit target artifacts, and the runtime carries Python object semantics.
 
@@ -26,7 +26,20 @@ In the design space, pcc gives three coexisting answers to "in what form should 
 
 ### 2.2.1 The Installed Entry Point and the click Wrapper
 
-The `pcc` command installed by `pip install python-cc` is wired through `[project.scripts]` in [pyproject.toml](../../pyproject.toml) to `pcc.cli_launcher:main`. [pcc/cli_launcher.py](../../pcc/cli_launcher.py) is 21 lines in total, and its docstring states a position outright: "The public command intentionally stays on the full CPython-hosted CLI. The native bootstrap compiler is exposed separately as `pcc1`." The public command runs on the host CPython with the full CLI; the native bootstrap compiler is shipped separately as `pcc1` (the wheel build hook `hatch_build.py` self-compiles [pcc/__main__.py](../../pcc/__main__.py) to produce a native `pcc1` that travels with the wheel). The launcher does exactly one thing: forward to `cli_main` in [pcc/cli_core.py](../../pcc/cli_core.py).
+The `pcc` command installed by `pip install python-cc` is wired through `[project.scripts]` in [pyproject.toml](../../pyproject.toml) to `pcc.cli_launcher:main`. [pcc/cli_launcher.py](../../pcc/cli_launcher.py) is 22 lines in total:
+
+```python
+# pcc/cli_launcher.py
+def main(argv=None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    from pcc.cli_core import cli_main
+
+    return cli_main(list(argv))
+```
+
+Its docstring states a position outright: "The public command intentionally stays on the full CPython-hosted CLI. The native bootstrap compiler is exposed separately as `pcc1`." The public command runs on the host CPython with the full CLI; the native bootstrap compiler is shipped separately as `pcc1` (the wheel build hook `hatch_build.py` self-compiles [pcc/__main__.py](../../pcc/__main__.py) to produce a native `pcc1` that travels with the wheel). The launcher does exactly one thing: forward to `cli_main` in [pcc/cli_core.py](../../pcc/cli_core.py).
 
 [pcc/pcc.py](../../pcc/pcc.py) is another thin shell: `_build_click_main()` performs a runtime `__import__("click")` and wraps `_click_entry` with click's decorators, one by one, into a command object with completion and help; when click is unavailable, it falls back to `_plain_main`, which is the same `cli_main`. The "decorators applied by hand inside a function" style is not a stylistic quirk — it makes click an optional dependency. Without it, the CLI works just the same.
 
@@ -38,7 +51,18 @@ The dispatch order of `cli_main` is itself an architecture diagram: `-m MODULE` 
 
 ### 2.2.3 cli_bootstrap: The CLI That Gets Compiled
 
-[pcc/__main__.py](../../pcc/__main__.py) is two lines of code: import `bootstrap_cli_sys_argv_exit` from `pcc.cli_bootstrap`, and call it. This is the entry to the bootstrap chain — the three stages of [scripts/bootstrap.sh](../../scripts/bootstrap.sh) compile [pcc/__main__.py](../../pcc/__main__.py). [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py) (roughly seven thousand lines) is the CLI that pcc1/pcc2/pcc3 actually run: Python inputs are compiled by the binary itself; C and project inputs are, in the words of its own help text, "delegated to the full host pcc CLI" (the host entry can be overridden with `PCC_HOST_PCC`); and a `--pytest` subcommand lets pcc1 launch the repository's test suite (it delegates to `env -u LC_ALL uv run pytest` and sets `PCC1_BINARY` so that pcc1-specific test cases get the current binary).
+[pcc/__main__.py](../../pcc/__main__.py) is a few lines of code:
+
+```python
+# pcc/__main__.py
+from pcc.cli_bootstrap import bootstrap_cli_sys_argv_exit
+
+
+if __name__ == "__main__":
+    bootstrap_cli_sys_argv_exit()
+```
+
+This is the entry to the bootstrap chain — the three stages of [scripts/bootstrap.sh](../../scripts/bootstrap.sh) compile [pcc/__main__.py](../../pcc/__main__.py). [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py) (roughly seven thousand lines) is the CLI that pcc1/pcc2/pcc3 actually run: Python inputs are compiled by the binary itself; C and project inputs are, in the words of its own help text, "delegated to the full host pcc CLI" (the host entry can be overridden with `PCC_HOST_PCC`); and a `--pytest` subcommand lets pcc1 launch the repository's test suite (it delegates to `env -u LC_ALL uv run pytest` and sets `PCC1_BINARY` so that pcc1-specific test cases get the current binary).
 
 Why not make `cli_core` the bootstrap entry directly? Because the two have different dependency closures. `cli_core` must import `CEvaluator`, `project.py`, and the other C-path modules — a closure that cannot compile itself today; the closure of `cli_bootstrap` is deliberately narrowed to the Python pipeline plus the delegation logic. Multi-file bootstrap compilation is carried by a separate entry, [scripts/pcc_multi.py](../../scripts/pcc_multi.py) — it wraps `pipeline.compile_python_multi` and itself uses `pcc.extern` for its exit logic, written to the same "will be compiled by pcc" standard.
 
@@ -54,7 +78,22 @@ Three flags decide which mode space a Python compilation lands in, and every def
 
 The C path's flag family is organized around project shape: `--separate-tus`, `--sources-from-make GOAL`, `--depends-on PATH[=GOAL]`, `--system-link`, `--jobs N` (when given explicitly it must be paired with multiple inputs or system-link, otherwise it is an error), `--cpp-arg`/`--link-arg`, `--prepare-cmd`/`--ensure-make-goal`, plus the emission family `--emit-llvm/--emit-asm/--emit-obj` and the cross-compilation flag `--target TRIPLE` (`--target` must be paired with an emission mode or `--system-link`). The diagnostics surface is shared by both pipelines: `--diagnostic-format text|json|sarif`, `--profile-json PATH`, and `--explain-fallback`, conveyed through environment variables to the `observed_compile` wrapper layer in `pcc.compile_observability`.
 
-One detail deserves to be called out by name: on the C path, `--backend self` clamps the default `-O2` down to 0 (`cli_core._effective_self_backend_opt_level`) unless `PCC_SELF_BACKEND_VECTORIZE` is set. The comment explains why: the self backend does not yet fully lower LLVM's vectorized pointer stores (such as Lua's `<4 x ptr>` strcache broadcast). This is a small specimen of "honesty before benchmarks": rather than let vectorized IR blow up on the self backend, degrade openly and leave an explicit switch.
+One detail deserves to be called out by name: on the C path, `--backend self` clamps the default `-O2` down to 0 (`cli_core._effective_self_backend_opt_level`) unless `PCC_SELF_BACKEND_VECTORIZE` is set:
+
+```python
+# pcc/cli_core.py
+def _effective_self_backend_opt_level(backend, opt_level: int) -> int:
+    backend_name = (backend or os.environ.get("PCC_BACKEND", "") or "").strip().lower()
+    if (
+        backend_name == "self"
+        and int(opt_level) > 0
+        and not _self_backend_vectorize_requested()
+    ):
+        return 0
+    return int(opt_level)
+```
+
+The comment explains why: the self backend does not yet fully lower LLVM's vectorized pointer stores (such as Lua's `<4 x ptr>` strcache broadcast). This is a small specimen of "honesty before benchmarks": rather than let vectorized IR blow up on the self backend, degrade openly and leave an explicit switch.
 
 ## 2.3 The C Path: From Source Collection to Four Execution Roots
 
@@ -97,7 +136,7 @@ pcc/evaluater/c_evaluator.py   once per TU (--jobs process-pool parallelism;
 1. **Single file**: `pcc hello.c`; the whole file read in is one TU.
 2. **Directory merge (merged, the default for directory inputs)**: `_collect_directory()` collects `*.c` non-recursively, sorts them, and stitches them into one large source text with `// --- filename ---` comment lines, the file containing `main()` placed last. The `main` test, `_has_main()`, does a coarse regex filter first, then a real preprocessing pass to confirm, so a `main` excluded by `#if` is not misjudged.
 3. **`--separate-tus`**: the same set of files, each its own TU, linked at the module layer; exactly one `main` is enforced, and `compile_translation_units` raises on duplicate external definitions across TUs (`_raise_if_duplicate_external_definitions`).
-4. **`--sources-from-make GOAL`**: dry-run archaeology against make, recovering the participating `.c` files and the `-D/-U/-I/-include` family of flags from real compile command lines. `_scan_make_goal()` tries `-n`, `-n clean`, and `-nB` in that order (the comment explains that `-nB` goes last because forcing a rebuild of every prerequisite can trigger expensive or fragile reconfiguration rules), plus `Makefile.in` detection, per-target `make -n -W src obj.o` probes, and a pure-Python Makefile-parsing fallback. The mechanics and limits are in Chapter 3, Section 3.6; it can only recover flags the build system **actually says out loud** — that boundary is the subject of the war story in 2.6.1.
+4. **`--sources-from-make GOAL`**: dry-run archaeology against make, recovering the participating `.c` files and the `-D/-U/-I/-include` family of flags from real compile command lines. `_scan_make_goal()` tries `-n`, `-n clean`, and `-nB` in that order (the comment explains that `-nB` goes last because forcing a rebuild of every prerequisite can trigger expensive or fragile reconfiguration rules), plus `Makefile.in` detection, per-target `make -n -W src obj.o` probes, and a pure-Python Makefile-parsing fallback. The mechanics and limits are in Chapter 3, Section 3.6; it can only recover flags the build system **actually says out loud** — that boundary is the subject of the case study in 2.6.1.
 
 `--depends-on PATH[=GOAL]` layers constraints on top of multi-input mode: the dependency inputs may contain no `main` at all, the primary input must contain exactly one; dependency units are ordered first, the primary unit last. `--prepare-cmd` and `--ensure-make-goal` run preparation commands before collection (generating headers, prebuilding libraries); `run_prepare_commands` strips `LC_ALL` from the subprocess environment.
 
@@ -196,7 +235,7 @@ The three states of `--python-libpython` converge in `_finalize_libpython_mode`,
 
 `_ensure_runtime` selects the runtime archive to link along three dimensions: `PCC_RUNTIME_CC` (is the runtime compiled by pcc or by the host cc; default pcc) × `PCC_RUNTIME_HIGH` (are the high-level runtime modules the pcc-Python ports or the C implementations; default py) × whether the libpython bridge is needed. The default combination lands on `libpy_runtime_pcc_py.a` — the pcc-compiled archive with the pcc-Python ports as the high level; an existing archive must also pass the staleness detection (`_runtime_archive_stale`), failing which it is rebuilt through the Makefile. The four-layer runtime model and the C/pcc-Python mirror discipline are Chapter 14; here, only one fact is needed: **the default links the pcc-Python ports, not the C sources**, so a fix that "only changed the C implementation" may never have been linked in under the default mode at all.
 
-There are two link roots, dispatched by `_link_native`: `llvm` goes through `_link_with_clang` (first passing `_clang_link_compatible_python_ir`, which downgrades the newer LLVM memory-effect attributes into a form clang can swallow); `self` goes through `_link_with_self_backend`, whose publication sequence deserves quoting in full — `codesign --force -s -` on a temporary file, an atomic rename via `/bin/mv -f`, `codesign --verify`, and finally a publication barrier (`/bin/sync` or one complete read of the artifact). The provenance of this ritual is the war story of 2.6.2. Note that the Python path's emission backends accept only `llvm` and `self` (`_resolve_native_backend` errors explicitly on `llvm_capi`): `llvm_capi` is a choice of IR-construction layer, not an emitter of Python executables.
+There are two link roots, dispatched by `_link_native`: `llvm` goes through `_link_with_clang` (first passing `_clang_link_compatible_python_ir`, which downgrades the newer LLVM memory-effect attributes into a form clang can swallow); `self` goes through `_link_with_self_backend`, whose publication sequence deserves quoting in full — `codesign --force -s -` on a temporary file, an atomic rename via `/bin/mv -f`, `codesign --verify`, and finally a publication barrier (`/bin/sync` or one complete read of the artifact). The provenance of this ritual is the case study of 2.6.2. Note that the Python path's emission backends accept only `llvm` and `self` (`_resolve_native_backend` errors explicitly on `llvm_capi`): `llvm_capi` is a choice of IR-construction layer, not an emitter of Python executables.
 
 ### 2.4.5 Why Host Queries Go Through Subprocesses, Not In-Process Calls
 
@@ -258,7 +297,7 @@ All three stories are about **boundaries**: the first draws the line between the
 
 **Architectural reflexivity.** Midway, an `os.replace()`-based atomic publish was attempted — and rejected, because the strict bootstrap immediately reported a no-libpython fallback appearing in `pcc.py_frontend.pipeline`: `pipeline.py` must itself be compiled by pcc1, so the idioms available to it are constrained by the very gate it guards. The final implementation had to take the already-supported subprocess boundary (`/bin/mv`). The repair technique is selected by the architecture of the thing being repaired — a closed loop peculiar to self-hosting systems.
 
-**The honest ending.** The investigation's 2026-05-15 update records that even with `--verify` in place, one more stage3 crash reproduced — and its crash report pointed at `py_decref`, not the loader. The publication-boundary fix remains useful, but the "stage3 crash class" has not been proven closed; the follow-up was handed to a separate investigation. Half the value of a war story is the fix; the other half is refusing to record "the symptom disappeared" as "the root cause is closed."
+**The honest ending.** The investigation's 2026-05-15 update records that even with `--verify` in place, one more stage3 crash reproduced — and its crash report pointed at `py_decref`, not the loader. The publication-boundary fix remains useful, but the "stage3 crash class" has not been proven closed; the follow-up was handed to a separate investigation. Half the value of a case study is the fix; the other half is refusing to record "the symptom disappeared" as "the root cause is closed."
 
 ### 2.6.3 Four Fallbacks in a Two-Line Entry Script: The CLI Is Itself a Compile Target
 

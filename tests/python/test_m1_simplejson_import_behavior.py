@@ -16,7 +16,7 @@ REPO = Path(__file__).absolute().parents[2]
 def _real_simplejson_site() -> Path:
     raw = os.environ.get("PCC_M1_SIMPLEJSON_SITE", "").strip()
     if not raw:
-        pytest.skip("set PCC_M1_SIMPLEJSON_SITE to the pinned pcc-native install")
+        pytest.fail("PCC_M1_SIMPLEJSON_SITE must point to the pinned pcc-native install when this gate is selected")
     site = Path(raw).resolve()
     if not (site / "simplejson" / "__init__.py").is_file():
         pytest.fail(f"PCC_M1_SIMPLEJSON_SITE is not a simplejson install: {site}")
@@ -79,6 +79,7 @@ def _assert_no_host_runtime_dependencies(exe: Path) -> None:
     assert "libllvm" not in dependencies
 
 
+@pytest.mark.pcc_gate(env="PCC_M1_SIMPLEJSON_SITE")
 def test_real_simplejson_extension_behavior_matches_cpython_under_all_gcs(
     tmp_path,
 ):
@@ -165,6 +166,7 @@ def test_real_simplejson_extension_behavior_matches_cpython_under_all_gcs(
     assert gc_stdout["0"].splitlines()[1:] == oracle.stdout.splitlines()
 
 
+@pytest.mark.pcc_gate(env="PCC_M1_SIMPLEJSON_SITE")
 def test_real_simplejson_missing_compiled_dependency_has_mode_labeled_diagnostic(
     tmp_path,
 ):

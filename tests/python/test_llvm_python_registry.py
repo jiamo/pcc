@@ -1454,7 +1454,7 @@ def test_registered_disable_alias_can_turn_off_analysis_only_sroa_translation(
     assert metric["skips"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 @pytest.mark.parametrize(
     ("alias", "code", "needle", "default_count", "disabled_count", "llvm_count"),
     [
@@ -1600,7 +1600,7 @@ def test_selected_python_translations_match_external_llvm_reference_on_focused_c
     assert metric["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_dse_translation_tracks_external_reference_with_mem2reg_bridge(monkeypatch):
     code = """
     int f(int a) {
@@ -1634,7 +1634,7 @@ def test_dse_translation_tracks_external_reference_with_mem2reg_bridge(monkeypat
     assert llvm_ctx.pass_report()["passes"]["dse"]["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_deadargelim_analysis_boundary_tracks_external_llvm_reference(monkeypatch):
     code = (
         "int callee(int x){ return x; } "
@@ -1658,7 +1658,7 @@ def test_deadargelim_analysis_boundary_tracks_external_llvm_reference(monkeypatc
     assert metric["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_elim_avail_extern_boundary_tracks_external_llvm_reference(monkeypatch):
     code = "extern int helper(void); int main(void){ return 0; }"
 
@@ -1678,7 +1678,7 @@ def test_elim_avail_extern_boundary_tracks_external_llvm_reference(monkeypatch):
     assert metric["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 @pytest.mark.parametrize("alias", ["gvn", "newgvn"])
 def test_gvn_family_tracks_external_reference_on_focused_case(monkeypatch, alias):
     code = "int f(int x,int y){ int a=x+y; int b=x+y; return a==b; }"
@@ -1710,7 +1710,7 @@ def test_gvn_family_tracks_external_reference_on_focused_case(monkeypatch, alias
     assert metric["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 @pytest.mark.parametrize(
     ("alias", "code"),
     [
@@ -1747,7 +1747,7 @@ def test_cfg_cleanup_translations_track_external_llvm_reference(
     assert metric["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 @pytest.mark.parametrize(
     ("alias", "code"),
     [
@@ -1784,7 +1784,7 @@ def test_branch_refinement_translations_track_external_llvm_reference(
     assert metric["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_speculation_friendly_translation_tracks_external_llvm_reference(monkeypatch):
     code = "int f(int c, int x){ if (c) return x + 0; return 0; }"
 
@@ -1804,7 +1804,7 @@ def test_speculation_friendly_translation_tracks_external_llvm_reference(monkeyp
     assert metric["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_loop_idiom_analysis_boundary_tracks_external_llvm_reference(monkeypatch):
     code = "void fill(int *p, int n){ for (int i=0; i<n; ++i) { p[i] = 0; } }"
 
@@ -1844,7 +1844,7 @@ def test_registered_disable_alias_can_turn_off_analysis_only_loop_sink_translati
     assert disabled_artifact["pass_report"]["passes"]["loop-opt"]["skips"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_loop_sink_analysis_boundary_tracks_external_llvm_reference(monkeypatch):
     code = (
         "int f(int *p, int cond){ int sum=0; "
@@ -1868,7 +1868,7 @@ def test_loop_sink_analysis_boundary_tracks_external_llvm_reference(monkeypatch)
     assert metric["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 @pytest.mark.parametrize(
     ("alias", "code", "stat_name"),
     [
@@ -1919,7 +1919,7 @@ def test_analysis_only_memory_translations_track_external_llvm_reference(
     assert metric["runs"] >= 1
 
 
-@pytest.mark.skipif(find_opt_binary() is None, reason="matching llvm opt not installed")
+@pytest.mark.pcc_gate(unavailable=None if find_opt_binary() is not None else "matching llvm opt not installed")
 def test_sroa_analysis_boundary_tracks_external_reference(monkeypatch):
     code = (
         "struct S { int x; int y; }; "

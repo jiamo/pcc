@@ -49,6 +49,14 @@ def _is_macos_arm64() -> bool:
     }
 
 
+pytestmark = pytest.mark.pcc_gate(
+    unavailable=None
+    if _is_macos_arm64()
+    else "the authoritative bootstrap baseline is captured on macOS arm64"
+)
+
+
+
 def _load_baseline() -> dict:
     with open(_BASELINE_JSON, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -66,7 +74,7 @@ def _links_libpython(path: Path) -> bool:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        pytest.skip(f"can't run {cmd[0]}; cannot verify linkage")
+        pytest.fail(f"can't run {cmd[0]}; cannot verify linkage")
     text = (result.stdout or "") + (result.stderr or "")
     return "libpython" in text or "Python.framework" in text
 
@@ -92,17 +100,33 @@ def _byte_identical_after_normalize(a: Path, b: Path) -> bool:
             return fa.read() == fb.read()
 
 
-def _require_bins(backend: str) -> None:
+def _missing_stage_bin_reason(backend: str) -> str | None:
     for stage in (1, 2, 3):
         path = _stage_bin(backend, stage)
         if not path.exists():
-            pytest.skip(
+            return (
                 f"{path} missing; run scripts/bootstrap.sh --backend "
-                f"{backend} to populate, then re-run this test"
+                f"{backend} to populate"
             )
+    return None
 
 
-@pytest.mark.parametrize("backend", ["llvm", "self"])
+def _require_bins(backend: str) -> None:
+    reason = _missing_stage_bin_reason(backend)
+    if reason is not None:
+        pytest.fail(reason + " (gate selected but stage binaries absent)")
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            backend,
+            marks=pytest.mark.pcc_gate(unavailable=_missing_stage_bin_reason(backend)),
+        )
+        for backend in ("llvm", "self")
+    ],
+)
 def test_bootstrap_libpython_state_matches_baseline(backend):
     """Each backend×stage binary's libpython linkage must match what
     the baseline records. When Path A flips a binary from true→false,
@@ -114,7 +138,7 @@ def test_bootstrap_libpython_state_matches_baseline(backend):
         detail="the authoritative bootstrap baseline is captured on macOS arm64",
     )
     if not platform_verdict.available:
-        pytest.skip(platform_verdict.skip_reason())
+        pytest.fail(platform_verdict.skip_reason())
     _require_bins(backend)
     baseline = _load_baseline()
     expected_state = baseline["current_state"][backend]
@@ -142,7 +166,16 @@ def test_bootstrap_libpython_state_matches_baseline(backend):
     )
 
 
-@pytest.mark.parametrize("backend", ["llvm", "self"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            backend,
+            marks=pytest.mark.pcc_gate(unavailable=_missing_stage_bin_reason(backend)),
+        )
+        for backend in ("llvm", "self")
+    ],
+)
 def test_bootstrap_pcc2_pcc3_byte_identical(backend):
     """The README's self-host gate: pcc2 and pcc3 must be byte
     identical after Mach-O signature normalization. Path A must not
@@ -154,7 +187,7 @@ def test_bootstrap_pcc2_pcc3_byte_identical(backend):
         detail="the byte-identical gate is captured on macOS arm64",
     )
     if not platform_verdict.available:
-        pytest.skip(platform_verdict.skip_reason())
+        pytest.fail(platform_verdict.skip_reason())
     _require_bins(backend)
     pcc2 = _stage_bin(backend, 2)
     pcc3 = _stage_bin(backend, 3)

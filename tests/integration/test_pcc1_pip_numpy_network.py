@@ -8,19 +8,19 @@ import subprocess
 
 import pytest
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.pcc_gate(env="PCC_RUN_PCC1_PIP_NUMPY_NETWORK")]
 
 REPO = Path(__file__).resolve().parents[2]
 def _require_enabled() -> Path:
     if os.environ.get("PCC_RUN_PCC1_PIP_NUMPY_NETWORK") != "1":
-        pytest.skip(
+        pytest.fail(
             "set PCC_RUN_PCC1_PIP_NUMPY_NETWORK=1 to run online NumPy acquisition"
         )
     pcc1 = Path(
         os.environ.get("PCC1_BINARY", str(REPO / "build" / "bootstrap" / "pcc1"))
     ).expanduser()
     if not pcc1.is_file():
-        pytest.skip(f"current self-host pcc1 binary required: {pcc1}")
+        pytest.fail(f"current self-host pcc1 binary required: {pcc1}")
     return pcc1.resolve()
 
 

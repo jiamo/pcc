@@ -388,6 +388,49 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (_export_arg("path", ("str",)),),
         ),
     },
+    # Package environment selection is shared by the host CLI, the compiled
+    # bootstrap CLI, and frontend import discovery.  Standalone module probes
+    # need the same signatures as the closed-world build; treating these
+    # helpers as dynamic silently adds libpython calls to both cli_bootstrap
+    # and pipeline.
+    "pcc.package_environment": {
+        "apply_locked_environment_resource_defaults": _function_export(
+            ("list", ("str",)),
+            (),
+            (),
+        ),
+        "default_package_cache": _function_export(
+            ("str",),
+            (("dyn",),),
+            (_export_arg("environ", ("dyn",), has_default=True),),
+        ),
+        "default_package_site": _function_export(
+            ("str",),
+            (("dyn",), ("dyn",)),
+            (
+                _export_arg("environ", ("dyn",), has_default=True),
+                _export_arg("target_triple", ("dyn",), has_default=True),
+            ),
+        ),
+        "environment_info_json": _function_export(
+            ("str",),
+            (("dyn",),),
+            (_export_arg("environ", ("dyn",), has_default=True),),
+        ),
+        "environment_info_text": _function_export(
+            ("str",),
+            (("dyn",),),
+            (_export_arg("environ", ("dyn",), has_default=True),),
+        ),
+        "package_site_roots": _function_export(
+            ("list", ("str",)),
+            (("dyn",), ("dyn",)),
+            (
+                _export_arg("environ", ("dyn",), has_default=True),
+                _export_arg("target_triple", ("dyn",), has_default=True),
+            ),
+        ),
+    },
     # The strict AArch64 self path is linked into pcc1 and called in-process;
     # these three signatures keep pipeline.py's independent diagnostic probe
     # on the same native edge as the real closed-world compiler.
@@ -774,6 +817,68 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             ("int",),
             (("dyn",),),
             (_export_arg("module_args", ("dyn",)),),
+        ),
+    },
+    "pcc.py_frontend.compile_cache": {
+        "acquire_python_frontend_ir_cache": _function_export(
+            ("bool",),
+            (("dyn",),),
+            (_export_arg("plan", ("dyn",)),),
+        ),
+        "load_python_frontend_ir_cache": _function_export(
+            ("dyn",),
+            (("dyn",), ("dyn",)),
+            (
+                _export_arg("plan", ("dyn",)),
+                _export_arg("expected_module_names", ("dyn",)),
+            ),
+        ),
+        "plan_python_frontend_ir_cache": _function_export(
+            ("dyn",),
+            (
+                ("dyn",),
+                ("dyn",),
+                ("str",),
+                ("str",),
+                ("str",),
+                ("dyn",),
+                ("str",),
+                ("str",),
+            ),
+            (
+                _export_arg("src_paths", ("dyn",)),
+                _export_arg("module_names", ("dyn",)),
+                _export_arg("", kind="kw_only"),
+                _export_arg("compiler_executable", ("str",)),
+                _export_arg("host_python", ("str",)),
+                _export_arg("entry_module", ("str",)),
+                _export_arg("sibling_inits", ("dyn",)),
+                _export_arg("libpython_mode", ("str",)),
+                _export_arg("ir_scaffold_mode", ("str",)),
+            ),
+        ),
+        "publish_python_frontend_ir_cache": _function_export(
+            ("bool",),
+            (("dyn",), ("dyn",)),
+            (
+                _export_arg("plan", ("dyn",)),
+                _export_arg("result", ("dyn",)),
+            ),
+        ),
+        "release_python_frontend_ir_cache": _function_export(
+            ("none",),
+            (("dyn",),),
+            (_export_arg("plan", ("dyn",)),),
+        ),
+        "wait_python_frontend_ir_cache": _function_export(
+            ("dyn",),
+            (("dyn",), ("dyn",), ("float",)),
+            (
+                _export_arg("plan", ("dyn",)),
+                _export_arg("expected_module_names", ("dyn",)),
+                _export_arg("", kind="kw_only"),
+                _export_arg("timeout_seconds", ("float",), has_default=True),
+            ),
         ),
     },
     # ``pcc/cli_bootstrap.py`` reaches into pipeline for the two
@@ -1313,6 +1418,7 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
 _PCC_FRONTEND_STATIC_NATIVE_MODULES = frozenset(
     {
         "pcc.py_frontend.pipeline",
+        "pcc.py_frontend.compile_cache",
         "pcc.py_frontend.codegen.layer1_support",
         "pcc.py_frontend.codegen.host_contract",
         "pcc.py_frontend.codegen.layer1_constants",
@@ -1374,6 +1480,7 @@ if _layer1_exports is not None:
 def _default_native_module_exports(module_name: str | None):
     if not (
         module_name == "pcc.py_frontend.pipeline"
+        or module_name == "pcc.py_frontend.compile_cache"
         or module_name == "pcc.py_frontend.codegen.layer1_support"
         or module_name == "pcc.py_frontend.codegen.host_contract"
         or module_name == "pcc.py_frontend.codegen.layer1_constants"

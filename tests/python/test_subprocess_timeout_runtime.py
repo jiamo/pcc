@@ -5,13 +5,15 @@ import subprocess
 import time
 from pathlib import Path
 
+from pcc1_gate import repo_root
+
 import pytest
 
 import pcc.py_stdlib.subprocess as pcc_subprocess
 from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = repo_root()
 
 
 def test_pcc_stdlib_timeout_result_raises_timeout_expired(monkeypatch):

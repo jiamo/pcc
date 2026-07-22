@@ -280,16 +280,23 @@ def _read_checkout_head(root: Path) -> str:
 # CI stays green without ~/pcc_refs. Never a source of the core PASS.
 # --------------------------------------------------------------------------
 
+_DS4_LIVE_ROOT = Path("~/pcc_refs/antirez-ds4-depth1").expanduser()
+_DS4_LIVE_REASON = (
+    None
+    if _DS4_LIVE_ROOT.is_dir()
+    else "external ds4 reference tree absent; core assertions cover the manifest"
+)
+
+
+@pytest.mark.pcc_gate(unavailable=_DS4_LIVE_REASON)
 def test_live_tree_cross_check_optional(manifest: dict) -> None:
-    ds4_root = Path("~/pcc_refs/antirez-ds4-depth1").expanduser()
-    if not ds4_root.is_dir():
-        pytest.skip("external ds4 reference tree absent; core assertions cover the manifest")
+    ds4_root = _DS4_LIVE_ROOT
     if not (ds4_root / ".git").exists():
-        pytest.skip("external ds4 tree present but not a git checkout")
+        pytest.fail("external ds4 tree present but not a git checkout")
     try:
         head = _read_checkout_head(ds4_root)
     except OSError:
-        pytest.skip("could not read ds4 HEAD commit")
+        pytest.fail("could not read ds4 HEAD commit")
     assert head == PINNED_COMMIT, (
         f"live ds4 tree HEAD {head} != pinned {PINNED_COMMIT}; "
         "re-pin the reference before trusting the inventory"

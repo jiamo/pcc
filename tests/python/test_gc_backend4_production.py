@@ -7,7 +7,6 @@ from pathlib import Path
 
 from tests.runtime_build_cache import cached_c_runtime, cached_threaded_c_runtime
 
-
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
@@ -134,9 +133,15 @@ def test_backend4_skips_zpage_and_graph_for_leaf_objects(tmp_path: Path) -> None
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().splitlines() == [
-        "0", "1", "0",
-        "0", "1", "0",
-        "1", "0", "1",
+        "0",
+        "1",
+        "0",
+        "0",
+        "1",
+        "0",
+        "1",
+        "0",
+        "1",
     ]
 
     c_obj = (RUNTIME_DIR / "src" / "py_obj.c").read_text(encoding="utf-8")
@@ -186,12 +191,10 @@ def test_backend4_deallocating_index_node_is_not_active(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "backend4-zero-refcount-node-inactive-ok"
 
-    c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
-        encoding="utf-8"
-    )
-    c_active = c_src.split(
-        "static int pcc_gc_object_node_is_active", 1
-    )[1].split("static void pcc_gc_object_node_link_head", 1)[0]
+    c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
+    c_active = c_src.split("static int pcc_gc_object_node_is_active", 1)[1].split(
+        "static void pcc_gc_object_node_link_head", 1
+    )[0]
     assert "PY_FLAG_GC_DEALLOCATING" in c_active
 
     c_obj = (RUNTIME_DIR / "src" / "py_obj.c").read_text(encoding="utf-8")
@@ -202,16 +205,14 @@ def test_backend4_deallocating_index_node_is_not_active(tmp_path: Path) -> None:
         "pcc_obj_runtime_log_event_code"
     )
 
-    c_finalize = c_src.split("static void pcc_gc_finalize_unreachable", 1)[
-        1
-    ].split("static void pcc_gc_recheck_reachability_after_finalizers", 1)[0]
+    c_finalize = c_src.split("static void pcc_gc_finalize_unreachable", 1)[1].split(
+        "static void pcc_gc_recheck_reachability_after_finalizers", 1
+    )[0]
     assert c_finalize.index("PY_FLAG_GC_DEALLOCATING") < c_finalize.index(
         "pcc_gc_note_object_freeing(o)"
     )
 
-    py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(
-        encoding="utf-8"
-    )
+    py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
     py_active = py_src.split("def _object_node_is_active", 1)[1].split(
         "def _object_node_prev", 1
     )[0]
@@ -235,9 +236,9 @@ def test_backend4_deallocating_index_node_is_not_active(tmp_path: Path) -> None:
 
 def test_backend4_forwarding_target_lookup_is_indexed() -> None:
     c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
-    c_target_exists = c_src.split(
-        "static int pcc_gc_forwarding_target_exists", 1
-    )[1].split("static int pcc_gc_forwarding_target_prepare", 1)[0]
+    c_target_exists = c_src.split("static int pcc_gc_forwarding_target_exists", 1)[
+        1
+    ].split("static int pcc_gc_forwarding_target_prepare", 1)[0]
     assert "pcc_gc_forwarding_target_find(target) != NULL" in c_target_exists
     assert "pcc_gc_forwardings" not in c_target_exists
     assert "target_next" in c_src
@@ -290,18 +291,16 @@ def test_backend4_zpage_owner_lookup_is_indexed(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-owner-index-ok"
 
-    c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
-        encoding="utf-8"
-    )
-    c_link = c_src.split(
-        "static void pcc_gc_backend4_zpage_link_node_unlocked", 1
-    )[1].split("static void pcc_gc_backend4_zpage_unlink_node_unlocked", 1)[0]
-    c_unlink = c_src.split(
-        "static void pcc_gc_backend4_zpage_unlink_node_unlocked", 1
-    )[1].split("static PccGcZPageNode *pcc_gc_backend4_zpage_track_alloc_unlocked", 1)[0]
-    c_remove = c_src.split(
-        "static void pcc_gc_backend4_zpage_remove_unlocked", 1
-    )[1].split("static PccGcZPageNode *pcc_gc_backend4_zpage_find_unlocked", 1)[0]
+    c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
+    c_link = c_src.split("static void pcc_gc_backend4_zpage_link_node_unlocked", 1)[
+        1
+    ].split("static void pcc_gc_backend4_zpage_unlink_node_unlocked", 1)[0]
+    c_unlink = c_src.split("static void pcc_gc_backend4_zpage_unlink_node_unlocked", 1)[
+        1
+    ].split("static PccGcZPageNode *pcc_gc_backend4_zpage_track_alloc_unlocked", 1)[0]
+    c_remove = c_src.split("static void pcc_gc_backend4_zpage_remove_unlocked", 1)[
+        1
+    ].split("static PccGcZPageNode *pcc_gc_backend4_zpage_find_unlocked", 1)[0]
     c_freeing = c_src.split("void pcc_gc_note_object_freeing", 1)[1].split(
         "if (!pcc_gc_tracks_objects())", 1
     )[0]
@@ -327,9 +326,7 @@ def test_backend4_zpage_owner_lookup_is_indexed(tmp_path: Path) -> None:
     assert "pcc_gc_backend4_zpage_owns_addr_unlocked(o)" in c_free_memory
     assert "if (zpage_indexed != 0 || zpage_addr_owned != 0) return;" in c_free_memory
 
-    py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(
-        encoding="utf-8"
-    )
+    py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
     py_link = py_src.split("def _backend4_zpage_link_node", 1)[1].split(
         "def _backend4_zpage_unlink_node", 1
     )[0]
@@ -343,7 +340,7 @@ def test_backend4_zpage_owner_lookup_is_indexed(tmp_path: Path) -> None:
         "if _gc_tracks_objects() == 0", 1
     )[0]
     py_free_memory = py_src.split("def pcc_gc_free_object_memory", 1)[1].split(
-        "@c_abi_export(\"pcc_gc_note_alloc\")", 1
+        '@c_abi_export("pcc_gc_note_alloc")', 1
     )[0]
     assert "pcc_gc_zpage_owner_index_upsert(load_ptr(node, 0), node)" in py_link
     assert "pcc_gc_zpage_owner_index_remove(load_ptr(node, 0))" in py_unlink
@@ -368,7 +365,7 @@ def test_backend4_zpage_owner_lookup_is_indexed(tmp_path: Path) -> None:
 def test_backend4_zpage_free_fallback_checks_retained_span_address(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include "py_internal.h"
         #include <stdio.h>
@@ -394,7 +391,7 @@ def test_backend4_zpage_free_fallback_checks_retained_span_address(tmp_path):
             printf("backend4-zpage-address-free-fallback-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-address-free-fallback-ok"
@@ -403,7 +400,7 @@ def test_backend4_zpage_free_fallback_checks_retained_span_address(tmp_path):
 def test_backend4_relocation_stress_stable_ids_and_no_old_addresses(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -444,7 +441,7 @@ def test_backend4_relocation_stress_stable_ids_and_no_old_addresses(tmp_path):
             printf("backend4-production-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-production-ok"
@@ -453,7 +450,7 @@ def test_backend4_relocation_stress_stable_ids_and_no_old_addresses(tmp_path):
 def test_backend4_relocation_preserves_container_payloads_under_stress(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -496,7 +493,7 @@ def test_backend4_relocation_preserves_container_payloads_under_stress(tmp_path)
             printf("backend4-container-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-container-ok"
@@ -505,7 +502,7 @@ def test_backend4_relocation_preserves_container_payloads_under_stress(tmp_path)
 def test_backend4_obj_dispatch_loads_forwarded_exception_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -625,7 +622,7 @@ def test_backend4_obj_dispatch_loads_forwarded_exception_slots(tmp_path):
             printf("backend4-obj-dispatch-exc-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-obj-dispatch-exc-slots-ok"
@@ -634,7 +631,7 @@ def test_backend4_obj_dispatch_loads_forwarded_exception_slots(tmp_path):
 def test_backend4_obj_dispatch_loads_forwarded_instance_class_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -711,7 +708,7 @@ def test_backend4_obj_dispatch_loads_forwarded_instance_class_slot(tmp_path):
             printf("backend4-obj-dispatch-instance-class-slot-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-obj-dispatch-instance-class-slot-ok"
@@ -720,7 +717,7 @@ def test_backend4_obj_dispatch_loads_forwarded_instance_class_slot(tmp_path):
 def test_backend4_list_get_loads_forwarded_item_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -762,7 +759,7 @@ def test_backend4_list_get_loads_forwarded_item_slot(tmp_path):
             printf("backend4-list-get-forwarded-item-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-list-get-forwarded-item-ok"
@@ -771,7 +768,7 @@ def test_backend4_list_get_loads_forwarded_item_slot(tmp_path):
 def test_backend4_capi_internal_owner_slots_trace_and_load_forwarded_values(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -920,7 +917,7 @@ def test_backend4_capi_internal_owner_slots_trace_and_load_forwarded_values(tmp_
             printf("backend4-capi-owner-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-capi-owner-slots-ok"
@@ -929,7 +926,7 @@ def test_backend4_capi_internal_owner_slots_trace_and_load_forwarded_values(tmp_
 def test_backend4_list_concat_loads_forwarded_item_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -976,7 +973,7 @@ def test_backend4_list_concat_loads_forwarded_item_slot(tmp_path):
             printf("backend4-list-concat-forwarded-item-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-list-concat-forwarded-item-ok"
@@ -985,7 +982,7 @@ def test_backend4_list_concat_loads_forwarded_item_slot(tmp_path):
 def test_backend4_list_mutations_load_forwarded_item_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1062,7 +1059,7 @@ def test_backend4_list_mutations_load_forwarded_item_slots(tmp_path):
             printf("backend4-list-mutation-barriers-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-list-mutation-barriers-ok"
@@ -1071,7 +1068,7 @@ def test_backend4_list_mutations_load_forwarded_item_slots(tmp_path):
 def test_backend4_tuple_get_loads_forwarded_item_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1119,7 +1116,7 @@ def test_backend4_tuple_get_loads_forwarded_item_slot(tmp_path):
             printf("backend4-tuple-get-forwarded-item-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-tuple-get-forwarded-item-ok"
@@ -1128,7 +1125,7 @@ def test_backend4_tuple_get_loads_forwarded_item_slot(tmp_path):
 def test_backend4_tuple_concat_loads_forwarded_item_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1181,7 +1178,7 @@ def test_backend4_tuple_concat_loads_forwarded_item_slot(tmp_path):
             printf("backend4-tuple-concat-forwarded-item-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-tuple-concat-forwarded-item-ok"
@@ -1190,7 +1187,7 @@ def test_backend4_tuple_concat_loads_forwarded_item_slot(tmp_path):
 def test_backend4_relocation_preserves_descriptor_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1300,7 +1297,7 @@ def test_backend4_relocation_preserves_descriptor_slots(tmp_path):
             printf("backend4-descriptor-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-descriptor-relocation-ok"
@@ -1309,7 +1306,7 @@ def test_backend4_relocation_preserves_descriptor_slots(tmp_path):
 def test_backend4_relocation_preserves_memoryview_base(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1353,7 +1350,7 @@ def test_backend4_relocation_preserves_memoryview_base(tmp_path):
             printf("backend4-memoryview-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-memoryview-relocation-ok"
@@ -1362,7 +1359,7 @@ def test_backend4_relocation_preserves_memoryview_base(tmp_path):
 def test_backend4_memoryview_loads_forwarded_base_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1425,7 +1422,7 @@ def test_backend4_memoryview_loads_forwarded_base_slot(tmp_path):
             printf("backend4-memoryview-base-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-memoryview-base-barrier-ok"
@@ -1442,7 +1439,7 @@ def test_backend4_libpython_bridge_memoryview_base_uses_read_barrier():
 def test_backend4_container_dealloc_loads_forwarded_reference_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1505,7 +1502,7 @@ def test_backend4_container_dealloc_loads_forwarded_reference_slots(tmp_path):
             printf("backend4-container-dealloc-barriers-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-container-dealloc-barriers-ok"
@@ -1514,7 +1511,7 @@ def test_backend4_container_dealloc_loads_forwarded_reference_slots(tmp_path):
 def test_backend4_relocation_preserves_func_entry_and_captures(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -1571,7 +1568,7 @@ def test_backend4_relocation_preserves_func_entry_and_captures(tmp_path):
             printf("backend4-func-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-func-relocation-ok"
@@ -1580,7 +1577,7 @@ def test_backend4_relocation_preserves_func_entry_and_captures(tmp_path):
 def test_backend4_func_call_loads_forwarded_captures_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -1652,7 +1649,7 @@ def test_backend4_func_call_loads_forwarded_captures_slot(tmp_path):
             printf("backend4-func-captures-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-func-captures-barrier-ok"
@@ -1661,7 +1658,7 @@ def test_backend4_func_call_loads_forwarded_captures_slot(tmp_path):
 def test_backend4_func_relocation_loads_forwarded_captures_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -1743,7 +1740,7 @@ def test_backend4_func_relocation_loads_forwarded_captures_slot(tmp_path):
             printf("backend4-func-relocation-captures-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-func-relocation-captures-barrier-ok"
@@ -1752,7 +1749,7 @@ def test_backend4_func_relocation_loads_forwarded_captures_slot(tmp_path):
 def test_backend4_relocation_preserves_iter_sequence_and_index(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1814,7 +1811,7 @@ def test_backend4_relocation_preserves_iter_sequence_and_index(tmp_path):
             printf("backend4-iter-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-iter-relocation-ok"
@@ -1823,7 +1820,7 @@ def test_backend4_relocation_preserves_iter_sequence_and_index(tmp_path):
 def test_backend4_iter_next_loads_forwarded_sequence_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1897,7 +1894,7 @@ def test_backend4_iter_next_loads_forwarded_sequence_slot(tmp_path):
             printf("backend4-iter-next-seq-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-iter-next-seq-barrier-ok"
@@ -1906,7 +1903,7 @@ def test_backend4_iter_next_loads_forwarded_sequence_slot(tmp_path):
 def test_backend4_relocation_preserves_generator_state_and_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -1986,7 +1983,7 @@ def test_backend4_relocation_preserves_generator_state_and_slots(tmp_path):
             printf("backend4-gen-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-gen-relocation-ok"
@@ -1995,7 +1992,7 @@ def test_backend4_relocation_preserves_generator_state_and_slots(tmp_path):
 def test_backend4_relocation_preserves_coroutine_shell_state(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <string.h>
@@ -2092,7 +2089,7 @@ def test_backend4_relocation_preserves_coroutine_shell_state(tmp_path):
             printf("backend4-coroutine-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-coroutine-relocation-ok"
@@ -2101,7 +2098,7 @@ def test_backend4_relocation_preserves_coroutine_shell_state(tmp_path):
 def test_backend4_relocation_preserves_task_slots_and_done(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -2177,7 +2174,7 @@ def test_backend4_relocation_preserves_task_slots_and_done(tmp_path):
             printf("backend4-task-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-task-relocation-ok"
@@ -2186,7 +2183,7 @@ def test_backend4_relocation_preserves_task_slots_and_done(tmp_path):
 def test_backend4_relocation_preserves_exception_slots_and_traceback(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -2286,7 +2283,7 @@ def test_backend4_relocation_preserves_exception_slots_and_traceback(tmp_path):
             printf("backend4-exc-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-exc-relocation-ok"
@@ -2295,7 +2292,7 @@ def test_backend4_relocation_preserves_exception_slots_and_traceback(tmp_path):
 def test_backend4_exception_accessors_load_forwarded_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -2413,7 +2410,7 @@ def test_backend4_exception_accessors_load_forwarded_slots(tmp_path):
             printf("backend4-exc-accessor-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-exc-accessor-barrier-ok"
@@ -2422,7 +2419,7 @@ def test_backend4_exception_accessors_load_forwarded_slots(tmp_path):
 def test_backend4_exception_print_loads_forwarded_message_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -2489,7 +2486,7 @@ def test_backend4_exception_print_loads_forwarded_message_slot(tmp_path):
             printf("backend4-exception-print-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-exception-print-barrier-ok"
@@ -2498,7 +2495,7 @@ def test_backend4_exception_print_loads_forwarded_message_slot(tmp_path):
 def test_backend4_tls_exception_accessors_heal_forwarded_reference(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -2587,7 +2584,7 @@ def test_backend4_tls_exception_accessors_heal_forwarded_reference(tmp_path):
             printf("backend4-tls-exception-forwarding-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-tls-exception-forwarding-ok"
@@ -2596,7 +2593,7 @@ def test_backend4_tls_exception_accessors_heal_forwarded_reference(tmp_path):
 def test_backend4_raise_context_chaining_resolves_forwarded_current_exception(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -2681,7 +2678,7 @@ def test_backend4_raise_context_chaining_resolves_forwarded_current_exception(tm
             printf("backend4-raise-context-forwarded-current-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-raise-context-forwarded-current-ok"
@@ -2690,7 +2687,7 @@ def test_backend4_raise_context_chaining_resolves_forwarded_current_exception(tm
 def test_backend4_relocation_retargets_class_attrs_side_table(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -2809,7 +2806,7 @@ def test_backend4_relocation_retargets_class_attrs_side_table(tmp_path):
             printf("backend4-class-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-relocation-ok"
@@ -2818,7 +2815,7 @@ def test_backend4_relocation_retargets_class_attrs_side_table(tmp_path):
 def test_backend4_class_attrs_creation_uses_store_barrier(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -2879,7 +2876,7 @@ def test_backend4_class_attrs_creation_uses_store_barrier(tmp_path):
             printf("backend4-class-attrs-store-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-attrs-store-barrier-ok"
@@ -2888,7 +2885,7 @@ def test_backend4_class_attrs_creation_uses_store_barrier(tmp_path):
 def test_backend4_class_relocation_loads_forwarded_attrs_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -2998,7 +2995,7 @@ def test_backend4_class_relocation_loads_forwarded_attrs_slot(tmp_path):
             printf("backend4-class-forwarded-attrs-load-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-forwarded-attrs-load-ok"
@@ -3007,7 +3004,7 @@ def test_backend4_class_relocation_loads_forwarded_attrs_slot(tmp_path):
 def test_backend4_class_attrs_api_resolves_forwarded_class_argument(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -3087,7 +3084,7 @@ def test_backend4_class_attrs_api_resolves_forwarded_class_argument(tmp_path):
             printf("backend4-class-attrs-forwarded-class-arg-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-attrs-forwarded-class-arg-ok"
@@ -3096,7 +3093,7 @@ def test_backend4_class_attrs_api_resolves_forwarded_class_argument(tmp_path):
 def test_backend4_class_relocation_loads_forwarded_metadata_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -3229,7 +3226,7 @@ def test_backend4_class_relocation_loads_forwarded_metadata_slots(tmp_path):
             printf("backend4-class-forwarded-metadata-load-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-forwarded-metadata-load-ok"
@@ -3238,7 +3235,7 @@ def test_backend4_class_relocation_loads_forwarded_metadata_slots(tmp_path):
 def test_backend4_class_lookup_loads_forwarded_method_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -3322,7 +3319,7 @@ def test_backend4_class_lookup_loads_forwarded_method_slot(tmp_path):
             printf("backend4-class-lookup-forwarded-method-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-lookup-forwarded-method-ok"
@@ -3331,7 +3328,7 @@ def test_backend4_class_lookup_loads_forwarded_method_slot(tmp_path):
 def test_backend4_class_add_method_uses_metadata_store_barrier(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -3392,7 +3389,7 @@ def test_backend4_class_add_method_uses_metadata_store_barrier(tmp_path):
             printf("backend4-class-add-method-store-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-add-method-store-barrier-ok"
@@ -3401,7 +3398,7 @@ def test_backend4_class_add_method_uses_metadata_store_barrier(tmp_path):
 def test_backend4_isinstance_resolves_forwarded_class_argument(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -3477,7 +3474,7 @@ def test_backend4_isinstance_resolves_forwarded_class_argument(tmp_path):
             printf("backend4-isinstance-forwarded-class-arg-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-isinstance-forwarded-class-arg-ok"
@@ -3486,7 +3483,7 @@ def test_backend4_isinstance_resolves_forwarded_class_argument(tmp_path):
 def test_backend4_instance_get_field_loads_forwarded_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -3577,7 +3574,7 @@ def test_backend4_instance_get_field_loads_forwarded_slot(tmp_path):
             printf("backend4-instance-get-field-forwarded-slot-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-instance-get-field-forwarded-slot-ok"
@@ -3586,7 +3583,7 @@ def test_backend4_instance_get_field_loads_forwarded_slot(tmp_path):
 def test_backend4_instance_get_field_resolves_forwarded_class_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -3670,7 +3667,7 @@ def test_backend4_instance_get_field_resolves_forwarded_class_slot(tmp_path):
             printf("backend4-instance-get-field-forwarded-class-slot-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-instance-get-field-forwarded-class-slot-ok"
@@ -3679,7 +3676,7 @@ def test_backend4_instance_get_field_resolves_forwarded_class_slot(tmp_path):
 def test_backend4_instance_new_resolves_forwarded_class_argument(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -3750,7 +3747,7 @@ def test_backend4_instance_new_resolves_forwarded_class_argument(tmp_path):
             printf("backend4-instance-new-forwarded-class-arg-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-instance-new-forwarded-class-arg-ok"
@@ -3759,7 +3756,7 @@ def test_backend4_instance_new_resolves_forwarded_class_argument(tmp_path):
 def test_backend4_class_add_method_resolves_forwarded_class_argument(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -3838,7 +3835,7 @@ def test_backend4_class_add_method_resolves_forwarded_class_argument(tmp_path):
             printf("backend4-class-add-method-forwarded-class-arg-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-add-method-forwarded-class-arg-ok"
@@ -3847,7 +3844,7 @@ def test_backend4_class_add_method_resolves_forwarded_class_argument(tmp_path):
 def test_backend4_class_new_resolves_forwarded_base_argument(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -3908,7 +3905,7 @@ def test_backend4_class_new_resolves_forwarded_base_argument(tmp_path):
             printf("backend4-class-new-forwarded-base-arg-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-new-forwarded-base-arg-ok"
@@ -3917,7 +3914,7 @@ def test_backend4_class_new_resolves_forwarded_base_argument(tmp_path):
 def test_backend4_class_new_resolves_forwarded_mro_entries(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -3979,7 +3976,7 @@ def test_backend4_class_new_resolves_forwarded_mro_entries(tmp_path):
             printf("backend4-class-new-forwarded-mro-entry-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-class-new-forwarded-mro-entry-ok"
@@ -3988,7 +3985,7 @@ def test_backend4_class_new_resolves_forwarded_mro_entries(tmp_path):
 def test_backend4_exception_match_loads_forwarded_mro_entry(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
         #include <stdlib.h>
@@ -4083,7 +4080,7 @@ def test_backend4_exception_match_loads_forwarded_mro_entry(tmp_path):
             printf("backend4-exception-match-mro-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-exception-match-mro-barrier-ok"
@@ -4092,7 +4089,7 @@ def test_backend4_exception_match_loads_forwarded_mro_entry(tmp_path):
 def test_backend4_dunder_lookup_loads_forwarded_instance_class_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -4189,7 +4186,7 @@ def test_backend4_dunder_lookup_loads_forwarded_instance_class_slot(tmp_path):
             printf("backend4-dunder-instance-class-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-dunder-instance-class-barrier-ok"
@@ -4198,7 +4195,7 @@ def test_backend4_dunder_lookup_loads_forwarded_instance_class_slot(tmp_path):
 def test_backend4_relocation_retargets_weakref_intrusive_list(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -4260,7 +4257,7 @@ def test_backend4_relocation_retargets_weakref_intrusive_list(tmp_path):
             printf("backend4-weakref-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-weakref-relocation-ok"
@@ -4269,7 +4266,7 @@ def test_backend4_relocation_retargets_weakref_intrusive_list(tmp_path):
 def test_backend4_weakref_callback_loads_forwarded_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -4353,7 +4350,7 @@ def test_backend4_weakref_callback_loads_forwarded_slot(tmp_path):
             printf("backend4-weakref-callback-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-weakref-callback-barrier-ok"
@@ -4364,7 +4361,7 @@ def test_backend4_remap_rewrites_weakref_target_slot_before_forwarding_retiremen
 ):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -4416,7 +4413,7 @@ def test_backend4_remap_rewrites_weakref_target_slot_before_forwarding_retiremen
             printf("backend4-weakref-target-remap-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-weakref-target-remap-ok"
@@ -4425,7 +4422,7 @@ def test_backend4_remap_rewrites_weakref_target_slot_before_forwarding_retiremen
 def test_backend4_gc_callback_remove_loads_forwarded_list_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -4477,7 +4474,7 @@ def test_backend4_gc_callback_remove_loads_forwarded_list_slot(tmp_path):
             printf("backend4-gc-callback-remove-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-gc-callback-remove-barrier-ok"
@@ -4486,7 +4483,7 @@ def test_backend4_gc_callback_remove_loads_forwarded_list_slot(tmp_path):
 def test_backend4_relocation_preserves_unstarted_thread_wrapper(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -4548,7 +4545,7 @@ def test_backend4_relocation_preserves_unstarted_thread_wrapper(tmp_path):
             printf("backend4-thread-relocation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-thread-relocation-ok"
@@ -4557,7 +4554,7 @@ def test_backend4_relocation_preserves_unstarted_thread_wrapper(tmp_path):
 def test_backend4_thread_start_loads_forwarded_args_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -4645,7 +4642,7 @@ def test_backend4_thread_start_loads_forwarded_args_slot(tmp_path):
             printf("backend4-thread-args-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-thread-args-barrier-ok"
@@ -4654,7 +4651,7 @@ def test_backend4_thread_start_loads_forwarded_args_slot(tmp_path):
 def test_backend4_module_attr_slot_helper_loads_forwarded_value(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -4704,7 +4701,7 @@ def test_backend4_module_attr_slot_helper_loads_forwarded_value(tmp_path):
             printf("backend4-module-attr-slot-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-module-attr-slot-barrier-ok"
@@ -4713,7 +4710,7 @@ def test_backend4_module_attr_slot_helper_loads_forwarded_value(tmp_path):
 def test_backend4_relocation_skips_thread_wrapper_with_native_handle(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -4760,7 +4757,7 @@ def test_backend4_relocation_skips_thread_wrapper_with_native_handle(tmp_path):
             printf("backend4-thread-native-handle-skip-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-thread-native-handle-skip-ok"
@@ -4769,7 +4766,7 @@ def test_backend4_relocation_skips_thread_wrapper_with_native_handle(tmp_path):
 def test_backend4_relocation_skips_native_handle_wrappers(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -4890,7 +4887,7 @@ def test_backend4_relocation_skips_native_handle_wrappers(tmp_path):
             printf("backend4-native-handle-wrapper-skip-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-native-handle-wrapper-skip-ok"
@@ -4899,7 +4896,7 @@ def test_backend4_relocation_skips_native_handle_wrappers(tmp_path):
 def test_backend4_fragmentation_score_tracks_live_evacuation_debt(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -4955,7 +4952,7 @@ def test_backend4_fragmentation_score_tracks_live_evacuation_debt(tmp_path):
             printf("backend4-fragmentation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-fragmentation-ok"
@@ -4964,7 +4961,7 @@ def test_backend4_fragmentation_score_tracks_live_evacuation_debt(tmp_path):
 def test_backend4_genzgc_page_policy_records_candidates_and_evacuated_bytes(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -5095,7 +5092,7 @@ def test_backend4_genzgc_page_policy_records_candidates_and_evacuated_bytes(tmp_
             printf("backend4-page-policy-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-page-policy-ok"
@@ -5104,7 +5101,7 @@ def test_backend4_genzgc_page_policy_records_candidates_and_evacuated_bytes(tmp_
 def test_backend4_genzgc_reset_relocation_set_clears_page_policy_shape(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -5188,7 +5185,7 @@ def test_backend4_genzgc_reset_relocation_set_clears_page_policy_shape(tmp_path)
             printf("backend4-reset-relocation-shape-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-reset-relocation-shape-ok"
@@ -5197,11 +5194,12 @@ def test_backend4_genzgc_reset_relocation_set_clears_page_policy_shape(tmp_path)
 def test_backend4_genzgc_store_barrier_remembers_old_to_young_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
         #include <stdlib.h>
+        #include <string.h>
 
         enum {
             PY_FLAG_GC_YOUNG = 0x80,
@@ -5293,7 +5291,7 @@ def test_backend4_genzgc_store_barrier_remembers_old_to_young_slot(tmp_path):
             printf("backend4-genzgc-store-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-genzgc-store-barrier-ok"
@@ -5302,7 +5300,7 @@ def test_backend4_genzgc_store_barrier_remembers_old_to_young_slot(tmp_path):
 def test_backend4_genzgc_store_buffer_owner_count_high_water(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -5380,7 +5378,7 @@ def test_backend4_genzgc_store_buffer_owner_count_high_water(tmp_path):
             printf("backend4-owner-count-high-water-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-owner-count-high-water-ok"
@@ -5389,7 +5387,7 @@ def test_backend4_genzgc_store_buffer_owner_count_high_water(tmp_path):
 def test_backend4_genzgc_store_buffer_drains_in_bounded_batches(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -5474,7 +5472,7 @@ def test_backend4_genzgc_store_buffer_drains_in_bounded_batches(tmp_path):
             printf("backend4-store-buffer-batches-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-store-buffer-batches-ok"
@@ -5483,7 +5481,7 @@ def test_backend4_genzgc_store_buffer_drains_in_bounded_batches(tmp_path):
 def test_backend4_genzgc_store_buffer_uses_medium_path_before_global_flush(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -5548,7 +5546,7 @@ def test_backend4_genzgc_store_buffer_uses_medium_path_before_global_flush(tmp_p
             printf("backend4-store-buffer-medium-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-store-buffer-medium-ok"
@@ -5557,7 +5555,7 @@ def test_backend4_genzgc_store_buffer_uses_medium_path_before_global_flush(tmp_p
 def test_backend4_genzgc_step_flushes_other_mutator_medium_buffer(tmp_path):
     proc = _compile_and_run_threaded(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -5648,7 +5646,7 @@ def test_backend4_genzgc_step_flushes_other_mutator_medium_buffer(tmp_path):
             printf("backend4-cross-thread-medium-flush-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-cross-thread-medium-flush-ok"
@@ -5657,7 +5655,7 @@ def test_backend4_genzgc_step_flushes_other_mutator_medium_buffer(tmp_path):
 def test_backend4_genzgc_fragmentation_policy_exposes_backlog_and_efficiency(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -5719,7 +5717,7 @@ def test_backend4_genzgc_fragmentation_policy_exposes_backlog_and_efficiency(tmp
             printf("backend4-fragmentation-policy-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-fragmentation-policy-ok"
@@ -5728,7 +5726,7 @@ def test_backend4_genzgc_fragmentation_policy_exposes_backlog_and_efficiency(tmp
 def test_backend4_genzgc_selector_prefers_fragmented_zpage(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -5775,7 +5773,7 @@ def test_backend4_genzgc_selector_prefers_fragmented_zpage(tmp_path):
             printf("backend4-fragmented-zpage-selector-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-fragmented-zpage-selector-ok"
@@ -5784,7 +5782,7 @@ def test_backend4_genzgc_selector_prefers_fragmented_zpage(tmp_path):
 def test_backend4_genzgc_remembered_set_tracks_unique_dirty_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -5852,7 +5850,7 @@ def test_backend4_genzgc_remembered_set_tracks_unique_dirty_slots(tmp_path):
             printf("backend4-remset-bitmap-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-remset-bitmap-slots-ok"
@@ -5861,11 +5859,12 @@ def test_backend4_genzgc_remembered_set_tracks_unique_dirty_slots(tmp_path):
 def test_backend4_genzgc_remembered_page_bitmap_predicate_and_clear(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
         #include <stdlib.h>
+        #include <string.h>
 
         enum {
             PY_FLAG_GC_YOUNG = 0x80,
@@ -5891,8 +5890,14 @@ def test_backend4_genzgc_remembered_page_bitmap_predicate_and_clear(tmp_path):
             if (owner == 0) return 3;
             owner->length = 3;
             owner->capacity = 3;
-            owner->items = (PyObject **)calloc(3, sizeof(PyObject *));
+            /* The remembered-page API groups slots by their real 4 KiB page.
+             * A small malloc/calloc allocation may legally begin in the last
+             * bytes of a page, putting items[0] and items[2] on two pages.
+             * Use one aligned page so the bitmap grouping assertion is
+             * deterministic and still exercises two distinct slot bits. */
+            owner->items = (PyObject **)aligned_alloc(4096, 4096);
             if (owner->items == 0) return 4;
+            memset(owner->items, 0, 4096);
 
             PyObject *child0 = py_list_new(0);
             PyObject *child2 = py_list_new(0);
@@ -5927,7 +5932,7 @@ def test_backend4_genzgc_remembered_page_bitmap_predicate_and_clear(tmp_path):
             printf("backend4-remset-page-bitmap-api-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-remset-page-bitmap-api-ok"
@@ -5936,7 +5941,7 @@ def test_backend4_genzgc_remembered_page_bitmap_predicate_and_clear(tmp_path):
 def test_backend4_genzgc_telemetry_reset_reseeds_pending_store_buffer_shape(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -5996,7 +6001,7 @@ def test_backend4_genzgc_telemetry_reset_reseeds_pending_store_buffer_shape(tmp_
             printf("backend4-reset-reseeds-store-buffer-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-reset-reseeds-store-buffer-ok"
@@ -6005,7 +6010,7 @@ def test_backend4_genzgc_telemetry_reset_reseeds_pending_store_buffer_shape(tmp_
 def test_backend4_genzgc_store_buffer_clear_resets_shape_telemetry(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -6058,7 +6063,7 @@ def test_backend4_genzgc_store_buffer_clear_resets_shape_telemetry(tmp_path):
             printf("backend4-clear-resets-store-buffer-shape-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-clear-resets-store-buffer-shape-ok"
@@ -6067,7 +6072,7 @@ def test_backend4_genzgc_store_buffer_clear_resets_shape_telemetry(tmp_path):
 def test_backend4_genzgc_store_buffer_keeps_value_snapshot_until_drain(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -6134,7 +6139,7 @@ def test_backend4_genzgc_store_buffer_keeps_value_snapshot_until_drain(tmp_path)
             printf("backend4-genzgc-store-snapshot-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-genzgc-store-snapshot-ok"
@@ -6143,7 +6148,7 @@ def test_backend4_genzgc_store_buffer_keeps_value_snapshot_until_drain(tmp_path)
 def test_backend4_genzgc_allocations_default_young_and_age_to_old(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6193,7 +6198,7 @@ def test_backend4_genzgc_allocations_default_young_and_age_to_old(tmp_path):
             printf("backend4-genzgc-aging-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-genzgc-aging-ok"
@@ -6202,7 +6207,7 @@ def test_backend4_genzgc_allocations_default_young_and_age_to_old(tmp_path):
 def test_backend4_genzgc_page_class_live_population_telemetry(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6241,7 +6246,7 @@ def test_backend4_genzgc_page_class_live_population_telemetry(tmp_path):
             printf("backend4-page-class-live-telemetry-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-page-class-live-telemetry-ok"
@@ -6250,7 +6255,7 @@ def test_backend4_genzgc_page_class_live_population_telemetry(tmp_path):
 def test_backend4_genzgc_zpage_ownership_telemetry(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6311,7 +6316,7 @@ def test_backend4_genzgc_zpage_ownership_telemetry(tmp_path):
             printf("backend4-zpage-telemetry-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-telemetry-ok"
@@ -6320,7 +6325,7 @@ def test_backend4_genzgc_zpage_ownership_telemetry(tmp_path):
 def test_backend4_genzgc_small_objects_share_zpage(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6362,7 +6367,7 @@ def test_backend4_genzgc_small_objects_share_zpage(tmp_path):
             printf("backend4-small-zpage-sharing-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-small-zpage-sharing-ok"
@@ -6371,7 +6376,7 @@ def test_backend4_genzgc_small_objects_share_zpage(tmp_path):
 def test_backend4_genzgc_zpage_tracks_virtual_span_gap(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6416,7 +6421,7 @@ def test_backend4_genzgc_zpage_tracks_virtual_span_gap(tmp_path):
             printf("backend4-zpage-virtual-span-gap-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-virtual-span-gap-ok"
@@ -6425,7 +6430,7 @@ def test_backend4_genzgc_zpage_tracks_virtual_span_gap(tmp_path):
 def test_backend4_genzgc_objects_are_carved_from_zpage_span(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -6457,7 +6462,7 @@ def test_backend4_genzgc_objects_are_carved_from_zpage_span(tmp_path):
             printf("backend4-zpage-real-span-alloc-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-real-span-alloc-ok"
@@ -6466,7 +6471,7 @@ def test_backend4_genzgc_objects_are_carved_from_zpage_span(tmp_path):
 def test_backend4_genzgc_large_object_uses_dedicated_zpage_span(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6504,7 +6509,7 @@ def test_backend4_genzgc_large_object_uses_dedicated_zpage_span(tmp_path):
             printf("backend4-large-zpage-span-lifecycle-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-large-zpage-span-lifecycle-ok"
@@ -6513,7 +6518,7 @@ def test_backend4_genzgc_large_object_uses_dedicated_zpage_span(tmp_path):
 def test_backend4_genzgc_step_evacuates_fragmented_large_zpage(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6566,7 +6571,7 @@ def test_backend4_genzgc_step_evacuates_fragmented_large_zpage(tmp_path):
             printf("backend4-large-zpage-step-evacuation-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-large-zpage-step-evacuation-ok"
@@ -6575,7 +6580,7 @@ def test_backend4_genzgc_step_evacuates_fragmented_large_zpage(tmp_path):
 def test_backend4_genzgc_zpage_exposes_owner_virtual_span_location(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6610,7 +6615,7 @@ def test_backend4_genzgc_zpage_exposes_owner_virtual_span_location(tmp_path):
             printf("backend4-zpage-owner-span-location-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-owner-span-location-ok"
@@ -6619,7 +6624,7 @@ def test_backend4_genzgc_zpage_exposes_owner_virtual_span_location(tmp_path):
 def test_backend4_genzgc_zpage_backing_span_survives_free_cache(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6655,7 +6660,7 @@ def test_backend4_genzgc_zpage_backing_span_survives_free_cache(tmp_path):
             printf("backend4-zpage-backing-span-cache-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-backing-span-cache-ok"
@@ -6664,7 +6669,7 @@ def test_backend4_genzgc_zpage_backing_span_survives_free_cache(tmp_path):
 def test_backend4_genzgc_candidate_zpage_bytes_count_shared_page_once(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6718,7 +6723,7 @@ def test_backend4_genzgc_candidate_zpage_bytes_count_shared_page_once(tmp_path):
             printf("backend4-zpage-candidate-bytes-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-candidate-bytes-ok"
@@ -6727,7 +6732,7 @@ def test_backend4_genzgc_candidate_zpage_bytes_count_shared_page_once(tmp_path):
 def test_backend4_genzgc_relocation_targets_use_non_evacuation_zpage(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -6763,7 +6768,7 @@ def test_backend4_genzgc_relocation_targets_use_non_evacuation_zpage(tmp_path):
             printf("backend4-relocation-target-zpage-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-relocation-target-zpage-ok"
@@ -6772,7 +6777,7 @@ def test_backend4_genzgc_relocation_targets_use_non_evacuation_zpage(tmp_path):
 def test_backend4_genzgc_medium_objects_share_zpage(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6812,7 +6817,7 @@ def test_backend4_genzgc_medium_objects_share_zpage(tmp_path):
             printf("backend4-medium-zpage-sharing-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-medium-zpage-sharing-ok"
@@ -6821,7 +6826,7 @@ def test_backend4_genzgc_medium_objects_share_zpage(tmp_path):
 def test_backend4_genzgc_reuses_empty_zpages_from_free_list(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6872,7 +6877,7 @@ def test_backend4_genzgc_reuses_empty_zpages_from_free_list(tmp_path):
             printf("backend4-zpage-free-list-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-free-list-ok"
@@ -6881,7 +6886,7 @@ def test_backend4_genzgc_reuses_empty_zpages_from_free_list(tmp_path):
 def test_backend4_genzgc_free_zpage_cache_is_bounded(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6915,7 +6920,7 @@ def test_backend4_genzgc_free_zpage_cache_is_bounded(tmp_path):
             printf("backend4-zpage-free-cache-bounded-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-free-cache-bounded-ok"
@@ -6924,7 +6929,7 @@ def test_backend4_genzgc_free_zpage_cache_is_bounded(tmp_path):
 def test_backend4_genzgc_zpage_tracks_generation_age_pressure(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -6965,7 +6970,7 @@ def test_backend4_genzgc_zpage_tracks_generation_age_pressure(tmp_path):
             printf("backend4-zpage-age-pressure-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-age-pressure-ok"
@@ -6974,7 +6979,7 @@ def test_backend4_genzgc_zpage_tracks_generation_age_pressure(tmp_path):
 def test_backend4_genzgc_zpage_tracks_owner_remembered_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -7078,7 +7083,7 @@ def test_backend4_genzgc_zpage_tracks_owner_remembered_slots(tmp_path):
             printf("backend4-zpage-remembered-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-remembered-slots-ok"
@@ -7087,7 +7092,7 @@ def test_backend4_genzgc_zpage_tracks_owner_remembered_slots(tmp_path):
 def test_backend4_genzgc_zpage_card_api_clears_owner_card(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -7175,7 +7180,7 @@ def test_backend4_genzgc_zpage_card_api_clears_owner_card(tmp_path):
             printf("backend4-zpage-card-api-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-card-api-ok"
@@ -7184,7 +7189,7 @@ def test_backend4_genzgc_zpage_card_api_clears_owner_card(tmp_path):
 def test_backend4_genzgc_zpage_card_refcount_is_shared_by_page_span_card(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -7273,7 +7278,7 @@ def test_backend4_genzgc_zpage_card_refcount_is_shared_by_page_span_card(tmp_pat
             printf("backend4-zpage-shared-span-card-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-shared-span-card-ok"
@@ -7282,7 +7287,7 @@ def test_backend4_genzgc_zpage_card_refcount_is_shared_by_page_span_card(tmp_pat
 def test_backend4_genzgc_inline_slots_use_owner_slot_span_card(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stddef.h>
         #include <stdint.h>
@@ -7377,7 +7382,7 @@ def test_backend4_genzgc_inline_slots_use_owner_slot_span_card(tmp_path):
             printf("backend4-inline-slot-span-card-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-inline-slot-span-card-ok"
@@ -7386,7 +7391,7 @@ def test_backend4_genzgc_inline_slots_use_owner_slot_span_card(tmp_path):
 def test_backend4_genzgc_payload_slots_use_registered_payload_span_card(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -7479,7 +7484,7 @@ def test_backend4_genzgc_payload_slots_use_registered_payload_span_card(tmp_path
             printf("backend4-payload-slot-span-card-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-payload-slot-span-card-ok"
@@ -7488,7 +7493,7 @@ def test_backend4_genzgc_payload_slots_use_registered_payload_span_card(tmp_path
 def test_backend4_genzgc_container_payload_allocators_register_spans(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -7563,7 +7568,7 @@ def test_backend4_genzgc_container_payload_allocators_register_spans(tmp_path):
             printf("backend4-container-payload-span-registration-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-container-payload-span-registration-ok"
@@ -7572,7 +7577,7 @@ def test_backend4_genzgc_container_payload_allocators_register_spans(tmp_path):
 def test_backend4_relocated_container_payload_tables_register_spans(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -7675,7 +7680,7 @@ def test_backend4_relocated_container_payload_tables_register_spans(tmp_path):
             printf("backend4-relocated-container-payload-span-registration-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (
@@ -7687,7 +7692,7 @@ def test_backend4_relocated_container_payload_tables_register_spans(tmp_path):
 def test_backend4_continuation_stack_slots_register_payload_spans(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -7748,7 +7753,7 @@ def test_backend4_continuation_stack_slots_register_payload_spans(tmp_path):
             printf("backend4-continuation-stack-payload-span-registration-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (
@@ -7760,7 +7765,7 @@ def test_backend4_continuation_stack_slots_register_payload_spans(tmp_path):
 def test_backend4_relocated_class_method_table_registers_payload_span(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -7813,19 +7818,16 @@ def test_backend4_relocated_class_method_table_registers_payload_span(tmp_path):
             printf("backend4-class-method-payload-span-registration-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert (
-        proc.stdout.strip()
-        == "backend4-class-method-payload-span-registration-ok"
-    )
+    assert proc.stdout.strip() == "backend4-class-method-payload-span-registration-ok"
 
 
 def test_backend4_class_creation_registers_bases_and_mro_payload_spans(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -7876,19 +7878,16 @@ def test_backend4_class_creation_registers_bases_and_mro_payload_spans(tmp_path)
             printf("backend4-class-create-payload-span-registration-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert (
-        proc.stdout.strip()
-        == "backend4-class-create-payload-span-registration-ok"
-    )
+    assert proc.stdout.strip() == "backend4-class-create-payload-span-registration-ok"
 
 
 def test_backend4_class_method_growth_registers_payload_span(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -7929,7 +7928,7 @@ def test_backend4_class_method_growth_registers_payload_span(tmp_path):
             printf("backend4-class-method-growth-payload-span-registration-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (
@@ -7939,9 +7938,7 @@ def test_backend4_class_method_growth_registers_payload_span(tmp_path):
 
 
 def test_backend4_class_creation_payload_span_registration_is_mirrored_source():
-    header = (RUNTIME_DIR / "include" / "py_runtime.h").read_text(
-        encoding="utf-8"
-    )
+    header = (RUNTIME_DIR / "include" / "py_runtime.h").read_text(encoding="utf-8")
     c_class = (RUNTIME_DIR / "src" / "py_class.c").read_text(encoding="utf-8")
     c_gc = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
     py_class = (RUNTIME_DIR / "py" / "py_class.py").read_text(encoding="utf-8")
@@ -7952,7 +7949,9 @@ def test_backend4_class_creation_payload_span_registration_is_mirrored_source():
 
     assert "pcc_gc_backend4_zpage_unregister_owner_payload_span" in header
     assert "pcc_gc_backend4_zpage_retarget_owner_payload_span" in header
-    assert '@c_abi_export("pcc_gc_backend4_zpage_unregister_owner_payload_span")' in py_gc
+    assert (
+        '@c_abi_export("pcc_gc_backend4_zpage_unregister_owner_payload_span")' in py_gc
+    )
     assert '@c_abi_export("pcc_gc_backend4_zpage_retarget_owner_payload_span")' in py_gc
     assert '"pcc_gc_backend4_zpage_unregister_owner_payload_span":' in abi
     assert '"pcc_gc_backend4_zpage_retarget_owner_payload_span":' in abi
@@ -7979,13 +7978,13 @@ def test_backend4_class_creation_payload_span_registration_is_mirrored_source():
     assert "pcc_gc_backend4_zpage_unregister_owner_payload_span = extern(" in py_class
     assert "pcc_gc_backend4_zpage_retarget_owner_payload_span = extern(" in py_class
     py_new = py_class.split("def py_class_new(", 1)[1].split(
-        "@c_abi_export(\"py_class_mark_slots_only\")", 1
+        '@c_abi_export("py_class_mark_slots_only")', 1
     )[0]
     assert "pcc_gc_backend4_zpage_register_owner_payload_span(" in py_new
     assert "n_bases * 8" in py_new
     assert "mro_len * 8" in py_new
     py_add_method = py_class.split("def py_class_add_method(", 1)[1].split(
-        "@c_abi_export(\"py_class_set_metaclass\")", 1
+        '@c_abi_export("py_class_set_metaclass")', 1
     )[0]
     assert "pcc_gc_backend4_zpage_retarget_owner_payload_span(" in py_add_method
     assert "pcc_gc_backend4_zpage_unregister_owner_payload_span(" in py_add_method
@@ -7994,18 +7993,10 @@ def test_backend4_class_creation_payload_span_registration_is_mirrored_source():
 
 
 def test_backend4_continuation_payload_span_registration_is_mirrored_source():
-    c_coroutine = (RUNTIME_DIR / "src" / "py_coroutine.c").read_text(
-        encoding="utf-8"
-    )
-    c_gc = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
-        encoding="utf-8"
-    )
-    py_coroutine = (RUNTIME_DIR / "py" / "py_coroutine.py").read_text(
-        encoding="utf-8"
-    )
-    py_gc = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(
-        encoding="utf-8"
-    )
+    c_coroutine = (RUNTIME_DIR / "src" / "py_coroutine.c").read_text(encoding="utf-8")
+    c_gc = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
+    py_coroutine = (RUNTIME_DIR / "py" / "py_coroutine.py").read_text(encoding="utf-8")
+    py_gc = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
 
     c_new = c_coroutine.split("static PyObject *py_continuation_new_with_abi(", 1)[1]
     c_new = c_new.split("PyObject *py_continuation_new(", 1)[0]
@@ -8034,16 +8025,11 @@ def test_backend4_continuation_payload_span_registration_is_mirrored_source():
 
 
 def test_backend4_relocated_payload_span_registration_is_mirrored_source():
-    c_gc = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
-        encoding="utf-8"
-    )
-    py_gc = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(
-        encoding="utf-8"
-    )
+    c_gc = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
+    py_gc = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
 
     assert (
-        "static int64_t "
-        "pcc_gc_backend4_zpage_register_owner_payload_span_unlocked("
+        "static int64_t " "pcc_gc_backend4_zpage_register_owner_payload_span_unlocked("
     ) in c_gc
     assert "pcc_gc_backend4_zpage_remove_payload_span_base_unlocked(" in c_gc
     assert "_backend4_zpage_remove_payload_span_base(" in py_gc
@@ -8051,16 +8037,17 @@ def test_backend4_relocated_payload_span_registration_is_mirrored_source():
     assert "store_i64(span_existing, 16, size_bytes)" in py_gc
     assert "allocated_existing < end_existing" in py_gc
     unlocked_start = c_gc.index(
-        "static int64_t "
-        "pcc_gc_backend4_zpage_register_owner_payload_span_unlocked("
+        "static int64_t " "pcc_gc_backend4_zpage_register_owner_payload_span_unlocked("
     )
     unlocked_body = c_gc[
-        unlocked_start:c_gc.index(
+        unlocked_start : c_gc.index(
             "int64_t pcc_gc_backend4_zpage_register_owner_payload_span(",
             unlocked_start,
         )
     ]
-    assert "pcc_gc_backend4_zpage_remove_payload_spans_unlocked(node)" not in unlocked_body
+    assert (
+        "pcc_gc_backend4_zpage_remove_payload_spans_unlocked(node)" not in unlocked_body
+    )
     assert "span->base != (uint8_t *)base" in unlocked_body
     assert "span->size_bytes = size_bytes" in unlocked_body
     assert "page->allocated_bytes < end" in unlocked_body
@@ -8068,7 +8055,7 @@ def test_backend4_relocated_payload_span_registration_is_mirrored_source():
         "int64_t pcc_gc_backend4_zpage_register_owner_payload_span("
     )
     public_body = c_gc[
-        public_start:c_gc.index(
+        public_start : c_gc.index(
             "int64_t pcc_gc_backend4_zpage_fragmentation_per_mille(",
             public_start,
         )
@@ -8134,7 +8121,7 @@ def test_backend4_relocated_payload_span_registration_is_mirrored_source():
 def test_backend4_genzgc_relocation_retargets_remembered_list_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -8211,7 +8198,7 @@ def test_backend4_genzgc_relocation_retargets_remembered_list_slots(tmp_path):
             printf("backend4-remembered-slot-retarget-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-remembered-slot-retarget-ok"
@@ -8220,7 +8207,7 @@ def test_backend4_genzgc_relocation_retargets_remembered_list_slots(tmp_path):
 def test_backend4_genzgc_relocation_retargets_inline_tuple_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -8289,7 +8276,7 @@ def test_backend4_genzgc_relocation_retargets_inline_tuple_slots(tmp_path):
             printf("backend4-inline-slot-retarget-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-inline-slot-retarget-ok"
@@ -8298,7 +8285,7 @@ def test_backend4_genzgc_relocation_retargets_inline_tuple_slots(tmp_path):
 def test_backend4_genzgc_selector_uses_zpage_remembered_pressure(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -8358,7 +8345,7 @@ def test_backend4_genzgc_selector_uses_zpage_remembered_pressure(tmp_path):
             printf("backend4-zpage-remembered-selector-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-remembered-selector-ok"
@@ -8367,7 +8354,7 @@ def test_backend4_genzgc_selector_uses_zpage_remembered_pressure(tmp_path):
 def test_backend4_genzgc_selector_prefers_old_zpage_age_pressure(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -8397,7 +8384,7 @@ def test_backend4_genzgc_selector_prefers_old_zpage_age_pressure(tmp_path):
             printf("backend4-zpage-age-selector-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-age-selector-ok"
@@ -8406,7 +8393,7 @@ def test_backend4_genzgc_selector_prefers_old_zpage_age_pressure(tmp_path):
 def test_backend4_genzgc_selector_skips_zero_benefit_zpage(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -8427,7 +8414,7 @@ def test_backend4_genzgc_selector_skips_zero_benefit_zpage(tmp_path):
             printf("backend4-zpage-zero-benefit-selector-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-zpage-zero-benefit-selector-ok"
@@ -8436,7 +8423,7 @@ def test_backend4_genzgc_selector_skips_zero_benefit_zpage(tmp_path):
 def test_backend4_genzgc_remembered_page_telemetry_groups_dirty_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -8494,7 +8481,7 @@ def test_backend4_genzgc_remembered_page_telemetry_groups_dirty_slots(tmp_path):
             printf("backend4-remembered-page-telemetry-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-remembered-page-telemetry-ok"
@@ -8503,7 +8490,7 @@ def test_backend4_genzgc_remembered_page_telemetry_groups_dirty_slots(tmp_path):
 def test_backend4_genzgc_evacuation_incomplete_batches_track_budget_backlog(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -8538,7 +8525,7 @@ def test_backend4_genzgc_evacuation_incomplete_batches_track_budget_backlog(tmp_
             printf("backend4-genzgc-evacuation-backlog-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-genzgc-evacuation-backlog-ok"
@@ -8547,7 +8534,7 @@ def test_backend4_genzgc_evacuation_incomplete_batches_track_budget_backlog(tmp_
 def test_backend4_genzgc_evacuation_drain_preserves_page_handoff_until_empty(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -8583,7 +8570,7 @@ def test_backend4_genzgc_evacuation_drain_preserves_page_handoff_until_empty(tmp
             printf("backend4-evacuation-drain-page-handoff-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-evacuation-drain-page-handoff-ok"
@@ -8592,7 +8579,7 @@ def test_backend4_genzgc_evacuation_drain_preserves_page_handoff_until_empty(tmp
 def test_backend4_genzgc_evacuation_page_handoff_reports_current_pressure(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdint.h>
         #include <stdio.h>
@@ -8656,7 +8643,7 @@ def test_backend4_genzgc_evacuation_page_handoff_reports_current_pressure(tmp_pa
             printf("backend4-evacuation-page-pressure-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-evacuation-page-pressure-ok"
@@ -8665,7 +8652,7 @@ def test_backend4_genzgc_evacuation_page_handoff_reports_current_pressure(tmp_pa
 def test_backend4_genzgc_evacuation_page_drain_moves_whole_selected_page(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -8696,7 +8683,7 @@ def test_backend4_genzgc_evacuation_page_drain_moves_whole_selected_page(tmp_pat
             printf("backend4-evacuation-page-drain-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-evacuation-page-drain-ok"
@@ -8705,7 +8692,7 @@ def test_backend4_genzgc_evacuation_page_drain_moves_whole_selected_page(tmp_pat
 def test_backend4_genzgc_step_drains_selected_zpage_as_page_budget(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -8737,7 +8724,7 @@ def test_backend4_genzgc_step_drains_selected_zpage_as_page_budget(tmp_path):
             printf("backend4-step-page-drain-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-step-page-drain-ok"
@@ -8746,7 +8733,7 @@ def test_backend4_genzgc_step_drains_selected_zpage_as_page_budget(tmp_path):
 def test_backend4_genzgc_step_selects_and_drains_whole_zpage(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -8809,16 +8796,18 @@ def test_backend4_genzgc_step_selects_and_drains_whole_zpage(tmp_path):
             printf("backend4-step-selects-drains-whole-zpage-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-step-selects-drains-whole-zpage-ok"
 
 
-def test_backend4_genzgc_page_drain_retires_source_zpage_without_reusing_retained_span(tmp_path):
+def test_backend4_genzgc_page_drain_retires_source_zpage_without_reusing_retained_span(
+    tmp_path,
+):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -8876,7 +8865,7 @@ def test_backend4_genzgc_page_drain_retires_source_zpage_without_reusing_retaine
             printf("backend4-page-drain-retires-source-zpage-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-page-drain-retires-source-zpage-ok"
@@ -8885,7 +8874,7 @@ def test_backend4_genzgc_page_drain_retires_source_zpage_without_reusing_retaine
 def test_backend4_dict_get_loads_forwarded_key_and_value_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -8965,7 +8954,7 @@ def test_backend4_dict_get_loads_forwarded_key_and_value_slots(tmp_path):
             printf("backend4-dict-forwarded-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-dict-forwarded-slots-ok"
@@ -8974,7 +8963,7 @@ def test_backend4_dict_get_loads_forwarded_key_and_value_slots(tmp_path):
 def test_backend4_dict_traversal_loads_forwarded_key_and_value_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -9072,7 +9061,7 @@ def test_backend4_dict_traversal_loads_forwarded_key_and_value_slots(tmp_path):
             printf("backend4-dict-traversal-forwarded-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-dict-traversal-forwarded-slots-ok"
@@ -9081,7 +9070,7 @@ def test_backend4_dict_traversal_loads_forwarded_key_and_value_slots(tmp_path):
 def test_backend4_set_contains_loads_forwarded_key_slot(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include <stdio.h>
 
@@ -9149,7 +9138,7 @@ def test_backend4_set_contains_loads_forwarded_key_slot(tmp_path):
             printf("backend4-set-forwarded-key-slot-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-set-forwarded-key-slot-ok"
@@ -9158,7 +9147,7 @@ def test_backend4_set_contains_loads_forwarded_key_slot(tmp_path):
 def test_backend4_obj_compare_loads_forwarded_container_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include "py_internal.h"
         #include <stdio.h>
@@ -9289,7 +9278,7 @@ def test_backend4_obj_compare_loads_forwarded_container_slots(tmp_path):
             printf("backend4-obj-compare-forwarded-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-obj-compare-forwarded-slots-ok"
@@ -9298,7 +9287,7 @@ def test_backend4_obj_compare_loads_forwarded_container_slots(tmp_path):
 def test_backend4_json_dumps_loads_forwarded_container_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include "py_internal.h"
         #include <stdio.h>
@@ -9369,7 +9358,7 @@ def test_backend4_json_dumps_loads_forwarded_container_slots(tmp_path):
             printf("backend4-json-forwarded-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-json-forwarded-slots-ok"
@@ -9378,7 +9367,7 @@ def test_backend4_json_dumps_loads_forwarded_container_slots(tmp_path):
 def test_backend4_print_format_loads_forwarded_sequence_slots(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include "py_internal.h"
         #include <stdio.h>
@@ -9446,21 +9435,20 @@ def test_backend4_print_format_loads_forwarded_sequence_slots(tmp_path):
             printf("backend4-print-forwarded-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout == (
-        "[[]]\n"
-        "([],)\n"
-        "[]\n"
-        "backend4-print-forwarded-slots-ok\n"
+        "[[]]\n" "([],)\n" "[]\n" "backend4-print-forwarded-slots-ok\n"
     )
 
 
-def test_backend4_os_path_helpers_leave_leaf_string_sequence_slots_unforwarded(tmp_path):
+def test_backend4_os_path_helpers_leave_leaf_string_sequence_slots_unforwarded(
+    tmp_path,
+):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include "py_internal.h"
         #include <stdio.h>
@@ -9511,7 +9499,7 @@ def test_backend4_os_path_helpers_leave_leaf_string_sequence_slots_unforwarded(t
             printf("backend4-os-path-leaf-string-slots-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-os-path-leaf-string-slots-ok"
@@ -9520,7 +9508,7 @@ def test_backend4_os_path_helpers_leave_leaf_string_sequence_slots_unforwarded(t
 def test_backend4_str_join_leaves_leaf_string_list_items_unforwarded(tmp_path):
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_runtime.h"
         #include "py_internal.h"
         #include <stdio.h>
@@ -9555,7 +9543,7 @@ def test_backend4_str_join_leaves_leaf_string_list_items_unforwarded(tmp_path):
             printf("backend4-str-join-leaf-string-items-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-str-join-leaf-string-items-ok"
@@ -9566,7 +9554,9 @@ def test_backend4_public_telemetry_symbols_are_wired():
     c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
     py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
     py_substrate = (RUNTIME_DIR / "py" / "py_substrate.py").read_text(encoding="utf-8")
-    abi = (REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "runtime_abi.py").read_text(encoding="utf-8")
+    abi = (REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "runtime_abi.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "PCC_GC_COUNTER_RELOCATION_FRAGMENTATION_SCORE" in header
     assert "PCC_GC_COUNTER_GENZGC_STORE_BARRIERS" in header
@@ -9599,7 +9589,10 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FLUSHED_ENTRIES" in header
     assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_MEDIUM_FULL_FLUSHES" in header
     assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_CROSS_THREAD_MEDIUM_FLUSHES" in header
-    assert "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_CROSS_THREAD_MEDIUM_FLUSHED_ENTRIES" in header
+    assert (
+        "PCC_GC_COUNTER_GENZGC_STORE_BUFFER_CROSS_THREAD_MEDIUM_FLUSHED_ENTRIES"
+        in header
+    )
     assert "PCC_GC_COUNTER_GENZGC_EVACUATION_EFFICIENCY_PER_MILLE" in header
     assert "PCC_GC_COUNTER_GENZGC_FRAGMENTATION_BACKLOG_BYTES" in header
     assert "PCC_GC_COUNTER_GENZGC_FRAGMENTATION_POLICY_SCORE" in header
@@ -9813,7 +9806,9 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '@c_abi_export("pcc_gc_backend4_medium_page_candidate_bytes")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_evacuation_candidate_zpage_bytes")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_small_page_candidate_zpage_bytes")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_medium_page_candidate_zpage_bytes")' in py_src
+    assert (
+        '@c_abi_export("pcc_gc_backend4_medium_page_candidate_zpage_bytes")' in py_src
+    )
     assert '@c_abi_export("pcc_gc_backend4_evacuation_page_candidate_score")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_evacuation_page_candidate_bytes")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_evacuation_page_dirty_cards")' in py_src
@@ -9823,8 +9818,13 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '@c_abi_export("pcc_gc_backend4_store_buffer_drained_entries")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_store_buffer_duplicate_skips")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_store_buffer_high_water")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_store_buffer_owner_fanout_high_water")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_store_buffer_owner_count_high_water")' in py_src
+    assert (
+        '@c_abi_export("pcc_gc_backend4_store_buffer_owner_fanout_high_water")'
+        in py_src
+    )
+    assert (
+        '@c_abi_export("pcc_gc_backend4_store_buffer_owner_count_high_water")' in py_src
+    )
     assert '@c_abi_export("pcc_gc_backend4_store_buffer_incomplete_drains")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_evacuation_incomplete_batches")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_store_buffer_batch_capacity")' in py_src
@@ -9833,10 +9833,18 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_capacity")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_pending")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_flushes")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_flushed_entries")' in py_src
+    assert (
+        '@c_abi_export("pcc_gc_backend4_store_buffer_medium_flushed_entries")' in py_src
+    )
     assert '@c_abi_export("pcc_gc_backend4_store_buffer_medium_full_flushes")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_store_buffer_cross_thread_medium_flushes")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_store_buffer_cross_thread_medium_flushed_entries")' in py_src
+    assert (
+        '@c_abi_export("pcc_gc_backend4_store_buffer_cross_thread_medium_flushes")'
+        in py_src
+    )
+    assert (
+        '@c_abi_export("pcc_gc_backend4_store_buffer_cross_thread_medium_flushed_entries")'
+        in py_src
+    )
     assert '@c_abi_export("pcc_gc_backend4_evacuation_efficiency_per_mille")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_fragmentation_backlog_bytes")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_fragmentation_policy_score")' in py_src
@@ -9905,9 +9913,15 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '@c_abi_export("pcc_gc_backend4_zpage_owner_size_bytes")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_zpage_owner_span_card")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_zpage_owner_slot_span_card")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_zpage_register_owner_payload_span")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_zpage_unregister_owner_payload_span")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_zpage_retarget_owner_payload_span")' in py_src
+    assert (
+        '@c_abi_export("pcc_gc_backend4_zpage_register_owner_payload_span")' in py_src
+    )
+    assert (
+        '@c_abi_export("pcc_gc_backend4_zpage_unregister_owner_payload_span")' in py_src
+    )
+    assert (
+        '@c_abi_export("pcc_gc_backend4_zpage_retarget_owner_payload_span")' in py_src
+    )
     assert "ptr_diff" in py_src
     assert "_backend4_zpage_payload_offset_for_slot" in py_src
     assert "inline_delta: int = ptr_diff(slot, owner)" in py_src
@@ -9921,7 +9935,10 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert "pcc_gc_backend4_free_page_head" in py_src
     assert '@c_abi_export("pcc_gc_backend4_zpage_remembered_slots")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_zpage_remembered_cards")' in py_src
-    assert '@c_abi_export("pcc_gc_backend4_zpage_remembered_card_ratio_per_mille")' in py_src
+    assert (
+        '@c_abi_export("pcc_gc_backend4_zpage_remembered_card_ratio_per_mille")'
+        in py_src
+    )
     assert '@c_abi_export("pcc_gc_backend4_zpage_dirty_pages")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_zpage_fragmented_pages")' in py_src
     assert '@c_abi_export("pcc_gc_backend4_zpage_young_pages")' in py_src
@@ -9945,9 +9962,15 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '"pcc_gc_backend4_evacuation_candidate_bytes": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_small_page_candidate_bytes": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_medium_page_candidate_bytes": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_evacuation_candidate_zpage_bytes": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_small_page_candidate_zpage_bytes": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_medium_page_candidate_zpage_bytes": (_I64, [], False)' in abi
+    assert (
+        '"pcc_gc_backend4_evacuation_candidate_zpage_bytes": (_I64, [], False)' in abi
+    )
+    assert (
+        '"pcc_gc_backend4_small_page_candidate_zpage_bytes": (_I64, [], False)' in abi
+    )
+    assert (
+        '"pcc_gc_backend4_medium_page_candidate_zpage_bytes": (_I64, [], False)' in abi
+    )
     assert '"pcc_gc_backend4_evacuation_page_candidate_score": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_evacuation_page_candidate_bytes": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_evacuation_page_dirty_cards": (_I64, [], False)' in abi
@@ -9957,8 +9980,14 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '"pcc_gc_backend4_store_buffer_drained_entries": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_store_buffer_duplicate_skips": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_store_buffer_high_water": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_store_buffer_owner_fanout_high_water": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_store_buffer_owner_count_high_water": (_I64, [], False)' in abi
+    assert (
+        '"pcc_gc_backend4_store_buffer_owner_fanout_high_water": (_I64, [], False)'
+        in abi
+    )
+    assert (
+        '"pcc_gc_backend4_store_buffer_owner_count_high_water": (_I64, [], False)'
+        in abi
+    )
     assert '"pcc_gc_backend4_store_buffer_incomplete_drains": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_evacuation_incomplete_batches": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_store_buffer_batch_capacity": (_I64, [], False)' in abi
@@ -9967,9 +9996,17 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '"pcc_gc_backend4_store_buffer_medium_capacity": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_store_buffer_medium_pending": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_store_buffer_medium_flushes": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_store_buffer_medium_flushed_entries": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_store_buffer_medium_full_flushes": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_store_buffer_cross_thread_medium_flushes": (_I64, [], False)' in abi
+    assert (
+        '"pcc_gc_backend4_store_buffer_medium_flushed_entries": (_I64, [], False)'
+        in abi
+    )
+    assert (
+        '"pcc_gc_backend4_store_buffer_medium_full_flushes": (_I64, [], False)' in abi
+    )
+    assert (
+        '"pcc_gc_backend4_store_buffer_cross_thread_medium_flushes": (_I64, [], False)'
+        in abi
+    )
     assert '"pcc_gc_backend4_store_buffer_cross_thread_medium_flushed_entries":' in abi
     assert '"pcc_gc_backend4_evacuation_efficiency_per_mille": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_fragmentation_backlog_bytes": (_I64, [], False)' in abi
@@ -9994,10 +10031,18 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '"pcc_gc_backend4_remembered_page_entries": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_remembered_page_slot_entries": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_remembered_page_high_water": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_remembered_page_contains_slot": (_I64, [_PTR], False)' in abi
+    assert (
+        '"pcc_gc_backend4_remembered_page_contains_slot": (_I64, [_PTR], False)' in abi
+    )
     assert '"pcc_gc_backend4_remembered_page_clear_slot": (_I64, [_PTR], False)' in abi
-    assert '"pcc_gc_backend4_zpage_contains_remembered_card": (_I64, [_PTR, _PTR], False)' in abi
-    assert '"pcc_gc_backend4_zpage_clear_remembered_card": (_I64, [_PTR, _PTR], False)' in abi
+    assert (
+        '"pcc_gc_backend4_zpage_contains_remembered_card": (_I64, [_PTR, _PTR], False)'
+        in abi
+    )
+    assert (
+        '"pcc_gc_backend4_zpage_clear_remembered_card": (_I64, [_PTR, _PTR], False)'
+        in abi
+    )
     assert '"pcc_gc_backend4_zpage_count": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_zpage_capacity_bytes": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_zpage_fragmentation_bytes": (_I64, [], False)' in abi
@@ -10009,7 +10054,10 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '"pcc_gc_backend4_zpage_owner_offset_bytes": (_I64, [_PYOBJ], False)' in abi
     assert '"pcc_gc_backend4_zpage_owner_size_bytes": (_I64, [_PYOBJ], False)' in abi
     assert '"pcc_gc_backend4_zpage_owner_span_card": (_I64, [_PYOBJ], False)' in abi
-    assert '"pcc_gc_backend4_zpage_owner_slot_span_card": (_I64, [_PYOBJ, _PTR], False)' in abi
+    assert (
+        '"pcc_gc_backend4_zpage_owner_slot_span_card": (_I64, [_PYOBJ, _PTR], False)'
+        in abi
+    )
     assert '"pcc_gc_backend4_zpage_register_owner_payload_span":' in abi
     assert '"pcc_gc_backend4_zpage_unregister_owner_payload_span":' in abi
     assert '"pcc_gc_backend4_zpage_retarget_owner_payload_span":' in abi
@@ -10017,7 +10065,10 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '"pcc_gc_backend4_zpage_policy_score": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_zpage_remembered_slots": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_zpage_remembered_cards": (_I64, [], False)' in abi
-    assert '"pcc_gc_backend4_zpage_remembered_card_ratio_per_mille": (_I64, [], False)' in abi
+    assert (
+        '"pcc_gc_backend4_zpage_remembered_card_ratio_per_mille": (_I64, [], False)'
+        in abi
+    )
     assert '"pcc_gc_backend4_zpage_dirty_pages": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_zpage_fragmented_pages": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_zpage_young_pages": (_I64, [], False)' in abi
@@ -10026,12 +10077,25 @@ def test_backend4_public_telemetry_symbols_are_wired():
     assert '"pcc_gc_backend4_zpage_free_capacity_bytes": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_zpage_free_span_bytes": (_I64, [], False)' in abi
     assert '"pcc_gc_backend4_page_pressure_score": (_I64, [], False)' in abi
-    assert '"pcc_gc_note_slot_write_barrier": (_VOID, [_PYOBJ, _PTR, _PYOBJ], False)' in abi
+    assert (
+        '"pcc_gc_note_slot_write_barrier": (_VOID, [_PYOBJ, _PTR, _PYOBJ], False)'
+        in abi
+    )
     assert 'define_global_ptr_null("pcc_gc_backend4_free_page_head")' in py_substrate
-    assert 'define_global_ptr_null("pcc_gc_backend4_retained_page_head")' in py_substrate
-    assert 'define_global_ptr_null("pcc_gc_backend4_zpage_payload_span_head")' in py_substrate
-    assert 'define_global_ptr_null("pcc_gc_backend4_evacuation_page_head")' in py_substrate
-    assert 'define_global_i32("pcc_gc_backend4_evacuation_candidate_zpage_bytes_count", 0)' in py_substrate
+    assert (
+        'define_global_ptr_null("pcc_gc_backend4_retained_page_head")' in py_substrate
+    )
+    assert (
+        'define_global_ptr_null("pcc_gc_backend4_zpage_payload_span_head")'
+        in py_substrate
+    )
+    assert (
+        'define_global_ptr_null("pcc_gc_backend4_evacuation_page_head")' in py_substrate
+    )
+    assert (
+        'define_global_i32("pcc_gc_backend4_evacuation_candidate_zpage_bytes_count", 0)'
+        in py_substrate
+    )
 
 
 def test_backend4_class_method_metadata_is_not_treated_as_gc_slots() -> None:
@@ -10040,7 +10104,9 @@ def test_backend4_class_method_metadata_is_not_treated_as_gc_slots() -> None:
     c_gc = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
     py_gc = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
 
-    assert "PyObject *func = pcc_gc_note_relocation_read(m->methods[j].func);" in c_class
+    assert (
+        "PyObject *func = pcc_gc_note_relocation_read(m->methods[j].func);" in c_class
+    )
     assert "m->methods[j].func = func;" in c_class
     assert "&m->methods[j].func" not in c_class
     assert "func = pcc_gc_note_relocation_read(load_ptr(method_slot, 0))" in py_class
@@ -10082,8 +10148,7 @@ def test_backend4_class_method_metadata_is_not_treated_as_gc_slots() -> None:
     trace_start = c_gc.index("static void pcc_gc_trace_referents(", promote_start)
     promote_body = c_gc[promote_start:trace_start]
     trace_body = c_gc[
-        trace_start:
-        c_gc.index("/* Slot-ADDRESS flavored sibling", trace_start)
+        trace_start : c_gc.index("/* Slot-ADDRESS flavored sibling", trace_start)
     ]
     assert "py_obj_visit_slots(" in promote_body
     assert "pcc_gc_promote_owner_slot" in promote_body
@@ -10113,15 +10178,17 @@ def test_backend4_class_method_metadata_is_not_treated_as_gc_slots() -> None:
     slot_adapter_end = py_gc.index("def _py_obj_visit_class_slots(", slot_adapter_start)
     slot_adapter_body = py_gc[slot_adapter_start:slot_adapter_end]
     assert "role == 1:  # _PY_OBJ_SLOT_OWNED" in slot_adapter_body
-    assert "_promote_young_slot_mode(slot_base, slot_offset, recurse)" in slot_adapter_body
+    assert (
+        "_promote_young_slot_mode(slot_base, slot_offset, recurse)" in slot_adapter_body
+    )
     assert "_promote_young_borrowed_slot_mode(" in slot_adapter_body
     assert "role != 3:  # _PY_OBJ_SLOT_BORROWED_UPDATE_ONLY" in slot_adapter_body
     trace_py = py_gc.split("def _trace_referents(o)", 1)[1].split(
         "def _subtract_known_child_ref", 1
     )[0]
-    promote_py = py_gc.split("def _trace_referents_for_promotion_mode", 1)[
-        1
-    ].split("def _trace_referents_for_promotion", 1)[0]
+    promote_py = py_gc.split("def _trace_referents_for_promotion_mode", 1)[1].split(
+        "def _trace_referents_for_promotion", 1
+    )[0]
     remap_py = py_gc.split("def _remap_referents(o)", 1)[1].split(
         "def _backend4_remap_and_retire", 1
     )[0]
@@ -10130,12 +10197,16 @@ def test_backend4_class_method_metadata_is_not_treated_as_gc_slots() -> None:
         1,
     )[0]
     assert "_py_obj_visit_class_slots(o, mode, recurse)" in covered_body
-    assert "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE" in trace_py
+    assert (
+        "_py_obj_visit_covered_slots(o, 1, 0) != 0:  # _PY_OBJ_VISIT_TRACE" in trace_py
+    )
     assert (
         "_py_obj_visit_covered_slots(o, 2, recurse) != 0:  # _PY_OBJ_VISIT_PROMOTE"
         in promote_py
     )
-    assert "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE" in remap_py
+    assert (
+        "_py_obj_visit_covered_slots(o, 3, 0) != 0:  # _PY_OBJ_VISIT_UPDATE" in remap_py
+    )
     assert "_mark_gray_if_known(load_ptr(methods, k * 16 + 8))" not in py_gc
     assert "_mark_gray_if_known(load_ptr(o, 96))" not in py_gc
 
@@ -10157,7 +10228,7 @@ def test_backend4_list_extend_old_to_young_uses_store_barrier(tmp_path):
     """
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -10247,7 +10318,7 @@ def test_backend4_list_extend_old_to_young_uses_store_barrier(tmp_path):
             printf("backend4-list-extend-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-list-extend-barrier-ok"
@@ -10271,7 +10342,7 @@ def test_backend4_set_rehash_old_to_young_uses_store_barrier(tmp_path):
     """
     proc = _compile_and_run(
         tmp_path,
-        '''
+        """
         #include "py_internal.h"
         #include <stdio.h>
 
@@ -10368,7 +10439,7 @@ def test_backend4_set_rehash_old_to_young_uses_store_barrier(tmp_path):
             printf("backend4-set-rehash-barrier-ok\\n");
             return 0;
         }
-        ''',
+        """,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.strip() == "backend4-set-rehash-barrier-ok"
