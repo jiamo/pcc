@@ -34,6 +34,16 @@ PCC_STDATOMIC_HEADER = $(PCC_REPO_ROOT)/utils/fake_libc_include/stdatomic.h
 #   make PCC_WITH_LIBPYTHON=1
 # to enable the CPython C-API path in py_libpython.c. Off by default
 # so the default runtime has no libpython dependency.
+# Linux/glibc: -std=c11 defines __STRICT_ANSI__, which switches off glibc's
+# default feature set and hides POSIX/BSD declarations (CLOCK_MONOTONIC,
+# struct addrinfo, struct stat::st_mtim, ...). Restore the default set in ONE
+# place instead of sprinkling feature macros per file; _DEFAULT_SOURCE does not
+# enable any GNU-only compiler extension, so the strict C11 dialect is kept.
+# Darwin's headers declare these unconditionally and need nothing.
+ifneq ($(shell uname),Darwin)
+CPPFLAGS += -D_DEFAULT_SOURCE
+endif
+
 ifeq ($(PCC_WITH_THREADS),1)
 CPPFLAGS += -DPCC_WITH_THREADS=1
 CFLAGS   += -pthread
