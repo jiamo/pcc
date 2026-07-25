@@ -20,13 +20,13 @@ Historical startup ledger:
 ## Active milestone
 
 - Milestone: `M5`
-- Tasks in milestone: `133`
+- Tasks in milestone: `149`
 - `BLOCKED`: `2`
 - `CLAIM_RISK`: `1`
 - `DONE_STRONG`: `91`
 - `DONE_WEAK`: `2`
 - `IN_PROGRESS`: `2`
-- `TODO_READY`: `35`
+- `TODO_READY`: `51`
 - Next dependency-ready task: `PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE`
 - Next title: Eliminate repeated GC-invariant work from self-host compiler stages
 - Next open boundary: Measure isolated pcc1-to-pcc2 phase costs and artifact identity, then remove or content-address reuse of repeated parse, discovery, type/export, IR-pass, and self-object work wherever the cache key proves it independent of GC runtime policy. Keep GC-specific runtime, ABI, link, fixed-point, and behavior gates distinct; do not reduce tests, loosen semantics, or increase timeouts as the optimization.
@@ -57,13 +57,29 @@ startup state compact; the full ledger is `docs/goal/task-board.yaml`.
 | 1000 | `DIST-P1-MULTI-MAC-TRANSPORT-E2E` | `BLOCKED` | DIST-P0-TRANSPORT-COLLECTIVE-OWNER | docs/goal/evidence/2026-07-17-dist-multi-mac-owner-blocked.md |
 | 1000 | `DIST-P1-THROUGHPUT-SCALING` | `BLOCKED` | DIST-P0-TRANSPORT-COLLECTIVE-OWNER, DIST-P1-MULTI-MAC-TRANSPORT-E2E | docs/design/pcc-dist-runtime.md |
 | 1000 | `LIBC-P1-IMPORT-RATCHET` | `DONE_WEAK` | - | tests/libc_import_baseline.json |
+| 1000 | `LIBC-P1-PCC-RUNTIME-ARCHIVE` | `TODO_READY` | - | tests/python/test_py_runtime_pcc_emit.py |
 | 1000 | `LIBC-P1-PRIMITIVES` | `TODO_READY` | - | pcc/unsafe/__init__.py |
 | 1000 | `LIBC-P2-ALLOCATOR` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
 | 1000 | `LIBC-P2-MEM-STR` | `TODO_READY` | - | tests/libc_import_baseline.json |
+| 1000 | `LIBC-P2-SDK-STRUCT-HELPERS` | `TODO_READY` | LIBC-P1-PCC-RUNTIME-ARCHIVE | tests/python/test_py_runtime_pcc_emit.py |
 | 1000 | `LIBC-P2-STDIO-SUBSET` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
 | 1000 | `LIBC-P2-THIN-WRAPPERS` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
 | 1000 | `LIBC-P3-HARD-SINGLETONS` | `TODO_READY` | - | tests/libc_import_baseline.json |
 | 1000 | `LIBC-P3-LINUX-ZERO-LIBC-TRACER` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
+| 1000 | `LINK-P1-MACHO-CODESIGN` | `TODO_READY` | LINK-P1-MACHO-LINK-DYLD | pcc/py_frontend/pipeline.py |
+| 1000 | `LINK-P1-MACHO-LINK-DYLD` | `TODO_READY` | LINK-P1-MACHO-LINK-STATIC | pcc/py_frontend/pipeline.py |
+| 1000 | `LINK-P1-MACHO-LINK-STATIC` | `TODO_READY` | LINK-P1-MACHO-OBJ-FULL | pcc/py_frontend/pipeline.py |
+| 1000 | `LINK-P1-MACHO-LINK-SWITCH` | `TODO_READY` | LINK-P1-MACHO-CODESIGN | tests/python/test_bootstrap_gate_baseline.py |
+| 1000 | `LINK-P1-MACHO-OBJ-FULL` | `TODO_READY` | LINK-P1-MACHO-OBJ-RELOC | pcc/backend/self_backend_emit.py |
+| 1000 | `LINK-P1-MACHO-OBJ-MINIMAL` | `TODO_READY` | LINK-P1-MACHO-SPEC | pcc/backend/self_backend_emit.py |
+| 1000 | `LINK-P1-MACHO-OBJ-RELOC` | `TODO_READY` | LINK-P1-MACHO-OBJ-MINIMAL | pcc/backend/self_backend_emit.py |
+| 1000 | `LINK-P1-MACHO-OBJ-SWITCH` | `TODO_READY` | LINK-P1-MACHO-OBJ-FULL | pcc/py_frontend/pipeline.py |
+| 1000 | `LINK-P1-MACHO-SPEC` | `TODO_READY` | - | pcc/backend/self_backend_emit.py |
+| 1000 | `LINK-P2-INCREMENTAL` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH | pcc/backend/self_backend_cache_identity.py |
+| 1000 | `LINK-P2-NATIVE-OBJ-FASTPATH` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH | pcc/backend/self_backend_emit.py |
+| 1000 | `LINK-P3-ELF-LINUX` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH | tests/integration/test_self_backend_x86_64_linux.py |
+| 1000 | `LINK-P3-PARALLEL` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH, LIBC-P1-PRIMITIVES | pcc/py_runtime/src/pcc_threads.c |
+| 1000 | `LINK-P3-SEMANTIC-LAYOUT` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH | pcc/py_frontend/pipeline.py |
 | 1000 | `PERF-P1-FRAME-POOL` | `TODO_READY` | - | docs/investigations/gc-frame-index-entry-pool-perf.md |
 | 1000 | `PERF-P1-INT-READMIT` | `TODO_READY` | - | tests/python/test_py_typed_int_unboxed.py |
 | 1000 | `PERF-P1-REGALLOC` | `TODO_READY` | - | pcc/backend/self_backend_aarch64_darwin_slots.py |

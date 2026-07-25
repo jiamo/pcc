@@ -1531,13 +1531,266 @@ tasks:
     required_gates:
       - "rg -n '_fnv1a_update_u64' pcc/ shows a single definition"
       - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LIBC-P1-PCC-RUNTIME-ARCHIVE
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Make the pcc-compiled runtime archive a proven production bootstrap path"
+    latest_evidence: tests/python/test_py_runtime_pcc_emit.py
+    open_boundary: "pcc already emits objects for 84 of the 86 runtime .c files (Makefile target libpy_runtime_pcc.a over OBJS_PCC; per-file gate tests/python/test_py_runtime_pcc_emit.py), but the production default links the pcc-Python port archive and the C fallback uses cc. Prove the pcc-compiled C archive end to end: build libpy_runtime_pcc.a, link a stage1 pcc1 against it, and run the full stage1-to-stage3 chain. This is the row that turns 'pcc can emit each object' into 'pcc compiles its own C runtime'."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "libpy_runtime_pcc.a builds and a pcc1 linked against it completes stage1->stage2->stage3"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LIBC-P2-SDK-STRUCT-HELPERS
+    priority: P2
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Remove the last two cc-only runtime sources (SDK struct readers)"
+    latest_evidence: tests/python/test_py_runtime_pcc_emit.py
+    open_boundary: "py_os_rss.c and py_os_heap.c are the only runtime sources pcc cannot compile (_CC_ONLY_KERNEL_SOURCES): they read OS-specific SDK structs. Options to evaluate and pick one with evidence: generate the struct layouts as pcc declarations, express the bodies via pcc.extern against libSystem symbols, or accept them as a documented two-file cc requirement. Closing this removes the last per-source cc dependency in the runtime build."
+    milestone: M5
+    depends_on:
+      - LIBC-P1-PCC-RUNTIME-ARCHIVE
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "gtimeout 300s env -u LC_ALL uv run pytest -q -m integration tests/python/test_py_runtime_pcc_emit.py"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P1-MACHO-SPEC
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Pin the Mach-O structures pcc needs as generated declarations verified against clang output"
+    latest_evidence: pcc/backend/self_backend_emit.py
+    open_boundary: "Before writing any bytes: declare mach_header_64, segment_command_64, section_64, symtab_command/dysymtab_command, nlist_64, relocation_info, build_version_command and the constants pcc needs, generated from or checked against the SDK headers (mach-o/loader.h, reloc.h, arm64/reloc.h). Acceptance is a round-trip: parse a clang-produced .o with these declarations and reproduce every field value exactly. No emission in this row. Refs (read-only): ~/pcc_refs/{ld64,go-src,zig-src,mold,llvm-project-20.1.8-full-depth1}; SDK mach-o/{loader.h,reloc.h,arm64/reloc.h}."
+    milestone: M5
+    depends_on: []
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "round-trip test parses clang .o and reproduces all field values"
+  - id: LINK-P1-MACHO-OBJ-MINIMAL
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Emit a minimal relocation-free Mach-O object for a leaf function"
+    latest_evidence: pcc/backend/self_backend_emit.py
+    open_boundary: "Emit a single-__TEXT,__text-section arm64 object with a symbol table and no relocations, for a leaf function with no calls or global references. Two acceptance paths, both required: the system linker consumes pcc's .o and the resulting binary runs; and a structural diff against the .o that as(1) produces from the same asm shows no semantic difference (byte-identity is not required, field-level equivalence is). Refs (read-only): ~/pcc_refs/{ld64,go-src,zig-src,mold,llvm-project-20.1.8-full-depth1}; SDK mach-o/{loader.h,reloc.h,arm64/reloc.h}."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-SPEC
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "system ld links pcc-emitted .o and the binary runs"
+      - "field-level diff vs as(1) output on pinned shapes"
+  - id: LINK-P1-MACHO-OBJ-RELOC
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Emit arm64 relocations one type at a time, each differentially verified"
+    latest_evidence: pcc/backend/self_backend_emit.py
+    open_boundary: "Add exactly the relocation types pcc's own emitter produces, one per slice with a pinned asm shape: ARM64_RELOC_BRANCH26, PAGE21, PAGEOFF12, GOT_LOAD_PAGE21, GOT_LOAD_PAGEOFF12, UNSIGNED, SUBTRACTOR, ADDEND. Wrong relocations link successfully and crash at runtime, so every slice needs both a field-level diff against as(1) and an execution check. Unsupported relocation shapes stay fail-closed (BackendUnavailable), never guessed. Refs (read-only): ~/pcc_refs/{ld64,go-src,zig-src,mold,llvm-project-20.1.8-full-depth1}; SDK mach-o/{loader.h,reloc.h,arm64/reloc.h}."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-OBJ-MINIMAL
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "per-relocation pinned shape: field diff vs as(1) plus execution check"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P1-MACHO-OBJ-FULL
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Complete the object writer: full section set, symbol ordering, string table, unwind"
+    latest_evidence: pcc/backend/self_backend_emit.py
+    open_boundary: "__text/__const/__data/__bss/__cstring section emission with correct alignment; symbol table ordering (locals, then defined externals, then undefined) and N_SECT/N_EXT/N_PEXT flags as ld expects; string table; __LD,__compact_unwind or the eh_frame equivalent that the platform requires for correct backtraces. Acceptance: pcc emits every object of the runtime archive and the system linker produces a working pcc1 from them. Refs (read-only): ~/pcc_refs/{ld64,go-src,zig-src,mold,llvm-project-20.1.8-full-depth1}; SDK mach-o/{loader.h,reloc.h,arm64/reloc.h}."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-OBJ-RELOC
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "system ld builds a working pcc1 entirely from pcc-emitted objects"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P1-MACHO-OBJ-SWITCH
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Switch the self path from asm-text plus as(1) to direct object emission"
+    latest_evidence: pcc/py_frontend/pipeline.py
+    open_boundary: "Today the self path writes assembly text and shells out to cc to assemble and link. Make direct .o emission the default (asm text stays available as a debug dump), removing both the assembler dependency and a full text serialize/reparse cycle. Record the compile-time delta on bootstrap stage2 — removing the text round trip is expected to be a measurable win and is part of the compile-time budget story."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-OBJ-FULL
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "bootstrap stage2 wall-time before/after recorded"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P1-MACHO-LINK-STATIC
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Own static linking: symbol resolution, archive member selection, layout, relocation application"
+    latest_evidence: pcc/py_frontend/pipeline.py
+    open_boundary: "Resolve symbols across pcc's own objects plus the static runtime archive (.a member selection with the usual repeated-scan semantics), merge sections, compute the output layout, and apply relocations. Scope is pcc's own link job, not a general-purpose linker: the reference designs are go-src/src/cmd/link/internal/ld/macho.go (1603 lines, the high-level-language precedent) and lld/MachO (21281 lines, production). System ld stays the fallback and the differential oracle throughout. Refs (read-only): ~/pcc_refs/{ld64,go-src,zig-src,mold,llvm-project-20.1.8-full-depth1}; SDK mach-o/{loader.h,reloc.h,arm64/reloc.h}."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-OBJ-FULL
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "pcc-linked binary output matches the ld-linked binary behaviorally on the self-backend suites"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P1-MACHO-LINK-DYLD
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Emit the dynamic-loader surface: libSystem load command, stubs, GOT, fixups, entry point"
+    latest_evidence: pcc/py_frontend/pipeline.py
+    open_boundary: "LC_LOAD_DYLIB for libSystem, __stubs and __got sections, and one deliberately chosen binding mechanism (LC_DYLD_CHAINED_FIXUPS on modern targets versus classic LC_DYLD_INFO_ONLY) plus LC_MAIN, LC_BUILD_VERSION and LC_UUID. Pin the choice with the minimum OS version pcc targets recorded, since chained fixups are not available on older loaders. ld64 is the authority; zig-src/src/link and lld/MachO show two modern implementations. Refs (read-only): ~/pcc_refs/{ld64,go-src,zig-src,mold,llvm-project-20.1.8-full-depth1}; SDK mach-o/{loader.h,reloc.h,arm64/reloc.h}."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-LINK-STATIC
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "dyld loads and runs a pcc-linked binary that calls libSystem symbols"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P1-MACHO-CODESIGN
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Emit a valid ad-hoc code signature so codesign(1) is no longer required"
+    latest_evidence: pcc/py_frontend/pipeline.py
+    open_boundary: "arm64 macOS refuses to exec unsigned binaries, and the current publish sequence shells out to /usr/bin/codesign. Emit LC_CODE_SIGNATURE with a correct SuperBlob/CodeDirectory and per-page SHA-256 hashes so pcc signs its own output. ld64's code-sign-blobs and cs_blobs.h are the authority. Acceptance is external: codesign --verify accepts pcc's signature and the kernel execs the binary. Keep the codesign shell-out as an explicit fallback until this is proven across the bootstrap chain."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-LINK-DYLD
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "codesign --verify passes on a pcc-signed binary; the binary execs"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P1-MACHO-LINK-SWITCH
+    priority: P1
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Make pcc's own linker the default on the self path with ld retained as oracle"
+    latest_evidence: tests/python/test_bootstrap_gate_baseline.py
+    open_boundary: "Flip the default and keep system ld behind an explicit flag as fallback and differential oracle. The acceptance gate is the strongest one the repository has: a full pcc1->pcc2->pcc3 chain linked by pcc's own linker, with pcc2/pcc3 byte-identity preserved. Determinism is not optional here — the fixed point is what proves the linker is reproducible."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-CODESIGN
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "full self-host bootstrap green with pcc's linker; pcc2/pcc3 byte-identical"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P2-NATIVE-OBJ-FASTPATH
+    priority: P2
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Co-design an internal object format for pcc's own pipeline, keeping Mach-O at the boundary"
+    latest_evidence: pcc/backend/self_backend_emit.py
+    open_boundary: "Go's linker is fast partly because Go co-designs its object format with its linker instead of round-tripping relocatable platform objects. pcc can do the same: an internal format with pre-resolved symbol indices and no string-table reparsing for pcc-to-pcc links, emitting standard Mach-O only at the external boundary (C interop, distributed artifacts, extension objects). Acceptance is compile-time measured on bootstrap stage2, with the external-boundary path unchanged and still gated."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-LINK-SWITCH
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "stage2 link-time before/after recorded; external Mach-O path unchanged and gated"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P2-INCREMENTAL
+    priority: P2
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Incremental linking: patch the previous artifact instead of relinking from scratch"
+    latest_evidence: pcc/backend/self_backend_cache_identity.py
+    open_boundary: "The bootstrap and the edit-rebuild loop relink the same hundreds of modules repeatedly. Zig's self-hosted linker keeps link state and patches binaries in place; zig-src/src/link is the reference. This fits the repository's existing content-hash cache culture (bootstrap source hash, IR-keyed object cache). Hard constraint: incremental output must be byte-identical to a from-scratch link, or the fixed-point gate is meaningless — the equality check is part of the gate, not an afterthought."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-LINK-SWITCH
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "incremental link output byte-identical to from-scratch link on pinned inputs"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P3-PARALLEL
+    priority: P3
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Parallel linking with deterministic-by-construction output"
+    latest_evidence: pcc/py_runtime/src/pcc_threads.c
+    open_boundary: "mold's design is the state of the art: compute the complete output layout first, then let threads write disjoint regions of the mmap-ed output concurrently, with a sharded symbol table for resolution. Determinism must be structural, not lucky: identical bytes regardless of thread scheduling, verified by the pcc2/pcc3 byte-identity gate plus repeated-run equality. This row doubles as the most demanding real workload for the threaded runtime and the five GC backends, so it is deliberately sequenced after the atomic intrinsics land. Reference: ~/pcc_refs/mold."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-LINK-SWITCH
+      - LIBC-P1-PRIMITIVES
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "repeated parallel links produce byte-identical output; PCC_GC_BACKEND=0..4 green under PCC_WITH_THREADS=1"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P3-SEMANTIC-LAYOUT
+    priority: P3
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Link-time optimizations only pcc can do: semantic dead-code, hot/cold layout, runtime table packing"
+    latest_evidence: pcc/py_frontend/pipeline.py
+    open_boundary: "A general linker sees sections and symbols; pcc additionally knows the Python module graph, which symbols are runtime internals versus exported API, where the err-check cold paths are, and where safepoint/stack-map data lives. Candidates, each measured separately: dead-code elimination with semantic reachability rather than section granularity; whole-program hot/cold placement that pairs with the cold-error-path backend work; and packing safepoint and stack-map tables contiguously and sorted for binary search instead of scattered. Every candidate must preserve five-GC semantics and the fixed point."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-LINK-SWITCH
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "per-candidate size and runtime deltas recorded; PCC_GC_BACKEND=0..4 green"
+      - "gtimeout 360s env -u LC_ALL uv run pytest -q -n0 tests/python/test_bootstrap_gate_baseline.py"
+  - id: LINK-P3-ELF-LINUX
+    priority: P3
+    status: TODO_READY
+    track: toolchain/ownership
+    title: "Port the object writer and linker to static ELF on x86_64 linux"
+    latest_evidence: tests/integration/test_self_backend_x86_64_linux.py
+    open_boundary: "The ELF twin, sequenced after macOS because the owner's iteration platform is macOS and every repository gate is macOS arm64. Technically simpler than the Darwin path: no dyld, no mandatory code signature, static-only to start. References: go-src/src/cmd/link/internal/ld/elf.go (2398 lines), lld/ELF, mold. This row is also what makes the static zero-libc demonstration reachable."
+    milestone: M5
+    depends_on:
+      - LINK-P1-MACHO-LINK-SWITCH
+    rank: 1000
+    exit_criteria:
+      - "Exit the finite claim boundary in open_boundary and pass every required gate."
+    required_gates:
+      - "docker gate: pcc-emitted, pcc-linked static ELF runs; nm -u empty on the static target"
   - id: LIBC-P1-IMPORT-RATCHET
     priority: P1
     status: DONE_WEAK
     track: libc/ownership
     title: "Freeze the pcc1 libc import surface as a shrink-only ratchet baseline"
     latest_evidence: tests/libc_import_baseline.json
-    open_boundary: "Landed 2026-07-24: tests/libc_import_baseline.json records the exact 78 libSystem symbols the darwin-arm64 stage1 pcc1 imports (threads-off build), with pinned translation references (musl 1.2.5 sha256-verified, llvm-libc from the llvm 20.1.8 tree, apple-libc @ 71bbe350); tests/python/test_libc_import_baseline.py enforces subset-only (growth fails, shrinkage prompts deliberate tightening) behind probe=pcc1 auto-provisioning. Remaining: a linux-x86_64 twin baseline (docker gate) and a PCC_WITH_THREADS variant baseline."
+    open_boundary: "Landed 2026-07-24: tests/libc_import_baseline.json records the exact 78 libSystem symbols the darwin-arm64 stage1 pcc1 imports (threads-off build), with pinned translation references (musl 1.2.5 sha256-verified, llvm-libc from the llvm 20.1.8 tree, apple-libc @ 71bbe350); tests/python/test_libc_import_baseline.py enforces subset-only (growth fails, shrinkage prompts deliberate tightening) behind probe=pcc1 auto-provisioning. Remaining: a linux-x86_64 twin baseline (docker gate) and a PCC_WITH_THREADS variant baseline. TRACK STRATEGY (owner ruling 2026-07-24): ownership is decided by WHO COMPILES, not by source language. Replacement libc code is vendored upstream C compiled BY PCC, not rewritten in pcc-Python: pcc already emits objects for 84 of its own 86 runtime .c files (Makefile libpy_runtime_pcc.a / OBJS_PCC, gated by tests/python/test_py_runtime_pcc_emit.py), so vendored musl inherits battle-tested correctness while the artifact stays pcc-produced. macOS arm64 is the primary iteration platform; linux is the follow-on."
     milestone: M5
     depends_on: []
     rank: 1000
@@ -1565,7 +1818,7 @@ tasks:
     track: libc/ownership
     title: "Translate the mem/str family (11 imported symbols) from musl into pcc-Python"
     latest_evidence: tests/libc_import_baseline.json
-    open_boundary: "memcpy/memmove/memset/memchr/bzero/strchr/strcmp/strlen/strncmp/strrchr/__memcpy_chk translated from ~/pcc_refs/musl-1.2.5/src/string (primary) with llvm-libc per-function tests as the secondary oracle, differential-tested against the host libc, then linked in place of the imports so the ratchet count drops. Performance parity for memcpy/memset depends on the PERF-P3-SIMD block-op stage; correctness lands first."
+    open_boundary: "Vendor ~/pcc_refs/musl-1.2.5/src/string sources for memcpy/memmove/memset/memchr/bzero/strchr/strcmp/strlen/strncmp/strrchr/__memcpy_chk into a tracked vendor tree, compile them WITH PCC (not rewritten in pcc-Python), and link them in place of the imports so the ratchet count drops. Differential-test against the host libc; llvm-libc per-function tests are the secondary oracle. Record the upstream version so vendor drift is a tracked update, not a fork. Performance parity for memcpy/memset depends on PERF-P3-SIMD block ops; correctness lands first."
     milestone: M5
     depends_on: []
     rank: 1000
@@ -1579,7 +1832,7 @@ tasks:
     track: libc/ownership
     title: "Own allocation: a page-level allocator over mmap replacing the malloc family imports"
     latest_evidence: tests/libc_import_baseline.json
-    open_boundary: "Replace malloc/calloc/realloc/free imports with a pcc-owned allocator (musl mallocng as the reference design; ~/pcc_refs/musl-1.2.5/src/malloc) over mmap (libSystem extern on macOS, syscall intrinsic on linux). Must serve the five GC backends without weakening any allocation-path invariant; longrun RSS/fragmentation benchmarks are the acceptance surface alongside correctness."
+    open_boundary: "Replace malloc/calloc/realloc/free with vendored musl mallocng (~/pcc_refs/musl-1.2.5/src/malloc) compiled by pcc, over mmap (libSystem extern on macOS). Must serve all five GC backends without weakening any allocation-path invariant; longrun RSS/fragmentation benchmarks are the acceptance surface alongside correctness. A pcc-Python allocator is explicitly NOT the plan: allocator bugs are the most expensive class and upstream mallocng is proven."
     milestone: M5
     depends_on:
       - LIBC-P1-PRIMITIVES
@@ -1594,7 +1847,7 @@ tasks:
     track: libc/ownership
     title: "Own the buffered-IO subset pcc actually uses (14 stdio imports)"
     latest_evidence: tests/libc_import_baseline.json
-    open_boundary: "fopen/fclose/fread/fwrite/fflush/ferror/fgetc/fprintf/snprintf/vsnprintf/__stderrp/popen/pclose/remove: implement the subset pcc's runtime and CLI actually exercise (not a general FILE* emulation), musl as reference, formatting reuses the runtime's own py_format machinery where possible. popen/pclose sit on the process-spawn wrappers."
+    open_boundary: "fopen/fclose/fread/fwrite/fflush/ferror/fgetc/fprintf/snprintf/vsnprintf/__stderrp/popen/pclose/remove: vendor musl's stdio subset that pcc's runtime and CLI actually exercise (not a general FILE* emulation) and compile it with pcc. Scope is defined by the ratchet baseline, not by POSIX completeness; anything outside the exercised subset stays absent rather than half-implemented. popen/pclose sit on the process-spawn wrappers."
     milestone: M5
     depends_on:
       - LIBC-P1-PRIMITIVES
@@ -1624,7 +1877,7 @@ tasks:
     track: libc/ownership
     title: "Translate the numerically hard singletons: strtod and pow"
     latest_evidence: tests/libc_import_baseline.json
-    open_boundary: "The only two numerically hard imports: strtod (correctly-rounded decimal-to-double; the runtime already owns shortest-repr float printing, this is its inverse) and pow (the single libm import). Translate from musl with llvm-libc's correctly-rounded implementations and tests as the stronger oracle; differential fuzz against the host on large corpora including subnormals, halfway cases, and hex floats."
+    open_boundary: "The only two numerically hard imports: strtod (correctly-rounded decimal-to-double) and pow (the single libm import). Vendor them rather than reimplement: musl for strtod, llvm-libc's correctly-rounded math for pow, compiled by pcc. Differential fuzz against the host and against llvm-libc's own tests on corpora including subnormals, exact-halfway cases, hex floats, and extreme exponents. Hand-writing correctly-rounded conversion is explicitly out of scope."
     milestone: M5
     depends_on: []
     rank: 1000

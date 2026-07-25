@@ -3,10 +3,32 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 import scripts.numpy_head_gate as numpy_gate
 from pcc.package.build_exec import execute_build_actions
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# The two plan/replay tests below read the meson build products of a real local
+# NumPy build (projects/numpy-2.4.4/build/pcc-package/meson-build). Those
+# products are generated, never committed, so a clean checkout (CI) does not
+# have them: gate at collection instead of failing on a missing prerequisite.
+# When the build products ARE present the tests run for real and must pass.
+_MESON_COMPILE_COMMANDS = (
+    ROOT
+    / "projects"
+    / "numpy-2.4.4"
+    / "build"
+    / "pcc-package"
+    / "meson-build"
+    / "compile_commands.json"
+)
+_MESON_REASON = (
+    None
+    if _MESON_COMPILE_COMMANDS.is_file()
+    else f"local NumPy meson build products required: {_MESON_COMPILE_COMMANDS}"
+)
 
 
 def test_numpy_artifact_uses_package_qualified_site_layout(tmp_path: Path) -> None:
@@ -38,6 +60,7 @@ def test_loader_package_site_includes_generated_python_modules(tmp_path: Path) -
     ]
 
 
+@pytest.mark.pcc_gate(unavailable=_MESON_REASON)
 def test_current_numpy_plan_locks_historical_surface_and_real_link_closure() -> None:
     plan = numpy_gate.build_plan(ROOT / "projects" / "numpy-2.4.4")
 
@@ -52,6 +75,7 @@ def test_current_numpy_plan_locks_historical_surface_and_real_link_closure() -> 
     assert len(plan.source_sha256) == 64
 
 
+@pytest.mark.pcc_gate(unavailable=_MESON_REASON)
 def test_package_executor_dry_plan_replays_only_multiarray_umath_closure() -> None:
     report = execute_build_actions(
         "numpy",

@@ -248,7 +248,12 @@ class CustomBuildHook(BuildHookInterface):
                 if not chunk:
                     break
                 digest.update(chunk)
-        marker_root = Path(self.directory) / "pcc-runtime-wheel-markers"
+        # Never write into self.directory: that is the distribution output
+        # directory (dist/), and every non-distribution entry left there makes
+        # the PyPI upload fail with "InvalidDistribution: Unknown distribution
+        # format". The marker only needs a real path on disk because it is
+        # force_include-d into the artifact under pcc/py_runtime/.
+        marker_root = Path(self.root) / "build" / "pcc-runtime-wheel-markers"
         marker_root.mkdir(parents=True, exist_ok=True)
         marker = marker_root / (archive.name + ".wheel")
         marker.write_text(

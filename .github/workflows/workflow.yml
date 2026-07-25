@@ -5,12 +5,13 @@ on:
     types: [published]
 
 jobs:
-  head-truth:
-    uses: ./.github/workflows/head-truth-heavy.yml
-
+  # Publication is not gated on the truth matrix: the head-truth light/heavy
+  # workflows were removed (owner ruling 2026-07-25) because a 115-minute
+  # macOS matrix made releases unusable and blocked them outright on any red
+  # gate. The gate runner itself (scripts/head_truth_gate.py) is unchanged and
+  # is run locally.
   pypi-publish:
     name: Upload release to PyPI
-    needs: head-truth
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -21,7 +22,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install build dependencies
         run: pip install build

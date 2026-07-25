@@ -1,6 +1,6 @@
 [project]
 name = "python-cc"
-version = "0.1.5"
+version = "0.1.7"
 description = "A Python-authored compiler toolchain that compiles C and Python to native code (LLVM and LLVM-free backends)."
 readme = "README.md"
 license = "MIT"
