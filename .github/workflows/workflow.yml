@@ -5,12 +5,13 @@ on:
     types: [published]
 
 jobs:
-  head-truth:
-    uses: ./.github/workflows/head-truth-heavy.yml
-
+  # The heavy five-GC fixed-point matrix is NOT a release blocker: it needs up
+  # to 115 minutes on a macOS runner, so gating publication on it made releases
+  # unusable. It keeps running on its own daily schedule and on demand
+  # (head-truth-heavy.yml: schedule + workflow_dispatch), and the light
+  # ratchets run on every push (head-truth-light.yml).
   pypi-publish:
     name: Upload release to PyPI
-    needs: head-truth
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
